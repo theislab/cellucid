@@ -15,6 +15,7 @@
 import { PlotHelpers, getPageColor } from '../core/plugin-contract.js';
 import { createMinimalPlotly, getPlotlyConfig } from './plotly-loader.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { pageValueAt } from '../shared/category-counts.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 
 /**
@@ -277,7 +278,7 @@ export class BasePlot {
         rows.push({
           page: pd.pageName,
           cell_index: pd.cellIndices[i],
-          value: pd.values[i]
+          value: pageValueAt(pd, i)
         });
       }
     }

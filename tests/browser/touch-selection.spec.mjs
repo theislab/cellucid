@@ -12,13 +12,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=touch-selection-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=touch-selection-ci';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -36,7 +36,7 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells',
@@ -161,7 +161,11 @@ async function useNavigationMode(page, mode) {
   ).toBe(mode);
 }
 const unifiedState = page => page.evaluate(
-  () => window._cellucidViewer.getUnifiedSelectionState(),
+  () => {
+    // The candidates are a cell list (Uint32Array); hand them over as numbers.
+    const state = window._cellucidViewer.getUnifiedSelectionState();
+    return { ...state, candidates: Array.from(state.candidates) };
+  },
 );
 const selectModeOf = page => page.evaluate(
   () => window._cellucidViewer.getSelectMode(),

@@ -5,8 +5,22 @@
  * readbacks and avoiding padded CPU copies for large datasets by streaming
  * row-by-row with `texSubImage2D`.
  *
+ * A texture whose storage already has the packed shape is rewritten in place:
+ * rows written into storage WebGL has accepted allocate nothing, so only a lost
+ * context can refuse them and no error is read back (`requireLiveContext`).
+ * `getError()` is a synchronous round trip to the GPU process that waits for
+ * every queued command, the previous frames' draws included: a velocity
+ * overlay rebuilding the tables of seven restored views spent 112 ms there.
+ * Only a new allocation reads the error queue, once, so a refused allocation is
+ * deleted instead of published: at once (`allocationCheck: 'now'`), or by the
+ * caller before it publishes (`'caller'`), which lets it read once for several
+ * textures, a task later, when the GPU process has caught up.
+ *
  * @module rendering/overlays/shared/packed-texture
  */
+
+import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
+import { deleteTextureTracked, restorableTexture } from '../../gl-utils.js';
 
 /**
  * Compute width/height for a packed 2D texture.
@@ -33,54 +47,143 @@ function computePackedDims(gl, itemCount) {
   return { width, height, maxTexSize };
 }
 
-function uploadStagedTexture(gl, existing, label, upload) {
-  if (existing !== null && !gl.isTexture(existing)) {
-    throw new TypeError(`${label} existing texture is not owned by WebGL.`);
+/**
+ * Whether `existing` (a packed texture record or null) has exactly the shape
+ * `itemCount` items of `components` values pack into: a write of that many
+ * items then goes in place.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} existing
+ * @param {number} itemCount
+ * @param {number} components
+ * @returns {boolean}
+ */
+export function packedTextureFits(gl, existing, itemCount, components) {
+  const { width, height } = computePackedDims(gl, itemCount);
+  return fitsExisting(existing, width, height, components, 'Packed texture');
+}
+
+/**
+ * Whether `existing` -- a texture this module returned, still owned by the
+ * caller -- has exactly this shape. Ownership is the caller's record, not a
+ * `gl.isTexture` query: that is a synchronous GPU round trip as well.
+ *
+ * @returns {boolean}
+ */
+function fitsExisting(existing, width, height, components, label) {
+  if (existing === null) return false;
+  if (
+    typeof existing !== 'object' ||
+    existing.texture === null ||
+    typeof existing.texture !== 'object'
+  ) {
+    throw new TypeError(`${label} existing texture must be a packed texture record or null.`);
   }
-  const priorError = gl.getError();
-  if (priorError !== gl.NO_ERROR) {
-    throw new Error(
-      `${label} cannot start while WebGL error 0x${priorError.toString(16)} is pending.`
+  return existing.width === width &&
+    existing.height === height &&
+    existing.components === components;
+}
+
+/**
+ * Write `itemCount` items, `components` values each, row by row from the top
+ * of the bound texture.
+ */
+function writeRows(gl, width, itemCount, components, format, type, data) {
+  let remaining = itemCount;
+  let srcOffset = 0;
+  for (let y = 0; remaining > 0; y++) {
+    const rowItems = Math.min(width, remaining);
+    const rowLen = rowItems * components;
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      0,
+      y,
+      rowItems,
+      1,
+      format,
+      type,
+      data.subarray(srcOffset, srcOffset + rowLen)
     );
+    remaining -= rowItems;
+    srcOffset += rowLen;
   }
+}
+
+/**
+ * Write the packed items into `existing` when it has the shape, else into a new
+ * texture. The caller owns both: a new texture is returned for it to publish
+ * and `existing` is left for it to retire.
+ *
+ * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ */
+function uploadPacked(gl, existing, spec) {
+  const {
+    label,
+    width,
+    height,
+    components,
+    internalFormat,
+    format,
+    type,
+    data,
+    itemCount,
+    allocationCheck
+  } = spec;
+  if (allocationCheck !== 'now' && allocationCheck !== 'caller') {
+    throw new TypeError(`${label} allocationCheck must be exactly 'now' or 'caller'.`);
+  }
+  const inPlace = fitsExisting(existing, width, height, components, label);
+  if (!inPlace) requireLiveContext(gl, `${label} preflight`);
   const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
   const previousAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
   const previousPixelUnpackBuffer =
     gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING);
-  const candidate = gl.createTexture();
-  if (candidate === null) {
+  const target = inPlace ? existing.texture : gl.createTexture();
+  if (target === null) {
     throw new Error(`WebGL failed to allocate ${label}.`);
   }
-  const restoreBinding = previousBinding === existing
-    ? candidate
-    : previousBinding;
   try {
-    gl.bindTexture(gl.TEXTURE_2D, candidate);
+    gl.bindTexture(gl.TEXTURE_2D, target);
     gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
-    upload();
-    const uploadError = gl.getError();
-    if (uploadError !== gl.NO_ERROR) {
-      throw new Error(
-        `${label} upload failed with WebGL error 0x${uploadError.toString(16)}.`
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    if (!inPlace) {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      // Allocate storage, then stream rows to avoid padded CPU copies.
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        internalFormat,
+        width,
+        height,
+        0,
+        format,
+        type,
+        null
       );
     }
+    writeRows(gl, width, itemCount, components, format, type, data);
+    if (inPlace || allocationCheck === 'caller') {
+      requireLiveContext(gl, `${label} upload`);
+    } else {
+      // The one read: a refused allocation must not stay resident.
+      requireCleanWebGLState(gl, `${label} allocation`);
+    }
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment);
-    gl.bindBuffer(
-      gl.PIXEL_UNPACK_BUFFER,
-      previousPixelUnpackBuffer
-    );
-    gl.bindTexture(gl.TEXTURE_2D, restoreBinding);
+    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, previousPixelUnpackBuffer);
+    gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousBinding));
   } catch (error) {
     const cleanupErrors = [];
-    for (const cleanup of [
+    const cleanups = [
       () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
-      () => gl.bindBuffer(
-        gl.PIXEL_UNPACK_BUFFER,
-        previousPixelUnpackBuffer
-      ),
-      () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
-      () => gl.deleteTexture(candidate)
-    ]) {
+      () => gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, previousPixelUnpackBuffer),
+      () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousBinding)),
+    ];
+    if (!inPlace) cleanups.push(() => deleteTextureTracked(gl, target));
+    for (const cleanup of cleanups) {
       try {
         cleanup();
       } catch (cleanupError) {
@@ -95,98 +198,63 @@ function uploadStagedTexture(gl, existing, label, upload) {
     }
     throw error;
   }
-  if (existing !== null) {
-    try {
-      gl.deleteTexture(existing);
-    } catch (error) {
-      // A host wrapper may perform the WebGL deletion and then throw. In that
-      // case the replacement has already committed and rolling the candidate
-      // back would leave the caller with no live texture at all.
-      let existingIsLive;
-      try {
-        existingIsLive = gl.isTexture(existing);
-      } catch (inspectionError) {
-        const ownershipErrors = [error, inspectionError];
-        try {
-          gl.deleteTexture(candidate);
-        } catch (cleanupError) {
-          ownershipErrors.push(cleanupError);
-        }
-        throw new AggregateError(
-          ownershipErrors,
-          `${label} replacement retirement state could not be determined; candidate cleanup was attempted.`
-        );
-      }
-      if (!existingIsLive) return candidate;
-      const cleanupErrors = [];
-      for (const cleanup of [
-        () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
-        () => gl.bindBuffer(
-          gl.PIXEL_UNPACK_BUFFER,
-          previousPixelUnpackBuffer
-        ),
-        () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
-        () => gl.deleteTexture(candidate)
-      ]) {
-        try {
-          cleanup();
-        } catch (cleanupError) {
-          cleanupErrors.push(cleanupError);
-        }
-      }
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupErrors],
-          `${label} replacement retirement failed and cleanup was incomplete.`
-        );
-      }
-      throw error;
-    }
-  }
-  return candidate;
+  return inPlace ? existing : { texture: target, width, height, components };
 }
 
-/**
- * Create or replace a packed float texture.
- *
- * @param {WebGL2RenderingContext} gl
- * @param {object} options
- * @param {WebGLTexture|null} [options.texture]
- * @param {Float32Array} options.data
- * @param {number} options.itemCount
- * @param {1|2|3|4} options.components
- * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
- */
-export function createOrUpdatePackedFloatTexture(gl, options) {
+function requireExactOptions(options, keys, label) {
   if (
     options === null ||
     typeof options !== 'object' ||
     Array.isArray(options) ||
     Object.getPrototypeOf(options) !== Object.prototype ||
-    Object.keys(options).sort().join(',') !==
-      'components,data,itemCount,texture'
+    Object.keys(options).sort().join(',') !== keys
   ) {
     throw new TypeError(
-      'Packed float texture options must contain exactly components, data, itemCount, and texture.'
+      `${label} options must contain exactly ${keys.split(',').join(', ')}.`
     );
   }
+}
+
+function requireItemCount(count, label) {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError(
+      `${label} itemCount must be a non-negative safe integer.`
+    );
+  }
+}
+
+/**
+ * Write a packed float texture: into `texture` when it has the shape, else into
+ * a new one (the caller retires `texture`).
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {object} options
+ * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
+ *   The texture this one replaces, or null.
+ * @param {Float32Array} options.data
+ * @param {number} options.itemCount
+ * @param {1|2|3|4} options.components
+ * @param {'now'|'caller'} options.allocationCheck - Who reads the error queue
+ *   after a new allocation (an in-place write reads none).
+ * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ */
+export function createOrUpdatePackedFloatTexture(gl, options) {
+  requireExactOptions(
+    options,
+    'allocationCheck,components,data,itemCount,texture',
+    'Packed float texture'
+  );
   const {
     texture: existing,
     data,
     itemCount: count,
-    components: comps
+    components: comps,
+    allocationCheck
   } = options;
-  if (existing !== null && typeof existing !== 'object') {
-    throw new TypeError('Packed float texture must be a WebGLTexture or null.');
-  }
   if (![1, 2, 3, 4].includes(comps)) {
     throw new RangeError('Packed float texture components must be exactly 1, 2, 3, or 4.');
   }
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError(
-      'Packed float texture itemCount must be a non-negative safe integer.'
-    );
-  }
+  requireItemCount(count, 'Packed float texture');
   if (!(data instanceof Float32Array)) {
     throw new TypeError('Packed float texture data must be a Float32Array.');
   }
@@ -197,103 +265,50 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
   }
 
   const { width, height } = computePackedDims(gl, count);
-
-  const internalFormat =
-    comps === 1 ? gl.R32F :
-    comps === 2 ? gl.RG32F :
-    comps === 3 ? gl.RGB32F :
-    gl.RGBA32F;
-  const format =
-    comps === 1 ? gl.RED :
-    comps === 2 ? gl.RG :
-    comps === 3 ? gl.RGB :
-    gl.RGBA;
-
-  const texture = uploadStagedTexture(
-    gl,
-    existing,
-    'packed float texture',
-    () => {
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-      // Allocate storage, then stream rows to avoid padded CPU copies.
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        internalFormat,
-        width,
-        height,
-        0,
-        format,
-        gl.FLOAT,
-        null
-      );
-
-      let remaining = count;
-      let srcOffset = 0;
-      for (let y = 0; y < height && remaining > 0; y++) {
-        const rowItems = Math.min(width, remaining);
-        const rowLen = rowItems * comps;
-        const row = data.subarray(srcOffset, srcOffset + rowLen);
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          y,
-          rowItems,
-          1,
-          format,
-          gl.FLOAT,
-          row
-        );
-        remaining -= rowItems;
-        srcOffset += rowLen;
-      }
-    }
-  );
-  return { texture, width, height, components: comps };
+  return uploadPacked(gl, existing, {
+    label: 'packed float texture',
+    width,
+    height,
+    components: comps,
+    internalFormat:
+      comps === 1 ? gl.R32F :
+      comps === 2 ? gl.RG32F :
+      comps === 3 ? gl.RGB32F :
+      gl.RGBA32F,
+    format:
+      comps === 1 ? gl.RED :
+      comps === 2 ? gl.RG :
+      comps === 3 ? gl.RGB :
+      gl.RGBA,
+    type: gl.FLOAT,
+    data,
+    itemCount: count,
+    allocationCheck
+  });
 }
 
 /**
- * Create or replace the packed per-cell visibility texture (R32F) from point
- * transparency: one byte a cell, exactly 0 or 1 (rendering/alpha-visibility.js).
- *
- * The shader reads the texel as a float, so each row is widened through one
- * row-sized Float32 scratch on its way to the GPU; no dataset-sized Float32
- * copy of the transparency is ever made.
+ * Write the packed per-cell visibility texture (R8UI) from point transparency:
+ * one byte a cell, exactly 0 or 1 (rendering/alpha-visibility.js), uploaded as
+ * it is held; the shader reads it through a `usampler2D`. Into `texture` when
+ * it has the shape, else into a new one (the caller retires `texture`).
  *
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
- * @param {WebGLTexture|null} options.texture
+ * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
  * @param {Uint8Array} options.data
  * @param {number} options.itemCount
+ * @param {'now'|'caller'} options.allocationCheck
  * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
  */
 export function createOrUpdatePackedVisibilityTexture(gl, options) {
-  if (
-    options === null ||
-    typeof options !== 'object' ||
-    Array.isArray(options) ||
-    Object.getPrototypeOf(options) !== Object.prototype ||
-    Object.keys(options).sort().join(',') !== 'data,itemCount,texture'
-  ) {
-    throw new TypeError(
-      'Packed visibility texture options must contain exactly data, itemCount, and texture.'
-    );
-  }
-  const { texture: existing, data, itemCount: count } = options;
-  if (existing !== null && typeof existing !== 'object') {
-    throw new TypeError('Packed visibility texture must be a WebGLTexture or null.');
-  }
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError(
-      'Packed visibility texture itemCount must be a non-negative safe integer.'
-    );
-  }
+  requireExactOptions(
+    options,
+    'allocationCheck,data,itemCount,texture',
+    'Packed visibility texture'
+  );
+  const { texture: existing, data, itemCount: count, allocationCheck } = options;
+  requireItemCount(count, 'Packed visibility texture');
   if (!(data instanceof Uint8Array)) {
     throw new TypeError('Packed visibility texture data must be a Uint8Array.');
   }
@@ -304,86 +319,54 @@ export function createOrUpdatePackedVisibilityTexture(gl, options) {
   }
 
   const { width, height } = computePackedDims(gl, count);
-
-  const texture = uploadStagedTexture(
-    gl,
-    existing,
-    'packed visibility texture',
-    () => {
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.R32F,
-        width,
-        height,
-        0,
-        gl.RED,
-        gl.FLOAT,
-        null
-      );
-
-      const row = new Float32Array(width);
-      let remaining = count;
-      let srcOffset = 0;
-      for (let y = 0; y < height && remaining > 0; y++) {
-        const rowItems = Math.min(width, remaining);
-        for (let index = 0; index < rowItems; index++) {
-          row[index] = data[srcOffset + index];
-        }
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          y,
-          rowItems,
-          1,
-          gl.RED,
-          gl.FLOAT,
-          row.subarray(0, rowItems)
-        );
-        remaining -= rowItems;
-        srcOffset += rowItems;
-      }
-    }
-  );
-  return { texture, width, height, components: 1 };
+  // One unsigned byte a cell, as the visibility is held (0 or 1): no float
+  // conversion, a quarter of a float texture's bytes.
+  return uploadPacked(gl, existing, {
+    label: 'packed visibility texture',
+    width,
+    height,
+    components: 1,
+    internalFormat: gl.R8UI,
+    format: gl.RED_INTEGER,
+    type: gl.UNSIGNED_BYTE,
+    data,
+    itemCount: count,
+    allocationCheck
+  });
 }
 
 /**
- * Create or replace a packed unsigned-int texture (R32UI).
+ * Write a packed unsigned-int texture (R32UI) shaped for `capacity` items and
+ * holding the first `itemCount` of them: a table that refills with fewer items
+ * keeps its storage. Into `texture` when it has the shape, else into a new one
+ * (the caller retires `texture`).
  *
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
- * @param {WebGLTexture|null} [options.texture]
+ * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
  * @param {Uint32Array} options.data
  * @param {number} options.itemCount
- * @returns {{ texture: WebGLTexture, width: number, height: number }}
+ * @param {number} options.capacity - Items the shape holds; at least `itemCount`.
+ * @param {'now'|'caller'} options.allocationCheck
+ * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
  */
 export function createOrUpdatePackedUintTexture(gl, options) {
-  if (
-    options === null ||
-    typeof options !== 'object' ||
-    Array.isArray(options) ||
-    Object.getPrototypeOf(options) !== Object.prototype ||
-    Object.keys(options).sort().join(',') !== 'data,itemCount,texture'
-  ) {
-    throw new TypeError(
-      'Packed uint texture options must contain exactly data, itemCount, and texture.'
-    );
-  }
-  const { texture: existing, data, itemCount: count } = options;
-  if (existing !== null && typeof existing !== 'object') {
-    throw new TypeError('Packed uint texture must be a WebGLTexture or null.');
-  }
-  if (!Number.isSafeInteger(count) || count < 0) {
+  requireExactOptions(
+    options,
+    'allocationCheck,capacity,data,itemCount,texture',
+    'Packed uint texture'
+  );
+  const {
+    texture: existing,
+    data,
+    itemCount: count,
+    capacity,
+    allocationCheck
+  } = options;
+  requireItemCount(count, 'Packed uint texture');
+  if (!Number.isSafeInteger(capacity) || capacity < count) {
     throw new RangeError(
-      'Packed uint texture itemCount must be a non-negative safe integer.'
+      `Packed uint texture capacity must be a safe integer of at least ${count}.`
     );
   }
   if (!(data instanceof Uint32Array)) {
@@ -395,51 +378,17 @@ export function createOrUpdatePackedUintTexture(gl, options) {
     );
   }
 
-  const { width, height } = computePackedDims(gl, count);
-
-  const texture = uploadStagedTexture(
-    gl,
-    existing,
-    'packed uint texture',
-    () => {
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.R32UI,
-        width,
-        height,
-        0,
-        gl.RED_INTEGER,
-        gl.UNSIGNED_INT,
-        null
-      );
-
-      let remaining = count;
-      let srcOffset = 0;
-      for (let y = 0; y < height && remaining > 0; y++) {
-        const rowItems = Math.min(width, remaining);
-        const row = data.subarray(srcOffset, srcOffset + rowItems);
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          y,
-          rowItems,
-          1,
-          gl.RED_INTEGER,
-          gl.UNSIGNED_INT,
-          row
-        );
-        remaining -= rowItems;
-        srcOffset += rowItems;
-      }
-    }
-  );
-  return { texture, width, height };
+  const { width, height } = computePackedDims(gl, capacity);
+  return uploadPacked(gl, existing, {
+    label: 'packed uint texture',
+    width,
+    height,
+    components: 1,
+    internalFormat: gl.R32UI,
+    format: gl.RED_INTEGER,
+    type: gl.UNSIGNED_INT,
+    data,
+    itemCount: count,
+    allocationCheck
+  });
 }

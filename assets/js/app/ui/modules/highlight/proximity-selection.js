@@ -218,12 +218,14 @@ export function initProximitySelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'proximityHistory', {
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
     selectionState.proximityRedoStack = [];
 
-    selectionState.lastProximityCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastProximityCandidates = stepEvent.candidates;
     selectionState.lastProximityStep = stepEvent.step;
 
     updateProximityUI(stepEvent);
@@ -240,7 +242,7 @@ export function initProximitySelection(options) {
     if (selectionState.proximityHistory.length === 0) return;
 
     selectionState.proximityRedoStack.push({
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
 
@@ -268,7 +270,7 @@ export function initProximitySelection(options) {
     if (selectionState.proximityRedoStack.length === 0) return;
 
     selectionState.proximityHistory.push({
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
 
@@ -438,7 +440,7 @@ export function initProximitySelection(options) {
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];
     selectionState.lastProximityCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastProximityStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

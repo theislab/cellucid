@@ -182,8 +182,15 @@ export class ExpressionMatrixBuilder {
    * @param {number[]|Uint32Array} options.groups[].cellIndices - Cell indices
    * @param {string} options.groups[].color - Group color owned by the category
    * @param {'none'|'zscore'|'log1p'} [options.transform='zscore'] - Transform to apply
+   * @param {{genes: string[], groupIds: string[], meanInGroupByGroup: Float32Array[]}|null} [options.knownMeans]
+   *   Every gene's mean in every group from a marker discovery over exactly
+   *   these groups (`stats` of its result): the genes it covers are not read
+   *   again. Its means are the ones computed here — each group's finite
+   *   values summed in cell order over their count — so the matrix is the
+   *   same either way.
    * @param {Function} [options.onProgress] - Progress callback
    * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
+   * @param {string|null} [options.readOwner] - The job the gene reads are for
    * @returns {Promise<ExpressionMatrix>} Expression matrix
    */
   async buildMatrix(options) {
@@ -192,8 +199,10 @@ export class ExpressionMatrixBuilder {
       groups,
       transform = DEFAULTS.transform,
       batchConfig = {},
+      knownMeans = null,
       onProgress,
-      signal
+      signal,
+      readOwner = null
     } = options;
 
     if (!genes || genes.length === 0) {
@@ -207,6 +216,9 @@ export class ExpressionMatrixBuilder {
     // Initialize raw matrix (row-major: genes × groups)
     const rawMatrix = new Float32Array(nRows * nCols);
     rawMatrix.fill(NaN);
+
+    const rowsToRead = this._fillKnownMeans(rawMatrix, genes, groups, knownMeans);
+    const genesToRead = rowsToRead.map(row => genes[row]);
 
     // Create streaming loader
     const loader = new StreamingGeneLoader({
@@ -225,24 +237,38 @@ export class ExpressionMatrixBuilder {
           message: `Loading gene ${p.loaded} of ${p.total}`
         });
       } : null,
-      signal
+      signal,
+      owner: readOwner
     });
 
     // Precompute group index arrays for tight loops (avoid repeated property lookups).
     const groupIndices = groups.map((g) => g.cellIndices);
 
     // Stream raw genes and compute per-group means without allocating per-group arrays.
-    for await (const { values, index: geneIdx } of loader.streamGenesRaw(genes)) {
+    // A gene read as its non-zero entries is placed in one reused dense
+    // column (and cleared again after), so its means are the same sums in
+    // the same order as a dense column's.
+    let scratch = null;
+    for await (const { values, index: readIndex } of loader.streamGenesRaw(genesToRead)) {
       if (signal?.aborted) {
         throw new DOMException('Request aborted', 'AbortError');
       }
       // `StreamingGeneLoader.streamGenesRaw()` yields genes in the same order
-      // as the requested `genes` array (index is the request index).
-      if (!Number.isFinite(geneIdx) || geneIdx < 0 || geneIdx >= nRows) continue;
+      // as the requested list (index is the request index).
+      const geneIdx = rowsToRead[readIndex];
+      let column = values;
+      if (!ArrayBuffer.isView(values)) {
+        scratch ??= new Float32Array(values.length);
+        for (let k = 0; k < values.indices.length; k++) scratch[values.indices[k]] = values.values[k];
+        column = scratch;
+      }
 
       // Compute mean expression for each group
       for (let g = 0; g < nCols; g++) {
-        rawMatrix[geneIdx * nCols + g] = this._computeMeanByIndices(values, groupIndices[g]);
+        rawMatrix[geneIdx * nCols + g] = this._computeMeanByIndices(column, groupIndices[g]);
+      }
+      if (column === scratch) {
+        for (let k = 0; k < values.indices.length; k++) scratch[values.indices[k]] = 0;
       }
     }
 
@@ -432,6 +458,49 @@ export class ExpressionMatrixBuilder {
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================
+
+  /**
+   * Fill the rows whose means a marker discovery already computed, and return
+   * the rows left to read.
+   *
+   * @private
+   * @param {Float32Array} rawMatrix
+   * @param {string[]} genes
+   * @param {Object[]} groups
+   * @param {{genes: string[], groupIds: string[], meanInGroupByGroup: Float32Array[]}|null} knownMeans
+   * @returns {number[]}
+   */
+  _fillKnownMeans(rawMatrix, genes, groups, knownMeans) {
+    const allRows = genes.map((_, row) => row);
+    if (knownMeans === null || knownMeans === undefined) return allRows;
+    const { genes: knownGenes, groupIds, meanInGroupByGroup } = knownMeans;
+    if (
+      !Array.isArray(knownGenes) ||
+      !Array.isArray(groupIds) ||
+      !Array.isArray(meanInGroupByGroup) ||
+      meanInGroupByGroup.length !== groupIds.length ||
+      meanInGroupByGroup.some(means => !(means instanceof Float32Array) || means.length !== knownGenes.length)
+    ) {
+      throw new TypeError('[ExpressionMatrixBuilder] knownMeans must hold one Float32Array of gene means per group');
+    }
+    const columnOf = new Map(groupIds.map((groupId, column) => [groupId, column]));
+    const columns = groups.map(group => columnOf.get(group.groupId));
+    if (columns.some(column => column === undefined)) return allRows;
+    const geneRow = new Map(knownGenes.map((gene, row) => [gene, row]));
+    const nCols = groups.length;
+    const rowsToRead = [];
+    for (let row = 0; row < genes.length; row++) {
+      const known = geneRow.get(genes[row]);
+      if (known === undefined) {
+        rowsToRead.push(row);
+        continue;
+      }
+      for (let c = 0; c < nCols; c++) {
+        rawMatrix[row * nCols + c] = meanInGroupByGroup[columns[c]][known];
+      }
+    }
+    return rowsToRead;
+  }
 
   /**
    * Compute mean of finite values

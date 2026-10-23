@@ -41,15 +41,15 @@ Cellucid is split by responsibility:
 |---|---|---|
 | `cellucid` (this repo) | Web app (UI + state + WebGL rendering) | are fixing UI bugs, rendering/performance, figure export, sessions, or community annotation frontend |
 | `cellucid-python` | Python package + CLI + Sphinx docs | are fixing `prepare`/`serve`/`show_anndata`, server endpoints, Jupyter hooks, or documentation site pages |
-| `cellucid-r` | R package exporter | are changing `cellucid_prepare()` / R export format logic |
+| `cellucid-r` | R package writing the same Cellucid-ready AnnData from R | are changing the R writer (`cellucid_prepare()`) or adding R-side docs/tests |
 | `cellucid-annotation` | GitHub repo template for annotation | are changing repo schema/validation/workflows |
 | `cellucid-datasets` | The published demo catalog | are correcting a published generation or its catalog entry |
 | `cellucid-demo-custom-datasets` | Worked example of publishing your own datasets | are changing that guide or its synthetic examples |
 
 If you’re unsure where a bug belongs, open an issue in the repo you’re currently using and include:
 - where the UI ran (hosted app vs local app vs Jupyter iframe),
-- how data was loaded (Prepared, H5AD, Zarr ZIP, remote server, GitHub, or
-  Jupyter),
+- how data was loaded (H5AD, Zarr folder, Zarr ZIP, sample dataset, link,
+  remote server, or Jupyter),
 - and the smallest reproduction you can share.
 
 ---
@@ -141,7 +141,10 @@ High-level map:
   - `app/session/`: `.cellucid-session` save/load bundles
   - `app/ui/modules/figure-export/`: figure export
   - `app/community-annotations/`: GitHub-backed community annotation sync/auth
-- `cellucid/assets/js/data/`: data sources + loaders (exports/h5ad/zarr/remote/github/jupyter)
+- `cellucid/assets/js/data/`: data sources + loaders (AnnData `.h5ad`/Zarr/`.zarr.zip` files, links and catalogs, `cellucid serve`, Jupyter)
+  - `data/anndata/`: the one AnnData reader (elements, data frames, dense and sparse matrices) over any store
+  - `data/sources/`: dataset catalogs (`datasets.json`, `anndata-catalog.js`) and link providers
+- `cellucid/assets/js/formats/`: file-format readers with no Cellucid knowledge — `hdf5/`, `zarr/` (v2 and v3, folder/ZIP/HTTP stores), `zip/`, and `io/` (byte sources, range reads, the decode worker pool)
 - `cellucid/assets/js/rendering/`: WebGL2 viewer + shaders + overlays
 - `cellucid/assets/css/`: design system (tokens/themes/components)
 

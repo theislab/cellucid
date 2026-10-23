@@ -1,0 +1,18 @@
+{
+  "schema": 2,
+  "default": "synthetic-cell-types-2d",
+  "datasets": [
+    {
+      "id": "synthetic-cell-types-2d",
+      "path": "synthetic-cell-types-2d.zarr.zip"
+    },
+    {
+      "id": "synthetic-development-3d",
+      "path": "synthetic-development-3d.zarr.zip"
+    },
+    {
+      "id": "synthetic-trajectory-1d",
+      "path": "synthetic-trajectory-1d.zarr.zip"
+    }
+  ]
+}

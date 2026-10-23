@@ -1,15 +1,16 @@
 import { expect, test } from './helpers/test.mjs';
 
+import { currentUiLike, listCatalogDatasets } from './helpers/catalog-datasets.mjs';
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { WORKER_EXPOSED_RESPONSE_HEADERS } from './helpers/worker-exposed-headers.mjs';
 
 const WORKER_ORIGIN = 'https://worker.example';
-const EXPORTS_ROOT =
-  `${APP_ORIGIN}/tests/browser/fixtures/exports/`;
+const CATALOG_ROOT =
+  `${APP_ORIGIN}/tests/browser/fixtures/catalog/`;
 const AUTH_USER = Object.freeze({ id: 4242, login: 'tester' });
 const AUTH_USER_KEY = `ghid_${AUTH_USER.id}`;
-const FIRST_DATASET_ID = 'current-ui-prepared';
+const FIRST_DATASET_ID = 'current-ui';
 const SECOND_DATASET_ID = 'current-ui-alternate';
 const SECOND_DATASET_NAME = 'Current UI alternate fixture';
 const SECOND_DATASET_OPTION =
@@ -229,7 +230,7 @@ function configDocument() {
     supportedDatasets: [
       {
         datasetId: FIRST_DATASET_ID,
-        name: 'Current UI prepared fixture',
+        name: 'Current UI fixture',
         fieldsToAnnotate: ['cell_type'],
         annotatableSettings: {
           cell_type: { minAnnotators: 1, threshold: 0.5 },
@@ -252,7 +253,7 @@ function configDocument() {
 function configDocumentAtCanonicalBytes(targetBytes) {
   const supportedDatasets = [{
     datasetId: FIRST_DATASET_ID,
-    name: 'Current UI prepared fixture',
+    name: 'Current UI fixture',
     fieldsToAnnotate: ['cell_type'],
     annotatableSettings: {
       cell_type: { minAnnotators: 1, threshold: 0 },
@@ -323,27 +324,27 @@ function configDocumentAtCanonicalBytes(targetBytes) {
   return document;
 }
 
+/** The contributor's file as the repository holds it (version 2). */
 function userDocument() {
   return {
-    version: 1,
+    version: 2,
     username: AUTH_USER_KEY,
     githubUserId: AUTH_USER.id,
     login: AUTH_USER.login,
     displayName: 'Reconnect Tester',
     updatedAt: '2026-07-29T00:00:00.000Z',
-    suggestions: {},
-    votes: {},
+    datasets: {},
   };
 }
 
 function schemaDocument(kind) {
   const ids = {
     user:
-      'https://cellucid.com/contracts/community-annotation/user-v1.schema.json',
+      'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
     config:
       'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
     merges:
-      'https://cellucid.com/contracts/community-annotation/merges-v1.schema.json',
+      'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
   };
   return {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -547,7 +548,7 @@ async function installGitHubApi(
       contentPath === 'annotations/moderation/merges.json'
     ) {
       document = {
-        version: 1,
+        version: 2,
         updatedAt: '2026-07-29T00:00:00.000Z',
         merges: [],
       };
@@ -564,90 +565,30 @@ async function installGitHubApi(
   return requests;
 }
 
-async function installAlternatePreparedDataset(page) {
-  await page.route(
-    '**/tests/browser/fixtures/exports/datasets.json',
-    async route => {
-      const response = await route.fetch();
-      const catalog = await response.json();
-      const source = catalog.datasets.find(
-        dataset => dataset.id === FIRST_DATASET_ID,
-      );
-      if (source === undefined) {
-        throw new Error('Prepared fixture is missing from its dataset catalog.');
-      }
-      catalog.datasets.push({
-        ...source,
-        id: SECOND_DATASET_ID,
-        name: SECOND_DATASET_NAME,
-        path: `${SECOND_DATASET_ID}/`,
-      });
-      await route.fulfill({ response, json: catalog });
-    },
-  );
-
-  await page.route(
-    `**/tests/browser/fixtures/exports/${SECOND_DATASET_ID}/**`,
-    async route => {
-      const alternateUrl = new URL(route.request().url());
-      const preparedUrl = new URL(alternateUrl);
-      const alternatePrefix =
-        `/tests/browser/fixtures/exports/${SECOND_DATASET_ID}/`;
-      preparedUrl.pathname =
-        `/tests/browser/fixtures/exports/${FIRST_DATASET_ID}/` +
-        alternateUrl.pathname.slice(alternatePrefix.length);
-      const response = await route.fetch({ url: preparedUrl.href });
-      if (alternateUrl.pathname.endsWith('/dataset_identity.json')) {
-        const identity = await response.json();
-        identity.id = SECOND_DATASET_ID;
-        identity.name = SECOND_DATASET_NAME;
-        await route.fulfill({ response, json: identity });
-        return;
-      }
-      await route.fulfill({ response });
-    },
-  );
+async function installAlternateDataset(page) {
+  await listCatalogDatasets(page, [{
+    id: SECOND_DATASET_ID,
+    bytes: currentUiLike({ id: SECOND_DATASET_ID, name: SECOND_DATASET_NAME }),
+  }]);
 }
 
-async function installPrototypeNamedPreparedField(page) {
-  await page.route(
-    '**/current-ui-prepared/dataset_identity.json',
-    async route => {
-      const response = await route.fetch();
-      const identity = await response.json();
-      const categorical = identity.obs_fields.find(
-        field => field.key === 'cell_type',
-      );
-      if (categorical === undefined) {
-        throw new Error('Prepared fixture is missing its categorical field.');
-      }
-      categorical.key = '__proto__';
-      await route.fulfill({ response, json: identity });
-    },
-  );
-  await page.route(
-    '**/current-ui-prepared/obs_manifest.json',
-    async route => {
-      const response = await route.fetch();
-      const manifest = await response.json();
-      const categorical = manifest._categoricalFields.find(
-        field => field[1] === 'cell_type',
-      );
-      if (categorical === undefined) {
-        throw new Error('Prepared manifest is missing its categorical field.');
-      }
-      // A field name is no longer part of any path, so renaming it to a
-      // prototype key leaves the payload where the manifest's index says.
-      categorical[1] = '__proto__';
-      await route.fulfill({ response, json: manifest });
-    },
-  );
+/** The catalog's `current-ui`, with its categorical field named `__proto__`. */
+async function installPrototypeNamedField(page) {
+  await listCatalogDatasets(page, [{
+    id: FIRST_DATASET_ID,
+    path: 'current-ui-prototype-field.zarr.zip',
+    bytes: currentUiLike({
+      id: FIRST_DATASET_ID,
+      name: 'Current UI fixture',
+      fieldKey: '__proto__',
+    }),
+  }], { withCurrentUi: false });
 }
 
 function deepLink(repo = FIRST_REPO, { includeBranch = true } = {}) {
   const annotationReference = includeBranch ? `${repo}@main` : repo;
   return (
-    `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
     `&dataset=${encodeURIComponent(FIRST_DATASET_ID)}` +
     `&annotations=${encodeURIComponent(annotationReference)}` +
     '&acceptance=community-annotation-startup-lifecycle'
@@ -696,7 +637,7 @@ async function runtimeSnapshot(page) {
       reposByDataset: auth.isAuthenticated()
         ? {
             first: getAnnotationRepoForDataset(
-              'current-ui-prepared',
+              'current-ui',
               `ghid_${auth.getUser().id}`,
             ),
             second: getAnnotationRepoForDataset(
@@ -711,24 +652,24 @@ async function runtimeSnapshot(page) {
   });
 }
 
-async function openPreparedDeepLink(page) {
+async function openCatalogDeepLink(page) {
   await page.goto(deepLink(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
-async function openPreparedWithoutAnnotationRepo(page) {
+async function openCatalogWithoutAnnotationRepo(page) {
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
       `&dataset=${encodeURIComponent(FIRST_DATASET_ID)}` +
       '&acceptance=community-annotation-github-discovery-lifecycle',
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
@@ -841,7 +782,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
       paths.merges,
       {
         text: `${JSON.stringify({
-          version: 1,
+          version: 2,
           updatedAt: '2026-07-29T00:00:00.000Z',
           merges: [],
         }, null, 2)}\n`,
@@ -889,7 +830,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
     },
   );
 
-  await openPreparedDeepLink(page);
+  await openCatalogDeepLink(page);
   await expect.poll(() => runtimeSnapshot(page), {
     timeout: 10_000,
   }).toMatchObject({
@@ -899,7 +840,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
   });
 
   const exactDocuments = await page.evaluate(
-    async ({ login, userId, userKey }) => {
+    async ({ datasetId, login, userId, userKey }) => {
       const { getCommunityAnnotationSession } =
         await import('/assets/js/app/community-annotations/session.js');
       const session = getCommunityAnnotationSession();
@@ -931,9 +872,16 @@ async function runExactAuthorBaselineLifecycle(page, target) {
         JSON.parse(JSON.stringify(user));
       session.buildModerationMergesDocument = () =>
         JSON.parse(JSON.stringify(merges));
-      return { merges, user };
+      // The repository holds the files the views publish as.
+      const { composeMergesFile, composeUserFile } =
+        await import('/assets/js/app/community-annotations/wire-contract.js');
+      return {
+        merges: composeMergesFile(null, datasetId, merges),
+        user: composeUserFile(null, datasetId, user),
+      };
     },
     {
+      datasetId: FIRST_DATASET_ID,
       login: AUTH_USER.login,
       userId: AUTH_USER.id,
       userKey: AUTH_USER_KEY,
@@ -1041,7 +989,7 @@ test(
       };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await repoRequested.promise;
 
     try {
@@ -1117,7 +1065,7 @@ test(
       });
     });
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const startingUrl = page.url();
     const modal = await openGitHubSetupFromMainControls(page);
     await modal.getByRole('button', {
@@ -1205,7 +1153,7 @@ test(
       });
     });
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     await expect(
       page.locator('.notification-error').last()
     ).toContainText(
@@ -1276,7 +1224,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const modal = await openGitHubSetupFromMainControls(page);
     await installationEntered.promise;
     await modal.evaluate(overlay => {
@@ -1325,7 +1273,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    await installAlternatePreparedDataset(page);
+    await installAlternateDataset(page);
     const installationEntered = deferred();
     const releaseInstallation = deferred();
     let repositoryRequests = 0;
@@ -1357,7 +1305,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const modal = await openGitHubSetupFromMainControls(page);
     await installationEntered.promise;
     const requestFailed = waitForWorkerRequestFailure(page, {
@@ -1437,7 +1385,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     await page.evaluate(async datasetId => {
       const { initCommunityAnnotationControls } = await import(
         '/assets/js/app/ui/modules/community-annotation-controls.js'
@@ -1453,7 +1401,7 @@ test(
         },
         dom: { container },
         dataSourceManager: {
-          getCurrentDatasetId() {
+          getCurrentIdentityId() {
             return datasetId;
           },
           onDatasetChange() {},
@@ -1580,7 +1528,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const modal = await openGitHubSetupFromMainControls(page);
     const step2Grid = modal.locator(
       '[aria-label="Available annotation repositories"]'
@@ -1760,7 +1708,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const modal = await openGitHubSetupFromMainControls(page);
     const status = modal.locator(
       '.community-annotation-wizard-status'
@@ -1788,7 +1736,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     await page.evaluate(async () => {
       const { getGitHubAuthSession } = await import(
         '/assets/js/app/community-annotations/github-auth.js'
@@ -1905,7 +1853,7 @@ test(
       },
     );
 
-    await openPreparedWithoutAnnotationRepo(page);
+    await openCatalogWithoutAnnotationRepo(page);
     const modal = await openGitHubSetupFromMainControls(page);
     const status = modal.getByRole('status');
     await expect(status).toContainText(
@@ -1948,7 +1896,7 @@ test(
       };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(1);
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
@@ -1994,14 +1942,14 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await page.goto(
-      `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
+      `/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
         `&dataset=${encodeURIComponent(FIRST_DATASET_ID)}` +
         '&acceptance=community-annotation-destroy-dataset-owner',
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
 
     const result = await page.evaluate(async ({
@@ -2021,7 +1969,7 @@ test(
       let onCalls = 0;
       let offCalls = 0;
       const manager = {
-        getCurrentDatasetId() {
+        getCurrentIdentityId() {
           return currentDatasetId;
         },
         onDatasetChange(listener) {
@@ -2106,7 +2054,7 @@ test(
       },
     }));
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
@@ -2176,7 +2124,7 @@ test(
     await installGitHubApi(page, async fullName => ({
       body: repoInfo(fullName, { author: true }),
     }));
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2404,7 +2352,7 @@ test(
         });
       },
     );
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2570,7 +2518,7 @@ test(
       body: repoInfo(fullName, { author: true }),
     }));
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -2677,7 +2625,7 @@ test(
       return { body: repoInfo(fullName, { author: true }) };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -2762,7 +2710,7 @@ test(
       body: repoInfo(fullName, { author: true }),
     }));
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -2932,7 +2880,7 @@ test(
       const listeners = new Set();
       const dataSourceManager = {
         currentDatasetId: firstDataset,
-        getCurrentDatasetId() {
+        getCurrentIdentityId() {
           return this.currentDatasetId;
         },
         onDatasetChange(listener) {
@@ -3079,7 +3027,7 @@ test(
       };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
     );
@@ -3209,7 +3157,7 @@ test(
       };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await firstRequestEntered.promise;
     await page.evaluate(() => window.dispatchEvent(new Event('online')));
     await settleBrowserContinuations(page);
@@ -3238,7 +3186,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    await installAlternatePreparedDataset(page);
+    await installAlternateDataset(page);
     const releaseFirstRepo = deferred();
     const requestedRepos = [];
     await installGitHubApi(page, async fullName => {
@@ -3257,7 +3205,7 @@ test(
       throw new Error(`Unexpected repository request: ${fullName}`);
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(
       () => requestedRepos,
       { timeout: 10_000 },
@@ -3310,12 +3258,12 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    await installAlternatePreparedDataset(page);
+    await installAlternateDataset(page);
     await installGitHubApi(page, async fullName => ({
       body: repoInfo(fullName, { author: true }),
     }));
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: FIRST_DATASET_ID,
@@ -3438,7 +3386,7 @@ test(
       supportedDatasets: [
         {
           datasetId: FIRST_DATASET_ID,
-          name: 'Current UI prepared fixture',
+          name: 'Current UI fixture',
           fieldsToAnnotate: ['__proto__'],
           annotatableSettings: prototypeSettings,
           closedFields: [],
@@ -3446,7 +3394,7 @@ test(
       ],
     };
     await installStoredAuthentication(page);
-    await installPrototypeNamedPreparedField(page);
+    await installPrototypeNamedField(page);
     await installGitHubApi(
       page,
       async fullName => ({
@@ -3464,7 +3412,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: FIRST_DATASET_ID,
@@ -3631,7 +3579,7 @@ test(
       };
     });
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(
       () => repoRequested,
       { timeout: 10_000 },
@@ -3708,7 +3656,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
@@ -3800,7 +3748,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
@@ -3880,7 +3828,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
@@ -3888,7 +3836,7 @@ test(
     });
 
     const exactDocument = await page.evaluate(
-      async ({ login, userId, userKey }) => {
+      async ({ datasetId, login, userId, userKey }) => {
         const { getCommunityAnnotationSession } =
           await import('/assets/js/app/community-annotations/session.js');
         const session = getCommunityAnnotationSession();
@@ -3906,9 +3854,13 @@ test(
         });
         session.buildUserFileDocument = () =>
           JSON.parse(JSON.stringify(document));
-        return document;
+        // The repository holds the file the view publishes as.
+        const { composeUserFile } =
+          await import('/assets/js/app/community-annotations/wire-contract.js');
+        return composeUserFile(null, datasetId, document);
       },
       {
+        datasetId: FIRST_DATASET_ID,
         login: AUTH_USER.login,
         userId: AUTH_USER.id,
         userKey: AUTH_USER_KEY,
@@ -4028,7 +3980,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -4111,7 +4063,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -4195,7 +4147,7 @@ test(
       },
     );
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -4234,7 +4186,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    await installAlternatePreparedDataset(page);
+    await installAlternateDataset(page);
     const releaseDefaultBranch = deferred();
     let firstRepoRequestCount = 0;
     await installGitHubApi(page, async fullName => {
@@ -4260,7 +4212,7 @@ test(
     });
     await dismissWelcome(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect.poll(
       () => firstRepoRequestCount,
@@ -4316,7 +4268,7 @@ test(
       body: repoInfo(fullName, { author: true }),
     }));
 
-    await openPreparedDeepLink(page);
+    await openCatalogDeepLink(page);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -4410,7 +4362,7 @@ test(
       '&payload=cellucid_github_token%3Dnot-a-field';
     const cleanedHash = `#${retainedBefore}&${retainedAfter}`;
     const callbackBase =
-      `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
+      `/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
       `&dataset=${encodeURIComponent(FIRST_DATASET_ID)}` +
       '&acceptance=community-annotation-auth-callback';
     const startupOwned =
@@ -4422,7 +4374,7 @@ test(
     );
     await dismissWelcome(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect.poll(
       () => page.evaluate(() => window.location.hash),
@@ -4573,7 +4525,7 @@ test(
     expect(emptyComponent).toEqual({
       hash: '',
       href:
-        `${APP_ORIGIN}/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
+        `${APP_ORIGIN}/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
         `&dataset=${encodeURIComponent(FIRST_DATASET_ID)}` +
         '&acceptance=community-annotation-auth-callback#',
       historyState: { marker: 'empty-component' },

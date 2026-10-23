@@ -8,16 +8,16 @@
  * follows panes in a grid; and on a touch screen it answers a held press.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
-const DATASET_URL = `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
 }

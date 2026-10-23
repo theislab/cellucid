@@ -169,7 +169,7 @@ test('main benchmark panel consumes exact renderer memory and labels only the pr
     'function formatBenchmarkGpuMemory',
   );
   const helperEnd = mainSource.indexOf(
-    '// Default export base URL',
+    '// The base URL of the dataset shown',
     helperStart,
   );
   assert.ok(helperStart >= 0 && helperEnd > helperStart);

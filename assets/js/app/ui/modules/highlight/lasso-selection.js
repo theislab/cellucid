@@ -186,12 +186,14 @@ export function initLassoSelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after drawing reads as a broken control.
     pushHistoryStep(selectionState, 'lassoHistory', {
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
     selectionState.lassoRedoStack = [];
 
-    selectionState.lastLassoCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastLassoCandidates = stepEvent.candidates;
     selectionState.lastLassoStep = stepEvent.step;
 
     updateLassoUI(stepEvent);
@@ -208,7 +210,7 @@ export function initLassoSelection(options) {
     if (selectionState.lassoHistory.length === 0) return;
 
     selectionState.lassoRedoStack.push({
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
 
@@ -236,7 +238,7 @@ export function initLassoSelection(options) {
     if (selectionState.lassoRedoStack.length === 0) return;
 
     selectionState.lassoHistory.push({
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
 
@@ -399,7 +401,7 @@ export function initLassoSelection(options) {
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
     selectionState.lastLassoCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastLassoStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

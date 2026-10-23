@@ -799,9 +799,10 @@ export function ascendingOrder(values) {
 
 /**
  * Largest number of distinct values a rank kernel will tabulate before it
- * switches to sorting. Prepared exports quantize expression to 8 bits, so a
- * gene carries at most 256 distinct values across half a million cells and the
- * tabulated form is exact and far cheaper than any sort. `data-worker.js` bounds
+ * switches to sorting. Count-derived expression (raw counts, or normalised
+ * counts of a sparse matrix) carries few distinct values per gene even across
+ * half a million cells, and there the tabulated form is exact and far cheaper
+ * than any sort. `data-worker.js` bounds
  * its own per-value marker tabulation with the same constant.
  */
 export const MAX_TABULATED_DISTINCT_VALUES = 4096;
@@ -827,8 +828,22 @@ export class DistinctValueIndex {
   constructor() {
     this._keys = new Float64Array(DISTINCT_INDEX_SLOTS);
     this._numbers = new Int32Array(DISTINCT_INDEX_SLOTS).fill(-1);
+    /** The slot each number occupies, so `clear` touches only used slots. */
+    this._slots = new Uint16Array(MAX_TABULATED_DISTINCT_VALUES);
     /** Distinct values by number, in first-seen order. */
     this.values = new Float64Array(MAX_TABULATED_DISTINCT_VALUES);
+    this.size = 0;
+  }
+
+  /**
+   * Forget every value, in time proportional to how many were numbered: a
+   * kernel that tabulates a handful of values per gene reuses one index
+   * instead of allocating and clearing its 8,192 slots for every gene.
+   */
+  clear() {
+    const numbers = this._numbers;
+    const slots = this._slots;
+    for (let number = 0; number < this.size; number++) numbers[slots[number]] = -1;
     this.size = 0;
   }
 
@@ -853,6 +868,7 @@ export class DistinctValueIndex {
         const assigned = this.size++;
         keys[slot] = value;
         numbers[slot] = assigned;
+        this._slots[assigned] = slot;
         this.values[assigned] = value;
         return assigned;
       }
@@ -1032,7 +1048,7 @@ export function medianInPlace(values, count) {
  * Compute ranks with proper handling of ties (average rank method).
  *
  * @param {ArrayLike<number>} values - Finite values to rank
- * @returns {number[]} Array of ranks (1-based, fractional for ties)
+ * @returns {Float64Array} Ranks (1-based, fractional for ties)
  */
 export function computeRanks(values) {
   return computeRanksWithTies(values).ranks;
@@ -1055,11 +1071,11 @@ export function computeRanks(values) {
  * Values must be finite. -0 and +0 are one tied value, as `===` has them.
  *
  * @param {ArrayLike<number>} values
- * @returns {{ranks: number[], tieTerm: number}}
+ * @returns {{ranks: Float64Array, tieTerm: number}}
  */
 export function computeRanksWithTies(values) {
   const n = values.length;
-  if (n === 0) return { ranks: [], tieTerm: 0 };
+  if (n === 0) return { ranks: new Float64Array(0), tieTerm: 0 };
 
   const tabulated = tabulateValueNumbers(values);
   if (tabulated !== null) {
@@ -1073,7 +1089,7 @@ export function computeRanksWithTies(values) {
       averageRank[number] = ranked + (count + 1) / 2;
       ranked += count;
     }
-    const ranks = new Array(n);
+    const ranks = new Float64Array(n);
     for (let i = 0; i < n; i++) ranks[i] = averageRank[numbers[i]];
     // Value numbers are assigned in first-occurrence order.
     let tieTerm = 0;
@@ -1088,7 +1104,7 @@ export function computeRanksWithTies(values) {
   // linear-time ascending permutation. Equal values (including -0 and +0,
   // which the order places next to each other) form one block.
   const order = ascendingOrder(values);
-  const ranks = new Array(n);
+  const ranks = new Float64Array(n);
   /** First occurrence and size of every block of two or more equal values. */
   const blockFirst = [];
   const blockSize = [];
@@ -1236,7 +1252,7 @@ export function mannWhitneyPValue(n1, n2, statistic, options = {}) {
  * IEEE-754 doubles because rank blocks are integers or exact halves and the
  * products and sums stay far below 2^53 for any dataset that fits in memory.
  */
-class TwoSampleRankSum {
+export class TwoSampleRankSum {
   constructor() {
     this.rankSumA = 0;
     this.tieTerm = 0;

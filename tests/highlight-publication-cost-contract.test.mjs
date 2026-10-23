@@ -319,7 +319,7 @@ test('the visible-cell predicate is exactly the published R8 byte', () => {
 test('a no-op filter change uploads zero highlight bytes through the composed path', () => {
   const { renderer } = makeHighPerfRenderer();
   const fixture = makeFixture();
-  const cellIndices = Array.from({ length: 16 }, (_, index) => index * 3);
+  const cellIndices = Uint32Array.from({ length: 16 }, (_, index) => index * 3);
   fixture.state.addHighlightDirect({
     cellIndices,
     label: 'selection',
@@ -392,47 +392,44 @@ test('the live transparency publication gates the highlight invalidation', async
 
 // --- CEL-0143: how many times a selection may be walked and copied ----------
 
-test('a direct highlight reads the caller selection exactly once per cell', () => {
+test('a direct highlight takes a cell list and owns a copy of it', () => {
   const fixture = makeFixture();
-  const cells = [11, 2, 40, 2, 7];
-  let elementReads = 0;
-  const counted = new Proxy(cells, {
-    get(target, property, receiver) {
-      if (typeof property === 'string' && /^\d+$/.test(property)) {
-        elementReads += 1;
-      }
-      return Reflect.get(target, property, receiver);
-    },
-  });
+  const cells = Uint32Array.of(2, 7, 11, 40);
 
   fixture.state.addHighlightDirect({
-    cellIndices: counted,
+    cellIndices: cells,
     label: 'selection',
     type: 'lasso',
   });
 
-  assert.equal(
-    elementReads,
-    cells.length,
-    'validation and the copy must be the same pass over the selection'
-  );
   const [group] = fixture.page.highlightedGroups;
   assert.ok(
     group.cellIndices instanceof Uint32Array,
     'the group owns its cells as a Uint32Array'
   );
-  assert.deepEqual([...group.cellIndices], cells);
+  assert.deepEqual([...group.cellIndices], [...cells]);
   assert.notEqual(
     group.cellIndices,
-    counted,
+    cells,
     'the group must not alias the caller selection'
   );
+  // A selection is one form only: an ascending Uint32Array (unique by order).
+  for (const malformed of [[2, 7], Uint32Array.of(7, 2), Uint32Array.of(2, 2)]) {
+    assert.throws(
+      () => fixture.state.addHighlightDirect({
+        cellIndices: malformed,
+        label: 'malformed',
+        type: 'lasso',
+      }),
+      /Direct highlight cellIndices must/,
+    );
+  }
 });
 
 test('the packed highlight buffer is never copied on the way to the renderer', () => {
   const fixture = makeFixture();
   fixture.state.addHighlightDirect({
-    cellIndices: [5, 1, 9],
+    cellIndices: Uint32Array.of(1, 5, 9),
     label: 'selection',
     type: 'lasso',
   });
@@ -455,12 +452,8 @@ test('the packed bytes match an independent reference for every selection shape'
     { name: 'sparse', groups: [[2, 17, 33, 61]] },
     { name: 'dense', groups: [Array.from({ length: 32 }, (_, i) => i * 2)] },
     { name: 'all', groups: [Array.from({ length: POINT_COUNT }, (_, i) => i)] },
-    { name: 'out of order', groups: [[61, 2, 33, 17]] },
-    { name: 'duplicated across groups', groups: [[1, 2, 3], [3, 2, 8]] },
-    {
-      name: 'reversed',
-      groups: [Array.from({ length: POINT_COUNT }, (_, i) => POINT_COUNT - 1 - i)],
-    },
+    { name: 'duplicated across groups', groups: [[1, 2, 3], [2, 3, 8]] },
+    { name: 'later group before earlier', groups: [[40, 61], [2, 17, 40]] },
   ];
 
   for (const shape of shapes) {
@@ -471,7 +464,7 @@ test('the packed bytes match an independent reference for every selection shape'
     }
     for (const cellIndices of shape.groups) {
       fixture.state.addHighlightDirect({
-        cellIndices,
+        cellIndices: Uint32Array.from(cellIndices),
         label: `group for ${shape.name}`,
         type: 'lasso',
       });
@@ -524,11 +517,11 @@ test('an empty page publishes an empty list and no buffer', () => {
 test('a preview unions the active page with the in-progress selection in one buffer', () => {
   const fixture = makeFixture();
   fixture.state.addHighlightDirect({
-    cellIndices: [4, 5],
+    cellIndices: Uint32Array.of(4, 5),
     label: 'committed',
     type: 'lasso',
   });
-  fixture.state.setPreviewHighlightFromIndices([5, 12, 4, 30]);
+  fixture.state.setPreviewHighlightFromIndices(Uint32Array.of(4, 5, 12, 30));
 
   const published = fixture.state._highlightedCellIndices;
   assert.ok(published instanceof Uint32Array);
@@ -581,7 +574,7 @@ test('a group inventory that outgrows its sizing pass fails loudly', () => {
   // The output buffer is sized from the group lengths, then filled. A silent
   // out-of-range typed-array write would paint cells the published list omits.
   const fixture = makeFixture();
-  const growing = [1, 2, 3];
+  const growing = Uint32Array.of(1, 2, 3);
   let capacityReads = 0;
   fixture.page.highlightedGroups.push({
     id: 'highlight_1',
@@ -591,7 +584,7 @@ test('a group inventory that outgrows its sizing pass fails loudly', () => {
     cellCount: 3,
     get cellIndices() {
       capacityReads += 1;
-      return capacityReads === 1 ? growing : [1, 2, 3, 4, 5, 6];
+      return capacityReads === 1 ? growing : Uint32Array.of(1, 2, 3, 4, 5, 6);
     },
   });
 
@@ -615,12 +608,12 @@ test('a preview union that outgrows its sizing pass fails loudly', () => {
     cellCount: 1,
     get cellIndices() {
       capacityReads += 1;
-      return capacityReads === 1 ? [1] : [1, 2];
+      return capacityReads === 1 ? Uint32Array.of(1) : Uint32Array.of(1, 2);
     },
   });
 
   assert.throws(
-    () => fixture.state.setPreviewHighlightFromIndices([9]),
+    () => fixture.state.setPreviewHighlightFromIndices(Uint32Array.of(9)),
     /Preview highlight produced more cells than its 2-entry buffer holds/,
   );
 });
@@ -636,7 +629,7 @@ test('reported GPU memory includes the per-view highlight buffers', () => {
 
   const before = renderer._refreshGpuMemoryStats();
 
-  const cellIndices = Array.from({ length: 12 }, (_, index) => index * 2);
+  const cellIndices = Uint32Array.from({ length: 12 }, (_, index) => index * 2);
   fixture.state.addHighlightDirect({
     cellIndices,
     label: 'selection',

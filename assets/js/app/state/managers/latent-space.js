@@ -5,35 +5,32 @@
  *
  * Cells, colours, category filters and every view's outlier threshold are
  * kept: a threshold is a share of a category ("hide the farthest 5%"), so it
- * means the same in the new space. What changes:
- * - every categorical field's descriptor names the new outlier payload (or
- *   none), so a field loaded later reads it;
- * - a field already loaded gets the new quantiles, read before anything
- *   changes, in every view; with no latent space it has none, and its
- *   outlier filter goes away;
- * - every view coloured by a categorical field is recoloured, so its outlier
- *   filter applies the new quantiles at once, and `latent-space:changed`
- *   tells the interface to show or hide outlier controls.
+ * means the same in the new space. Applying reads nothing — getting outlier
+ * quantiles is its own operation, with progress and Cancel
+ * (`outlier-quantiles.js`). What changes:
+ * - every categorical field's descriptor names the new outlier route (or
+ *   none), so its quantiles are got in the new space;
+ * - every loaded field drops the quantiles of the old space, in every view
+ *   and in the field cache; a field whose outlier filter is in use (a
+ *   threshold below 1 in some view) gets the new ones at once
+ *   (`resumeOutlierFilters`), the others on the filter's next use; with no
+ *   latent space a field has none, and its outlier filter waits for one;
+ * - every view coloured by a categorical field is recoloured, and
+ *   `latent-space:changed` tells the interface to redraw the outlier
+ *   controls.
  *
  * @module state/managers/latent-space
  */
 
 import { getFieldRegistry } from '../../utils/field-registry.js';
 
-const OUTLIER_BOUNDS = Object.freeze(['outlierMinValue', 'outlierMaxValue']);
-
 function isCategoricalDescriptor(descriptor) {
   return descriptor !== null && descriptor !== undefined && descriptor.kind === 'category';
 }
 
-/** A categorical descriptor naming another outlier payload, frozen. */
+/** A categorical descriptor naming another outlier route, frozen. */
 function withOutlierPath(descriptor, path) {
-  const next = { ...descriptor };
-  for (const key of OUTLIER_BOUNDS) delete next[key];
-  next.outlierQuantilesPath = path;
-  next.outlierDtype = path === null ? null : 'float32';
-  next.outlierQuantized = false;
-  return Object.freeze(next);
+  return Object.freeze({ ...descriptor, outlierQuantilesPath: path });
 }
 
 export class DataStateLatentSpaceMethods {
@@ -53,23 +50,21 @@ export class DataStateLatentSpaceMethods {
   }
 
   /**
-   * Read what a new latent space gives the categorical fields that need it
-   * now, and return the steps that publish it and restore the current one.
+   * The steps that publish a new latent space and restore the current one.
+   * Nothing is read: fields whose outlier filter is in use get their new
+   * quantiles after the commit, each as a job with progress and Cancel.
    *
-   * @param {{
-   *   outlierPathFor: (payloadIndex: number) => string|null,
-   *   loadOutliers: (descriptor: Object) => Promise<Float32Array>
-   * }} latent - The outlier payload of each categorical field in the new
-   *   latent space (null for none), and the reader of one descriptor's payload.
+   * @param {{outlierPathFor: (fieldIndex: number) => string|null}} latent -
+   *   The outlier route of each categorical field in the new latent space
+   *   (null for none).
    * @returns {Promise<{commit: () => void, rollback: () => void}>}
    */
-  async stageLatentReplacement({ outlierPathFor, loadOutliers }) {
-    if (typeof outlierPathFor !== 'function' || typeof loadOutliers !== 'function') {
-      throw new TypeError('A latent space requires its outlier paths and their reader.');
+  async stageLatentReplacement({ outlierPathFor }) {
+    if (typeof outlierPathFor !== 'function') {
+      throw new TypeError('A latent space requires the outlier route of each categorical field.');
     }
-    // A categorical field still loading reads the descriptor it started
-    // with, so it would land without the new space's quantiles: let every
-    // such load finish first, and treat its field as loaded.
+    // A categorical field still loading adopts the descriptor it started
+    // with: let every such load finish first.
     const loading = [];
     for (const fields of this._everyObsFieldList()) {
       for (const field of fields) {
@@ -81,39 +76,18 @@ export class DataStateLatentSpaceMethods {
     const descriptors = this._obsFieldDescriptors ?? [];
     const next = descriptors.map(descriptor => (
       isCategoricalDescriptor(descriptor)
-        ? withOutlierPath(descriptor, outlierPathFor(descriptor.payloadIndex))
+        ? withOutlierPath(descriptor, outlierPathFor(descriptor.fieldIndex))
         : descriptor
     ));
-
-    // The fields loaded in any view are read now; every other field reads
-    // its new payload when it is first loaded.
-    // A field's arrays are the same in every view that loaded it, so its
-    // previous quantiles are kept by position.
-    const loaded = new Map();
+    // Each view's copy of each categorical field, with the quantiles it holds now.
+    const held = [];
     for (const fields of this._everyObsFieldList()) {
       fields.forEach((field, index) => {
-        if (field?.loaded === true && isCategoricalDescriptor(next[index]) && !loaded.has(index)) {
-          loaded.set(index, field.outlierQuantiles);
+        if (field?.loaded === true && isCategoricalDescriptor(next[index])) {
+          held.push({ field, quantiles: field.outlierQuantiles });
         }
       });
     }
-    const staged = new Map();
-    const reads = [...loaded.keys()].filter(index => next[index].outlierQuantilesPath !== null);
-    // A latent space no loaded field needs yet is still read and checked
-    // once, through the first categorical field, so a broken one is refused
-    // now and not when a field is first coloured.
-    const check = reads.length === 0
-      ? next.findIndex(descriptor => isCategoricalDescriptor(descriptor) && descriptor.outlierQuantilesPath !== null)
-      : -1;
-    for (const index of reads) {
-      const quantiles = await loadOutliers(next[index]);
-      if (!(quantiles instanceof Float32Array) || quantiles.length !== this.pointCount) {
-        throw new Error(`Outlier quantiles of "${next[index].key}" did not load one value per cell.`);
-      }
-      staged.set(index, quantiles);
-    }
-    if (check >= 0) await loadOutliers(next[check]);
-
     // Cache entries are keyed as field/loading.js keys them.
     const indexByCacheKey = new Map();
     (this.obsData?.fields ?? []).forEach((field, index) => {
@@ -122,25 +96,25 @@ export class DataStateLatentSpaceMethods {
     const categoricalEntries = () => [...this._fieldDataCache].filter(
       ([key]) => isCategoricalDescriptor(next[indexByCacheKey.get(key)])
     );
-    const previous = { descriptors, cache: categoricalEntries() };
+    const previousCache = categoricalEntries();
 
-    const publish = (nextDescriptors, quantilesOf, cacheEntryOf) => {
-      this._obsFieldDescriptors = Object.freeze([...nextDescriptors]);
-      for (const fields of this._everyObsFieldList()) {
-        fields.forEach((field, index) => {
-          if (!loaded.has(index) || field?.loaded !== true) return;
-          const quantiles = quantilesOf(index);
-          if (quantiles === undefined) delete field.outlierQuantiles;
-          else field.outlierQuantiles = quantiles;
-        });
+    const publish = (nextDescriptors, restore) => {
+      // Jobs of the space being left end; their fields' thresholds stay.
+      for (let index = 0; index < descriptors.length; index++) {
+        if (isCategoricalDescriptor(descriptors[index])) this.cancelOutlierQuantiles(index);
       }
-      // A categorical cache entry carries the outliers of the latent space it
-      // was read in: it is replaced, or dropped so the field reads its new
-      // payload when it is loaded again.
-      for (const [key, entry] of categoricalEntries()) {
-        const replacement = cacheEntryOf(key, entry);
-        if (replacement === null) this._fieldDataCache.delete(key);
-        else this._fieldDataCache.set(key, replacement);
+      this._obsFieldDescriptors = Object.freeze([...nextDescriptors]);
+      for (const { field, quantiles } of held) {
+        if (restore && quantiles !== undefined) field.outlierQuantiles = quantiles;
+        else delete field.outlierQuantiles;
+      }
+      for (const [key, entry] of restore ? previousCache : categoricalEntries()) {
+        if (restore) {
+          this._fieldDataCache.set(key, entry);
+        } else if (entry.outlierQuantiles !== undefined) {
+          const { outlierQuantiles: _dropped, ...rest } = entry;
+          this._fieldDataCache.set(key, rest);
+        }
       }
       this._recolourCategoricalViews();
       this.emit('latent-space:changed', {});
@@ -148,24 +122,10 @@ export class DataStateLatentSpaceMethods {
 
     return {
       commit: () => {
-        publish(
-          next,
-          index => staged.get(index),
-          (key, entry) => {
-            const index = indexByCacheKey.get(key);
-            return loaded.has(index) ? { ...entry, outlierQuantiles: staged.get(index) } : null;
-          }
-        );
+        publish(next, false);
+        this.resumeOutlierFilters();
       },
-      rollback: () => {
-        const restoredCache = new Map(previous.cache);
-        publish(
-          previous.descriptors,
-          index => loaded.get(index),
-          key => restoredCache.get(key) ?? null
-        );
-        for (const [key, entry] of restoredCache) this._fieldDataCache.set(key, entry);
-      },
+      rollback: () => publish(descriptors, true),
     };
   }
 

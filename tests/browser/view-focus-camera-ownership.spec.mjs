@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=view-focus-camera-ownership`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=view-focus-camera-ownership`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -27,7 +27,7 @@ async function openTwoUnlockedPanes(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
   await page.locator('#camera-lock-btn').click();

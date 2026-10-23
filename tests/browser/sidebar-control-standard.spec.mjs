@@ -12,18 +12,18 @@
  * No pixel snapshots: each check reads computed styles, ARIA and DOM writes.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=sidebar-control-standard-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=sidebar-control-standard-ci';
 
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);

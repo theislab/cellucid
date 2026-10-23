@@ -43,8 +43,9 @@ function cachedSamples(pageData, nbins) {
  *
  * @param {Object[]} pageData
  * @param {number} nbins
+ * @param {AbortSignal|null} [signal] - Cancels the worker task
  */
-async function ensureHistogramSamples(pageData, nbins) {
+async function ensureHistogramSamples(pageData, nbins, signal = null) {
   if (pageData.length === 0 || cachedSamples(pageData, nbins) !== null) return;
   let total = 0;
   for (const pd of pageData) total += pd.values.length;
@@ -57,7 +58,7 @@ async function ensureHistogramSamples(pageData, nbins) {
       pages: pageData.map(pd => (ArrayBuffer.isView(pd.values) ? pd.values : Float64Array.from(pd.values))),
       nbins
     },
-    { transfer: false }
+    { transfer: false, signal }
   );
   pageData.forEach((pd, index) => {
     adoptFiniteNumbers(pd.values, finite[index].finiteCount, finite[index].finite);
@@ -164,8 +165,12 @@ const histogramDefinition = {
     return layout;
   },
 
-  async render(pageData, options, container, layoutEngine) {
-    await ensureHistogramSamples(pageData, options.nbins ?? 20);
+  /**
+   * `run.signal` (the detailed analysis's job) cancels the worker tasks the
+   * plot computes its statistics with; nothing partial is kept.
+   */
+  async render(pageData, options, container, layoutEngine, run = {}) {
+    await ensureHistogramSamples(pageData, options.nbins ?? 20, run.signal ?? null);
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 

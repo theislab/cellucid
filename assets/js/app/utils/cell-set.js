@@ -43,6 +43,26 @@ export class CellSet {
     return set;
   }
 
+  /**
+   * The set of one cell list (see `requireCellList`), checked while it is
+   * read: one typed pass, no per-index call.
+   *
+   * @param {Uint32Array} list
+   * @param {number} cellCount
+   * @returns {CellSet}
+   */
+  static fromCellList(list, cellCount) {
+    requireCellList(list, cellCount, 'Cell list');
+    const set = new CellSet(cellCount);
+    const words = set.words;
+    for (let index = 0; index < list.length; index++) {
+      const cell = list[index];
+      words[cell >>> 5] |= 1 << (cell & 31);
+    }
+    set.size = list.length;
+    return set;
+  }
+
   _require(index) {
     if (!Number.isInteger(index) || index < 0 || index >= this.cellCount) {
       throw new RangeError(
@@ -175,50 +195,109 @@ export class CellSet {
   }
 
   forEach(callback) {
-    for (const index of this.values()) callback(index, index, this);
-  }
-}
-
-/**
- * Whether `values` (valid indices below `cellCount`) repeat an index: one bit
- * a cell, no Set, so any number of indices can be checked.
- *
- * @param {ArrayLike<number>} values
- * @param {number} cellCount
- * @returns {boolean}
- */
-export function hasDuplicateCellIndex(values, cellCount) {
-  const seen = new Uint32Array(Math.ceil(cellCount / 32));
-  for (let index = 0; index < values.length; index++) {
-    const cell = values[index];
-    const word = cell >>> 5;
-    const bit = 1 << (cell & 31);
-    if ((seen[word] & bit) !== 0) return true;
-    seen[word] |= bit;
-  }
-  return false;
-}
-
-/**
- * Whether non-negative integer `values` repeat one, when no cell count bounds
- * them: ascending input is checked in one pass, anything else on a sorted
- * copy (no Set, so any number of values can be checked).
- *
- * @param {ArrayLike<number>} values
- * @returns {boolean}
- */
-export function hasDuplicateIndex(values) {
-  let ascending = true;
-  for (let index = 1; index < values.length; index++) {
-    if (values[index] <= values[index - 1]) {
-      ascending = false;
-      break;
+    // A word loop, not the generator: no iterator object a member.
+    const words = this.words;
+    for (let word = 0; word < words.length; word++) {
+      let bits = words[word];
+      while (bits !== 0) {
+        const low = bits & -bits;
+        const index = word * 32 + (31 - Math.clz32(low));
+        callback(index, index, this);
+        bits ^= low;
+      }
     }
   }
-  if (ascending) return false;
-  const sorted = Float64Array.from(values).sort();
-  for (let index = 1; index < sorted.length; index++) {
-    if (sorted[index] === sorted[index - 1]) return true;
+}
+
+/**
+ * Require a cell list: the one form a selection takes between modules -- a
+ * `Uint32Array` of strictly ascending cell indices below `cellCount`.
+ * Ascending order proves uniqueness, so one pass checks it all, and a list
+ * made by `CellSet.toUint32Array()` is one by construction.
+ *
+ * @param {unknown} list
+ * @param {number} cellCount
+ * @param {string} label - What to name in the failure.
+ * @returns {Uint32Array}
+ */
+export function requireCellList(list, cellCount, label) {
+  if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+    throw new TypeError(`${label}: the dataset cell count must be a non-negative safe integer.`);
   }
-  return false;
+  if (!(list instanceof Uint32Array)) {
+    throw new TypeError(`${label} must be a Uint32Array of ascending cell indices.`);
+  }
+  const length = list.length;
+  if (length > 0 && list[length - 1] >= cellCount) {
+    throw new RangeError(
+      `${label} must be inside the current dataset of ${cellCount} cells.`
+    );
+  }
+  for (let index = 1; index < length; index++) {
+    if (list[index] <= list[index - 1]) {
+      throw new TypeError(
+        `${label} must hold unique cell indices in ascending order.`
+      );
+    }
+  }
+  return list;
+}
+
+/**
+ * The cell list of cell indices received from outside the page (a Python
+ * command): every value a non-negative integer below `cellCount`, no value
+ * twice. An unordered input is sorted once, as a typed array.
+ *
+ * @param {ArrayLike<unknown>} values
+ * @param {number} cellCount
+ * @param {string} label
+ * @returns {Uint32Array}
+ */
+export function cellListFrom(values, cellCount, label) {
+  if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+    throw new TypeError(`${label}: the dataset cell count must be a non-negative safe integer.`);
+  }
+  const length = values?.length;
+  if (!Number.isSafeInteger(length) || length < 0) {
+    throw new TypeError(`${label} must be an array of cell indices.`);
+  }
+  const list = new Uint32Array(length);
+  let ascending = true;
+  for (let index = 0; index < length; index++) {
+    const cell = values[index];
+    if (!Number.isInteger(cell) || cell < 0) {
+      throw new TypeError(`${label}[${index}] must be a non-negative integer.`);
+    }
+    if (cell >= cellCount) {
+      throw new RangeError(
+        `${label}[${index}] is outside the current dataset of ${cellCount} cells.`
+      );
+    }
+    if (index > 0 && cell <= list[index - 1]) ascending = false;
+    list[index] = cell;
+  }
+  if (!ascending) {
+    list.sort();
+    for (let index = 1; index < length; index++) {
+      if (list[index] === list[index - 1]) {
+        throw new TypeError(`${label} must not contain duplicate cell indices.`);
+      }
+    }
+  }
+  return list;
+}
+
+/**
+ * Whether two cell lists hold the same cells.
+ *
+ * @param {Uint32Array} left
+ * @param {Uint32Array} right
+ * @returns {boolean}
+ */
+export function cellListsEqual(left, right) {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
 }

@@ -163,7 +163,7 @@ function renderLegend(values, prepare = () => {}) {
     state: proxy,
     viewer: null,
     dom: { legendEl, optionsContainer: new FakeElement() },
-    dataSourceManager: { getCurrentDatasetId: () => null },
+    dataSourceManager: { getCurrentIdentityId: () => null },
   });
   legend.render(field);
   const nodes = [];

@@ -14,42 +14,36 @@
 
 import { OperationType } from './operations.js';
 import {
-  mean,
   tTwoSidedPValue,
   computeRanks,
-  mannWhitneyU,
-  welchTTest,
-  filterNumeric,
   isValidNumber,
-  log2FoldChangeOfMeans,
   pairedCentredMoments,
   pearsonCorrelation,
   pearsonFromCentredMoments,
   kernelDensityAt,
   selectSorted
 } from './math-utils.js';
+import {
+  createTwoGroupContext,
+  geneSampleOf,
+  splitTwoGroups,
+  twoSampleDifferential
+} from './gene-statistics.js';
 import { computeStats, finiteNumbers, finiteNumbersReport } from '../shared/number-utils.js';
 import { runStatisticalTests } from '../stats/statistical-tests.js';
 import { plotlyBoxSummary, plotlyViolinBox } from '../plots/plotly-box-statistics.js';
 import { histogramSamples } from '../plots/plotly-histogram-bins.js';
 import { densityCurveOrPlan } from '../plots/density-curve.js';
 import {
+  agglomerate,
+  dendrogramLeafOrder,
+  pairwiseDistanceRows
+} from './hierarchical-clustering.js';
+import { perCellCSVRows } from './csv-export.js';
+import {
   plotlyViolinDensitySlice,
   plotlyViolinPlan
 } from '../plots/plotly-violin-density.js';
-
-function filterNumericIfNeeded(values) {
-  if (!values || values.length === 0) return values;
-
-  // Fast path: avoid allocating a copy when inputs are already finite.
-  for (let i = 0; i < values.length; i++) {
-    if (!Number.isFinite(values[i])) {
-      return filterNumeric(values);
-    }
-  }
-
-  return values;
-}
 
 // ============================================================================
 // Statistical Computation Operations
@@ -137,57 +131,137 @@ export function computeCorrelation(payload) {
 /**
  * Compute differential expression statistics between two groups.
  *
+ * Each group is its values (a numeric array) or the sample of its non-zero
+ * entries `{length, indices, values}` (see compute/gene-statistics.js); both
+ * give the same numbers. Non-finite values are missing and left out.
+ *
  * @param {Object} payload
- * @param {number[]} payload.groupAValues - Values for group A
- * @param {number[]} payload.groupBValues - Values for group B
+ * @param {ArrayLike<number>|import('./gene-statistics.js').GeneSample} payload.groupAValues
+ * @param {ArrayLike<number>|import('./gene-statistics.js').GeneSample} payload.groupBValues
  * @param {string} [payload.method='wilcox'] - 'wilcox' (Mann-Whitney U) or 'ttest' (Welch's t-test)
  * @returns {Object} Differential expression result
  */
 export function computeDifferential(payload) {
   const { groupAValues, groupBValues, method = 'wilcox' } = payload;
+  return twoSampleDifferential(
+    geneSampleOf(groupAValues, 0),
+    geneSampleOf(groupBValues, 1),
+    method
+  );
+}
 
-  const valsA = filterNumericIfNeeded(groupAValues);
-  const valsB = filterNumericIfNeeded(groupBValues);
+/**
+ * The two groups of differential expression runs read by gene column, held
+ * here by run so a gene is sent as its column alone: no thread gathers the
+ * groups' values out of it, and the groups cross to this thread once per run.
+ *
+ * @type {Map<string, ReturnType<typeof createTwoGroupContext>>}
+ */
+const twoGroupContexts = new Map();
 
-  if (valsA.length < 2 || valsB.length < 2) {
-    return {
-      meanA: NaN,
-      meanB: NaN,
-      log2FoldChange: NaN,
-      pValue: NaN,
-      statistic: NaN,
-      nA: valsA.length,
-      nB: valsB.length
-    };
+function requireContextId(contextId) {
+  if (typeof contextId !== 'string' || contextId.length === 0) {
+    throw new TypeError('Two-group context id must be a non-empty string');
   }
+  return contextId;
+}
 
-  // Calculate means using centralized utility
-  const meanA = mean(valsA);
-  const meanB = mean(valsB);
-
-  let minimum = Infinity;
-  for (let i = 0; i < valsA.length; i++) if (valsA[i] < minimum) minimum = valsA[i];
-  for (let i = 0; i < valsB.length; i++) if (valsB[i] < minimum) minimum = valsB[i];
-  const log2FoldChange = log2FoldChangeOfMeans(meanA, meanB, minimum);
-
-  // Statistical test
-  let testResult;
-  if (method === 'wilcox') {
-    testResult = mannWhitneyU(valsA, valsB);
-  } else {
-    testResult = welchTTest(valsA, valsB);
+/**
+ * Hold the two groups of one run.
+ *
+ * @param {{contextId: string, groupOfCell: Uint8Array}} payload - 1 for a cell
+ *   of group A, 2 for group B, 0 for neither
+ * @returns {{sizeA: number, sizeB: number}}
+ */
+export function setTwoGroupContext(payload) {
+  const contextId = requireContextId(payload.contextId);
+  if (twoGroupContexts.has(contextId)) {
+    throw new Error(`Two-group context "${contextId}" is already held`);
   }
+  const context = createTwoGroupContext(payload.groupOfCell);
+  twoGroupContexts.set(contextId, context);
+  return { sizeA: context.sizeA, sizeB: context.sizeB };
+}
 
-  return {
-    meanA,
-    meanB,
-    log2FoldChange,
-    pValue: testResult.pValue,
-    statistic: testResult.statistic,
-    nA: valsA.length,
-    nB: valsB.length,
+/**
+ * Differential expression of one gene column between the held groups: the
+ * numbers `computeDifferential` gives for the two groups' values in ascending
+ * cell order.
+ *
+ * @param {{contextId: string, values: Float32Array|import('./gene-statistics.js').GeneSample, method: 'wilcox'|'ttest'}} payload
+ */
+export function computeDifferentialOfColumn(payload) {
+  const contextId = requireContextId(payload.contextId);
+  const context = twoGroupContexts.get(contextId);
+  if (context === undefined) {
+    throw new Error(`Two-group context "${contextId}" is not held`);
+  }
+  const { sampleA, sampleB } = splitTwoGroups(payload.values, context);
+  return twoSampleDifferential(sampleA, sampleB, payload.method);
+}
+
+/**
+ * Differential expression of a run of genes read in the cells of two groups
+ * (`StreamingGeneLoader.readCellSubset`): each gene's non-zero entries over
+ * the union of the groups' cells, ascending, and each union position's group.
+ * Each gene gives the numbers `computeDifferential` gives for its two groups'
+ * values in ascending cell order; a worker takes a whole run of genes in one
+ * message.
+ *
+ * @param {{groupOfPosition: Uint8Array, pointers: Float64Array, positions: Uint32Array, values: Float32Array, method: 'wilcox'|'ttest'}} payload
+ *   `pointers` (one more than the genes, from 0) delimit each gene's entries
+ *   in `positions` (into the union) and `values`
+ * @returns {{meanA: Float64Array, meanB: Float64Array, log2FoldChange: Float64Array, pValue: Float64Array, statistic: Float64Array, nA: Uint32Array, nB: Uint32Array, method: string}}
+ */
+export function computeDifferentialOfSubset(payload) {
+  const { groupOfPosition, pointers, positions, values, method } = payload;
+  if (!(pointers instanceof Float64Array) || pointers.length < 1 || pointers[0] !== 0) {
+    throw new TypeError('Subset pointers must be a Float64Array starting at 0');
+  }
+  if (!(positions instanceof Uint32Array) || !(values instanceof Float32Array) ||
+      positions.length !== values.length || pointers[pointers.length - 1] !== values.length) {
+    throw new TypeError('Subset entries must be matching Uint32Array positions and Float32Array values');
+  }
+  const context = createTwoGroupContext(groupOfPosition);
+  const genes = pointers.length - 1;
+  const out = {
+    meanA: new Float64Array(genes),
+    meanB: new Float64Array(genes),
+    log2FoldChange: new Float64Array(genes),
+    pValue: new Float64Array(genes),
+    statistic: new Float64Array(genes),
+    nA: new Uint32Array(genes),
+    nB: new Uint32Array(genes),
     method
   };
+  for (let gene = 0; gene < genes; gene++) {
+    const from = pointers[gene];
+    const to = pointers[gene + 1];
+    const { sampleA, sampleB } = splitTwoGroups({
+      length: context.length,
+      indices: positions.subarray(from, to),
+      values: values.subarray(from, to)
+    }, context);
+    const result = twoSampleDifferential(sampleA, sampleB, method);
+    out.meanA[gene] = result.meanA;
+    out.meanB[gene] = result.meanB;
+    out.log2FoldChange[gene] = result.log2FoldChange;
+    out.pValue[gene] = result.pValue;
+    out.statistic[gene] = result.statistic;
+    out.nA[gene] = result.nA;
+    out.nB[gene] = result.nB;
+  }
+  return out;
+}
+
+/**
+ * Release the groups of a run.
+ *
+ * @param {{contextId: string}} payload
+ * @returns {{released: boolean}}
+ */
+export function clearTwoGroupContext(payload) {
+  return { released: twoGroupContexts.delete(requireContextId(payload.contextId)) };
 }
 
 /**
@@ -371,6 +445,43 @@ export function computeDensityPlan(payload) {
   };
 }
 
+/**
+ * One block of rows of a clustering's condensed distance matrix
+ * (compute/hierarchical-clustering.js).
+ *
+ * @param {{values: ArrayLike<number>, nItems: number, nFeatures: number, metric: string, rowFrom: number, rowTo: number}} payload
+ * @returns {{distances: Float64Array}}
+ */
+export function computePairwiseDistances(payload) {
+  const { values, nItems, nFeatures, metric, rowFrom, rowTo } = payload;
+  return { distances: pairwiseDistanceRows(values, nItems, nFeatures, metric, rowFrom, rowTo) };
+}
+
+/**
+ * The merges and leaf order of a clustering from its condensed distance
+ * blocks (compute/hierarchical-clustering.js).
+ *
+ * @param {{blocks: Float64Array[], ranges: Array<[number, number]>, nItems: number, linkage: string}} payload
+ * @returns {{left: Int32Array, right: Int32Array, height: Float64Array, order: Int32Array}}
+ */
+export function computeAgglomeration(payload) {
+  const { blocks, ranges, nItems, linkage } = payload;
+  const { left, right, height } = agglomerate(blocks, ranges, nItems, linkage);
+  return { left, right, height, order: dendrogramLeafOrder(left, right, nItems) };
+}
+
+/**
+ * The data lines of a per-cell CSV for a range of rows
+ * (compute/csv-export.js `perCellCSVRows`).
+ *
+ * @param {{layout: 'page-data'|'signature-scores', pages: Object[]}} payload
+ * @returns {{rows: Blob}}
+ */
+export function computeCsvExport(payload) {
+  const { layout, pages } = payload;
+  return { rows: perCellCSVRows(layout, pages) };
+}
+
 // ============================================================================
 // Unified Operation Router
 // ============================================================================
@@ -389,6 +500,14 @@ export function executeOperation(operationType, payload) {
       return computeCorrelation(payload);
     case OperationType.COMPUTE_DIFFERENTIAL:
       return computeDifferential(payload);
+    case OperationType.SET_TWO_GROUP_CONTEXT:
+      return setTwoGroupContext(payload);
+    case OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMN:
+      return computeDifferentialOfColumn(payload);
+    case OperationType.CLEAR_TWO_GROUP_CONTEXT:
+      return clearTwoGroupContext(payload);
+    case OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET:
+      return computeDifferentialOfSubset(payload);
     case OperationType.COMPUTE_KERNEL_DENSITY:
       return computeKernelDensity(payload);
     case OperationType.COMPUTE_BOX_STATISTICS:
@@ -405,6 +524,12 @@ export function executeOperation(operationType, payload) {
       return computeHistogramSamples(payload);
     case OperationType.COMPUTE_DENSITY_PLAN:
       return computeDensityPlan(payload);
+    case OperationType.COMPUTE_PAIRWISE_DISTANCES:
+      return computePairwiseDistances(payload);
+    case OperationType.COMPUTE_AGGLOMERATION:
+      return computeAgglomeration(payload);
+    case OperationType.COMPUTE_CSV_EXPORT:
+      return computeCsvExport(payload);
     default:
       throw new Error(`Unknown operation type: ${operationType}`);
   }

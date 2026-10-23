@@ -1,8 +1,8 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-/* The floating-panel layout is one of the five chunks a published preset may
+/* The floating-panel layout is one of the seven chunks a published preset may
    carry (`session/published-default.js`), so what it records is what a reader
    gets back. Three of the things it records used to be read from the wrong
    owner, and each of them is only observable against real CSS:
@@ -21,7 +21,7 @@ import { dismissWelcome } from './helpers/welcome.mjs';
    through the real modules, the real stylesheet and the real layout engine. */
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=dockable-panel-session-round-trip-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=dockable-panel-session-round-trip-ci`;
 
 const DOCKABLE_REGISTRY_URL = '/assets/js/app/dockable-accordions-registry.js';
 const DOCKABLE_CONTRIBUTOR_URL =
@@ -36,7 +36,7 @@ async function openPreparedDataset(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 }
 

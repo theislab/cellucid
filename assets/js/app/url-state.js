@@ -10,8 +10,12 @@
  *                                     bare `dataset` names a server dataset)
  * - ?remote=http://localhost:8765&dataset=served
  *                                   → Remote server dataset
- * - ?github=owner/repo/path&dataset=atlas
- *                                   → GitHub repository dataset
+ * - ?data=<locator>[&dataset=atlas] → A dataset opened from a link: a
+ *                                     GitHub repository (gh:owner/repo/path),
+ *                                     CELLxGENE (cellxgene:<id>), GEO
+ *                                     (geo:GSE…), or any web address.
+ *                                     `dataset` picks one entry of a link
+ *                                     that holds several.
  * - ?annotations=owner/repo[@branch]→ Community annotation repo (votes/suggestions)
  * - (no params)                     → Local file or empty state
  */
@@ -23,14 +27,14 @@ let latestPublicationGeneration = 0;
 
 /**
  * Prepare URL publication from the exact source instance whose dataset is
- * being staged. A not-yet-registered Remote/GitHub connection candidate can
+ * being staged. A not-yet-registered Remote/link connection candidate can
  * therefore publish one atomic source+dataset URL only if its runtime also
  * succeeds.
  *
  * @param {{
  *   datasetId: string,
  *   source: Object,
- *   sourceType: 'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'
+ *   sourceType: 'local-demo'|'remote'|'link'|'local-user'|'jupyter'
  * }} selection
  * @returns {Readonly<{commit: () => string, rollback: () => string}>}
  */
@@ -76,21 +80,21 @@ export function prepareUrlForDatasetSelection(selection) {
       serverUrl: connection.url
     });
   }
-  if (record.sourceType === 'github-repo') {
+  if (record.sourceType === 'link') {
     if (typeof record.source.getConnectionInfo !== 'function') {
       throw new TypeError(
-        'GitHub dataset URL source must implement getConnectionInfo().'
+        'Link dataset URL source must implement getConnectionInfo().'
       );
     }
     const connection = record.source.getConnectionInfo();
     if (connection === null || typeof connection !== 'object') {
       throw new TypeError(
-        'GitHub dataset URL source must publish connection information.'
+        'Link dataset URL source must publish connection information.'
       );
     }
-    return prepareUrlForDataSource('github-repo', {
-      datasetId: record.datasetId,
-      path: connection.inputPath
+    return prepareUrlForDataSource('link', {
+      datasetId: connection.datasetsCount > 1 ? record.datasetId : null,
+      locator: connection.locator
     });
   }
   if (
@@ -109,7 +113,7 @@ export function prepareUrlForDatasetSelection(selection) {
  * The returned owner commits all data-source parameters in one replaceState
  * call and can restore the exact prior URL if final dataset publication stops.
  *
- * @param {'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'|null} sourceType
+ * @param {'local-demo'|'remote'|'link'|'local-user'|'jupyter'|null} sourceType
  * @param {Object} sourceInfo
  * @returns {Readonly<{
  *   commit: () => string,
@@ -192,7 +196,7 @@ const DATA_SOURCE_URL_PARAMETERS = Object.freeze([
   'dataset',
   'source',
   'remote',
-  'github',
+  'data',
   'anndata'
 ]);
 
@@ -304,27 +308,22 @@ function requireUrlSourceState(sourceType, sourceInfo) {
       ]
     };
   }
-  if (sourceType === 'github-repo') {
+  if (sourceType === 'link') {
     const record = requirePlainDataRecord(
       sourceInfo,
-      ['datasetId', 'path'],
-      'GitHub URL state'
+      ['datasetId', 'locator'],
+      'Link URL state'
     );
-    return {
-      entries: [
-        [
-          'github',
-          requireExactString(record.path, 'GitHub URL state path')
-        ],
-        [
-          'dataset',
-          validateDatasetId(
-            record.datasetId,
-            'GitHub URL state datasetId'
-          )
-        ]
-      ]
-    };
+    const entries = [
+      ['data', requireExactString(record.locator, 'Link URL state locator')]
+    ];
+    if (record.datasetId !== null) {
+      entries.push([
+        'dataset',
+        validateDatasetId(record.datasetId, 'Link URL state datasetId')
+      ]);
+    }
+    return { entries };
   }
   if (URL_FREE_SOURCE_TYPES.has(sourceType)) {
     requirePlainDataRecord(

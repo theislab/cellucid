@@ -142,7 +142,7 @@ test('a failed tree build is retried once memory has been released, not before',
   assert.equal(builds, 2, 'retried after memory was released');
   assert.deepEqual(settled, [false, false, false]);
   const source = readFileSync(new URL('../assets/js/rendering/high-perf-renderer.js', import.meta.url), 'utf8');
-  assert.match(source, /gl\[deleteMethod\]\(handle\);\n\s*entry\.handle = null;[\s\S]{0,200}this\._releaseEpoch = /);
+  assert.match(source, /deleteGlObject\(gl, deleteMethod, handle\);\n\s*entry\.handle = null;[\s\S]{0,200}this\._releaseEpoch = /);
 });
 
 test('a frame adopts at most one new draw order; the rest wait for the next frame', () => {

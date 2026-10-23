@@ -1,8 +1,10 @@
 /**
- * The outlier filter belongs to categorical observation fields: the prepared
- * export only writes latent outlier quantiles for categoricals, and the filter
- * manager refuses an outlier filter on anything else. A session therefore has
- * to carry the outlier threshold and its enabled state in the category entry.
+ * The outlier filter belongs to categorical observation fields: latent outlier
+ * quantiles exist only for categoricals, and the filter manager refuses an
+ * outlier filter on anything else. A session therefore carries the outlier
+ * threshold and its enabled state in the category entry, and restoring it gets
+ * the quantiles the threshold needs; a threshold whose quantiles cannot be got
+ * is never applied silently and never dropped silently: it is named.
  */
 
 import assert from 'node:assert/strict';
@@ -16,6 +18,7 @@ import {
 import {
   DataStateColorMethods,
 } from '../assets/js/app/state/managers/color-manager.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 
 function createHarness() {
   const leiden = {
@@ -38,6 +41,13 @@ function createHarness() {
     getVarFields: () => [],
     async ensureFieldLoaded() {},
     async ensureVarFieldLoaded() {},
+    // Quantiles load on the filter's first use; a restored threshold below 1
+    // asks for them before it is applied.
+    quantileReads: [],
+    async ensureOutlierQuantiles(fieldIndex) {
+      this.quantileReads.push(fieldIndex);
+      return leiden.outlierQuantiles;
+    },
     beginBatch() {},
     endBatch() {},
     ensureCategoryMetadata(field) {
@@ -83,6 +93,7 @@ test('a categorical outlier threshold and its enabled state survive save and loa
   );
   assert.equal(loading.leiden._outlierThreshold, 0.95);
   assert.equal(loading.leiden._outlierFilterEnabled, false);
+  assert.deepEqual(loading.state.quantileReads, [0]);
 });
 
 test('an unchanged outlier filter writes nothing', () => {
@@ -106,3 +117,40 @@ test('continuous entries carry no outlier keys', () => {
     /Continuous filter "obs:score"/,
   );
 });
+
+for (const [label, failure, reason] of [
+  ['cancelled', new DOMException('Computing the outlier quantiles was cancelled.', 'AbortError'), 'computing its outlier quantiles was cancelled'],
+  ['failed', new Error("Latent space 'X_scVI' cannot be used: NaN at cell 3."), 'NaN at cell 3'],
+]) {
+  test(`a threshold whose quantiles were ${label} is named, not applied, and the rest is restored`, async t => {
+    const warnings = [];
+    const notifications = getNotificationCenter();
+    const warning = notifications.warning;
+    notifications.warning = message => {
+      warnings.push(message);
+      return 'warning-id';
+    };
+    t.after(() => {
+      notifications.warning = warning;
+    });
+    const saving = createHarness();
+    saving.leiden._outlierThreshold = 0.9;
+    saving.state.ensureContinuousMetadata(saving.score);
+    saving.score._filterEnabled = false;
+    const session = createFilterSerializer({ state: saving.state }).serializeFilters();
+
+    const loading = createHarness();
+    loading.state.ensureOutlierQuantiles = async () => {
+      throw failure;
+    };
+    const outcome = await createFilterSerializer({ state: loading.state }).restoreFilters(session, { signal: null });
+    assert.equal(loading.leiden._outlierThreshold, undefined);
+    assert.equal(loading.score._filterEnabled, false, 'the rest of the session is restored');
+    assert.equal(outcome.outliersNotRestored.length, 1);
+    assert.equal(outcome.outliersNotRestored[0].fieldKey, 'leiden');
+    assert.equal(outcome.outliersNotRestored[0].threshold, 0.9);
+    assert.match(outcome.outliersNotRestored[0].reason, new RegExp(reason));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /The outlier filter of "leiden" \(90%\) was not restored/);
+  });
+}

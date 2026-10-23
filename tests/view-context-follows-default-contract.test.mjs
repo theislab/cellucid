@@ -25,7 +25,6 @@ function liveState(followsDefault) {
     cellVisibilityMask: null,
     centroidPositions: null,
     centroidColors: null,
-    centroidOutliers: null,
     centroidLabels: [],
     filteredCount: { shown: 3, total: 3 },
     activeViewId: 'live',

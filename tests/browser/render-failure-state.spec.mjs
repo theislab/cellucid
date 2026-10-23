@@ -1,6 +1,6 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('a thrown grid pane releases scissor before the next scheduled full-frame clear', async ({
@@ -20,12 +20,12 @@ test('a thrown grid pane releases scissor before the next scheduled full-frame c
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=render-failure-state-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=render-failure-state-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const result = await page.evaluate(async () => {

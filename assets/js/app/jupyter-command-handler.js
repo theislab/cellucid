@@ -2,7 +2,7 @@
  * Apply authenticated Python commands to the current browser-owned state.
  */
 
-import { hasDuplicateIndex } from './utils/cell-set.js';
+import { cellListFrom } from './utils/cell-set.js';
 
 function requireMethod(owner, key, label) {
   if (
@@ -13,28 +13,6 @@ function requireMethod(owner, key, label) {
     throw new TypeError(`${label} requires ${key}()`);
   }
   return owner[key].bind(owner);
-}
-
-function requireCellIndices(cells, label, { allowEmpty = true } = {}) {
-  if (!Array.isArray(cells) || (!allowEmpty && cells.length === 0)) {
-    throw new TypeError(`${label} must be ${allowEmpty ? 'an' : 'a non-empty'} array`);
-  }
-  for (let index = 0; index < cells.length; index++) {
-    if (
-      !Object.hasOwn(cells, index) ||
-      !Number.isInteger(cells[index]) ||
-      cells[index] < 0
-    ) {
-      throw new TypeError(
-        `${label}[${index}] must be a non-negative integer`
-      );
-    }
-  }
-  // No Set: it refuses more than 2^24 entries.
-  if (hasDuplicateIndex(cells)) {
-    throw new TypeError(`${label} must not contain duplicates`);
-  }
-  return cells;
 }
 
 /**
@@ -72,8 +50,7 @@ export function createJupyterCommandHandlers(options) {
 
   function handleHighlight(cells, color) {
     if (color === null) {
-      requireCellIndices(cells, 'Jupyter clear-highlight cells');
-      if (cells.length !== 0) {
+      if (!Array.isArray(cells) || cells.length !== 0) {
         throw new TypeError(
           'Jupyter clear-highlight cells must be an empty array'
         );
@@ -86,10 +63,14 @@ export function createJupyterCommandHandlers(options) {
       return;
     }
 
-    requireCellIndices(
+    if (!Array.isArray(cells) || cells.length === 0) {
+      throw new TypeError('Jupyter highlight cells must be a non-empty array');
+    }
+    // One cell list, sorted once when Python sent the cells unordered.
+    const cellList = cellListFrom(
       cells,
-      'Jupyter highlight cells',
-      { allowEmpty: false }
+      state.pointCount,
+      'Jupyter highlight cells'
     );
     if (
       typeof color !== 'string' ||
@@ -137,8 +118,8 @@ export function createJupyterCommandHandlers(options) {
       'Jupyter highlight command'
     )({
       type: 'annotation',
-      label: `Python selection (${cells.length} cells)`,
-      cellIndices: cells
+      label: `Python selection (${cellList.length} cells)`,
+      cellIndices: cellList
     });
     if (group === null || typeof group !== 'object') {
       throw new Error(

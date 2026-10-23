@@ -21,10 +21,12 @@ import { requireCategoryCodesInInventory } from './category-codes.js';
 import { computeCentroidsForDimension } from '../../registries/user-defined-fields/centroids.js';
 import {
   UndrawableContinuousPayloadError,
-  createNonFiniteTally,
   hasUndrawableValues,
-  recordNonFiniteValue,
 } from '../../../data/continuous-payload-diagnosis.js';
+import {
+  scanContinuousColumn,
+  writeContinuousColors,
+} from './continuous-colors.js';
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
 import {
@@ -50,28 +52,11 @@ const CONTINUOUS_VALUE_SCANS = new WeakMap();
 function scanContinuousValues(values) {
   let scan = CONTINUOUS_VALUE_SCANS.get(values);
   if (scan !== undefined) return scan;
-  let min = Infinity;
-  let max = -Infinity;
-  let minPositive = Infinity;
-  let maxPositive = -Infinity;
   // The range scan is also the diagnosis scan. Reporting on the first
   // offending value would name one flat index and nothing else; counting them
   // here costs one pass that was already being made, and turns the refusal
   // into something the person looking at the screen can act on.
-  const tally = createNonFiniteTally(values.length);
-  for (let index = 0; index < values.length; index++) {
-    const value = values[index];
-    if (!Number.isFinite(value)) {
-      recordNonFiniteValue(tally, value, index);
-      continue;
-    }
-    if (value < min) min = value;
-    if (value > max) max = value;
-    if (value > 0) {
-      if (value < minPositive) minPositive = value;
-      if (value > maxPositive) maxPositive = value;
-    }
-  }
+  const { tally, min, max, minPositive, maxPositive } = scanContinuousColumn(values);
   scan = Object.freeze({
     drawable: !hasUndrawableValues(tally) && min !== Infinity,
     tally,
@@ -413,20 +398,14 @@ export class DataStateColorMethods {
     return computeContinuousDomain(field, meta, field._useLogScale);
   }
 
-  updateColorsContinuous(field, { resetTransparency = false } = {}) {
-    requireBoolean(resetTransparency, 'Continuous transparency reset');
-    this.ensureContinuousMetadata(field);
+  /**
+   * Write every cell's color for a continuous field: RGB from the field's
+   * colormap and domain, alpha from the current transparency, in one pass.
+   */
+  updateColorsContinuous(field) {
     const domain = this.getContinuousColorDomain(field);
     const colormap = requireColormap(field._colormapId);
-    const useLog = domain.scale === 'log';
-    const domainMin = domain.min;
-    const domainMax = domain.max;
-    const logMin = useLog ? Math.log10(domainMin) : 0;
-    const denom = useLog ? (Math.log10(domainMax) - logMin) : (domainMax - domainMin);
-    const isConstantDomain = denom === 0;
-    const values = field.values;
     const n = this.pointCount;
-
     if (
       !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
@@ -435,39 +414,13 @@ export class DataStateColorMethods {
     ) {
       throw new TypeError('Continuous coloring requires complete color and transparency buffers.');
     }
-    if (resetTransparency) {
-      writableTransparency(this).fill(1);
-    }
-    const colors = writableColors(this);
-
-    const sample = [0, 0, 0];
-    for (let i = 0; i < n; i++) {
-      const v = values[i];
-      let r, g, b;
-      if (Number.isNaN(v) || (useLog && v <= 0)) {
-        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
-      } else {
-        let t;
-        if (isConstantDomain) {
-          t = 0.5;
-        } else if (useLog) {
-          t = (Math.log10(v) - logMin) / denom;
-        } else {
-          t = (v - domainMin) / denom;
-        }
-        const c = colormap.sampleInto(t, sample);
-        // Convert from 0-1 float to 0-255 uint8
-        r = Math.round(c[0] * 255);
-        g = Math.round(c[1] * 255);
-        b = Math.round(c[2] * 255);
-      }
-      const j = i * 4;
-      colors[j] = r;
-      colors[j + 1] = g;
-      colors[j + 2] = b;
-      // Alpha will be synced from categoryTransparency in syncColorsAlpha
-    }
-    this._syncColorsAlpha();
+    writeContinuousColors(
+      writableColors(this),
+      field.values,
+      this.categoryTransparency,
+      domain,
+      colormap
+    );
   }
 
   // Sync alpha from categoryTransparency to packed RGBA colorsArray
@@ -637,24 +590,49 @@ export class DataStateColorMethods {
     // Byte-identical words in both views, so platform byte order is moot.
     const rgbaWords = new Uint32Array(rgbaBytes.buffer);
     const colors = writableColors(this);
-    const colorWords = colors.byteOffset % 4 === 0
-      ? new Uint32Array(colors.buffer, colors.byteOffset, n)
-      : null;
     const transparency = writeTransparency ? writableTransparency(this) : null;
-    for (let i = 0; i < n; i++) {
-      const code = codes[i];
-      const slot = code === missingCode ? numCats : code;
-      if (colorWords !== null) {
-        colorWords[i] = rgbaWords[slot];
-      } else {
+    if (colors.byteOffset % 4 !== 0) {
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        const slot = code === missingCode ? numCats : code;
         const j = i * 4;
         const k = slot * 4;
         colors[j] = rgbaBytes[k];
         colors[j + 1] = rgbaBytes[k + 1];
         colors[j + 2] = rgbaBytes[k + 2];
         colors[j + 3] = rgbaBytes[k + 3];
+        if (transparency !== null) transparency[i] = alphaByCode[slot];
       }
-      if (writeTransparency) transparency[i] = alphaByCode[slot];
+      return;
+    }
+    const colorWords = new Uint32Array(colors.buffer, colors.byteOffset, n);
+    if (codes instanceof Uint32Array) {
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        const slot = code === missingCode ? numCats : code;
+        colorWords[i] = rgbaWords[slot];
+        if (transparency !== null) transparency[i] = alphaByCode[slot];
+      }
+      return;
+    }
+    // Uint8 and Uint16 codes index tables spanning their whole dtype, the
+    // missing code's entry holding the missing-value slot, so each cell is
+    // one table read per array written and no comparison.
+    const span = missingCode + 1;
+    const wordBySpan = new Uint32Array(span);
+    wordBySpan.set(rgbaWords.subarray(0, numCats));
+    wordBySpan[missingCode] = rgbaWords[numCats];
+    if (transparency === null) {
+      for (let i = 0; i < n; i++) colorWords[i] = wordBySpan[codes[i]];
+      return;
+    }
+    const alphaBySpan = new Uint8Array(span);
+    alphaBySpan.set(alphaByCode.subarray(0, numCats));
+    alphaBySpan[missingCode] = alphaByCode[numCats];
+    for (let i = 0; i < n; i++) {
+      const code = codes[i];
+      colorWords[i] = wordBySpan[code];
+      transparency[i] = alphaBySpan[code];
     }
   }
 
@@ -662,7 +640,6 @@ export class DataStateColorMethods {
     this.centroidCount = 0;
     this.centroidPositions = null;
     this.centroidColors = null; // RGBA uint8
-    this.centroidOutliers = null;
     this.centroidLabels = [];
     this._removeLabelsForView(this.activeViewId);
     if (this.viewer && typeof this.viewer.setCentroidLabels === 'function') {
@@ -824,8 +801,6 @@ export class DataStateColorMethods {
 
     this.centroidPositions = new Float32Array(this.centroidCount * 3);
     this.centroidColors = new Uint8Array(this.centroidCount * 4); // RGBA uint8
-    this.centroidOutliers = new Float32Array(this.centroidCount);
-    this.centroidOutliers.fill(-1.0);
 
     this.centroidLabels = [];
     if (allowLabels && this.labelLayer) this._removeLabelsForView(viewKey);

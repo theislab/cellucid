@@ -10,14 +10,14 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { pixelParityVerdict } from './helpers/pixel-parity.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=snapshot-compact-lod-parity-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=snapshot-compact-lod-parity-ci';
 // Large enough that the spatial index builds a deep ladder of reduced levels.
 const POINT_COUNT = 60_000;
 const REDUCED_LEVEL = 6;

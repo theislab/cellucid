@@ -2,7 +2,7 @@
  * Google Analytics bootstrap for the declared production hosts.
  *
  * The one automatic `page_view` reports origin and path only. The query string
- * names what the page opens (`dataset`, `remote`, `github`, `exportsBaseUrl`)
+ * names what the page opens (`dataset`, `remote`, `data`, `sampleCatalog`)
  * and can carry a private server address, so it is never part of
  * `page_location`. Every other event is declared in `analytics/schema.js`.
  */

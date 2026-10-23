@@ -9,7 +9,7 @@
  * @module ui/modules/highlight/selection-state
  */
 
-import { CellSet } from '../../../utils/cell-set.js';
+import { CellSet, cellListsEqual } from '../../../utils/cell-set.js';
 import { residencyBudgetBytes } from '../../../../data/memory-budget.js';
 
 const HISTORY_KEYS = Object.freeze([
@@ -20,18 +20,18 @@ const HISTORY_KEYS = Object.freeze([
 ]);
 
 /**
- * Bytes one recorded step holds: a cell-index array costs a JavaScript number
- * per cell, a CellSet its bitmask words.
+ * Bytes one recorded step holds: a cell list four a cell, a CellSet its
+ * bitmask words.
  *
- * @param {{ candidates: CellSet|number[]|null }} entry
+ * @param {{ candidates: CellSet|Uint32Array|null }} entry
  * @returns {number}
  */
 function historyEntryBytes(entry) {
   const candidates = entry.candidates;
   if (candidates === null) return 0;
   if (candidates instanceof CellSet) return candidates.words.byteLength;
-  if (Array.isArray(candidates)) return candidates.length * 8;
-  throw new TypeError('Selection history candidates must be a CellSet, an array, or null.');
+  if (candidates instanceof Uint32Array) return candidates.byteLength;
+  throw new TypeError('Selection history candidates must be a CellSet, a cell list, or null.');
 }
 
 /**
@@ -42,7 +42,7 @@ function historyEntryBytes(entry) {
  *
  * @param {ReturnType<typeof createHighlightSelectionState>} selectionState
  * @param {'annotationHistory'|'lassoHistory'|'proximityHistory'|'knnHistory'} key
- * @param {{ candidates: CellSet|number[]|null, step: number }} entry
+ * @param {{ candidates: CellSet|Uint32Array|null, step: number }} entry
  * @param {number} [budgetBytes]
  */
 export function pushHistoryStep(
@@ -92,35 +92,28 @@ export function pushHistoryStep(
  * (`null`) and a tool holding an empty candidate set are equally unchanged by a
  * gesture that selects nothing.
  *
- * @param {CellSet|number[]|null} current
- * @param {CellSet|number[]|null} next
+ * @param {CellSet|Uint32Array|null} current - A CellSet or a cell list.
+ * @param {CellSet|Uint32Array|null} next
  * @returns {boolean}
  */
 export function selectionUnchanged(current, next) {
   const size = candidateCount(current, 'current');
   if (size !== candidateCount(next, 'next')) return false;
   if (size === 0) return true;
-  // Equal sizes of unique cells: equal as sets exactly when equal sorted.
-  // No JS Set (it refuses more than 2^24 entries).
-  const a = sortedCells(current);
-  const b = sortedCells(next);
-  for (let index = 0; index < a.length; index++) {
-    if (a[index] !== b[index]) return false;
-  }
-  return true;
+  // Equal sizes of unique cells: equal as sets exactly when equal ascending.
+  return cellListsEqual(ascendingCells(current), ascendingCells(next));
 }
 
-function sortedCells(candidates) {
-  if (candidates instanceof CellSet) return candidates.toUint32Array();
-  return Float64Array.from(candidates).sort();
+function ascendingCells(candidates) {
+  return candidates instanceof CellSet ? candidates.toUint32Array() : candidates;
 }
 
 function candidateCount(candidates, label) {
   if (candidates === null) return 0;
   if (candidates instanceof CellSet) return candidates.size;
-  if (Array.isArray(candidates)) return candidates.length;
+  if (candidates instanceof Uint32Array) return candidates.length;
   throw new TypeError(
-    `Selection ${label} candidates must be a CellSet, an array, or null.`
+    `Selection ${label} candidates must be a CellSet, a cell list, or null.`
   );
 }
 
@@ -153,4 +146,3 @@ export function createHighlightSelectionState() {
     lastKnnStep: 0
   };
 }
-

@@ -1,0 +1,32 @@
+/* components/_transfers.css
+   The Transfers panel (ui/modules/transfers-panel.js): what linked data is
+   read, from where, and where the bytes go. */
+
+.transfers-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.transfer-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.transfer-label {
+  color: var(--color-text-primary);
+}
+
+.transfer-meta {
+  color: var(--color-text-secondary);
+  font-size: var(--type-hint);
+}
+
+.transfer-row[data-status='failed'] .transfer-error {
+  color: var(--color-danger-text);
+}

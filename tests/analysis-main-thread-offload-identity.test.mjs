@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataLayer, excludeMissingCategoricalValues } from '../assets/js/app/analysis/data/data-layer.js';
-import { categoryCounts } from '../assets/js/app/analysis/shared/category-counts.js';
+import { categoryCounts, pageValueAt } from '../assets/js/app/analysis/shared/category-counts.js';
 import {
   adoptFiniteNumbers,
   computeStats,
@@ -59,14 +59,23 @@ test('a categorical page carries exactly the counts a recount gives, in first-oc
     ensureVarFieldLoaded: async () => {},
   }, { enableNotifications: false, enablePrefetch: false, enableVersionTracking: true });
   const pages = await layer.getDataForPages({ type: 'categorical_obs', variableKey: 'cell_type', pageIds: ['a', 'b'] });
-  for (const pd of pages) {
+  // The page holds the codes at the field's width; its counts are keyed by label.
+  const recountLabels = pd => {
     const recount = new Map();
-    for (const value of pd.values) recount.set(value, (recount.get(value) ?? 0) + 1);
-    assert.deepEqual([...categoryCounts(pd.values)], [...recount]);
+    for (let i = 0; i < pd.values.length; i++) {
+      const label = pageValueAt(pd, i);
+      recount.set(label, (recount.get(label) ?? 0) + 1);
+    }
+    return recount;
+  };
+  for (const pd of pages) {
+    assert.ok(pd.values instanceof Uint16Array);
+    assert.equal(pd.categories, categories);
+    assert.equal(pd.missingCode, 65535);
+    assert.deepEqual([...categoryCounts(pd.values)], [...recountLabels(pd)]);
   }
   for (const pd of excludeMissingCategoricalValues(pages)) {
-    const recount = new Map();
-    for (const value of pd.values) recount.set(value, (recount.get(value) ?? 0) + 1);
+    const recount = recountLabels(pd);
     assert.equal(recount.has(null), false);
     assert.deepEqual([...categoryCounts(pd.values)], [...recount]);
   }

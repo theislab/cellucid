@@ -4,10 +4,11 @@
 // web app, cellucid-python (tests/fixtures/data_mapping_conformance.json) and
 // cellucid-r (tests/testthat/fixtures/data_mapping_conformance.json). The
 // rules it pins -- making names unique, the best-guess ranking, the
-// embedding-column checks, canonical embedding ids, the default expression and
-// vector bindings, the representations enabled when a dataset opens, the
-// "nothing to plot" text, the export mapping and DataMapping validation --
-// are the ones every reader and writer must apply identically, so a change to
+// embedding-column checks, canonical embedding ids, the default expression,
+// the vector-field key rule and the default vector bindings, the
+// representations enabled when a dataset opens, the "nothing to plot" text and
+// DataMapping validation -- are the ones every reader and writer must apply
+// identically, so a change to
 // any of them changes the fixture, the pin, and the other two implementations
 // together.
 
@@ -19,27 +20,28 @@ import test from 'node:test';
 import {
   DataMappingError,
   DIMENSION_SLOTS,
-  DIMENSIONAL_UMAP_KEYS,
   bestGuessOrder,
   bestGuessTier,
   canonicalEmbeddingId,
   compareCodePoints,
+  compareEmbeddingRefs,
   defaultEnabledEmbeddings,
   defaultExpression,
   defaultVectorBindings,
-  exportDataMapping,
   describeObsmEntry,
-  isVectorFieldKey,
   makeUniqueNames,
   nothingPlottableMessage,
   obsmEntryDefect,
+  parseVectorFieldKey,
   resolveEmbeddingSlots,
   uniqueNamesNote,
   validateDataMapping,
   validateEmbeddingColumns,
+  vectorFieldKeys,
 } from '../assets/js/data/data-mapping.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { DataSourceErrorCode } from '../assets/js/data/data-source.js';
+import { withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
 
 const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.meta.url);
 
@@ -47,7 +49,7 @@ const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.m
 // (tests/testthat/test-data-mapping-conformance.R) pin this same digest.
 // Update all three together.
 const FIXTURE_SHA256 =
-  'dd08f84297c179b37e21a09dd820781cbfa21bf33f063bd79f925ec44a026660';
+  '9e7e7b443fcdcb4f8891165951459d1cae2c4e198041ddb2ffc3a82577ecb4f6';
 
 /**
  * A JSON number literal written with a fraction or an exponent, such as
@@ -117,7 +119,7 @@ test('the fixture is the pinned shared copy', () => {
     createHash('sha256').update(FIXTURE_BYTES).digest('hex'),
     FIXTURE_SHA256
   );
-  assert.equal(FIXTURE.version, 2);
+  assert.equal(FIXTURE.version, 3);
   assert.deepEqual(Object.keys(FIXTURE), [
     '_about',
     'version',
@@ -129,10 +131,10 @@ test('the fixture is the pinned shared copy', () => {
     'embeddingColumns',
     'canonicalEmbeddingId',
     'defaultExpression',
+    'vectorFieldKeys',
     'defaultVectorBindings',
     'nothingPlottable',
     'dataMapping',
-    'exportDataMapping',
   ]);
   for (const section of Object.keys(FIXTURE).slice(2)) {
     assert.ok(FIXTURE[section].length > 0, section);
@@ -264,7 +266,7 @@ for (const testCase of cases('embeddingSlots')) {
       },
       close() {},
     };
-    const adapter = new BaseAnnDataAdapter(loader);
+    const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
     const expected = testCase.expected;
     const filled = Object.values(expected.slots).some(ref => ref !== null);
     if (!filled) {
@@ -343,13 +345,50 @@ cases('defaultExpression').forEach((testCase, position) => {
   });
 });
 
-cases('defaultVectorBindings').forEach((testCase, position) => {
-  test(`defaultVectorBindings #${position}`, () => {
-    const bindings = defaultVectorBindings(testCase.keys, testCase.slots);
+for (const testCase of cases('vectorFieldKeys')) {
+  test(`vectorFieldKeys: ${testCase.name}`, () => {
+    const found = [...vectorFieldKeys(testCase.keys)]
+      .map(([key, { field, basis }]) => ({ key, field, basis }));
+    assert.deepEqual(found, testCase.expected);
+    const keys = new Set(testCase.keys);
+    for (const key of testCase.keys) {
+      const parsed = parseVectorFieldKey(key, keys);
+      const expected = testCase.expected.find(entry => entry.key === key);
+      if (expected === undefined) {
+        assert.equal(parsed, null, key);
+      } else {
+        assert.deepEqual(parsed, {
+          field: expected.field,
+          basis: expected.basis,
+          embeddingKey: `X_${expected.basis}`,
+        });
+        assert.equal(`${parsed.field}_${parsed.basis}`, key);
+      }
+    }
+  });
+}
+
+for (const testCase of cases('defaultVectorBindings')) {
+  test(`defaultVectorBindings: ${testCase.name}`, () => {
+    const bindings = defaultVectorBindings(testCase.obsm, testCase.enabled);
     assert.deepEqual(bindings, testCase.expected);
     assert.equal(JSON.stringify(bindings), JSON.stringify(testCase.expected));
+    // The bindings are valid in a mapping that enables those embeddings.
+    const enabled = [...testCase.enabled].sort(compareEmbeddingRefs);
+    const defaults = { '1d': null, '2d': null, '3d': null };
+    defaults[`${enabled[0].columns.length}d`] = enabled[0];
+    const mapping = {
+      kind: 'anndata',
+      embeddings: { enabled, defaults },
+      knn: null,
+      geneNames: 'index',
+      expression: null,
+      latent: null,
+      vectorFields: bindings,
+    };
+    assert.deepEqual(validateDataMapping(mapping).vectorFields, bindings);
   });
-});
+}
 
 cases('nothingPlottable').forEach((testCase, position) => {
   test(`nothingPlottable #${position}`, () => {
@@ -378,15 +417,6 @@ for (const testCase of cases('enabledEmbeddings')) {
   });
 }
 
-for (const testCase of cases('exportDataMapping')) {
-  test(`exportDataMapping: ${testCase.name}`, () => {
-    assert.deepEqual(
-      exportDataMapping(testCase.identity, { geneNameSource: testCase.geneNameSource }),
-      testCase.expected
-    );
-  });
-}
-
 for (const testCase of cases('dataMapping')) {
   test(`dataMapping: ${testCase.name}`, () => {
     const expected = testCase.expected;
@@ -408,17 +438,18 @@ for (const testCase of cases('dataMapping')) {
 
 test('the best guess skips vector keys and the latent space by role', () => {
   const entries = [
-    { key: 'velocity_umap_2d', width: 2, usable: true, reason: null },
+    { key: 'velocity_scvi', width: 2, usable: true, reason: null },
     { key: 'X_scvi', width: 2, usable: true, reason: null },
   ];
   const guess = resolveEmbeddingSlots(entries, { latentKey: 'X_scvi' });
   assert.deepEqual(guess.slots, { '1d': null, '2d': null, '3d': null });
   const described = [
-    { key: 'velocity_umap_2d', storage: 'dense', shape: [5, 2], usable: true, reason: null },
+    { key: 'velocity_scvi', storage: 'dense', shape: [5, 2], usable: true, reason: null },
     { key: 'X_scvi', storage: 'dense', shape: [5, 2], usable: true, reason: null },
   ];
+  const vectorKeys = vectorFieldKeys(described.map(item => item.key));
   const defects = described.map(item =>
-    obsmEntryDefect(item, { latentKey: 'X_scvi', rejected: {} })
+    obsmEntryDefect(item, { latentKey: 'X_scvi', rejected: {}, vectorKeys })
   );
   assert.deepEqual(defects, ['a vector field', 'the latent space']);
 });
@@ -446,14 +477,16 @@ test('compareCodePoints orders astral characters by code point, as Python does',
   );
 });
 
-test('the vector key grammar matches Python: only a newline stops the field name', () => {
-  assert.equal(isVectorFieldKey('velocity_umap_2d'), true);
-  assert.equal(isVectorFieldKey('a\r_umap_2d'), true);
-  assert.equal(isVectorFieldKey('a _umap_2d'), true);
-  assert.equal(isVectorFieldKey('a\n_umap_2d'), false);
-  assert.equal(isVectorFieldKey('velocity_umap_2d\n'), false);
-  assert.equal(isVectorFieldKey('velocity_umap_4d'), false);
-  for (const key of DIMENSIONAL_UMAP_KEYS) assert.equal(isVectorFieldKey(key), false);
+test('the vector key rule splits at any character, line breaks and astral ones included', () => {
+  const keys = new Set(['X_umap', 'X_\u{1F600}']);
+  assert.deepEqual(parseVectorFieldKey('a\r_umap', keys), { field: 'a\r', basis: 'umap', embeddingKey: 'X_umap' });
+  assert.deepEqual(parseVectorFieldKey('a\n b_umap', keys), { field: 'a\n b', basis: 'umap', embeddingKey: 'X_umap' });
+  assert.deepEqual(
+    parseVectorFieldKey('\u{1F600}_\u{1F600}', keys),
+    { field: '\u{1F600}', basis: '\u{1F600}', embeddingKey: 'X_\u{1F600}' }
+  );
+  assert.equal(parseVectorFieldKey('velocity_umap\n', keys), null);
+  assert.equal(parseVectorFieldKey('X_umap', keys), null);
   assert.deepEqual([...DIMENSION_SLOTS], ['1d', '2d', '3d']);
 });
 

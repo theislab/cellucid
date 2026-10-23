@@ -9,11 +9,11 @@
  */
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
 test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
   const pageErrors = [];
@@ -159,7 +159,7 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;

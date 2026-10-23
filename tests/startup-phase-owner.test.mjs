@@ -75,7 +75,7 @@ test('an ordinary failure is reported as itself, and retire aborts open steps', 
   );
 
   let stepSignal = null;
-  const pending = startup.step('identity', 'https://x.test/dataset_identity.json', signal => {
+  const pending = startup.step('identity', 'h5ad://x/', signal => {
     stepSignal = signal;
     return new Promise((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -153,4 +153,39 @@ test('every network await of the bootstrap runs through the startup owner', asyn
   const ready = main.indexOf("    startup.enter('ready');", startupLoad);
   assert.ok(viewerStart > 0 && startupLoad > viewerStart && ready > startupLoad);
   assert.match(main, /catch \(thrown\) \{\n    const startupError = normalizeStartupError\(thrown\);\n    startup\.retire\(startupError\);/);
+});
+
+test('a step that reports progress stalls only when progress stops, however long it takes', async () => {
+  // Opening a linked file reads as much as its first view needs, which grows
+  // with the file: steady bytes keep it alive past the deadline.
+  const startup = createStartupPhaseOwner({ root: fakeRoot(), deadlineMs: 40 });
+  const listeners = new Set();
+  const progress = onProgress => {
+    listeners.add(onProgress);
+    return () => listeners.delete(onProgress);
+  };
+  const tick = () => new Promise(resolve => setTimeout(resolve, 15));
+  const result = await startup.step('catalog', 'zenodo:1', async () => {
+    for (let report = 0; report < 8; report += 1) {
+      await tick();
+      for (const listener of listeners) listener();
+    }
+    return 'opened';
+  }, { progress });
+  assert.equal(result, 'opened', '120 ms of work under a 40 ms deadline');
+  assert.equal(listeners.size, 0, 'the subscription ends with the step');
+
+  await assert.rejects(
+    startup.step('catalog', 'zenodo:2', signal => new Promise((_resolve, reject) => {
+      // Progress twice, then silence.
+      setTimeout(() => listeners.forEach(listener => listener()), 15);
+      setTimeout(() => listeners.forEach(listener => listener()), 30);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }), { progress }),
+    error => error.code === STARTUP_STALL_CODE && error.target === 'zenodo:2'
+  );
+  await assert.rejects(
+    startup.step('catalog', 'x', () => {}, { progress: 'not a subscription' }),
+    /progress source must be a subscription/
+  );
 });

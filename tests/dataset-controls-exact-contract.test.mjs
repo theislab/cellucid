@@ -160,11 +160,9 @@ class FakeDocument {
 
 function makeIdentity(id, name, nCells = 0) {
   return {
-    version: 3,
     id,
     name,
     description: '',
-    cellucid_data_version: '1.0.0',
     stats: {
       n_cells: nCells,
       n_genes: 0,
@@ -181,7 +179,7 @@ function makeIdentity(id, name, nCells = 0) {
         X_umap: {
           label: 'X_umap',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: { key: 'X_umap', columns: [0, 1] }
         }
       }
@@ -361,6 +359,7 @@ function makeHarness(catalog) {
     sourceEl: new FakeElement('span', fakeDocument),
     descriptionEl: new FakeElement('span', fakeDocument),
     urlEl: new FakeElement('span', fakeDocument),
+    citationEl: new FakeElement('span', fakeDocument),
     cellsEl: new FakeElement('span', fakeDocument),
     genesEl: new FakeElement('span', fakeDocument),
     obsEl: new FakeElement('span', fakeDocument),
@@ -1290,7 +1289,7 @@ test('a retry that fails again says so instead of settling silently', async t =>
       error: new Error('catalog host unreachable')
     },
     {
-      sourceType: 'github-repo',
+      sourceType: 'link',
       datasets: [],
       error: new Error('rate limited')
     }
@@ -1311,7 +1310,7 @@ test('a retry that fails again says so instead of settling silently', async t =>
   const { messageEl, retryButton } = harness.catalogNotice();
   assert.match(
     messageEl.textContent,
-    /Sample datasets and GitHub data could not be loaded/,
+    /Sample datasets and Linked data could not be loaded/,
     'every failed source must be named, in the words the dropdown uses'
   );
   assert.equal(harness.select.value, '__none__');

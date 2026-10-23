@@ -1,9 +1,8 @@
 /**
- * @fileoverview One scheduler for dataset payload downloads: what the user is
- * looking at goes first, and the same payload is never downloaded twice at
- * once.
+ * @fileoverview One scheduler for dataset field reads: what the user is
+ * looking at goes first, and the same field is never read twice at once.
  *
- * Every payload download is one of four kinds:
+ * Every read is one of four kinds:
  * - `high`: what the user just asked for and is waiting to see (a chosen gene,
  *   the field a view is coloured by);
  * - `normal`: work the user started and is watching (a gene signature, a
@@ -12,14 +11,19 @@
  *   marker discovery), which bounds its own concurrency;
  * - `low`: speculative (prefetch on intent).
  *
- * `high` and `normal` downloads start at once. `bulk` and `low` downloads wait
- * while any `high` or `normal` download is in flight: the requests a long run
- * already started finish, but no new one competes with the user's for the
- * connection, so a gene chosen during a 5,000-gene run is not shared out among
- * a dozen of the run's downloads. Waiting downloads start in priority order
- * (`bulk` before `low`), each kind first come, first served. The browser is
- * told the same order through the fetch priority hint (`high` for the first
- * two kinds, `low` for the others).
+ * `high` and `normal` reads start at once. `bulk` and `low` reads wait while
+ * any `high` or `normal` read is in flight: the reads a long run already
+ * started finish, but no new one competes with the user's, so a gene chosen
+ * during a 5,000-gene run is not shared out among a dozen of the run's reads.
+ * Waiting reads start in priority order (`bulk` before `low`), each kind first
+ * come, first served, and no more of them run at once than requests the
+ * dataset's source answers at once (`backgroundConcurrency`): every read
+ * needs at most that many requests' worth of the link, and more would only
+ * queue behind the reader's slots, where priority no longer applies. The
+ * bound is the source's, reported by its reader (`setSourceRequestConcurrency`):
+ * six to an HTTP/1.1 host until a reader says otherwise, the host's streams
+ * over HTTP/2 or HTTP/3, and no bound (Infinity) for a source whose reads
+ * cost no request (a local file, or reads answered from memory).
  *
  * Downloads are keyed (by URL, or by the object of a load that already shares
  * itself among its callers). A request for a key already queued or in flight
@@ -38,7 +42,34 @@
  * @module data/fetch-scheduler
  */
 
+import { onAbort } from '../formats/io/abort.js';
+import { REMOTE_POLICY } from '../formats/io/byte-source.js';
+
 /** @typedef {'high'|'normal'|'bulk'|'low'} DownloadPriority */
+
+/** Requests the open dataset's source answers at once, as its reader last reported. */
+let sourceRequestConcurrency = REMOTE_POLICY.concurrency;
+/** Schedulers that follow it, drained again when it rises. */
+const followers = new Set();
+
+function requireConcurrency(value) {
+  if (!(value === Infinity || (Number.isSafeInteger(value) && value >= 1))) {
+    throw new TypeError('Background concurrency must be a positive whole number or Infinity.');
+  }
+  return value;
+}
+
+/**
+ * Report how many requests the open dataset's source answers at once (the
+ * reader's link: its concurrency, or Infinity when reads cost no request).
+ * Every scheduler created without its own bound follows it at once.
+ *
+ * @param {number} value
+ */
+export function setSourceRequestConcurrency(value) {
+  sourceRequestConcurrency = requireConcurrency(value);
+  for (const scheduler of followers) scheduler._drain();
+}
 
 const RANK = Object.freeze({ high: 0, normal: 1, bulk: 2, low: 3 });
 
@@ -48,16 +79,6 @@ const RANK = Object.freeze({ high: 0, normal: 1, bulk: 2, low: 3 });
  */
 function isForeground(priority) {
   return RANK[priority] <= RANK.normal;
-}
-
-/**
- * The fetch priority hint (`RequestInit.priority`) for a download priority.
- * @param {DownloadPriority} priority
- * @returns {'high'|'low'}
- */
-export function fetchPriorityHint(priority) {
-  requirePriority(priority);
-  return isForeground(priority) ? 'high' : 'low';
 }
 
 /**
@@ -93,10 +114,29 @@ function abortReason(signal) {
  * }} Download
  */
 
+/** Whether `left` starts before `right`: higher priority, then first come. */
+function startsBefore(left, right) {
+  return left.rank - right.rank || left.sequence - right.sequence;
+}
+
 export class FetchScheduler {
-  constructor() {
+  /**
+   * @param {{backgroundConcurrency?: number}} [options] - Background reads in
+   *   flight at once; without it, the source's (`setSourceRequestConcurrency`).
+   */
+  constructor({ backgroundConcurrency } = {}) {
+    this._ownConcurrency = backgroundConcurrency === undefined ? null : requireConcurrency(backgroundConcurrency);
+    if (this._ownConcurrency === null) followers.add(this);
     /** @type {Map<string|object, Download<unknown>>} */
     this._downloads = new Map();
+    /**
+     * Queued downloads as a binary heap of `{download, rank, sequence}`, best
+     * first; an entry whose download started or changed priority since is
+     * skipped when it comes up.
+     * @type {Array<{download: Download<unknown>, rank: number, sequence: number}>}
+     */
+    this._queued = [];
+    this._backgroundInFlight = 0;
     this._foregroundInFlight = 0;
     this._sequence = 0;
     /** @type {unknown} Why the scheduler was closed, once it is. */
@@ -115,12 +155,15 @@ export class FetchScheduler {
   close(reason) {
     if (this._closedReason !== null) return;
     this._closedReason = reason ?? new DOMException('The downloads were closed.', 'AbortError');
+    followers.delete(this);
     for (const download of [...this._downloads.values()]) {
       download.controller.abort(this._closedReason);
       download.reject(this._closedReason);
     }
     this._downloads.clear();
+    this._queued = [];
     this._foregroundInFlight = 0;
+    this._backgroundInFlight = 0;
   }
 
   /** Downloads in flight and waiting, for diagnostics and tests. */
@@ -131,7 +174,12 @@ export class FetchScheduler {
       if (download.state === 'queued') queued += 1;
       else running += 1;
     }
-    return { queued, running, foregroundInFlight: this._foregroundInFlight };
+    return {
+      queued,
+      running,
+      foregroundInFlight: this._foregroundInFlight,
+      backgroundInFlight: this._backgroundInFlight,
+    };
   }
 
   /**
@@ -144,9 +192,8 @@ export class FetchScheduler {
    *   signal?: AbortSignal|null,
    *   start: (signal: AbortSignal, priority: DownloadPriority) => Promise<T>,
    * }} request - `start` performs the download under the shared signal, at
-   *   the download's priority when it starts (`fetchPriorityHint` gives the
-   *   hint to pass to `fetch`); it is called at most once per key and
-   *   download.
+   *   the download's priority when it starts; it is called at most once per
+   *   key and download.
    * @returns {Promise<T>}
    */
   run({ key, priority, signal = null, start }) {
@@ -215,7 +262,51 @@ export class FetchScheduler {
     };
     this._downloads.set(key, download);
     if (isForeground(priority)) this._start(download);
+    else this._enqueue(download);
     return download;
+  }
+
+  /** Put a queued download in the heap at its priority. @private */
+  _enqueue(download) {
+    const heap = this._queued;
+    const entry = { download, rank: RANK[download.priority], sequence: download.sequence };
+    heap.push(entry);
+    let at = heap.length - 1;
+    while (at > 0) {
+      const parent = (at - 1) >> 1;
+      if (startsBefore(heap[parent], entry) <= 0) break;
+      heap[at] = heap[parent];
+      at = parent;
+    }
+    heap[at] = entry;
+  }
+
+  /** The best queued download still waiting at the priority it was queued with, removed; or null. @private */
+  _dequeue() {
+    const heap = this._queued;
+    while (heap.length > 0) {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length > 0) {
+        let at = 0;
+        for (;;) {
+          const left = 2 * at + 1;
+          if (left >= heap.length) break;
+          const right = left + 1;
+          const child = right < heap.length && startsBefore(heap[right], heap[left]) < 0 ? right : left;
+          if (startsBefore(heap[child], last) >= 0) break;
+          heap[at] = heap[child];
+          at = child;
+        }
+        heap[at] = last;
+      }
+      const { download } = top;
+      if (download.state === 'queued' && this._downloads.get(download.key) === download &&
+          RANK[download.priority] === top.rank) {
+        return download;
+      }
+    }
+    return null;
   }
 
   _promote(download, priority) {
@@ -223,6 +314,7 @@ export class FetchScheduler {
     download.priority = priority;
     if (download.state === 'queued') {
       if (isForeground(priority)) this._start(download);
+      else this._enqueue(download);
     } else if (!wasForeground && isForeground(priority)) {
       // A running background download the user now waits for holds the
       // background back like any foreground download.
@@ -236,6 +328,9 @@ export class FetchScheduler {
     if (isForeground(download.priority)) {
       this._foregroundInFlight += 1;
       download.countedForeground = true;
+    } else {
+      this._backgroundInFlight += 1;
+      download.countedBackground = true;
     }
     const signal = download.controller.signal;
     // Started in the caller's own turn: the download begins exactly when it
@@ -260,18 +355,24 @@ export class FetchScheduler {
       download.countedForeground = false;
       this._foregroundInFlight -= 1;
     }
+    if (download.countedBackground) {
+      download.countedBackground = false;
+      this._backgroundInFlight -= 1;
+    }
     this._drain();
   }
 
-  /** Start waiting downloads, best first, while nothing in the foreground runs. */
+  /**
+   * Start waiting downloads, best first, while nothing in the foreground runs
+   * and fewer background downloads run than the source answers at once.
+   */
   _drain() {
-    if (this._foregroundInFlight > 0) return;
-    const queued = [...this._downloads.values()]
-      .filter(download => download.state === 'queued')
-      .sort((left, right) => (
-        RANK[left.priority] - RANK[right.priority] || left.sequence - right.sequence
-      ));
-    for (const download of queued) this._start(download);
+    const bound = this._ownConcurrency ?? sourceRequestConcurrency;
+    while (this._foregroundInFlight === 0 && this._backgroundInFlight < bound) {
+      const download = this._dequeue();
+      if (download === null) return;
+      this._start(download);
+    }
   }
 
   _wait(download, signal) {
@@ -298,19 +399,18 @@ export class FetchScheduler {
       });
     }
     return new Promise((resolve, reject) => {
-      const onAbort = () => {
+      const stopWaiting = onAbort(signal, () => {
         leave(abortReason(signal));
         reject(abortReason(signal));
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
+      });
       download.promise.then(
         value => {
-          signal.removeEventListener('abort', onAbort);
+          stopWaiting();
           settled = true;
           resolve(value);
         },
         error => {
-          signal.removeEventListener('abort', onAbort);
+          stopWaiting();
           settled = true;
           reject(error);
         }

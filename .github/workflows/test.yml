@@ -2,7 +2,7 @@ name: Web contracts
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main"]
   pull_request:
   # Every engine on every operating system, once a day and on demand.
   schedule:
@@ -22,9 +22,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: ["20", "22", "24", "26"]
-    # The repository is checked out beside the two sibling repositories its
-    # cross-repository contracts read (`../cellucid-demo-custom-datasets`,
-    # `../cellucid-datasets`), so those contracts run here instead of skipping.
+    # The repository is checked out beside the sibling repository its
+    # cross-repository contracts read (`../cellucid-datasets`), so those
+    # contracts run here instead of skipping.
     defaults:
       run:
         working-directory: cellucid
@@ -35,12 +35,6 @@ jobs:
         with:
           path: cellucid
 
-      - name: Check out the demo exports the browser fixture mirrors
-        uses: actions/checkout@v7
-        with:
-          repository: theislab/cellucid-demo-custom-datasets
-          path: cellucid-demo-custom-datasets
-
       - name: Check out the published dataset session presets
         uses: actions/checkout@v7
         with:
@@ -48,7 +42,8 @@ jobs:
           path: cellucid-datasets
           filter: blob:none
           sparse-checkout: |
-            exports-v3/*/default.cellucid-session
+            anndata/datasets.json
+            anndata/*.cellucid-session
           sparse-checkout-cone-mode: false
 
       - name: Install Node.js

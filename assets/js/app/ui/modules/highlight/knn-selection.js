@@ -199,12 +199,14 @@ export function initKnnSelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'knnHistory', {
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
     selectionState.knnRedoStack = [];
 
-    selectionState.lastKnnCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastKnnCandidates = stepEvent.candidates;
     selectionState.lastKnnStep = stepEvent.step;
 
     updateKnnUI(stepEvent);
@@ -221,7 +223,7 @@ export function initKnnSelection(options) {
     if (selectionState.knnHistory.length === 0) return;
 
     selectionState.knnRedoStack.push({
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
 
@@ -249,7 +251,7 @@ export function initKnnSelection(options) {
     if (selectionState.knnRedoStack.length === 0) return;
 
     selectionState.knnHistory.push({
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
 
@@ -409,7 +411,7 @@ export function initKnnSelection(options) {
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];
     selectionState.lastKnnCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastKnnStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

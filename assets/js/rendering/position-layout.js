@@ -95,6 +95,52 @@ export function readPositionXYZ(positions, dimension, index, out) {
 const POSITION_BOUNDS = new WeakMap();
 
 /**
+ * Float32 arrays already proven finite (`assertFiniteFloat32Array` of the
+ * viewer contracts): scanned once, or proven where they were made.
+ */
+const PROVEN_FINITE_FLOAT32_ARRAYS = new WeakSet();
+
+/** Whether a Float32 array was already proven finite. */
+export function isProvenFiniteFloat32Array(array) {
+  return PROVEN_FINITE_FLOAT32_ARRAYS.has(array);
+}
+
+/** Record a Float32 array as proven finite (it is never written after publication). */
+export function markProvenFiniteFloat32Array(array) {
+  PROVEN_FINITE_FLOAT32_ARRAYS.add(array);
+}
+
+/**
+ * Publish the bounds of a positions array whose maker already scanned it
+ * (the reader worker checks, normalizes and bounds an embedding in one pass,
+ * `data/embedding-payload.js`), so no one scans it again: the bounds are
+ * what `readPositionBounds` would compute, and every value was checked
+ * finite where the array was made.
+ *
+ * @param {Float32Array} positions
+ * @param {number} dimension
+ * @param {{min: ArrayLike<number>, max: ArrayLike<number>}} bounds - Three components each
+ */
+export function publishPositionBounds(positions, dimension, bounds) {
+  requirePositionArray(positions, dimension, 'Bounds positions');
+  const min = [0, 0, 0];
+  const max = [0, 0, 0];
+  for (let axis = 0; axis < 3; axis++) {
+    min[axis] = bounds.min[axis];
+    max[axis] = bounds.max[axis];
+    if (!Number.isFinite(min[axis]) || !Number.isFinite(max[axis]) || min[axis] > max[axis] ||
+        (axis >= dimension && (min[axis] !== 0 || max[axis] !== 0))) {
+      throw new RangeError('Published position bounds must be finite, ordered, and zero on absent axes.');
+    }
+  }
+  POSITION_BOUNDS.set(positions, {
+    dimension,
+    bounds: Object.freeze({ min: Object.freeze(min), max: Object.freeze(max) }),
+  });
+  PROVEN_FINITE_FLOAT32_ARRAYS.add(positions);
+}
+
+/**
  * Exact per-axis minimum and maximum of a positions array, with zero for the
  * axes the embedding does not have. The first point seeds every axis.
  *

@@ -150,6 +150,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._controlsContainer.className = 'detailed-analysis-controls';
     this._container.appendChild(this._controlsContainer);
 
+    // The running, cancelled or failed state of the plot's job.
+    this._container.appendChild(this._getJobStatusView().root);
+
     // Preview container
     this._previewContainer = document.createElement('div');
     this._previewContainer.className = 'analysis-preview-container empty';
@@ -545,16 +548,21 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * Run the analysis (implements abstract method from BaseAnalysisUI)
    * @override
    */
-  async _runAnalysis(requestId) {
+  async _runAnalysis(requestId, job) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
     await this._whileBusy(
       this._previewContainer,
-      () => this._runPreviewAnalysis(requestId)
+      () => this._runPreviewAnalysis(requestId, job)
     );
   }
 
+  /** @override */
+  _getJobTitle() {
+    return 'Detailed analysis';
+  }
+
   /** @private */
-  async _runPreviewAnalysis(requestId) {
+  async _runPreviewAnalysis(requestId, job) {
     const config = structuredClone(this._currentConfig);
     const pageIds = [...this._selectedPages];
     const customColors = new Map(
@@ -570,11 +578,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       if (!this._isCurrentAnalysisRequest(requestId)) return;
 
       // Fetch data
+      job.step(`Reading ${config.dataSource.variable}`);
       const fetchedPageData = await this.dataLayer.getDataForPages({
         type: config.dataSource.type,
         variableKey: config.dataSource.variable,
-        pageIds
+        pageIds,
+        silent: true,
+        signal: job.signal,
+        owner: job.id
       });
+      job.step('Drawing the plot');
       // Missing categories are excluded per variable, before any plot,
       // summary table or categorical test sees the page.
       const pageData = config.dataSource.type === 'categorical_obs'
@@ -617,7 +630,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
             pageData,
             mergedOptions,
             candidate,
-            layoutEngine
+            layoutEngine,
+            { signal: job.signal }
           )
         },
         {
@@ -747,29 +761,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this._actionsContainer) {
       this._actionsContainer.hidden = true;
     }
-    return true;
-  }
-
-  async _showError(message, requestId = null) {
-    const publicationCurrent = await this._hidePreview(requestId);
-    if (
-      !publicationCurrent ||
-      (
-        requestId !== null &&
-        !this._isCurrentAnalysisRequest(requestId)
-      )
-    ) {
-      return false;
-    }
-    if (this._previewContainer) {
-      this._previewContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message ?? '' }).root
-      );
-    }
-    this._notifications.error(
-      message,
-      { category: 'data', title: 'Analysis error' }
-    );
     return true;
   }
 

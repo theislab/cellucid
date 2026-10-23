@@ -14,15 +14,17 @@
  */
 
 import { readBundle } from './bundle/reader.js';
+import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
+import {
+  assertDatasetSourceRecord,
+  captureDatasetSourceRecord,
+} from './dataset-source-record.js';
 import { writeBundle } from './bundle/writer.js';
 import { downloadBlob } from '../utils/download.js';
 import {
   MAX_FRAME_BYTES
 } from './bundle/format.js';
 import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
-import {
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
-} from './contributors/analysis-artifacts.js';
 import {
   CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
   PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
@@ -31,7 +33,10 @@ import {
 } from './published-default.js';
 import {
   assertDatasetFingerprint,
+  assertSessionRequires,
   buildSessionContext,
+  collectRequiredFields,
+  describeMissingRequiredFields,
   createSessionRestoreTransaction,
   datasetFingerprintMatches,
   getDatasetFingerprint,
@@ -151,11 +156,9 @@ const STATIC_PROFILE_BY_ID = new Map(
   BUILT_IN_STATIC_CHUNK_PROFILES.map(profile => [profile.id, profile])
 );
 const STATIC_PROFILE_BY_CONTRIBUTOR = new Map(
-  BUILT_IN_STATIC_CHUNK_PROFILES
-    .filter(profile => profile.contributorId !== 'analysis-artifacts')
-    .map(
-      profile => [profile.contributorId, profile]
-    )
+  BUILT_IN_STATIC_CHUNK_PROFILES.map(
+    profile => [profile.contributorId, profile]
+  )
 );
 
 function validateBuiltInStaticChunkProfile(entry, context) {
@@ -256,16 +259,6 @@ function assertSessionDatasetOwner(ctx, owner) {
   }
 }
 
-/**
- * Yield back to the browser so rendering stays responsive.
- * @returns {Promise<void>}
- */
-function nextTick() {
-  if (typeof requestAnimationFrame !== 'function') {
-    throw new Error('Session restore requires requestAnimationFrame.');
-  }
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
 
 /**
  * Basic manifest shape validation (untrusted input).
@@ -280,7 +273,7 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   }
   assertExactKeys(
     manifest,
-    ['createdAt', 'datasetFingerprint', 'chunks'],
+    ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks'],
     'Session manifest'
   );
   if (
@@ -293,6 +286,13 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     manifest.datasetFingerprint,
     'Session manifest datasetFingerprint'
   );
+  assertDatasetSourceRecord(manifest.source, 'Session manifest source');
+  assertSessionRequires(manifest.requires, 'Session manifest requires');
+  if (manifestProfile === 'published-default' && manifest.source !== null) {
+    throw new TypeError(
+      'A published default is applied to the sample it ships beside; its source must be null.'
+    );
+  }
   assertArray(manifest.chunks, 'Session manifest chunks');
   const chunkIds = new Set();
   const contributorOrder = new Map(
@@ -384,15 +384,6 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     assertNonEmptyString(entry.label, `${context} label`);
     assertBoolean(entry.datasetDependent, `${context} datasetDependent`);
     validateBuiltInStaticChunkProfile(entry, context);
-    if (
-      contributorId === ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.contributorId
-      && entry.priority === 'eager'
-      && chunkId !== ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.id
-    ) {
-      throw new TypeError(
-        'The analysis-artifacts contributor has exactly one canonical eager cache inventory.'
-      );
-    }
     assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
       maximum: MAX_FRAME_BYTES
     });
@@ -686,6 +677,7 @@ export class SessionSerializer {
         'comparisonModule',
         'analysisWindowManager',
         'cinematicCamera',
+        'figureExport',
         'contributors'
       ],
       'SessionSerializer options'
@@ -709,6 +701,10 @@ export class SessionSerializer {
       cinematicCamera: assertNullableOwner(
         options.cinematicCamera,
         'SessionSerializer cinematicCamera'
+      ),
+      figureExport: assertNullableOwner(
+        options.figureExport,
+        'SessionSerializer figureExport'
       )
     };
 
@@ -779,6 +775,17 @@ export class SessionSerializer {
     this._base.cinematicCamera = assertOwner(
       cinematicCamera,
       'Session cinematic camera'
+    );
+  }
+
+  /**
+   * Set the figure-export panel once the UI is initialized.
+   * @param {object} figureExport
+   */
+  setFigureExportRef(figureExport) {
+    this._base.figureExport = assertOwner(
+      figureExport,
+      'Session figure export'
     );
   }
 
@@ -1128,6 +1135,8 @@ export class SessionSerializer {
     const manifest = {
       createdAt: new Date().toISOString(),
       datasetFingerprint: datasetOwner.fingerprint,
+      source: captureDatasetSourceRecord(this._base.dataSourceManager),
+      requires: collectRequiredFields(this._base.state),
       chunks: manifestChunks
     };
 
@@ -1189,6 +1198,31 @@ export class SessionSerializer {
         return false;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Read only a session file's manifest (its header) and say which dataset
+   * it belongs to and where that dataset can be opened from. Nothing is
+   * applied, and no chunk is read.
+   *
+   * @param {Blob} blob
+   * @returns {Promise<{datasetId: string, name: string|null, source: object|null}>}
+   */
+  async readSessionDataset(blob) {
+    if (!(blob instanceof Blob)) {
+      throw new TypeError('Session source must be a Blob or File.');
+    }
+    const bundle = await readBundle(blob, { signal: null, onProgress: null });
+    try {
+      validateManifest(bundle.manifest, this._contributorById, null);
+      return Object.freeze({
+        datasetId: bundle.manifest.datasetFingerprint.datasetId,
+        name: bundle.manifest.datasetFingerprint.name,
+        source: bundle.manifest.source
+      });
+    } finally {
+      await bundle.cancel('Only the session manifest was needed.');
     }
   }
 
@@ -1408,6 +1442,15 @@ export class SessionSerializer {
         manifest.datasetFingerprint.dataMapping
       );
       throwIfAborted(abortController.signal);
+      // Under the session's own mapping (its gene names), every field it
+      // uses has to exist before any chunk is applied.
+      const missingFields = describeMissingRequiredFields(
+        ctx.state,
+        manifest.requires
+      );
+      if (missingFields !== null) {
+        throw new RangeError(missingFields);
+      }
       // Phase split: apply eager chunks now, then continue lazy in the background.
       const iterator = chunkStream[Symbol.asyncIterator]();
 
@@ -1476,7 +1519,10 @@ export class SessionSerializer {
           throwIfAborted(abortController.signal);
           const { value, done } = await iterator.next();
           if (done) break;
-          await nextTick();
+          // A macrotask, not an animation frame: frames do not run in a
+          // background tab or an off-screen notebook iframe, and a restore
+          // there has to finish all the same.
+          await yieldToMacrotask();
           assertExactKeys(
             value,
             ['index', 'meta', 'bytes'],

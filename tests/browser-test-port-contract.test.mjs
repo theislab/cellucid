@@ -19,7 +19,7 @@
  *
  * Moving the servers was only half the fix (CEL-0128). About a hundred absolute
  * URLs in `tests/browser/` still spelled the two ports out, most of them
- * percent-encoded inside the `exportsBaseUrl` query parameter that tells the
+ * percent-encoded inside the `sampleCatalog` query parameter that tells the
  * application where to fetch its fixtures. A moved run then served the page at
  * the new address and asked it for fixtures at the old one, so an overridden
  * port failed the suite instead of relieving the collision. The specs derive
@@ -245,19 +245,19 @@ test('the origins helper derives what the specs import', async () => {
   assert.equal(origins.APP_ORIGIN, origin);
   assert.equal(origins.SAMPLE_ORIGIN, sampleOrigin);
   assert.equal(
-    origins.EXPORTS_BASE_URL,
-    `${origin}/tests/browser/fixtures/exports/`
+    origins.SAMPLE_CATALOG_URL,
+    `${origin}/tests/browser/fixtures/catalog/`
   );
 
   // The encoded form is produced by encoding the resolved URL, so moving the
   // port cannot corrupt the escape sequences around it.
   assert.equal(
-    origins.ENCODED_EXPORTS_BASE_URL,
-    encodeURIComponent(origins.EXPORTS_BASE_URL)
+    origins.ENCODED_SAMPLE_CATALOG_URL,
+    encodeURIComponent(origins.SAMPLE_CATALOG_URL)
   );
   assert.equal(
-    origins.encodedAppUrl('/tests/browser/fixtures/exports/'),
-    origins.ENCODED_EXPORTS_BASE_URL
+    origins.encodedAppUrl('/tests/browser/fixtures/catalog/'),
+    origins.ENCODED_SAMPLE_CATALOG_URL
   );
   assert.equal(origins.appUrl('/_cellucid/health'), `${origin}/_cellucid/health`);
   assert.equal(origins.sampleUrl('/datasets.json'), `${sampleOrigin}/datasets.json`);

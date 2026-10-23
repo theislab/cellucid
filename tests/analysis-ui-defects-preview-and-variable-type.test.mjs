@@ -25,7 +25,7 @@ import { DetailedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
 import { PlotRegistry } from '../assets/js/app/analysis/shared/plot-registry-utils.js';
-import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
+import { createRequestIdTracker } from '../assets/js/app/jobs/cancellable-job.js';
 
 // =============================================================================
 // Minimal DOM

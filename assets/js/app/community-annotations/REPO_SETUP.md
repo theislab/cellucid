@@ -139,9 +139,43 @@ In the Cellucid UI, **Publish** (for authors) pushes:
 - Comments always have `createdAt`, and may have `editedAt` if you edit the comment later.
 - Moderation merges in `annotations/moderation/merges.json` always have `at`, and may have `editedAt` if you edit the merge note later; `by` is stored as `ghid_<githubUserId>`.
 
+## Per-dataset sections (Developer note)
+
+A repository can annotate several datasets, and two datasets can share a field
+and a category label (`leiden` / `0`). So a user file (version 2) keeps the
+profile once and everything else per dataset:
+
+```json
+{
+  "version": 2,
+  "username": "ghid_42",
+  "githubUserId": 42,
+  "updatedAt": "2026-10-22T10:00:00.000Z",
+  "datasets": {
+    "<datasetId>": {
+      "fieldsToAnnotate": ["cell_type"],
+      "lastAccessedAt": "2026-10-22T10:00:00.000Z",
+      "suggestions": { "cell_type:T": [] },
+      "votes": {},
+      "comments": {},
+      "deletedSuggestions": {}
+    }
+  }
+}
+```
+
+and every merge in `annotations/moderation/merges.json` (version 2) names its
+`datasetId`. Cellucid reads only the open dataset's section and merges, and
+publishing replaces only that dataset's part of a file; a contributor's other
+datasets are kept as they were. The dataset id is the dataset's identity id
+(the id its AnnData file states in `uns['cellucid']['id']`, else the stable id
+a data link gives a file, such as `cellxgene:<dataset id>`), the same whether
+the dataset was opened from a sample, a link, a server, a notebook or a local
+file.
+
 ## Bucket keys (Developer note)
 
-In `annotations/users/ghid_<id>.json`, the `suggestions` and `deletedSuggestions` maps are keyed by a **bucket key**:
+In a dataset's section of `annotations/users/ghid_<id>.json`, the `suggestions` and `deletedSuggestions` maps are keyed by a **bucket key**:
 
 - Format: `<fieldKey>:<categoryLabel>`
 - If `fieldKey` contains `:`, Cellucid encodes it as `fk~<urlencoded>` to keep the delimiter unambiguous.
@@ -175,9 +209,9 @@ repaired.
 
 Repository JSON must be UTF-8 without a byte-order mark. GitHub blob responses
 must use the API's `base64` encoding, and a truncated Git tree fails Pull rather
-than compiling only the returned prefix. Suggestion ids must remain globally
-unambiguous across contributors: the same id cannot identify suggestions owned
-by different users or stored in different buckets.
+than compiling only the returned prefix. Within one dataset, suggestion ids must
+remain unambiguous across contributors: the same id cannot identify suggestions
+owned by different users or stored in different buckets.
 
 Every active annotation JSON file has an exact maximum of **1,000,000 UTF-8
 bytes**, matching the GitHub Contents API boundary at which the complete

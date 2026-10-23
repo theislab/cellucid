@@ -48,6 +48,7 @@ export function collectDOMReferences(root) {
       sourceEl: byId('dataset-source'),
       descriptionEl: byId('dataset-description'),
       urlEl: byId('dataset-url'),
+      citationEl: byId('dataset-citation'),
       cellsEl: byId('dataset-cells'),
       genesEl: byId('dataset-genes'),
       obsEl: byId('dataset-obs'),
@@ -56,10 +57,10 @@ export function collectDOMReferences(root) {
       userDataBlock: byId('user-data-block'),
       userDataH5adBtn: byId('user-data-h5ad-btn'),
       userDataZarrArchiveBtn: byId('user-data-zarr-archive-btn'),
-      userDataBrowseBtn: byId('user-data-browse-btn'),
-      userDataFileInput: byId('user-data-file-input'),
       userDataH5adInput: byId('user-data-h5ad-input'),
       userDataZarrArchiveInput: byId('user-data-zarr-archive-input'),
+      userDataZarrFolderBtn: byId('user-data-zarr-folder-btn'),
+      userDataZarrFolderInput: byId('user-data-zarr-folder-input'),
       datasetDropOverlay: byId('dataset-drop-overlay'),
 
       remoteServerUrl: byId('remote-server-url'),
@@ -67,10 +68,12 @@ export function collectDOMReferences(root) {
       remoteDisconnectBtn: byId('remote-disconnect-btn'),
       remoteDisconnectContainer: byId('remote-disconnect-container'),
 
-      githubRepoUrl: byId('github-repo-url'),
-      githubConnectBtn: byId('github-connect-btn'),
-      githubDisconnectBtn: byId('github-disconnect-btn'),
-      githubDisconnectContainer: byId('github-disconnect-container'),
+      dataLinkUrl: byId('data-link-url'),
+      dataLinkConnectBtn: byId('data-link-connect-btn'),
+      dataLinkDisconnectBtn: byId('data-link-disconnect-btn'),
+      dataLinkDisconnectContainer: byId('data-link-disconnect-container'),
+      transfersBlock: byId('transfers-block'),
+      transfersList: byId('transfers-list'),
     },
 
     session: {
@@ -110,6 +113,10 @@ export function collectDOMReferences(root) {
       outlierFilterContainer: byId('outlier-filter-container'),
       outlierFilterInput: byId('outlier-filter'),
       outlierFilterDisplay: byId('outlier-filter-display'),
+      outlierFilterNote: byId('outlier-filter-note'),
+      outlierFilterProgress: byId('outlier-filter-progress'),
+      outlierFilterProgressBar: byId('outlier-filter-progress-bar'),
+      outlierFilterAction: byId('outlier-filter-action'),
 
       centroidControls: byId('centroid-controls'),
       centroidPointsCheckbox: byId('toggle-centroid-points'),

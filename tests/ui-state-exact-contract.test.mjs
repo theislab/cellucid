@@ -62,7 +62,7 @@ function residentLayoutManager(positions) {
         X_umap_2d: {
           label: 'UMAP',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: { key: 'X_umap', columns: [0, 1] },
         },
       },
@@ -117,6 +117,15 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
     Object.create(FieldOverlayInternalMethods.prototype),
     {
       _renameRegistry: {
+        getRevision() {
+          return 0;
+        },
+        editsSince() {
+          return [];
+        },
+        hasEntriesFor() {
+          return true;
+        },
         getDisplayKey(_source, originalKey) {
           return originalKey;
         },
@@ -125,6 +134,15 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
         },
       },
       _deleteRegistry: {
+        getRevision() {
+          return 0;
+        },
+        editsSince() {
+          return [];
+        },
+        hasEntriesFor() {
+          return true;
+        },
         isDeleted() {
           return false;
         },
@@ -442,9 +460,7 @@ test('continuous color metadata preserves constant domains and rejects impossibl
     },
   );
 
-  colorState.updateColorsContinuous(constantField, {
-    resetTransparency: false,
-  });
+  colorState.updateColorsContinuous(constantField);
 
   assert.deepEqual(constantField._continuousStats, { min: 5, max: 5 });
   assert.deepEqual(constantField._continuousFilter, { min: 5, max: 5 });
@@ -678,7 +694,7 @@ test('highlight selections require exact target-view transparency', () => {
       0,
       transparency,
     ),
-    [0, 3],
+    Uint32Array.of(0, 3),
   );
   assert.deepEqual(
     highlightStateMethods.getCellIndicesForRange.call(
@@ -688,7 +704,7 @@ test('highlight selections require exact target-view transparency', () => {
       3,
       transparency,
     ),
-    [1, 3],
+    Uint32Array.of(1, 3),
   );
 });
 
@@ -797,7 +813,6 @@ test('view restoration preserves exact null field inventories', () => {
     cellVisibilityMask: Uint8Array.from([1, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: 2, total: 2 },
     viewContexts: new Map(),
@@ -853,7 +868,6 @@ test('view switching moves cell masks between views and rejects invalid targets 
     cellVisibilityMask: Uint8Array.from([1, 1, 0, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: 3, total: pointCount },
     viewContexts: new Map(),
@@ -1489,7 +1503,6 @@ test('syncing the active view shares its per-cell arrays instead of copying them
     cellVisibilityMask: new Uint8Array(pointCount),
     centroidPositions: new Float32Array(3),
     centroidColors: new Uint8Array(4),
-    centroidOutliers: new Float32Array(1),
     centroidLabels: [],
     filteredCount: { shown: pointCount, total: pointCount },
     _cloneFieldState: viewContextCoreMethods._cloneFieldState,
@@ -1503,7 +1516,6 @@ test('syncing the active view shares its per-cell arrays instead of copying them
     'cellVisibilityMask',
     'centroidPositions',
     'centroidColors',
-    'centroidOutliers',
   ]) {
     assert.strictEqual(live[key], state[key], key);
   }

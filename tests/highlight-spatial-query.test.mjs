@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
+import { POINT_VISIBILITY_THRESHOLD } from '../assets/js/rendering/alpha-visibility.js';
 import {
-  findCellsInLasso,
-  findCellsInProximity,
-} from '../assets/js/rendering/highlight-renderer.js';
+  LassoHitTest,
+  ProximityHitTest,
+} from '../assets/js/rendering/selection-gesture-queries.js';
 import {
   findScreenSpacePick,
 } from '../assets/js/rendering/picking.js';
@@ -19,25 +20,86 @@ function identityMatrix() {
   return matrix;
 }
 
-const mat4 = {
-  create: identityMatrix,
-  multiply(out, left, right) {
-    const product = new Float32Array(16);
-    for (let column = 0; column < 4; column++) {
-      for (let row = 0; row < 4; row++) {
-        let value = 0;
-        for (let inner = 0; inner < 4; inner++) {
-          value +=
-            left[inner * 4 + row] *
-            right[column * 4 + inner];
-        }
-        product[column * 4 + row] = value;
+function makeViewport() {
+  return {
+    vpWidth: 160,
+    vpHeight: 120,
+    vpOffsetX: 25,
+    vpOffsetY: 15,
+    visibleOffsetX: 25,
+    visibleOffsetY: 15,
+    visibleWidth: 160,
+    visibleHeight: 120,
+  };
+}
+
+// The selection rules, written out cell by cell: the even-odd test over the
+// path's vertices in drawing order, on each drawn cell's projected
+// pane-local position.
+function referenceLasso({ path, mvp, viewport, transparency, positions, dimensionLevel }) {
+  if (path.length < 3) return [];
+  const local = path.map(point => ({
+    x: point.x - viewport.vpOffsetX,
+    y: point.y - viewport.vpOffsetY,
+  }));
+  const minX = viewport.visibleOffsetX - viewport.vpOffsetX;
+  const minY = viewport.visibleOffsetY - viewport.vpOffsetY;
+  const out = [];
+  for (let cell = 0; cell < transparency.length; cell++) {
+    if (!(transparency[cell] >= POINT_VISIBILITY_THRESHOLD)) continue;
+    const base = cell * dimensionLevel;
+    const px = positions[base];
+    const py = dimensionLevel > 1 ? positions[base + 1] : 0;
+    const pz = dimensionLevel > 2 ? positions[base + 2] : 0;
+    const clipX = mvp[0] * px + mvp[4] * py + mvp[8] * pz + mvp[12];
+    const clipY = mvp[1] * px + mvp[5] * py + mvp[9] * pz + mvp[13];
+    const clipZ = mvp[2] * px + mvp[6] * py + mvp[10] * pz + mvp[14];
+    const clipW = mvp[3] * px + mvp[7] * py + mvp[11] * pz + mvp[15];
+    if (Math.abs(clipW) < 1e-10) continue;
+    const ndcZ = clipZ / clipW;
+    if (ndcZ < -1 || ndcZ > 1) continue;
+    const x = (clipX / clipW + 1) * 0.5 * viewport.vpWidth;
+    const y = (1 - clipY / clipW) * 0.5 * viewport.vpHeight;
+    if (x < minX || x > minX + viewport.visibleWidth || y < minY || y > minY + viewport.visibleHeight) continue;
+    let inside = false;
+    for (let i = 0, j = local.length - 1; i < local.length; j = i++) {
+      const xi = local[i].x, yi = local[i].y;
+      const xj = local[j].x, yj = local[j].y;
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+        inside = !inside;
       }
     }
-    out.set(product);
-    return out;
-  },
-};
+    if (inside) out.push(cell);
+  }
+  return out;
+}
+
+function referenceProximity({ center, radius, transparency, positions, dimensionLevel }) {
+  if (radius === 0) return [];
+  const out = [];
+  for (let cell = 0; cell < transparency.length; cell++) {
+    if (!(transparency[cell] >= POINT_VISIBILITY_THRESHOLD)) continue;
+    const base = cell * dimensionLevel;
+    const dx = positions[base] - center[0];
+    const dy = (dimensionLevel > 1 ? positions[base + 1] : 0) - center[1];
+    const dz = (dimensionLevel > 2 ? positions[base + 2] : 0) - center[2];
+    if (dx * dx + dy * dy + dz * dz <= radius * radius) out.push(cell);
+  }
+  return out;
+}
+
+function lassoHits({ path, mvp, viewport, transparency, positions, dimensionLevel }) {
+  const lasso = new LassoHitTest({
+    positions,
+    dimensionLevel,
+    transparency,
+    mvpMatrix: mvp,
+    viewport,
+  });
+  lasso.prepare(Infinity);
+  for (const point of path) lasso.appendVertex(point.x, point.y);
+  return lasso.hits().toArray();
+}
 
 function makeSpatialIndex(
   positions,
@@ -56,49 +118,7 @@ function makeSpatialIndex(
   );
 }
 
-function makeViewport(projectionMatrix = identityMatrix()) {
-  return {
-    viewId: 'pane',
-    vpWidth: 160,
-    vpHeight: 120,
-    vpOffsetX: 25,
-    vpOffsetY: 15,
-    vpLocalX: 0,
-    vpLocalY: 0,
-    visibleOffsetX: 25,
-    visibleOffsetY: 15,
-    visibleWidth: 160,
-    visibleHeight: 120,
-    vpAspect: 4 / 3,
-    projectionCenterNdcX: 0,
-    projectionMatrix,
-    effectiveViewMatrix: identityMatrix(),
-    cameraForward: Float32Array.from([0, 0, -1]),
-    cameraTargetRadius: 2,
-  };
-}
-
-function makeLassoContext(projectionMatrix = identityMatrix()) {
-  return {
-    viewId: 'pane',
-    viewport: makeViewport(projectionMatrix),
-    viewMatrix: identityMatrix(),
-  };
-}
-
-function sortedIds(values) {
-  return [...values].sort((left, right) => left - right);
-}
-
-function assertExactSetParity(direct, indexed) {
-  // Direct traversal happens to be ascending. Indexed traversal is
-  // intentionally spatial and therefore has no public ordering contract.
-  assert.deepEqual(direct, sortedIds(direct));
-  assert.equal(new Set(indexed).size, indexed.length);
-  assert.deepEqual(sortedIds(indexed), direct);
-}
-
-test('indexed lasso and proximity match direct selection in every dimension', () => {
+test('lasso and proximity queries answer every move exactly as the cell-by-cell rule', () => {
   let randomState = 0x51f15e;
   const random = () => {
     randomState = (
@@ -108,7 +128,7 @@ test('indexed lasso and proximity match direct selection in every dimension', ()
   };
 
   for (const dimensionLevel of [1, 2, 3]) {
-    const pointCount = 8192;
+    const pointCount = 40_000;
     // Exactly `dimensionLevel` components per cell.
     const positions = new Float32Array(pointCount * dimensionLevel);
     const transparency = new Uint8Array(pointCount);
@@ -119,89 +139,98 @@ test('indexed lasso and proximity match direct selection in every dimension', ()
         positions[offset + axis] =
           random() * axisRange[axis][0] + axisRange[axis][1];
       }
-      transparency[cellIndex] =
-        cellIndex % 17 === 0
-          ? 0
-          : (
-              cellIndex % 19 === 0
-                ? Math.fround(0.009)
-                : (
-                    cellIndex % 23 === 0
-                      ? Math.fround(0.01)
-                      : 1
-                  )
-            );
+      transparency[cellIndex] = cellIndex % 17 === 0 ? 0 : 1;
     }
-    const spatialIndex = makeSpatialIndex(
+    // A cell without a position is never selected.
+    positions[3 * dimensionLevel] = Number.NaN;
+
+    const center = [0.1, -0.15, 0.05];
+    const proximity = new ProximityHitTest({
       positions,
       dimensionLevel,
-    );
+      transparency,
+      center,
+    });
+    proximity.setRadius(0.42);
+    // A past deadline: one chunk of the pass a call.
+    let slices = 1;
+    while (!proximity.prepare(0)) slices++;
+    assert.ok(slices > 2, 'the distance pass runs in slices');
+    // Growing, shrinking, zero and covering-everything radii, and radii that
+    // land exactly on a cell's distance.
+    const onCell = cell => {
+      const base = cell * dimensionLevel;
+      const dx = positions[base] - center[0];
+      const dy = (dimensionLevel > 1 ? positions[base + 1] : 0) - center[1];
+      const dz = (dimensionLevel > 2 ? positions[base + 2] : 0) - center[2];
+      return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    for (const radius of [0.42, 0.43, 1.7, 0.2, 0, 9, onCell(11), onCell(12345), 0.05]) {
+      proximity.setRadius(radius);
+      assert.deepEqual(
+        proximity.hits().toArray(),
+        referenceProximity({ center, radius, transparency, positions, dimensionLevel }),
+        `${dimensionLevel}D proximity at ${radius}`
+      );
+    }
 
-    const directProximityStats = {};
-    const directProximity = findCellsInProximity({
-      transparencyArray: transparency,
-      centerPos: [0.1, -0.15, 0.05],
-      radius3D: 0.42,
-      viewPositions: positions,
-      dimensionLevel,
-      queryStats: directProximityStats,
+    const viewport = makeViewport();
+    const mvp = identityMatrix();
+    // Pane-local cell positions, so vertices can sit exactly on cells.
+    const cellOnPane = cell => ({
+      x: (positions[cell * dimensionLevel] + 1) * 0.5 * 160 + 25,
+      y: (1 - (dimensionLevel > 1 ? positions[cell * dimensionLevel + 1] : 0)) * 0.5 * 120 + 15,
     });
-    const indexedProximityStats = {};
-    const indexedProximity = findCellsInProximity({
-      transparencyArray: transparency,
-      centerPos: [0.1, -0.15, 0.05],
-      radius3D: 0.42,
-      viewPositions: positions,
-      dimensionLevel,
-      spatialIndex,
-      queryStats: indexedProximityStats,
-    });
-    assertExactSetParity(directProximity, indexedProximity);
-    assert.equal(
-      directProximityStats.examinedPointCount,
-      pointCount,
-    );
-    assert.ok(
-      indexedProximityStats.examinedPointCount <= pointCount,
-    );
-
-    const lassoPath = [
-      { x: 73, y: 40 },
-      { x: 131, y: 37 },
-      { x: 146, y: 72 },
-      { x: 112, y: 104 },
-      { x: 66, y: 83 },
-    ];
-    const directLassoStats = {};
-    const directLasso = findCellsInLasso({
-      lassoPath,
-      lassoViewContext: makeLassoContext(),
-      mat4,
-      modelMatrix: identityMatrix(),
-      transparencyArray: transparency,
-      viewPositions: positions,
-      dimensionLevel,
-      queryStats: directLassoStats,
-    });
-    const indexedLassoStats = {};
-    const indexedLasso = findCellsInLasso({
-      lassoPath,
-      lassoViewContext: makeLassoContext(),
-      mat4,
-      modelMatrix: identityMatrix(),
-      transparencyArray: transparency,
-      viewPositions: positions,
-      dimensionLevel,
-      spatialIndex,
-      queryStats: indexedLassoStats,
-    });
-    assertExactSetParity(directLasso, indexedLasso);
-    assert.equal(directLassoStats.examinedPointCount, pointCount);
-    assert.ok(indexedLassoStats.examinedPointCount <= pointCount);
+    const paths = {
+      convex: [{ x: 73, y: 40 }, { x: 131, y: 37 }, { x: 146, y: 72 }, { x: 112, y: 104 }, { x: 66, y: 83 }],
+      // A figure eight and a pentagram cross themselves.
+      figureEight: Array.from({ length: 120 }, (_, index) => {
+        const angle = 2 * Math.PI * index / 120;
+        return { x: 105 + 70 * Math.sin(angle), y: 75 + 70 * Math.sin(angle) * Math.cos(angle) };
+      }),
+      pentagram: Array.from({ length: 5 }, (_, index) => {
+        const angle = 4 * Math.PI * index / 5;
+        return { x: 105 + 55 * Math.cos(angle), y: 75 + 55 * Math.sin(angle) };
+      }),
+      // Vertices on cells, and a horizontal edge through a cell.
+      onCells: [cellOnPane(5), cellOnPane(6), cellOnPane(7), cellOnPane(8), cellOnPane(9)],
+      horizontal: [
+        { x: 30, y: cellOnPane(21).y }, { x: 180, y: cellOnPane(21).y },
+        { x: 180, y: 130 }, { x: 30, y: 130 },
+      ],
+      // Partly beyond the presented pane.
+      offPane: [{ x: 150, y: 10 }, { x: 260, y: 30 }, { x: 240, y: 160 }, { x: 140, y: 120 }],
+    };
+    for (const [name, path] of Object.entries(paths)) {
+      const lasso = new LassoHitTest({
+        positions,
+        dimensionLevel,
+        transparency,
+        mvpMatrix: mvp,
+        viewport,
+      });
+      lasso.appendVertex(path[0].x, path[0].y);
+      while (!lasso.prepare(0));
+      for (let count = 1; count < path.length; count++) {
+        lasso.appendVertex(path[count].x, path[count].y);
+        assert.deepEqual(
+          lasso.hits().toArray(),
+          referenceLasso({
+            path: path.slice(0, count + 1),
+            mvp,
+            viewport,
+            transparency,
+            positions,
+            dimensionLevel,
+          }),
+          `${dimensionLevel}D ${name} lasso after ${count + 1} vertices`
+        );
+      }
+    }
   }
 });
 
-test('radius traversal is cap-free and visits every candidate ID at most once', () => {
+test('proximity selection has no cap and holds every cell once', () => {
   const pointCount = 513;
   const positions = new Float32Array(pointCount * 3);
   const transparency = new Uint8Array(pointCount).fill(1);
@@ -211,26 +240,21 @@ test('radius traversal is cap-free and visits every candidate ID at most once', 
     positions[offset + 1] = (cellIndex % 7) * 0.0001;
     positions[offset + 2] = (cellIndex % 5) * 0.0001;
   }
-  const spatialIndex = makeSpatialIndex(positions, 3, 4);
-  const queryStats = {};
-  const selected = findCellsInProximity({
-    transparencyArray: transparency,
-    centerPos: [0, 0, 0],
-    radius3D: 0.01,
-    viewPositions: positions,
+  const proximity = new ProximityHitTest({
+    positions,
     dimensionLevel: 3,
-    spatialIndex,
-    queryStats,
+    transparency,
+    center: [0, 0, 0],
   });
-
+  proximity.prepare(Infinity);
+  proximity.setRadius(0.01);
+  const selected = proximity.hits().toArray();
   assert.equal(selected.length, pointCount);
   assert.equal(new Set(selected).size, pointCount);
-  assert.equal(queryStats.examinedPointCount, pointCount);
 });
 
-test('projected traversal is conservative across clip-W and near-plane adversaries', () => {
-  // clipW=z. Negative-W points reverse screen inequalities and a node spanning
-  // z=0 cannot safely use ordinary frustum rejection.
+test('the lasso projection is exact across clip-W and near-plane adversaries', () => {
+  // clipW=z. Negative-W points reverse screen inequalities.
   const projection = identityMatrix();
   projection[11] = 1;
   projection[15] = 0;
@@ -250,54 +274,31 @@ test('projected traversal is conservative across clip-W and near-plane adversari
   ]);
   const transparency = Uint8Array.from([
     1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, Math.fround(0.009),
+    1, 1, 1, 1, 1, 0,
   ]);
-  const lassoPath = [
+  const path = [
     { x: 85, y: 55 },
     { x: 125, y: 55 },
     { x: 125, y: 95 },
     { x: 85, y: 95 },
   ];
-
-  // Clip-W adversaries need a z coordinate, which only a 3D embedding has;
-  // 1D and 2D positions carry no z component at all.
-  for (const dimensionLevel of [3]) {
-    const spatialIndex = makeSpatialIndex(
-      positions,
-      dimensionLevel,
-      1,
-    );
-    const direct = findCellsInLasso({
-      lassoPath,
-      lassoViewContext: makeLassoContext(projection),
-      mat4,
-      modelMatrix: identityMatrix(),
-      transparencyArray: transparency,
-      viewPositions: positions,
-      dimensionLevel: 3,
-    });
-    const queryStats = {};
-    const indexed = findCellsInLasso({
-      lassoPath,
-      lassoViewContext: makeLassoContext(projection),
-      mat4,
-      modelMatrix: identityMatrix(),
-      transparencyArray: transparency,
-      viewPositions: positions,
-      dimensionLevel: 3,
-      spatialIndex,
-      queryStats,
-    });
-    assertExactSetParity(direct, indexed);
-    assert.ok(queryStats.examinedPointCount <= positions.length / 3);
-    assert.ok(direct.includes(0), 'negative clip-W point remains selectable');
-    assert.ok(direct.includes(1), 'positive clip-W point remains selectable');
-    assert.ok(!direct.includes(6), 'clip-W singularity is rejected exactly');
-    assert.ok(!direct.includes(7), 'negative clip-W singularity is rejected exactly');
-  }
+  const query = {
+    path,
+    mvp: projection,
+    viewport: makeViewport(),
+    transparency,
+    positions,
+    dimensionLevel: 3,
+  };
+  const selected = lassoHits(query);
+  assert.deepEqual(selected, referenceLasso(query));
+  assert.ok(selected.includes(0), 'negative clip-W point remains selectable');
+  assert.ok(selected.includes(1), 'positive clip-W point remains selectable');
+  assert.ok(!selected.includes(6), 'clip-W singularity is rejected exactly');
+  assert.ok(!selected.includes(7), 'negative clip-W singularity is rejected exactly');
 });
 
-test('same-size spatial indexes from another position owner are rejected', () => {
+test('picking rejects a same-size spatial index from another position owner', () => {
   const positions = Float32Array.from([
     0, 0, 0,
     0.1, 0.1, 0.1,
@@ -309,34 +310,6 @@ test('same-size spatial indexes from another position owner are rejected', () =>
   const transparency = Uint8Array.of(1, 1);
   const wrongIndex = makeSpatialIndex(wrongPositions, 3, 1);
 
-  assert.throws(
-    () => findCellsInProximity({
-      transparencyArray: transparency,
-      centerPos: [0, 0, 0],
-      radius3D: 1,
-      viewPositions: positions,
-      dimensionLevel: 3,
-      spatialIndex: wrongIndex,
-    }),
-    /exact matching spatial owner/,
-  );
-  assert.throws(
-    () => findCellsInLasso({
-      lassoPath: [
-        { x: 70, y: 50 },
-        { x: 120, y: 50 },
-        { x: 120, y: 100 },
-      ],
-      lassoViewContext: makeLassoContext(),
-      mat4,
-      modelMatrix: identityMatrix(),
-      transparencyArray: transparency,
-      viewPositions: positions,
-      dimensionLevel: 3,
-      spatialIndex: wrongIndex,
-    }),
-    /exact matching spatial owner/,
-  );
   assert.throws(
     () => findScreenSpacePick({
       dimension: 3,
@@ -361,32 +334,29 @@ test('lasso and proximity admit exactly the cells the shader draws', () => {
     -0.01, 0, 0,
   ]);
   const transparency = Uint8Array.from([0, 1, 0]);
-  const spatialIndex = makeSpatialIndex(positions, 3, 1);
 
-  const proximity = findCellsInProximity({
-    transparencyArray: transparency,
-    centerPos: [0, 0, 0],
-    radius3D: 1,
-    viewPositions: positions,
+  const proximity = new ProximityHitTest({
+    positions,
     dimensionLevel: 3,
-    spatialIndex,
+    transparency,
+    center: [0, 0, 0],
   });
-  const lasso = findCellsInLasso({
-    lassoPath: [
+  proximity.prepare(Infinity);
+  proximity.setRadius(1);
+  const lasso = lassoHits({
+    path: [
       { x: 80, y: 55 },
       { x: 130, y: 55 },
       { x: 130, y: 100 },
       { x: 80, y: 100 },
     ],
-    lassoViewContext: makeLassoContext(),
-    mat4,
-    modelMatrix: identityMatrix(),
-    transparencyArray: transparency,
-    viewPositions: positions,
+    mvp: identityMatrix(),
+    viewport: makeViewport(),
+    transparency,
+    positions,
     dimensionLevel: 3,
-    spatialIndex,
   });
 
-  assert.deepEqual(proximity, [1]);
+  assert.deepEqual(proximity.hits().toArray(), [1]);
   assert.deepEqual(lasso, [1]);
 });

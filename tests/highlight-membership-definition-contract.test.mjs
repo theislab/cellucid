@@ -54,14 +54,18 @@ function createPage(id, groups) {
   return { id, name: id, color: '#ff0000', highlightedGroups: groups };
 }
 
+/** A group holds its cells as a Uint32Array (a cell list once validated). */
 function createGroup(id, cellIndices, enabled = true) {
+  const cells = cellIndices instanceof Uint32Array
+    ? cellIndices
+    : Uint32Array.from(cellIndices);
   return {
     id,
     type: 'lasso',
     label: id,
     enabled,
-    cellIndices,
-    cellCount: cellIndices.length,
+    cellIndices: cells,
+    cellCount: cells.length,
   };
 }
 
@@ -211,10 +215,10 @@ test('a preview cell outside the dataset stops the publication instead of vanish
   });
 
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, 4, 8]),
+    () => state.setPreviewHighlightFromIndices(Uint32Array.of(2, 4, 8)),
     (error) => (
       error instanceof RangeError
-      && /Preview highlight cell index 8 is outside the current dataset of 8 cells/
+      && /Preview highlight cell list must be ascending and inside the current dataset of 8 cells/
         .test(error.message)
     ),
     'a preview cell from another dataset must be reported, not dropped'
@@ -222,17 +226,19 @@ test('a preview cell outside the dataset stops the publication instead of vanish
   assert.equal(publications.length, 0);
 
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, -1]),
-    RangeError
+    () => state.setPreviewHighlightFromIndices(Uint32Array.of(4, 2)),
+    RangeError,
+    'a preview is a cell list: ascending, so every cell once'
   );
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, 1.5]),
-    RangeError
+    () => state.setPreviewHighlightFromIndices([2, 4]),
+    TypeError,
+    'a preview is a cell list, never a plain array'
   );
   assert.throws(
     () => state.setPreviewHighlightFromIndices(new Set([1, 2])),
     TypeError,
-    'only an indexed cell collection can be a preview'
+    'only a cell list can be a preview'
   );
 });
 
@@ -246,7 +252,7 @@ test('a preview publishes the active page underneath the in-progress selection',
     ])],
   });
 
-  state.setPreviewHighlightFromIndices([1, 4, 5]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(1, 4, 5));
   const publication = publications.at(-1);
 
   assert.deepEqual(publication.painted, [0, 1, 4, 5]);
@@ -289,7 +295,7 @@ test('combining pages reads the same membership the pages render', () => {
     [...union.highlightedGroups[0].cellIndices],
     [1, 2, 3, 4, 7],
     'a disabled group contributes to neither the count nor the combination; '
-    + 'the union lists page 1 first, then what page 2 adds'
+    + 'the union is a cell list: every cell once, ascending'
   );
   assert.equal(union.highlightedGroups[0].cellCount, 5);
   assert.ok(
@@ -370,11 +376,11 @@ test('a preview replaces the previous preview instead of accumulating it', () =>
     pages: [createPage('page_1', [createGroup('highlight_1', [0])])],
   });
 
-  state.setPreviewHighlightFromIndices([2, 3, 4, 5]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(2, 3, 4, 5));
   assert.deepEqual(publications.at(-1).painted, [0, 2, 3, 4, 5]);
 
   // The same gesture, now subtracting 4 and 5 from its candidates.
-  state.setPreviewHighlightFromIndices([2, 3]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(2, 3));
   assert.deepEqual(
     publications.at(-1).painted,
     [0, 2, 3],

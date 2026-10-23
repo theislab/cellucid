@@ -33,7 +33,6 @@ function viewContext(id) {
     cellVisibilityMask: Uint8Array.from([1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: 1, total: 1 }
   };
@@ -64,7 +63,6 @@ function makeState(initialMode) {
     categoryTransparency: Uint8Array.from([1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: 1, total: 1 },
     activeDimensionLevel: 2,

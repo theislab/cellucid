@@ -12,6 +12,7 @@
  */
 
 import { cloneCameraState } from '../camera-state-contract.js';
+import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../position-layout.js';
 import {
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   isViewerBackground
@@ -125,22 +126,22 @@ function assertExactFloat32Array(value, expectedLength, label) {
 }
 
 /**
- * Float32 arrays already proven finite. A published positions or centroid
- * array is never written after publication, so it is scanned once, the
- * first time it is published: a representation switch back to a layout the
- * viewer has shown costs no O(N) pass (a full scan is 30-60 ms at 10M 3D).
+ * A published positions or centroid array is never written after
+ * publication, so it is proven finite once: scanned the first time it is
+ * published, or already proven where it was made (an embedding the reader
+ * worker checked, `publishPositionBounds`). A representation switch back to
+ * a layout the viewer has shown costs no O(N) pass (a full scan is 30-60 ms
+ * at 10M 3D).
  */
-const PROVEN_FINITE_FLOAT32_ARRAYS = new WeakSet();
-
 function assertFiniteFloat32Array(value, expectedLength, label) {
   const exact = assertExactFloat32Array(value, expectedLength, label);
-  if (PROVEN_FINITE_FLOAT32_ARRAYS.has(exact)) return exact;
+  if (isProvenFiniteFloat32Array(exact)) return exact;
   for (let index = 0; index < exact.length; index += 1) {
     if (!Number.isFinite(exact[index])) {
       throw new RangeError(`${label} value ${index} must be finite.`);
     }
   }
-  PROVEN_FINITE_FLOAT32_ARRAYS.add(exact);
+  markProvenFiniteFloat32Array(exact);
   return exact;
 }
 

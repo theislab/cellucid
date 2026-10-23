@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataState } from '../assets/js/app/state/core/data-state.js';
-import { createInMemoryDimensionManager } from '../assets/js/data/dimension-manager.js';
+import {
+  createInMemoryAnnDataDimensionManager,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 import {
   capture as captureCoreState
 } from '../assets/js/app/session/contributors/core-state.js';
@@ -27,6 +30,8 @@ function twoViewState() {
   const state = new DataState(permissiveViewer, null);
   state.pointCount = 2;
   state.cellVisibilityMask = new Uint8Array([1, 1]);
+  state.categoryTransparency = new Uint8Array([1, 1]);
+  state.colorsArray = new Uint8Array(8);
   state.obsData = {
     fields: [
       { key: 'leiden', kind: 'category', categories: ['a', 'b'], codes: new Uint16Array([0, 1]), loaded: true },
@@ -35,21 +40,13 @@ function twoViewState() {
   };
   state.varData = { fields: [] };
   // One 3D representation, shown by every view.
-  const dimensionManager = createInMemoryDimensionManager({
+  const dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: new Float32Array(6),
     dimension: 3
   });
   state.setDimensionManager(dimensionManager);
   state.publishDatasetMapping({
-    mapping: {
-      kind: 'export',
-      embeddings: {
-        enabled: [{ key: '3d', columns: null }],
-        defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } }
-      },
-      geneNames: 'index',
-      vectorFields: []
-    },
+    mapping: inMemoryAnnDataMapping(),
     candidates: null,
     origin: 'default'
   });
@@ -84,7 +81,8 @@ function captureWith(state, activeId) {
           fieldKind: 'category',
           meta: { filtersText: [] }
         }],
-        getViewCameraState: () => cameraState()
+        getViewCameraState: () => cameraState(),
+        getCentroidFlags: () => ({ points: false, labels: false })
       },
       sidebar: { querySelectorAll: () => [] }
     });
@@ -127,8 +125,8 @@ test('saving while a kept view is selected records the live view as the live vie
     });
     assert.deepEqual(payload.multiview.snapshots[0].filters, {});
     // Each view records the representation it shows.
-    assert.deepEqual(payload.liveEmbedding, { key: '3d', columns: null });
-    assert.deepEqual(payload.multiview.snapshots[0].embedding, { key: '3d', columns: null });
+    assert.deepEqual(payload.liveEmbedding, { key: 'X_umap', columns: [0, 1, 2] });
+    assert.deepEqual(payload.multiview.snapshots[0].embedding, { key: 'X_umap', columns: [0, 1, 2] });
   }
 });
 

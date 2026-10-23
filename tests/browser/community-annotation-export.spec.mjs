@@ -1,7 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { readFile } from 'node:fs/promises';
 
-import { EXPORTS_BASE_URL as FIXTURE_ROOT } from './helpers/origins.mjs';
+import { SAMPLE_CATALOG_URL as FIXTURE_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('consensus snapshot downloads once and reports the exact success', async ({
@@ -27,15 +27,15 @@ test('consensus snapshot downloads once and reports the exact success', async ({
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(FIXTURE_ROOT)}` +
-      '&dataset=current-ui-prepared' +
+    `/?sampleCatalog=${encodeURIComponent(FIXTURE_ROOT)}` +
+      '&dataset=current-ui' +
       '&annotations=theislab%2Fcellucid-annotation%40main' +
       '&acceptance=community-consensus-export',
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.getByText('Community annotation', { exact: true }).click();
   await page.getByRole('button', {

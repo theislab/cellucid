@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=info-popovers-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=info-popovers-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -43,7 +43,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   await page.locator('#theme-select').selectOption('dark');

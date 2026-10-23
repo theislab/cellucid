@@ -1,6 +1,17 @@
 /**
  * @fileoverview Exact multiview snapshot graph restoration.
  *
+ * A session records, per view, only what the person chose: its embedding,
+ * camera, active field, filters and centroid toggles. Labels and filter
+ * summaries are derived from those and recomputed when the view is rebuilt.
+ *
+ * Restore replays each kept view once on the live view and publishes it, then
+ * applies the live view's own state last. Each view therefore costs one filter
+ * application, one colour pass and one embedding switch; nothing is reset to
+ * a base state in between, because every replay applies a complete state (the
+ * filter restore clears every field first, and the active field and embedding
+ * are set explicitly).
+ *
  * @module state-serializer/multiview
  */
 
@@ -17,36 +28,35 @@ import {
   assertActiveFieldsState,
   validateActiveFieldsForState
 } from './active-fields.js';
-import { validateFiltersForState } from './filters.js';
+import { readFieldInventory, validateFiltersForState } from './filters.js';
 import {
   assertArray,
   assertBoolean,
   assertExactKeys,
   assertNonEmptyString,
-  assertNullableString,
   assertPlainRecord,
   requireMethod
 } from '../session/schema-contract.js';
 import { requireRepresentationRef } from '../../data/dimension-manager.js';
+import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
 
 const MULTIVIEW_KEYS = [
   'layout',
   'camerasLocked',
-  'liveCameraState',
+  'live',
   'snapshots'
 ];
 const LAYOUT_KEYS = ['mode', 'activeId', 'liveViewHidden'];
+const LIVE_KEYS = ['cameraState', 'centroids'];
 const SNAPSHOT_KEYS = [
   'id',
-  'label',
-  'fieldKey',
-  'fieldKind',
-  'meta',
   'embedding',
   'cameraState',
   'activeFields',
-  'filters'
+  'filters',
+  'centroids'
 ];
+const CENTROID_KEYS = ['points', 'labels'];
 
 function assertSnapshotId(value, context) {
   const id = assertNonEmptyString(value, context);
@@ -56,20 +66,24 @@ function assertSnapshotId(value, context) {
   return id;
 }
 
-function assertSnapshotMeta(meta, context) {
-  assertExactKeys(meta, ['filtersText'], context);
-  assertArray(meta.filtersText, `${context} filtersText`);
-  for (const line of meta.filtersText) {
-    if (typeof line !== 'string') {
-      throw new TypeError(`${context} filtersText entries must be strings.`);
-    }
-  }
+export function assertCentroidFlags(value, context) {
+  assertExactKeys(value, CENTROID_KEYS, context);
+  assertBoolean(value.points, `${context} points`);
+  assertBoolean(value.labels, `${context} labels`);
+  return value;
 }
 
-export function assertMultiviewState(state, multiview) {
+/**
+ * @param {object} state
+ * @param {unknown} multiview
+ * @param {ReturnType<typeof readFieldInventory>} [inventory]
+ */
+export function assertMultiviewState(state, multiview, inventory = null) {
   assertExactKeys(multiview, MULTIVIEW_KEYS, 'Multiview session state');
   assertBoolean(multiview.camerasLocked, 'Multiview camerasLocked');
-  assertCameraState(multiview.liveCameraState, 'Multiview live camera state');
+  assertExactKeys(multiview.live, LIVE_KEYS, 'Multiview live view');
+  assertCameraState(multiview.live.cameraState, 'Multiview live camera state');
+  assertCentroidFlags(multiview.live.centroids, 'Multiview live centroids');
   assertExactKeys(multiview.layout, LAYOUT_KEYS, 'Multiview layout');
   if (multiview.layout.mode !== 'single' && multiview.layout.mode !== 'grid') {
     throw new TypeError('Multiview layout mode must be "single" or "grid".');
@@ -81,6 +95,7 @@ export function assertMultiviewState(state, multiview) {
   assertBoolean(multiview.layout.liveViewHidden, 'Multiview layout liveViewHidden');
   assertArray(multiview.snapshots, 'Multiview snapshots');
 
+  const fieldInventory = inventory ?? readFieldInventory(state);
   const snapshotIds = new Set();
   for (let index = 0; index < multiview.snapshots.length; index++) {
     const snapshot = multiview.snapshots[index];
@@ -91,28 +106,13 @@ export function assertMultiviewState(state, multiview) {
       throw new TypeError(`Multiview snapshot id "${snapshotId}" is duplicated.`);
     }
     snapshotIds.add(snapshotId);
-    assertNonEmptyString(snapshot.label, `${context} label`);
-    assertNullableString(snapshot.fieldKey, `${context} fieldKey`);
-    if (
-      snapshot.fieldKind !== null
-      && snapshot.fieldKind !== 'category'
-      && snapshot.fieldKind !== 'continuous'
-    ) {
-      throw new TypeError(`${context} fieldKind must be category, continuous, or null.`);
-    }
-    if ((snapshot.fieldKey === null) !== (snapshot.fieldKind === null)) {
-      throw new TypeError(`${context} fieldKey and fieldKind must both be null or both be present.`);
-    }
-    assertSnapshotMeta(snapshot.meta, `${context} meta`);
     requireRepresentationRef(snapshot.embedding);
     assertCameraState(snapshot.cameraState, `${context} camera state`);
     assertActiveFieldsState(snapshot.activeFields);
-    if (snapshot.activeFields.activeFieldKey !== snapshot.fieldKey) {
-      throw new TypeError(`${context} active field identity does not match its descriptor.`);
-    }
     assertPlainRecord(snapshot.filters, `${context} filters`);
-    validateActiveFieldsForState(state, snapshot.activeFields);
-    validateFiltersForState(state, snapshot.filters);
+    assertCentroidFlags(snapshot.centroids, `${context} centroids`);
+    validateActiveFieldsForState(state, snapshot.activeFields, fieldInventory);
+    validateFiltersForState(state, snapshot.filters, fieldInventory);
   }
 
   if (activeId !== 'live' && !snapshotIds.has(activeId)) {
@@ -126,12 +126,22 @@ export function assertMultiviewState(state, multiview) {
   return multiview;
 }
 
+/**
+ * The camera of the view a multiview record focuses.
+ * @param {object} multiview - A validated multiview record.
+ * @returns {object}
+ */
+export function focusedCameraState(multiview) {
+  const activeId = multiview.layout.activeId;
+  if (activeId === 'live') return multiview.live.cameraState;
+  return multiview.snapshots.find(snapshot => snapshot.id === activeId).cameraState;
+}
+
 function requireRestoreOwners({
   state,
   viewer,
   restoreFilters,
-  restoreActiveFields,
-  pushViewerState
+  restoreActiveFields
 }) {
   if (state === null || typeof state !== 'object') {
     throw new TypeError('Multiview restore requires the current DataState owner.');
@@ -141,7 +151,7 @@ function requireRestoreOwners({
   }
   for (const method of [
     'applySnapshotConfigToView',
-    'captureCurrentContext',
+    'beginBatch',
     'createViewFromSource',
     'getActiveViewId',
     'getDimensionManager',
@@ -149,12 +159,10 @@ function requireRestoreOwners({
     'getViewDimensionLevel',
     'getViewEmbeddingRef',
     'getViewLayoutKey',
+    'endBatch',
     'removeView',
-    'restoreContext',
     'restoreViewEmbedding',
     'setActiveView',
-    'setViewRepresentation',
-    'viewFollowsDefault',
     'syncSnapshotContexts'
   ]) {
     requireMethod(state, method, 'Multiview DataState owner');
@@ -170,6 +178,8 @@ function requireRestoreOwners({
     'setCameraState',
     'setCamerasLocked',
     'setLiveViewHidden',
+    'setShowCentroidLabels',
+    'setShowCentroidPoints',
     'setViewLayout',
     'setViewCameraState'
   ]) {
@@ -177,8 +187,7 @@ function requireRestoreOwners({
   }
   for (const [fn, context] of [
     [restoreFilters, 'Multiview restoreFilters'],
-    [restoreActiveFields, 'Multiview restoreActiveFields'],
-    [pushViewerState, 'Multiview pushViewerState']
+    [restoreActiveFields, 'Multiview restoreActiveFields']
   ]) {
     if (typeof fn !== 'function') {
       throw new TypeError(`${context} must be a function.`);
@@ -186,22 +195,29 @@ function requireRestoreOwners({
   }
 }
 
-export async function restoreMultiview(owners, multiview) {
+function applyCentroidFlags(viewer, viewId, flags) {
+  viewer.setShowCentroidPoints(flags.points, viewId);
+  viewer.setShowCentroidLabels(flags.labels, viewId);
+}
+
+/**
+ * Rebuild the saved view graph: every kept view, then the live view.
+ *
+ * @param {{state: object, viewer: object, restoreFilters: (filters: object) => Promise<unknown>, restoreActiveFields: (activeFields: object) => Promise<unknown>}} owners
+ * @param {object} multiview - The saved multiview record.
+ * @param {{embedding: object, filters: object, activeFields: object}} live -
+ *   The live view's own state, applied after the kept views.
+ */
+export async function restoreMultiview(owners, multiview, live) {
   assertMultiviewState(owners.state, multiview);
   requireRestoreOwners(owners);
+  assertExactKeys(live, ['embedding', 'filters', 'activeFields'], 'Multiview live state');
   const {
     state,
     viewer,
     restoreFilters,
-    restoreActiveFields,
-    pushViewerState
+    restoreActiveFields
   } = owners;
-  const dimensionManager = state.getDimensionManager();
-  requireMethod(
-    dimensionManager,
-    'getViewLayout',
-    'Multiview dimension owner'
-  );
 
   // The graph rollback returns the live view to where this restore found it.
   // That pose is reachable by construction — the viewer reported it — whereas
@@ -212,53 +228,6 @@ export async function restoreMultiview(owners, multiview) {
     viewer.getViewCameraState('live'),
     'Live camera state before multiview restore'
   );
-
-  clearPublishedSnapshotViews({ state, viewer });
-  viewer.setCamerasLocked(multiview.camerasLocked);
-  viewer.setViewCameraState('live', multiview.liveCameraState);
-  pushViewerState();
-
-  const baseContext = state.captureCurrentContext();
-  if (baseContext === null || typeof baseContext !== 'object') {
-    throw new TypeError('Multiview captureCurrentContext() must return an object.');
-  }
-  // The live view's representation, and whether it follows its dimension's
-  // default, are what the replay below changes; they come back with it.
-  const baseLayoutKey = state.getViewLayoutKey('live');
-  const baseFollowsDefault = state.viewFollowsDefault('live');
-  const idMap = new Map();
-  const createdIds = new Set();
-
-  async function restoreBaseContext() {
-    if (state.getActiveViewId() !== 'live') {
-      const activeResult = state.setActiveView('live');
-      if (activeResult !== 'live') {
-        throw new Error(
-          'Multiview base-context restoration could not reactivate the live view.'
-        );
-      }
-    }
-    await state.setViewRepresentation('live', baseLayoutKey, {
-      followsDefault: baseFollowsDefault
-    });
-    state.restoreContext(baseContext);
-    if (state.getActiveViewId() !== 'live') {
-      throw new Error(
-        'Multiview base-context restoration must reactivate the live view.'
-      );
-    }
-    const restoredLayouts = [
-      state.getViewLayoutKey('live'),
-      dimensionManager.getViewLayout('live'),
-      viewer.getViewLayoutKey('live')
-    ];
-    if (restoredLayouts.some(layoutKey => layoutKey !== baseLayoutKey)) {
-      throw new Error(
-        'Multiview base-context restoration did not restore the exact ' +
-        'DataState, dimension-manager, and viewer representation.'
-      );
-    }
-  }
 
   function applyLiveCamera(cameraState, description) {
     viewer.setViewCameraState('live', cameraState);
@@ -274,125 +243,87 @@ export async function restoreMultiview(owners, multiview) {
     }
   }
 
-  function restoreSavedLiveCamera() {
-    applyLiveCamera(multiview.liveCameraState, 'saved live camera');
-  }
-
-  function restorePriorLiveCamera() {
-    if (viewer.getCamerasLocked() !== priorCamerasLocked) {
-      viewer.setCamerasLocked(priorCamerasLocked);
+  async function applyViewState(viewState, description) {
+    // Filters and active field in one batch: the view's visibility is
+    // computed once, from both (each alone would compute it again).
+    state.beginBatch();
+    try {
+      await restoreFilters(viewState.filters);
+      await restoreActiveFields(viewState.activeFields);
+    } finally {
+      state.endBatch();
     }
-    applyLiveCamera(priorLiveCameraState, 'live camera it started from');
+    // The embedding switch in a task of its own: with its centroids and
+    // geometry it would otherwise share one long task with the field's.
+    await yieldToMacrotask();
+    await state.restoreViewEmbedding('live', viewState.embedding);
+    if (
+      JSON.stringify(state.getViewEmbeddingRef('live'))
+        !== JSON.stringify(viewState.embedding)
+    ) {
+      throw new Error(`${description} did not restore its exact embedding.`);
+    }
   }
 
-  let replayError = null;
   try {
-    for (const snapshot of multiview.snapshots) {
-      await restoreBaseContext();
-      await restoreFilters(snapshot.filters);
-      await restoreActiveFields(snapshot.activeFields);
-      await state.restoreViewEmbedding('live', snapshot.embedding);
-      if (
-        JSON.stringify(state.getViewEmbeddingRef('live'))
-          !== JSON.stringify(snapshot.embedding)
-      ) {
-        throw new Error(
-          `Replayed snapshot "${snapshot.id}" did not restore its exact embedding.`
-        );
+    if (state.getActiveViewId() !== 'live') {
+      if (state.setActiveView('live') !== 'live') {
+        throw new Error('Multiview restoration could not activate the live view.');
       }
-      const snapshotDimension = state.getViewDimensionLevel('live');
-      pushViewerState();
+    }
+    clearPublishedSnapshotViews({ state, viewer });
+    viewer.setCamerasLocked(multiview.camerasLocked);
 
-      const sourceViewId = state.getActiveViewId();
-      if (sourceViewId !== 'live') {
-        throw new Error('Multiview snapshot replay must start from the live context.');
-      }
+    const idMap = new Map();
+    for (const snapshot of multiview.snapshots) {
+      // One view per task: with every field already loaded a replay is
+      // synchronous work, and the views of a large session would otherwise
+      // be rebuilt in one long task. A macrotask, not a frame, so a restore
+      // in a background tab or an off-screen notebook still runs.
+      await yieldToMacrotask();
+      await applyViewState(snapshot, `Replayed snapshot "${snapshot.id}"`);
+      const snapshotDimension = state.getViewDimensionLevel('live');
       const payload = state.getSnapshotPayload();
       if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
         throw new TypeError('Multiview getSnapshotPayload() must return an object.');
       }
-      if (
-        payload.fieldKey !== snapshot.fieldKey
-        || payload.fieldKind !== snapshot.fieldKind
-        || payload.label !== snapshot.label
-        || payload.dimensionLevel !== snapshotDimension
-      ) {
+      if (payload.dimensionLevel !== snapshotDimension) {
         throw new Error(
-          `Replayed snapshot "${snapshot.id}" does not match its saved descriptor.`
+          `Replayed snapshot "${snapshot.id}" does not match its embedding dimension.`
         );
       }
       assertArray(payload.filtersText, `Replayed snapshot "${snapshot.id}" filtersText`);
-      if (
-        payload.filtersText.length !== snapshot.meta.filtersText.length
-        || payload.filtersText.some(
-          (line, index) => line !== snapshot.meta.filtersText[index]
-        )
-      ) {
-        throw new Error(`Replayed snapshot "${snapshot.id}" filter summary does not match.`);
-      }
-
       const created = publishSnapshotView({
         state,
         viewer,
         config: {
-          label: snapshot.label,
-          fieldKey: snapshot.fieldKey,
-          fieldKind: snapshot.fieldKind,
+          label: payload.label,
+          fieldKey: payload.fieldKey,
+          fieldKind: payload.fieldKind,
           colors: payload.colors,
           transparency: payload.transparency,
           centroidPositions: payload.centroidPositions,
           centroidColors: payload.centroidColors,
-          sourceViewId,
+          sourceViewId: 'live',
           meta: {
-            filtersText: [...snapshot.meta.filtersText]
+            filtersText: [...payload.filtersText]
           },
           dimensionLevel: snapshotDimension,
           cameraState: snapshot.cameraState
         }
       });
       const newId = assertSnapshotId(created.id, 'Created multiview snapshot id');
-      if (createdIds.has(newId)) {
+      if ([...idMap.values()].includes(newId)) {
         throw new TypeError(`Viewer created duplicate snapshot id "${newId}".`);
       }
-      createdIds.add(newId);
       idMap.set(snapshot.id, newId);
+      applyCentroidFlags(viewer, newId, snapshot.centroids);
     }
-  } catch (error) {
-    replayError = error;
-  }
 
-  async function rollbackRestoredGraph(error) {
-    const cleanupFailures = [];
-    try {
-      clearPublishedSnapshotViews({ state, viewer });
-    } catch (cleanupError) {
-      cleanupFailures.push(cleanupError);
-    }
-    try {
-      await restoreBaseContext();
-    } catch (cleanupError) {
-      cleanupFailures.push(cleanupError);
-    }
-    try {
-      restorePriorLiveCamera();
-    } catch (cleanupError) {
-      cleanupFailures.push(cleanupError);
-    }
-    if (cleanupFailures.length > 0) {
-      throw new AggregateError(
-        [error, ...cleanupFailures],
-        'Multiview restoration failed and graph rollback was incomplete.'
-      );
-    }
-    throw error;
-  }
-  if (replayError !== null) {
-    await rollbackRestoredGraph(replayError);
-  }
-
-  try {
-    await restoreBaseContext();
-    restoreSavedLiveCamera();
+    await yieldToMacrotask();
+    await applyViewState(live, 'The live view');
+    applyCentroidFlags(viewer, 'live', multiview.live.centroids);
+    applyLiveCamera(multiview.live.cameraState, 'saved live camera');
 
     const savedActiveId = multiview.layout.activeId;
     const resolvedActiveId = savedActiveId === 'live'
@@ -419,6 +350,27 @@ export async function restoreMultiview(owners, multiview) {
     );
     viewer.setCameraState(activeCamera);
   } catch (error) {
-    await rollbackRestoredGraph(error);
+    const cleanupFailures = [];
+    try {
+      clearPublishedSnapshotViews({ state, viewer });
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    try {
+      if (state.getActiveViewId() !== 'live') state.setActiveView('live');
+      if (viewer.getCamerasLocked() !== priorCamerasLocked) {
+        viewer.setCamerasLocked(priorCamerasLocked);
+      }
+      applyLiveCamera(priorLiveCameraState, 'live camera it started from');
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        'Multiview restoration failed and graph rollback was incomplete.'
+      );
+    }
+    throw error;
   }
 }

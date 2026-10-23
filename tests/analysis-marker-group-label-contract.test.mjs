@@ -100,7 +100,7 @@ function withFakeDocument(run) {
 // A marker result shaped exactly as MarkerDiscoveryEngine publishes one
 // =============================================================================
 
-// cellucid-datasets exports-v3/pancreas/obs_manifest.json, field `cell_type`.
+// The Pancreas sample dataset's obs field `cell_type` (scVelo pancreas).
 const PANCREAS_CELL_TYPES = [
   'Ductal', 'Ngn3 low EP', 'Ngn3 high EP', 'Pre-endocrine',
   'Beta', 'Alpha', 'Delta', 'Epsilon',

@@ -3,7 +3,7 @@
  *
  * Handles:
  * - Dataset dropdown + metadata panel
- * - Local user data (prepared, h5ad, zarr)
+ * - Local user data (h5ad, zarr)
  * - Remote server connect/disconnect
  * - GitHub repo connect/disconnect
  *
@@ -13,7 +13,10 @@
  * @module ui/modules/dataset-controls
  */
 
-import { validateDatasetIdentity } from '../../../data/data-source.js';
+import {
+  validateDatasetIdentity,
+  validateDatasetSummary
+} from '../../../data/data-source.js';
 import { formatCompactCount } from '../components/display-format.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { debug } from '../../../utils/debug.js';
@@ -49,8 +52,8 @@ const CATALOG_TOTAL_FAILURE_MESSAGE =
  * thing wherever the user meets it.
  */
 const SOURCE_DISPLAY_NAMES = {
-  'github-repo': 'GitHub data',
   jupyter: 'Jupyter data',
+  link: 'Linked data',
   'local-demo': 'Sample datasets',
   'local-user': 'Your data',
   remote: 'Remote server data'
@@ -105,6 +108,13 @@ function requireNonEmptyString(value, name) {
   return value;
 }
 
+/** The source type that opens each kind of recorded session source. */
+const RECORDED_SOURCE_TYPES = Object.freeze({
+  sample: 'local-demo',
+  link: 'link',
+  remote: 'remote'
+});
+
 function sourceDisplayName(sourceType) {
   requireNonEmptyString(sourceType, 'Dataset source type');
   return Object.hasOwn(SOURCE_DISPLAY_NAMES, sourceType)
@@ -149,6 +159,17 @@ function requireElement(element, name, methods = []) {
     }
   }
   return element;
+}
+
+/**
+ * What the dataset list shows about one dataset (`DatasetSummary`): a
+ * catalog's description of a file, or an open dataset's identity.
+ */
+function requireDatasetSummary(summary, sourceType, name) {
+  requirePlainObject(summary, name);
+  requireNonEmptyString(sourceType, `${name} sourceType`);
+  validateDatasetSummary(summary, sourceType);
+  return summary;
 }
 
 function requireDatasetMetadata(metadata, sourceType, name) {
@@ -239,7 +260,7 @@ function requireCatalog(catalog) {
       );
     }
     const datasets = record.datasets.map((metadata, datasetIndex) => {
-      requireDatasetMetadata(
+      requireDatasetSummary(
         metadata,
         record.sourceType,
         `Dataset catalog ${record.sourceType}[${datasetIndex}]`
@@ -347,6 +368,7 @@ export function initDatasetControls(options) {
     sourceEl: datasetSourceEl,
     descriptionEl: datasetDescriptionEl,
     urlEl: datasetUrlEl,
+    citationEl: datasetCitationEl,
     cellsEl: datasetCellsEl,
     genesEl: datasetGenesEl,
     obsEl: datasetObsEl,
@@ -374,7 +396,8 @@ export function initDatasetControls(options) {
     datasetNameEl,
     datasetObsEl,
     datasetSourceEl,
-    datasetUrlEl
+    datasetUrlEl,
+    datasetCitationEl
   })) {
     requireElement(element, name);
   }
@@ -577,7 +600,7 @@ export function initDatasetControls(options) {
   }
 
   function createDatasetOption(metadata, sourceType) {
-    requireDatasetMetadata(metadata, sourceType, 'Dataset option metadata');
+    requireDatasetSummary(metadata, sourceType, 'Dataset option metadata');
     const value = datasetSelectionValue(sourceType, metadata.id);
     if (datasetOptionsByKey.has(value)) {
       throw new Error(
@@ -751,6 +774,8 @@ function updateDatasetInfo(metadata, sourceTypeOverride = null) {
     datasetDescriptionEl.title = '—';
     datasetUrlEl.textContent = '—';
     datasetUrlEl.title = '—';
+    datasetCitationEl.textContent = '—';
+    datasetCitationEl.title = '—';
     datasetCellsEl.textContent = '–';
     datasetGenesEl.textContent = '–';
     datasetObsEl.textContent = '–';
@@ -794,21 +819,50 @@ function updateDatasetInfo(metadata, sourceTypeOverride = null) {
   const url = metadata.source?.url ?? '—';
   datasetUrlEl.textContent = url;
   datasetUrlEl.title = url;
+  // How to cite it, as its file states (`uns['cellucid']['citation']`) or
+  // its repository record gives it; the title carries its address.
+  const citation = metadata.citation?.text ?? '—';
+  datasetCitationEl.textContent = citation;
+  datasetCitationEl.title = metadata.citation?.url ?? citation;
   datasetCellsEl.textContent = formatCompactCount(stats.n_cells);
   datasetGenesEl.textContent = formatCompactCount(stats.n_genes);
   datasetObsEl.textContent = formatCompactCount(stats.n_obs_fields);
-  showConnectivityEdges(stats.has_connectivity ? stats.n_edges : null);
+  showConnectivityEdges(stats.has_connectivity ? { edges: stats.n_edges } : null);
   datasetInfo.classList.remove('loading', 'error');
 }
 
 /**
- * Show the edge count of the neighbour graph in use, or None.
+ * Show the neighbour graph in use: its edge count, that it is present but not
+ * counted yet (a graph read straight from a file is counted when its edges are
+ * first read), or None.
  * @param {number|null} edges
  */
-function showConnectivityEdges(edges) {
-  datasetConnectivityEl.textContent = edges === null
+function showConnectivityEdges(graph) {
+  shownConnectivity = graph;
+  datasetConnectivityEl.textContent = graph === null
     ? 'None'
-    : `${formatCompactCount(edges)} edges`;
+    : graph.edges === null
+      ? 'Present (counted when shown)'
+      : `${formatCompactCount(graph.edges)} edges`;
+}
+
+/** The graph the panel shows, as last given to `showConnectivityEdges`. */
+let shownConnectivity = null;
+
+/**
+ * The edges of the graph in use were read: an uncounted graph now shows its
+ * count. A panel showing another graph (or none) is left as it is.
+ *
+ * @param {number} edges
+ */
+function showLoadedConnectivityEdges(edges) {
+  assertAlive();
+  if (!Number.isSafeInteger(edges) || edges < 0) {
+    throw new TypeError('Connectivity edge count must be a non-negative integer.');
+  }
+  if (shownConnectivity !== null && shownConnectivity.edges === null) {
+    showConnectivityEdges({ edges });
+  }
 }
 
 /**
@@ -816,17 +870,20 @@ function showConnectivityEdges(edges) {
  * describe the mapping it opened with, and the neighbour graph and gene list
  * in use are whichever the mapping names now.
  *
- * @param {{connectivityEdges: number|null, genes: number}} facts
+ * @param {{connectivity: {edges: number|null}|null, genes: number}} facts
+ *   `connectivity` is null without a graph; its `edges` is null while the
+ *   graph is not counted yet
  */
-function updateMappedDatasetFacts({ connectivityEdges, genes }) {
+function updateMappedDatasetFacts({ connectivity, genes }) {
   assertAlive();
-  if (connectivityEdges !== null && !(Number.isSafeInteger(connectivityEdges) && connectivityEdges >= 0)) {
+  const edges = connectivity?.edges;
+  if (connectivity !== null && edges !== null && !(Number.isSafeInteger(edges) && edges >= 0)) {
     throw new TypeError('Connectivity edge count must be null or a non-negative integer.');
   }
   if (!Number.isSafeInteger(genes) || genes < 0) {
     throw new TypeError('Gene count must be a non-negative integer.');
   }
-  showConnectivityEdges(connectivityEdges);
+  showConnectivityEdges(connectivity === null ? null : { edges });
   datasetGenesEl.textContent = formatCompactCount(genes);
 }
 
@@ -1732,17 +1789,59 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     return destroyPromise;
   }
 
+  /**
+   * Open the dataset a session file recorded (see
+   * `session/dataset-source-record.js`): a sample by its id, a data link or a
+   * server through its connection control, then the recorded dataset when
+   * the connection holds several.
+   *
+   * @param {{kind: 'sample'|'link'|'remote', dataset: string,
+   *   locator?: string, url?: string}} record
+   * @returns {Promise<boolean>} Whether that dataset is now open.
+   */
+  async function openDatasetSource(record) {
+    const sourceType = RECORDED_SOURCE_TYPES[record.kind];
+    if (sourceType === undefined) {
+      throw new TypeError(`Unknown recorded dataset source "${record.kind}".`);
+    }
+    const isOpen = () =>
+      dataSourceManager.getCurrentSourceType() === sourceType &&
+      dataSourceManager.getCurrentDatasetId() === record.dataset;
+    try {
+      if (sourceType !== 'local-demo') {
+        const connected = await datasetConnections.openConnection(
+          sourceType,
+          sourceType === 'link' ? record.locator : record.url
+        );
+        if (!connected) return false;
+        if (isOpen()) return true;
+      }
+      const ready = await handleDatasetChange(
+        record.dataset,
+        sourceType,
+        DATA_LOAD_METHODS.SESSION_SOURCE
+      );
+      return ready === true && isOpen();
+    } catch (error) {
+      if (isDatasetReloadSupersededError(error)) return false;
+      throw error;
+    }
+  }
+
   return {
     catalogReady,
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     destroy,
+    openDatasetSource: record =>
+      invokeTracked(() => openDatasetSource(record)),
     loadStartupDataset: selection =>
       invokeTracked(() => loadStartupDataset(selection)),
     populateDatasetDropdown: () =>
       invokeTracked(() => populateDatasetDropdown()),
     refreshDatasetUI,
     updateMappedDatasetFacts,
+    showLoadedConnectivityEdges,
     selectDataset: (...args) =>
       invokeTracked(() => handleDatasetChange(...args))
   };

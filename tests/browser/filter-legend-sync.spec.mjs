@@ -1,9 +1,9 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=filter-legend-sync-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=filter-legend-sync-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -19,7 +19,7 @@ function observeProductErrors(page) {
 async function openPreparedFixture(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
 }
 

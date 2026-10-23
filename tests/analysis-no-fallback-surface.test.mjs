@@ -500,7 +500,7 @@ test('requested clustering never becomes an unclustered result', async () => {
   // and what to change, before anything is allocated; it is never returned
   // in input order as if it were clustered.
   const engine = new ClusteringEngine();
-  const matrix = { values: new Float32Array(501 * 2), nRows: 501, nCols: 2 };
+  const matrix = { values: new Float32Array(1001 * 2), nRows: 1001, nCols: 2 };
   await assert.rejects(
     engine.clusterMatrix({
       matrix,
@@ -512,21 +512,21 @@ test('requested clustering never becomes an unclustered result', async () => {
     }),
     {
       name: 'RangeError',
-      message: 'Clustering 501 genes needs about 25 MB of memory, more than the 1 MB ' +
+      message: 'Clustering 1,001 genes needs about 4 MB of memory, more than the 1 MB ' +
         'analysis memory budget. Raise the budget in Performance settings, use fewer ' +
         'genes, or turn clustering of genes off.',
     },
   );
-  // The same 501 rows within the budget are clustered (no fixed row count).
+  // The same 1,001 rows within the budget are clustered (no fixed row count).
   const clustered = await engine.clusterMatrix({
-    matrix: { ...matrix, values: Float32Array.from({ length: 501 * 2 }, (_, i) => (i * 7919) % 101) },
+    matrix: { ...matrix, values: Float32Array.from({ length: 1001 * 2 }, (_, i) => (i * 7919) % 101) },
     clusterRows: true,
     clusterCols: false,
     distance: 'euclidean',
     linkage: 'average',
     memoryBudgetBytes: 512 * 2 ** 20,
   });
-  assert.equal(clustered.rowOrder.length, 501);
+  assert.equal(clustered.rowOrder.length, 1001);
   assert.notEqual(clustered.rowDendrogram, null);
 });
 
@@ -534,17 +534,13 @@ test('marker caches require one exact dataset identity', () => {
   assert.throws(
     () => new MarkerCache({
       maxCategories: 3,
-      maxAgeDays: 7,
-      cacheVersion: 1,
     }),
     /datasetId.*required|dataset identity/i,
   );
   assert.throws(
     () => new MarkerCache({
       maxCategories: 3,
-      maxAgeDays: 7,
-      cacheVersion: 1,
-      identity: { key: '   ', persistent: false },
+      identity: { key: '   ' },
     }),
     /datasetId.*non-empty|dataset identity/i,
   );
@@ -583,16 +579,12 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
   const loader = new StreamingGeneLoader({
     dataLayer: {
       state: { pointCount: 4 },
-      async ensureGeneExpressionLoaded() {
+      async readGeneColumn() {
         throw loadFailure;
       },
       async prefetchGenePayload() {
         return null;
       },
-      unloadGeneExpression() {
-        return true;
-      },
-      invalidateVariable() {},
     },
     config: {
       preloadCount: 1,
@@ -653,30 +645,25 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
 
 test('gene signature median computes the exact per-cell median', async () => {
   const cellIndices = Uint32Array.from([0, 1, 2, 3]);
-  const page = values => ({
-    values,
-    cellIndices,
-    pageName: 'Exact page',
-  });
+  const columns = {
+    A: Float32Array.from([1, 100, NaN, 4]),
+    // A sparse column: its absent entry (cell 1) is a zero.
+    B: { length: 4, indices: Uint32Array.of(0, 2, 3), values: Float32Array.of(3, 5, 6) },
+    C: Float32Array.from([2, 10, 7, 8]),
+  };
   const dataLayer = {
-    async getGeneExpressionSubset() {
-      return {
-        A: { page: page(Float32Array.from([1, 100, NaN, 4])) },
-        B: { page: page(Float32Array.from([3, 0, 5, 6])) },
-        C: { page: page(Float32Array.from([2, 10, 7, 8])) },
-      };
+    state: { pointCount: 4 },
+    async readGeneColumns(genes) {
+      return genes.map(gene => columns[gene]);
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({ pageId, pageName: 'Exact page', cellIndices }));
+    },
     performCacheCleanup() {},
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = dataLayer;
   analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'signature-notification'; },
-    complete() {},
-    fail() {},
-  };
 
   const [result] = await analysis.computeSignatureScore({
     genes: ['A', 'B', 'C'],
@@ -701,35 +688,28 @@ test('gene signature median computes the exact per-cell median', async () => {
 
 test('gene signature scoring preserves prototype-named gene and page cross-products', async () => {
   const exactNames = Object.getOwnPropertyNames(Object.prototype);
-  const geneData = Object.fromEntries(
-    exactNames.map((gene, geneIndex) => [
-      gene,
-      Object.fromEntries(
-        exactNames.map((pageId, pageIndex) => [
-          pageId,
-          {
-            values: Float32Array.of(geneIndex + pageIndex),
-            cellIndices: Uint32Array.of(0),
-            pageName: `Page ${pageId}`,
-          },
-        ]),
-      ),
-    ]),
-  );
+  // Page p is cell p; gene g has the value g + p there.
+  const pointCount = exactNames.length;
+  const columns = new Map(exactNames.map((gene, geneIndex) => [
+    gene,
+    Float32Array.from({ length: pointCount }, (_, cell) => geneIndex + cell),
+  ]));
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return geneData;
+    state: { pointCount },
+    async readGeneColumns(genes) {
+      return genes.map(gene => columns.get(gene));
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({
+        pageId,
+        pageName: `Page ${pageId}`,
+        cellIndices: Uint32Array.of(exactNames.indexOf(pageId)),
+      }));
+    },
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'prototype-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
 
   const result = await analysis.computeSignatureScore({
     genes: exactNames,
@@ -740,78 +720,12 @@ test('gene signature scoring preserves prototype-named gene and page cross-produ
   assert.deepEqual(result.map(page => page.pageId), exactNames);
   for (const [pageIndex, page] of result.entries()) {
     assert.equal(page.pageName, `Page ${exactNames[pageIndex]}`);
-    assert.deepEqual(Array.from(page.cellIndices), [0]);
+    assert.deepEqual(Array.from(page.cellIndices), [pageIndex]);
     assert.deepEqual(Array.from(page.scores), [
       ((exactNames.length - 1) / 2) + pageIndex,
     ]);
     assert.equal(page.genesUsed, exactNames.length);
   }
-});
-
-test('gene signature scoring rejects an inherited-only gene record', async () => {
-  const pageData = {
-    values: Float32Array.of(1),
-    cellIndices: Uint32Array.of(0),
-    pageName: 'Inherited page',
-  };
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return Object.create({
-        GENE: Object.fromEntries([['page', pageData]]),
-      });
-    },
-    clearBulkGeneCache() {},
-    performCacheCleanup() {},
-  };
-  analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'inherited-gene-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
-
-  await assert.rejects(
-    analysis.computeSignatureScore({
-      genes: ['GENE'],
-      pageIds: ['page'],
-      method: 'mean',
-    }),
-    /signature data is missing for gene GENE on page page/i,
-  );
-});
-
-test('gene signature scoring rejects an inherited-only page record', async () => {
-  const pageData = {
-    values: Float32Array.of(1),
-    cellIndices: Uint32Array.of(0),
-    pageName: 'Inherited page',
-  };
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return Object.fromEntries([
-        ['GENE', Object.create({ page: pageData })],
-      ]);
-    },
-    clearBulkGeneCache() {},
-    performCacheCleanup() {},
-  };
-  analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'inherited-page-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
-
-  await assert.rejects(
-    analysis.computeSignatureScore({
-      genes: ['GENE'],
-      pageIds: ['page'],
-      method: 'mean',
-    }),
-    /signature data is missing for gene GENE on page page/i,
-  );
 });
 
 test('differential expression requires exact dataset and gene identities', async () => {

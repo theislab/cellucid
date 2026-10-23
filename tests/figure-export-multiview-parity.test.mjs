@@ -7,6 +7,7 @@ import {
 import {
   areLegendModelsSemanticallyEqual,
 } from '../assets/js/app/ui/modules/figure-export/utils/legend-model-equality.js';
+import './helpers/figure-export-worker-in-process.mjs';
 
 const IDENTITY = Float32Array.from([
   1, 0, 0, 0,

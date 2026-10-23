@@ -2657,7 +2657,7 @@ export class BottleneckAnalyzer {
         actions: [
           'Reduce point size to decrease fill rate requirements',
           'Make the window smaller — fewer pixels is the biggest immediate win',
-          'Turn antialiasing off under Image quality — it applies to the next frame',
+          'Turn antialiasing off under Performance — it applies to the next frame',
           'Enable more aggressive LOD to reduce vertex count'
         ]
       });
@@ -2671,7 +2671,7 @@ export class BottleneckAnalyzer {
         title: 'Optimize fragment processing',
         actions: [
           'Reduce point size (current scaling shows fragment sensitivity)',
-          'Turn antialiasing off under Image quality — it costs per pixel covered',
+          'Turn antialiasing off under Performance — it costs per pixel covered',
           'Make the window smaller, or use fewer views',
           'Filter down to the cells you are looking at — hidden points are free'
         ]
@@ -2784,7 +2784,7 @@ export class BottleneckAnalyzer {
         title: 'Low-end device detected',
         actions: [
           `Only ${jsAnalysis.cpuCores} CPU cores available`,
-          'Turn antialiasing off under Image quality — it applies to the next frame',
+          'Turn antialiasing off under Performance — it applies to the next frame',
           'Reduce data size or enable aggressive LOD',
           'Consider showing fewer points on mobile'
         ]

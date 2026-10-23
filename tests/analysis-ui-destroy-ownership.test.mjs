@@ -333,7 +333,7 @@ test(
     const quick = Object.create(QuickInsights.prototype);
     quick._destroyPromise = null;
     quick._currentRequestId = 0;
-    quick._abortController = null;
+    quick._job = null;
     quick._debounceTimer = null;
     quick._cache = new Map();
     quick._fieldPickers = { categorical: null, continuous: null };

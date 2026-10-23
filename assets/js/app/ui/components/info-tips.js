@@ -53,7 +53,7 @@ const TIPS = {
     title: 'Data mapping',
     body: [
       'Which stored arrays this dataset is drawn from: the embeddings views can show -- any number, of any mix of 1D, 2D and 3D -- the neighbour graph, the gene names and expression matrix, the latent space of outlier filters and the vector fields.',
-      'An AnnData file (an `.h5ad` or Zarr ZIP opened in the browser, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices; a prepared dataset can choose among the embeddings, gene-name sets and vector fields it was exported with.',
+      'A dataset (an `.h5ad` or Zarr store opened in the browser, from a link or the samples, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices.',
       'A file without a UMAP opens on a best guess, marked guessed. Sessions record the mapping and restore it.',
     ],
     links: [
@@ -90,17 +90,17 @@ const TIPS = {
     title: 'Latent space',
     body: [
       'The `obsm` space (scVI, PCA) where a categorical field’s outlier filter measures each cell’s distance to its category’s centre; the filter hides the farthest share of each category.',
-      'Apply reads the space and computes the outliers before anything changes; a space with a missing value is refused and stays unavailable. Filter thresholds are kept. None removes outlier filters.',
+      'Apply reads nothing: an outlier filter in use is measured again in the new space, with progress and Cancel, and keeps its threshold. A space with a missing value is refused when it is first read. The space a file stores outlier distances for is marked “outliers stored” and filters at once. None turns outlier filters off.',
     ],
     links: [
       doc('Latent space', 'b_data_loading/13_data_mapping', 'latent-space'),
-      doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'what-this-filter-is-and-is-not'),
+      doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'stored-or-computed'),
     ],
   },
   'data-mapping-vectors': {
     title: 'Vector fields',
     body: [
-      'Which `obsm` arrays are drawn as vectors (velocity, drift) on which embedding. An array fits an embedding as wide as its dimension, or as wide as the embedding’s array, read at the same columns; arrays named for it are marked suggested.',
+      'Which `obsm` arrays are drawn as vectors (velocity, drift) on which embedding. An array fits an embedding as wide as its dimension, or as wide as the embedding’s array, read at the same columns. An array named for an embedding the way scVelo names it (`velocity_umap` for `X_umap`, `velocity_branches` for `X_branches`) is marked suggested and is bound when the file opens.',
       'A view draws a vector field only while it shows an embedding the field is bound to. Values are read when the overlay first shows them.',
     ],
     links: [
@@ -119,29 +119,19 @@ const TIPS = {
       doc('KNN drag', 'f_highlighting_selection/02_selection_tools_document_each_tool', 'tool-4-knn-drag-alt-click-drag-degree'),
     ],
   },
-  'data-mapping-fixed': {
-    title: 'Read from file',
-    body: [
-      'What a prepared dataset is read with that this panel cannot change: its gene names when it was exported with one name set, and its vector fields when it was exported with none.',
-      'Its neighbour graph, expression matrix and latent space were fixed when it was exported with `cellucid prepare`. An AnnData file has nothing fixed: every group is a menu.',
-    ],
-    links: [
-      doc('What stays fixed', 'b_data_loading/13_data_mapping', 'what-stays-fixed'),
-    ],
-  },
   'open-data': {
     title: 'Open data',
     body: [
       'Four ways to open a dataset. Opening one replaces the dataset that is open now.',
       {
         list: [
-          'Sample: a prepared public dataset, downloaded on demand.',
-          'Files: a file or folder from this computer. Nothing is uploaded.',
+          'Sample: a public dataset, read in place as each view needs it.',
+          'Files: an `.h5ad`, a `.zarr` folder or a `.zarr.zip` from this computer. Nothing is uploaded.',
           'Server: a `cellucid serve` process on this machine or through an SSH tunnel.',
-          'GitHub: prepared exports published in a public repository.',
+          'Link: an AnnData file or a dataset catalog wherever it is published.',
         ],
       },
-      'For large datasets, a prepared export (from `cellucid prepare`) loads fastest on every route.',
+      'Every route reads AnnData. For large datasets, an AnnData file written by `cellucid prepare` reads fastest.',
     ],
     links: [
       doc('Loading options', 'b_data_loading/01_loading_options_overview', 'at-a-glance'),
@@ -155,14 +145,14 @@ const TIPS = {
         list: [
           'H5AD: one `.h5ad` file, read in the browser. Quick for previews; very large files are limited by browser memory.',
           'Zarr ZIP: a `.zarr.zip` or `.zip` holding one AnnData Zarr store. It opens in Safari, Chrome, Edge and Firefox alike.',
-          'Prepared: a folder written by `cellucid prepare`. It loads lazily and is the fastest option for large data.',
+          'Zarr folder: an AnnData `.zarr` store folder, as `cellucid.prepare()` and `cellucid_prepare()` write it. Choose or drop the folder itself.',
         ],
       },
       'Files stay on this computer: they are read by the browser and never uploaded.',
     ],
     links: [
       doc('Browser file picker', 'b_data_loading/03_browser_file_picker_tutorial', 'fast-path-wet-lab-friendly'),
-      doc('What Cellucid reads', 'b_data_loading/07_folder_file_format_expectations_high_level_link_to_spec', 'the-four-things-cellucid-can-load-practical-view'),
+      doc('What Cellucid reads', 'b_data_loading/07_file_format_expectations', 'the-four-things-cellucid-can-load-practical-view'),
     ],
   },
   'remote-server': {
@@ -175,22 +165,33 @@ const TIPS = {
           'Remote machine: forward the port first with `ssh -L 8765:localhost:8765 user@host`.',
         ],
       },
-      'Serving a prepared folder is fastest; `.h5ad` and `.zarr` are read lazily on the server.',
+      'The server serves the `.h5ad` or Zarr store as it is; the browser reads only what each view needs.',
     ],
     links: [
       doc('Server mode', 'b_data_loading/04_server_tutorial', 'fast-path-cli'),
       doc('SSH tunnel', 'b_data_loading/04_server_tutorial', 'remote-server-access-ssh-tunnel-workflow'),
     ],
   },
-  'github-data': {
-    title: 'GitHub',
+  'data-link': {
+    title: 'Open from link',
     body: [
-      'Opens prepared exports from a public GitHub repository. Enter `owner/repo/path`, where the path is the folder that holds `datasets.json`.',
-      'Use this to share datasets without running a server: anyone with the path can open them.',
+      'Opens data where it already lives, reading only what each view needs. Paste a CELLxGENE dataset link or id, a GEO series (`GSE…`), a Zenodo record or DOI, a Hugging Face dataset link, a Dropbox file link, a GitHub repository (`owner/repo/path`, the folder that holds `datasets.json`), or any web address of an `.h5ad` file, a zipped Zarr store, a Zarr store folder, or a dataset catalog folder (holding `datasets.json`) ending in `/`.',
+      'No sign-in is needed. The host must allow other sites to read the data (CORS). Share the page link to let anyone open the same data.',
     ],
     links: [
+      doc('What you can paste', 'b_data_loading/14_open_from_link', 'what-you-can-paste'),
+      doc('Why a link is refused', 'b_data_loading/14_open_from_link', 'why-a-link-can-be-refused'),
       doc('Publish a dataset repository', 'b_data_loading/11_custom_dataset_repository', 'the-repository-contract'),
-      doc('Remote demo', 'b_data_loading/02_local_demo_tutorial', 'step-4-publish-to-a-public-github-repo-remote-demo'),
+    ],
+  },
+  transfers: {
+    title: 'Transfers',
+    body: [
+      'Every read of linked data: what is read, from which host, why, how much has come in, and where it goes.',
+      'Linked data is read in place: only the parts a view needs are requested. Nothing is saved to disk; what was read is kept in memory and released when the dataset closes.',
+    ],
+    links: [
+      doc('Transfers', 'b_data_loading/14_open_from_link', 'transfers'),
     ],
   },
   'session-file': {
@@ -313,14 +314,14 @@ const TIPS = {
     ],
     links: [
       doc('Connectivity edges', 'c_core_interactions/07_screenshots', 'connectivity-edges'),
-      doc('Include a graph', 'b_data_loading/04_server_tutorial', 'connectivity-is-opt-in-on-this-path'),
+      doc('Name a graph when serving', 'b_data_loading/04_server_tutorial', 'launch-choices-what-the-viewer-opens-on'),
       doc('Choose a graph', 'b_data_loading/13_data_mapping', 'neighbour-graph'),
     ],
   },
   'vector-field': {
     title: 'Vector field',
     body: [
-      'Animates particles along per-cell vectors, such as RNA velocity or drift, each exported for one embedding.',
+      'Animates particles along per-cell vectors, such as RNA velocity or drift, each bound to one embedding.',
       'It appears when the view shows an embedding the dataset has a vector field for. Particle density and trail length cost the most. With Sync with LOD on, a reduced level of detail also draws fewer particles, spawned only from the cells that level shows.',
     ],
     links: [
@@ -656,7 +657,7 @@ const TIPS = {
       'With a repository connected, only its authors (maintain or admin) can change the list, and publishing writes it for everyone.',
     ],
     links: [
-      doc('Manage annotation', 'j_community_annotation/03_ui_reference', 'manage-annotation-author-only'),
+      doc('Annotated columns', 'j_community_annotation/03_ui_reference', 'annotated-columns-author-only'),
     ],
   },
   'cell-info': {
@@ -699,7 +700,7 @@ const TIPS = {
       'Off: colors span the field’s full data range, so one color always means the same value, whatever the range.',
     ],
     links: [
-      doc('Rescale to the range', 'd_fields_coloring_legends/03_color_by_behavior', 'rescale-colorbar-to-slider-range-contrast-control'),
+      doc('Rescale to range', 'd_fields_coloring_legends/03_color_by_behavior', 'rescale-to-range-contrast-control'),
     ],
   },
   'live-filtering': {
@@ -726,11 +727,13 @@ const TIPS = {
   'outlier-filter': {
     title: 'Outlier filter',
     body: [
-      'Hides cells far from the centre of their category in the latent space. The value is a within-category quantile: at 95% the farthest 5% of each category are hidden; at 100% nothing is.',
-      'It appears for categorical fields whose export includes outlier scores, and applies to the active field in the selected view.',
+      'Hides cells far from the centre of their category in a latent space (an `obsm` array such as scVI or PCA), not in the 2D/3D layout. The value is a share of each category: at 95% the farthest 5% of every category are hidden; at 100% nothing is.',
+      'Choose the latent space in Data mapping (“Outliers in”). A file written by `prepare()` or `cellucid_prepare()` with a latent space stores every categorical field’s distances, so the filter works at once; for any other file the first use reads the latent space once to compute them, with progress and Cancel.',
+      'Only categories of at least 10 cells are measured (a file or launch can set another number, `centroid_min_points`). The filter applies to the active field in the selected view.',
     ],
     links: [
       doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'what-this-filter-is-and-is-not'),
+      doc('Stored or computed', 'e_filtering/02_outlier_filtering_per_active_field', 'stored-or-computed'),
     ],
   },
 
@@ -912,7 +915,7 @@ const TIPS = {
       'It does not change the voting rules and publishes nothing; it is only for colouring and analysis here.',
     ],
     links: [
-      doc('Derived consensus column', 'j_community_annotation/02_author_guide', 'build-a-derived-consensus-column-optional-local'),
+      doc('Consensus column', 'j_community_annotation/02_author_guide', 'build-a-consensus-column-optional-local'),
     ],
   },
   'community-consensus-settings': {
@@ -990,7 +993,7 @@ const TIPS = {
     title: 'Open in Cellucid badge',
     body: [
       'Markdown for a README, a wiki page or an issue. It renders as a small badge that opens this dataset in one click.',
-      'Put it in the repository that hosts your exports.',
+      'Put it in the repository that hosts your data.',
     ],
     links: [
       doc('Badge', 'l_sessions_sharing/13_share_links_badges_and_embeds', 'open-in-cellucid-badge'),

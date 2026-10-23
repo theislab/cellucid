@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=highlight-selection-feedback-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=highlight-selection-feedback-ci';
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
 
@@ -23,7 +23,7 @@ async function openPreparedDataset(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells'
@@ -156,7 +156,11 @@ async function armSelection(page, tool, gesture) {
 }
 
 const unifiedState = page => page.evaluate(
-  () => window._cellucidViewer.getUnifiedSelectionState(),
+  () => {
+    // The candidates are a cell list (Uint32Array); hand them over as numbers.
+    const state = window._cellucidViewer.getUnifiedSelectionState();
+    return { ...state, candidates: Array.from(state.candidates) };
+  },
 );
 
 test(

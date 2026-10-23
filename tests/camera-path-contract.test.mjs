@@ -42,7 +42,7 @@ const mainSource = await readFile(
 );
 const datasetStateSource = await readFile(
   new URL(
-    '../assets/js/app/session/dataset-state-manifest.js',
+    '../assets/js/app/session/catalog-default-session.js',
     import.meta.url
   ),
   'utf8'

@@ -120,7 +120,7 @@ test('a dataset activation joins the open request of its load method', async () 
   analytics.openDataLoad('remote-connect', 'remote')
     .fail(new Error('unreachable'));
   // A superseded or list-only request sends nothing.
-  analytics.openDataLoad('github-connect', 'github-repo').cancel();
+  analytics.openDataLoad('link-connect', 'link').cancel();
   const superseded = analytics.beginDataLoad('dataset-dropdown', 'local-demo');
   superseded.cancel();
   superseded.succeed({ datasetId: null, metadata: null, stateStatus: 'ready' });

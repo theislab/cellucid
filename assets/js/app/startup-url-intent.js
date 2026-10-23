@@ -117,7 +117,7 @@ function requireJupyterConfigEvidence(value) {
  * @param {Object|null} jupyterConfig
  * @returns {{
  *   remoteUrlParam: string|null,
- *   githubPathParam: string|null,
+ *   dataLinkParam: string|null,
  *   sourceParam: string|null,
  *   requestedDataset: string|null,
  *   isAnndataMode: boolean,
@@ -128,15 +128,15 @@ function requireJupyterConfigEvidence(value) {
 export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
   const params = requireSearchParams(searchParams);
   const remoteUrlParam = readOptionalExactUrlParameter(params, 'remote');
-  const githubPathParam = readOptionalExactUrlParameter(params, 'github');
+  const dataLinkParam = readOptionalExactUrlParameter(params, 'data');
   const sourceParam = readOptionalExactUrlParameter(params, 'source');
   const requestedDataset = readOptionalExactUrlParameter(params, 'dataset');
   const isAnndataMode = readExactTrueUrlFlag(params, 'anndata');
   const inJupyter = requireJupyterConfigEvidence(jupyterConfig);
 
-  if (remoteUrlParam !== null && githubPathParam !== null) {
+  if (remoteUrlParam !== null && dataLinkParam !== null) {
     throw new Error(
-      'Startup cannot request both remote and GitHub dataset sources.'
+      'Startup cannot request both a remote server and a data link.'
     );
   }
   if (
@@ -149,12 +149,11 @@ export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
     );
   }
   if (
-    githubPathParam !== null &&
-    sourceParam !== null &&
-    sourceParam !== 'github-repo'
+    dataLinkParam !== null &&
+    sourceParam !== null
   ) {
     throw new Error(
-      'The "github" startup parameter requires source="github-repo".'
+      'The "data" startup parameter names its own source; remove "source".'
     );
   }
   if (
@@ -171,7 +170,7 @@ export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
     inJupyter &&
     (
       remoteUrlParam !== null ||
-      githubPathParam !== null ||
+      dataLinkParam !== null ||
       (sourceParam !== null && sourceParam !== 'jupyter')
     )
   ) {
@@ -183,14 +182,14 @@ export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
   const shouldShowWelcome = !(
     inJupyter ||
     remoteUrlParam !== null ||
-    githubPathParam !== null ||
+    dataLinkParam !== null ||
     sourceParam === 'remote' ||
     isAnndataMode
   );
 
   return Object.freeze({
     remoteUrlParam,
-    githubPathParam,
+    dataLinkParam,
     sourceParam,
     requestedDataset,
     isAnndataMode,
@@ -240,10 +239,7 @@ export function classifySameOriginHealthAdvertisement(payload) {
     return 'static';
   }
 
-  if (
-    payload.status === 'ok' &&
-    (payload.type === 'exported' || payload.type === 'anndata')
-  ) {
+  if (payload.status === 'ok' && payload.type === 'anndata') {
     return 'server';
   }
 

@@ -1,4 +1,8 @@
-import { CellSet, hasDuplicateCellIndex } from '../../../utils/cell-set.js';
+import {
+  CellSet,
+  cellListsEqual,
+  requireCellList
+} from '../../../utils/cell-set.js';
 import {
   ABANDONED_GESTURE_REASONS,
   ANNOTATION_ABANDONED_GESTURE_REASONS
@@ -160,35 +164,15 @@ export function requireCellIndex(value, label, pointCount) {
   return value;
 }
 
+/**
+ * Require a selection's cells as the one currency selections cross module
+ * boundaries in: a cell list (`requireCellList`), checked in one pass.
+ */
 export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
-  if (!Array.isArray(value)) {
-    throw new TypeError(`${label} must be an array.`);
-  }
+  requirePointCount(pointCount, label);
+  requireCellList(value, pointCount, label);
   if (!allowEmpty && value.length === 0) {
     throw new TypeError(`${label} must not be empty.`);
-  }
-  requirePointCount(pointCount, label);
-  for (let index = 0; index < value.length; index++) {
-    if (!Object.hasOwn(value, index)) {
-      throw new TypeError(`${label} must not contain holes.`);
-    }
-    const cellIndex = value[index];
-    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
-      throw new TypeError(
-        `${label} must contain unique non-negative safe integers.`
-      );
-    }
-    if (cellIndex >= pointCount) {
-      throw new RangeError(
-        `${label} must be inside the current dataset of ${pointCount} cells.`
-      );
-    }
-  }
-  // One bit a cell, not a Set: a Set refuses more than 2^24 entries.
-  if (hasDuplicateCellIndex(value, pointCount)) {
-    throw new TypeError(
-      `${label} must contain unique non-negative safe integers.`
-    );
   }
   return value;
 }
@@ -348,36 +332,9 @@ export function requireHighlightGroup(value, label, pointCount) {
     throw new TypeError(`${label} enabled must be boolean.`);
   }
   requireSafeInteger(value.cellCount, `${label} cellCount`, 1);
-  if (
-    (
-      !Array.isArray(value.cellIndices)
-      && !(value.cellIndices instanceof Uint32Array)
-    )
-    || value.cellIndices.length !== value.cellCount
-  ) {
-    throw new TypeError(
-      `${label} cellIndices must be an Array or Uint32Array matching cellCount.`
-    );
-  }
-  for (const cellIndex of value.cellIndices) {
-    if (
-      !Number.isSafeInteger(cellIndex)
-      || cellIndex < 0
-    ) {
-      throw new TypeError(
-        `${label} cellIndices must contain unique non-negative safe integers.`
-      );
-    }
-    if (cellIndex >= pointCount) {
-      throw new RangeError(
-        `${label} cellIndices must be inside the current dataset of ${pointCount} cells.`
-      );
-    }
-  }
-  if (hasDuplicateCellIndex(value.cellIndices, pointCount)) {
-    throw new TypeError(
-      `${label} cellIndices must contain unique non-negative safe integers.`
-    );
+  requireCellList(value.cellIndices, pointCount, `${label} cellIndices`);
+  if (value.cellIndices.length !== value.cellCount) {
+    throw new TypeError(`${label} cellIndices must match cellCount.`);
   }
   if (type === 'category' || type === 'range') {
     if (
@@ -445,17 +402,13 @@ export function requireSavedHighlightGroup(
       `${label} cellCount must match the completed selection.`
     );
   }
-  // requireHighlightGroup already proved the saved indices are unique and
-  // exactly cellCount long, so an equal length plus containment is set
-  // equality. A permuted, offset, or substituted index set is rejected here
-  // instead of being saved as a selection nobody made.
-  const expectedCellIndexSet = CellSet.from(expectedCellIndices, pointCount);
-  for (const cellIndex of value.cellIndices) {
-    if (!expectedCellIndexSet.has(cellIndex)) {
-      throw new RangeError(
-        `${label} cellIndices must be exactly the completed selection.`
-      );
-    }
+  // Both are cell lists, so equal sets are equal lists. A permuted, offset,
+  // or substituted index set is rejected here instead of being saved as a
+  // selection nobody made.
+  if (!cellListsEqual(value.cellIndices, expectedCellIndices)) {
+    throw new RangeError(
+      `${label} cellIndices must be exactly the completed selection.`
+    );
   }
   return value;
 }

@@ -10,7 +10,7 @@ import {
   ORBIT_ANCHOR_VS,
   ORBIT_ANCHOR_FS,
 } from './shaders/orbit-anchor-shaders.js';
-import { configureStraightAlphaBlending, createProgram } from './gl-utils.js';
+import { configureStraightAlphaBlending, createProgram, deleteProgramReleasingUse } from './gl-utils.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 
 const VIEW_BUFFER_PROPERTIES = Object.freeze([
@@ -112,7 +112,7 @@ export class OrbitAnchorRenderer {
 
     if (this.program !== null) {
       try {
-        gl.deleteProgram(this.program);
+        deleteProgramReleasingUse(gl, this.program);
         this.program = null;
       } catch (error) {
         failures.push(error);

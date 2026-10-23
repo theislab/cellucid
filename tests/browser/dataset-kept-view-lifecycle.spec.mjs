@@ -1,21 +1,15 @@
 import { readFile } from 'node:fs/promises';
 
 import { expect, test } from './helpers/test.mjs';
-import { EXPORTS_BASE_URL as EXPORTS_ROOT } from './helpers/origins.mjs';
+import { anndataZarrZip } from './helpers/anndata-zarr-zip.mjs';
+import { currentUiLike, listCatalogDatasets } from './helpers/catalog-datasets.mjs';
+import { SAMPLE_CATALOG_URL as CATALOG_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
-const PREPARED_FIXTURE_ROOT = new URL(
-  './fixtures/exports/current-ui-prepared/',
-  import.meta.url,
-);
-const PREPARED_CATALOG_URL = new URL(
-  './fixtures/exports/datasets.json',
-  import.meta.url,
-);
-const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
-  '&dataset=current-ui-prepared&acceptance=dataset-kept-view-lifecycle';
+const CATALOG_DATASET_URL =
+  `/?sampleCatalog=${encodeURIComponent(CATALOG_ROOT)}` +
+  '&dataset=current-ui&acceptance=dataset-kept-view-lifecycle';
 const ALTERNATE_DATASET_ID = 'current-ui-alternate';
 const ALTERNATE_DATASET_NAME = 'Current UI alternate fixture';
 const ALTERNATE_DATASET_OPTION =
@@ -28,35 +22,7 @@ const ALTERNATE_CATEGORY_LABELS = Object.freeze([
   'epsilon',
   'zeta',
 ]);
-
-async function readPreparedCatalog() {
-  const body = await readFile(PREPARED_CATALOG_URL);
-  const catalog = JSON.parse(body.toString('utf8'));
-  if (
-    catalog === null ||
-    typeof catalog !== 'object' ||
-    !Array.isArray(catalog.datasets)
-  ) {
-    throw new TypeError(
-      'Prepared fixture catalog must publish a datasets array.'
-    );
-  }
-  return catalog;
-}
-
-async function readPreparedArtifact(relativePath) {
-  if (
-    typeof relativePath !== 'string' ||
-    relativePath.length === 0 ||
-    relativePath.startsWith('/') ||
-    relativePath.split('/').some(part => part === '..')
-  ) {
-    throw new TypeError(
-      'Prepared fixture requests require one safe relative path.'
-    );
-  }
-  return readFile(new URL(relativePath, PREPARED_FIXTURE_ROOT));
-}
+const GENES = Object.freeze(['GAPDH', 'ACTB', 'CD3E', 'MS4A1', 'NKG7', 'LYZ']);
 
 function observeProductErrors(page) {
   const errors = [];
@@ -76,307 +42,39 @@ function observeProductErrors(page) {
   return errors;
 }
 
-function mapFloat32Body(body, transform) {
-  if (body.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
-    throw new Error('Fixture Float32 payload is not element-aligned.');
-  }
-  const output = Buffer.from(body);
-  const values = new DataView(
-    output.buffer,
-    output.byteOffset,
-    output.byteLength,
-  );
-  for (
-    let byteOffset = 0, index = 0;
-    byteOffset < output.byteLength;
-    byteOffset += Float32Array.BYTES_PER_ELEMENT, index += 1
-  ) {
-    const current = values.getFloat32(byteOffset, true);
-    const next = Math.fround(transform(current, index));
-    if (!Number.isFinite(next)) {
-      throw new Error(`Fixture Float32 transform ${index} is not finite.`);
-    }
-    values.setFloat32(byteOffset, next, true);
-  }
-  return output;
-}
-
-function rotatePreparedPoints(body) {
-  if (body.byteLength % (2 * Float32Array.BYTES_PER_ELEMENT) !== 0) {
-    throw new Error('Prepared 2D positions are not point-aligned.');
-  }
-  const output = Buffer.from(body);
-  const values = new DataView(
-    output.buffer,
-    output.byteOffset,
-    output.byteLength,
-  );
-  for (let byteOffset = 0; byteOffset < output.byteLength; byteOffset += 8) {
-    const x = values.getFloat32(byteOffset, true);
-    const y = values.getFloat32(byteOffset + 4, true);
-    values.setFloat32(byteOffset, Math.fround(-y), true);
-    values.setFloat32(byteOffset + 4, Math.fround(x), true);
-  }
-  return output;
-}
-
-function readFloat32At(body, index) {
-  return new DataView(
-    body.buffer,
-    body.byteOffset,
-    body.byteLength,
-  ).getFloat32(index * Float32Array.BYTES_PER_ELEMENT, true);
-}
-
-function buildAlternateObsManifest({
-  manifest,
-  positions,
-  codes,
-  outliers,
-}) {
-  const alternate = structuredClone(manifest);
-  const categorical = alternate._categoricalFields.find(
-    field => field[1] === 'cell_type',
-  );
-  if (!categorical) {
-    throw new Error('Prepared fixture has no cell_type categorical field.');
-  }
-  categorical[2] = [...ALTERNATE_CATEGORY_LABELS];
-
-  const centroids = ALTERNATE_CATEGORY_LABELS.map((category, code) => {
-    let count = 0;
-    let sumX = 0;
-    let sumY = 0;
-    for (let index = 0; index < codes.byteLength; index += 1) {
-      if (
-        codes[index] !== code ||
-        readFloat32At(outliers, index) >
-          alternate.centroid_outlier_quantile
-      ) {
-        continue;
-      }
-      count += 1;
-      sumX += readFloat32At(positions, index * 2);
-      sumY += readFloat32At(positions, index * 2 + 1);
-    }
-    if (count === 0) {
-      throw new Error(`Alternate category "${category}" has no centroid.`);
-    }
-    return {
-      category,
-      position: [sumX / count, sumY / count],
-      n_points: count,
-    };
-  });
-  categorical[5] = { X_umap_2d: centroids };
-  return alternate;
-}
-
-async function createAlternatePreparedArtifacts() {
-  const [
-    identityBody,
-    manifestBody,
-    positionsBody,
-    codesBody,
-    outliersBody,
-    scoreBody,
-  ] = await Promise.all([
-    readFile(new URL('dataset_identity.json', PREPARED_FIXTURE_ROOT)),
-    readFile(new URL('obs_manifest.json', PREPARED_FIXTURE_ROOT)),
-    readFile(new URL('embeddings/0_2d.bin', PREPARED_FIXTURE_ROOT)),
-    readFile(
-      new URL('obs/1.codes.u8', PREPARED_FIXTURE_ROOT),
-    ),
-    readFile(
-      new URL('obs/1.outliers.f32', PREPARED_FIXTURE_ROOT),
-    ),
-    readFile(new URL('obs/0.values.f32', PREPARED_FIXTURE_ROOT)),
-  ]);
-
-  const positions = rotatePreparedPoints(positionsBody);
-  const codes = Buffer.from(codesBody);
-  for (let index = 0; index < codes.length; index += 1) {
-    codes[index] = (codes[index] + 1) % 3;
-  }
-  const outliers = mapFloat32Body(outliersBody, value => 1 - value);
-  const score = mapFloat32Body(scoreBody, value => 1 - value);
-
-  const identity = JSON.parse(identityBody.toString('utf8'));
-  identity.id = ALTERNATE_DATASET_ID;
-  identity.name = ALTERNATE_DATASET_NAME;
-  identity.description =
-    'Distinct same-cell-count browser lifecycle fixture';
-
-  const manifest = buildAlternateObsManifest({
-    manifest: JSON.parse(manifestBody.toString('utf8')),
-    positions,
-    codes,
-    outliers,
-  });
-
-  if (
-    positions.byteLength !== positionsBody.byteLength ||
-    codes.byteLength !== codesBody.byteLength ||
-    outliers.byteLength !== outliersBody.byteLength ||
-    score.byteLength !== scoreBody.byteLength
-  ) {
-    throw new Error('Alternate fixture changed a canonical array length.');
-  }
-  for (const [name, before, after] of [
-    ['positions', positionsBody, positions],
-    ['category codes', codesBody, codes],
-    ['outlier quantiles', outliersBody, outliers],
-    ['continuous values', scoreBody, score],
-  ]) {
-    if (before.equals(after)) {
-      throw new Error(`Alternate fixture ${name} bytes did not change.`);
-    }
-  }
-
-  return new Map([
-    ['dataset_identity.json', Buffer.from(JSON.stringify(identity))],
-    ['obs_manifest.json', Buffer.from(JSON.stringify(manifest))],
-    ['embeddings/0_2d.bin', positions],
-    ['obs/1.codes.u8', codes],
-    ['obs/1.outliers.f32', outliers],
-    ['obs/0.values.f32', score],
-  ]);
-}
-
-async function installAlternatePreparedDataset(page) {
-  const [artifacts, catalog] = await Promise.all([
-    createAlternatePreparedArtifacts(),
-    readPreparedCatalog(),
-  ]);
-  const requestedPaths = [];
-  const source = catalog.datasets.find(
-    dataset => dataset.id === 'current-ui-prepared',
-  );
-  if (source === undefined) {
-    throw new Error('Prepared fixture is missing from its dataset catalog.');
-  }
-  catalog.datasets.push({
-    ...source,
+/**
+ * The same number of cells as `current-ui` with different everything else:
+ * positions, categories and codes, scores, latent space and expression.
+ */
+async function installAlternateDataset(page) {
+  const bytes = currentUiLike({
     id: ALTERNATE_DATASET_ID,
     name: ALTERNATE_DATASET_NAME,
-    path: `${ALTERNATE_DATASET_ID}/`,
+    description: 'Distinct same-cell-count browser lifecycle fixture',
+    categories: [...ALTERNATE_CATEGORY_LABELS],
   });
-  await page.route(
-    '**/tests/browser/fixtures/exports/datasets.json',
-    route => route.fulfill({ status: 200, json: catalog }),
-  );
-
-  await page.route(
-    `**/tests/browser/fixtures/exports/${ALTERNATE_DATASET_ID}/**`,
-    async route => {
-      const alternateUrl = new URL(route.request().url());
-      const alternatePrefix =
-        `/tests/browser/fixtures/exports/${ALTERNATE_DATASET_ID}/`;
-      if (!alternateUrl.pathname.startsWith(alternatePrefix)) {
-        throw new Error(
-          `Unexpected alternate fixture URL: ${alternateUrl.pathname}`,
-        );
-      }
-      const relativePath =
-        alternateUrl.pathname.slice(alternatePrefix.length);
-      requestedPaths.push(relativePath);
-      const artifact = artifacts.get(relativePath);
-      if (artifact !== undefined) {
-        await route.fulfill({
-          status: 200,
-          contentType: relativePath.endsWith('.json')
-            ? 'application/json'
-            : 'application/octet-stream',
-          body: artifact,
-        });
-        return;
-      }
-      const canonicalArtifact = await readPreparedArtifact(relativePath);
-      await route.fulfill({
-        status: 200,
-        contentType: relativePath.endsWith('.json')
-          ? 'application/json'
-          : 'application/octet-stream',
-        body: canonicalArtifact,
-      });
-    },
-  );
-  return requestedPaths;
+  const reads = await listCatalogDatasets(page, [{ id: ALTERNATE_DATASET_ID, bytes }]);
+  return reads.get(ALTERNATE_DATASET_ID);
 }
 
-async function installZeroCellPreparedDataset(page) {
-  const requestedPaths = [];
-  const [identityBody, obsManifestBody, varManifestBody, catalog] =
-    await Promise.all([
-      readFile(new URL('dataset_identity.json', PREPARED_FIXTURE_ROOT)),
-      readFile(new URL('obs_manifest.json', PREPARED_FIXTURE_ROOT)),
-      readFile(new URL('var_manifest.json', PREPARED_FIXTURE_ROOT)),
-      readPreparedCatalog(),
-    ]);
-  const identity = JSON.parse(identityBody.toString('utf8'));
-  identity.id = ZERO_DATASET_ID;
-  identity.name = ZERO_DATASET_NAME;
-  identity.description = 'Unsupported zero-cell browser policy fixture';
-  identity.stats.n_cells = 0;
-
-  const obsManifest = JSON.parse(obsManifestBody.toString('utf8'));
-  obsManifest.n_points = 0;
-  for (const categorical of obsManifest._categoricalFields) {
-    categorical[5] = Object.fromEntries(
-      Object.keys(categorical[5]).map(embeddingId => [embeddingId, []]),
-    );
-  }
-  const varManifest = JSON.parse(varManifestBody.toString('utf8'));
-  varManifest.n_points = 0;
-  const source = catalog.datasets.find(
-    dataset => dataset.id === 'current-ui-prepared',
-  );
-  if (source === undefined) {
-    throw new Error('Prepared fixture is missing from its dataset catalog.');
-  }
-  catalog.datasets.push({
-    ...source,
-    id: ZERO_DATASET_ID,
-    name: ZERO_DATASET_NAME,
-    path: `${ZERO_DATASET_ID}/`,
-    n_cells: 0,
-  });
-
-  await page.route(
-    '**/tests/browser/fixtures/exports/datasets.json',
-    route => route.fulfill({ status: 200, json: catalog }),
-  );
-
-  await page.route(
-    `**/tests/browser/fixtures/exports/${ZERO_DATASET_ID}/**`,
-    async route => {
-      const url = new URL(route.request().url());
-      const prefix =
-        `/tests/browser/fixtures/exports/${ZERO_DATASET_ID}/`;
-      if (!url.pathname.startsWith(prefix)) {
-        throw new Error(`Unexpected zero-cell fixture URL: ${url.pathname}`);
-      }
-      const relativePath = url.pathname.slice(prefix.length);
-      requestedPaths.push(relativePath);
-      const json = relativePath === 'dataset_identity.json'
-        ? identity
-        : relativePath === 'obs_manifest.json'
-          ? obsManifest
-          : relativePath === 'var_manifest.json'
-            ? varManifest
-            : null;
-      await route.fulfill({
-        status: 200,
-        contentType: json === null
-          ? 'application/octet-stream'
-          : 'application/json',
-        body: json === null
-          ? Buffer.alloc(0)
-          : Buffer.from(JSON.stringify(json)),
-      });
+/** A dataset with no cells, which the viewer does not open. */
+async function installZeroCellDataset(page) {
+  const bytes = anndataZarrZip({
+    cells: 0,
+    genes: [...GENES],
+    obs: { cell_type: { categories: ['alpha', 'beta', 'gamma'], codes: new Int8Array(0) } },
+    obsm: { X_umap_2d: { data: new Float32Array(0), columns: 2 } },
+    uns: {
+      cellucid: {
+        schema: 1,
+        id: ZERO_DATASET_ID,
+        name: ZERO_DATASET_NAME,
+        description: 'Unsupported zero-cell browser policy fixture',
+      },
     },
-  );
-  return requestedPaths;
+  });
+  const reads = await listCatalogDatasets(page, [{ id: ZERO_DATASET_ID, bytes }]);
+  return reads.get(ZERO_DATASET_ID);
 }
 
 async function settleRendering(page) {
@@ -525,15 +223,15 @@ test(
   'direct dataset replacement retires every kept view before refreshing active-view UI',
   async ({ page }, testInfo) => {
     const productErrors = observeProductErrors(page);
-    const alternateRequests = await installAlternatePreparedDataset(page);
-    await page.goto(PREPARED_DATASET_URL, {
+    const alternateRequests = await installAlternateDataset(page);
+    await page.goto(CATALOG_DATASET_URL, {
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
     await openCollapsedPanels(page);
 
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect(
       page.locator(
@@ -554,7 +252,7 @@ test(
       testInfo,
       `${testInfo.project.name}-same-n-before`,
     );
-    expect(beforeSvg).toContain('Current UI prepared fixture');
+    expect(beforeSvg).toContain('Current UI fixture');
     for (const label of ['alpha', 'beta', 'gamma']) {
       expect(beforeSvg).toContain(label);
     }
@@ -607,12 +305,8 @@ test(
       error: null,
       name: ALTERNATE_DATASET_NAME,
       productErrors: [],
-      requests: expect.arrayContaining([
-        'dataset_identity.json',
-        'obs_manifest.json',
-        'var_manifest.json',
-        'embeddings/0_2d.bin',
-      ]),
+      // The alternate's file was read: listing it, and opening it.
+      requests: expect.arrayContaining([expect.stringMatching(/^bytes=/)]),
       selected: ALTERNATE_DATASET_OPTION,
     });
     await expect.poll(() => page.evaluate(() => {
@@ -641,8 +335,9 @@ test(
     await expect(page.locator('#split-clear-btn')).toBeDisabled();
     await expect(page.locator('#camera-lock-btn')).toBeDisabled();
     await selectCategoricalOutlierView(page);
+    // The alternate's latent space keeps 60 cells under the 50% cut.
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing 63 of 120 cells',
+      'Showing 60 of 120 cells',
     );
     expect(
       await page.locator('.legend-item').allTextContents(),
@@ -704,13 +399,13 @@ test(
   'same-N publication inside a borrowed callback commits but fails its ownership fence',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
-    await page.goto(PREPARED_DATASET_URL, {
+    await page.goto(CATALOG_DATASET_URL, {
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
 
     const result = await page.evaluate(() => {
@@ -785,10 +480,10 @@ test(
   'delayed PNG encoding remains wholly old across same-N replacement and the next export is wholly new',
   async ({ page }, testInfo) => {
     const productErrors = observeProductErrors(page);
-    await installAlternatePreparedDataset(page);
+    await installAlternateDataset(page);
     await page.addInitScript(() => {
       const originalGetContext = HTMLCanvasElement.prototype.getContext;
-      const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+      const originalCreateImageBitmap = window.createImageBitmap.bind(window);
       const webgl2Contexts = [];
       HTMLCanvasElement.prototype.getContext = function getContext(
         type,
@@ -811,7 +506,7 @@ test(
         webgl2Start: null,
         arm() {
           if (this.pause !== null) {
-            throw new Error('A PNG encoding callback is already paused.');
+            throw new Error('A PNG frame handoff is already paused.');
           }
           this.armed = true;
           this.lastRelease = null;
@@ -839,7 +534,7 @@ test(
         },
         release() {
           if (this.pause === null) {
-            throw new Error('No PNG encoding callback is paused.');
+            throw new Error('No PNG frame handoff is paused.');
           }
           const pending = this.pause;
           const context = pending.canvas.getContext('2d');
@@ -851,11 +546,8 @@ test(
               pending.canvas.height,
             ).data,
           );
-          originalToBlob.call(
-            pending.canvas,
-            pending.callback,
-            ...pending.args,
-          );
+          originalCreateImageBitmap(pending.canvas, ...pending.args)
+            .then(pending.resolve, pending.reject);
           this.lastRelease = {
             height: pending.canvas.height,
             pausedHash: pending.pausedHash,
@@ -866,20 +558,20 @@ test(
           this.pause = null;
         },
       };
-      Object.defineProperty(window, '__sameNToBlobGate', {
+      Object.defineProperty(window, '__sameNFrameGate', {
         configurable: false,
         value: gate,
         writable: false,
       });
-      HTMLCanvasElement.prototype.toBlob = function toBlob(
-        callback,
-        ...args
-      ) {
-        if (!gate.armed) {
-          return originalToBlob.call(this, callback, ...args);
+      // The composed PNG canvas is handed to the figure-export worker as an
+      // ImageBitmap, which the worker encodes; holding that handoff holds the
+      // export after its frame is complete.
+      window.createImageBitmap = function createImageBitmap(source, ...args) {
+        if (!gate.armed || !(source instanceof HTMLCanvasElement)) {
+          return originalCreateImageBitmap(source, ...args);
         }
         gate.armed = false;
-        const context = this.getContext('2d');
+        const context = source.getContext('2d');
         if (context === null) {
           throw new Error('Paused PNG export canvas has no 2D context.');
         }
@@ -891,19 +583,22 @@ test(
           }
           return hash >>> 0;
         };
-        gate.pause = {
-          args,
-          callback,
-          canvas: this,
-          hashPixels,
-          pausedHash: hashPixels(
-            context.getImageData(0, 0, this.width, this.height).data,
-          ),
-          releasedHash: null,
-        };
+        return new Promise((resolve, reject) => {
+          gate.pause = {
+            args,
+            canvas: source,
+            hashPixels,
+            pausedHash: hashPixels(
+              context.getImageData(0, 0, source.width, source.height).data,
+            ),
+            reject,
+            releasedHash: null,
+            resolve,
+          };
+        });
       };
     });
-    await page.goto(PREPARED_DATASET_URL, {
+    await page.goto(CATALOG_DATASET_URL, {
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
@@ -911,12 +606,12 @@ test(
     await selectCategoricalOutlierView(page);
     await openFigureExportDownload(page);
     await configureSmallPngExport(page);
-    await page.evaluate(() => window.__sameNToBlobGate.arm());
+    await page.evaluate(() => window.__sameNFrameGate.arm());
 
     const delayedDownload = page.waitForEvent('download');
     await page.locator('#figure-export-btn').click();
     await expect.poll(
-      () => page.evaluate(() => window.__sameNToBlobGate.inspect()),
+      () => page.evaluate(() => window.__sameNFrameGate.inspect()),
     ).not.toBeNull();
 
     await page.locator('#dataset-select').selectOption(
@@ -927,9 +622,9 @@ test(
     );
     await selectCategoricalOutlierView(page);
     const pausedBeforeRelease = await page.evaluate(
-      () => window.__sameNToBlobGate.inspect(),
+      () => window.__sameNFrameGate.inspect(),
     );
-    await page.evaluate(() => window.__sameNToBlobGate.release());
+    await page.evaluate(() => window.__sameNFrameGate.release());
     const delayed = await delayedDownload;
     expect(await delayed.failure()).toBeNull();
     const delayedPath = testInfo.outputPath(
@@ -937,23 +632,23 @@ test(
     );
     await delayed.saveAs(delayedPath);
     const oldBytes = await readFile(delayedPath);
+    // The export creates no WebGL context on the page: its point passes run
+    // on the figure-export worker's own contexts.
     expect(pausedBeforeRelease).toMatchObject({
       pausedHash: expect.any(Number),
       releasedHash: null,
       state: 'paused',
-      webgl2ContextLost: [false],
+      webgl2ContextLost: [],
     });
     await expect.poll(
-      () => page.evaluate(() => window.__sameNToBlobGate.inspect()),
+      () => page.evaluate(() => window.__sameNFrameGate.inspect()),
     ).toMatchObject({
       pausedHash: pausedBeforeRelease.pausedHash,
       releasedHash: pausedBeforeRelease.pausedHash,
       state: 'released',
-      // The export's raster context returns to its pool, never lost
-      // (webgl-point-rasterizer.js).
-      webgl2ContextLost: [false],
+      webgl2ContextLost: [],
     });
-    expect(oldBytes.includes(Buffer.from('Current UI prepared fixture'))).toBe(
+    expect(oldBytes.includes(Buffer.from('Current UI fixture'))).toBe(
       true,
     );
     expect(oldBytes.includes(Buffer.from(ALTERNATE_DATASET_NAME))).toBe(false);
@@ -974,20 +669,20 @@ test(
 );
 
 test(
-  'unsupported zero-cell prepared selection rejects before publication and preserves the active UI',
+  'unsupported zero-cell selection rejects before publication and preserves the active UI',
   async ({ page }) => {
-    const zeroRequests = await installZeroCellPreparedDataset(page);
+    const zeroRequests = await installZeroCellDataset(page);
     const pageErrors = [];
     page.on('pageerror', error => {
       pageErrors.push(error.stack || error.message);
     });
-    await page.goto(PREPARED_DATASET_URL, {
+    await page.goto(CATALOG_DATASET_URL, {
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect(
       page.locator(`#dataset-select option[value="${ZERO_DATASET_OPTION}"]`),
@@ -997,25 +692,26 @@ test(
     const before = await capturePublishedView(page);
 
     await page.locator('#dataset-select').selectOption(ZERO_DATASET_OPTION);
-    await expect(page.locator('.notification-error').last()).toContainText(
-      'n_points must be a positive safe integer',
+    // The file is what is wrong, so the message says so and names it: it is
+    // never sent to check a connection that worked.
+    const failure = page.locator('.notification-error').last();
+    await expect(failure).toContainText(
+      `${ZERO_DATASET_ID}.zarr.zip (dataset '${ZERO_DATASET_ID}' in datasets.json): ` +
+        'This AnnData has no cells (n_obs is 0), so there is nothing to plot.',
     );
+    await expect(failure).not.toContainText('connection');
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect(page.locator('#dataset-cells')).toHaveText('120');
     await expect(page.locator('#dataset-select')).toHaveValue(
-      'dataset:local-demo:current-ui-prepared',
+      'dataset:local-demo:current-ui',
     );
     await expect(page.locator('.split-badge')).toHaveCount(2);
 
     const after = await capturePublishedView(page);
     expect(after).toEqual(before);
-    expect(zeroRequests).toEqual(expect.arrayContaining([
-      'dataset_identity.json',
-      'obs_manifest.json',
-    ]));
-    expect(zeroRequests).not.toContain('embeddings/0_2d.bin');
+    expect(zeroRequests.length).toBeGreaterThan(0);
     expect(pageErrors).toEqual([]);
     expect(await page.evaluate(
       () => window._cellucidViewer.getGLContext().getError(),

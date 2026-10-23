@@ -6,6 +6,7 @@
 
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
+import { getFieldRegistry } from '../../../utils/field-registry.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -72,14 +73,33 @@ function requireField(field, label) {
   return field;
 }
 
-function requireFields(value, label, { nullable = false } = {}) {
+/**
+ * How many leading fields of each inventory were checked. A field's key and
+ * kind change only through checked paths (a rename validates its new key), and
+ * an inventory only grows (user-defined fields are appended), so a checked
+ * inventory is read again only from its first unchecked field.
+ * @type {WeakMap<Object[], number>}
+ */
+const checkedInventoryLengths = new WeakMap();
+
+/**
+ * One exact field inventory: an array of field records with valid keys and
+ * kinds.
+ * @param {*} value
+ * @param {string} label
+ * @param {{nullable?: boolean}} [options]
+ * @returns {Object[]|null}
+ */
+export function requireFields(value, label, { nullable = false } = {}) {
   if (nullable && value === null) return null;
   if (!Array.isArray(value)) {
     throw new TypeError(`${label} must be an array`);
   }
-  value.forEach((field, index) => {
-    requireField(field, `${label}[${index}]`);
-  });
+  const checked = checkedInventoryLengths.get(value) ?? 0;
+  for (let index = Math.min(checked, value.length); index < value.length; index++) {
+    requireField(value[index], `${label}[${index}]`);
+  }
+  checkedInventoryLengths.set(value, value.length);
   return value;
 }
 
@@ -125,6 +145,37 @@ function formatRangeValue(value) {
   return value.toFixed(2);
 }
 
+/**
+ * The registry revisions each field inventory shows. A copy of an inventory
+ * (a kept view's, a restored view's) shows what its source showed
+ * (`carryOverlayRevisions`).
+ * @type {WeakMap<Object[], {rename: number, delete: number}>}
+ */
+const overlayRevisions = new WeakMap();
+
+/**
+ * A copied inventory shows the same overlays as the one it was copied from.
+ * @param {Object[]|undefined|null} from
+ * @param {Object[]} to
+ */
+export function carryOverlayRevisions(from, to) {
+  if (!Array.isArray(from)) return;
+  const shown = overlayRevisions.get(from);
+  if (shown !== undefined) overlayRevisions.set(to, shown);
+}
+
+/** Where a field of `originalKey` is in one inventory, or -1. */
+function findFieldByOriginalKey(fields, source, originalKey) {
+  // Inventories of one dataset list its fields in one order, so the shared
+  // index is checked first; user-defined fields are never registry-edited.
+  const indexed = getFieldRegistry().getIndexByKey(source, originalKey);
+  const at = fields[indexed];
+  if (at !== undefined && (at._originalKey ?? at.key) === originalKey) {
+    return indexed;
+  }
+  return fields.findIndex(field => (field?._originalKey ?? field?.key) === originalKey);
+}
+
 export class FieldOverlayInternalMethods {
   _ensureActiveSelectionNotDeleted() {
     const source = this.activeFieldSource;
@@ -163,115 +214,189 @@ export class FieldOverlayInternalMethods {
     }
   }
 
+  /**
+   * Show one field inventory under the rename and delete registries.
+   *
+   * An inventory remembers the registry revisions it shows
+   * (`overlayRevisions`); applying them again reads only the fields edited
+   * since, so a view switch or a kept view costs the edits, not one pass over
+   * every gene. An inventory not seen before, or one older than a whole
+   * registry replacement (a dataset or a session restore), is read in full.
+   */
   _applyOverlaysToFields(fields, source) {
     requireSource(source);
-    const inventory = requireFields(
-      fields,
-      `${source} overlay field inventory`,
-      { nullable: true }
-    );
-    if (inventory === null || inventory.length === 0) return;
+    if (fields === null) return;
+    if (!Array.isArray(fields)) {
+      throw new TypeError(`${source} overlay field inventory must be an array`);
+    }
+    if (fields.length === 0) return;
     for (const methodName of [
       'getDisplayCategory',
-      'getDisplayKey'
+      'getDisplayKey',
+      'getRevision',
+      'editsSince',
+      'hasEntriesFor'
     ]) {
       requireMethod(this._renameRegistry, methodName, 'Rename registry');
     }
-    for (const methodName of ['isDeleted', 'isPurged']) {
+    for (const methodName of ['isDeleted', 'isPurged', 'getRevision', 'editsSince', 'hasEntriesFor']) {
       requireMethod(this._deleteRegistry, methodName, 'Delete registry');
     }
-
-    for (let fieldIndex = 0; fieldIndex < inventory.length; fieldIndex++) {
-      const field = inventory[fieldIndex];
-      if (field._isUserDefined === true) {
-        requireIdentifier(
-          field._userDefinedId,
-          `User-defined ${source} field ${fieldIndex} id`
-        );
-        if (field._fieldSource !== source) {
-          throw new Error(
-            `User-defined ${source} field ${fieldIndex} has mismatched ownership`
-          );
-        }
-        continue;
-      }
-
-      const originalKey = requireOriginalKey(field);
-      const displayKey = this._renameRegistry.getDisplayKey(
-        source,
-        originalKey
+    const revisions = {
+      rename: this._renameRegistry.getRevision(),
+      delete: this._deleteRegistry.getRevision()
+    };
+    const shown = overlayRevisions.get(fields);
+    const renameEdits = shown === undefined
+      ? null
+      : this._renameRegistry.editsSince(shown.rename);
+    const deleteEdits = shown === undefined
+      ? null
+      : this._deleteRegistry.editsSince(shown.delete);
+    if (renameEdits === null || deleteEdits === null) {
+      const inventory = requireFields(
+        fields,
+        `${source} overlay field inventory`
       );
-      StateValidator.validateFieldKey(displayKey);
-      if (displayKey === originalKey) {
-        field.key = originalKey;
-        delete field._originalKey;
-      } else {
-        field._originalKey = originalKey;
-        field.key = displayKey;
-      }
-
-      const deleted = requireBoolean(
-        this._deleteRegistry.isDeleted(source, originalKey),
-        'Delete registry deletion state'
-      );
-      const purged = requireBoolean(
-        this._deleteRegistry.isPurged(source, originalKey),
-        'Delete registry purge state'
-      );
-      if (purged && !deleted) {
-        throw new Error('Purged field overlay must also be deleted');
-      }
-      if (deleted) field._isDeleted = true;
-      else delete field._isDeleted;
-      if (purged) field._isPurged = true;
-      else delete field._isPurged;
-
-      if (field.kind !== FieldKind.CATEGORY) continue;
-      const categories = requireCategoryInventory(
-        field,
-        `${source} field ${fieldIndex}`
-      );
-      const previousCategories = [...categories];
-      let originalCategories;
-      if (Object.hasOwn(field, '_originalCategories')) {
+      // With nothing of this source renamed or deleted, a field shows its
+      // own name and categories: only a field still showing an earlier
+      // overlay is read.
+      const overlaid = this._renameRegistry.hasEntriesFor(source)
+        || this._deleteRegistry.hasEntriesFor(source);
+      for (let fieldIndex = 0; fieldIndex < inventory.length; fieldIndex++) {
+        const field = inventory[fieldIndex];
         if (
-          !Array.isArray(field._originalCategories)
-          || field._originalCategories.length !== categories.length
+          overlaid
+          || field._isUserDefined === true
+          || Object.hasOwn(field, '_originalKey')
+          || Object.hasOwn(field, '_originalCategories')
+          || Object.hasOwn(field, '_isDeleted')
+          || Object.hasOwn(field, '_isPurged')
         ) {
-          throw new TypeError(
-            `${source} field ${fieldIndex} original categories must exactly match its inventory`
-          );
+          this._applyOverlayToField(field, source, fieldIndex);
         }
-        field._originalCategories.forEach((category) => {
-          StateValidator.validateCategoryLabel(category);
-        });
-        originalCategories = [...field._originalCategories];
-      } else {
-        originalCategories = [...categories];
       }
-
-      const displayCategories = originalCategories.map(
-        (originalLabel) => {
-          const displayLabel = this._renameRegistry.getDisplayCategory(
-            source,
-            originalKey,
-            originalLabel
-          );
-          StateValidator.validateCategoryLabel(displayLabel);
-          return displayLabel;
-        }
-      );
-      const hasRename = displayCategories.some(
-        (category, index) => category !== originalCategories[index]
-      );
-      field.categories = displayCategories;
-      if (hasRename) {
-        field._originalCategories = originalCategories;
-      } else {
-        delete field._originalCategories;
+    } else {
+      const edited = new Set();
+      for (const edit of [...renameEdits, ...deleteEdits]) {
+        if (edit.source === source) edited.add(edit.originalKey);
       }
-      this._syncCentroidCategoryLabels(field, previousCategories);
+      for (const originalKey of edited) {
+        const fieldIndex = findFieldByOriginalKey(fields, source, originalKey);
+        if (fieldIndex < 0) continue;
+        requireField(fields[fieldIndex], `${source} overlay field inventory[${fieldIndex}]`);
+        this._applyOverlayToField(fields[fieldIndex], source, fieldIndex);
+      }
     }
+    overlayRevisions.set(fields, revisions);
+  }
+
+  /** Show one field under the rename and delete registries. */
+  _applyOverlayToField(field, source, fieldIndex) {
+    if (field._isUserDefined === true) {
+      requireIdentifier(
+        field._userDefinedId,
+        `User-defined ${source} field ${fieldIndex} id`
+      );
+      if (field._fieldSource !== source) {
+        throw new Error(
+          `User-defined ${source} field ${fieldIndex} has mismatched ownership`
+        );
+      }
+      return;
+    }
+
+    const originalKey = requireOriginalKey(field);
+    const displayKey = this._renameRegistry.getDisplayKey(
+      source,
+      originalKey
+    );
+    StateValidator.validateFieldKey(displayKey);
+    if (displayKey === originalKey) {
+      field.key = originalKey;
+      delete field._originalKey;
+    } else {
+      field._originalKey = originalKey;
+      field.key = displayKey;
+    }
+
+    const deleted = requireBoolean(
+      this._deleteRegistry.isDeleted(source, originalKey),
+      'Delete registry deletion state'
+    );
+    const purged = requireBoolean(
+      this._deleteRegistry.isPurged(source, originalKey),
+      'Delete registry purge state'
+    );
+    if (purged && !deleted) {
+      throw new Error('Purged field overlay must also be deleted');
+    }
+    if (deleted) field._isDeleted = true;
+    else delete field._isDeleted;
+    if (purged) field._isPurged = true;
+    else delete field._isPurged;
+
+    if (field.kind !== FieldKind.CATEGORY) return;
+    // A column whose categories are found when it is first loaded gets
+    // its category renames then (field/loading.js).
+    if (field.categories === null) return;
+    this._applyCategoryOverlay(field, source, originalKey, `${source} field ${fieldIndex}`);
+  }
+
+  /**
+   * Show one categorical field's categories under their display names (the
+   * rename registry), keeping the original names beside them.
+   *
+   * @param {Object} field
+   * @param {string} source
+   * @param {string} originalKey
+   * @param {string} label
+   */
+  _applyCategoryOverlay(field, source, originalKey, label) {
+    const categories = requireCategoryInventory(
+      field,
+      label
+    );
+    const previousCategories = [...categories];
+    let originalCategories;
+    if (Object.hasOwn(field, '_originalCategories')) {
+      if (
+        !Array.isArray(field._originalCategories)
+        || field._originalCategories.length !== categories.length
+      ) {
+        throw new TypeError(
+          `${label} original categories must exactly match its inventory`
+        );
+      }
+      field._originalCategories.forEach((category) => {
+        StateValidator.validateCategoryLabel(category);
+      });
+      originalCategories = [...field._originalCategories];
+    } else {
+      originalCategories = [...categories];
+    }
+
+    const displayCategories = originalCategories.map(
+      (originalLabel) => {
+        const displayLabel = this._renameRegistry.getDisplayCategory(
+          source,
+          originalKey,
+          originalLabel
+        );
+        StateValidator.validateCategoryLabel(displayLabel);
+        return displayLabel;
+      }
+    );
+    const hasRename = displayCategories.some(
+      (category, index) => category !== originalCategories[index]
+    );
+    field.categories = displayCategories;
+    if (hasRename) {
+      field._originalCategories = originalCategories;
+    } else {
+      delete field._originalCategories;
+    }
+    this._syncCentroidCategoryLabels(field, previousCategories);
   }
 
   _injectUserDefinedFields() {
@@ -535,8 +660,7 @@ export class FieldOverlayInternalMethods {
    * `positions` are the layout's normalized positions, the ones the view is
    * about to draw: the caller has already loaded and pinned them, so the
    * centroids are computed from exactly that geometry and are normalized from
-   * birth. Built-in fields carry their own manifest centroids and are left
-   * alone.
+   * birth. Any other field is left alone.
    *
    * @param {object} field
    * @param {string} layoutKey

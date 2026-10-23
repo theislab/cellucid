@@ -12,6 +12,8 @@
  * @module genes-panel/constants
  */
 
+import { analysisMemoryBudgetMB } from '../shared/performance-config.js';
+
 // =============================================================================
 // DEFAULT CONFIGURATION
 // =============================================================================
@@ -41,16 +43,15 @@ export const DEFAULTS = {
 
   // Performance parameters
   batchSize: 100,
-  memoryBudgetMB: 512,
+  // A sixteenth of the device memory the browser reports (performance-config.js).
+  memoryBudgetMB: analysisMemoryBudgetMB(),
   // Must agree with PerformanceConfig.batch.networkConcurrency; see the
   // measurement recorded there for why twelve.
   networkConcurrency: 12,
   progressInterval: 100, // Emit partial results every N genes
 
   // Cache parameters
-  cacheMaxCategories: 3, // Hot cache: number of categories to keep in memory
-  cacheMaxAgeDays: 7,    // Warm cache: IndexedDB TTL
-  cacheVersion: 1        // Increment to invalidate old caches
+  cacheMaxCategories: 3 // Marker results kept in memory: the categories analysed last
 };
 
 // =============================================================================

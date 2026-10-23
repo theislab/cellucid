@@ -1,7 +1,8 @@
 /**
  * Vector fields of a data mapping, read from a real `.h5ad` and Zarr ZIP in
- * the browser readers, against what `cellucid-python` serves for the same
- * binding (`data-mapping-full.expected.json`):
+ * the browser readers, against the numpy reference for the same binding
+ * (`data-mapping-full.expected.json`, computed by
+ * `scripts/generate-data-mapping-fixtures.py` independently of this code):
  * - an array as wide as the embedding's dimension is read whole, one as wide
  *   as the embedding's array at the embedding's own columns, and both are
  *   scaled by that embedding's normalization: byte-identical payloads;
@@ -68,7 +69,7 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
         embedding: { key: embeddingKey, columns: columns.split(',').map(Number) },
       });
       assert.equal(resolved.ok, true, name);
-      const vectors = await adapter.getVectorPayload(resolved.path, resolved.dimension);
+      const { vectors } = await adapter.getVectorPayload(resolved.path, resolved.dimension);
       assert.equal(sha256(vectors), expected, name);
     }
   });

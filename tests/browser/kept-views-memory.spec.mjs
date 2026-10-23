@@ -1,11 +1,11 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { pixelParityVerdict } from './helpers/pixel-parity.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=kept-views-memory-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=kept-views-memory-ci`;
 
 /**
  * Any number of kept views (there is no view-count ceiling), and memory, not
@@ -19,7 +19,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const keepView = async () => {
     const before = await page.evaluate(() => window._cellucidViewer.getSnapshotViews().length);

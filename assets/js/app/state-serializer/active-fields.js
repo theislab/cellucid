@@ -179,35 +179,42 @@ export async function restoreActiveFields(
   }
 }
 
-export function validateActiveFieldsForState(state, activeFields) {
+/**
+ * @param {object} state
+ * @param {unknown} activeFields
+ * @param {{obsFields: object[], varFields: object[], obsLookup: Map<string, number>, varLookup: Map<string, number>}|null} [inventory] -
+ *   One inventory read for several views (`readFieldInventory`).
+ */
+export function validateActiveFieldsForState(state, activeFields, inventory = null) {
   assertActiveFieldsState(activeFields);
   requireMethod(state, 'getFields', 'Active-field restore owner');
   requireMethod(state, 'getVarFields', 'Active-field restore owner');
-
-  const obsFields = assertFieldInventory(
-    state.getFields(),
-    'Current obs field inventory'
-  );
-  const varFields = assertFieldInventory(
-    state.getVarFields(),
-    'Current var field inventory'
-  );
 
   if (activeFields.activeFieldSource === null) {
     requireMethod(state, 'clearActiveField', 'Active-field restore owner');
     return { source: null, fieldIndex: null, field: null };
   }
 
-  const fields = activeFields.activeFieldSource === 'obs'
-    ? obsFields
-    : varFields;
-  const fieldIndex = fields.findIndex(
-    field => (
-      field.key === activeFields.activeFieldKey
-      && field._isDeleted !== true
-    )
-  );
-  if (fieldIndex < 0) {
+  let fields;
+  let fieldIndex;
+  if (inventory === null) {
+    const obsFields = assertFieldInventory(
+      state.getFields(),
+      'Current obs field inventory'
+    );
+    const varFields = assertFieldInventory(
+      state.getVarFields(),
+      'Current var field inventory'
+    );
+    fields = activeFields.activeFieldSource === 'obs' ? obsFields : varFields;
+    fieldIndex = fields.findIndex(field => field.key === activeFields.activeFieldKey);
+  } else {
+    const isObs = activeFields.activeFieldSource === 'obs';
+    fields = isObs ? inventory.obsFields : inventory.varFields;
+    fieldIndex = (isObs ? inventory.obsLookup : inventory.varLookup)
+      .get(activeFields.activeFieldKey) ?? -1;
+  }
+  if (fieldIndex < 0 || fields[fieldIndex]._isDeleted === true) {
     throw new RangeError(
       `Current field "${activeFields.activeFieldKey}" was not found for source "${activeFields.activeFieldSource}".`
     );

@@ -4,7 +4,11 @@
  * @module session/contributors/highlights-cells
  */
 
-import { encodeDeltaUvarint, decodeDeltaUvarint } from '../codecs/delta-varint.js';
+import {
+  cellSetNeedsReference,
+  decodeCellSet,
+  encodeCellSet
+} from '../codecs/cell-set.js';
 import {
   assertArray,
   assertExactKeys,
@@ -72,6 +76,53 @@ function getRestoreTransaction(ctx) {
   return ctx.restoreTransaction;
 }
 
+/**
+ * The cells of one category of one dataset observation field, ascending: the
+ * reference a category highlight is stored relative to. Null for a group
+ * that has none (another group type, a gene field, a user-defined field, or
+ * a field whose codes are not held).
+ *
+ * @param {object} state
+ * @param {object} group - A live group with its resolved positions.
+ * @param {Map<object, Uint32Array[]>} cache - Per-field category members.
+ * @returns {Uint32Array|null}
+ */
+function categoryReference(state, group, cache) {
+  if (group.type !== 'category' || group.fieldSource !== 'obs') return null;
+  const field = state.obsData?.fields?.[group.fieldIndex];
+  if (
+    field === undefined
+    || field === null
+    || field.key !== group.fieldKey
+    || field.kind !== 'category'
+    || field._isUserDefined === true
+    || !Array.isArray(field.categories)
+    || !ArrayBuffer.isView(field.codes)
+    || field.codes.length !== state.pointCount
+  ) {
+    return null;
+  }
+  let members = cache.get(field);
+  if (members === undefined) {
+    // One counting pass per field serves every category group on it.
+    const codes = field.codes;
+    const categoryCount = field.categories.length;
+    const counts = new Uint32Array(categoryCount);
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code < categoryCount) counts[code] += 1;
+    }
+    members = Array.from(counts, count => new Uint32Array(count));
+    const fill = new Uint32Array(categoryCount);
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code < categoryCount) members[code][fill[code]++] = i;
+    }
+    cache.set(field, members);
+  }
+  return members[group.categoryIndex] ?? null;
+}
+
 function requireStagedHighlightState(value, state) {
   assertPlainRecord(value, 'Staged highlight restore state');
   assertExactKeys(
@@ -130,6 +181,7 @@ export function capture(ctx) {
   );
   const groupIds = new Set();
   const chunks = [];
+  const referenceCache = new Map();
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
     const page = pages[pageIndex];
@@ -179,7 +231,10 @@ export function capture(ctx) {
         codec: 'gzip',
         label: `Highlight cells: ${label}`,
         datasetDependent: true,
-        payload: encodeDeltaUvarint(indices)
+        payload: encodeCellSet(indices, {
+          cellCount: pointCount,
+          reference: categoryReference(state, group, referenceCache)
+        })
       });
     }
   }
@@ -300,9 +355,28 @@ export async function restore(ctx, chunkMeta, payload) {
   ) {
     throw new TypeError('Highlight cells abortSignal must be an AbortSignal or null.');
   }
-  const decoded = await decodeDeltaUvarint(payload, {
-    maxCount: pointCount,
-    maxIndex: pointCount - 1,
+  let reference = null;
+  if (cellSetNeedsReference(payload)) {
+    if (targetGroup.type !== 'category' || targetGroup.fieldSource !== 'obs') {
+      throw new TypeError(
+        `Highlight group "${groupId}" is stored relative to a category, `
+        + 'and it is not a category group.'
+      );
+    }
+    requireMethod(state, 'ensureFieldLoaded', 'Highlight cells restore owner');
+    await state.ensureFieldLoaded(targetGroup.fieldIndex, { silent: true });
+    reference = categoryReference(state, targetGroup, new Map());
+    if (reference === null) {
+      throw new TypeError(
+        `Highlight group "${groupId}" is stored relative to the category `
+        + `"${String(targetGroup.categoryName)}" of "${targetGroup.fieldKey}", `
+        + 'whose cells are not available.'
+      );
+    }
+  }
+  const decoded = await decodeCellSet(payload, {
+    cellCount: pointCount,
+    reference,
     signal
   });
   if (decoded.length !== expectedCellCount) {

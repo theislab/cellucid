@@ -34,11 +34,11 @@ export class StateValidator {
   /**
    * A field key is an identity, not a path and not a rendered token.
    *
-   * This is exactly the rule both writers apply to every exported field
+   * This is exactly the rule both writers apply to every written field
    * identity (cellucid-python's _require_field_identities(), cellucid-r's
    * .require_field_identities()): a non-empty string with no leading or
    * trailing whitespace and no character that has no glyph. Anything narrower
-   * rejects a key a producer may legitimately publish, and the manifest reader
+   * rejects a key a producer may legitimately publish, and the field list check
    * accepts it long before the overlay and rename paths reach this check, so
    * the field loads and then throws when the reader touches it.
    *

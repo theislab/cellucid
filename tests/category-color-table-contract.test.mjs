@@ -22,14 +22,14 @@ test('category codes are proven per array and category count', () => {
   );
 });
 
-function referenceColors(field, n) {
+function referenceColors(field, n, missingCode) {
   const colors = new Uint8Array(n * 4);
   const transparency = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     const code = field.codes[i];
     let rgb;
     let alpha;
-    if (code === 255) {
+    if (code === missingCode) {
       rgb = [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8];
       alpha = 1;
     } else if (!field._categoryVisible[code]) {
@@ -45,11 +45,15 @@ function referenceColors(field, n) {
   return { colors, transparency };
 }
 
-for (const aligned of [true, false]) {
-  test(`table-driven category colors match the per-cell rule (${aligned ? 'aligned' : 'unaligned'} buffer)`, () => {
+for (const [Codes, missingCode] of [
+  [Uint8Array, 0xff],
+  [Uint16Array, 0xffff],
+  [Uint32Array, 0xffffffff],
+]) for (const aligned of [true, false]) {
+  test(`table-driven category colors match the per-cell rule (${Codes.name}, ${aligned ? 'aligned' : 'unaligned'} buffer)`, () => {
     const n = 1_000;
-    const codes = new Uint8Array(n);
-    for (let i = 0; i < n; i++) codes[i] = i % 7 === 6 ? 255 : (i * 7919) % 5;
+    const codes = new Codes(n);
+    for (let i = 0; i < n; i++) codes[i] = i % 7 === 6 ? missingCode : (i * 7919) % 5;
     const field = {
       kind: 'category',
       categories: ['a', 'b', 'c', 'd', 'e'],
@@ -66,7 +70,7 @@ for (const aligned of [true, false]) {
       // A byte no visibility can hold, so every entry the table writes shows.
       categoryTransparency: new Uint8Array(n).fill(7),
     };
-    const expected = referenceColors(field, n);
+    const expected = referenceColors(field, n, missingCode);
 
     DataStateColorMethods.prototype._writeCategoryColors.call(state, field, true);
     assert.deepEqual(state.colorsArray, expected.colors);

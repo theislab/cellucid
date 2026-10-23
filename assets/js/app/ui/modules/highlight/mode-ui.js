@@ -269,7 +269,7 @@ export function initHighlightModeUI(options) {
         viewer.cancelUnifiedSelection();
       } else {
         viewer.restoreUnifiedState(
-          selectionState.annotationCandidateSet.toArray(),
+          selectionState.annotationCandidateSet.toUint32Array(),
           selectionState.annotationStepCount
         );
       }

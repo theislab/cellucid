@@ -1,5 +1,5 @@
 /**
- * The published `default.cellucid-session` presets record the *complete* UI
+ * The published sample presets (`anndata/<id>.cellucid-session`) record the *complete* UI
  * control inventory, so adding one identified input to the sidebar invalidates
  * every preset that was saved before it existed (CEL-0224). The loader refuses
  * the whole document with `Session UI state is missing current control
@@ -59,31 +59,34 @@
  *
  * The presets are not regenerated from markup — they are real saves. When a
  * control is added or removed, each published preset has to be re-saved and
- * repinned in `cellucid-datasets`:
+ * republished in `cellucid-datasets`:
  *
  *  1. open the app on the dataset, restore its current preset, and save state;
- *  2. write the result to `exports-v3/<id>/default.cellucid-session`;
- *  3. repin `state_sha256` for that entry in `exports-v3/datasets.json`;
- *  4. repin the same digest and the stored byte counts in
- *     `tests/catalog-contract.test.mjs` and
- *     `tests/session-presets-contract.test.mjs`.
+ *  2. run `node scripts/publish_session_preset.mjs --dataset <id> --from <save>`
+ *     there: it trims the save to the published profile, rebinds it to the
+ *     store's identity, writes `anndata/<id>.cellucid-session`, and repins that
+ *     entry's `session.bytes` and `session.sha256` in `anndata/datasets.json`;
+ *  3. review and repin what that repository's own preset tests pin
+ *     (`tests/session-presets-contract.test.mjs`).
  *
- * All five presets carry the same inventory, so a control change always
- * invalidates all five, never one.
+ * Every preset carries the same inventory, so a control change always
+ * invalidates all of them, never one.
  */
 
 import assert from 'node:assert/strict';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
 import test from 'node:test';
 import { gunzipSync } from 'node:zlib';
+
+import { SESSION_BUNDLE_MAGIC_BYTES } from '../assets/js/app/session/bundle/format.js';
 
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { createDomId } from '../assets/js/app/ui/components/dom-id.js';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
 const PRESET_REPOSITORY_URL = new URL('../../cellucid-datasets/', import.meta.url);
-const PRESET_EXPORTS_URL = new URL('exports-v3/', PRESET_REPOSITORY_URL);
-const PRESET_FILENAME = 'default.cellucid-session';
+const PRESET_CATALOG_URL = new URL('anndata/datasets.json', PRESET_REPOSITORY_URL);
 
 const indexHtml = await readFile(INDEX_URL, 'utf8');
 
@@ -421,14 +424,12 @@ function loaderRefusalFor(markup, candidateControls) {
  * Reading the published presets out of the sibling repository.
  * ------------------------------------------------------------------ */
 
-const SESSION_MAGIC = 'CELLUCID_SESSION\n';
-
 function decodeCoreStateControls(bytes, label) {
-  const magicLength = Buffer.byteLength(SESSION_MAGIC);
-  assert.equal(
-    bytes.subarray(0, magicLength).toString('utf8'),
-    SESSION_MAGIC,
-    `${label} must open with the session container magic`,
+  const magicLength = SESSION_BUNDLE_MAGIC_BYTES.byteLength;
+  assert.deepEqual(
+    [...bytes.subarray(0, magicLength)],
+    [...SESSION_BUNDLE_MAGIC_BYTES],
+    `${label} must open with the current session format signature`,
   );
   let offset = magicLength;
   const manifestLength = bytes.readUInt32LE(offset);
@@ -463,11 +464,13 @@ function decodeCoreStateControls(bytes, label) {
 }
 
 /**
- * The presets, or `null` when the sibling repository is not checked out.
+ * The presets the catalog advertises, or `null` when the sibling repository is
+ * not checked out.
  *
- * Only an absent *repository* is a reason to skip. A repository that is present
- * but publishes no `exports-v3/` is a defect, not an environment, so that case is
- * left to fail.
+ * Read the way the viewer reads them: through `anndata/datasets.json`, each
+ * `session` at its catalog path, held to the declared byte length and SHA-256.
+ * Only an absent *repository* is a reason to skip; a present repository whose
+ * catalog is missing, or advertises no session, is a defect and fails.
  */
 async function readPublishedPresets() {
   let repositoryRoot;
@@ -478,22 +481,21 @@ async function readPublishedPresets() {
   }
   if (!repositoryRoot.isDirectory()) return null;
 
-  const entries = await readdir(PRESET_EXPORTS_URL, { withFileTypes: true });
+  const catalog = JSON.parse(await readFile(PRESET_CATALOG_URL, 'utf8'));
+  assert.equal(catalog.schema, 2, 'the sample catalog must be schema 2');
   const presets = [];
-  for (const entry of entries.filter(candidate => candidate.isDirectory())) {
-    const presetUrl = new URL(
-      `${entry.name}/${PRESET_FILENAME}`,
-      PRESET_EXPORTS_URL,
+  for (const entry of catalog.datasets) {
+    if (entry.session === undefined) continue;
+    const label = `anndata/${entry.session.path}`;
+    const bytes = await readFile(new URL(entry.session.path, PRESET_CATALOG_URL));
+    assert.equal(bytes.byteLength, entry.session.bytes, `${label} must be the byte length the catalog declares`);
+    assert.equal(
+      createHash('sha256').update(bytes).digest('hex'),
+      entry.session.sha256,
+      `${label} must have the SHA-256 the catalog declares`,
     );
-    let bytes;
-    try {
-      bytes = await readFile(presetUrl);
-    } catch {
-      continue;
-    }
-    const label = `${entry.name}/${PRESET_FILENAME}`;
     presets.push({
-      datasetId: entry.name,
+      datasetId: entry.id,
       label,
       controls: decodeCoreStateControls(bytes, label),
     });
@@ -695,8 +697,8 @@ test('every published preset records the current control inventory', async (t) =
   }
   assert.ok(
     presets.length > 0,
-    `${PRESET_EXPORTS_URL.pathname} exists but publishes no `
-      + `${PRESET_FILENAME}; an empty exports tree must not read as agreement`,
+    `${PRESET_CATALOG_URL.pathname} advertises no session; a catalog without `
+      + 'presets must not read as agreement',
   );
 
   for (const preset of presets) {

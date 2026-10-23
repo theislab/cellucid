@@ -1,11 +1,11 @@
 import { expect, test } from './helpers/test.mjs';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=dataset-transient-ownership-ci`;
-const DATASET_OPTION = 'dataset:local-demo:current-ui-prepared';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=dataset-transient-ownership-ci`;
+const DATASET_OPTION = 'dataset:local-demo:current-ui';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -29,7 +29,7 @@ async function openPreparedDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
@@ -38,7 +38,7 @@ async function replaceWithFreshPreparedDataset(page) {
   await expect(page.locator('#dataset-name')).toHaveText('—');
   await page.locator('#dataset-select').selectOption(DATASET_OPTION);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 

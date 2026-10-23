@@ -15,7 +15,7 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 /** The last rung of the 18-level ladder: every point, no reduction. */
 // Two different numbers for two different things, and conflating them is what
@@ -29,8 +29,8 @@ const FULL_DETAIL_REPORTED_LEVEL = -1;
 const ADAPTIVE_FLOOR_LADDER_INDEX = 8;
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=benchmark-harness-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=benchmark-harness-ci';
 
 const HARNESS_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
 const PROCESS_INTENSIVE = Object.freeze({

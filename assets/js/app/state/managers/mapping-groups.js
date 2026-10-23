@@ -11,10 +11,11 @@
  *   without changing what is shown, and the *commit* and *rollback* steps
  *   that publish it or restore the previous choice.
  *
- * Staging reads through the same mapping routes on every AnnData path
- * (`_cellucid/mapping/...` under the dataset base): a file read in the
- * browser answers them from its adapter, `cellucid serve` and a notebook over
- * HTTP. A choice whose data fails its check -- a graph that is not symmetric,
+ * Staging reads through the same routes on every AnnData path (`obsm/...`,
+ * `obsp/{p}`, `var/{axis}/{names}`, ... under the dataset base,
+ * `data-mapping-candidates.js`), answered by the adapter
+ * of the file read in the browser -- opened here, from a link, or served by
+ * `cellucid serve` or a notebook. A choice whose data fails its check -- a graph that is not symmetric,
  * a NaN -- is a `MappingLoadError`: that choice is marked unusable with its
  * reason for the rest of the dataset's session, and the transaction rolls
  * back.
@@ -28,9 +29,9 @@
 import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
-  VECTOR_KEY_PATTERN,
+  EMBEDDING_KEY_PREFIX,
   canonicalEmbeddingId,
-  isVectorFieldKey,
+  vectorFieldKeys,
 } from '../../../data/data-mapping.js';
 import {
   MappingLoadError,
@@ -38,8 +39,8 @@ import {
   expressionAxisRoute,
   geneNamesRoute,
   latentCandidateReason,
-  mappingGenesBase,
-  mappingKnnBase,
+  mappingGeneListPath,
+  mappingGraphPath,
   mappingLatentOutlierPath,
   obsmIndexOf,
   obsmWidth,
@@ -48,9 +49,8 @@ import {
 } from '../../../data/data-mapping-candidates.js';
 import {
   createVarFieldLoader,
-  loadConnectivityManifest,
-  loadOutlierQuantiles,
-  loadVarManifest,
+  loadConnectivitySummary,
+  loadGeneList,
 } from '../../../data/data-loaders.js';
 import {
   describeMappingGroupValue,
@@ -98,34 +98,11 @@ export function describeObspCandidate(item) {
   return `${item.key} · ${kind}${shape}`;
 }
 
-/**
- * The groups each kind of dataset can change. A prepared export fixes its
- * graph, expression matrix and latent space at `prepare()` time, so they are
- * not part of its mapping at all; it can use any of the gene-name sets and
- * vector bindings it was exported with.
- */
-const CHANGEABLE_GROUPS = Object.freeze({
-  [ANNDATA_KIND]: Object.freeze(['vectorFields', 'knn', 'latent', 'geneNames', 'expression']),
-  export: Object.freeze(['vectorFields', 'geneNames']),
-});
+/** The groups an AnnData dataset can change. */
+const CHANGEABLE_GROUPS = Object.freeze(['vectorFields', 'knn', 'latent', 'geneNames', 'expression']);
 
 function formatColumnCount(width) {
   return `${formatCount(width)} ${width === 1 ? 'column' : 'columns'}`;
-}
-
-/**
- * Whether `key` is named for the embedding `embeddingKey`, the way scVelo and
- * CellRank name what they compute on a basis (`velocity_umap` for `X_umap`),
- * or by the default rule (`velocity_umap_2d` for `X_umap` in 2D).
- */
-function isSuggestedVector(key, embeddingKey, dimension) {
-  const match = VECTOR_KEY_PATTERN.exec(key);
-  if (match !== null) {
-    return Number(match.groups.dimension) === dimension
-      && (embeddingKey === 'X_umap' || embeddingKey === `X_umap_${dimension}d`);
-  }
-  const basis = embeddingKey.replace(/^X_/i, '').toLowerCase();
-  return basis.length > 0 && key.toLowerCase().endsWith(`_${basis}`);
 }
 
 /**
@@ -161,8 +138,8 @@ export class DataStateMappingGroupMethods {
    *
    * @param {{
    *   getBaseUrl: () => string,
-   *   getConnectivityGraph: () => {manifest: Object|null, manifestUrl: string|null},
-   *   replaceConnectivityGraph: (graph: {manifest: Object|null, manifestUrl: string|null}) => void
+   *   getConnectivityGraph: () => {summary: Object|null, url: string|null, edges: number|null},
+   *   replaceConnectivityGraph: (graph: {summary: Object|null, url: string|null}) => void
    * }|null} runtime
    */
   setMappingRuntime(runtime) {
@@ -177,13 +154,14 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
-   * The edge count of the neighbour graph in use, or null for none.
+   * The neighbour graph in use: null for none, else its edge count (null
+   * while a graph read straight from a file is not counted yet).
    *
-   * @returns {number|null}
+   * @returns {{edges: number|null}|null}
    */
-  getConnectivityEdgeCount() {
-    const manifest = this._mappingRuntime?.getConnectivityGraph().manifest ?? null;
-    return manifest === null ? null : manifest.n_edges;
+  getConnectivityGraphFact() {
+    const graph = this._mappingRuntime?.getConnectivityGraph() ?? null;
+    return (graph?.summary ?? null) === null ? null : { edges: graph.edges ?? null };
   }
 
   /**
@@ -192,11 +170,6 @@ export class DataStateMappingGroupMethods {
    */
   _resetMappingGroups() {
     this._unusableMappingChoices = new Map();
-    // A prepared export publishes every vector binding it was exported with;
-    // those are the bindings its panel offers.
-    this._exportVectorBindings = this.dataMapping?.kind === 'export'
-      ? this.dataMapping.vectorFields
-      : [];
   }
 
   /**
@@ -208,17 +181,8 @@ export class DataStateMappingGroupMethods {
   canChangeMappingGroup(group) {
     const mapping = this.dataMapping;
     if (mapping === null || mapping === undefined) return false;
-    if (mapping.kind === ANNDATA_KIND && this.getMappingCandidates() === null) return false;
-    if (!(CHANGEABLE_GROUPS[mapping.kind] ?? []).includes(group)) return false;
-    // A prepared export offers the gene-name sets and vector bindings it was
-    // exported with.
-    if (mapping.kind !== ANNDATA_KIND && group === 'geneNames') {
-      return (this.varData?.geneNameSets?.length ?? 0) > 1;
-    }
-    if (mapping.kind !== ANNDATA_KIND && group === 'vectorFields') {
-      return (this._exportVectorBindings?.length ?? 0) > 0;
-    }
-    return true;
+    if (mapping.kind !== ANNDATA_KIND || this.getMappingCandidates() === null) return false;
+    return CHANGEABLE_GROUPS.includes(group);
   }
 
   /**
@@ -281,15 +245,19 @@ export class DataStateMappingGroupMethods {
       return this.getGeneNameChoices(this.dataMapping.expression);
     }
     if (group === 'latent') {
+      const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
+      // The latent space the file stores outlier quantiles for filters at
+      // once; any other is read whole on the filter's first use.
+      const stored = this.fieldLoader?.storedOutlierLatentKey ?? null;
       return [
         { value: null, label: 'None', usable: true, reason: null },
-        ...candidates.obsm.filter(item => !isVectorFieldKey(item.key)).map(item => {
+        ...candidates.obsm.filter(item => !vectorKeys.has(item.key)).map(item => {
           const reason = latentCandidateReason(item)
             ?? this.getMappingChoiceUnusableReason('latent', item.key);
           const width = obsmWidth(item);
           return {
             value: item.key,
-            label: width === null ? item.key : `${item.key} · ${formatColumnCount(width)}`,
+            label: [item.key, ...(width === null ? [] : [formatColumnCount(width)]), ...(item.key === stored ? ['outliers stored'] : [])].join(' · '),
             usable: reason === null,
             reason,
           };
@@ -317,21 +285,12 @@ export class DataStateMappingGroupMethods {
 
   /**
    * The gene-name choices of one expression source: the var index, then
-   * every column of that axis's var (`raw.var` for `raw`). A prepared export
-   * offers the name sets it was exported with.
+   * every column of that axis's var (`raw.var` for `raw`).
    *
    * @param {string|null} expression
    * @returns {Array<{value: string, label: string, usable: boolean, reason: string|null}>}
    */
   getGeneNameChoices(expression) {
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      return this.varData.geneNameSets.map(set => ({
-        value: set.source === null ? 'index' : `column:${set.source}`,
-        label: set.source === null ? 'var index' : set.source,
-        usable: true,
-        reason: null,
-      }));
-    }
     const candidates = this.getMappingCandidates();
     const index = { value: 'index', label: 'var index', usable: true, reason: null };
     if (expression === null) return [index];
@@ -352,8 +311,9 @@ export class DataStateMappingGroupMethods {
    * The vector bindings the panel offers, grouped by the embedding they bind
    * to. For an AnnData file: every embedding `mapping` shows or binds, each
    * with every `obsm` array that can be drawn on it (`resolveVectorBinding`),
-   * the arrays named for it first and marked suggested. For a prepared export:
-   * the bindings it was exported with. Every embedding `mapping` enables is
+   * the arrays named for it by the vector-field key rule (`velocity_umap` for
+   * `X_umap`, `parseVectorFieldKey`) first and marked suggested. Every embedding
+   * `mapping` enables is
    * listed, since a binding's embedding must be enabled. Null when the dataset cannot change
    * its vector fields. Embeddings bound in the mapping in use are listed too,
    * so unbinding one does not hide it.
@@ -364,22 +324,8 @@ export class DataStateMappingGroupMethods {
    */
   getVectorBindingChoices(mapping) {
     if (!this.canChangeMappingGroup('vectorFields')) return null;
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      const groups = new Map();
-      for (const binding of this._exportVectorBindings) {
-        const key = binding.embedding.key;
-        if (!groups.has(key)) groups.set(key, { embeddingKey: key, label: key, options: [] });
-        groups.get(key).options.push({
-          binding,
-          label: binding.field,
-          usable: true,
-          reason: null,
-          suggested: false,
-        });
-      }
-      return [...groups.values()];
-    }
     const candidates = this.getMappingCandidates();
+    const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
     const refs = new Map();
     for (const ref of mapping.embeddings.enabled) refs.set(JSON.stringify(ref), ref);
     // An embedding stays listed while its bindings are being edited: those
@@ -398,7 +344,7 @@ export class DataStateMappingGroupMethods {
       for (const vector of candidates.obsm) {
         // `X_…` arrays are representations (embeddings, latent spaces), as
         // AnnData names them, never vectors drawn on one.
-        if (/^X_/.test(vector.key)) continue;
+        if (vector.key.startsWith(EMBEDDING_KEY_PREFIX)) continue;
         const binding = { key: vector.key, embedding: { key: ref.key, columns: [...ref.columns] } };
         const resolved = resolveVectorBinding(candidates, binding);
         if (!resolved.ok) continue;
@@ -408,7 +354,7 @@ export class DataStateMappingGroupMethods {
           label: vector.key,
           usable: reason === null,
           reason,
-          suggested: isSuggestedVector(vector.key, ref.key, ref.columns.length),
+          suggested: vectorKeys.get(vector.key)?.embeddingKey === ref.key,
         });
       }
       options.sort((left, right) => (
@@ -486,12 +432,6 @@ export class DataStateMappingGroupMethods {
    * @private
    */
   _describeVectorBindingsRefusal(bindings) {
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      const declared = new Set(this._exportVectorBindings.map(binding => JSON.stringify(binding)));
-      return bindings.every(binding => declared.has(JSON.stringify(binding)))
-        ? null
-        : 'this dataset does not have';
-    }
     const candidates = this.getMappingCandidates();
     for (const binding of bindings) {
       if (obsmIndexOf(candidates, binding.key) < 0) return 'this dataset does not have';
@@ -515,7 +455,6 @@ export class DataStateMappingGroupMethods {
    */
   describeMappingGroupRefusal(current, next) {
     for (const group of MAPPING_GROUPS) {
-      if (!Object.hasOwn(current, group)) continue;
       // Gene names are read from the axis of the next expression matrix, so a
       // name source is checked whenever either changes.
       const changed = !sameJson(current[group], next[group])
@@ -563,7 +502,7 @@ export class DataStateMappingGroupMethods {
     const steps = [];
     const staged = new Set();
     for (const group of MAPPING_GROUPS) {
-      if (!Object.hasOwn(current, group) || sameJson(current[group], next[group])) continue;
+      if (sameJson(current[group], next[group])) continue;
       const stageName = STAGE_OF_GROUP[group];
       if (staged.has(stageName)) continue;
       staged.add(stageName);
@@ -634,29 +573,29 @@ function refusedGroup(stageName, error, next) {
  */
 const GROUP_STAGES = Object.freeze({
   /**
-   * The neighbour graph: its manifest is read (and, in the browser, the graph
+   * The neighbour graph: its summary is read (and, in the browser, the graph
    * itself extracted and checked) before anything changes; commit hands the
    * connectivity owner the new graph, rollback the previous one.
    */
   async knn(next) {
     const key = next.knn;
     const runtime = this._requireMappingRuntime();
-    let graph = { manifest: null, manifestUrl: null };
+    let graph = { summary: null, url: null };
     if (key !== null) {
       const index = obspIndexOf(this.getMappingCandidates(), key);
       if (index < 0) {
         throw new RangeError(`This dataset has no obsp['${key}'].`);
       }
-      const manifestUrl = `${runtime.getBaseUrl()}${mappingKnnBase(index)}connectivity_manifest.json`;
-      const manifest = await loadConnectivityManifest(manifestUrl, {});
-      if (manifest === null) {
+      const url = `${runtime.getBaseUrl()}${mappingGraphPath(index)}`;
+      const summary = await loadConnectivitySummary(url, {});
+      if (summary === null) {
         throw new MappingLoadError(
           key,
           'not present in this dataset',
           `obsp['${key}'] is not present in this dataset.`
         );
       }
-      graph = { manifest, manifestUrl };
+      graph = { summary, url };
     }
     const previous = runtime.getConnectivityGraph();
     return {
@@ -665,34 +604,28 @@ const GROUP_STAGES = Object.freeze({
       },
       rollback() {
         runtime.replaceConnectivityGraph({
-          manifest: previous.manifest,
-          manifestUrl: previous.manifestUrl,
+          summary: previous.summary,
+          url: previous.url,
         });
       },
     };
   },
 
   /**
-   * The latent space: every categorical field's outlier payload becomes the
-   * mapping route of the new space (`_cellucid/mapping/latent/{obsm}/obs/
-   * {field}.outliers.f32`), or none; the fields loaded now read theirs first
-   * (`stageLatentReplacement`).
+   * The latent space: every categorical field's outlier route becomes the
+   * route of the new space (`outliers/{obsm}/{field}`), or none. Nothing is read here: outlier filters
+   * in use get their quantiles after the commit (`stageLatentReplacement`).
    */
   async latent(next) {
-    const runtime = this._requireMappingRuntime();
     const candidates = this.getMappingCandidates();
     const obsmIndex = next.latent === null ? -1 : obsmIndexOf(candidates, next.latent);
     if (next.latent !== null && obsmIndex < 0) {
       throw new RangeError(`This dataset has no obsm['${next.latent}'].`);
     }
-    const manifestUrl = `${runtime.getBaseUrl()}obs_manifest.json`;
     return this.stageLatentReplacement({
-      outlierPathFor: payloadIndex => (
-        obsmIndex < 0 ? null : mappingLatentOutlierPath(obsmIndex, payloadIndex)
+      outlierPathFor: fieldIndex => (
+        obsmIndex < 0 ? null : mappingLatentOutlierPath(obsmIndex, fieldIndex)
       ),
-      loadOutliers: descriptor => loadOutlierQuantiles(manifestUrl, descriptor, {
-        pointCount: this.pointCount,
-      }),
     });
   },
 
@@ -722,52 +655,39 @@ const GROUP_STAGES = Object.freeze({
 
   /**
    * The gene list: an AnnData file's gene names and expression matrix are
-   * read through `_cellucid/mapping/genes/{axis}/{names}/`; a prepared
-   * export relabels its genes with another exported name set. Only the genes
-   * a view is coloured by are read now; the rest load on demand.
+   * read through `var/{axis}/{names}`. Only the genes a
+   * view is coloured by are read now; the rest load on demand.
    */
   async genes(next, current) {
     const runtime = this._requireMappingRuntime();
-    let varManifest;
+    let geneList;
     let varFieldLoader;
     let sameMatrix;
     // X and every layer share var; raw has its own axis.
     let sameAxis = true;
-    if (next.kind === ANNDATA_KIND && next.expression === null) {
+    if (next.expression === null) {
       // No expression matrix: an empty gene list, as a dataset without genes
       // is published.
-      varManifest = { n_points: this.pointCount, fields: [] };
+      geneList = { n_points: this.pointCount, fields: [] };
       varFieldLoader = null;
       sameMatrix = false;
       sameAxis = false;
-    } else if (next.kind === ANNDATA_KIND) {
+    } else {
       const candidates = this.getMappingCandidates();
       const axisRoute = expressionAxisRoute(candidates, next.expression);
       const namesRoute = geneNamesRoute(candidates, axisRoute, next.geneNames);
       if (axisRoute === null || namesRoute === null) {
         throw new RangeError('This dataset does not have the expression matrix or gene names this mapping names.');
       }
-      const manifestUrl = `${runtime.getBaseUrl()}${mappingGenesBase(axisRoute, namesRoute)}var_manifest.json`;
-      varManifest = await loadVarManifest(manifestUrl, {});
-      varFieldLoader = createVarFieldLoader(manifestUrl, { pointCount: varManifest.n_points });
+      const url = `${runtime.getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
+      geneList = await loadGeneList(url, {});
+      varFieldLoader = createVarFieldLoader(url, { pointCount: geneList.n_points });
       sameMatrix = next.expression === current.expression;
       sameAxis = current.expression !== null
         && (current.expression === 'raw') === (next.expression === 'raw');
-    } else {
-      const source = next.geneNames === 'index' ? null : next.geneNames.slice('column:'.length);
-      const set = this.varData.geneNameSets.find(entry => entry.source === source);
-      if (set === undefined) {
-        throw new RangeError('This dataset was exported without these gene names.');
-      }
-      varManifest = {
-        ...this.varData,
-        fields: this._varFieldDescriptors.map((field, index) => ({ ...field, key: set.names[index] })),
-      };
-      varFieldLoader = this.varFieldLoader;
-      sameMatrix = true;
     }
     const step = await this.stageVarAxisReplacement({
-      varManifest,
+      geneList,
       varFieldLoader,
       sameAxis,
       sameMatrix,

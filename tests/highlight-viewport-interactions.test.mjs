@@ -4,9 +4,9 @@ import test from 'node:test';
 import {
   drawKnnIndicator,
   drawProximityIndicator,
-  findCellsInLasso,
   HighlightTools,
 } from '../assets/js/rendering/highlight-renderer.js';
+import { LassoHitTest } from '../assets/js/rendering/selection-gesture-queries.js';
 import { SELECT_MODE_OFF } from '../assets/js/rendering/select-mode.js';
 
 function identityMatrix() {
@@ -234,24 +234,21 @@ for (const overlayCase of overlayCases) {
       assertClose(knnContext.arcs.at(-1).x, overlayCase.expectedCanvasX);
       assert.equal(knnContext.arcs.at(-1).y, 50);
 
-      const selected = findCellsInLasso({
-        lassoPath: [
-          { x: overlayCase.expectedCanvasX - 3, y: 47 },
-          { x: overlayCase.expectedCanvasX + 3, y: 47 },
-          { x: overlayCase.expectedCanvasX + 3, y: 53 },
-          { x: overlayCase.expectedCanvasX - 3, y: 53 },
-        ],
-        lassoViewContext: {
-          viewId: viewport.viewId,
-          viewport,
-          viewMatrix: identityMatrix(),
-        },
-        mat4,
-        modelMatrix,
-        transparencyArray: Uint8Array.from([1]),
-        viewPositions: Float32Array.from([0, 0, 0]),
+      const mvpMatrix = mat4.create();
+      mat4.multiply(mvpMatrix, viewport.projectionMatrix, identityMatrix());
+      mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+      const lasso = new LassoHitTest({
+        positions: Float32Array.from([0, 0, 0]),
         dimensionLevel: 3,
+        transparency: Uint8Array.from([1]),
+        mvpMatrix,
+        viewport,
       });
+      lasso.prepare(Infinity);
+      for (const [x, y] of [[-3, 47], [3, 47], [3, 53], [-3, 53]]) {
+        lasso.appendVertex(overlayCase.expectedCanvasX + x, y);
+      }
+      const selected = lasso.hits().toArray();
       assert.deepEqual(selected, [0]);
     }
   );
@@ -460,7 +457,7 @@ test('a stale lasso retires with one empty preview and no selection callback', t
   assert.equal(tools.isLassoing, false);
   assert.equal(tools.lassoViewContext, null);
   assert.equal(previewPayloads.length, 1);
-  assert.deepEqual(previewPayloads[0].cellIndices, []);
+  assert.deepEqual(previewPayloads[0].cellIndices, new Uint32Array(0));
   assert.equal(previewPayloads[0].cellCount, 0);
   assert.equal(previewPayloads[0].type, 'lasso-preview');
   assert.deepEqual([...tools.lassoCandidateSet], [7]);
@@ -542,13 +539,13 @@ test('snapshot proximity remains bound to its pane and retires only with that vi
     tools.handlePointerMove({ clientX: 170, clientY: 50 }),
     true,
   );
-  assert.deepEqual(previewPayload.cellIndices, [0]);
+  assert.deepEqual(previewPayload.cellIndices, Uint32Array.of(0));
 
   tools.clearViewState('snapshot');
   assert.equal(tools.isProximityDragging, false);
   assert.equal(tools.proximityCenter, null);
   assert.equal(tools.proximityCandidateSet, null);
-  assert.deepEqual(previewPayload.cellIndices, []);
+  assert.deepEqual(previewPayload.cellIndices, new Uint32Array(0));
   assert.equal(previewPayload.cellCount, 0);
   assert.equal(previewPayload.newCellCount, 0);
 });
@@ -788,7 +785,7 @@ test('a lasso that encloses no cells still publishes its step', t => {
     event: {
       step: 1,
       candidateCount: 0,
-      candidates: [],
+      candidates: new Uint32Array(0),
       mode: 'intersect',
     },
   }]);
@@ -849,7 +846,7 @@ test('a release inside the render canvas still commits', t => {
     event: {
       step: 1,
       candidateCount: 1,
-      candidates: [0],
+      candidates: Uint32Array.of(0),
       mode: 'intersect',
     },
   }]);

@@ -26,6 +26,9 @@ import { writeFogUniforms } from '../../shaders/fog-shaders.js';
 import {
   configureStraightAlphaBlending,
   createProgramBatch,
+  deleteProgramReleasingUse,
+  deleteTextureTracked,
+  restorableTexture,
 } from '../../gl-utils.js';
 import { getNotificationCenter } from '../../../app/notification-center.js';
 import { getColormap } from '../../../data/palettes.js';
@@ -45,8 +48,11 @@ import {
   createOrUpdatePackedFloatTexture,
   createOrUpdatePackedUintTexture,
   createOrUpdatePackedVisibilityTexture,
+  packedTextureFits,
 } from '../shared/packed-texture.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../alpha-visibility.js';
+import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
+import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../../position-layout.js';
 
 // =============================================================================
 // CONFIGURATION
@@ -571,12 +577,17 @@ function validateVelocityFieldData(
       `VelocityOverlay vectors must contain exactly ${cellCount * components} values; received ${vectors.length}.`
     );
   }
-  for (let index = 0; index < vectors.length; index += 1) {
-    if (!Number.isFinite(vectors[index])) {
-      throw new RangeError(
-        `VelocityOverlay vector value ${index} must be finite.`
-      );
+  // Vectors the reader worker checked arrive proven finite; any other is
+  // scanned once.
+  if (!isProvenFiniteFloat32Array(vectors)) {
+    for (let index = 0; index < vectors.length; index += 1) {
+      if (!Number.isFinite(vectors[index])) {
+        throw new RangeError(
+          `VelocityOverlay vector value ${index} must be finite.`
+        );
+      }
     }
+    markProvenFiniteFloat32Array(vectors);
   }
   requireNumber(maxMagnitude, 'maxMagnitude', 0, Number.MAX_VALUE);
   return {
@@ -746,8 +757,13 @@ export class VelocityOverlay extends OverlayBase {
     this._fieldsById = new Map();
     this._activeFieldId = null;
 
-    // Position texture pool (shared across views)
+    // Position texture pool (shared across views). A texture no view uses
+    // stays while the renderer holds a geometry over the same positions
+    // (`setPositionRetention`), so switching back to a layout shown a moment
+    // ago uploads nothing; published positions are never written, so the
+    // texture of an array stays its exact snapshot.
     this._positionTexturePool = new Map();
+    this._positionRetained = () => false;
     this._positionsRefByView = new Map();
     this._pendingDerivedTextureDeletes = new Map();
 
@@ -937,7 +953,8 @@ export class VelocityOverlay extends OverlayBase {
       texture: null,
       data: validated.vectors,
       itemCount: validated.cellCount,
-      components: validated.components
+      components: validated.components,
+      allocationCheck: 'now'
     });
     if (existing?.texture) {
       try {
@@ -1065,19 +1082,13 @@ export class VelocityOverlay extends OverlayBase {
     const positionEntry = this._positionsRefByView.get(key);
     if (positionEntry) {
       this._positionsRefByView.delete(key);
-      // The source array may have been mutated in place. Retire this
-      // generation from the reusable pool before releasing the view ref so
-      // another owner can keep rendering the immutable GPU snapshot while
-      // this view publishes a fresh upload for the same JS identity.
-      if (
-        this._positionTexturePool.get(positionEntry.source) === positionEntry
-      ) {
-        this._positionTexturePool.delete(positionEntry.source);
-      }
+      // The view now shows other positions; the texture of these stays
+      // pooled while the renderer holds their geometry.
       this._reportDerivedRetirementFailures(
         this._releasePositionTexture(positionEntry),
         `VelocityOverlay view "${key}" position retirement was incomplete.`
       );
+      this._prunePositionTextures();
     }
     const spawn = this._spawnByView.get(key);
     if (spawn) {
@@ -1318,7 +1329,7 @@ export class VelocityOverlay extends OverlayBase {
     if (spawn?.visibilityTextureInfo?.texture) {
       attempt(() => this._queueDerivedTextureDelete(
         spawn.visibilityTextureInfo,
-        4
+        1
       ));
     }
     if (positionEntry) {
@@ -1695,7 +1706,7 @@ export class VelocityOverlay extends OverlayBase {
     const pending = this._getPendingColormapTextureDeletes();
     for (const texture of pending) {
       try {
-        this.gl.deleteTexture(texture);
+        deleteTextureTracked(this.gl, texture);
         pending.delete(texture);
       } catch (error) {
         // Instrumented WebGL wrappers can delete successfully and then throw.
@@ -1741,7 +1752,7 @@ export class VelocityOverlay extends OverlayBase {
       const program = this[name];
       if (!program) continue;
       try {
-        gl.deleteProgram(program);
+        deleteProgramReleasingUse(gl, program);
         this[name] = null;
       } catch (error) {
         failures = appendFailure(failures, error);
@@ -1902,7 +1913,7 @@ export class VelocityOverlay extends OverlayBase {
         try {
           this._queueDerivedTextureDelete(
             state.visibilityTextureInfo,
-            4
+            1
           );
           state.visibilityTextureInfo = null;
         } catch (error) {
@@ -2010,12 +2021,7 @@ export class VelocityOverlay extends OverlayBase {
 
     const previousVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
     const previousArrayBuffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
-    const pendingError = gl.getError();
-    if (pendingError !== gl.NO_ERROR) {
-      throw new Error(
-        `VelocityOverlay particle allocation cannot start with WebGL error 0x${pendingError.toString(16)} pending.`
-      );
-    }
+    requireLiveContext(gl, 'VelocityOverlay particle allocation');
     const buffers = [null, null];
     const vaos = [null, null];
     const bufferBytes = [0n, 0n];
@@ -2051,12 +2057,6 @@ export class VelocityOverlay extends OverlayBase {
         // WebGL zero-initializes sized allocations. The update shader's exact
         // force-respawn generation initializes every active particle on first use.
         gl.bufferData(gl.ARRAY_BUFFER, bufferSize, gl.DYNAMIC_COPY);
-        const storageError = gl.getError();
-        if (storageError !== gl.NO_ERROR) {
-          throw new Error(
-            `VelocityOverlay particle buffer ${index} storage failed with WebGL error 0x${storageError.toString(16)}.`
-          );
-        }
         bufferBytes[index] = BigInt(bufferSize);
 
         const vao = gl.createVertexArray();
@@ -2085,6 +2085,9 @@ export class VelocityOverlay extends OverlayBase {
           3, 1, gl.UNSIGNED_INT, BYTES_PER_PARTICLE, 28
         );
       }
+      // One read for both buffers: a refused allocation must not stay
+      // resident (it is deleted below).
+      requireCleanWebGLState(gl, 'VelocityOverlay particle buffer storage');
     } catch (error) {
       allocationFailure = error;
     }
@@ -2816,7 +2819,7 @@ export class VelocityOverlay extends OverlayBase {
     let failures = null;
     for (const restore of [
       () => gl.activeTexture(state.activeTexture),
-      () => gl.bindTexture(gl.TEXTURE_2D, replace(state.texture)),
+      () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(replace(state.texture))),
       () => gl.bindBuffer(
         gl.PIXEL_UNPACK_BUFFER,
         state.pixelUnpackBuffer
@@ -2875,7 +2878,7 @@ export class VelocityOverlay extends OverlayBase {
         const texture = textures[index];
         if (!texture) continue;
         try {
-          gl.deleteTexture(texture);
+          deleteTextureTracked(gl, texture);
           textures[index] = null;
           if (Array.isArray(textureBytes)) {
             textureBytes[index] = 0n;
@@ -3284,12 +3287,7 @@ export class VelocityOverlay extends OverlayBase {
       return existing;
     }
 
-    const pendingError = gl.getError();
-    if (pendingError !== gl.NO_ERROR) {
-      throw new Error(
-        `VelocityOverlay render-target allocation cannot start with WebGL error 0x${pendingError.toString(16)} pending.`
-      );
-    }
+    requireLiveContext(gl, 'VelocityOverlay render-target allocation');
     const savedState = this._captureRenderTargetState();
     const allocationFailures = [];
     let candidate = null;
@@ -3386,13 +3384,10 @@ export class VelocityOverlay extends OverlayBase {
           gl.viewport(0, 0, width, height);
           gl.disable(gl.SCISSOR_TEST);
           gl.colorMask(true, true, true, true);
+          // Clearing a complete framebuffer allocates nothing: only a lost
+          // context refuses it.
           gl.clearBufferfv(gl.COLOR, 0, TRANSPARENT_BLACK);
-          const clearError = gl.getError();
-          if (clearError !== gl.NO_ERROR) {
-            throw new Error(
-              `VelocityOverlay ${label} target ${index} clear failed with WebGL error 0x${clearError.toString(16)}.`
-            );
-          }
+          requireLiveContext(gl, `VelocityOverlay ${label} target ${index} clear`);
         };
         for (let index = 0; index < 2; index++) {
           allocatePair(
@@ -3555,7 +3550,7 @@ export class VelocityOverlay extends OverlayBase {
     let failures = null;
     for (const texture of this._pendingDerivedTextureDeletes.keys()) {
       try {
-        this.gl.deleteTexture(texture);
+        deleteTextureTracked(this.gl, texture);
         this._pendingDerivedTextureDeletes.delete(texture);
       } catch (error) {
         failures = appendFailure(failures, error);
@@ -3643,7 +3638,7 @@ export class VelocityOverlay extends OverlayBase {
         try {
           this._queueDerivedTextureDelete(
             visibilityTextureInfo,
-            4
+            1
           );
           state.visibilityTextureInfo = null;
         } catch (error) {
@@ -3706,7 +3701,7 @@ export class VelocityOverlay extends OverlayBase {
     for (const state of this._spawnByView.values()) {
       for (const [textureInfo, bytesPerPixel] of [
         [state.textureInfo, 4],
-        [state.visibilityTextureInfo, 4],
+        [state.visibilityTextureInfo, 1],
       ]) {
         if (
           !textureInfo?.texture ||
@@ -4080,12 +4075,7 @@ export class VelocityOverlay extends OverlayBase {
       data[base + 2] = Math.round(Math.max(0, Math.min(255, rgb[2] * 255)));
     }
 
-    const pendingError = gl.getError();
-    if (pendingError !== gl.NO_ERROR) {
-      throw new Error(
-        `VelocityOverlay colormap upload cannot start with WebGL error 0x${pendingError.toString(16)} pending.`
-      );
-    }
+    requireLiveContext(gl, 'VelocityOverlay colormap upload');
     const existing = this._colormapTexture;
     const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
     const previousAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
@@ -4134,7 +4124,7 @@ export class VelocityOverlay extends OverlayBase {
         gl.PIXEL_UNPACK_BUFFER,
         previousPixelUnpackBuffer
       );
-      gl.bindTexture(gl.TEXTURE_2D, restoreBinding);
+      gl.bindTexture(gl.TEXTURE_2D, restorableTexture(restoreBinding));
     } catch (error) {
       let cleanupFailures = null;
       for (const cleanup of [
@@ -4143,7 +4133,7 @@ export class VelocityOverlay extends OverlayBase {
           gl.PIXEL_UNPACK_BUFFER,
           previousPixelUnpackBuffer
         ),
-        () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
+        () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousBinding)),
       ]) {
         try {
           cleanup();
@@ -4191,6 +4181,7 @@ export class VelocityOverlay extends OverlayBase {
   _ensurePositionTexture(viewId, positions, dimension) {
     const key = requireViewId(viewId);
     const prev = this._positionsRefByView.get(key);
+    this._prunePositionTextures();
 
     if (prev?.source === positions) {
       if (!prev.textureInfo) {
@@ -4207,7 +4198,8 @@ export class VelocityOverlay extends OverlayBase {
         texture: null,
         data: positions,
         itemCount: positions.length / dimension,
-        components: dimension
+        components: dimension,
+        allocationCheck: 'now'
       });
       entry = { source: positions, textureInfo, refs: 0 };
       this._positionTexturePool.set(positions, entry);
@@ -4236,7 +4228,10 @@ export class VelocityOverlay extends OverlayBase {
       );
     }
     entry.refs--;
-    if (entry.refs > 0) {
+    if (entry.refs > 0 || (
+      this._positionTexturePool.get(entry.source) === entry &&
+      this._isPositionRetained(entry.source)
+    )) {
       return this._flushPendingDerivedTextureDeletes();
     }
 
@@ -4251,6 +4246,35 @@ export class VelocityOverlay extends OverlayBase {
     }
     return this._flushPendingDerivedTextureDeletes();
   }
+  /**
+   * Keep the position texture of a layout no view shows while `retained`
+   * says the renderer still holds a geometry over the same positions.
+   *
+   * @param {(positions: Float32Array) => boolean} retained
+   */
+  setPositionRetention(retained) {
+    if (typeof retained !== 'function') {
+      throw new TypeError('VelocityOverlay position retention must be a function.');
+    }
+    this._positionRetained = retained;
+  }
+
+  /** Whether the renderer still holds a geometry over `positions` (`setPositionRetention`). @private */
+  _isPositionRetained(positions) {
+    return this._positionRetained?.(positions) === true;
+  }
+
+  /** Delete the pooled textures no view uses whose geometry the renderer let go. @private */
+  _prunePositionTextures() {
+    for (const entry of [...this._positionTexturePool.values()]) {
+      if (entry.refs !== 0 || this._isPositionRetained(entry.source)) continue;
+      this._positionTexturePool.delete(entry.source);
+      if (entry.textureInfo?.texture) {
+        this._queueDerivedTextureDelete(entry.textureInfo, entry.textureInfo.components * 4);
+      }
+    }
+  }
+
 
   _createSpawnTableBuild(transparency, cellCount, lodIndices) {
     if (
@@ -4286,6 +4310,9 @@ export class VelocityOverlay extends OverlayBase {
       // the same cells in the same order and can share one exact pass.
       phase: lodIndices === null ? 'sample-unindexed' : 'validate',
       rng: createRNG(seed),
+      // Textures allocated for this build's tables, awaiting the error read
+      // that publishes them (`runBuildSlice`).
+      staged: null,
       table: new Uint32Array(maxSize),
       transparency,
       validationIndex: 0,
@@ -4409,15 +4436,65 @@ export class VelocityOverlay extends OverlayBase {
     return true;
   }
 
+  /**
+   * Delete the textures a build allocated and has not published. Returns the
+   * deletion failures (their textures stay queued for retry), or null.
+   *
+   * @param {object|null} build
+   * @param {object} state - The view's spawn state (its published textures
+   *   are never deleted here).
+   * @returns {Error[]|null}
+   */
+  _releaseStagedSpawnTextures(build, state) {
+    const staged = build?.staged ?? null;
+    if (staged === null) return null;
+    build.staged = null;
+    // A lost context has already invalidated them.
+    if (this._contextLost || this.gl === null) return null;
+    let failures = null;
+    for (const [info, published, bytesPerPixel] of [
+      [staged.visibilityTextureInfo, state.visibilityTextureInfo, 1],
+      [staged.textureInfo, state.textureInfo, 4],
+    ]) {
+      if (!info?.texture || info === published) continue;
+      try {
+        this._queueDerivedTextureDelete(info, bytesPerPixel);
+      } catch (error) {
+        failures = appendFailure(failures, error);
+      }
+    }
+    const deletionFailures = this._flushPendingDerivedTextureDeletes();
+    if (deletionFailures !== null) {
+      for (const error of deletionFailures) {
+        failures = appendFailure(failures, error);
+      }
+    }
+    return failures;
+  }
+
+  /** Release a build's unpublished textures, then throw `error`. */
+  _discardStagedSpawnTextures(build, state, key, error) {
+    const cleanupFailures = this._releaseStagedSpawnTextures(build, state);
+    if (cleanupFailures !== null) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        `VelocityOverlay view "${key}" spawn-table allocation and cleanup both failed.`
+      );
+    }
+    throw error;
+  }
+
   _finishSpawnTableBuild(build) {
     if (build.phase !== 'complete') {
       throw new Error(
         'VelocityOverlay cannot publish an incomplete spawn-table build.'
       );
     }
+    // A view of the filled entries: the build is dropped once its table is
+    // uploaded, so nothing else reads the rest.
     return build.filled === build.table.length
       ? build.table
-      : build.table.slice(0, build.filled);
+      : build.table.subarray(0, build.filled);
   }
 
   _ensureSpawnTable(viewId, ctx, cellCount) {
@@ -4539,6 +4616,10 @@ export class VelocityOverlay extends OverlayBase {
     };
 
     const abortStaleBuild = () => {
+      this._reportDerivedRetirementFailures(
+        this._releaseStagedSpawnTextures(build, state),
+        `VelocityOverlay view "${key}" stale spawn-table cleanup was incomplete.`
+      );
       if (ownsBuild()) {
         state.building = false;
         state.buildToken = null;
@@ -4573,6 +4654,10 @@ export class VelocityOverlay extends OverlayBase {
     };
 
     const reportFailure = err => {
+      this._reportDerivedRetirementFailures(
+        this._releaseStagedSpawnTextures(build, state),
+        `VelocityOverlay view "${key}" failed spawn-table cleanup was incomplete.`
+      );
       try {
         this.setEnabled(false);
       } catch (cleanupError) {
@@ -4687,7 +4772,7 @@ export class VelocityOverlay extends OverlayBase {
             try {
               this._queueDerivedTextureDelete(
                 previousVisibilityTextureInfo,
-                4
+                1
               );
             } catch (error) {
               retirementFailures = appendFailure(
@@ -4711,60 +4796,89 @@ export class VelocityOverlay extends OverlayBase {
             `VelocityOverlay view "${key}" empty-generation retirement was incomplete.`
           );
         } else {
-          let visibilityTextureInfo = null;
-          let textureInfo = null;
-          try {
-            visibilityTextureInfo = createOrUpdatePackedVisibilityTexture(this.gl, {
-              texture: null,
-              data: build.transparency,
-              itemCount: cellCount,
-            });
-            textureInfo = createOrUpdatePackedUintTexture(this.gl, {
-              texture: null,
-              data: table,
-              itemCount: table.length
-            });
-          } catch (error) {
-            let cleanupFailures = null;
-            for (const [candidateInfo, bytesPerPixel] of [
-              [visibilityTextureInfo, 4],
-              [textureInfo, 4],
-            ]) {
-              if (!candidateInfo?.texture) continue;
-              try {
-                this._queueDerivedTextureDelete(
-                  candidateInfo,
-                  bytesPerPixel
-                );
-              } catch (cleanupError) {
-                cleanupFailures = appendFailure(
-                  cleanupFailures,
-                  cleanupError
-                );
-              }
-            }
-            const deletionFailures =
-              this._flushPendingDerivedTextureDeletes();
-            if (deletionFailures !== null) {
-              for (const cleanupError of deletionFailures) {
-                cleanupFailures = appendFailure(
-                  cleanupFailures,
-                  cleanupError
-                );
-              }
-            }
-            if (cleanupFailures !== null) {
-              throw new AggregateError(
-                [error, ...cleanupFailures],
-                `VelocityOverlay view "${key}" visibility publication and cleanup both failed.`
-              );
-            }
-            throw error;
-          }
-
+          // A view's tables keep their storage across rebuilds: rows are
+          // rewritten in place (no allocation, no GPU round trip), and only a
+          // new shape -- the first build, another cell count or level of
+          // detail -- allocates. The table texture is shaped for the build's
+          // capacity, so a refill with fewer visible cells keeps it too. New
+          // storage is allocated in one slice and its error queue read once,
+          // for both textures, in the next: by then the GPU process has taken
+          // the uploads, so the read does not wait on them (two reads in the
+          // allocating slice cost up to 90 ms a view on Suo).
           const previousTextureInfo = state.textureInfo;
           const previousVisibilityTextureInfo =
             state.visibilityTextureInfo;
+          if (build.staged === null) {
+            const visibilityFits = packedTextureFits(
+              this.gl, previousVisibilityTextureInfo, cellCount, 1
+            );
+            const tableFits = packedTextureFits(
+              this.gl, previousTextureInfo, build.table.length, 1
+            );
+            build.staged = {
+              visibilityTextureInfo: visibilityFits ? previousVisibilityTextureInfo : null,
+              textureInfo: tableFits ? previousTextureInfo : null,
+            };
+            if (!visibilityFits || !tableFits) {
+              try {
+                if (!visibilityFits) {
+                  build.staged.visibilityTextureInfo =
+                    createOrUpdatePackedVisibilityTexture(this.gl, {
+                      texture: null,
+                      data: build.transparency,
+                      itemCount: cellCount,
+                      allocationCheck: 'caller',
+                    });
+                }
+                if (!tableFits) {
+                  build.staged.textureInfo = createOrUpdatePackedUintTexture(this.gl, {
+                    texture: null,
+                    data: table,
+                    itemCount: table.length,
+                    capacity: build.table.length,
+                    allocationCheck: 'caller',
+                  });
+                }
+              } catch (error) {
+                this._discardStagedSpawnTextures(build, state, key, error);
+              }
+              schedule(runBuildSlice);
+              return;
+            }
+          } else {
+            try {
+              // The one read for this generation's new storage.
+              requireCleanWebGLState(
+                this.gl,
+                `VelocityOverlay view "${key}" spawn-table allocation`
+              );
+            } catch (error) {
+              this._discardStagedSpawnTextures(build, state, key, error);
+            }
+          }
+          // Storage that already had the shape takes its rows now, as the
+          // generation is published.
+          const visibilityTextureInfo =
+            build.staged.visibilityTextureInfo === previousVisibilityTextureInfo
+              ? createOrUpdatePackedVisibilityTexture(this.gl, {
+                texture: previousVisibilityTextureInfo,
+                data: build.transparency,
+                itemCount: cellCount,
+                allocationCheck: 'now',
+              })
+              : build.staged.visibilityTextureInfo;
+          const textureInfo =
+            build.staged.textureInfo === previousTextureInfo
+              ? createOrUpdatePackedUintTexture(this.gl, {
+                texture: previousTextureInfo,
+                data: table,
+                itemCount: table.length,
+                capacity: build.table.length,
+                allocationCheck: 'now',
+              })
+              : build.staged.textureInfo;
+          build.staged = null;
+
           state.textureInfo = textureInfo;
           state.visibilityTextureInfo = visibilityTextureInfo;
           state.tableSize = table.length;
@@ -4774,7 +4888,10 @@ export class VelocityOverlay extends OverlayBase {
           state.ready = true;
 
           let retirementFailures = null;
-          if (previousTextureInfo?.texture) {
+          if (
+            previousTextureInfo?.texture &&
+            previousTextureInfo !== textureInfo
+          ) {
             try {
               this._queueDerivedTextureDelete(
                 previousTextureInfo,
@@ -4787,11 +4904,14 @@ export class VelocityOverlay extends OverlayBase {
               );
             }
           }
-          if (previousVisibilityTextureInfo?.texture) {
+          if (
+            previousVisibilityTextureInfo?.texture &&
+            previousVisibilityTextureInfo !== visibilityTextureInfo
+          ) {
             try {
               this._queueDerivedTextureDelete(
                 previousVisibilityTextureInfo,
-                4
+                1
               );
             } catch (error) {
               retirementFailures = appendFailure(

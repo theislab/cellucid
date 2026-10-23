@@ -12,6 +12,7 @@ import {
 import {
   renderFigureToSvgBlob,
 } from '../assets/js/app/ui/modules/figure-export/renderers/svg-renderer.js';
+import './helpers/figure-export-worker-in-process.mjs';
 
 const IDENTITY = Float32Array.from([
   1, 0, 0, 0,

@@ -73,7 +73,6 @@ import {
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop] - optional framing crop in normalized viewport coords
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
- * @param {number} [options.maxSortedPoints]
  * @param {(x: number, y: number, r: number, g: number, b: number, a: number, radius: number, index: number) => void} options.onPoint
  * @returns {{ drawn: number, skipped: number }}
  */
@@ -90,7 +89,6 @@ export function forEachProjectedPoint({
   crop = null,
   sortByDepth = false,
   depthBins = 256,
-  maxSortedPoints = 200000,
   onPoint
 }) {
   if (!positions || !colors || !renderState?.mvpMatrix) {
@@ -135,11 +133,9 @@ export function forEachProjectedPoint({
   let drawn = 0;
   let skipped = n - candidateCount;
 
-  const wantsDepthSort =
-    Boolean(sortByDepth) &&
-    candidateCount <= Math.max(1, maxSortedPoints | 0);
-
-  if (wantsDepthSort) {
+  // The binned sort is O(n) in time and memory, so a requested depth sort is
+  // honoured at every point count.
+  if (sortByDepth) {
     let bins = depthBins | 0;
     if (bins < 16) bins = 16;
     else if (bins > 1024) bins = 1024;

@@ -17,6 +17,7 @@
  * @module ui/modules/community-annotation/github-connection-flow
  */
 
+import { annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
 import { toCacheScopeKey } from '../../../community-annotations/cache-scope.js';
 import { toGitHubUserKey } from '../../../community-annotations/github-auth.js';
 import { getAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
@@ -217,7 +218,7 @@ export function createGitHubConnectionFlow(controller) {
           const did =
             datasetId !== null
               ? datasetId
-              : (dataSourceManager?.getCurrentDatasetId?.() ?? null);
+              : (annotationDatasetIdOf(dataSourceManager) ?? null);
           const initialUserKey =
             cacheUser !== null ? cacheUser : getCacheUserKey();
           assertExactAnnotationUserKey(
@@ -1577,7 +1578,7 @@ export function createGitHubConnectionFlow(controller) {
   }
 
   async function connectRepoFlow({ reason = null } = {}) {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const datasetId = annotationDatasetIdOf(dataSourceManager) || null;
     const login = getGitHubLogin();
     const cacheUser = getCacheUserKey();
     const currentRepo = getAnnotationRepoForDataset(datasetId, cacheUser);

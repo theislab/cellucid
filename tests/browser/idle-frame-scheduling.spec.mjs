@@ -10,7 +10,7 @@
  */
 
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import {
   QUIET_WINDOW_MS,
@@ -20,8 +20,8 @@ import {
 } from './helpers/frame-scheduling.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=idle-frame-scheduling-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=idle-frame-scheduling-ci';
 
 test('a static scene stops drawing and a mutation draws it again', async ({
   page,
@@ -29,7 +29,7 @@ test('a static scene stops drawing and a mutation draws it again', async ({
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   // The scene goes quiet once startup work and the settle window run out. How
@@ -74,7 +74,7 @@ test('a still highlight lets the scene go quiet; only a pulsing one keeps drawin
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const selectQuality = quality => page.evaluate(value => {
@@ -125,7 +125,7 @@ test('a selection preview republished with the same cells does not redraw the sc
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   // A still ring, so a highlight alone is no reason to keep drawing.
   await page.evaluate(() => {
@@ -133,14 +133,14 @@ test('a selection preview republished with the same cells does not redraw the sc
     select.value = 'light';
     select.dispatchEvent(new Event('change', { bubbles: true }));
   });
-  await page.evaluate(() => window._cellucidState.setPreviewHighlightFromIndices([0, 1, 2]));
+  await page.evaluate(() => window._cellucidState.setPreviewHighlightFromIndices(Uint32Array.of(0, 1, 2)));
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
   // What a lasso does on every pointer move: publish the preview again. The
   // same cells are the same picture, so the frame stays valid and nothing is
   // re-uploaded; a different set redraws.
   const invalidatedBy = indices => page.evaluate(cells => {
-    window._cellucidState.setPreviewHighlightFromIndices(cells);
+    window._cellucidState.setPreviewHighlightFromIndices(Uint32Array.from(cells));
     return window._cellucidViewer.getFrameScheduleState().invalidated;
   }, indices);
   expect(await invalidatedBy([0, 1, 2])).toBe(false);
@@ -168,7 +168,7 @@ test('a renderer slower than the settle window still settles the camera', async 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   // The dataset's first frames publish its presented state (its LOD among
@@ -280,7 +280,7 @@ test('pointer movement and typing that change nothing do not redraw the scene', 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.evaluate(() => window._cellucidViewer.setFrameInvalidationTracing(true));
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
@@ -332,7 +332,7 @@ test('focus and visibility changes that end no input do not redraw the scene', a
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
@@ -379,7 +379,7 @@ test('cell lookups under the pointer, and the Cell info card, do not redraw the 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   // The field activation is asynchronous and redraws the scene when it lands
   // (new colours, labels and centroids). Its legend is the sign it has landed;
@@ -436,7 +436,7 @@ test('a backdrop whose opacity target drops still settles, and reduced motion sk
     try {
       await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
       await dismissWelcome(page);
-      await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+      await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
       // Grid (light) fades the grid to 0.85, Grid (dark) to 0.75. The fade used
       // to move only upwards, so after this switch the opacity stayed above
       // its target and the scene was redrawn on every frame, indefinitely.
@@ -469,7 +469,7 @@ test('a settled scene requests no animation frames; input, a resize and a mutati
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   const frames = count => page.evaluate(n => new Promise(resolve => {
     const step = () => (n-- <= 0 ? resolve() : requestAnimationFrame(step));
     requestAnimationFrame(step);

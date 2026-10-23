@@ -2,24 +2,26 @@
  * Every data-loading path fails bounded, explains itself, and leaves the
  * application in a state the user can act from.
  *
- * The broken artifacts under `fixtures/broken-exports/` are derived from the
- * real published export tree: a truncated payload is a real prefix of the real
- * gzip stream, a corrupt payload is the real byte count with the real bytes
- * permuted, and an absent payload is the real tree with one file removed. The
- * `mixed-*` catalogs pair one intact dataset with one broken one so a broken
- * dataset can be chosen from a working session, which is the only way to
- * observe recovery — a broken *default* dataset is a terminal startup failure
- * that replaces the whole application.
+ * The catalogs under `fixtures/broken-catalogs/` each fail for one reason: a
+ * listed file that is missing, truncated or not a file at all, a file that
+ * does not state the id it is listed under, a truncated `datasets.json`, and
+ * a catalog that does not state its schema. Listing a catalog reads every file it names,
+ * so each is a failure of the whole catalog. A dataset that breaks only when
+ * it is opened -- removed, cut short or damaged after the catalog was listed
+ * -- is reached from a working session, which is the only way to observe
+ * recovery; it is made from the demo catalog at the transport.
  *
- * The only synthetic failures are the ones a file cannot express — an HTTP
- * status, an offline network, a slow link and a cancelled request — and those
- * are injected at the transport while the loader under test stays real.
+ * The other synthetic failures are the ones a file cannot express -- an HTTP
+ * status, an offline network, a slow link and a cancelled request -- and
+ * those are injected at the transport while the loader under test stays real.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
+import { demoFile } from './helpers/dataset-loading.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -33,13 +35,18 @@ const zarrFixturePath = path.join(
   'current-ui-smoke.zarr.zip',
 );
 
-const GOOD_EXPORTS = `${ORIGIN}/tests/browser/fixtures/demo-custom-exports/`;
-const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-exports/`;
+const GOOD_CATALOG = `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
+const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-catalogs/`;
 
 const GOOD_DATASET = Object.freeze({
   id: 'synthetic-cell-types-2d',
   name: 'Synthetic cell-type islands — 2D',
   cells: 72,
+});
+/** GOOD_DATASET's file opened by the user: it names itself the same. */
+const GOOD_FILE = Object.freeze({
+  ...GOOD_DATASET,
+  path: path.join(fixturesDirectory, 'demo-catalog', `${GOOD_DATASET.id}.zarr.zip`),
 });
 const MIXED_DEFAULT = Object.freeze({
   id: 'synthetic-development-3d',
@@ -55,11 +62,13 @@ const MIXED_DEFAULT = Object.freeze({
 const NO_DATASET_NAMES = Object.freeze(['–', '—']);
 
 const CATALOG_NOTICE = '.dataset-info[role="status"]';
+const FIREFOX_WORKER_ROUTING =
+  'Firefox does not route requests made by the AnnData reader worker';
 const STARTUP_FAILURE = '#cellucid-startup-failure';
 
-function exportsUrl(baseUrl, datasetId) {
+function catalogUrl(baseUrl, datasetId) {
   const url = new URL('/', ORIGIN);
-  url.searchParams.set('exportsBaseUrl', baseUrl);
+  url.searchParams.set('sampleCatalog', baseUrl);
   if (datasetId !== null) url.searchParams.set('dataset', datasetId);
   return url.toString();
 }
@@ -162,6 +171,12 @@ async function expectRenders(page, dataset) {
     .toBe(dataset.cells);
 }
 
+/** The user opens GOOD_DATASET's file themselves, without reloading. */
+async function openGoodFile(page) {
+  await page.locator('#user-data-zarr-archive-input').setInputFiles(GOOD_FILE.path);
+  await expectRenders(page, GOOD_FILE);
+}
+
 async function derivedFile(testInfo, name, bytes) {
   const target = testInfo.outputPath(name);
   await mkdir(path.dirname(target), { recursive: true });
@@ -193,15 +208,20 @@ async function captureFirstErrorNotification(page, timeoutMs = 45_000) {
 const CATALOG_FAILURES = Object.freeze([
   Object.freeze({
     label: 'absent',
-    base: `${ORIGIN}/tests/browser/fixtures/no-such-export-tree/`,
-  }),
-  Object.freeze({
-    label: 'wrong-format',
-    base: `${BROKEN}wrong-format-catalog/`,
+    base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
+    notice: 'nothing is published at that address',
   }),
   Object.freeze({
     label: 'truncated',
     base: `${BROKEN}truncated-catalog/`,
+    notice: 'may not hold Cellucid data',
+  }),
+  Object.freeze({
+    label: 'schemaless',
+    base: `${BROKEN}schemaless-catalog/`,
+    notice: "is missing 'schema'",
+    // Retrying cannot help: the notice says what the catalog must be.
+    advice: false,
   }),
 ]);
 
@@ -209,7 +229,7 @@ for (const failure of CATALOG_FAILURES) {
   test(
     `a ${failure.label} dataset catalog fails bounded and stays recoverable`,
     async ({ page }, testInfo) => {
-      await page.goto(exportsUrl(failure.base, null), {
+      await page.goto(catalogUrl(failure.base, null), {
         waitUntil: 'domcontentloaded',
       });
       await dismissWelcome(page);
@@ -218,12 +238,10 @@ for (const failure of CATALOG_FAILURES) {
       // The cause the loader published reaches the notice: an address with
       // nothing on it is not reported as a network problem, and a reply that
       // is not a dataset list is not reported as a missing address.
-      await expect(page.locator(CATALOG_NOTICE)).toContainText(
-        failure.label === 'absent'
-          ? 'nothing is published at that address'
-          : 'may not hold Cellucid data',
-      );
-      await expect(page.locator(CATALOG_NOTICE)).toContainText('try again');
+      await expect(page.locator(CATALOG_NOTICE)).toContainText(failure.notice);
+      if (failure.advice !== false) {
+        await expect(page.locator(CATALOG_NOTICE)).toContainText('try again');
+      }
       await expect(
         page.locator(`${CATALOG_NOTICE} button`),
       ).toHaveText('Try again');
@@ -241,11 +259,7 @@ for (const failure of CATALOG_FAILURES) {
       ).toHaveText(['No datasets found']);
 
       // The user can still load their own data without reloading the page.
-      await chooseDirectory(
-        page.locator('#user-data-file-input'),
-        path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
-      );
-      await expectRenders(page, GOOD_DATASET);
+      await openGoodFile(page);
     },
   );
 }
@@ -253,14 +267,14 @@ for (const failure of CATALOG_FAILURES) {
 test('a permission-denied catalog fails bounded and stays recoverable', async ({
   page,
 }, testInfo) => {
-  await page.route(`${GOOD_EXPORTS}datasets.json`, route =>
+  await page.route(`${GOOD_CATALOG}datasets.json`, route =>
     route.fulfill({
       status: 403,
       contentType: 'text/plain',
       body: 'Forbidden',
     }));
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, null), {
+  await page.goto(catalogUrl(GOOD_CATALOG, null), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -274,13 +288,16 @@ test('a permission-denied catalog fails bounded and stays recoverable', async ({
 test('a catalog failure recovers in place once the catalog is reachable', async ({
   page,
 }, testInfo) => {
-  // Serve a 503 for the first catalog request only, then let the real bytes
-  // through, so "Try again" is tested against a transient outage rather than a
-  // permanently broken tree.
-  let served = 0;
-  await page.route(`${GOOD_EXPORTS}datasets.json`, async route => {
-    served += 1;
-    if (served === 1) {
+  // Serve a 503 until the outage ends, then let the real bytes through, so
+  // recovery is tested against a transient outage rather than a permanently
+  // broken tree. Startup asks a busy host again on its own before it reports
+  // anything; once the notice offers "Try again", nothing asks again behind
+  // it, and each "Try again" is one request whose answer is shown at once.
+  let outage = true;
+  let requests = 0;
+  await page.route(`${GOOD_CATALOG}datasets.json`, async route => {
+    requests += 1;
+    if (outage) {
       await route.fulfill({
         status: 503,
         contentType: 'text/plain',
@@ -291,15 +308,35 @@ test('a catalog failure recovers in place once the catalog is reachable', async 
     await route.continue();
   });
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, null), {
+  await page.goto(catalogUrl(GOOD_CATALOG, null), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
-  await expect(page.locator(CATALOG_NOTICE)).toBeVisible();
+  const retry = page.locator(`${CATALOG_NOTICE} button`);
+  await expect(retry).toHaveText('Try again');
+  await expect(page.locator(CATALOG_NOTICE)).toContainText(
+    'the server reported a problem of its own',
+  );
   await recordUserFacingFailure(page, testInfo, 'transient-503');
+  expect(requests).toBeGreaterThan(1);
 
-  await page.locator(`${CATALOG_NOTICE} button`).click();
+  // The notice is the person's to act on: nothing retries behind it.
+  const shown = requests;
+  await page.waitForTimeout(3_000);
+  expect(requests).toBe(shown);
+
+  // "Try again" while the host is still busy: one request, reported at once.
+  await retry.click();
+  await expect(retry).toHaveText('Try again', { timeout: 5_000 });
+  await expect(page.locator(CATALOG_NOTICE)).toContainText(
+    'the server reported a problem of its own',
+  );
+  expect(requests).toBe(shown + 1);
+
+  outage = false;
+  await retry.click();
   await expect(page.locator(CATALOG_NOTICE)).toBeHidden();
+  expect(requests).toBe(shown + 2);
   await expect(page.locator('#dataset-select')).toBeEnabled();
   await page.locator('#dataset-select').selectOption(
     optionValue(GOOD_DATASET.id),
@@ -308,30 +345,47 @@ test('a catalog failure recovers in place once the catalog is reachable', async 
 });
 
 /* ------------------------------------------------------------------ *
- * Payload-level failures reached from a working session
+ * Dataset failures reached from a working session
  * ------------------------------------------------------------------ */
 
-const PAYLOAD_FAILURES = Object.freeze([
-  'mixed-missing-payload',
-  'mixed-truncated-payload',
-  'mixed-corrupt-payload',
-]);
+/**
+ * GOOD_DATASET's file, as the demo catalog serves it, broken once the
+ * catalog has been listed: removed, cut to a third, or with one byte of its
+ * embedding flipped, so its ZIP entry no longer matches its checksum.
+ */
+const OPENING_FAILURES = Object.freeze({
+  removed: route => route.fulfill({ status: 404, body: 'Not Found' }),
+  truncated: route => {
+    const whole = demoFile(GOOD_DATASET);
+    return fulfillFile(route, whole.subarray(0, Math.floor(whole.length / 3)));
+  },
+  damaged: route => {
+    const damaged = Buffer.from(demoFile(GOOD_DATASET));
+    const embedding = zipEntryData(damaged, `${GOOD_DATASET.id}.zarr/obsm/X_islands/0.0`);
+    damaged[embedding.offset + embedding.length - 1] ^= 0xff;
+    return fulfillFile(route, damaged);
+  },
+});
 
-for (const label of PAYLOAD_FAILURES) {
+for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
   test(
-    `choosing a ${label.replace('mixed-', '')} dataset fails bounded and keeps the session`,
-    async ({ page }, testInfo) => {
-      await page.goto(exportsUrl(`${BROKEN}${label}/`, null), {
+    `choosing a dataset whose file was ${label} fails bounded and keeps the session`,
+    async ({ browserName, page }, testInfo) => {
+      test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
+      await page.goto(catalogUrl(GOOD_CATALOG, MIXED_DEFAULT.id), {
         waitUntil: 'domcontentloaded',
       });
       await dismissWelcome(page);
       await expectRenders(page, MIXED_DEFAULT);
+      // The catalog has been listed: every read of the file from here on
+      // opens it.
+      await page.route(`${GOOD_CATALOG}${GOOD_DATASET.id}.zarr.zip`, fail);
 
       await page.locator('#dataset-select').selectOption(
         optionValue(GOOD_DATASET.id),
       );
       const errors = await captureFirstErrorNotification(page);
-      await testInfo.attach(`user-facing-failure-${label}.json`, {
+      await testInfo.attach(`user-facing-failure-${label}-file.json`, {
         body: JSON.stringify({ errorNotifications: errors }, null, 2),
         contentType: 'application/json',
       });
@@ -347,68 +401,50 @@ for (const label of PAYLOAD_FAILURES) {
         optionValue(MIXED_DEFAULT.id),
       );
       await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
-      await chooseDirectory(
-        page.locator('#user-data-file-input'),
-        path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
-      );
-      await expectRenders(page, GOOD_DATASET);
+      await openGoodFile(page);
     },
   );
 }
 
-test('a broken default dataset stops startup with one actionable card', async ({
-  page,
-}, testInfo) => {
-  await page.goto(exportsUrl(`${BROKEN}corrupt-payload/`, null), {
-    waitUntil: 'domcontentloaded',
-  });
+/**
+ * A catalog whose only (default) dataset cannot be described stops startup:
+ * the failure says what is wrong with the dataset's file.
+ */
+const STARTUP_FILE_FAILURES = Object.freeze({
+  'missing-file': /forms-h5ad\.h5ad/,
+  'truncated-file': /forms-h5ad\.h5ad is truncated/,
+  'corrupt-file': /forms-h5ad\.h5ad \(dataset 'forms-h5ad' in datasets\.json\): .*not a valid HDF5\/H5AD file/,
+  'mismatched-id': /lists forms-h5ad\.h5ad as dataset 'another-id', but the file states the id 'forms-h5ad'/,
+});
 
-  const failure = page.locator(STARTUP_FAILURE);
-  await expect(failure).toBeVisible();
-  await expect(failure).toHaveAttribute('role', 'alert');
-  await expect(failure).toContainText('Cellucid could not start');
-  await expect(failure).toContainText('invalid gzip header');
-  await expect(failure).toContainText(
-    'Correct the launch configuration or server response, then reload this page.',
-  );
-  await expect.poll(() => page.evaluate(
-    () => window._cellucidViewer.isDisposalSettled(),
-  )).toBe(true);
-  const observed = await recordUserFacingFailure(
+for (const [label, names] of Object.entries(STARTUP_FILE_FAILURES)) {
+  test(`a catalog with a ${label.replace('-', ' ')} stops startup with one actionable card`, async ({
     page,
-    testInfo,
-    'startup-corrupt-default',
-  );
-  expect(NO_DATASET_NAMES).toContain(observed.datasetName);
+  }, testInfo) => {
+    await page.goto(catalogUrl(`${BROKEN}${label}/`, null), {
+      waitUntil: 'domcontentloaded',
+    });
 
-  // The terminal alert is the sole visible owner of a failed startup, so
-  // onboarding is retracted rather than left competing with it.
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await testInfo.attach('welcome-modal-state-on-terminal-failure.json', {
-    body: JSON.stringify({
-      welcomeModalClass: await page.locator('#welcome-modal')
-        .getAttribute('class'),
-      welcomeModalHasBox: await page.locator('#welcome-modal')
-        .evaluate(node => node.getBoundingClientRect().height > 0),
-    }, null, 2),
-    contentType: 'application/json',
+    const failure = page.locator(STARTUP_FAILURE);
+    await expect(failure).toBeVisible();
+    await expect(failure).toHaveAttribute('role', 'alert');
+    await expect(failure).toContainText('Cellucid could not start');
+    await expect(failure).toContainText(names);
+    await expect.poll(() => page.evaluate(
+      () => window._cellucidViewer.isDisposalSettled(),
+    )).toBe(true);
+    const observed = await recordUserFacingFailure(
+      page,
+      testInfo,
+      `startup-${label}`,
+    );
+    expect(NO_DATASET_NAMES).toContain(observed.datasetName);
+
+    // The terminal alert is the sole visible owner of a failed startup, so
+    // onboarding is retracted rather than left competing with it.
+    await expect(page.locator('#welcome-modal')).toBeHidden();
   });
-});
-
-test('a mismatched dataset manifest stops startup naming both counts', async ({
-  page,
-}, testInfo) => {
-  await page.goto(exportsUrl(`${BROKEN}mismatched-manifest/`, null), {
-    waitUntil: 'domcontentloaded',
-  });
-
-  const failure = page.locator(STARTUP_FAILURE);
-  await expect(failure).toBeVisible();
-  await expect(failure).toContainText(
-    'catalog n_cells=72 does not match dataset_identity.json n_cells=7200',
-  );
-  await recordUserFacingFailure(page, testInfo, 'startup-mismatched-manifest');
-});
+}
 
 /* ------------------------------------------------------------------ *
  * Transport failures: offline, slow, cancelled
@@ -418,7 +454,7 @@ test('an offline dataset switch is reported and the session survives', async ({
   page,
   context,
 }, testInfo) => {
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -447,12 +483,12 @@ test('an offline dataset switch is reported and the session survives', async ({
 });
 
 test('a slow link still reaches a rendered dataset', async ({ page }) => {
-  await page.route(`${GOOD_EXPORTS}**`, async route => {
+  await page.route(`${GOOD_CATALOG}**`, async route => {
     await new Promise(resolve => setTimeout(resolve, 250));
     await route.continue();
   });
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -460,27 +496,30 @@ test('a slow link still reaches a rendered dataset', async ({ page }) => {
 });
 
 test('a load cancelled by switching datasets leaves the winner rendered', async ({
+  browserName,
   page,
 }) => {
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
 
-  // Slow every payload for the 3D dataset, start it, then immediately choose
-  // the 1D dataset. The last request must win and the first must not resurface.
-  const supersededPrefix = `${GOOD_EXPORTS}synthetic-development-3d/`;
+  // Slow every read of the 3D dataset's file, start it, then immediately
+  // choose the 1D dataset. The last request must win and the first must not
+  // resurface. (The catalog was listed at startup: these reads open it.)
+  const supersededUrl = `${GOOD_CATALOG}synthetic-development-3d.zarr.zip`;
   const superseded = { settled: 0, started: 0 };
   const settleSuperseded = request => {
-    if (request.url().startsWith(supersededPrefix)) superseded.settled += 1;
+    if (request.url() === supersededUrl) superseded.settled += 1;
   };
-  page.on('requestfinished', settleSuperseded);
-  page.on('requestfailed', settleSuperseded);
-  await page.route(`${supersededPrefix}**`, async route => {
+  page.context().on('requestfinished', settleSuperseded);
+  page.context().on('requestfailed', settleSuperseded);
+  await page.route(supersededUrl, async route => {
     superseded.started += 1;
     await new Promise(resolve => setTimeout(resolve, 1_500));
-    await route.continue();
+    await route.continue().catch(() => {});
   });
   await page.locator('#dataset-select').selectOption(
     optionValue('synthetic-development-3d'),
@@ -540,7 +579,7 @@ test('a non-h5ad file offered to the .h5ad picker fails bounded', async ({
     ),
   );
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -579,7 +618,7 @@ test('a truncated .h5ad file fails bounded and the previous dataset survives', a
     whole.subarray(0, Math.floor(whole.length / 3)),
   );
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -605,7 +644,7 @@ test('a truncated Zarr ZIP archive fails bounded and the previous dataset surviv
     whole.subarray(0, Math.floor(whole.length / 3)),
   );
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -623,28 +662,28 @@ test('a truncated Zarr ZIP archive fails bounded and the previous dataset surviv
   await expectRenders(page, GOOD_DATASET);
 });
 
-test('a prepared directory chosen one level too high fails bounded', async ({
+test('a Zarr store folder chosen one level too high fails bounded', async ({
   page,
 }, testInfo) => {
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
 
-  // Picking the parent of an export instead of the export itself is the
-  // mistake a first-time user makes with a directory picker.
+  // Picking the folder that holds a store instead of the store itself is the
+  // mistake a first-time user makes with a folder picker.
   await chooseDirectory(
-    page.locator('#user-data-file-input'),
-    path.join(fixturesDirectory, 'demo-custom-exports'),
+    page.locator('#user-data-zarr-folder-input'),
+    path.join(fixturesDirectory, 'forms-catalog'),
   );
 
   const errors = await captureFirstErrorNotification(page);
-  await testInfo.attach('user-facing-failure-prepared-parent-directory.json', {
+  await testInfo.attach('user-facing-failure-zarr-parent-folder.json', {
     body: JSON.stringify({ errorNotifications: errors }, null, 2),
     contentType: 'application/json',
   });
-  expect(errors.length).toBeGreaterThan(0);
+  expect(errors.join('\n')).toContain('Select the .zarr folder itself');
   await expectRenders(page, GOOD_DATASET);
 });
 
@@ -657,7 +696,7 @@ test('a rejected file can be fixed and re-picked without reloading', async ({
     Buffer.from('not an hdf5 file at all\n', 'utf8'),
   );
 
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);

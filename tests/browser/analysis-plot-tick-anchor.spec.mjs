@@ -26,7 +26,7 @@ import { openPlotHarness } from './helpers/plot-harness.mjs';
 /** The accordion preview: `--analysis-panel-width` less its padding. */
 const SIDEBAR = Object.freeze({ width: 224, height: 180 });
 
-// cellucid-datasets exports-v3/pancreas/obs_manifest.json, field `cell_type`, in descending count
+// The cellucid-datasets Pancreas dataset's `cell_type` categories, in descending count
 // order so `PlotFactory.getSortedCategories(pageData, 'count')` reproduces it.
 const PANCREAS_CELL_TYPES = Object.freeze([
   'Ductal', 'Ngn3 high EP', 'Pre-endocrine', 'Beta',

@@ -38,6 +38,12 @@ import {
 } from './components/backdrop-look-export.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { assertCropRect01 } from './utils/crop.js';
+import {
+  assertFigureExportSessionSettings,
+  FIGURE_EXPORT_SESSION_SETTINGS_VERSION,
+  FIGURE_EXPORT_SETTING_RANGES,
+  trackCommittedNumber,
+} from './utils/session-settings.js';
 import { rgb01ToHex } from './utils/color-utils.js';
 import { resolveFigureInk } from './utils/figure-ink.js';
 import {
@@ -213,8 +219,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       + 'getAntialiasing().'
     );
   }
-  // Session bundles must NOT persist Figure Export UI state. Mark the entire
-  // subtree as opt-out so generic UI control snapshotting ignores it.
+  // Generic UI control snapshotting skips this subtree: a session records the
+  // panel's settings through exportSessionSettings()/importSessionSettings()
+  // (utils/session-settings.js), exactly and without derived values.
   container.setAttribute('data-state-serializer-skip', 'true');
 
   if (container.__cellucidCleanup !== undefined) {
@@ -1818,7 +1825,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function hasUsableWebgl2Context() {
-    if (typeof WebGL2RenderingContext !== 'function') return false;
+    // The point pass draws in the export worker on an OffscreenCanvas.
+    if (typeof WebGL2RenderingContext !== 'function' || typeof OffscreenCanvas !== 'function') return false;
     try {
       const gl = viewer.getGLContext();
       return (
@@ -3293,5 +3301,175 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   syncFormatDependentUi();
   syncCropUi();
 
-  return { setCellsPresent, destroy };
+  // A session may be saved while a number box holds a half-typed value; it
+  // records each box's last valid value instead (`trackCommittedNumber`).
+  const committedNumber = (input, label, range, integer = true) =>
+    trackCommittedNumber(input, { label, range, integer, signal: domLifecycle.signal });
+  const committedNumbers = {
+    width: committedNumber(widthInput, 'width', FIGURE_EXPORT_SETTING_RANGES.plotSize),
+    height: committedNumber(heightInput, 'height', FIGURE_EXPORT_SETTING_RANGES.plotSize),
+    base: committedNumber(fontSizeInput, 'base font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    legend: committedNumber(legendFontSizeInput, 'legend font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    ticks: committedNumber(tickFontSizeInput, 'tick font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    axisLabel: committedNumber(axisLabelFontSizeInput, 'axis-label font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    title: committedNumber(titleFontSizeInput, 'title font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    centroidLabel: committedNumber(centroidLabelFontSizeInput, 'centroid-label font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    selectionMutedOpacity: committedNumber(
+      selectionMutedOpacityInput,
+      'non-selected opacity',
+      FIGURE_EXPORT_SETTING_RANGES.selectionMutedOpacity,
+      false
+    ),
+    optimizedTargetCount: committedNumber(
+      optimizedTargetCountInput,
+      'optimized vector target',
+      FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount
+    ),
+  };
+
+  /**
+   * Every figure-export setting as one plain JSON object
+   * (`utils/session-settings.js`).
+   *
+   * @returns {import('./utils/session-settings.js').FigureExportSessionSettings}
+   */
+  function exportSessionSettings() {
+    const settings = {
+      version: FIGURE_EXPORT_SESSION_SETTINGS_VERSION,
+      sizePreset: presetSelect.value,
+      width: committedNumbers.width.read(),
+      height: committedNumbers.height.read(),
+      frame: cropEnabled
+        ? {
+          lockAspect: cropLockCheckbox.checked,
+          rect: {
+            x: cropRect01.x,
+            y: cropRect01.y,
+            width: cropRect01.width,
+            height: cropRect01.height,
+          },
+        }
+        : null,
+      background: backgroundSelect.value,
+      backgroundColor: backgroundColorInput.value.toLowerCase(),
+      fontFamily: fontSelect.value,
+      autoTextSize: autoTextSizingCheckbox.checked,
+      fontSizes: autoTextSizingCheckbox.checked
+        ? null
+        : {
+          base: committedNumbers.base.read(),
+          legend: committedNumbers.legend.read(),
+          ticks: committedNumbers.ticks.read(),
+          axisLabel: committedNumbers.axisLabel.read(),
+          title: committedNumbers.title.read(),
+          centroidLabel: committedNumbers.centroidLabel.read(),
+        },
+      titleFollowsDataset: titleAutofillEnabled,
+      title: titleAutofillEnabled ? null : titleInput.value,
+      xLabel: xLabelInput.value,
+      yLabel: yLabelInput.value,
+      includeAxes: includeAxesCheckbox.checked,
+      includeLegend: includeLegendCheckbox.checked,
+      referenceGrid: referenceGridCheckbox.checked,
+      showOrientation: showOrientationCheckbox.checked,
+      depthSort: depthSortCheckbox.checked,
+      legendPosition: legendPosSelect.value,
+      emphasizeSelection: emphasizeSelectionCheckbox.checked,
+      selectionMutedOpacity: committedNumbers.selectionMutedOpacity.read(),
+      preview: {
+        enabled: previewEnabledCheckbox.checked,
+        colorblindMode: previewModeSelect.value,
+      },
+      download: downloadSelect.value,
+      dpi: Number(dpiSelect.value),
+      svgStrategy: strategySelect.value === '' ? null : strategySelect.value,
+      optimizedTargetCount: committedNumbers.optimizedTargetCount.read(),
+      exportAllViews: exportAllViewsCheckbox.checked,
+    };
+    return assertFigureExportSessionSettings(settings);
+  }
+
+  /**
+   * Apply a session's figure-export settings to every control. The object is
+   * validated whole first, so an invalid one changes nothing.
+   *
+   * @param {unknown} settings
+   */
+  function importSessionSettings(settings) {
+    if (cleanupComplete) {
+      throw new Error('Figure export settings cannot be applied after teardown.');
+    }
+    const exact = assertFigureExportSessionSettings(settings);
+
+    presetSelect.value = exact.sizePreset;
+    widthInput.value = String(exact.width);
+    heightInput.value = String(exact.height);
+
+    backgroundSelect.value = exact.background;
+    backgroundColorInput.value = exact.backgroundColor;
+    fontSelect.value = exact.fontFamily;
+    autoTextSizingCheckbox.checked = exact.autoTextSize;
+    if (!exact.autoTextSize) {
+      fontSizeInput.value = String(exact.fontSizes.base);
+      legendFontSizeInput.value = String(exact.fontSizes.legend);
+      tickFontSizeInput.value = String(exact.fontSizes.ticks);
+      axisLabelFontSizeInput.value = String(exact.fontSizes.axisLabel);
+      titleFontSizeInput.value = String(exact.fontSizes.title);
+      centroidLabelFontSizeInput.value = String(exact.fontSizes.centroidLabel);
+    }
+
+    xLabelInput.value = exact.xLabel;
+    yLabelInput.value = exact.yLabel;
+    includeAxesCheckbox.checked = exact.includeAxes;
+    includeLegendCheckbox.checked = exact.includeLegend;
+    referenceGridCheckbox.checked = exact.referenceGrid;
+    showOrientationCheckbox.checked = exact.showOrientation;
+    depthSortCheckbox.checked = exact.depthSort;
+    legendPosSelect.value = exact.legendPosition;
+    emphasizeSelectionCheckbox.checked = exact.emphasizeSelection;
+    selectionMutedOpacityInput.value = String(exact.selectionMutedOpacity);
+
+    downloadSelect.value = exact.download;
+    dpiSelect.value = String(exact.dpi);
+    strategySelect.value = exact.svgStrategy ?? '';
+    optimizedTargetCountInput.value = String(exact.optimizedTargetCount);
+    exportAllViewsCheckbox.checked = exact.exportAllViews;
+
+    previewModeSelect.value = exact.preview.colorblindMode;
+    previewEnabledCheckbox.checked = exact.preview.enabled;
+    previewFramingMode = 'edit';
+    previewSampleCrop = null;
+    cropEnabled = exact.frame !== null;
+    cropEnabledCheckbox.checked = cropEnabled;
+    cropLockCheckbox.checked = exact.frame?.lockAspect ?? false;
+    lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
+    cropRect01 = exact.frame === null
+      ? { x: 0, y: 0, width: 1, height: 1 }
+      : { ...exact.frame.rect };
+
+    if (exact.titleFollowsDataset) {
+      titleAutofillEnabled = true;
+      lastAutoTitle = '';
+      titleInput.value = '';
+      syncAutoTitle();
+    } else {
+      titleAutofillEnabled = false;
+      titleInput.value = exact.title;
+    }
+
+    syncAnnotationUi();
+    syncTextSizingUi();
+    for (const tracked of Object.values(committedNumbers)) tracked.commit();
+    syncFormatDependentUi();
+    syncCropUi();
+    invalidatePreviewSamples({ rebuild: false });
+    if (exact.preview.enabled) {
+      // The preview toggle's own path builds the sample the settings show.
+      previewEnabledCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      clearPreview();
+    }
+  }
+
+  return { setCellsPresent, destroy, exportSessionSettings, importSessionSettings };
 }

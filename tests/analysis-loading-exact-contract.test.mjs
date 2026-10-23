@@ -60,11 +60,13 @@ test('dataset reset generation-isolates old cache and pending-request settlement
     pageIds: ['page-1'],
   };
   const olderRequest = layer.getDataForPages(request);
-  assert.equal(layer._pendingRequests.get('same-request'), older.promise);
+  const olderWork = layer._pendingRequests.get('same-request');
+  assert.ok(olderWork !== undefined);
 
   layer.resetForDatasetReload();
   const newerRequest = layer.getDataForPages(request);
-  assert.equal(layer._pendingRequests.get('same-request'), newer.promise);
+  const newerWork = layer._pendingRequests.get('same-request');
+  assert.notEqual(newerWork, olderWork, 'a reset starts the request again');
 
   older.resolve(['old-dataset']);
   await assert.rejects(
@@ -78,8 +80,8 @@ test('dataset reset generation-isolates old cache and pending-request settlement
   );
   assert.equal(
     layer._pendingRequests.get('same-request'),
-    newer.promise,
-    'an old finally block must not delete the newer same-key pending owner',
+    newerWork,
+    'an old settlement must not delete the newer same-key pending owner',
   );
 
   newer.resolve(['new-dataset']);
@@ -118,105 +120,13 @@ test('page-data requests snapshot caller-owned page IDs before cache keying and 
   assert.equal(layer._dataCache.has('pages:page-B'), false);
 });
 
-test('dataset reset rejects an old bulk-gene generation without cache or notification publication', async t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-
-  const gate = deferred();
-  const terminal = [];
-  layer._notifications = {
-    show() {
-      return 'bulk-old';
-    },
-    updateProgress() {},
-    complete(id) {
-      terminal.push(['complete', id]);
-    },
-    fail(id) {
-      terminal.push(['fail', id]);
-    },
-    dismiss(id) {
-      terminal.push(['dismiss', id]);
-    },
-  };
-  layer.refreshPageVersions = () => {};
-  layer.getAvailableVariables = () => [{ key: 'Gene A' }];
-  layer.getDataForPages = async () => gate.promise;
-
-  const request = layer.fetchBulkGeneExpression({
-    pageIds: ['page-1'],
-    geneList: ['Gene A'],
-  });
-  layer.resetForDatasetReload();
-  gate.resolve([{
-    pageId: 'page-1',
-    pageName: 'Old page',
-    values: [1],
-    cellIndices: [0],
-    cellCount: 1,
-  }]);
-
-  await assert.rejects(
-    request,
-    /analysis data request.*invalidated|invalidated.*analysis data request/i,
-  );
-  assert.equal(layer._bulkGeneCache.size, 0);
-  assert.deepEqual(terminal, [['dismiss', 'bulk-old']]);
-});
-
-test('session cache rollback cannot resurrect an older dataset after reset or destroy', async t => {
-  for (const lifecycle of ['reset', 'destroy']) {
-    await t.test(lifecycle, () => {
-      const layer = new DataLayer({}, {
-        enableNotifications: false,
-        enablePrefetch: false,
-        enableVersionTracking: false,
-      });
-      layer._bulkGeneCache.set('old-dataset', {
-        data: {},
-        timestamp: 1,
-        geneCount: 0,
-      });
-      layer._bulkGeneCacheAccessOrder.push('old-dataset');
-      const replacement = layer.beginSessionCacheReplacement();
-
-      if (lifecycle === 'reset') {
-        layer.resetForDatasetReload();
-      } else {
-        layer.destroy();
-      }
-      assert.deepEqual([...layer._bulkGeneCache.keys()], []);
-      assert.throws(
-        () => replacement.rollback(),
-        /dataset|lifecycle|invalidated|ownership changed/i,
-      );
-      assert.deepEqual([...layer._bulkGeneCache.keys()], []);
-
-      if (lifecycle !== 'destroy') layer.destroy();
-    });
-  }
-});
-
 test('observation fields load only through the DataState lease, never a second loader', async () => {
-  // `fetchBulkObsFields` used to branch on `state.obsManifest` and
-  // `state.manifestUrl` and download the fields itself. Nothing in the
-  // application ever set either key, so the branch was unreachable — and had it
-  // been reachable it would have been wrong twice over: it bypassed
-  // `DataState.ensureFieldLoaded`, which is what registers analysis as an
-  // independent lease on a shared field, and it left `field.loaded` false so
-  // every later read re-downloaded the same bytes. A state that carries both
-  // keys must still take the one load path.
+  // `fetchBulkObsFields` reads every field through
+  // `DataState.ensureFieldLoaded`, which registers analysis as an independent
+  // lease on a shared field and marks it loaded, so a later read reuses the
+  // same values instead of reading them again.
   const loadedThroughLease = [];
-  const layer = bareDataLayer({
-    manifestUrl: 'https://example.test/obs_manifest.json',
-    obsManifest: {
-      fields: [{ key: 'score', kind: 'continuous', valuesPath: 'score.f32' }],
-    },
-  });
+  const layer = bareDataLayer();
   layer.getAvailableVariables = type => (
     type === 'continuous_obs' ? [{ key: 'score' }] : []
   );
@@ -229,7 +139,6 @@ test('observation fields load only through the DataState lease, never a second l
     pageIds: ['page-1'],
     obsFields: ['score'],
     subsetPages: false,
-    includeCategoricalValues: false,
   });
 
   assert.deepEqual(loadedThroughLease, ['score']);
@@ -458,215 +367,6 @@ test('bulk observation projection rejects out-of-range page membership', async t
   });
 });
 
-test('cached bulk gene reads reject a missing requested gene atomically', async () => {
-  const layer = bareDataLayer();
-  layer._bulkGeneCacheMaxAge = 60_000;
-  layer._getBulkGeneCacheKey = () => 'cache-key';
-  layer._getBulkGeneCache = () => ({
-    timestamp: Date.now(),
-    data: {
-      'Gene A': {
-        'page-1': {
-          values: Float32Array.of(1),
-          cellIndices: Uint32Array.of(0),
-          pageName: 'Page 1',
-          cellCount: 1,
-        },
-      },
-    },
-  });
-
-  await assert.rejects(
-    layer.fetchBulkGeneExpression({
-      pageIds: ['page-1'],
-      geneList: ['Gene A', 'Missing Gene'],
-    }),
-    /cached bulk gene data.*missing requested genes.*Missing Gene/i,
-  );
-});
-
-test('session cache import owns exact gene and page keys without global prototype writes', t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-
-  const pageIds = PROTOTYPE_PROPERTY_NAMES.map(
-    (_name, index) => `page_0453_${index}`,
-  );
-  const pageDescriptors = new Map(
-    pageIds.map(pageId => [
-      pageId,
-      Object.getOwnPropertyDescriptor(Object.prototype, pageId),
-    ]),
-  );
-  const apply = (gene, pageId, index) => layer.importSessionCache({
-    kind: 'bulk-gene',
-    cacheKey: 'exact-cache',
-    gene,
-    pageId,
-    values: Float32Array.of(index + 0.25),
-    cellIndices: Uint32Array.of(0),
-    pageName: pageId,
-    cellCount: 1,
-    timestamp: index + 1,
-    geneCount: PROTOTYPE_PROPERTY_NAMES.length + 1,
-  });
-
-  for (const [index, gene] of PROTOTYPE_PROPERTY_NAMES.entries()) {
-    assert.equal(apply(gene, pageIds[index], index), 1);
-  }
-  for (const [index, pageId] of PROTOTYPE_PROPERTY_NAMES.entries()) {
-    assert.equal(
-      apply('safe-gene', pageId, PROTOTYPE_PROPERTY_NAMES.length + index),
-      1,
-    );
-  }
-
-  const globalWrites = pageIds.filter(
-    pageId => Object.hasOwn(Object.prototype, pageId),
-  );
-  for (const [pageId, descriptor] of pageDescriptors) {
-    if (descriptor === undefined) delete Object.prototype[pageId];
-    else Object.defineProperty(Object.prototype, pageId, descriptor);
-  }
-
-  const entry = layer._bulkGeneCache.get('exact-cache');
-  const safeGenePages = entry?.data?.['safe-gene'];
-  const exported = layer.exportSessionCache();
-  assert.deepEqual(
-    {
-      exportedIdentities: exported.map(
-        artifact => JSON.stringify([artifact.gene, artifact.pageId]),
-      ),
-      globalWrites,
-      geneKeys: Object.keys(entry?.data || {}),
-      geneOwnKeys: PROTOTYPE_PROPERTY_NAMES.filter(
-        key => Object.hasOwn(entry?.data || {}, key),
-      ),
-      geneRecordPrototype: Object.getPrototypeOf(entry?.data || {}),
-      safePageKeys: Object.keys(safeGenePages || {}),
-      safePageOwnKeys: PROTOTYPE_PROPERTY_NAMES.filter(
-        key => Object.hasOwn(safeGenePages || {}, key),
-      ),
-      safePageRecordPrototype: Object.getPrototypeOf(safeGenePages || {}),
-    },
-    {
-      exportedIdentities: [
-        ...PROTOTYPE_PROPERTY_NAMES.map(
-          (gene, index) => JSON.stringify([gene, pageIds[index]]),
-        ),
-        ...PROTOTYPE_PROPERTY_NAMES.map(
-          pageId => JSON.stringify(['safe-gene', pageId]),
-        ),
-      ],
-      globalWrites: [],
-      geneKeys: [...PROTOTYPE_PROPERTY_NAMES, 'safe-gene'],
-      geneOwnKeys: PROTOTYPE_PROPERTY_NAMES,
-      geneRecordPrototype: Object.prototype,
-      safePageKeys: PROTOTYPE_PROPERTY_NAMES,
-      safePageOwnKeys: PROTOTYPE_PROPERTY_NAMES,
-      safePageRecordPrototype: Object.prototype,
-    },
-  );
-});
-
-test('cached subsets never treat inherited prototype names as gene hits', async () => {
-  const layer = bareDataLayer();
-  layer._bulkGeneCacheMaxAge = 60_000;
-  layer._getBulkGeneCacheKey = () => 'exact-cache';
-  layer._getBulkGeneCache = () => ({
-    timestamp: Date.now(),
-    data: {},
-  });
-  let fallbackLoads = 0;
-  layer.getDataForPages = async ({ variableKey }) => {
-    fallbackLoads++;
-    return PROTOTYPE_PROPERTY_NAMES.map((pageId, pageIndex) => ({
-      pageId,
-      pageName: pageId,
-      values: Float32Array.of(
-        PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey) + pageIndex,
-      ),
-      cellIndices: Uint32Array.of(0),
-      cellCount: 1,
-    }));
-  };
-
-  const result = await layer.getGeneExpressionSubset(
-    PROTOTYPE_PROPERTY_NAMES,
-    PROTOTYPE_PROPERTY_NAMES,
-  );
-  assert.equal(fallbackLoads, PROTOTYPE_PROPERTY_NAMES.length);
-  assertExactOrdinaryRecord(result, PROTOTYPE_PROPERTY_NAMES);
-  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
-    assertExactOrdinaryRecord(
-      result[gene],
-      PROTOTYPE_PROPERTY_NAMES,
-    );
-  }
-});
-
-test('fresh and cached bulk gene results preserve prototype-named genes and pages', async t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-
-  layer.refreshPageVersions = () => {};
-  layer.getAvailableVariables = type => {
-    assert.equal(type, 'gene_expression');
-    return PROTOTYPE_PROPERTY_NAMES.map(key => ({ key }));
-  };
-  layer.getDataForPages = async ({ variableKey, pageIds }) => (
-    pageIds.map((pageId, pageIndex) => ({
-      pageId,
-      pageName: pageId,
-      values: Float32Array.of(
-        PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey) + pageIndex,
-      ),
-      cellIndices: Uint32Array.of(0),
-      cellCount: 1,
-    }))
-  );
-
-  const fresh = await layer.fetchBulkGeneExpression({
-    pageIds: PROTOTYPE_PROPERTY_NAMES,
-    geneList: PROTOTYPE_PROPERTY_NAMES,
-    forceReload: true,
-  });
-  assertExactOrdinaryRecord(fresh, PROTOTYPE_PROPERTY_NAMES);
-  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
-    assertExactOrdinaryRecord(fresh[gene], PROTOTYPE_PROPERTY_NAMES);
-  }
-
-  const cached = await layer.fetchBulkGeneExpression({
-    pageIds: PROTOTYPE_PROPERTY_NAMES,
-    geneList: PROTOTYPE_PROPERTY_NAMES,
-  });
-  assertExactOrdinaryRecord(cached, PROTOTYPE_PROPERTY_NAMES);
-  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
-    assert.equal(cached[gene], fresh[gene]);
-  }
-
-  const exported = layer.exportSessionCache();
-  assert.equal(
-    exported.length,
-    PROTOTYPE_PROPERTY_NAMES.length ** 2,
-  );
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
-});
-
 test('all public DataLayer page records preserve prototype-named page identities', async t => {
   const createLayer = () => {
     const layer = bareDataLayer();
@@ -746,7 +446,6 @@ test('sequential observation loading publishes the same raw field contract', asy
     pageIds: ['page-1'],
     obsFields: ['score'],
     subsetPages: false,
-    includeCategoricalValues: false,
   });
 
   assert.equal(result.stats.fieldsLoaded, 1);
@@ -775,7 +474,6 @@ test('sequential DataLayer analysis preserves prototype-named fields and categor
       pageIds: ['page-1'],
       obsFields: PROTOTYPE_PROPERTY_NAMES,
       subsetPages: false,
-      includeCategoricalValues: false,
     });
     assert.equal(result.stats.fieldsLoaded, PROTOTYPE_PROPERTY_NAMES.length);
     assertExactOrdinaryRecord(result.fields, PROTOTYPE_PROPERTY_NAMES);
@@ -820,7 +518,6 @@ test('raw categorical publication rejects an invalid selected code', async () =>
       pageIds: ['page-1'],
       obsFields: ['cell_type'],
       subsetPages: false,
-      includeCategoricalValues: false,
     }),
     /category code 1.*cell_type.*outside 1 categor/i,
   );

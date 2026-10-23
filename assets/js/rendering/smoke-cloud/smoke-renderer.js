@@ -4,6 +4,7 @@
 // Provides a clean API for volumetric cloud visualization
 
 import { requireCleanWebGLState } from '../gl-errors.js';
+import { deleteGlObject, deleteProgramReleasingUse, deleteTextureTracked, restorableTexture } from '../gl-utils.js';
 import {
   SMOKE_COMPOSITE_FS,
   SMOKE_COMPOSITE_VS,
@@ -103,7 +104,7 @@ function releaseNoiseTextures(
   owned.delete(undefined);
   for (const texture of owned) {
     try {
-      gl.deleteTexture(texture);
+      deleteTextureTracked(gl, texture);
     } catch (error) {
       pendingTextureDeletes?.add(texture);
       failures.push(asError(
@@ -140,6 +141,53 @@ function requireVector3(value, owner) {
   return value;
 }
 
+/**
+ * What a GPU density build read: the positions (published arrays are never
+ * written), the parameters, and copies of the arrays a caller may rewrite in
+ * place (colours, visibility, outlier quantiles), with the volume it made.
+ */
+export function captureSmokeInputs(positions, options, textureInfo, summary) {
+  const visibility = options.visibility ?? null;
+  return {
+    positions,
+    dimension: options.dimension,
+    gridSize: options.gridSize,
+    gamma: options.gamma,
+    colors: options.colors.slice(),
+    alpha: visibility === null ? null : visibility.alpha.slice(),
+    outlierQuantiles: visibility?.outlierQuantiles?.slice() ?? null,
+    outlierThreshold: visibility?.outlierThreshold ?? null,
+    textureInfo,
+    summary,
+  };
+}
+
+function sameBytes(a, b) {
+  if (a === null || b === null) return a === b;
+  if (a.constructor !== b.constructor || a.length !== b.length) return false;
+  const left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+  const right = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+/** Whether a build of `positions` and `options` would read exactly what `built` read. */
+export function sameSmokeInputs(built, positions, options) {
+  const visibility = options.visibility ?? null;
+  return (
+    built.positions === positions
+    && built.dimension === options.dimension
+    && built.gridSize === options.gridSize
+    && Object.is(built.gamma, options.gamma)
+    && Object.is(built.outlierThreshold, visibility?.outlierThreshold ?? null)
+    && sameBytes(built.colors, options.colors ?? null)
+    && sameBytes(built.alpha, visibility?.alpha ?? null)
+    && sameBytes(built.outlierQuantiles, visibility?.outlierQuantiles ?? null)
+  );
+}
+
 export class SmokeRenderer {
   constructor(gl, createProgram) {
     if (!gl || typeof gl !== 'object') {
@@ -165,6 +213,7 @@ export class SmokeRenderer {
 
     // === STATE ===
     this.textureInfo = null;
+    this._builtInputs = null;
     // Lighting and occupancy volumes derived from textureInfo for one light
     // direction (buildDerivedVolumesGPU); rebuilt lazily when either changes.
     this.derivedVolumes = null;
@@ -410,7 +459,7 @@ export class SmokeRenderer {
         if (!program) continue;
         attempt(
           failures,
-          () => gl.deleteProgram(program),
+          () => deleteProgramReleasingUse(gl, program),
           'SmokeRenderer program rollback failed with a non-Error value.'
         );
       }
@@ -500,7 +549,7 @@ export class SmokeRenderer {
     const failures = [];
     for (const resource of pending) {
       try {
-        this.gl[deleteMethod](resource);
+        deleteGlObject(this.gl, deleteMethod, resource);
         pending.delete(resource);
       } catch (error) {
         if (typeof this.gl[inspectionMethod] === 'function') {
@@ -690,6 +739,7 @@ export class SmokeRenderer {
     const nextTextureInfo = createDensityTexture3D(gl, volumeDesc);
     const previousTexture = this.textureInfo?.texture ?? null;
     this.textureInfo = nextTextureInfo;
+    this._builtInputs = null;
     this._retireDerivedVolumes();
     this.volumeMin.set(boundsMin);
     this.volumeMax.set(boundsMax);
@@ -707,6 +757,7 @@ export class SmokeRenderer {
     this._convergePendingDirectResources('Smoke volume clearing');
     const previousTexture = this.textureInfo?.texture ?? null;
     this.textureInfo = null;
+    this._builtInputs = null;
     this._retireDerivedVolumes();
     if (previousTexture) {
       this._pendingTextureDeletes.add(previousTexture);
@@ -721,6 +772,18 @@ export class SmokeRenderer {
     this._convergePendingDirectResources(
       'GPU smoke density publication'
     );
+    // A rebuild asked for inputs identical to the volume shown (a filter that
+    // moved no cell, a repeated publication) would write the same volume:
+    // it is answered without GPU work.
+    const built = this._builtInputs ?? null;
+    if (
+      built !== null
+      && built.textureInfo === this.textureInfo
+      && sameSmokeInputs(built, positions, options)
+    ) {
+      return built.summary;
+    }
+    this._builtInputs = null;
     const gl = this.gl;
     // A device that cannot run smoke is refused before any work or progress
     // notification; its owner reports the human reason.
@@ -876,6 +939,7 @@ export class SmokeRenderer {
         `[SmokeRenderer] Created 3D density texture (${candidate.gridSize}³)`
       );
     }
+    this._builtInputs = captureSmokeInputs(positions, options, this.textureInfo, summary);
     return summary;
   }
 
@@ -908,6 +972,7 @@ export class SmokeRenderer {
     this._noiseGenerationTransaction = null;
     const transactionInvalidated = noiseTransaction?.invalidate() ?? false;
     this.textureInfo = null;
+    this._builtInputs = null;
     this.derivedVolumes = null;
     this._derivedVolumesSource = null;
     this._derivedVolumesDirection = null;
@@ -1248,7 +1313,7 @@ export class SmokeRenderer {
     );
     attempt(
       failures,
-      () => gl.bindTexture(gl.TEXTURE_2D, targetTextureBinding),
+      () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(targetTextureBinding)),
       'Smoke target-texture restoration failed with a non-Error value.'
     );
     attempt(
@@ -1287,7 +1352,7 @@ export class SmokeRenderer {
       );
       attempt(
         failures,
-        () => gl.bindTexture(gl.TEXTURE_2D, previousTextureBinding),
+        () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousTextureBinding)),
         'Smoke target-texture rollback failed with a non-Error value.'
       );
       if (candidateFramebuffer) {
@@ -1768,6 +1833,7 @@ export class SmokeRenderer {
     // Detach the complete live publication before the first fallible GL
     // operation. The pending sets remain the authoritative exact owners.
     this.textureInfo = null;
+    this._builtInputs = null;
     this.derivedVolumes = null;
     this._derivedVolumesSource = null;
     this._derivedVolumesDirection = null;

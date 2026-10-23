@@ -15,6 +15,7 @@ import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 import { createField } from '../../../ui/components/controls.js';
 import { createDomId } from '../../../ui/components/dom-id.js';
+import { createWindowedListbox } from '../../../ui/components/windowed-listbox.js';
 import { formatCells } from '../../../ui/components/display-format.js';
 
 // =============================================================================
@@ -132,8 +133,6 @@ export function createGeneExpressionSelector(options = {}) {
   input.className = 'obs-select';
   input.placeholder = 'None';
   input.autocomplete = 'off';
-  input.setAttribute('role', 'combobox');
-  input.setAttribute('aria-autocomplete', 'list');
   input.setAttribute('aria-expanded', 'false');
   input.setAttribute('aria-controls', `${id}-dropdown`);
   if (!label) input.setAttribute('aria-label', 'Gene expression');
@@ -142,15 +141,37 @@ export function createGeneExpressionSelector(options = {}) {
   const dropdown = document.createElement('div');
   dropdown.id = `${id}-dropdown`;
   dropdown.className = 'dropdown-list';
-  dropdown.setAttribute('role', 'listbox');
   dropdown.setAttribute('aria-label', 'Gene expression options');
   dropdown.hidden = true;
 
   let currentSelectedGene = selectedValue;
-  /** Index into `optionElements` that Enter would commit, or -1. */
-  let activeIndex = -1;
-  /** @type {HTMLElement[]} */
-  let optionElements = [];
+
+  /**
+   * One windowed combobox list (ui/components/windowed-listbox.js): entry 0
+   * is None, then every gene that matches the search, in gene order. The
+   * chosen gene (None when there is none) is marked `selected`.
+   */
+  /** @type {Object[]} Matches of the current search, in gene order. */
+  let matches = [];
+
+  const entryKey = index => (index === 0 ? '' : matches[index - 1].key);
+
+  const geneList = createWindowedListbox({
+    input,
+    listbox: dropdown,
+    idPrefix: `${id}-option`,
+    buildOption: index => {
+      const item = document.createElement('div');
+      item.className = index === 0 ? 'dropdown-item text-tertiary' : 'dropdown-item';
+      if (entryKey(index) === currentSelectedGene) item.classList.add('selected');
+      item.dataset.optionKey = entryKey(index);
+      item.textContent = index === 0 ? 'None' : matches[index - 1].key;
+      return item;
+    },
+    onActive: index => {
+      if (genePrefetch !== null && index > 0) genePrefetch.intend(entryKey(index));
+    },
+  });
 
   const updateSelectedDisplay = () => {
     if (currentSelectedGene) {
@@ -163,37 +184,6 @@ export function createGeneExpressionSelector(options = {}) {
   };
 
   const isOpen = () => !dropdown.hidden;
-
-  /**
-   * Mark one option active. Scrolling it into view forces a layout, so it is
-   * done only for keyboard navigation, or once, a frame after the list was
-   * (re)built, never right after the options were appended.
-   */
-  let scrollFrame = null;
-  const setActiveIndex = (nextIndex, { scroll = true } = {}) => {
-    activeIndex = nextIndex;
-    optionElements.forEach((element, index) => {
-      const active = index === activeIndex;
-      element.classList.toggle('selected', active);
-      element.setAttribute('aria-selected', active ? 'true' : 'false');
-    });
-    if (activeIndex < 0) {
-      input.removeAttribute('aria-activedescendant');
-      return;
-    }
-    const active = optionElements[activeIndex];
-    input.setAttribute('aria-activedescendant', active.id);
-    intendOption(active);
-    if (scroll) {
-      active.scrollIntoView({ block: 'nearest' });
-      return;
-    }
-    if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
-    scrollFrame = requestAnimationFrame(() => {
-      scrollFrame = null;
-      if (active.isConnected) active.scrollIntoView({ block: 'nearest' });
-    });
-  };
 
   const commit = (gene) => {
     // A prefetch of this gene is the load its choice joins; any other is no
@@ -208,17 +198,40 @@ export function createGeneExpressionSelector(options = {}) {
   function closeDropdown() {
     dropdown.hidden = true;
     input.setAttribute('aria-expanded', 'false');
-    input.removeAttribute('aria-activedescendant');
-    activeIndex = -1;
+    geneList.setActive(-1);
   }
 
-  // Every opening shows a list just built: it starts at its top. Left where
-  // an earlier, longer list was scrolled, it would be clamped to its own end
-  // and build its next page before anyone scrolled.
+  /**
+   * Open the list for the search in the input (every gene while the input
+   * shows the chosen one), with the chosen gene active wherever it is listed,
+   * None otherwise.
+   */
   const openDropdown = () => {
     dropdown.hidden = false;
-    dropdown.scrollTop = 0;
     input.setAttribute('aria-expanded', 'true');
+    const filter = input.value;
+    const lowerFilter = filter.toLowerCase();
+    const isShowingSelection = currentSelectedGene && input.value === currentSelectedGene;
+    matches = isShowingSelection
+      ? genes
+      : genes.filter(g => g.key.toLowerCase().includes(lowerFilter));
+
+    if (matches.length === 0 && filter) {
+      const empty = document.createElement('div');
+      empty.className = 'dropdown-no-results';
+      empty.textContent = 'No matches.';
+      empty.setAttribute('role', 'option');
+      empty.setAttribute('aria-disabled', 'true');
+      empty.setAttribute('aria-selected', 'false');
+      geneList.showMessage(empty);
+      return;
+    }
+
+    geneList.reset(matches.length + 1);
+    const currentIndex = currentSelectedGene
+      ? matches.findIndex(match => match.key === currentSelectedGene)
+      : -1;
+    geneList.setActive(currentIndex >= 0 ? currentIndex + 1 : 0);
   };
 
   dropdown.addEventListener('pointerover', (e) => {
@@ -238,99 +251,15 @@ export function createGeneExpressionSelector(options = {}) {
     commit(item.dataset.optionKey);
   });
 
-  /**
-   * Every gene that matches the search is listed. The options are built a page
-   * at a time — the first page when the list opens, the next when it is
-   * scrolled or arrowed to its end — so a search matching tens of thousands of
-   * genes costs a hundred list items to open, not tens of thousands.
-   */
-  const OPTION_PAGE = 100;
-  /** @type {Object[]} Matches of the current search, in gene order. */
-  let matches = [];
-  let renderedMatches = 0;
-
-  const addOption = (parent, key, text, extraClass) => {
-    const item = document.createElement('div');
-    item.className = `dropdown-item${extraClass ? ` ${extraClass}` : ''}`;
-    item.id = `${id}-option-${optionElements.length}`;
-    item.setAttribute('role', 'option');
-    item.setAttribute('aria-selected', 'false');
-    item.dataset.optionKey = key;
-    item.textContent = text;
-    parent.appendChild(item);
-    optionElements.push(item);
-    return item;
-  };
-
-  /** Append the next page of matches (or up to `through`, a match index). */
-  const renderMoreMatches = (through = renderedMatches + OPTION_PAGE - 1) => {
-    const end = Math.min(matches.length, Math.max(through + 1, renderedMatches));
-    if (end <= renderedMatches) return false;
-    const fragment = document.createDocumentFragment();
-    for (let i = renderedMatches; i < end; i++) {
-      addOption(fragment, matches[i].key, matches[i].key);
-    }
-    renderedMatches = end;
-    dropdown.appendChild(fragment);
-    return true;
-  };
-
-  const renderOptions = (filter = '') => {
-    optionElements = [];
-    activeIndex = -1;
-    // Options are built off-document and inserted in one step.
-    const fragment = document.createDocumentFragment();
-
-    // "None" clears the selection.
-    addOption(fragment, '', 'None', 'text-tertiary');
-
-    const lowerFilter = filter.toLowerCase();
-    // Don't filter if the input shows the current selection
-    const isShowingSelection = currentSelectedGene && input.value === currentSelectedGene;
-    matches = isShowingSelection
-      ? genes
-      : genes.filter(g => g.key.toLowerCase().includes(lowerFilter));
-    renderedMatches = 0;
-
-    if (matches.length === 0 && filter) {
-      const empty = document.createElement('div');
-      empty.className = 'dropdown-no-results';
-      empty.textContent = 'No matches.';
-      empty.setAttribute('role', 'option');
-      empty.setAttribute('aria-disabled', 'true');
-      empty.setAttribute('aria-selected', 'false');
-      fragment.appendChild(empty);
-      dropdown.replaceChildren(fragment);
-      return;
-    }
-
-    dropdown.replaceChildren(fragment);
-    // One page to open with, whatever the match count; the current gene is
-    // marked when it is on it.
-    renderMoreMatches();
-    const currentIndex = optionElements.findIndex(
-      item => item.dataset.optionKey === currentSelectedGene
-    );
-    setActiveIndex(currentIndex >= 0 ? currentIndex : 0, { scroll: false });
-  };
-
-  dropdown.addEventListener('scroll', () => {
-    if (dropdown.scrollTop + dropdown.clientHeight >= dropdown.scrollHeight - 2 * (optionElements[0]?.offsetHeight || 24)) {
-      renderMoreMatches();
-    }
-  });
-
   input.addEventListener('focus', () => {
     // Clear input to allow searching, but remember selection
     if (currentSelectedGene) {
       input.value = '';
     }
-    renderOptions('');
     openDropdown();
   });
 
   input.addEventListener('input', () => {
-    renderOptions(input.value);
     openDropdown();
   });
 
@@ -343,41 +272,12 @@ export function createGeneExpressionSelector(options = {}) {
       return;
     }
     if (event.key === 'Enter') {
-      if (!isOpen() || activeIndex < 0) return;
+      if (!isOpen() || geneList.getActiveIndex() < 0) return;
       event.preventDefault();
-      commit(optionElements[activeIndex].dataset.optionKey);
+      commit(entryKey(geneList.getActiveIndex()));
       return;
     }
-    if (
-      event.key !== 'ArrowDown' &&
-      event.key !== 'ArrowUp' &&
-      event.key !== 'Home' &&
-      event.key !== 'End'
-    ) {
-      return;
-    }
-    event.preventDefault();
-    if (!isOpen()) {
-      renderOptions(input.value);
-      openDropdown();
-      return;
-    }
-    if (optionElements.length === 0) return;
-    // Moving past the last option built, or to the end, builds the rest of
-    // the way first: every match is reachable from the keyboard.
-    if (event.key === 'End' || (event.key === 'ArrowUp' && activeIndex <= 0)) {
-      renderMoreMatches(matches.length - 1);
-    } else if (event.key === 'ArrowDown' && activeIndex >= optionElements.length - 1) {
-      renderMoreMatches();
-    }
-    const last = optionElements.length - 1;
-    if (event.key === 'Home') setActiveIndex(0);
-    else if (event.key === 'End') setActiveIndex(last);
-    else if (event.key === 'ArrowDown') {
-      setActiveIndex(activeIndex >= last ? 0 : activeIndex + 1);
-    } else {
-      setActiveIndex(activeIndex <= 0 ? last : activeIndex - 1);
-    }
+    geneList.handleKeydown(event, { isOpen, open: openDropdown });
   });
 
   input.addEventListener('blur', () => {

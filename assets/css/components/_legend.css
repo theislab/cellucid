@@ -373,3 +373,35 @@
   gap: var(--space-1-5);
   margin-top: var(--space-1);
 }
+
+/* ------------------------------------------------------------------------
+   Outlier filter: what it can do for the active field, and its progress
+   (ui/modules/outlier-filter-control.js)
+   --------------------------------------------------------------------- */
+
+#outlier-filter-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+#outlier-filter-container[hidden] {
+  display: none;
+}
+
+.outlier-filter-note {
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: 1.4;
+  color: var(--color-text-secondary);
+}
+
+.outlier-filter-note[data-tone="error"] {
+  color: var(--color-danger-text);
+}
+
+/* The bar under the slider while the outlier distances are got is the job
+   progress bar every cancellable job shows (components/_jobs.css). */
+.outlier-filter-action {
+  align-self: flex-start;
+}

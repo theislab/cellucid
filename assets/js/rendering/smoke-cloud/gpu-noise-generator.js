@@ -10,6 +10,7 @@
 // Orders of magnitude faster than CPU/Web Worker generation
 
 import { contextLostError, requireCleanWebGLState } from '../gl-errors.js';
+import { deleteGlObject, deleteProgramReleasingUse, restorableTexture } from '../gl-utils.js';
 import {
   MAX_SMOKE_NOISE_RESOLUTION,
   MIN_SMOKE_NOISE_RESOLUTION,
@@ -21,15 +22,15 @@ import {
   BLUE_NOISE_FS
 } from '../shaders/noise-shaders.js';
 
-function asError(value, fallbackMessage) {
-  return value instanceof Error ? value : new Error(fallbackMessage);
+function asError(value, defaultMessage) {
+  return value instanceof Error ? value : new Error(defaultMessage);
 }
 
-function attempt(failures, operation, fallbackMessage) {
+function attempt(failures, operation, defaultMessage) {
   try {
     operation();
   } catch (error) {
-    failures.push(asError(error, fallbackMessage));
+    failures.push(asError(error, defaultMessage));
   }
 }
 
@@ -134,12 +135,12 @@ function restoreGenerationState(gl, state, failures) {
   );
   attempt(
     failures,
-    () => gl.bindTexture(gl.TEXTURE_2D, state.texture2D),
+    () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(state.texture2D)),
     'GPU noise 2D-texture restoration failed with a non-Error value.'
   );
   attempt(
     failures,
-    () => gl.bindTexture(gl.TEXTURE_3D, state.texture3D),
+    () => gl.bindTexture(gl.TEXTURE_3D, restorableTexture(state.texture3D)),
     'GPU noise 3D-texture restoration failed with a non-Error value.'
   );
   attempt(
@@ -282,7 +283,7 @@ export class GPUNoiseGenerator {
 
     for (const program of this._pendingProgramDeletes) {
       try {
-        gl.deleteProgram(program);
+        deleteProgramReleasingUse(gl, program);
         this._pendingProgramDeletes.delete(program);
       } catch (error) {
         failures.push(asError(
@@ -495,7 +496,7 @@ function retireNoiseResource(
   owner
 ) {
   try {
-    gl[deleteMethod](resource);
+    deleteGlObject(gl, deleteMethod, resource);
     return;
   } catch (error) {
     if (typeof gl[inspectionMethod] === 'function') {

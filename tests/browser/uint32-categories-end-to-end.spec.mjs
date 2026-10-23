@@ -6,63 +6,34 @@
  * 65,536) lands one category on another and fails an exact assertion:
  * alpha sits at 65,536 (which truncates onto gamma at 0) and beta at 69,999.
  */
-import { cp, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
-const fixtureDirectory = path.join(
+// `scripts/generate-browser-catalog-fixtures.py`: the current-ui cells, whose
+// cell_type cycles alpha, beta, gamma, with a 70,000-category inventory.
+const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
-  'exports',
-  'current-ui-prepared',
+  'uint32-categories.h5ad',
 );
 
-const CATEGORY_COUNT = 70_000;
 const UINT32_MISSING = 4_294_967_295;
-/** Where each fixture label (alpha, beta, gamma) moves in the inventory. */
+/** Where each label sits in the inventory. */
 const PLACEMENT = Object.freeze({ alpha: 65_536, beta: 69_999, gamma: 0 });
 const GESTURE_LANDING_TIMEOUT_MS = 3_000;
 
-async function writeExport(directory) {
-  await cp(fixtureDirectory, directory, { recursive: true });
-  const identityPath = path.join(directory, 'dataset_identity.json');
-  const manifestPath = path.join(directory, 'obs_manifest.json');
-  const identity = JSON.parse(await readFile(identityPath, 'utf8'));
-  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-  identity.export_settings.obs_categorical_dtype = 'uint32';
-  identity.name = 'uint32 end to end';
-  const expectedCodes = {};
-  for (const field of manifest._categoricalFields) {
-    const [index, key, categories] = field;
-    const oldPath = path.join(directory, 'obs', `${index}.codes.u8`);
-    const oldCodes = await readFile(oldPath);
-    const inventory = Array.from(
-      { length: CATEGORY_COUNT },
-      (_, slot) => `zz-${String(slot).padStart(6, '0')}`,
-    );
-    for (const label of categories) inventory[PLACEMENT[label]] = label;
-    const codes = new Uint32Array(oldCodes.length);
-    for (let cell = 0; cell < oldCodes.length; cell++) {
-      codes[cell] = oldCodes[cell] === 255
-        ? UINT32_MISSING
-        : PLACEMENT[categories[oldCodes[cell]]];
-    }
-    await rm(oldPath);
-    await writeFile(path.join(directory, 'obs', `${index}.codes.u32`), Buffer.from(codes.buffer));
-    field[2] = inventory;
-    field[3] = 'uint32';
-    field[4] = UINT32_MISSING;
-    identity.obs_fields.find(entry => entry.key === key).n_categories = inventory.length;
-    expectedCodes[key] = Array.from(codes);
-  }
-  await writeFile(identityPath, JSON.stringify(identity, null, 2));
-  await writeFile(manifestPath, JSON.stringify(manifest));
-  return expectedCodes;
+/** The fixture's codes: the first five gamma cells are missing. */
+function fixtureCodes() {
+  const labels = ['alpha', 'beta', 'gamma'];
+  return Array.from({ length: 120 }, (_, cell) => {
+    const label = labels[cell % 3];
+    return label === 'gamma' && cell < 15 ? UINT32_MISSING : PLACEMENT[label];
+  });
 }
 
 function observeProductErrors(page) {
@@ -74,16 +45,16 @@ function observeProductErrors(page) {
   return errors;
 }
 
-async function openExport(page, directory) {
+async function openFixture(page) {
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=browser-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=browser-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
-  await chooseDirectory(page.locator('#user-data-file-input'), directory);
-  await expect(page.locator('#dataset-name')).toHaveText('uint32 end to end');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await expect(page.locator('#dataset-name')).toHaveText('uint32 categories');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
 }
 
@@ -190,9 +161,7 @@ function highlightedCells(page) {
 
 test('codes above 65,535 keep their category through colour, filter, selection, views, export and sessions', async ({ page }, testInfo) => {
   test.setTimeout(300_000);
-  const directory = testInfo.outputPath('current-ui-prepared');
-  const expected = await writeExport(directory);
-  const codes = expected.cell_type;
+  const codes = fixtureCodes();
   const cellsOf = label => codes.flatMap((code, cell) => (code === PLACEMENT[label] ? [cell] : []));
   const alphaCells = cellsOf('alpha');
   const betaCells = cellsOf('beta');
@@ -200,7 +169,7 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   expect(betaCells).toHaveLength(40);
   const errors = observeProductErrors(page);
 
-  await openExport(page, directory);
+  await openFixture(page);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-items-container.legend-items-virtual')).toBeVisible();
 
@@ -267,7 +236,7 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   const sessionPath = testInfo.outputPath('uint32.cellucid-session');
   await (await sessionDownload).saveAs(sessionPath);
 
-  await openExport(page, directory);
+  await openFixture(page);
   const chooserPromise = page.waitForEvent('filechooser');
   await page.locator('#load-state-btn').click();
   await (await chooserPromise).setFiles(sessionPath);

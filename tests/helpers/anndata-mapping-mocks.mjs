@@ -5,6 +5,8 @@
  * in-memory `obsm` arrays.
  */
 
+import { EmbeddingPayloads } from '../../assets/js/data/embedding-payload.js';
+
 /**
  * One dense numeric `obsm` probe.
  *
@@ -107,4 +109,28 @@ export function obsmColumnReader(arrays) {
     if (array === undefined) throw new Error(`obsm['${key}'] does not exist in this file`);
     return selectColumns(array.data, array.width, columns);
   };
+}
+
+/**
+ * A test loader that reads `obsm` columns (`readObsmColumns`), given the
+ * embedding and vector payload methods the adapter calls -- the reader's
+ * own (`EmbeddingPayloads`, as the AnnData reader makes them), over the
+ * loader's `readObsmColumns` as it is when each read runs.
+ *
+ * @template T
+ * @param {T & {readObsmColumns: Function}} loader
+ * @returns {T}
+ */
+export function withObsmPayloads(loader) {
+  const payloads = new EmbeddingPayloads((key, columns, options) => loader.readObsmColumns(key, columns, options));
+  loader.readEmbedding = (key, columns, normalize, options = {}) =>
+    payloads.embedding(key, [...columns], normalize, options);
+  loader.readVectorField = (key, columns, embedding, normalize, options = {}) =>
+    payloads.vectors(key, [...columns], { key: embedding.key, columns: [...embedding.columns] }, normalize, options);
+  const clearCache = loader.clearCache;
+  loader.clearCache = function clearCacheAndPayloads(...args) {
+    payloads.clear();
+    return clearCache?.apply(this, args);
+  };
+  return loader;
 }

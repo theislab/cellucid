@@ -553,7 +553,7 @@ test('figure-export UI exposes its stable idempotent cleanup owner', async () =>
     /const destroy = \(\) => \{\s*if \(cleanupComplete\) return;/
   );
   assert.match(source, /container\.__cellucidCleanup = destroy;/);
-  assert.match(source, /return \{ setCellsPresent, destroy \};\s*\n\}/);
+  assert.match(source, /return \{ setCellsPresent, destroy, exportSessionSettings, importSessionSettings \};\s*\n\}/);
 });
 
 test('figure-export Export is offered only while the runtime has cells', async () => {

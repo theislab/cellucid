@@ -25,6 +25,7 @@ import {
   createDatasetFieldLoadSupersededError
 } from './loading.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
+import { requireFields } from './overlay-internals.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -91,13 +92,7 @@ function requireInventory(owner, source, { allowAbsent = false } = {}) {
     : owner.obsData;
   if (allowAbsent && data === null) return [];
   requireRecord(data, `${source} field data`);
-  if (!Array.isArray(data.fields)) {
-    throw new TypeError(`${source} field inventory must be an array`);
-  }
-  data.fields.forEach((field, index) => {
-    requireField(field, `${source} field inventory[${index}]`);
-  });
-  return data.fields;
+  return requireFields(data.fields, `${source} field inventory`);
 }
 
 function requireFieldAt(owner, source, fieldIndex) {
@@ -295,6 +290,8 @@ export class FieldOverlayPublicMethods {
     const varFields = this.varData === null
       ? null
       : requireInventory(this, FieldSource.VAR);
+    // Each inventory reads only the fields edited since it last showed the
+    // registries (overlay-internals.js).
     this._applyOverlaysToFields(obsFields, FieldSource.OBS);
     this._applyOverlaysToFields(varFields, FieldSource.VAR);
     this._injectUserDefinedFields();
@@ -370,7 +367,8 @@ export class FieldOverlayPublicMethods {
 
     this._propagateRenameToViewContexts(src, field);
     this._refreshHighlightGroupsForField(src, fieldIndex);
-    getFieldRegistry().invalidate();
+    // The field registry indexes fields by their original keys, which a
+    // rename keeps: it stays valid.
     this.updateFilterSummary();
     this._syncActiveContext();
     this._refreshInactiveViewLabels();
@@ -514,7 +512,9 @@ export class FieldOverlayPublicMethods {
     }
 
     getFieldRegistry().invalidate();
-    if (!wasActive) this.computeGlobalVisibility();
+    // Every obs field's filter takes part in which cells are shown; a gene's
+    // only while it colours the view, and clearing it has recomputed them.
+    if (!wasActive && src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { originalKey });
     return true;
@@ -645,7 +645,9 @@ export class FieldOverlayPublicMethods {
     }
 
     getFieldRegistry().invalidate();
-    this.computeGlobalVisibility();
+    // A restored gene colours no view, so only an obs field's filter can
+    // change which cells are shown.
+    if (src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.RESTORE, {
       originalKey,

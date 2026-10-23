@@ -16,6 +16,7 @@ import { getFiniteMinMax, isFiniteNumber } from '../../shared/number-utils.js';
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { POINT_LAYER } from '../point-layer.js';
 
 /**
  * Precomputed, columnar volcano-plot data for a single DE result set.
@@ -687,6 +688,9 @@ function buildVolcanoFigure(deResults, options, viewport) {
     text: safeGenes,
     customdata: selectedPValues,
     meta: { cellucid: 'volcano', version: 3 },
+    // One image of every gene's marker instead of one SVG path per gene
+    // (point-layer.js); hover reads the same points.
+    _cellucidPointLayer: POINT_LAYER,
     marker: {
       // Encode categories as numeric codes to avoid allocating large color-string arrays.
       color: codes,

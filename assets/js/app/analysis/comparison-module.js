@@ -909,15 +909,6 @@ export class ComparisonModule {
   }
 
   /**
-   * Fetch bulk gene expression data with progress
-   * @param {Object} options - { pageIds, geneList, forceReload, onProgress }
-   * @returns {Promise<Object>}
-   */
-  async fetchBulkGeneExpression(options) {
-    return this.dataLayer.fetchBulkGeneExpression(options);
-  }
-
-  /**
    * Get cache statistics from enhanced data layer
    * @returns {Object}
    */
@@ -1167,6 +1158,108 @@ export class ComparisonModule {
    */
   getUIManager() {
     return this._uiManager;
+  }
+
+  // ===========================================================================
+  // Session state (docked analysis panel)
+  // ===========================================================================
+
+  /**
+   * The docked mode whose row is open, or null when every row is closed.
+   * @returns {string|null}
+   * @private
+   */
+  _getOpenMode() {
+    if (!this._modeToggleContainer) return null;
+    for (const item of this._modeToggleContainer.querySelectorAll('.analysis-mode')) {
+      if (isModeItemOpen(item)) return item.dataset.mode;
+    }
+    return null;
+  }
+
+  /**
+   * The docked analysis panel for a session: which mode row is open, and for
+   * every mode created so far its settings (`ui.exportSettings()`) and result
+   * (`ui.exportResult()`: null, or `{kind, version, payload}` of JSON values
+   * and typed arrays; see shared/analysis-result-session.js). A mode never
+   * opened holds its defaults and is left out.
+   *
+   * @returns {{openMode: string|null, modes: Object<string, {settings: Object, result: null|Object}>}}
+   */
+  exportSessionState() {
+    const uiManager = this._uiManager;
+    if (!uiManager) throw new Error('The analysis panel is not initialized');
+    const modes = {};
+    for (const { id } of uiManager.getAllTypes()) {
+      if (!uiManager.isInitialized(id)) continue;
+      const ui = uiManager.getUI(id);
+      setOwnDataProperty(modes, id, {
+        settings: ui.exportSettings(),
+        result: ui.exportResult()
+      });
+    }
+    const openMode = this._getOpenMode();
+    if (openMode !== null && !Object.hasOwn(modes, openMode)) {
+      throw new Error(`The open analysis mode "${openMode}" has no initialized panel`);
+    }
+    return { openMode, modes };
+  }
+
+  /**
+   * Restore `exportSessionState()` output: open the saved mode row the way a
+   * click does (or close the open one), then for each mode apply its
+   * settings and then its result. The value is checked whole before anything
+   * changes; a mode's own settings and result are checked by its UI, and the
+   * first refusal is thrown.
+   *
+   * @param {{openMode: string|null, modes: Object<string, {settings: Object, result: null|Object}>}} state
+   * @returns {Promise<void>}
+   */
+  async importSessionState(state) {
+    const uiManager = this._uiManager;
+    if (!uiManager) throw new Error('The analysis panel is not initialized');
+    const isRecord = value => (
+      value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+    );
+    const exactKeys = (value, keys) => (
+      isRecord(value) && Object.keys(value).sort().join('\u0000') === [...keys].sort().join('\u0000')
+    );
+    if (!exactKeys(state, ['openMode', 'modes'])) {
+      throw new TypeError('Analysis session state must hold exactly openMode and modes');
+    }
+    if (!isRecord(state.modes)) {
+      throw new TypeError('Analysis session modes must be an object');
+    }
+    for (const [modeId, mode] of Object.entries(state.modes)) {
+      if (uiManager.getTypeInfo(modeId) === null) {
+        throw new Error(`Analysis session names an unknown mode "${modeId}"`);
+      }
+      if (!exactKeys(mode, ['settings', 'result'])) {
+        throw new TypeError(`Analysis session mode "${modeId}" must hold exactly settings and result`);
+      }
+      if (!isRecord(mode.settings)) {
+        throw new TypeError(`Analysis session mode "${modeId}" settings must be an object`);
+      }
+      if (mode.result !== null && !isRecord(mode.result)) {
+        throw new TypeError(`Analysis session mode "${modeId}" result must be null or an object`);
+      }
+    }
+    const { openMode } = state;
+    if (openMode !== null && !Object.hasOwn(state.modes, openMode)) {
+      throw new TypeError('Analysis session openMode must be null or one of its modes');
+    }
+
+    const currentOpenMode = this._getOpenMode();
+    if (openMode !== currentOpenMode) {
+      // _setAnalysisMode toggles: naming the open row closes it.
+      this._setAnalysisMode(openMode ?? currentOpenMode);
+    }
+    for (const [modeId, mode] of Object.entries(state.modes)) {
+      const ui = uiManager.getUI(modeId);
+      ui.importSettings(structuredClone(mode.settings));
+      await ui.importResult(mode.result);
+    }
   }
 }
 

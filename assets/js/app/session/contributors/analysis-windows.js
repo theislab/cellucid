@@ -15,6 +15,8 @@ import {
   getSessionRestoreSnapshot
 } from '../session-context.js';
 
+import { decodeTypedJson, encodeTypedJson } from '../codecs/typed-json.js';
+
 export const id = 'analysis-windows';
 
 function isPlainObject(value) {
@@ -68,17 +70,18 @@ export function capture(ctx) {
       'analysisWindowManager.exportSessionWindows() must return an array'
     );
   }
-  const windows = structuredClone(exportedWindows);
+  // Settings are JSON; a window's result columns are typed arrays, stored
+  // as their bytes (codecs/typed-json.js).
   return [
     {
       id: 'analysis/windows',
       contributorId: id,
       priority: 'eager',
-      kind: 'json',
+      kind: 'binary',
       codec: 'gzip',
       label: 'Analysis windows',
       datasetDependent: true,
-      payload: { windows }
+      payload: encodeTypedJson({ windows: exportedWindows })
     }
   ];
 }
@@ -101,7 +104,10 @@ export async function restore(ctx, _chunkMeta, payload) {
     ctx,
     ['closeAll', 'createFromSessionDescriptor']
   );
-  const windows = requireRestorePayload(payload);
+  if (!(payload instanceof Uint8Array)) {
+    throw new TypeError('Analysis-window payload must be typed JSON bytes.');
+  }
+  const windows = requireRestorePayload(decodeTypedJson(payload));
   const restoreTransaction = ctx?.restoreTransaction;
   if (
     restoreTransaction === null
@@ -119,9 +125,9 @@ export async function restore(ctx, _chunkMeta, payload) {
     ctx,
     'analysis/windows'
   );
-  const previousWindows = sharedSnapshot === undefined
-    ? requireRestorePayload(capture(ctx)[0].payload)
-    : requireRestorePayload(structuredClone(sharedSnapshot));
+  const previousWindows = requireRestorePayload(decodeTypedJson(
+    sharedSnapshot === undefined ? capture(ctx)[0].payload : sharedSnapshot
+  ));
   // Window settings name highlight pages and analysis caches that later
   // chunks stage and publish only at commit, so the windows reopen in the
   // transaction's presentation stage, after every state participant has

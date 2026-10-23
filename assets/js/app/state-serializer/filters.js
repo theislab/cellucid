@@ -11,6 +11,7 @@
  */
 
 import { getCategoryColor } from '../../data/palettes.js';
+import { getNotificationCenter } from '../notification-center.js';
 import { makeFieldId } from '../utils/field-constants.js';
 import {
   assertArray,
@@ -31,8 +32,8 @@ import {
 
 const COLOR_EPSILON = 1e-4;
 const RANGE_EPSILON = 1e-6;
-// The outlier filter lives with categorical fields: the prepared export writes
-// latent outlier quantiles only for categoricals, and the filter manager
+// The outlier filter lives with categorical fields: latent outlier quantiles
+// are computed only for categoricals, and the filter manager
 // refuses an outlier filter on any other field kind.
 const CATEGORY_KEYS = [
   'kind',
@@ -293,7 +294,7 @@ function serializeCategoryFilter(field) {
       assertRgb(color, `Category color "${field.key}"[${categoryIndex}]`);
       // The palette default is a function of position, so "changed" is measured
       // against the position the colour is currently at. Only the change itself
-      // is carried across a re-export, and it is carried by name.
+      // is carried across a rewritten file, and it is carried by name.
       if (!colorsEqual(color, getCategoryColor(categoryIndex))) {
         colors.push({
           categoryName: categoryNameAt(
@@ -403,14 +404,41 @@ function serializeContinuousFilter(field) {
   return changed ? entry : null;
 }
 
+/**
+ * Whether a field carries any filter or colour property at all. Most fields
+ * of a dataset with thousands of genes carry none, and are skipped without
+ * being serialized.
+ * @param {object} field
+ * @returns {boolean}
+ */
+export function hasFilterState(field) {
+  for (const property of RESET_FIELD_FILTER_PROPERTIES) {
+    if (field[property] !== undefined) return true;
+  }
+  return false;
+}
+
 export function serializeFiltersForFields(fields, source) {
   if (source !== 'obs' && source !== 'var') {
     throw new TypeError('Filter source must be exactly "obs" or "var".');
   }
-  assertFieldInventory(fields, `Current ${source} field inventory`);
+  assertArray(fields, `Current ${source} field inventory`);
   const filters = {};
-  for (const field of fields) {
-    if (field._isDeleted === true) continue;
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (field === null || typeof field !== 'object') {
+      throw new TypeError(`Current ${source} field inventory entry ${index} must be an object.`);
+    }
+    // Thousands of gene fields carry no filter state; only the ones that do
+    // are checked and written.
+    if (field._isDeleted === true || !hasFilterState(field)) continue;
+    const key = assertNonEmptyString(field.key, `Current ${source} field inventory entry ${index} key`);
+    if (field.kind !== 'category' && field.kind !== 'continuous') {
+      throw new TypeError(`Current ${source} field inventory field "${key}" has unsupported kind.`);
+    }
+    if (Object.hasOwn(filters, makeFieldId(source, key))) {
+      throw new TypeError(`Current ${source} field inventory contains duplicate key "${key}".`);
+    }
     const entry = field.kind === 'category'
       ? serializeCategoryFilter(field)
       : serializeContinuousFilter(field);
@@ -456,10 +484,13 @@ function validateCategoryEntry(entry, field, fieldId) {
   }
   assertArray(entry.visibility, `Category filter "${fieldId}" visibility`);
   assertArray(entry.colors, `Category filter "${fieldId}" colors`);
-  if (!Array.isArray(field.categories)) {
+  // A field whose categories are found when it is first loaded (a direct
+  // AnnData string column) is checked here by shape and names; its names
+  // are resolved to positions once the restore has loaded it.
+  if (field.categories !== null && !Array.isArray(field.categories)) {
     throw new TypeError(`Current category field "${fieldId}" requires a category inventory.`);
   }
-  const positions = indexCategoryPositions(field.categories);
+  const positions = field.categories === null ? null : indexCategoryPositions(field.categories);
 
   const visibilityIndices = new Set();
   const resolvedVisibility = [];
@@ -473,12 +504,14 @@ function validateCategoryEntry(entry, field, fieldId) {
       change.categoryName,
       `Category filter "${fieldId}" visibility categoryName`
     );
-    const categoryIndex = resolveCategoryIndex(
-      field,
-      positions,
-      change.categoryName,
-      `Category filter "${fieldId}" visibility change`
-    );
+    const categoryIndex = positions === null
+      ? change.categoryName
+      : resolveCategoryIndex(
+        field,
+        positions,
+        change.categoryName,
+        `Category filter "${fieldId}" visibility change`
+      );
     if (visibilityIndices.has(categoryIndex)) {
       throw new TypeError(`Category filter "${fieldId}" repeats a visibility category.`);
     }
@@ -501,12 +534,14 @@ function validateCategoryEntry(entry, field, fieldId) {
       change.categoryName,
       `Category filter "${fieldId}" color categoryName`
     );
-    const categoryIndex = resolveCategoryIndex(
-      field,
-      positions,
-      change.categoryName,
-      `Category filter "${fieldId}" color change`
-    );
+    const categoryIndex = positions === null
+      ? change.categoryName
+      : resolveCategoryIndex(
+        field,
+        positions,
+        change.categoryName,
+        `Category filter "${fieldId}" color change`
+      );
     if (colorIndices.has(categoryIndex)) {
       throw new TypeError(`Category filter "${fieldId}" repeats a color category.`);
     }
@@ -525,6 +560,7 @@ function validateCategoryEntry(entry, field, fieldId) {
   ) {
     throw new TypeError(`Category filter "${fieldId}" must contain an explicit change.`);
   }
+  if (positions === null) return null;
   return { visibility: resolvedVisibility, colors: resolvedColors };
 }
 
@@ -554,11 +590,18 @@ function validateContinuousEntry(entry, fieldId) {
   }
 }
 
-export function validateFiltersForState(state, filters) {
+/**
+ * The current obs and var field inventories with a key index for each, read
+ * once. Validating several views' filters against one inventory reads and
+ * indexes thousands of gene fields once instead of once per view.
+ *
+ * @param {object} state
+ * @returns {{obsFields: object[], varFields: object[], obsLookup: Map<string, number>, varLookup: Map<string, number>}}
+ */
+export function readFieldInventory(state) {
   if (state === null || typeof state !== 'object') {
     throw new TypeError('Filter validation requires the current DataState owner.');
   }
-  assertPlainRecord(filters, 'Session filters');
   requireMethod(state, 'getFields', 'Filter validation owner');
   requireMethod(state, 'getVarFields', 'Filter validation owner');
   const obsFields = assertFieldInventory(
@@ -569,8 +612,17 @@ export function validateFiltersForState(state, filters) {
     state.getVarFields(),
     'Current var field inventory'
   );
-  const obsLookup = new Map(obsFields.map((field, index) => [field.key, index]));
-  const varLookup = new Map(varFields.map((field, index) => [field.key, index]));
+  return {
+    obsFields,
+    varFields,
+    obsLookup: new Map(obsFields.map((field, index) => [field.key, index])),
+    varLookup: new Map(varFields.map((field, index) => [field.key, index]))
+  };
+}
+
+export function validateFiltersForState(state, filters, inventory = readFieldInventory(state)) {
+  assertPlainRecord(filters, 'Session filters');
+  const { obsFields, varFields, obsLookup, varLookup } = inventory;
   const actions = [];
 
   for (const [fieldId, entry] of Object.entries(filters)) {
@@ -593,7 +645,7 @@ export function validateFiltersForState(state, filters) {
         `Filter "${fieldId}" kind does not match current field kind "${field.kind}".`
       );
     }
-    actions.push({ source, fieldIndex, field, entry, resolved });
+    actions.push({ source, fieldIndex, fieldId, field, entry, resolved });
   }
   return actions;
 }
@@ -634,17 +686,47 @@ export function createFilterSerializer({ state }) {
       signal.addEventListener('abort', forwardCallerAbort, { once: true });
       if (signal.aborted) forwardCallerAbort();
     }
+    // Outlier thresholds whose quantiles could not be got: the rest of the
+    // session is restored, and these are named, never dropped silently.
+    const unrestoredOutliers = new Map();
     let loadOutcomes;
     try {
       loadOutcomes = await Promise.allSettled(actions.map(async ({
         source,
-        fieldIndex
+        fieldIndex,
+        entry
       }) => {
         try {
           if (source === 'obs') {
             await state.ensureFieldLoaded(fieldIndex, {
               signal: loadController.signal
             });
+            // A saved outlier threshold filters at once: the field's
+            // quantiles, got on the filter's first use, are got now (read
+            // from the file, or computed with progress and Cancel).
+            if (
+              entry.kind === 'category'
+              && entry.outlierThreshold !== null
+              && entry.outlierThreshold < 0.9999
+            ) {
+              requireMethod(state, 'ensureOutlierQuantiles', 'Outlier filter restore owner');
+              try {
+                const quantiles = await state.ensureOutlierQuantiles(fieldIndex, {
+                  signal: loadController.signal
+                });
+                if (quantiles === null) {
+                  unrestoredOutliers.set(fieldIndex, 'no latent space is chosen to measure outliers in');
+                }
+              } catch (error) {
+                if (loadController.signal.aborted) throw error;
+                unrestoredOutliers.set(
+                  fieldIndex,
+                  error?.name === 'AbortError'
+                    ? 'computing its outlier quantiles was cancelled'
+                    : (error?.message ?? String(error))
+                );
+              }
+            }
           } else {
             await state.ensureVarFieldLoaded(fieldIndex, {
               signal: loadController.signal
@@ -695,6 +777,13 @@ export function createFilterSerializer({ state }) {
           'superseded by a replacement inventory.'
         );
       }
+      if (action.entry.kind === 'category' && action.resolved === null) {
+        // Loaded now: its categories are known, and the saved names resolve.
+        action.resolved = validateCategoryEntry(action.entry, action.field, action.fieldId);
+        if (action.resolved === null) {
+          throw new Error(`Filter field "${action.fieldId}" loaded without its categories.`);
+        }
+      }
     }
 
     if (actions.some(action => action.entry.kind === 'category')) {
@@ -716,7 +805,7 @@ export function createFilterSerializer({ state }) {
         }
       }
 
-      for (const { field, entry, resolved } of actions) {
+      for (const { field, fieldIndex, source, entry, resolved } of actions) {
         throwIfAborted(signal);
         if (entry.kind === 'category') {
           // Positions resolved from the saved names, never the saved positions.
@@ -743,7 +832,7 @@ export function createFilterSerializer({ state }) {
           if (entry.outlierFilterEnabled !== null) {
             field._outlierFilterEnabled = entry.outlierFilterEnabled;
           }
-          if (entry.outlierThreshold !== null) {
+          if (entry.outlierThreshold !== null && !(source === 'obs' && unrestoredOutliers.has(fieldIndex))) {
             field._outlierThreshold = entry.outlierThreshold;
           }
           continue;
@@ -773,7 +862,21 @@ export function createFilterSerializer({ state }) {
       state.endBatch();
     }
 
-    return { restored: actions.length };
+    const outliersNotRestored = actions
+      .filter(({ source, fieldIndex }) => source === 'obs' && unrestoredOutliers.has(fieldIndex))
+      .map(({ field, fieldIndex, entry }) => ({
+        fieldKey: field.key,
+        threshold: entry.outlierThreshold,
+        reason: unrestoredOutliers.get(fieldIndex),
+      }));
+    for (const { fieldKey, threshold, reason } of outliersNotRestored) {
+      getNotificationCenter().warning(
+        `The outlier filter of "${fieldKey}" (${Math.round(threshold * 100)}%) was not restored: ${reason}. ` +
+        'Move its outlier slider to apply it again.',
+        { category: 'session', duration: 0 }
+      );
+    }
+    return { restored: actions.length, outliersNotRestored };
   }
 
   return {

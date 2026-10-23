@@ -1,10 +1,12 @@
 /**
  * Latent-space outlier quantiles (`data/latent-outliers.js`) are the numbers
- * `cellucid-python` computes, bit for bit:
+ * numpy computes by the stated rule, bit for bit:
  * - read from a real `.h5ad` and Zarr ZIP through the browser adapter's
  *   mapping route, every usable `obsm` array as the latent space and every
- *   categorical obs field gives the bytes `cellucid serve` sends
- *   (`data-mapping-full.expected.json`, written from cellucid itself);
+ *   categorical obs field gives the reference bytes
+ *   (`data-mapping-full.expected.json`, computed by
+ *   `scripts/generate-data-mapping-fixtures.py` with the rule of
+ *   `scripts/generate-latent-outlier-conformance.py`);
  * - a latent space with a NaN is refused in the server's words;
  * - the stated rule holds on a hand-checked case: ties share the larger rank,
  *   missing codes and small categories are NaN.
@@ -28,13 +30,14 @@ import {
 import {
   computeLatentOutlierQuantiles,
   LatentOutlierQuantiles,
+  storedQuantilesDefect,
 } from '../assets/js/data/latent-outliers.js';
 import { LatentOutlierReader } from '../assets/js/data/latent-outliers-stream.js';
 
-// The fixture cellucid-python writes and cellucid-r keeps byte for byte, under
-// the same pin (scripts/generate_latent_outlier_conformance.py).
+// Cases whose quantiles numpy computes independently of the browser
+// (scripts/generate-latent-outlier-conformance.py, which `--check`s this file).
 const CONFORMANCE_BYTES = await readFile(new URL('./fixtures/latent-outlier-conformance.json', import.meta.url));
-const CONFORMANCE_SHA256 = '46ea30291fc2d1fc51fc2021837eb8914062f8080b6ad51995cacaa1875b9d80';
+const CONFORMANCE_SHA256 = '99f6a92dc25d0e1e783793bc0bd9e84ab5b2046d550e91a440661e5bb1945fdd';
 
 const EXPECTED = JSON.parse(
   await readFile(new URL('./browser/fixtures/data-mapping-full.expected.json', import.meta.url), 'utf8')
@@ -78,7 +81,7 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
   test(`${format}: outlier quantiles in every latent space equal the server's bytes`, async t => {
     const adapter = await open(t, format);
     const obsm = adapter.getMappingCandidates().obsm.map(item => item.key);
-    const fields = adapter.getObsManifest()._categoricalFields.map(([index, key]) => [key, index]);
+    const fields = adapter.getObsFields().fields.filter(field => field.kind === 'category').map(field => [field.key, field.fieldIndex]);
     assert.deepEqual(fields.map(([key]) => key).sort(), ['batch', 'cell_type']);
     let compared = 0;
     for (const [key, expected] of Object.entries(EXPECTED.latent)) {
@@ -150,21 +153,31 @@ test('streamed in row slabs, the quantiles are the in-memory bytes; a small late
   const values = new Float64Array(nCells * width);
   for (let i = 0; i < values.length; i++) values[i] = (random() - 0.5) * 9;
   const codes = Int32Array.from({ length: nCells }, () => Math.floor(random() * 7) - 1);
-  const field = { codes, nCategories: 6, minPoints: 20 };
-  const expected = computeLatentOutlierQuantiles({ latent: Float32Array.from(values), width, ...field });
+  const other = Uint8Array.from({ length: nCells }, () => Math.floor(random() * 3));
+  const minPoints = 20;
+  const field = { codes, nCategories: 6 };
+  const second = { codes: other, nCategories: 3 };
+  const latent = Float32Array.from(values);
+  const expected = computeLatentOutlierQuantiles({ latent, width, ...field, minPoints });
+  const expectedSecond = computeLatentOutlierQuantiles({ latent, width, ...second, minPoints });
 
-  // Above the budget: never held, read once per pass.
+  // Above the budget: never held, read once per pass -- both fields in the
+  // same two passes.
   const streamed = slabLoader(values, width, 333);
   const large = new LatentOutlierReader(streamed, { budgetBytes: nCells * width * 4 - 1 });
-  assert.equal(sha256(await large.quantiles('X_latent', width, field)), sha256(expected));
+  const [first, both] = await large.quantiles('X_latent', width, [field, second], minPoints);
+  assert.equal(sha256(first), sha256(expected));
+  assert.equal(sha256(both), sha256(expectedSecond));
   assert.equal(streamed.reads.count, 2);
   assert.equal(large.heldKey, null);
+  assert.equal(large.wouldHold(width), false);
 
   // Within the budget: read once, kept, and the next field reads nothing.
   const kept = slabLoader(values, width, 1_024);
   const small = new LatentOutlierReader(kept, { budgetBytes: nCells * width * 4 });
-  assert.equal(sha256(await small.quantiles('X_latent', width, field)), sha256(expected));
-  assert.equal(sha256(await small.quantiles('X_latent', width, field)), sha256(expected));
+  assert.equal(sha256((await small.quantiles('X_latent', width, [field], minPoints))[0]), sha256(expected));
+  assert.equal(small.holds('X_latent', width), true);
+  assert.equal(sha256((await small.quantiles('X_latent', width, [second], minPoints))[0]), sha256(expectedSecond));
   assert.equal(kept.reads.count, 1);
   assert.equal(small.heldKey, 'X_latent');
   small.clear();
@@ -177,14 +190,14 @@ test('a value past float32 is refused at its own cell, wherever its slab falls',
   values[27 * width + 1] = Number.NaN;
   const reader = new LatentOutlierReader(slabLoader(values, width, 8), { budgetBytes: 0 });
   await assert.rejects(
-    reader.quantiles('X_bad', width, { codes: new Int32Array(40), nCategories: 1, minPoints: 1 }),
+    reader.quantiles('X_bad', width, [{ codes: new Int32Array(40), nCategories: 1 }], 1),
     error => error instanceof MappingLoadError && error.key === 'X_bad' && error.reason === 'NaN at cell 27'
   );
   // No category scored: nothing is read.
   const untouched = slabLoader(values, width, 8);
-  const quantiles = await new LatentOutlierReader(untouched).quantiles('X_bad', width, {
-    codes: new Int32Array(40).fill(-1), nCategories: 1, minPoints: 1,
-  });
+  const [quantiles] = await new LatentOutlierReader(untouched).quantiles('X_bad', width, [{
+    codes: new Int32Array(40).fill(-1), nCategories: 1,
+  }], 1);
   assert.ok(quantiles.every(Number.isNaN));
   assert.equal(untouched.reads.count, 0);
 });
@@ -198,7 +211,7 @@ test('slabs must arrive in order and cover every cell once per pass', () => {
   assert.throws(() => outliers.finishCentroids(), /every cell once/);
 });
 
-test('the shared conformance cases give the bytes cellucid-python and cellucid-r give', () => {
+test('the conformance cases give the bytes numpy computes by the stated rule', () => {
   assert.equal(createHash('sha256').update(CONFORMANCE_BYTES).digest('hex'), CONFORMANCE_SHA256);
   const { cases } = JSON.parse(CONFORMANCE_BYTES.toString('utf8'));
   assert.equal(cases.length, 4);
@@ -213,6 +226,17 @@ test('the shared conformance cases give the bytes cellucid-python and cellucid-r
       minPoints: entry.minPoints,
     });
     assert.equal(Buffer.from(quantiles.buffer).toString('hex'), entry.quantilesHex, entry.name);
+    // Quantiles the rule gives always fit their field, as stored ones must.
+    assert.equal(storedQuantilesDefect(quantiles, entry.codes, entry.nCategories, entry.minPoints), null, entry.name);
+    // Two cells moved to the other category no longer do.
+    if (entry.nCategories > 1) {
+      const moved = Int32Array.from(entry.codes);
+      let changed = 0;
+      for (let cell = 0; cell < moved.length && changed < 2; cell++) {
+        if (moved[cell] === 0) { moved[cell] = 1; changed++; }
+      }
+      assert.notEqual(storedQuantilesDefect(quantiles, moved, entry.nCategories, entry.minPoints), null, entry.name);
+    }
   }
 });
 

@@ -51,7 +51,7 @@ troubleshooting are covered in the
 - Orbit, Planar, and Free Fly navigation with reproducible Camera Path animation
 - Community annotation, voting, and consensus with optional GitHub collaboration
 - Shareable session state plus publication-ready SVG and high-DPI PNG export
-- Direct H5AD and Zarr loading, prepared datasets, local or remote servers, Jupyter, Python, and R
+- Reads AnnData directly (`.h5ad`, Zarr folders, `.zarr.zip`) from local files, links, GitHub, servers and Jupyter; Cellucid-ready AnnData from the Python and R packages
 
 ## Links
 

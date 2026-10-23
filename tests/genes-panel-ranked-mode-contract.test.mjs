@@ -45,6 +45,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
+import { CancellableJob } from '../assets/js/app/jobs/cancellable-job.js';
+
+/** The job a run gets, without a notification center or read log. */
+function quietJob() {
+  return new CancellableJob({
+    title: 'Marker genes',
+    notifyAfterMs: Infinity,
+    notifications: {},
+    log: { subscribe: () => () => {} },
+  });
+}
 
 const GENES = ['STRONG', 'MIDDLE', 'WEAK'];
 
@@ -163,7 +174,7 @@ test(
       const ui = createUI();
       ui._controller = controllerFor(mode);
 
-      const output = await ui._runAnalysisImpl(formValues(mode), 1, null, null);
+      const output = await ui._runAnalysisImpl(formValues(mode), 1, quietJob());
 
       assert.equal(
         output.result.plotType,
@@ -185,7 +196,7 @@ test(
   async () => {
     const ui = createUI();
     ui._controller = controllerFor('ranked');
-    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, null, null);
+    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, quietJob());
 
     const csvExport = ui._buildModalCSVExport(result);
 
@@ -217,7 +228,7 @@ test(
   async () => {
     const ui = createUI();
     ui._controller = controllerFor('ranked');
-    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, null, null);
+    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, quietJob());
 
     const { csv } = ui._buildModalCSVExport(result);
 
@@ -244,7 +255,7 @@ test(
     // strings to match exactly, so both render through `encodeGroupName`.
     const ui = createUI();
     ui._controller = controllerFor('ranked');
-    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, null, null);
+    const { result } = await ui._runAnalysisImpl(formValues('ranked'), 1, quietJob());
 
     const rankedGroups = new Set(
       ui._serializeRankedMarkersCSV(result.markers.groups)
@@ -316,7 +327,7 @@ test(
     for (const mode of ['clustered', 'custom']) {
       const ui = createUI();
       ui._controller = controllerFor(mode);
-      const { result } = await ui._runAnalysisImpl(formValues(mode), 1, null, null);
+      const { result } = await ui._runAnalysisImpl(formValues(mode), 1, quietJob());
 
       const csvExport = ui._buildModalCSVExport(result);
 

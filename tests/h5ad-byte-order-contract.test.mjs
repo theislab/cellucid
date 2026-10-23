@@ -1,9 +1,9 @@
 /**
  * Byte-order contract for direct `.h5ad` reading.
  *
- * `classifyH5WasmDtype` matches the NumPy byte-order prefix and then discards
- * it, so `>f4` and `<f4` classify identically. That is only safe if the HDF5
- * reader underneath has already converted stored data to the host byte order.
+ * The array store (`formats/store.js`) records each array's stored byte order
+ * in its element type and always returns values in host order; the AnnData
+ * reader judges arrays by kind alone, so `>f4` and `<f4` read identically.
  * These tests pin that guarantee against real HDF5 files rather than assuming
  * it: `byte-order-big-endian.h5ad` and `byte-order-little-endian.h5ad` carry
  * identical values and differ only in the recorded datatype byte order, and
@@ -16,14 +16,20 @@
 
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { classifyH5WasmDtype } from '../assets/js/data/h5ad-loader.js';
+import { valueKind } from '../assets/js/data/anndata/elements.js';
+import { openHdf5 } from '../assets/js/formats/hdf5/index.js';
+import { storeDtype } from '../assets/js/formats/hdf5/datatype.js';
+import { bytesByteSource } from '../assets/js/formats/io/byte-source.js';
+import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
+import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
+import { storedObsm } from './helpers/stored-obsm.mjs';
 
 const BIG_ENDIAN_FIXTURE = fileURLToPath(
   new URL('./browser/fixtures/byte-order-big-endian.h5ad', import.meta.url)
@@ -152,7 +158,7 @@ async function readEverything(t, fixturePath) {
   for (const key of ['X_umap_2d', 'X_umap_3d']) {
     const nDims = Number(key.at(-2));
     const columns = Array.from({ length: nDims }, (_, column) => column);
-    const data = await loader.readObsmColumns(key, columns);
+    const data = await storedObsm(file, key, columns);
     embeddings[key] = {
       data: Array.from(data),
       shape: [data.length / nDims, nDims],
@@ -177,28 +183,31 @@ async function readEverything(t, fixturePath) {
   const edges = await source.getConnectivityEdges();
 
   // The renderer-facing surface: normalized positions, packed obs payloads,
-  // and the manifests built from them. These are what actually reach the GPU
-  // and the UI, so they are compared as raw bytes.
+  // and the field lists built from them. These are what actually reach the
+  // GPU and the UI, so they are compared as raw bytes.
+  const identityEmbeddings = source.getAdapter().getMetadata().embeddings;
+  const shown = dimension =>
+    identityEmbeddings.items[identityEmbeddings.defaults[`${dimension}d`]].path;
   const published = {
     embedding2d: Array.from(
-      await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+      (await source.getAdapter().getEmbeddingPayload(shown(2), 2)).positions
     ),
     embedding3d: Array.from(
-      await source.getAdapter().getEmbeddingPayload('embeddings/1_3d.bin', 3)
+      (await source.getAdapter().getEmbeddingPayload(shown(3), 3)).positions
     ),
     candidates: JSON.stringify(source.getAdapter().getMappingCandidates()),
     genes: {},
     obs: {},
-    obsManifest: JSON.stringify(source.getObsManifest()),
-    varManifest: JSON.stringify(await source.getVarManifest()),
-    connectivityManifest: JSON.stringify(await source.getConnectivityManifest()),
+    obsFields: JSON.stringify(source.getObsFields()),
+    geneList: JSON.stringify(await source.getGeneList()),
+    connectivitySummary: JSON.stringify(await source.getConnectivitySummary()),
   };
-  const varManifest = JSON.parse(published.varManifest);
+  const geneList = JSON.parse(published.geneList);
   for (const name of Object.keys(EXPECTED.genes)) {
-    const field = varManifest.fields.find(([, fieldName]) => fieldName === name);
-    assert.ok(field, `gene ${name} is in the var manifest`);
+    const field = geneList.fields.find(gene => gene.key === name);
+    assert.ok(field, `gene ${name} is in the gene list`);
     published.genes[name] = Array.from(
-      await source.getAdapter().getGeneValues(`var/${field[0]}.values.f32`)
+      await source.getAdapter().getGeneValues(field.path)
     );
   }
   for (const key of [...Object.keys(EXPECTED.obs), 'cell_type']) {
@@ -219,9 +228,9 @@ async function readEverything(t, fixturePath) {
       values: categorical.values,
     },
     edges: {
-      sources: Array.from(edges.sources),
-      destinations: Array.from(edges.destinations),
-      weights: Array.from(edges.weights),
+      sources: Array.from(edgeListOf(edges).sources),
+      destinations: Array.from(edgeListOf(edges).destinations),
+      ...edgeWeightsOf(edges),
       nCells: edges.nCells,
       nEdges: edges.nEdges,
       maxNeighbors: edges.maxNeighbors,
@@ -229,51 +238,46 @@ async function readEverything(t, fixturePath) {
   };
 }
 
-test('H5AD dtype classification is independent of the NumPy byte-order prefix', () => {
-  const byKind = {
-    float: ['e', 'f', 'd'],
-    int: ['b', 'h', 'i', 'q'],
-    uint: ['B', 'H', 'I', 'Q'],
-    string: ['S', 'U', 'O'],
-  };
+async function openFixture(fixturePath) {
+  const bytes = new Uint8Array(await readFile(fixturePath));
+  return openHdf5(createByteReader(bytesByteSource(bytes, { name: path.basename(fixturePath) })));
+}
 
-  for (const [kind, codes] of Object.entries(byKind)) {
-    for (const code of codes) {
-      const withoutPrefix = classifyH5WasmDtype(code);
-      assert.equal(
-        withoutPrefix,
-        kind,
-        `dtype '${code}' must classify as ${kind}`
-      );
-      for (const prefix of ['<', '>', '=', '|']) {
-        assert.equal(
-          classifyH5WasmDtype(`${prefix}${code}`),
-          kind,
-          `dtype '${prefix}${code}' must classify as ${kind}`
-        );
-        assert.equal(
-          classifyH5WasmDtype(`${prefix}${code}4`),
-          kind,
-          `dtype '${prefix}${code}4' must classify as ${kind}`
-        );
-      }
+const BYTE_ORDERED_ARRAYS = [
+  'X',
+  'obsm/X_umap_2d',
+  'obsm/X_umap_3d',
+  'obsp/connectivities/data',
+  'obsp/connectivities/indices',
+  'obs/score_f4',
+  'obs/score_f8',
+  'obs/count_i4',
+  'obs/count_u4',
+  'obs/count_i2',
+  'obs/count_u2',
+];
+
+test('the AnnData value kind of an array is independent of its stored byte order', async () => {
+  const big = await openFixture(BIG_ENDIAN_FIXTURE);
+  const little = await openFixture(LITTLE_ENDIAN_FIXTURE);
+  try {
+    for (const key of BYTE_ORDERED_ARRAYS) {
+      const bigArray = big.get(key);
+      const littleArray = little.get(key);
+      assert.equal(valueKind(bigArray), valueKind(littleArray), `${key} has one kind in both byte orders`);
+      assert.notEqual(valueKind(bigArray), 'unknown', `${key} is a value AnnData reads`);
+      assert.equal(bigArray.dtype.name, littleArray.dtype.name, `${key} has one element type in both byte orders`);
     }
+    assert.equal(valueKind(big.get('obs/score_f4')), 'float');
+    assert.equal(valueKind(big.get('obs/count_i2')), 'int');
+    assert.equal(valueKind(big.get('obs/count_u4')), 'uint');
+  } finally {
+    big.close();
+    little.close();
   }
-
-  // The prefix is discarded, never used to reject: a big-endian dtype is as
-  // readable as a little-endian one because h5wasm converts on read.
-  assert.equal(classifyH5WasmDtype('>f4'), classifyH5WasmDtype('<f4'));
-  assert.equal(classifyH5WasmDtype('>i8'), classifyH5WasmDtype('<i8'));
-  assert.equal(classifyH5WasmDtype('>I'), classifyH5WasmDtype('<I'));
-  assert.equal(classifyH5WasmDtype('?'), 'bool');
-  assert.equal(classifyH5WasmDtype('>x4'), 'unknown');
-  assert.equal(classifyH5WasmDtype(42), 'unknown');
 });
 
 test('the byte-order fixtures really do record opposite HDF5 byte orders', async () => {
-  const module = await import('../assets/external/hdf5_hl.js');
-  await module.ready;
-
   const bigEndianBytes = await readFile(BIG_ENDIAN_FIXTURE);
   const littleEndianBytes = await readFile(LITTLE_ENDIAN_FIXTURE);
   assert.notDeepEqual(
@@ -283,31 +287,25 @@ test('the byte-order fixtures really do record opposite HDF5 byte orders', async
   );
 
   const inspected = [];
-  for (const [label, bytes] of [
-    ['big', bigEndianBytes],
-    ['little', littleEndianBytes],
+  for (const [label, fixturePath] of [
+    ['big', BIG_ENDIAN_FIXTURE],
+    ['little', LITTLE_ENDIAN_FIXTURE],
   ]) {
-    const virtualPath = `/cellucid-byte-order-${label}.h5ad`;
-    module.FS.writeFile(virtualPath, new Uint8Array(bytes));
-    const file = new module.File(virtualPath, 'r');
+    const root = await openFixture(fixturePath);
     try {
       inspected.push({
         label,
-        X: file.get('X').metadata.littleEndian,
-        umap2d: file.get('obsm/X_umap_2d').metadata.littleEndian,
-        umap3d: file.get('obsm/X_umap_3d').metadata.littleEndian,
-        connectivityData:
-          file.get('obsp/connectivities/data').metadata.littleEndian,
-        connectivityIndices:
-          file.get('obsp/connectivities/indices').metadata.littleEndian,
-        connectivityShape:
-          file.get('obsp/connectivities').attrs.shape.metadata.littleEndian,
-        obsScore: file.get('obs/score_f8').metadata.littleEndian,
-        obsCount: file.get('obs/count_u4').metadata.littleEndian,
+        X: root.get('X').dtype.littleEndian,
+        umap2d: root.get('obsm/X_umap_2d').dtype.littleEndian,
+        umap3d: root.get('obsm/X_umap_3d').dtype.littleEndian,
+        connectivityData: root.get('obsp/connectivities/data').dtype.littleEndian,
+        connectivityIndices: root.get('obsp/connectivities/indices').dtype.littleEndian,
+        connectivityShape: root.get('obsp/connectivities').attributeType('shape').dtype.littleEndian,
+        obsScore: root.get('obs/score_f8').dtype.littleEndian,
+        obsCount: root.get('obs/count_u4').dtype.littleEndian,
       });
     } finally {
-      file.close();
-      module.FS.unlink(virtualPath);
+      root.close();
     }
   }
 
@@ -384,7 +382,8 @@ test('a big-endian .h5ad yields the same values as its little-endian twin', asyn
     EXPECTED.categorical.categories
   );
   assert.equal(little.categorical.ordered, EXPECTED.categorical.ordered);
-  assert.deepEqual(little.edges, EXPECTED.edges);
+  const { weights: expectedWeights, ...expectedEdges } = EXPECTED.edges;
+  assert.deepEqual(little.edges, { ...expectedEdges, ...edgeWeightsFrom(expectedWeights) });
   assert.deepEqual(
     { min: little.published.obs.count_u4.min, max: little.published.obs.count_u4.max },
     { min: 0, max: 4294967040 },
@@ -412,25 +411,28 @@ test('a big-endian .h5ad yields the same values as its little-endian twin', asyn
  * on that field. These two tests close the gap the fixtures leave open.
  */
 test(
-  'no h5ad reader accepts or rejects a value because of stored byte order',
+  'no AnnData reader accepts or rejects a value because of stored byte order',
   async () => {
-    const source = await readFile(
-      fileURLToPath(new URL('../assets/js/data/h5ad.js', import.meta.url)),
-      'utf8'
-    );
-    const conditions = source
-      .split('\n')
-      .map((line, index) => [index + 1, line])
-      .filter(([, line]) => (
-        /littleEndian/.test(line) &&
-        !/^\s*(\*|\/\/)/.test(line)
-      ));
+    const files = [
+      '../assets/js/data/h5ad.js',
+      '../assets/js/data/zarr.js',
+      ...(await readdir(fileURLToPath(new URL('../assets/js/data/anndata/', import.meta.url))))
+        .filter(name => name.endsWith('.js'))
+        .map(name => `../assets/js/data/anndata/${name}`),
+    ];
+    const conditions = [];
+    for (const file of files) {
+      const source = await readFile(fileURLToPath(new URL(file, import.meta.url)), 'utf8');
+      source.split('\n').forEach((line, index) => {
+        if (/littleEndian/.test(line) && !/^\s*(\*|\/\/)/.test(line)) conditions.push([file, index + 1, line]);
+      });
+    }
     assert.deepEqual(
       conditions,
       [],
-      'h5wasm converts to host order while reading, so `metadata.littleEndian` ' +
+      'the store converts to host order while reading, so `dtype.littleEndian` ' +
       'describes only the file. A reader that branches on it rejects a ' +
-      'readable dataset and reports it as a malformed value.'
+      'readable array and reports it as a malformed value.'
     );
   }
 );
@@ -438,52 +440,33 @@ test(
 test(
   'a big-endian boolean enum is still an exact HDF5 boolean',
   async () => {
-    const module = await import('../assets/external/hdf5_hl.js');
-    await module.ready;
-
     // The `ordered` attribute in both committed fixtures: an h5py boolean
-    // enum. Byte order is the only field that differs from the big-endian
-    // variant a big-endian writing host would produce.
-    const bytes = await readFile(BIG_ENDIAN_FIXTURE);
-    const virtualPath = '/cellucid-ordered-attribute.h5ad';
-    module.FS.writeFile(virtualPath, new Uint8Array(bytes));
-    const file = new module.File(virtualPath, 'r');
+    // enum, decoded by the store to a boolean.
+    const root = await openFixture(BIG_ENDIAN_FIXTURE);
     let ordered;
+    let orderedType;
     try {
-      // `Attribute.value` reads lazily through the open file, so it must be
-      // captured before the file is closed.
-      const attribute = file.get('obs/cell_type').attrs.ordered;
-      ordered = {
-        dtype: attribute.dtype,
-        shape: attribute.shape,
-        metadata: attribute.metadata,
-        value: attribute.value,
-      };
+      const cellType = root.get('obs/cell_type');
+      ordered = cellType.attrs.ordered;
+      orderedType = cellType.attributeType('ordered');
     } finally {
-      file.close();
-      module.FS.unlink(virtualPath);
+      root.close();
     }
+    assert.equal(ordered, false);
+    assert.equal(orderedType.dtype.kind, 'bool');
+    assert.equal(orderedType.dtype.bytes, 1);
+    assert.deepEqual(orderedType.shape, []);
 
-    // Everything that actually determines the value. `size: 1` is why byte
-    // order cannot participate: there is no second byte to order.
-    assert.equal(ordered.dtype, 'unknown');
-    assert.deepEqual(ordered.shape, []);
-    assert.equal(ordered.metadata.type, 8);
-    assert.equal(ordered.metadata.signed, true);
-    assert.equal(ordered.metadata.vlen, false);
-    assert.equal(ordered.metadata.size, 1);
-    assert.equal(ordered.metadata.total_size, 1);
-    assert.deepEqual(ordered.metadata.enum_type.members, { FALSE: 0, TRUE: 1 });
-    assert.equal(ordered.value === 0 || ordered.value === 1, true);
-
-    // The fixture-level gap this test exists to record: the committed
-    // big-endian file does not carry a big-endian `ordered` attribute, so the
-    // fixture comparison above cannot exercise this path.
-    assert.equal(
-      ordered.metadata.littleEndian,
-      true,
-      'if this ever becomes false the fixtures do cover the attribute and ' +
-      'this note should be removed'
-    );
+    // The fixtures' `ordered` attribute takes its base type from the writing
+    // host, so neither committed file carries a big-endian one. The datatype
+    // a big-endian host would write -- FALSE = 0, TRUE = 1 over a big-endian
+    // one-byte integer -- is the same boolean: `size: 1` is why byte order
+    // cannot participate, there is no second byte to order.
+    for (const littleEndian of [true, false]) {
+      const base = { class: 'fixed-point', size: 1, signed: true, littleEndian, bitOffset: 0, precision: 8 };
+      const dtype = storeDtype({ class: 'enum', size: 1, base, names: ['FALSE', 'TRUE'], values: [0, 1] });
+      assert.equal(dtype.kind, 'bool', `a ${littleEndian ? 'little' : 'big'}-endian boolean enum is a boolean`);
+      assert.equal(dtype.bytes, 1);
+    }
   }
 );

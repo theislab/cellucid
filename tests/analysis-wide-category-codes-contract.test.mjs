@@ -11,6 +11,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { categoryCounts, pageValueAt } from '../assets/js/app/analysis/shared/category-counts.js';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
@@ -65,24 +66,30 @@ test('page values label every uint32 code as its own category', async () => {
   const [page] = await layer._fetchDataForPages({
     type: 'categorical_obs', variableKey: 'wide', pageIds: ['P1'], silent: true,
   });
-  assert.deepEqual(countLabels(page.values), EXPECTED);
-  assert.equal(page.values.filter(value => value === null).length, 2);
+  assert.ok(page.values instanceof Uint32Array);
+  const labels = Array.from(page.values, (_, i) => pageValueAt(page, i));
+  assert.deepEqual(countLabels(labels), EXPECTED);
+  assert.equal(labels.filter(value => value === null).length, 2);
+  // The published counts are the same labels.
+  const published = new Map(categoryCounts(page.values));
+  published.delete(null);
+  assert.deepEqual(published, EXPECTED);
 });
 
 test('bulk observation fields keep the width of the field in every page', async () => {
   const layer = layerOver(wideField());
   const whole = await layer.fetchBulkObsFields({
-    pageIds: ['P1'], obsFields: ['wide'], subsetPages: false, includeCategoricalValues: false,
+    pageIds: ['P1'], obsFields: ['wide'], subsetPages: false,
   });
   assert.strictEqual(whole.fields.wide.codes, codes);
 
   const paged = await layer.fetchBulkObsFields({
-    pageIds: ['P1'], obsFields: ['wide'], subsetPages: true, includeCategoricalValues: true,
+    pageIds: ['P1'], obsFields: ['wide'], subsetPages: true,
   });
   const page = paged.fields.wide.P1;
   assert.ok(page.codes instanceof Uint32Array);
   assert.deepEqual([...page.codes], CELL_CODES);
-  assert.deepEqual(countLabels(page.values), EXPECTED);
+  assert.equal(page.values, undefined, 'pages publish codes only');
 });
 
 test('marker groups from a uint32 field carry the exact codes and cell counts', async () => {

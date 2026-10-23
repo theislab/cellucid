@@ -3,10 +3,10 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
-  decodeDeltaUvarint,
-} from '../assets/js/app/session/codecs/delta-varint.js';
+  decodeCellSet,
+} from '../assets/js/app/session/codecs/cell-set.js';
 import {
-  pushUvarint,
+  encodeUvarints,
 } from '../assets/js/app/session/codecs/varint.js';
 import {
   restore as restoreUserDefinedCodes,
@@ -27,7 +27,7 @@ function residentDimensionManager(pointCount) {
       layoutKey: 'X_umap_2d',
       dimension: 2,
       label: 'UMAP',
-      path: 'embeddings/0_2d.bin',
+      path: 'obsm/0/0-1',
       provenance: null,
       origin: 'identity',
     },
@@ -35,7 +35,7 @@ function residentDimensionManager(pointCount) {
       layoutKey: 'X_tsne_2d',
       dimension: 2,
       label: 'tSNE',
-      path: 'embeddings/1_2d.bin',
+      path: 'obsm/1/0-1',
       provenance: null,
       origin: 'identity',
     },
@@ -51,18 +51,12 @@ function residentDimensionManager(pointCount) {
   return manager;
 }
 
+/** A user-defined codes payload in the runs encoding (1). */
 function userCodesPayload({ length, pairs }) {
-  const header = [2];
-  pushUvarint(length, header);
-  pushUvarint(pairs.length, header);
-  const pairBytes = [];
-  for (const [value, run] of pairs) {
-    pushUvarint(value, pairBytes);
-    pushUvarint(run, pairBytes);
-  }
-  const payload = new Uint8Array(header.length + pairBytes.length);
-  payload.set(header, 0);
-  payload.set(pairBytes, header.length);
+  const body = encodeUvarints([length, pairs.length, ...pairs.flat()]);
+  const payload = new Uint8Array(1 + body.length);
+  payload[0] = 1;
+  payload.set(body, 1);
   return payload;
 }
 
@@ -125,14 +119,15 @@ function userCodesMetadata(payload) {
   };
 }
 
-test('large delta-uvarint decode yields so a scheduled cancellation wins', async () => {
+test('a large sorted-delta cell set yields so a scheduled cancellation wins', async () => {
   const count = 256 * 1024;
-  const countBytes = [];
-  pushUvarint(count, countBytes);
-  const payload = new Uint8Array(countBytes.length + count);
-  payload.set(countBytes, 0);
-  payload[countBytes.length] = 0;
-  payload.fill(1, countBytes.length + 1);
+  const header = encodeUvarints([count]);
+  // Encoding 0, the count, a first index of 0, then deltas of 1.
+  const payload = new Uint8Array(1 + header.length + count);
+  payload[0] = 0;
+  payload.set(header, 1);
+  payload[1 + header.length] = 0;
+  payload.fill(1, 2 + header.length);
 
   const controller = new AbortController();
   const cancellation = new Error('scheduled highlight cancellation');
@@ -143,9 +138,9 @@ test('large delta-uvarint decode yields so a scheduled cancellation wins', async
   }, 0);
   try {
     await assert.rejects(
-      decodeDeltaUvarint(payload, {
-        maxCount: count,
-        maxIndex: count - 1,
+      decodeCellSet(payload, {
+        cellCount: count,
+        reference: null,
         signal: controller.signal,
       }),
       error => error === cancellation,
@@ -156,7 +151,24 @@ test('large delta-uvarint decode yields so a scheduled cancellation wins', async
   assert.equal(abortFired, true);
 });
 
-test('one very large RLE run yields and never publishes partial codes on cancel', async () => {
+test('a large bitset cell set yields so a scheduled cancellation wins', async () => {
+  const cellCount = 8 * 1024 * 1024;
+  const payload = new Uint8Array(1 + cellCount / 8).fill(0xff);
+  payload[0] = 1;
+  const controller = new AbortController();
+  const cancellation = new Error('scheduled bitset cancellation');
+  const timer = setTimeout(() => controller.abort(cancellation), 0);
+  try {
+    await assert.rejects(
+      decodeCellSet(payload, { cellCount, reference: null, signal: controller.signal }),
+      error => error === cancellation,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+test('one very large code run yields and never publishes partial codes on cancel', async () => {
   const pointCount = 1024 * 1024;
   const payload = userCodesPayload({
     length: pointCount,
@@ -200,7 +212,7 @@ test('one very large RLE run yields and never publishes partial codes on cancel'
   assert.equal(template._normalizedLayouts.size, 0);
 });
 
-test('high-pair-count RLE decodes directly into its final typed array', async () => {
+test('a run-encoded payload with many runs decodes directly into its final typed array', async () => {
   const pointCount = 128 * 1024;
   const pairs = new Array(pointCount);
   for (let index = 0; index < pointCount; index++) {

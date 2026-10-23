@@ -50,8 +50,17 @@
   border-bottom: var(--border-width-1) solid var(--color-border-faint);
 }
 
-.dropdown-item:last-child {
+.dropdown-item:last-child,
+.dropdown-item:has(+ .dropdown-spacer:last-child) {
   border-bottom: none;
+}
+
+/* Stands for the entries of a windowed list that are not built
+   (ui/components/windowed-listbox.js). */
+.dropdown-spacer {
+  margin: 0;
+  padding: 0;
+  border: none;
 }
 
 .dropdown-item:hover,

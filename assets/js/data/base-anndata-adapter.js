@@ -5,35 +5,41 @@
  * Contains common logic for:
  * - Resolving which `obsm` embedding each dimension shows, and the
  *   data-mapping candidate catalog (`data-mapping-candidates.js`)
- * - Embedding reads, load-time checks and normalization, by embedding id
- * - Obs manifest generation
- * - Var manifest generation
+ * - Embedding and vector-field payloads (checked and normalized in the
+ *   reader worker), cached by embedding id and route
+ * - The obs field list and the gene lists the data loaders check
  * - Obs field data processing
  * - Connectivity edge extraction
  *
- * The loader (H5adLoader or ZarrLoader) provides `getDatasetMetadata()`, whose
- * `probes` describe the file from metadata alone, and `readObsmColumns(key,
- * columns)`, which reads the selected columns of one dense `obsm` array.
+ * The loader (an `AnnDataReaderClient`, which runs the AnnData reader of
+ * `anndata/reader.js` in its worker) provides `getDatasetMetadata()`, whose
+ * `probes` describe the file from metadata alone, `readEmbedding(key,
+ * columns, normalize)` and `readVectorField(key, columns, embedding,
+ * normalize)`, which answer display coordinates and vectors made from the
+ * selected columns of dense `obsm` arrays (`embedding-payload.js`).
  * Subclasses may override `_computeObsFieldsMetadata()`.
  */
 
 import {
   DataSourceError,
   DataSourceErrorCode,
-  embeddingPayloadPath,
+  explainedFailure,
   validateDatasetIdentity,
-  vectorPayloadPath,
 } from './data-source.js';
 import {
   DIMENSION_SLOTS,
-  VECTOR_KEY_PATTERN,
   canonicalEmbeddingId,
   compareCodePoints,
+  defaultColumns,
+  defaultEmbeddingSlots,
   describeObsmEntry,
   dimensionSlot,
   makeUniqueNames,
   nothingPlottableMessage,
   obsmEntryDefect,
+  slotDimension,
+  validateEmbeddingColumns,
+  vectorFieldKeys,
 } from './data-mapping.js';
 import {
   EmbeddingLoadError,
@@ -44,25 +50,25 @@ import {
   geneNamesRoute,
   parseMappingGenesPath,
   describeAnnDataProbes,
-  embeddingLoadDefect,
   obsmEntries,
   obsmWidth,
+  mappingEmbeddingPath,
+  mappingLatentOutlierPath,
   parseMappingEmbeddingPath,
   parseMappingLatentPath,
   parseMappingVectorPath,
   resolveVectorBinding,
   LATENT_OUTLIER_MIN_POINTS,
   latentCandidateReason,
-  valueLoadDefect,
   resolveCandidateRef,
   DEFAULT_KNN_KEY,
+  obsmIndexOf,
   requireObspKey,
   resolveEmbeddingSlotsAsync,
 } from './data-mapping-candidates.js';
-import {
-  CONNECTIVITY_MANIFEST_CONTEXT,
-  validateConnectivityManifest,
-} from './connectivity-manifest-contract.js';
+import { validateConnectivitySummary } from './connectivity-summary-contract.js';
+import { requireCellucidFileMetadata } from './anndata-cellucid-metadata.js';
+import { OutlierQuantileSource } from './outlier-quantile-source.js';
 import {
   getMetadataLoadSignal,
   throwIfMetadataAborted,
@@ -71,10 +77,16 @@ import {
 import {
   categoricalStorageForCount,
   categoricalStorageForDtype,
+  isCategoricalCodes,
   requireCategoricalCategoryCount,
 } from './categorical-storage-contract.js';
 
 import { residencyBudgetBytes } from './memory-budget.js';
+import { onAbort } from '../formats/io/abort.js';
+import { getReadActivityLog } from './read-activity-log.js';
+
+/** Each shared gene read's key, for a job that joins it to adopt it (`getGeneValues`). */
+let nextGeneReadKey = 1;
 
 const CONNECTIVITY_EDGE_LABEL = 'Direct AnnData connectivity edge loading';
 /** Bytes a JavaScript array slot takes, for an obs field held as an Array. */
@@ -209,7 +221,7 @@ class CoalescedCancellationOwner {
     }
 
     let counted = false;
-    const onAbort = () => {
+    const abandon = () => {
       if (counted) return;
       counted = true;
       this._abandoned++;
@@ -220,12 +232,157 @@ class CoalescedCancellationOwner {
         this._controller.abort();
       }
     };
-    callerSignal.addEventListener('abort', onAbort, { once: true });
-    if (callerSignal.aborted) onAbort();
-    return () => {
-      callerSignal.removeEventListener('abort', onAbort);
-    };
+    const stopWaiting = onAbort(callerSignal, abandon);
+    if (callerSignal.aborted) abandon();
+    return stopWaiting;
   }
+}
+
+/** The launch defaults an AnnData dataset may be opened with. */
+const LAUNCH_DEFAULT_KEYS = Object.freeze([
+  'embedding1d',
+  'embedding2d',
+  'embedding3d',
+  'knn',
+  'expression',
+  'geneIdColumn',
+  'latentKey',
+  'vectorFieldDefault',
+  'obsKeys',
+  'normalizeEmbeddings',
+  'centroidMinPoints',
+]);
+
+function describeLaunchValue(value) {
+  return typeof value === 'string' ? `'${value}'` : JSON.stringify(value) ?? String(value);
+}
+
+function formatKeyList(keys) {
+  return `[${keys.map(key => `'${key}'`).join(', ')}]`;
+}
+
+function requireLaunchKeyOrNull(value, name, what) {
+  if (value === null) return null;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`defaults.${name} must be null or one non-empty ${what}; got ${describeLaunchValue(value)}.`);
+  }
+  return value;
+}
+
+/**
+ * Check the launch defaults one AnnData dataset is opened with -- the
+ * choices `cellucid serve`, `serve_anndata` and `show_anndata` take on the
+ * command line or in Python -- before anything is read. Every key is
+ * optional, and a key that is absent keeps the automatic choice:
+ *
+ * - `embedding1d`, `embedding2d`, `embedding3d`: the `obsm` key shown in that
+ *   dimension slot (its first columns), or `{key, columns}` naming the
+ *   0-based columns (null columns: the first ones); null keeps the automatic
+ *   choice (`embedding_keys`).
+ * - `knn`: the `obsp` matrix shown as the neighbour graph; null shows none
+ *   (`knn_key`).
+ * - `expression`: the matrix genes are read from, `'X'`, `'raw/X'` or
+ *   `'layers/<name>'`; null keeps the automatic choice
+ *   (`expression_source`).
+ * - `geneIdColumn`: the column of the expression matrix's var axis whose
+ *   values name the genes; null names them by the index (`gene_id_column`).
+ * - `latentKey`: the `obsm` array outlier quantiles are computed in; null
+ *   computes none (`latent_key`).
+ * - `vectorFieldDefault`: the vector field id selected when several are
+ *   bound (`vector_field_default`).
+ * - `obsKeys`: the obs columns shown, in this order; null shows every one
+ *   (`obs_keys`).
+ * - `normalizeEmbeddings`: false shows embeddings at their own coordinates
+ *   (`normalize_embeddings`, default true).
+ * - `centroidMinPoints`: the fewest cells a category needs to get latent
+ *   outlier quantiles (`centroid_min_points`, default
+ *   `LATENT_OUTLIER_MIN_POINTS`).
+ *
+ * @param {unknown} value
+ * @returns {Readonly<Object>} The defaults given, checked
+ */
+export function requireAnnDataLaunchDefaults(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('AnnData launch defaults must be an object.');
+  }
+  const unknown = Object.keys(value).filter(key => !LAUNCH_DEFAULT_KEYS.includes(key));
+  if (unknown.length > 0) {
+    throw new RangeError(
+      `Unknown AnnData launch default${unknown.length === 1 ? '' : 's'} ${formatKeyList(unknown)}; ` +
+      `the defaults are ${formatKeyList(LAUNCH_DEFAULT_KEYS)}.`
+    );
+  }
+  const checked = {};
+  for (const slot of DIMENSION_SLOTS) {
+    const name = `embedding${slot}`;
+    if (!Object.hasOwn(value, name)) continue;
+    const spec = value[name];
+    if (spec === null) continue;
+    if (typeof spec === 'string' && spec.length > 0) {
+      checked[name] = Object.freeze({ key: spec, columns: null });
+    } else if (
+      spec !== null && typeof spec === 'object' && !Array.isArray(spec) &&
+      Object.keys(spec).sort().join(',') === 'columns,key' &&
+      typeof spec.key === 'string' && spec.key.length > 0 &&
+      (spec.columns === null || Array.isArray(spec.columns))
+    ) {
+      checked[name] = Object.freeze({
+        key: spec.key,
+        columns: spec.columns === null ? null : Object.freeze([...spec.columns]),
+      });
+    } else {
+      throw new TypeError(
+        `defaults.${name} must be null, an obsm key, or {key, columns}; got ${describeLaunchValue(spec)}.`
+      );
+    }
+  }
+  if (Object.hasOwn(value, 'knn')) checked.knn = requireLaunchKeyOrNull(value.knn, 'knn', 'obsp key');
+  if (Object.hasOwn(value, 'expression') && value.expression !== null) {
+    const expression = value.expression;
+    if (
+      typeof expression !== 'string' ||
+      !(expression === 'X' || expression === 'raw/X' ||
+        (expression.startsWith('layers/') && expression.length > 'layers/'.length && !expression.slice('layers/'.length).includes('/')))
+    ) {
+      throw new RangeError(
+        `defaults.expression must be 'X', 'raw/X', 'layers/<name>' or null; got ${describeLaunchValue(expression)}.`
+      );
+    }
+    checked.expression = expression;
+  }
+  if (Object.hasOwn(value, 'geneIdColumn')) {
+    checked.geneIdColumn = requireLaunchKeyOrNull(value.geneIdColumn, 'geneIdColumn', 'var column name');
+  }
+  if (Object.hasOwn(value, 'latentKey')) {
+    checked.latentKey = requireLaunchKeyOrNull(value.latentKey, 'latentKey', 'obsm key');
+  }
+  if (Object.hasOwn(value, 'vectorFieldDefault')) {
+    checked.vectorFieldDefault = requireLaunchKeyOrNull(value.vectorFieldDefault, 'vectorFieldDefault', 'vector field id');
+  }
+  if (Object.hasOwn(value, 'obsKeys') && value.obsKeys !== null) {
+    const keys = value.obsKeys;
+    if (!Array.isArray(keys) || keys.some(key => typeof key !== 'string' || key.length === 0)) {
+      throw new TypeError('defaults.obsKeys must be null or a list of obs column names.');
+    }
+    if (keys.length === 0) throw new RangeError('defaults.obsKeys must name at least one obs column.');
+    const repeated = keys.filter((key, index) => keys.indexOf(key) !== index);
+    if (repeated.length > 0) throw new RangeError(`defaults.obsKeys repeats ${formatKeyList([...new Set(repeated)])}.`);
+    checked.obsKeys = Object.freeze([...keys]);
+  }
+  if (Object.hasOwn(value, 'normalizeEmbeddings')) {
+    if (typeof value.normalizeEmbeddings !== 'boolean') {
+      throw new TypeError('defaults.normalizeEmbeddings must be true or false.');
+    }
+    checked.normalizeEmbeddings = value.normalizeEmbeddings;
+  }
+  if (Object.hasOwn(value, 'centroidMinPoints')) {
+    const minPoints = value.centroidMinPoints;
+    if (!Number.isSafeInteger(minPoints) || minPoints < 1) {
+      throw new RangeError('defaults.centroidMinPoints must be a positive integer.');
+    }
+    checked.centroidMinPoints = minPoints;
+  }
+  return Object.freeze(checked);
 }
 
 /**
@@ -234,13 +391,37 @@ class CoalescedCancellationOwner {
  */
 export class BaseAnnDataAdapter {
   /**
-   * @param {Object} loader - The underlying loader (H5adLoader or ZarrLoader)
+   * @param {Object} loader - The AnnData reader's API: an `AnnDataReaderClient`
+   *   in the app, the reader of `anndata/reader.js` itself in tests
    * @param {Object} [options]
    * @param {number} [options.cacheBudgetBytes] - Residency budget of the coordinate and obs caches
+   * @param {Object} [options.defaults] - Launch defaults (`requireAnnDataLaunchDefaults`)
    */
   constructor(loader, options = {}) {
     /** @protected */
     this._loader = loader;
+
+    /**
+     * The launch defaults the caller named (a server's): they override the
+     * file's own (`uns['cellucid']['defaults']`).
+     * @type {Readonly<Object>}
+     */
+    this._explicitDefaults = requireAnnDataLaunchDefaults(options.defaults ?? {});
+
+    /**
+     * The launch defaults this dataset opens with, once `initialize()` has
+     * read the file's own: the file's, then the caller's over them. An absent
+     * key keeps the automatic choice.
+     * @type {Readonly<Object>}
+     */
+    this._defaults = this._explicitDefaults;
+
+    /**
+     * What the file says about itself (`uns['cellucid']`), checked; set by
+     * `initialize()`.
+     * @type {Readonly<import('./anndata-cellucid-metadata.js').CellucidFileMetadata>|null}
+     */
+    this._fileMetadata = null;
 
     /** @type {Object|null} */
     this._metadata = null;
@@ -261,14 +442,6 @@ export class BaseAnnDataAdapter {
      * @type {ReadonlyArray<Object>|null}
      */
     this._describedObsm = null;
-
-    /**
-     * The embeddings of the published identity, in item order: their embedding
-     * id and `{key, columns}`. A payload path `embeddings/{i}_{d}d.bin` names
-     * item `i`.
-     * @type {ReadonlyArray<{id: string, dimension: number, ref: {key: string, columns: number[]}}>|null}
-     */
-    this._identityEmbeddings = null;
 
     /**
      * Vector fields: field id -> (bound embedding id -> obsm vector key).
@@ -293,8 +466,6 @@ export class BaseAnnDataAdapter {
     this._coordinateBufferRefs = new Map();
     this._coordinateCacheBytes = 0n;
     this._coordinateCachePins = new Map();
-    this._coordinateReservedOutputBytes = 0n;
-    this._coordinateReservationState = {};
 
     /** @type {Array|null} Obs field metadata (kind, categories, etc.) */
     this._obsFieldsMetadata = null;
@@ -306,17 +477,24 @@ export class BaseAnnDataAdapter {
     this._obsFieldDataCacheBytes = 0n;
 
     /**
-     * Extracted neighbour graphs by obsp key (null for an absent key): the
-     * default graph, and at most one other.
+     * The extracted neighbour graph asked for last, by obsp key (null for an
+     * absent key).
      * @type {Map<string, Object|null>}
      */
     this._connectivityCache = new Map();
 
-    /** @type {Readonly<Object>|undefined|null} Finalized direct manifest summary */
-    this._connectivityManifest = undefined;
+    /** @type {Readonly<Object>|undefined|null} The finalized summary of the graph the file opens with */
+    this._connectivitySummary = undefined;
 
-    /** @type {Map<string, Object>} Normalization info per embedding id */
-    this._normInfo = new Map();
+    /**
+     * The display transform and bounds of every embedding read, by
+     * embedding id (`EmbeddingPayload`, `embedding-payload.js`).
+     * @type {Map<string, {transform: Object, bounds: Object|null}>}
+     */
+    this._embeddingInfo = new Map();
+
+    /** @type {Map<string, number>} The largest vector of each cached vector field, by route */
+    this._vectorMagnitudes = new Map();
 
     /** @type {Map<string, Promise<Float32Array>>} */
     this._embeddingInFlight = new Map();
@@ -337,10 +515,17 @@ export class BaseAnnDataAdapter {
     this._latentOutlierInFlight = new Map();
 
     /**
+     * Where outlier quantiles come from (stored in the file or computed);
+     * set by `initialize()`.
+     * @type {OutlierQuantileSource|null}
+     */
+    this._outliers = null;
+
+    /**
      * Unique gene names by var axis and name source, read once.
      * @type {Map<string, Readonly<Object>>}
      */
-    this._geneNameSets = new Map();
+    this._geneNamesByRoute = new Map();
 
     /** @type {number} Invalidates results from asynchronous work after cache lifecycle changes */
     this._lifecycleGeneration = 0;
@@ -437,7 +622,7 @@ export class BaseAnnDataAdapter {
     }
 
     const release = entry.cancellation.join(callerSignal);
-    return entry.promise.then(
+    const settled = entry.promise.then(
       result => {
         release();
         return result;
@@ -447,6 +632,30 @@ export class BaseAnnDataAdapter {
         throw error;
       }
     );
+    if (callerSignal === null) return settled;
+    // The caller's own wait ends as soon as its signal aborts; the shared
+    // work ends once no caller waits for it.
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        settled.catch(() => {});
+        reject(callerSignal.reason ?? new DOMException('The read was cancelled.', 'AbortError'));
+      };
+      if (callerSignal.aborted) {
+        abort();
+        return;
+      }
+      const stopWaiting = onAbort(callerSignal, abort);
+      settled.then(
+        result => {
+          stopWaiting();
+          resolve(result);
+        },
+        error => {
+          stopWaiting();
+          reject(error);
+        }
+      );
+    });
   }
 
   /**
@@ -533,21 +742,6 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * @param {number} length
-   * @param {string} label
-   * @returns {bigint}
-   * @private
-   */
-  _checkedCoordinateResultBytes(length, label) {
-    const valueCount = Number(length);
-    if (!Number.isSafeInteger(valueCount) || valueCount < 0) {
-      throw new Error(`${label} has an invalid result length.`);
-    }
-    return BigInt(valueCount) *
-      BigInt(Float32Array.BYTES_PER_ELEMENT);
-  }
-
-  /**
    * @param {string} cacheKey
    * @param {Float32Array} [expected]
    * @returns {boolean}
@@ -608,9 +802,7 @@ export class BaseAnnDataAdapter {
     // The budget decides what is evicted, never what loads: coordinates in
     // use stay pinned, and an entry larger than the budget is still admitted.
     while (
-      this._coordinateCacheBytes +
-        this._coordinateReservedOutputBytes +
-        additionalBytes >
+      this._coordinateCacheBytes + additionalBytes >
       this._cacheBudgetBytes
     ) {
       let victimKey = null;
@@ -622,121 +814,6 @@ export class BaseAnnDataAdapter {
       }
       if (victimKey == null) return;
       this._deleteCoordinateCacheEntry(victimKey);
-    }
-  }
-
-  /**
-   * Register one loader-owned raw coordinate buffer and reserve the exact
-   * normalized Float32 output before normalization allocates it. Raw buffers
-   * that alias a retained or concurrent buffer share one reference-counted
-   * byte owner.
-   *
-   * @param {ArrayBufferView} raw
-   * @param {bigint} outputBytes
-   * @param {string} label
-   * @returns {Object}
-   * @private
-   */
-  _reserveCoordinateMaterialization(raw, outputBytes, label) {
-
-    const descriptor = this._describeCoordinateBuffer(raw);
-    let bufferRef =
-      this._coordinateBufferRefs.get(descriptor.identity);
-    if (bufferRef) {
-      bufferRef.references++;
-    } else {
-      bufferRef = {
-        bytes: descriptor.bytes,
-        references: 1
-      };
-      this._coordinateBufferRefs.set(
-        descriptor.identity,
-        bufferRef
-      );
-      this._coordinateCacheBytes += descriptor.bytes;
-    }
-
-    const reservation = {
-      active: true,
-      bufferIdentity: descriptor.identity,
-      bufferRef,
-      outputBytes,
-      outputReserved: false,
-      state: this._coordinateReservationState
-    };
-
-    try {
-      this._makeCoordinateCacheRoom(outputBytes);
-      this._coordinateReservedOutputBytes += outputBytes;
-      reservation.outputReserved = true;
-      return reservation;
-    } catch (error) {
-      this._releaseCoordinateMaterialization(reservation);
-      throw error;
-    }
-  }
-
-  /**
-   * Convert a planned output reservation into an identity-accounted retained
-   * buffer without exposing an unreserved scheduling gap.
-   *
-   * @param {Object} reservation
-   * @private
-   */
-  _consumeCoordinateOutputReservation(reservation) {
-    if (
-      !reservation?.active ||
-      !reservation.outputReserved ||
-      reservation.state !== this._coordinateReservationState
-    ) {
-      throw new Error(
-        'Coordinate materialization reservation was invalidated'
-      );
-    }
-    this._coordinateReservedOutputBytes -=
-      reservation.outputBytes;
-    if (this._coordinateReservedOutputBytes < 0n) {
-      this._coordinateReservedOutputBytes = 0n;
-    }
-    reservation.outputReserved = false;
-  }
-
-  /**
-   * Release one exact transient reservation. State and buffer identities keep
-   * stale finally blocks harmless after clearCaches() replaces the owner.
-   *
-   * @param {Object|null} reservation
-   * @private
-   */
-  _releaseCoordinateMaterialization(reservation) {
-    if (!reservation?.active) return;
-    reservation.active = false;
-    if (reservation.state !== this._coordinateReservationState) {
-      return;
-    }
-
-    if (reservation.outputReserved) {
-      this._coordinateReservedOutputBytes -=
-        reservation.outputBytes;
-      if (this._coordinateReservedOutputBytes < 0n) {
-        this._coordinateReservedOutputBytes = 0n;
-      }
-      reservation.outputReserved = false;
-    }
-
-    const bufferRef = this._coordinateBufferRefs.get(
-      reservation.bufferIdentity
-    );
-    if (bufferRef !== reservation.bufferRef) return;
-    bufferRef.references--;
-    if (bufferRef.references <= 0) {
-      this._coordinateBufferRefs.delete(
-        reservation.bufferIdentity
-      );
-      this._coordinateCacheBytes -= bufferRef.bytes;
-      if (this._coordinateCacheBytes < 0n) {
-        this._coordinateCacheBytes = 0n;
-      }
     }
   }
 
@@ -804,8 +881,6 @@ export class BaseAnnDataAdapter {
     this._coordinateBufferRefs.clear();
     this._coordinateCachePins.clear();
     this._coordinateCacheBytes = 0n;
-    this._coordinateReservedOutputBytes = 0n;
-    this._coordinateReservationState = {};
   }
 
   /**
@@ -818,17 +893,67 @@ export class BaseAnnDataAdapter {
    *
    * @returns {Promise<void>}
    */
+  /**
+   * The title the file gives itself (`uns['title']`), or null.
+   * @returns {string|null}
+   */
+  getFileTitle() {
+    const title = this._metadata?.title;
+    return typeof title === 'string' && title.length > 0 ? title : null;
+  }
+
+  /**
+   * What the file says about itself for Cellucid (`uns['cellucid']`): its
+   * stable id, name, description, citation and source, each null when the
+   * file does not state it. Available once `initialize()` has resolved.
+   *
+   * @returns {Readonly<import('./anndata-cellucid-metadata.js').CellucidFileMetadata>}
+   */
+  getFileMetadata() {
+    if (this._fileMetadata === null) {
+      throw new Error('AnnData file metadata is read by initialize()');
+    }
+    return this._fileMetadata;
+  }
+
   async initialize() {
     const generation = this._captureLifecycleGeneration();
     try {
       const metadata = await this._loader.getDatasetMetadata();
       this._assertLifecycleGeneration(generation);
-      if (
-        !Number.isSafeInteger(this._loader.nObs) ||
-        this._loader.nObs <= 0
-      ) {
-        throw new Error(
-          'AnnData datasets must contain at least one observation'
+      const sourceType = this.constructor.sourceType ?? 'anndata';
+      const fileMetadata = requireCellucidFileMetadata(metadata?.cellucid ?? null, sourceType);
+      let fileDefaults;
+      try {
+        fileDefaults = requireAnnDataLaunchDefaults(fileMetadata.defaults);
+      } catch (error) {
+        throw explainedFailure(
+          `uns['cellucid']['defaults'] cannot be used: ${error?.message ?? error} ` +
+          'Write the file again with cellucid.prepare() in Python or cellucid_prepare() in R.',
+          DataSourceErrorCode.INVALID_FORMAT,
+          sourceType,
+          { cause: error }
+        );
+      }
+      this._fileMetadata = fileMetadata;
+      this._defaults = Object.freeze({ ...fileDefaults, ...this._explicitDefaults });
+      this._outliers?.close();
+      this._outliers = new OutlierQuantileSource({
+        loader: this._loader,
+        stored: fileMetadata.outlierQuantiles,
+        minPoints: this._defaults.centroidMinPoints ?? LATENT_OUTLIER_MIN_POINTS,
+      });
+      if (!Number.isSafeInteger(this._loader.nObs) || this._loader.nObs < 0) {
+        throw new Error('AnnData loader cell count must be a non-negative safe integer');
+      }
+      // A file with no cells is the person's data, not a failed read: say so,
+      // rather than leaving it to a generic cause ("check your connection").
+      if (this._loader.nObs === 0) {
+        throw explainedFailure(
+          'This AnnData has no cells (n_obs is 0), so there is nothing to plot. ' +
+          'Open a file that holds at least one cell.',
+          DataSourceErrorCode.VALIDATION_ERROR,
+          sourceType
         );
       }
       const described = describeAnnDataProbes(metadata?.probes);
@@ -844,7 +969,7 @@ export class BaseAnnDataAdapter {
 
       const resolution = await this._resolveEmbeddingSlots(described, generation);
       this._slots = Object.freeze({ ...resolution.slots });
-      this._candidates = assembleAnnDataCandidates(described, resolution);
+      this._candidates = this._assembleCandidates(described, resolution);
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
 
@@ -862,6 +987,8 @@ export class BaseAnnDataAdapter {
         generation === this._lifecycleGeneration
       ) {
         this._metadata = null;
+        this._fileMetadata = null;
+        this._defaults = this._explicitDefaults;
         this._slots = null;
         this._candidates = null;
         this._describedObsm = null;
@@ -871,6 +998,152 @@ export class BaseAnnDataAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * The candidate catalog, its defaults seeded by the launch defaults: the
+   * neighbour graph, expression matrix, gene names and latent space a launch
+   * named, each checked against the file, become the catalog's initial
+   * choices, which the data-mapping panel can still change.
+   *
+   * @param {ReturnType<typeof describeAnnDataProbes>} described
+   * @param {{slots: Object, guessed: string[], rejected: Array<[string, string]>}} resolution
+   * @returns {Object}
+   * @private
+   */
+  _assembleCandidates(described, resolution) {
+    const launch = this._defaults;
+    const chosen = {};
+    if (Object.hasOwn(launch, 'knn')) {
+      const key = launch.knn;
+      if (key !== null) {
+        const item = described.obsp.find(entry => entry.key === key);
+        if (item === undefined) {
+          throw new RangeError(
+            `defaults.knn names obsp['${key}'], which this file does not have. ` +
+            `obsp holds: ${formatKeyList(described.obsp.map(entry => entry.key))}.`
+          );
+        }
+        if (!item.usable) throw new RangeError(`defaults.knn: obsp['${key}'] ${item.reason}.`);
+      }
+      chosen.knn = key;
+    }
+    if (Object.hasOwn(launch, 'expression')) {
+      const element = launch.expression;
+      if (element === 'X') {
+        if (described.X === null) throw new RangeError("defaults.expression names X, which this file does not have.");
+        chosen.expression = 'X';
+      } else if (element === 'raw/X') {
+        if (described.raw === null || described.raw.X === null) {
+          throw new RangeError("defaults.expression names raw.X, which this file does not have.");
+        }
+        chosen.expression = 'raw';
+      } else {
+        const name = element.slice('layers/'.length);
+        const layer = described.layers.find(entry => entry.key === name);
+        if (layer === undefined) {
+          throw new RangeError(
+            `defaults.expression names layers['${name}'], which this file does not have. ` +
+            `layers holds: ${formatKeyList(described.layers.map(entry => entry.key))}.`
+          );
+        }
+        if (!layer.usable) throw new RangeError(`defaults.expression: layers['${name}'] ${layer.reason}.`);
+        chosen.expression = `layer:${name}`;
+      }
+    }
+    if (Object.hasOwn(launch, 'latentKey')) {
+      const key = launch.latentKey;
+      if (key !== null) {
+        const item = described.obsm.find(entry => entry.key === key);
+        if (item === undefined) {
+          throw new RangeError(`defaults.latentKey '${key}' was not found in obsm.`);
+        }
+        const reason = latentCandidateReason(item);
+        if (reason !== null) throw new RangeError(`defaults.latentKey: obsm['${key}'] ${reason}.`);
+      }
+      chosen.latent = key;
+    }
+    let candidates = assembleAnnDataCandidates(described, resolution, chosen);
+    if (Object.hasOwn(launch, 'geneIdColumn') && launch.geneIdColumn !== null) {
+      const column = launch.geneIdColumn;
+      const axisRoute = expressionAxisRoute(candidates, candidates.defaults.expression);
+      if (axisRoute === null) {
+        throw new RangeError(`defaults.geneIdColumn '${column}' names genes, and this file has no expression matrix.`);
+      }
+      const columns = axisVarColumns(candidates, axisRoute);
+      const entry = columns.find(item => item.key === column);
+      const axis = axisRoute === 'raw' ? 'raw.var' : 'var';
+      if (entry === undefined) {
+        throw new RangeError(
+          `defaults.geneIdColumn '${column}' not found in ${axis}. ` +
+          `Available columns: ${formatKeyList(columns.map(item => item.key))}.`
+        );
+      }
+      if (!entry.usable) throw new RangeError(`defaults.geneIdColumn '${column}': ${entry.reason}.`);
+      candidates = assembleAnnDataCandidates(described, resolution, { ...chosen, geneNames: `column:${column}` });
+    }
+    return candidates;
+  }
+
+  /**
+   * The dimension slots a launch named (`embedding1d` ...), checked against
+   * the file: each must exist, be a usable dense array wide enough, and load.
+   *
+   * @returns {Promise<Object|null>} The named slots, or null when none is
+   * @private
+   */
+  async _requestedEmbeddingSlots(entries, loadCheck) {
+    const named = DIMENSION_SLOTS.filter(slot => Object.hasOwn(this._defaults, `embedding${slot}`));
+    if (named.length === 0) return null;
+    const requested = {};
+    for (const slot of named) {
+      const name = `embedding${slot}`;
+      const { key, columns } = this._defaults[name];
+      const entry = entries.find(item => item.key === key);
+      if (entry === undefined) {
+        throw new RangeError(
+          `defaults.${name} names obsm['${key}'], which this file does not have. ` +
+          `obsm holds: ${formatKeyList(entries.map(item => item.key))}.`
+        );
+      }
+      if (!entry.usable || entry.width === null) {
+        throw new RangeError(`defaults.${name}: obsm['${key}'] ${entry.reason ?? 'is not a dense array'}.`);
+      }
+      const dimension = slotDimension(slot);
+      let resolved;
+      try {
+        resolved = validateEmbeddingColumns(columns ?? defaultColumns(dimension), { dimension, width: entry.width });
+      } catch (error) {
+        throw new RangeError(`defaults.${name} obsm['${key}']: ${error.message}`, { cause: error });
+      }
+      const defect = await loadCheck(key, resolved);
+      if (defect !== null) throw new EmbeddingLoadError(key, resolved, defect);
+      requested[slot] = { key, columns: resolved };
+    }
+    return requested;
+  }
+
+  /**
+   * The named slots, and the default rule's choice for every other slot,
+   * held to the rule's own checks.
+   * @private
+   */
+  _withDefaultRuleSlots(entries, requested) {
+    const slots = defaultEmbeddingSlots(entries);
+    for (const slot of DIMENSION_SLOTS) {
+      if (Object.hasOwn(requested, slot)) {
+        slots[slot] = requested[slot];
+        continue;
+      }
+      const ref = slots[slot];
+      if (ref === null) continue;
+      const entry = entries.find(item => item.key === ref.key);
+      if (!entry.usable || entry.width === null) throw new Error(`Embedding '${ref.key}' ${entry.reason}.`);
+      if (entry.width !== slotDimension(slot)) {
+        throw new Error(`Embedding '${ref.key}' must have exactly ${slotDimension(slot)} columns; got ${entry.width}.`);
+      }
+    }
+    return slots;
   }
 
   /**
@@ -892,20 +1165,24 @@ export class BaseAnnDataAdapter {
         throw error;
       }
     };
-    const resolution = await resolveEmbeddingSlotsAsync(
-      obsmEntries(described.obsm),
-      loadCheck
-    );
+    const entries = obsmEntries(described.obsm);
+    // Slots a launch named are shown as named; the others follow the default
+    // rule, and only when neither fills a slot is the best guess made.
+    const requested = await this._requestedEmbeddingSlots(entries, loadCheck);
+    const resolution = requested === null
+      ? await resolveEmbeddingSlotsAsync(entries, loadCheck)
+      : { slots: this._withDefaultRuleSlots(entries, requested), guessed: [], rejected: [] };
     this._assertLifecycleGeneration(generation);
     if (DIMENSION_SLOTS.every(slot => resolution.slots[slot] === null)) {
       const rejected = new Map(resolution.rejected);
+      const vectorKeys = vectorFieldKeys(described.obsm.map(item => item.key));
       const descriptions = described.obsm.map(item => describeObsmEntry({
         key: item.key,
         storage: item.storage,
         shape: item.shape,
-        defect: obsmEntryDefect(item, { latentKey: null, rejected }),
+        defect: obsmEntryDefect(item, { latentKey: null, rejected, vectorKeys }),
       }));
-      throw new DataSourceError(
+      throw explainedFailure(
         nothingPlottableMessage({ nObs: described.nObs, descriptions }),
         DataSourceErrorCode.NO_PLOTTABLE_EMBEDDING,
         this.constructor.sourceType ?? undefined
@@ -919,10 +1196,10 @@ export class BaseAnnDataAdapter {
    * the vector arrays.
    *
    * The rule is the data-mapping default (`defaultVectorBindings` in
-   * `data-mapping.js`, the same rule `cellucid serve` applies): a key
-   * `<field>_umap_<d>d` is the vector field `<field>_umap`, bound to the
-   * `d`-dimensional slot embedding only when that slot shows `X_umap_<d>d` or
-   * `X_umap`. A bound key must be a dense array of exactly `d` columns.
+   * `data-mapping.js`): a key `<field>_<basis>` is the vector field
+   * `<field>`, bound to every enabled representation of `X_<basis>` that is
+   * as wide as it (`velocity_umap` on `X_umap`, `velocity_branches` on
+   * `X_branches`).
    *
    * @param {number} [generation]
    * @protected
@@ -934,16 +1211,11 @@ export class BaseAnnDataAdapter {
     const bindings = this._candidates.defaults.vectorFields;
     const byField = new Map();
     for (const binding of bindings) {
-      const match = VECTOR_KEY_PATTERN.exec(binding.key);
-      const fieldId = match.groups.field;
-      const dimension = binding.embedding.columns.length;
-      const item = this._candidates.obsm.find(entry => entry.key === binding.key);
-      if (obsmWidth(item) !== dimension) {
-        throw new Error(
-          `Vector field '${binding.key}' has ${obsmWidth(item)} columns, ` +
-          `but its ${dimension}D suffix requires exactly ${dimension}`
-        );
+      const resolved = resolveVectorBinding(this._candidates, binding);
+      if (!resolved.ok) {
+        throw new Error(`Vector field obsm['${binding.key}'] cannot be drawn: ${resolved.reason}`);
       }
+      const fieldId = resolved.fieldId;
       const embeddingId = this._embeddingIdOf(binding.embedding);
       let keys = byField.get(fieldId);
       if (keys === undefined) {
@@ -955,6 +1227,18 @@ export class BaseAnnDataAdapter {
     this._assertLifecycleGeneration(generation);
     for (const fieldId of [...byField.keys()].sort(compareCodePoints)) {
       this._vectorBindings.set(fieldId, byField.get(fieldId));
+    }
+    if (Object.hasOwn(this._defaults, 'vectorFieldDefault') && this._defaults.vectorFieldDefault !== null) {
+      const fieldId = this._defaults.vectorFieldDefault;
+      if (this._vectorBindings.size === 0) {
+        throw new RangeError('defaults.vectorFieldDefault was provided but no vector fields exist.');
+      }
+      if (!this._vectorBindings.has(fieldId)) {
+        throw new RangeError(
+          `defaults.vectorFieldDefault '${fieldId}' does not match an available field: ` +
+          `${formatKeyList([...this._vectorBindings.keys()])}.`
+        );
+      }
     }
   }
 
@@ -975,8 +1259,8 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * The data-mapping candidate catalog of this file, the same document
-   * `cellucid serve` publishes at `_cellucid/mapping/candidates.json`.
+   * The data-mapping candidate catalog of this file, which the loaders read
+   * at its `candidates` route.
    *
    * @returns {Object}
    */
@@ -995,53 +1279,32 @@ export class BaseAnnDataAdapter {
   async _computeObsFieldsMetadata(
     generation = this._captureLifecycleGeneration()
   ) {
-    const obsFieldsMetadata = [];
     this._obsFieldsMetadata = null;
 
-    for (const key of this._loader.obsKeys) {
+    // Opening reads no obs value. Every field is described from its metadata
+    // (a categorical's categories are its stored dictionary), and every field
+    // is asked for at once, so the reader plans those small reads together.
+    // A string or boolean column is categorical too, but its categories are
+    // its distinct values: they are found when it is first loaded
+    // (`_getOrLoadFieldData`), so a column of per-cell unique strings (a
+    // barcode, `observation_joinid`) costs nothing until it is used, and one
+    // that cannot be a categorical is refused then, never at open.
+    const describe = async key => {
       const fieldInfo = await this._loader.getObsFieldInfo(key);
       this._assertLifecycleGeneration(generation);
-
       if (fieldInfo.dtype === 'categorical') {
         validateCellucidCategories(fieldInfo.categories, key);
-        obsFieldsMetadata.push({
-          key,
-          kind: 'category',
-          categories: fieldInfo.categories,
-          ordered: fieldInfo.ordered,
-        });
-      } else if (fieldInfo.dtype === 'float' || fieldInfo.dtype === 'int' || fieldInfo.dtype === 'uint') {
-        obsFieldsMetadata.push({
-          key,
-          kind: 'continuous',
-          min: null,
-          max: null,
-        });
-      } else if (fieldInfo.dtype === 'string' || fieldInfo.dtype === 'bool') {
-        // String/bool treated as categorical. Loading is part of validation:
-        // malformed supported fields must abort candidate source adoption.
-        let field = null;
-        try {
-          field = await this._loader.getObsField(key);
-          this._assertLifecycleGeneration(generation);
-          const categories =
-            this._discoverPrimitiveCategories(field.values, key);
-          validateCellucidCategories(categories, key);
-          obsFieldsMetadata.push({
-            key,
-            kind: 'category',
-            categories,
-            _needsCodeComputation: true,
-          });
-        } finally {
-          this._releaseLoaderObsField(key, field);
-        }
-      } else {
-        throw new Error(
-          `Observation field '${key}' has unsupported dtype '${fieldInfo.dtype}'`
-        );
+        return { key, kind: 'category', categories: fieldInfo.categories, ordered: fieldInfo.ordered };
       }
-    }
+      if (fieldInfo.dtype === 'float' || fieldInfo.dtype === 'int' || fieldInfo.dtype === 'uint') {
+        return { key, kind: 'continuous', min: null, max: null };
+      }
+      if (fieldInfo.dtype === 'string' || fieldInfo.dtype === 'bool') {
+        return { key, kind: 'category', categories: null, _needsCodeComputation: true };
+      }
+      throw new Error(`Observation field '${key}' has unsupported dtype '${fieldInfo.dtype}'`);
+    };
+    const obsFieldsMetadata = await Promise.all(this._shownObsKeys().map(describe));
 
     this._assertLifecycleGeneration(generation);
     this._obsFieldsMetadata = obsFieldsMetadata;
@@ -1050,7 +1313,8 @@ export class BaseAnnDataAdapter {
     this._metadata.obs_fields = obsFieldsMetadata.map(f => ({
       key: f.key,
       kind: f.kind,
-      n_categories: f.kind === 'category' ? f.categories?.length : undefined,
+      // Null for a column whose categories are found when it is loaded.
+      n_categories: f.kind === 'category' ? (f.categories?.length ?? null) : undefined,
       ...(typeof f.ordered === 'boolean'
         ? { ordered: f.ordered }
         : {}),
@@ -1060,6 +1324,27 @@ export class BaseAnnDataAdapter {
     const nContinuous = obsFieldsMetadata.filter(f => f.kind === 'continuous').length;
     this._metadata.stats.n_categorical_fields = nCategorical;
     this._metadata.stats.n_continuous_fields = nContinuous;
+    this._metadata.stats.n_obs_fields = obsFieldsMetadata.length;
+  }
+
+  /**
+   * The obs columns shown, in order: the ones a launch named
+   * (`defaults.obsKeys`), else every column.
+   *
+   * @returns {string[]}
+   * @private
+   */
+  _shownObsKeys() {
+    const available = this._loader.obsKeys;
+    if (!Object.hasOwn(this._defaults, 'obsKeys')) return available;
+    const missing = this._defaults.obsKeys.filter(key => !available.includes(key));
+    if (missing.length > 0) {
+      throw new RangeError(
+        `defaults.obsKeys contain columns not in obs: ${formatKeyList(missing)}. ` +
+        `Available columns: ${formatKeyList(available)}.`
+      );
+    }
+    return [...this._defaults.obsKeys];
   }
 
   /**
@@ -1204,10 +1489,11 @@ export class BaseAnnDataAdapter {
   /**
    * Get or compute full field data (lazy loading)
    * @param {string} key - Field name
+   * @param {AbortSignal|null} [signal] - Cancels the read
    * @returns {Promise<Object>}
    * @protected
    */
-  async _getOrLoadFieldData(key) {
+  async _getOrLoadFieldData(key, signal = null) {
     const generation = this._captureLifecycleGeneration();
     if (this._obsFieldDataCache.has(key)) {
       const cached = this._obsFieldDataCache.get(key);
@@ -1233,7 +1519,7 @@ export class BaseAnnDataAdapter {
         meta.ordered
       );
     }
-    const field = await this._loader.getObsField(key);
+    const field = await this._loader.getObsField(key, { signal });
     try {
       this._assertLifecycleGeneration(generation);
       let result;
@@ -1302,10 +1588,27 @@ export class BaseAnnDataAdapter {
               'dictionary after metadata adoption'
             );
           }
+          // Narrowed by the reader worker (`narrowCategoricalCodes`).
           codes = field.codes;
           categories = meta.categories;
+          const { TypedArrayClass } = getCellucidCategoryStorage(categories, key);
+          if (!(codes instanceof TypedArrayClass) || codes.length !== this._loader.nObs) {
+            throw new Error(
+              `Categorical observation field '${key}' must arrive as narrowed codes, one per cell`
+            );
+          }
         } else {
-          // Need to compute codes from values
+          // A string or boolean column: its categories are its distinct
+          // values, found the first time it is read and kept for the life
+          // of the dataset, so every later load codes it the same way.
+          if (meta.categories === null) {
+            const discovered = this._discoverPrimitiveCategories(field.values, key);
+            this._assertLifecycleGeneration(generation);
+            // The dataset identity keeps its null count: it describes what
+            // opening the file knows, and stays the same whichever fields
+            // were loaded.
+            meta.categories = discovered;
+          }
           categories = meta.categories;
           const valueCount = Number(field.values?.length);
           if (!Number.isSafeInteger(valueCount) || valueCount < 0) {
@@ -1317,11 +1620,12 @@ export class BaseAnnDataAdapter {
           for (let index = 0; index < categories.length; index++) {
             categoryMap.set(categories[index], index);
           }
-          codes = new Int32Array(valueCount);
+          const { TypedArrayClass, missingValue } = getCellucidCategoryStorage(categories, key);
+          codes = new TypedArrayClass(valueCount);
           for (let i = 0; i < valueCount; i++) {
             const v = field.values[i];
             if (v == null) {
-              codes[i] = -1;
+              codes[i] = missingValue;
               continue;
             }
             const code = categoryMap.get(v);
@@ -1366,35 +1670,45 @@ export class BaseAnnDataAdapter {
    *
    * @returns {Readonly<Object>|null}
    */
-  getConnectivityManifest() {
+  getConnectivitySummary() {
     if (
       !this._directIdentityFinalized ||
-      this._connectivityManifest === undefined
+      this._connectivitySummary === undefined
     ) {
       throw new Error(
         'Direct AnnData connectivity metadata is not finalized'
       );
     }
-    return this._connectivityManifest;
+    return this._connectivitySummary;
   }
 
   /**
    * Build and validate the one public direct-AnnData dataset identity.
    * Loader-only obsm resolution remains private to this adapter.
    *
+   * What the file says about itself (`uns['cellucid']`, `getFileMetadata()`)
+   * is the identity, over what the caller offers: its description, citation
+   * and source name and address replace the caller's. Its name replaces the
+   * caller's when `preferFileName` is set (a file opened by its user, from
+   * disk or a link), else the caller's name stands (a server that names the
+   * dataset); with no `uns['cellucid']['name']`, `uns['title']` is the
+   * file's name, as CELLxGENE writes it.
+   *
    * @param {Object} descriptor
-   * @param {string} descriptor.id
-   * @param {string} descriptor.name
-   * @param {string} descriptor.description
-   * @param {string} descriptor.cellucidDataVersion
-   * @param {Object} descriptor.source
+   * @param {string} descriptor.id - The dataset id the source serves it under
+   * @param {string} descriptor.name - The caller's name for it
+   * @param {boolean} descriptor.preferFileName - The file's own name wins
+   * @param {string} descriptor.description - The caller's description
+   * @param {{name: string, url?: string, filename?: string, citation?: string}} descriptor.source
+   *   Where the caller read it from; `citation` is the citation a provider
+   *   gives (a repository record's)
    * @returns {Promise<Object>}
    */
   async finalizeDirectIdentity({
     id,
     name,
+    preferFileName,
     description,
-    cellucidDataVersion,
     source,
   }) {
     const generation = this._captureLifecycleGeneration();
@@ -1408,9 +1722,8 @@ export class BaseAnnDataAdapter {
       id.length === 0 ||
       typeof name !== 'string' ||
       name.length === 0 ||
+      typeof preferFileName !== 'boolean' ||
       typeof description !== 'string' ||
-      typeof cellucidDataVersion !== 'string' ||
-      cellucidDataVersion.length === 0 ||
       !source ||
       typeof source !== 'object' ||
       Array.isArray(source)
@@ -1419,6 +1732,20 @@ export class BaseAnnDataAdapter {
         'Direct AnnData identity descriptor is incomplete'
       );
     }
+    const file = this.getFileMetadata();
+    const shownName = (preferFileName ? file.name ?? this.getFileTitle() : null) ?? name;
+    const { citation: providerCitation, ...readFrom } = source;
+    const identitySource = {
+      ...readFrom,
+      ...(file.source === null
+        ? {}
+        : { name: file.source.name, ...(file.source.url === null ? {} : { url: file.source.url }) }),
+    };
+    const citation = file.citation !== null
+      ? { text: file.citation.text, ...(file.citation.url === null ? {} : { url: file.citation.url }) }
+      : typeof providerCitation === 'string' && providerCitation.length > 0
+        ? { text: providerCitation }
+        : null;
 
     if (this._slots === null) {
       throw new Error('Direct AnnData embeddings are not resolved');
@@ -1442,99 +1769,51 @@ export class BaseAnnDataAdapter {
     resolved.sort((left, right) =>
       left.dimension - right.dimension || compareCodePoints(left.id, right.id)
     );
-    // A dataset opened straight from AnnData is not an export and records no
-    // export_settings, so its payload paths are uncompressed.
     const items = {};
     const defaults = {};
-    resolved.forEach((embedding, index) => {
+    for (const embedding of resolved) {
       items[embedding.id] = {
         label: embedding.id,
         dimension: embedding.dimension,
-        file: embeddingPayloadPath(index, embedding.dimension, null),
+        path: mappingEmbeddingPath(obsmIndexOf(this._candidates, embedding.key), embedding.columns),
         source: { key: embedding.key, columns: [...embedding.columns] },
       };
       defaults[dimensionSlot(embedding.dimension)] = embedding.id;
-    });
-    const embeddingIndexById = new Map(
-      resolved.map((embedding, index) => [embedding.id, index])
-    );
-
-    const edges = await this.getConnectivityEdges();
-    this._assertLifecycleGeneration(generation);
-    const hasConnectivity = edges !== null;
-    const connectivityManifest = hasConnectivity
-      ? {
-          format: 'edge_pairs',
-          n_cells: edges.nCells,
-          n_edges: edges.nEdges,
-          max_neighbors: edges.maxNeighbors,
-          index_dtype: 'uint32',
-          index_bytes: Uint32Array.BYTES_PER_ELEMENT,
-        }
-      : null;
-    validateConnectivityManifest(
-      connectivityManifest,
-      CONNECTIVITY_MANIFEST_CONTEXT.DIRECT
-    );
-    // The gene count of the gene list the file opens with (raw.X has its own).
-    const varManifest = await this.getVarManifest();
-    this._assertLifecycleGeneration(generation);
-    const obsManifest = this.getObsManifest();
-    const obsFields = [
-      // Element 0 of every entry is the payload index; the key is element 1.
-      ...obsManifest._continuousFields.map(([, key]) => ({
-        key,
-        kind: 'continuous',
-      })),
-      ...obsManifest._categoricalFields.map(([
-        ,
-        key,
-        categories,
-      ]) => {
-        return {
-          key,
-          kind: 'category',
-          n_categories: categories.length,
-        };
-      }),
-    ];
-
-    let vectorFields;
-    if (this._vectorBindings.size > 0) {
-      const fields = {};
-      let fieldIndex = 0;
-      for (const [fieldId, keysByEmbedding] of this._vectorBindings) {
-        const bound = [...keysByEmbedding.keys()]
-          .sort((left, right) =>
-            embeddingIndexById.get(left) - embeddingIndexById.get(right)
-          );
-        const files = {};
-        for (const embeddingId of bound) {
-          files[embeddingId] = vectorPayloadPath(
-            fieldIndex,
-            embeddingIndexById.get(embeddingId),
-            null
-          );
-        }
-        fields[fieldId] = { label: fieldId, files };
-        fieldIndex++;
-      }
-      const fieldIds = Object.keys(fields);
-      vectorFields = {
-        default_field: fieldIds.length === 1 ? fieldIds[0] : null,
-        fields,
-      };
     }
 
+    // Whether the default graph exists is known from the file's metadata;
+    // its edges are read (and counted) only when something shows or uses
+    // them. Counting them here would read the whole graph -- often the
+    // largest array in the file -- on every open.
+    const graphKey = this._defaultGraphKey();
+    const hasConnectivity = graphKey !== null && await this._loader.hasConnectivities(graphKey);
+    this._assertLifecycleGeneration(generation);
+    const connectivitySummary = hasConnectivity
+      ? { n_cells: this._loader.nObs, n_edges: null, max_neighbors: null }
+      : null;
+    validateConnectivitySummary(connectivitySummary);
+    // The gene count of the gene list the file opens with (raw.X has its own).
+    const geneList = await this.getGeneList();
+    this._assertLifecycleGeneration(generation);
+    const obsFields = this.getObsFields().fields.map(field => (
+      field.kind === 'continuous'
+        ? { key: field.key, kind: 'continuous' }
+        : {
+            key: field.key,
+            kind: 'category',
+            // Null for a string or boolean column: its categories are found
+            // when it is first loaded.
+            n_categories: field.categories === null ? null : field.categories.length,
+          }
+    ));
+
     const identity = {
-      version: 3,
       id,
-      name,
-      description,
-      cellucid_data_version: cellucidDataVersion,
+      name: shownName,
+      description: file.description ?? description,
       stats: {
         n_cells: this._loader.nObs,
-        n_genes: varManifest.fields.length,
+        n_genes: geneList.fields.length,
         n_obs_fields: obsFields.length,
         n_categorical_fields: obsFields.filter(
           field => field.kind === 'category'
@@ -1543,7 +1822,7 @@ export class BaseAnnDataAdapter {
           field => field.kind === 'continuous'
         ).length,
         has_connectivity: hasConnectivity,
-        n_edges: hasConnectivity ? edges.nEdges : null,
+        n_edges: null,
       },
       embeddings: {
         default_dimension: resolved[resolved.length - 1].dimension,
@@ -1551,76 +1830,65 @@ export class BaseAnnDataAdapter {
         items,
       },
       obs_fields: obsFields,
-      source: { ...source },
-      ...(vectorFields ? { vector_fields: vectorFields } : {}),
+      source: identitySource,
+      ...(citation === null ? {} : { citation }),
+      ...(this._defaults.vectorFieldDefault == null
+        ? {}
+        : { vector_field_default: this._defaults.vectorFieldDefault }),
     };
     validateDatasetIdentity(identity, id, 'direct-anndata');
     this._assertLifecycleGeneration(generation);
-    this._connectivityManifest = connectivityManifest === null
+    this._connectivitySummary = connectivitySummary === null
       ? null
-      : Object.freeze(connectivityManifest);
+      : Object.freeze(connectivitySummary);
     this._metadata = identity;
-    this._identityEmbeddings = Object.freeze(resolved.map(embedding => Object.freeze({
-      id: embedding.id,
-      dimension: embedding.dimension,
-      ref: Object.freeze({ key: embedding.key, columns: Object.freeze([...embedding.columns]) }),
-    })));
     this._directIdentityFinalized = true;
     return identity;
   }
 
   /**
-   * The normalized coordinates of one stored embedding payload, by its path
-   * under the dataset base: `embeddings/{i}_{d}d.bin` names item `i` of the
-   * published identity, and `_cellucid/mapping/embeddings/{obsm}/{cols}.bin`
-   * names `obsm` entry `obsm` of the candidate catalog read at `cols`. The
-   * bytes are the ones a prepared export or `cellucid serve` publishes for the
-   * same array.
+   * The display coordinates of one embedding, by its route under the
+   * dataset base: `obsm/{i}/{cols}` names `obsm` entry `i` of the candidate
+   * catalog read at `cols`.
    *
-   * The caller owns the returned array, exactly as it owns a fetched payload:
-   * the DimensionManager normalizes it in place for display and releases it
-   * when it evicts the layout. The adapter therefore hands over its cached
-   * copy and drops its own reference, so it never keeps (or hands out again)
-   * an array a caller may already have rewritten, and an eviction frees the
-   * memory instead of leaving it held here.
+   * The reader worker checked and normalized them (`embedding-payload.js`);
+   * `transform` is their display transform (the identity for normalized
+   * coordinates) and `bounds` their per-axis bounds, so the page neither
+   * normalizes nor scans them again.
+   *
+   * The caller owns the returned positions, exactly as it owns a fetched
+   * payload: the adapter hands over its cached array and drops its own
+   * reference, so an eviction by the caller frees the memory instead of
+   * leaving it held here.
    *
    * @param {string} path
    * @param {number} dimension - The dimension the caller's layout declares.
-   * @returns {Promise<Float32Array>}
+   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
+   *   wait; the read stops once no caller still waits for it.
+   * @returns {Promise<import('./embedding-payload.js').EmbeddingPayload>}
    */
-  async getEmbeddingPayload(path, dimension) {
-    let ref;
-    const identityMatch = /^embeddings\/(0|[1-9][0-9]*)_([123])d\.bin$/.exec(path);
-    if (identityMatch !== null) {
-      const item = this._identityEmbeddings?.[Number(identityMatch[1])];
-      if (item === undefined || item.dimension !== Number(identityMatch[2])) {
-        throw new RangeError(`This dataset has no embedding payload '${path}'.`);
-      }
-      ref = item.ref;
-    } else {
-      const route = parseMappingEmbeddingPath(path);
-      const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
-      if (item === undefined) {
-        throw new RangeError(`This dataset has no embedding payload '${path}'.`);
-      }
-      ref = { key: item.key, columns: route.columns };
+  async getEmbeddingPayload(path, dimension, { signal = null } = {}) {
+    const route = parseMappingEmbeddingPath(path);
+    const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+    if (item === undefined) {
+      throw new RangeError(`This dataset has no embedding '${path}'.`);
     }
+    const ref = { key: item.key, columns: route.columns };
     if (ref.columns.length !== dimension) {
       throw new RangeError(
         `Embedding payload '${path}' holds ${ref.columns.length}D coordinates, not ${dimension}D.`
       );
     }
-    const embedding = await this.getEmbeddingForRef(ref);
-    const coordinateCacheKey = this._embeddingCoordinateCacheKey(
-      this._resolveEmbeddingRef(ref).embeddingId
-    );
-    if (this._deleteCoordinateCacheEntry(coordinateCacheKey, embedding)) {
-      return embedding;
+    const embedding = await this.getEmbeddingForRef(ref, { signal });
+    const { embeddingId } = this._resolveEmbeddingRef(ref);
+    const { transform, bounds } = this._embeddingInfo.get(embeddingId);
+    if (this._deleteCoordinateCacheEntry(this._embeddingCoordinateCacheKey(embeddingId), embedding)) {
+      return { positions: embedding, transform, bounds };
     }
     // Another caller of the same computation was handed the cached array
     // first. Every caller sharing one computation resumes in the same turn,
     // before any of them can write to it, so this copy is still the payload.
-    return new Float32Array(embedding);
+    return { positions: new Float32Array(embedding), transform, bounds };
   }
 
   /**
@@ -1648,16 +1916,19 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Read, check and normalize the selected columns of one `obsm` array.
-   *
-   * The columns must be finite, representable as float32 and span a non-zero
-   * range (`embeddingLoadDefect`); otherwise an `EmbeddingLoadError` names the
-   * first offending cell. The normalized result is cached by its embedding id.
+   * The display coordinates of the selected columns of one `obsm` array,
+   * read, checked and normalized by the reader worker
+   * (`EmbeddingPayloads.embedding`). Values that are not finite,
+   * representable as float32 or (normalized) spanning a non-zero range are
+   * an `EmbeddingLoadError` naming the first offending cell. The result is
+   * cached by its embedding id, with its display transform and bounds.
    *
    * @param {{key: string, columns: ReadonlyArray<number>}} ref
+   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
+   *   wait; the read stops once no caller still waits for it.
    * @returns {Promise<Float32Array>}
    */
-  async getEmbeddingForRef(ref) {
+  async getEmbeddingForRef(ref, { signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const { columns, dimension, embeddingId } = this._resolveEmbeddingRef(ref);
     const coordinateCacheKey = this._embeddingCoordinateCacheKey(embeddingId);
@@ -1676,50 +1947,41 @@ export class BaseAnnDataAdapter {
         this._embeddingInFlight,
         embeddingId,
         generation,
-        async () => {
+        async workSignal => {
           if (this._embeddingCache.has(embeddingId)) {
             const cached = this._embeddingCache.get(embeddingId);
             this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
             this._assertLifecycleGeneration(generation);
             return cached;
           }
-          const values = await this._loader.readObsmColumns(ref.key, columns);
+          const payload = await this._loader.readEmbedding(
+            ref.key,
+            columns,
+            this._defaults.normalizeEmbeddings !== false,
+            { signal: workSignal }
+          );
           this._assertLifecycleGeneration(generation);
           const label = `Embedding '${embeddingId}'`;
-          if (!(values instanceof Float64Array) || values.length !== this._loader.nObs * dimension) {
+          const { positions } = payload;
+          if (!(positions instanceof Float32Array) || positions.length !== this._loader.nObs * dimension) {
             throw new Error(`${label} read did not return one row per cell`);
           }
-          const defect = embeddingLoadDefect(values, dimension);
-          if (defect !== null) {
-            throw new EmbeddingLoadError(ref.key, columns, defect);
-          }
-          const outputBytes = this._checkedCoordinateResultBytes(values.length, label);
-          const materialization = this._reserveCoordinateMaterialization(
-            values,
-            outputBytes,
-            label
-          );
-          try {
-            const normalized = this._normalizeEmbedding(values, dimension, embeddingId);
-            this._assertLifecycleGeneration(generation);
-            this._consumeCoordinateOutputReservation(materialization);
-            this._retainCoordinateCacheEntry({
-              cacheKey: coordinateCacheKey,
-              embeddingId,
-              kind: 'embedding',
-              label,
-              value: normalized
-            });
-            return normalized;
-          } catch (error) {
-            if (!this._embeddingCache.has(embeddingId)) {
-              this._normInfo.delete(embeddingId);
-            }
-            throw error;
-          } finally {
-            this._releaseCoordinateMaterialization(materialization);
-          }
-        }
+          this._embeddingInfo.set(embeddingId, {
+            transform: Object.freeze({ center: Object.freeze([...payload.transform.center]), scale: payload.transform.scale }),
+            bounds: payload.bounds === null
+              ? null
+              : Object.freeze({ min: Object.freeze([...payload.bounds.min]), max: Object.freeze([...payload.bounds.max]) }),
+          });
+          this._retainCoordinateCacheEntry({
+            cacheKey: coordinateCacheKey,
+            embeddingId,
+            kind: 'embedding',
+            label,
+            value: positions
+          });
+          return positions;
+        },
+        signal
       );
     } finally {
       releasePin();
@@ -1728,24 +1990,29 @@ export class BaseAnnDataAdapter {
 
   /**
    * The per-cell displacement vectors of one vector field bound to one
-   * embedding, by its route
-   * `_cellucid/mapping/vectors/{vector}/{vcols}/{embedding}/{ecols}.bin`
-   * (`resolveVectorBinding`): the vector array read at `vcols`, checked
-   * (finite, representable as float32) and scaled by the bound embedding's
-   * normalization scale, so the vectors live in the same normalized space as
-   * its positions -- the payload `cellucid serve` answers the same route with.
+   * embedding, by its route `vectors/{vector}/{vcols}/{embedding}/{ecols}`
+   * (`resolveVectorBinding`): the vector array read at `vcols`, checked and
+   * scaled by the bound embedding's transform in the reader worker
+   * (`EmbeddingPayloads.vectors`), so the vectors live in the space its
+   * positions are shown in -- with the largest vector's magnitude. Both
+   * arrays are read at once when the embedding is not read yet.
+   *
+   * The vectors are shared, read-only: the cache and every caller hold the
+   * same array.
    *
    * @param {string} path
    * @param {number} dimension - The bound embedding's dimension, as the caller's layout declares it.
-   * @returns {Promise<Float32Array>} `dimension` components per cell.
+   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
+   *   wait; the reads stop once no caller still waits for them.
+   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>} `dimension` components per cell.
    */
-  async getVectorPayload(path, dimension) {
+  async getVectorPayload(path, dimension, { signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const route = parseMappingVectorPath(path);
     const vectorItem = route === null ? undefined : this._candidates?.obsm[route.vectorIndex];
     const embeddingItem = route === null ? undefined : this._candidates?.obsm[route.embeddingIndex];
     if (vectorItem === undefined || embeddingItem === undefined) {
-      throw new RangeError(`This dataset has no vector payload '${path}'.`);
+      throw new RangeError(`This dataset has no vector route '${path}'.`);
     }
     const embeddingRef = { key: embeddingItem.key, columns: route.embeddingColumns };
     const resolved = resolveVectorBinding(this._candidates, { key: vectorItem.key, embedding: embeddingRef });
@@ -1762,14 +2029,19 @@ export class BaseAnnDataAdapter {
         `Vector payload '${path}' holds ${resolved.dimension}D vectors, not ${dimension}D.`
       );
     }
+    const embeddingColumns = this._resolveEmbeddingRef(embeddingRef).columns;
     const embeddingId = resolved.layoutKey;
     const coordinateCacheKey = this._vectorCoordinateCacheKey(path);
     const releasePin = this._pinCoordinateCacheKey(coordinateCacheKey);
+    const cachedPayload = () => {
+      const vectors = this._vectorFieldCache.get(path);
+      this._touchCoordinateCacheEntry(coordinateCacheKey, vectors);
+      return { vectors, maxMagnitude: this._vectorMagnitudes.get(path) };
+    };
 
     try {
       if (this._vectorFieldCache.has(path)) {
-        const cached = this._vectorFieldCache.get(path);
-        this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
+        const cached = cachedPayload();
         await Promise.resolve();
         this._assertLifecycleGeneration(generation);
         return cached;
@@ -1779,70 +2051,35 @@ export class BaseAnnDataAdapter {
         this._vectorFieldInFlight,
         path,
         generation,
-        async () => {
+        async workSignal => {
           if (this._vectorFieldCache.has(path)) {
-            const cached = this._vectorFieldCache.get(path);
-            this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
             this._assertLifecycleGeneration(generation);
-            return cached;
+            return cachedPayload();
           }
-
-          // The vectors share their embedding's normalization scale.
-          if (!this._normInfo.has(embeddingId)) {
-            await this.getEmbeddingForRef(embeddingRef);
-            this._assertLifecycleGeneration(generation);
-          }
-          const scale = this._normInfo.get(embeddingId)?.scale;
-          if (!Number.isFinite(scale) || scale <= 0) {
-            throw new Error(
-              `Embedding "${embeddingId}" normalization has no finite positive scale`
-            );
-          }
-
-          const raw = await this._loader.readObsmColumns(vectorItem.key, route.vectorColumns);
-          this._assertLifecycleGeneration(generation);
-          const cacheLabel = `Vector field '${vectorItem.key}'`;
-          const defect = valueLoadDefect(raw, dimension);
-          if (defect !== null) {
-            throw new MappingLoadError(
-              vectorItem.key,
-              defect,
-              `${cacheLabel} cannot be drawn: ${defect}.`
-            );
-          }
-          const outputBytes = this._checkedCoordinateResultBytes(raw.length, cacheLabel);
-          const materialization = this._reserveCoordinateMaterialization(
-            raw,
-            outputBytes,
-            cacheLabel
+          const payload = await this._loader.readVectorField(
+            vectorItem.key,
+            route.vectorColumns,
+            { key: embeddingItem.key, columns: embeddingColumns },
+            this._defaults.normalizeEmbeddings !== false,
+            { signal: workSignal }
           );
-          try {
-            const data = new Float32Array(raw.length);
-            for (let i = 0; i < raw.length; i++) {
-              const scaled = raw[i] * scale;
-              const narrowed = Math.fround(scaled);
-              if (!Number.isFinite(scaled) || !Number.isFinite(narrowed)) {
-                throw new Error(
-                  `${cacheLabel} component at flat index ${i} is outside the finite Float32 range after normalization`
-                );
-              }
-              data[i] = narrowed;
-            }
-            this._assertLifecycleGeneration(generation);
-            this._consumeCoordinateOutputReservation(materialization);
-            this._retainCoordinateCacheEntry({
-              cacheKey: coordinateCacheKey,
-              embeddingId,
-              vectorPath: path,
-              kind: 'vector',
-              label: cacheLabel,
-              value: data
-            });
-            return data;
-          } finally {
-            this._releaseCoordinateMaterialization(materialization);
+          this._assertLifecycleGeneration(generation);
+          const { vectors, maxMagnitude } = payload;
+          if (!(vectors instanceof Float32Array) || vectors.length !== this._loader.nObs * dimension) {
+            throw new Error(`Vector field '${vectorItem.key}' read did not return one vector per cell`);
           }
-        }
+          this._retainCoordinateCacheEntry({
+            cacheKey: coordinateCacheKey,
+            embeddingId,
+            vectorPath: path,
+            kind: 'vector',
+            label: `Vector field '${vectorItem.key}'`,
+            value: vectors
+          });
+          this._vectorMagnitudes.set(path, maxMagnitude);
+          return { vectors, maxMagnitude };
+        },
+        signal
       );
     } finally {
       releasePin();
@@ -1850,62 +2087,17 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Normalize checked embedding coordinates with the export format's rule --
-   * centred per axis, one `2 / max(axis ranges)` scale for every axis,
-   * computed at the input's precision and rounded to float32 once -- so the
-   * payload is byte-identical to the one `cellucid-python`/`cellucid-r`
-   * write and `cellucid serve` answers for the same array. The transform is
-   * recorded under the embedding's id so its vector fields share its scale.
+   * The obs field list the data loaders check (`checkObsFields`): one
+   * descriptor per obs field, continuous fields first, each with its
+   * position in the file's obs field list (`fieldIndex`). A categorical
+   * field states its categories, code dtype and missing code (all null for
+   * a string or boolean column, whose categories are found when it is first
+   * loaded, `getObsFieldData`) and the route of its outlier quantiles in the
+   * latent space the dataset opens with (null without one).
    *
-   * @param {Float64Array} data - Checked coordinates, row-major
-   * @param {number} dimension - Components per cell
-   * @param {string} embeddingId
-   * @returns {Float32Array}
-   * @protected
-   */
-  _normalizeEmbedding(data, dimension, embeddingId) {
-    const nCells = data.length / dimension;
-    const result = new Float32Array(nCells * dimension);
-    if (nCells === 0) return result;
-
-    const mins = new Array(dimension).fill(Infinity);
-    const maxs = new Array(dimension).fill(-Infinity);
-    for (let i = 0; i < nCells; i++) {
-      const baseIdx = i * dimension;
-      for (let d = 0; d < dimension; d++) {
-        const value = data[baseIdx + d];
-        if (value < mins[d]) mins[d] = value;
-        if (value > maxs[d]) maxs[d] = value;
-      }
-    }
-
-    // One range for all axes keeps the layout's aspect ratio. The load-time
-    // check (`embeddingLoadDefect`) already refused a zero range, and any
-    // positive range is used as is: the format's rule has no floor, so a
-    // narrow embedding gets the scale every writer gives it.
-    let maxRange = 0;
-    for (let d = 0; d < dimension; d++) {
-      const range = maxs[d] - mins[d];
-      if (range > maxRange) maxRange = range;
-    }
-
-    const centers = mins.map((min, d) => (min + maxs[d]) / 2);
-    const scale = 2 / maxRange;
-    for (let i = 0; i < nCells; i++) {
-      for (let d = 0; d < dimension; d++) {
-        result[i * dimension + d] = (data[i * dimension + d] - centers[d]) * scale;
-      }
-    }
-
-    this._normInfo.set(embeddingId, { maxRange, centers, scale });
-    return result;
-  }
-
-  /**
-   * Get obs manifest in Cellucid compact format
    * @returns {Object}
    */
-  getObsManifest() {
+  getObsFields() {
     if (
       !Number.isSafeInteger(this._loader.nObs) ||
       this._loader.nObs <= 0
@@ -1914,79 +2106,52 @@ export class BaseAnnDataAdapter {
         'AnnData datasets must contain at least one observation'
       );
     }
-    const continuousFields = [];
-    const categoricalFields = [];
-
-    // obs/ carries both arrays, so one payload-index space spans them, taken
-    // from each field's position in the single served obs field list.
-    for (
-      let payloadIndex = 0;
-      payloadIndex < this._obsFieldsMetadata.length;
-      payloadIndex++
-    ) {
-      const field = this._obsFieldsMetadata[payloadIndex];
+    // The latent space the dataset opens with (a launch's `latentKey`): every
+    // categorical field's outlier quantiles are computed in it, on its
+    // route, exactly as a latent space chosen later is applied.
+    const latentKey = this._candidates?.defaults.latent ?? null;
+    const latentIndex = latentKey === null ? -1 : obsmIndexOf(this._candidates, latentKey);
+    const continuous = [];
+    const categorical = [];
+    this._obsFieldsMetadata.forEach((field, fieldIndex) => {
       if (field.kind === 'continuous') {
-        continuousFields.push([payloadIndex, field.key]);
-      } else {
-        const { dtype, missingValue } = getCellucidCategoryStorage(
-          field.categories,
-          field.key
-        );
-
-        categoricalFields.push([
-          payloadIndex,
-          field.key,
-          field.categories,
-          dtype,
-          missingValue,
-          {},
-        ]);
+        continuous.push({ key: field.key, kind: 'continuous', fieldIndex, outlierQuantilesPath: null });
+        return;
       }
-    }
-
-    const obsSchemas = {};
-    if (continuousFields.length > 0) {
-      obsSchemas.continuous = {
-        pathPattern: 'obs/{index}.values.f32',
-        ext: 'f32',
-        dtype: 'float32',
-        quantized: false,
-      };
-    }
-    if (categoricalFields.length > 0) {
-      obsSchemas.categorical = {
-        codesPathPattern: 'obs/{index}.codes.{ext}',
-        outlierPathPattern: null,
-        outlierExt: null,
-        outlierDtype: null,
-        outlierQuantized: false,
-      };
-    }
-
+      const storage = field.categories === null
+        ? { dtype: null, missingValue: null }
+        : getCellucidCategoryStorage(field.categories, field.key);
+      categorical.push({
+        key: field.key,
+        kind: 'category',
+        fieldIndex,
+        categories: field.categories,
+        codesDtype: storage.dtype,
+        codesMissingValue: storage.missingValue,
+        outlierQuantilesPath: latentIndex < 0 ? null : mappingLatentOutlierPath(latentIndex, fieldIndex),
+      });
+    });
     return {
-      _format: 'compact_v2',
       n_points: this._loader.nObs,
-      centroid_outlier_quantile: null,
-      latent_key: null,
-      compression: null,
-      _obsSchemas: obsSchemas,
-      _continuousFields: continuousFields,
-      _categoricalFields: categoricalFields,
+      outlier_min_points: this._outliers?.minPoints ?? LATENT_OUTLIER_MIN_POINTS,
+      stored_outlier_latent_key: this._outliers?.storedLatentKey ?? null,
+      latent_key: latentIndex < 0 ? null : latentKey,
+      fields: [...continuous, ...categorical],
     };
   }
 
   /**
-   * The gene list of one var axis named by one name source, in Cellucid's
-   * compact var-manifest format: `var_manifest.json` is the gene list this
+   * One gene list the data loaders check (`checkGeneList`): the genes of one
+   * expression matrix named by one name source. `var` is the gene list this
    * file opens with (the default expression matrix and gene names), and
-   * `_cellucid/mapping/genes/{axis}/{names}/var_manifest.json` any other. The
-   * names are made unique with `makeUniqueNames`, exactly as `cellucid serve`
-   * does; the manifest records what that changed.
+   * `var/{axis}/{names}` any other; gene `g` of a list is at `{list}/{g}`.
+   * The names are made unique with `makeUniqueNames`, exactly as `cellucid
+   * serve` does; `geneNames` records what that changed.
    *
-   * @param {string} [path='var_manifest.json']
+   * @param {string} [path='var']
    * @returns {Promise<Object>}
    */
-  async getVarManifest(path = 'var_manifest.json') {
+  async getGeneList(path = 'var') {
     const generation = this._captureLifecycleGeneration();
     if (
       !Number.isSafeInteger(this._loader.nObs) ||
@@ -1996,7 +2161,7 @@ export class BaseAnnDataAdapter {
         'AnnData datasets must contain at least one observation'
       );
     }
-    const route = this._resolveGeneRoute(path, 'var_manifest');
+    const route = this._resolveGeneRoute(path, 'list');
     const names = route === null ? null : await this._geneNames(route);
     this._assertLifecycleGeneration(generation);
     // The genes listed here come from this matrix: let a reader that must
@@ -2004,41 +2169,28 @@ export class BaseAnnDataAdapter {
     // does not wait for the whole index.
     if (route !== null) this._loader.prepareMatrix?.(route.element);
     return {
-      _format: 'compact_v2',
       n_points: this._loader.nObs,
-      compression: null,
-      quantization: null,
-      _varSchema: {
-        kind: 'continuous',
-        pathPattern: 'var/{index}.values.f32',
-        ext: 'f32',
-        dtype: 'float32',
-        quantized: false,
-      },
       fields: names === null
         ? []
-        : names.names.map((name, payloadIndex) => [payloadIndex, name]),
-      gene_name_sets: [
-        names === null
-          ? { source: null, filled_from_index: 0, renamed: [], names: null }
-          : {
-              source: names.source,
-              filled_from_index: names.filledFromIndex,
-              renamed: names.renamed.map(pair => [...pair]),
-              names: null,
-            },
-      ],
+        : names.names.map((name, gene) => ({ key: name, kind: 'continuous', path: `${path}/${gene}` })),
+      geneNames: names === null
+        ? { source: null, filledFromIndex: 0, renamed: [] }
+        : {
+            source: names.source,
+            filledFromIndex: names.filledFromIndex,
+            renamed: names.renamed.map(pair => [...pair]),
+          },
     };
   }
 
   /**
-   * Resolve one gene path -- the file's own (`var_manifest.json`,
-   * `var/{g}.values.f32`) or a mapped one -- to the matrix and name source it
-   * reads. Null for the file's own gene list when it has no expression
-   * matrix.
+   * Resolve one gene route -- the file's own (`var`, `var/{g}`) or a mapped
+   * one (`var/{axis}/{names}`, `var/{axis}/{names}/{g}`) -- to the matrix and
+   * name source it reads. Null for the file's own gene list when it has no
+   * expression matrix.
    *
    * @param {string} path
-   * @param {'var_manifest'|'gene'} kind
+   * @param {'list'|'gene'} kind
    * @returns {{axisRoute: string, namesRoute: string, element: string, varAxis: 'X'|'raw', column: string|null, gene: number|null}|null}
    * @private
    */
@@ -2051,11 +2203,11 @@ export class BaseAnnDataAdapter {
     if (mapped !== null) {
       ({ axisRoute, namesRoute, gene } = mapped);
     } else {
-      const own = kind === 'var_manifest'
-        ? (path === 'var_manifest.json' ? {} : null)
-        : /^var\/(0|[1-9][0-9]*)\.values\.f32$/.exec(path);
+      const own = kind === 'list'
+        ? (path === 'var' ? {} : null)
+        : /^var\/(0|[1-9][0-9]*)$/.exec(path);
       if (own === null) {
-        throw new RangeError(`This file has no gene payload '${path}'.`);
+        throw new RangeError(`This file has no gene route '${path}'.`);
       }
       const defaults = candidates.defaults;
       if (defaults.expression === null) {
@@ -2069,7 +2221,7 @@ export class BaseAnnDataAdapter {
       gene = kind === 'gene' ? Number(own[1]) : null;
     }
     if ((kind === 'gene') !== (gene !== null)) {
-      throw new RangeError(`This file has no gene payload '${path}'.`);
+      throw new RangeError(`This file has no gene route '${path}'.`);
     }
     let element;
     let varAxis = 'X';
@@ -2110,7 +2262,7 @@ export class BaseAnnDataAdapter {
    */
   async _geneNames(route) {
     const cacheKey = JSON.stringify([route.varAxis, route.column]);
-    const cached = this._geneNameSets.get(cacheKey);
+    const cached = this._geneNamesByRoute.get(cacheKey);
     if (cached !== undefined) return cached;
     const generation = this._captureLifecycleGeneration();
     const { index, values } = await this._loader.readVarNames(route.varAxis, route.column);
@@ -2128,24 +2280,26 @@ export class BaseAnnDataAdapter {
       filledFromIndex: unique.filledFromIndex,
       source: route.column,
     });
-    this._geneNameSets.set(cacheKey, result);
+    this._geneNamesByRoute.set(cacheKey, result);
     return result;
   }
 
   /**
    * Get obs field data as binary (lazy loaded)
    * @param {string} key - Field name
+   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
+   *   wait; the read stops once no caller still waits for it.
    * @returns {Promise<{data: ArrayBuffer, kind: string, categories?: string[], min?: number, max?: number}>}
    */
-  async getObsFieldData(key) {
+  async getObsFieldData(key, { signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     return this._coalesceInFlight(
       this._obsFieldDataInFlight,
       key,
       generation,
-      async () => {
+      async workSignal => {
         // Lazy load the field data.
-        const fieldData = await this._getOrLoadFieldData(key);
+        const fieldData = await this._getOrLoadFieldData(key, workSignal);
         this._assertLifecycleGeneration(generation);
 
         if (fieldData.kind === 'continuous') {
@@ -2157,36 +2311,10 @@ export class BaseAnnDataAdapter {
           };
         }
 
-        // Categorical - convert codes to the compact public dtype.
-        const {
-          TypedArrayClass,
-          missingValue,
-          dtype: dtypeStr
-        } = getCellucidCategoryStorage(fieldData.categories, key);
-
-        const codes = new TypedArrayClass(fieldData.codes.length);
-        for (let i = 0; i < fieldData.codes.length; i++) {
-          const code = fieldData.codes[i];
-          if (
-            !Number.isInteger(code) ||
-            code < -1 ||
-            code >= fieldData.categories.length
-          ) {
-            throw new Error(
-              `Categorical observation field '${key}' has invalid code ` +
-              `${String(code)} at index ${i}; expected -1 or an integer ` +
-              `from 0 to ${fieldData.categories.length - 1}`
-            );
-          }
-          if (code === -1) {
-            codes[i] = missingValue;
-          } else {
-            codes[i] = code;
-          }
-        }
-
-        // The compact public buffer owns the result after this point. Do not
-        // retain a second full-width categorical code array in the adapter.
+        // Categorical: the codes are already in their narrowed storage
+        // (`_getOrLoadFieldData`); the caller owns them from here.
+        const { missingValue, dtype: dtypeStr } = getCellucidCategoryStorage(fieldData.categories, key);
+        const codes = fieldData.codes;
         this._deleteObsFieldDataCache(key, fieldData);
         return {
           data: codes.buffer,
@@ -2198,59 +2326,136 @@ export class BaseAnnDataAdapter {
             ? { ordered: fieldData.ordered }
             : {}),
         };
-      }
+      },
+      signal
     );
   }
 
   /**
-   * One gene's value in every cell, by its payload path: `var/{g}.values.f32`
-   * for the file's own gene list, or
-   * `_cellucid/mapping/genes/{axis}/{names}/var/{g}.values.f32`. The values
+   * One gene's value in every cell, by its route: `var/{g}` for the file's
+   * own gene list, or `var/{axis}/{names}/{g}`. The values
    * depend only on the matrix and the gene's position on it, never on the
-   * name source.
+   * name source. Genes asked for together (a long run's next genes) reach
+   * the reader as one batch (`AnnDataReaderClient.getMatrixColumn`).
    *
    * @param {string} path
+   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
+   *   wait; the read stops once no caller still waits for it.
    * @returns {Promise<Float32Array>}
    */
-  async getGeneValues(path) {
+  async getGeneValues(path, { signal = null, owner = null, key = null } = {}) {
     const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const inFlightKey = JSON.stringify([route.element, route.gene]);
+    // Shared by every caller of the gene: the first one's job owns the read,
+    // and a job joining it later adopts it (one notification, the job's).
+    const joined = this._geneExpressionInFlight.get(inFlightKey);
+    const sharing = joined !== undefined && !joined.cancellation.cancelled;
+    if (sharing && owner !== null) getReadActivityLog().adopt(joined.readKey, owner);
+    const readKey = sharing ? joined.readKey : key ?? `gene-read-${nextGeneReadKey++}`;
+    const result = this._coalesceInFlight(
+      this._geneExpressionInFlight,
+      inFlightKey,
+      generation,
+      async workSignal => {
+        const column = await this._loader.getMatrixColumn(route.element, route.gene, { signal: workSignal, owner, key: readKey });
+        this._assertLifecycleGeneration(generation);
+        return column;
+      },
+      signal
+    );
+    const entry = this._geneExpressionInFlight.get(inFlightKey);
+    if (entry !== undefined) entry.readKey ??= readKey;
+    return result;
+  }
+
+  /**
+   * One gene's non-zero entries, by its payload path (as `getGeneValues`):
+   * `{length, indices: Uint32Array, values: Float32Array}`, the dense
+   * column's values bit for bit, about 45 times fewer bytes for a median
+   * gene. What an analysis computes from; nothing is installed in field
+   * state.
+   *
+   * @param {string} path
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   *   `owner`: the job the read is for
+   * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}>}
+   */
+  async getGeneSparseValues(path, { signal = null, owner = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    // Not shared between callers: each owns (and may transfer) its arrays.
+    // Callers of one task still reach the reader as one request, which reads
+    // a gene once (`AnnDataReaderClient.getMatrixColumnSparse`).
+    const result = await this._loader.getMatrixColumnSparse(route.element, route.gene, { signal, owner });
+    this._assertLifecycleGeneration(generation);
+    return result;
+  }
+
+  /** The route of one gene payload path, checked against its gene list. @private */
+  async _geneRoute(path, generation) {
     const route = this._resolveGeneRoute(path, 'gene');
     const names = await this._geneNames(route);
     this._assertLifecycleGeneration(generation);
     if (route.gene >= names.names.length) {
       throw new RangeError(`This file has no gene ${route.gene} in ${route.element}.`);
     }
-    return this._coalesceInFlight(
-      this._geneExpressionInFlight,
-      JSON.stringify([route.element, route.gene]),
-      generation,
-      async () => {
-        const result = await this._loader.getMatrixColumn(route.element, route.gene);
-        this._assertLifecycleGeneration(generation);
-        return result;
-      }
-    );
+    return route;
   }
 
   /**
-   * The outlier quantiles of one categorical obs field in one latent space,
-   * by its route `_cellucid/mapping/latent/{obsm}/obs/{field}.outliers.f32`:
-   * `obsm` is the latent space's catalog position and `field` the field's
-   * payload index. The latent space is read once, checked (every value finite
-   * and representable as float32) as the reader worker streams it from the
-   * file, of any size; the reader keeps it while it fits its memory budget.
-   * The quantiles are the rule `cellucid serve` computes
-   * (`data/latent-outliers.js`).
+   * Some genes' values in some cells (`AnnDataReader.getMatrixCellSubset`):
+   * read by cell -- the cells' rows -- or by gene, whichever decodes less, so
+   * an analysis of a few thousand cells reads those cells' entries instead of
+   * every gene whole, and one of many cells reads the genes' entries.
    *
-   * @param {string} path
-   * @returns {Promise<Float32Array>}
+   * @param {ReadonlyArray<string>} paths - Gene payload paths of one matrix
+   *   (`getGeneValues`), each gene once
+   * @param {ArrayLike<number>} cells - Distinct cell positions
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   *   `owner`: the job the read is for
+   * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
+   *   Gene `g` (of `paths`) has entries `pointers[g]` to `pointers[g + 1]`,
+   *   each at position `cellIndex[k]` of `cells`, ascending
    */
-  async getLatentOutlierQuantiles(path) {
+  async getGeneCellSubset(paths, cells, { signal = null, owner = null } = {}) {
     const generation = this._captureLifecycleGeneration();
+    if (!Array.isArray(paths) || paths.length === 0) {
+      throw new TypeError('A cell subset reads at least one gene.');
+    }
+    const routes = paths.map(path => this._resolveGeneRoute(path, 'gene'));
+    const element = routes[0].element;
+    if (routes.some(route => route.element !== element)) {
+      throw new RangeError('A cell subset reads the genes of one expression matrix.');
+    }
+    const names = await this._geneNames(routes[0]);
+    this._assertLifecycleGeneration(generation);
+    for (const route of routes) {
+      if (route.gene >= names.names.length) {
+        throw new RangeError(`This file has no gene ${route.gene} in ${element}.`);
+      }
+    }
+    const subset = await this._loader.getMatrixCellSubset(
+      element,
+      cells,
+      routes.map(route => route.gene),
+      { signal, owner }
+    );
+    this._assertLifecycleGeneration(generation);
+    return subset;
+  }
+
+  /**
+   * The latent space and categorical field an outlier route names
+   * (`outliers/{obsm}/{field}`: `obsm` is the latent space's catalog
+   * position, `field` the field's position in the obs field list),
+   * checked. @private
+   */
+  _outlierRoute(path) {
     const route = parseMappingLatentPath(path);
     const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
     if (item === undefined) {
-      throw new RangeError(`This dataset has no outlier payload '${path}'.`);
+      throw new RangeError(`This dataset has no outlier route '${path}'.`);
     }
     const reason = latentCandidateReason(item);
     if (reason !== null) {
@@ -2260,25 +2465,86 @@ export class BaseAnnDataAdapter {
     if (field === undefined || field.kind !== 'category') {
       throw new RangeError(`This dataset has no categorical obs field ${route.fieldIndex}.`);
     }
+    if (this._outliers === null) throw new Error('Outlier quantiles are available once the dataset is open.');
+    return { item, field, width: obsmWidth(item) };
+  }
+
+  /**
+   * The latent space whose outlier quantiles the file stores (written by
+   * `prepare()` / `cellucid_prepare()`) for the rule this dataset applies,
+   * or null.
+   *
+   * @returns {string|null}
+   */
+  getStoredOutlierLatentKey() {
+    return this._outliers?.storedLatentKey ?? null;
+  }
+
+  /**
+   * What getting one field's outlier quantiles costs, before anything is
+   * read (`OutlierQuantileSource.describe`): read from the file, computed
+   * from a latent space the reader keeps, or computed by reading the whole
+   * latent space (and how many bytes that is).
+   *
+   * @param {string} path - The field's outlier route
+   * @param {{signal?: AbortSignal|null}} [options]
+   */
+  async describeLatentOutlierQuantiles(path, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const { item, field, width } = this._outlierRoute(path);
+    const plan = await this._outliers.describe({ latentKey: item.key, width, fieldKey: field.key, signal });
+    this._assertLifecycleGeneration(generation);
+    return plan;
+  }
+
+  /**
+   * The outlier quantiles of one categorical obs field in one latent space,
+   * by its route: the ones the file stores, else computed in the reader
+   * worker (`OutlierQuantileSource`; `data/latent-outliers.js` is the rule),
+   * from the field's codes: the ones the caller already holds (`codes`, a
+   * field just loaded), else the field's, read again.
+   *
+   * @param {string} path
+   * @param {{signal?: AbortSignal|null, codes?: Uint8Array|Uint16Array|Uint32Array|null}} [options]
+   *   `signal` ends this caller's wait; the computation stops once no caller
+   *   still waits for it.
+   * @returns {Promise<Float32Array>} NaN where a cell has none.
+   */
+  async getLatentOutlierQuantiles(path, { signal = null, codes = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const { item, field, width } = this._outlierRoute(path);
     return this._coalesceInFlight(
       this._latentOutlierInFlight,
       path,
       generation,
-      async () => {
-        const fieldData = await this.getObsFieldData(field.key);
-        this._assertLifecycleGeneration(generation);
-        const { TypedArrayClass } = categoricalStorageForDtype(
-          fieldData.dtype,
-          `Categorical field '${field.key}'`
-        );
-        const quantiles = await this._loader.latentOutlierQuantiles(item.key, obsmWidth(item), {
-          codes: new TypedArrayClass(fieldData.data),
-          nCategories: fieldData.categories.length,
-          minPoints: LATENT_OUTLIER_MIN_POINTS,
+      async workSignal => {
+        let fieldCodes = codes;
+        let nCategories = field.categories?.length ?? null;
+        if (fieldCodes === null || nCategories === null) {
+          const fieldData = await this.getObsFieldData(field.key, { signal: workSignal });
+          this._assertLifecycleGeneration(generation);
+          const { TypedArrayClass } = categoricalStorageForDtype(
+            fieldData.dtype,
+            `Categorical field '${field.key}'`
+          );
+          fieldCodes = new TypedArrayClass(fieldData.data);
+          nCategories = fieldData.categories.length;
+        }
+        if (!isCategoricalCodes(fieldCodes) || fieldCodes.length !== this._loader.nObs) {
+          throw new TypeError(`The codes of '${field.key}' must be one narrowed code per cell.`);
+        }
+        const quantiles = await this._outliers.quantiles({
+          latentKey: item.key,
+          width,
+          fieldKey: field.key,
+          codes: fieldCodes,
+          nCategories,
+          signal: workSignal,
         });
         this._assertLifecycleGeneration(generation);
         return quantiles;
-      }
+      },
+      signal
     );
   }
 
@@ -2291,30 +2557,32 @@ export class BaseAnnDataAdapter {
    * leaving no partial payload and no retained working set behind.
    *
    * The graph is checked as it is extracted (finite, non-negative, zero
-   * diagonal, exactly symmetric) and never repaired. The default graph's
-   * edges are kept for the life of the file; of every other graph only the
-   * one asked for last is kept, so switching graphs never holds more than two
-   * (the viewer holds the graph it shows, so it is not read again).
+   * diagonal, exactly symmetric) and never repaired. Only the graph asked
+   * for last is kept: it is the one the viewer shows, which holds the same
+   * payload by reference, so keeping it costs nothing and a graph no longer
+   * shown is not held.
    * A graph other than the default that fails its check is a
    * `MappingLoadError` naming the key, so that one choice is refused and the
    * rest stay available.
    *
    * @param {{signal?: AbortSignal|null, key?: string}} [options] - `key`
-   *   defaults to the graph the file opens with, `obsp['connectivities']`.
-   * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nCells: number, nEdges: number, maxNeighbors: number}|null>}
+   *   defaults to the graph the file opens with (`_defaultGraphKey`); when it
+   *   opens with none, the answer is null.
+   * @returns {Promise<Readonly<import('./connectivity-edges.js').ConnectivityEdges>|null>}
    *   Null when `obsp` has no such key.
    */
   async getConnectivityEdges(options = {}) {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Connectivity edge options must be an object.');
     }
-    const { key = DEFAULT_KNN_KEY, ...rest } = options;
-    requireObspKey(key);
+    const { key = this._defaultGraphKey(), ...rest } = options;
     const signal = getMetadataLoadSignal(
       rest,
       'Direct AnnData connectivity edges'
     );
     throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
+    if (key === null) return null;
+    requireObspKey(key);
     const generation = this._captureLifecycleGeneration();
     // Check if already computed.
     if (this._connectivityCache.has(key)) {
@@ -2325,7 +2593,7 @@ export class BaseAnnDataAdapter {
       return cached;
     }
 
-    const isDefault = key === DEFAULT_KNN_KEY;
+    const isDefault = key === this._defaultGraphKey();
     return waitForMetadata(
       this._coalesceInFlight(
         this._connectivityInFlight,
@@ -2347,7 +2615,7 @@ export class BaseAnnDataAdapter {
           // millions of stored values never holds the page.
           let edges;
           try {
-            edges = await this._loader.getConnectivityEdges(key);
+            edges = await this._loader.getConnectivityEdges(key, { signal: workSignal });
           } catch (error) {
             this._assertLifecycleGeneration(generation);
             if (isDefault) throw error;
@@ -2360,7 +2628,7 @@ export class BaseAnnDataAdapter {
             console.log(
               `[BaseAnnDataAdapter] obsp['${key}'] is absent`
             );
-            this._retainConnectivity(key, null, isDefault);
+            this._retainConnectivity(key, null);
             return null;
           }
           if (!edges || typeof edges !== 'object' || Array.isArray(edges)) {
@@ -2372,15 +2640,10 @@ export class BaseAnnDataAdapter {
             `[BaseAnnDataAdapter] Extracted ${edges.nEdges} unique edges`
           );
 
-          const result = {
-            sources: edges.sources,
-            destinations: edges.destinations,
-            weights: edges.weights,
-            nCells: edges.nCells,
-            nEdges: edges.nEdges,
-            maxNeighbors: edges.maxNeighbors,
-          };
-          this._retainConnectivity(key, result, isDefault);
+          // One payload, shared by reference with the viewer that shows it
+          // and the k-NN tool: keeping it here holds no second copy.
+          const result = Object.freeze(edges);
+          this._retainConnectivity(key, result);
           return result;
         },
         signal
@@ -2391,29 +2654,31 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Keep one extracted graph: the default for the life of the file, any
-   * other in the single slot of the graph asked for last.
+   * The neighbour graph the file opens with: the one a launch named
+   * (`defaults.knn`, null for none), else `obsp['connectivities']`.
+   *
+   * @returns {string|null}
+   * @private
+   */
+  _defaultGraphKey() {
+    return Object.hasOwn(this._defaults, 'knn') ? this._defaults.knn : DEFAULT_KNN_KEY;
+  }
+
+  /**
+   * Keep one extracted graph, the one asked for last.
    *
    * @param {string} key
    * @param {Object|null} edges
-   * @param {boolean} isDefault
    * @private
    */
-  _retainConnectivity(key, edges, isDefault) {
-    if (!isDefault) {
-      for (const cachedKey of [...this._connectivityCache.keys()]) {
-        if (cachedKey !== DEFAULT_KNN_KEY) {
-          this._connectivityCache.delete(cachedKey);
-        }
-      }
-    }
+  _retainConnectivity(key, edges) {
+    this._connectivityCache.clear();
     this._connectivityCache.set(key, edges);
   }
 
   /**
-   * The edge-pair manifest of one neighbour graph the candidate catalog
-   * lists, by its position in `candidates.obsp`
-   * (`_cellucid/mapping/knn/{p}/connectivity_manifest.json`). The graph is
+   * The summary of one neighbour graph the candidate catalog lists, by its
+   * position in `candidates.obsp` (its route `obsp/{p}`). The graph is
    * read and checked to count its edges; a graph that is unusable, absent or
    * fails its check is a `MappingLoadError` naming the key.
    *
@@ -2421,7 +2686,7 @@ export class BaseAnnDataAdapter {
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Readonly<Object>>}
    */
-  async getMappedConnectivityManifest(obspIndex, options = {}) {
+  async getMappedConnectivitySummary(obspIndex, options = {}) {
     const item = this.getMappingCandidates().obsp[obspIndex];
     if (item === undefined) {
       throw new RangeError(`This file has no obsp entry ${obspIndex}.`);
@@ -2444,14 +2709,11 @@ export class BaseAnnDataAdapter {
         `obsp['${item.key}'] is not present in this file.`
       );
     }
-    return Object.freeze(validateConnectivityManifest({
-      format: 'edge_pairs',
+    return Object.freeze(validateConnectivitySummary({
       n_cells: edges.nCells,
       n_edges: edges.nEdges,
       max_neighbors: edges.maxNeighbors,
-      index_dtype: 'uint32',
-      index_bytes: Uint32Array.BYTES_PER_ELEMENT,
-    }, CONNECTIVITY_MANIFEST_CONTEXT.DIRECT));
+    }));
   }
 
   /**
@@ -2465,7 +2727,7 @@ export class BaseAnnDataAdapter {
     this._vectorFieldInFlight.clear();
     this._connectivityInFlight.clear();
     this._geneExpressionInFlight.clear();
-    this._geneNameSets.clear();
+    this._geneNamesByRoute.clear();
     this._latentOutlierInFlight.clear();
     this._embeddingCache.clear();
     this._vectorFieldCache.clear();
@@ -2473,7 +2735,8 @@ export class BaseAnnDataAdapter {
     this._obsFieldDataCache.clear();
     this._obsFieldDataCacheBytes = 0n;
     this._connectivityCache.clear();
-    this._normInfo.clear();
+    this._embeddingInfo.clear();
+    this._vectorMagnitudes.clear();
   }
 
   /**
@@ -2482,6 +2745,7 @@ export class BaseAnnDataAdapter {
   close() {
     if (this._closed) return;
     this.clearCaches();
+    this._outliers?.close();
     this._closed = true;
     this._obsFieldsMetadata = null;
     this._loader.close();

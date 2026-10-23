@@ -5,17 +5,28 @@
  * dataset catalog, and any advertised WebSocket have all satisfied the current
  * contract. Remote failures are terminal; this source never retries,
  * reconnects, fabricates dataset metadata, or rewrites caller-supplied URLs.
+ *
+ * A Cellucid server (`cellucid serve` of an .h5ad or Zarr store,
+ * `serve_anndata()`) serves one AnnData store and declares it in its catalog
+ * entry (`anndata`, see `served-anndata.js`); the browser's AnnData reader
+ * reads it in place under the server's dataset id and name, and
+ * `getAnnDataSource()` exposes it.
  */
 
 import {
   DataSourceError,
   DataSourceErrorCode,
-  loadDatasetMetadata,
   readBoundedJson
 } from './data-source.js';
 import {
   loadMetadataBatchAtomically,
 } from './metadata-load-contract.js';
+import {
+  describeServedAnnData,
+  openServedAnnData,
+  requireServedAnnData,
+  servedStoreKey
+} from './served-anndata.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -24,7 +35,6 @@ import {
 const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
 const MAX_CONNECTION_TIMEOUT_MS = 120000;
 const REMOTE_MESSAGE_KEYS = Object.freeze(['type', 'payload']);
-const REMOTE_STATE_MANIFEST = 'state-snapshots.json';
 
 function isPlainRecord(value) {
   return (
@@ -230,117 +240,53 @@ function requireRemoteMessage(value) {
 }
 
 function requireRemoteHealthPayload(payload) {
-  if (!isPlainRecord(payload)) {
-    throw new TypeError('Remote health response must be a JSON object');
-  }
-
-  if (payload.type === 'exported') {
-    requireExactKeys(
-      payload,
-      ['status', 'type', 'version'],
-      [],
-      'Remote exported health response'
-    );
-  } else if (payload.type === 'anndata') {
-    requireExactKeys(
-      payload,
-      [
-        'status',
-        'type',
-        'version',
-        'format',
-        'is_backed',
-        'n_cells',
-        'n_genes'
-      ],
-      [],
-      'Remote AnnData health response'
-    );
-    if (!['h5ad', 'zarr', 'in-memory'].includes(payload.format)) {
-      throw new TypeError(
-        'Remote AnnData health format must be exactly h5ad, zarr, or in-memory'
-      );
-    }
-    if (typeof payload.is_backed !== 'boolean') {
-      throw new TypeError(
-        'Remote AnnData health is_backed must be a boolean'
-      );
-    }
-    requireNonNegativeSafeInteger(
-      payload.n_cells,
-      'Remote AnnData health n_cells'
-    );
-    requireNonNegativeSafeInteger(
-      payload.n_genes,
-      'Remote AnnData health n_genes'
-    );
-  } else {
-    throw new TypeError(
-      'Remote health response type must be exactly exported or anndata'
-    );
-  }
-
+  requireExactKeys(
+    payload,
+    ['status', 'type', 'version', 'format', 'n_cells', 'n_genes'],
+    [],
+    'Remote health response'
+  );
   if (payload.status !== 'ok') {
     throw new TypeError('Remote health response status must be exactly ok');
   }
+  if (payload.type !== 'anndata') {
+    throw new TypeError('Remote health response type must be exactly anndata');
+  }
+  if (!['h5ad', 'zarr'].includes(payload.format)) {
+    throw new TypeError('Remote health format must be exactly h5ad or zarr');
+  }
+  requireNonNegativeSafeInteger(payload.n_cells, 'Remote health n_cells');
+  requireNonNegativeSafeInteger(payload.n_genes, 'Remote health n_genes');
   requireExactText(payload.version, 'Remote health version');
   return Object.freeze({ ...payload });
 }
 
 function requireRemoteServerInfo(payload, health) {
-  if (!isPlainRecord(payload)) {
-    throw new TypeError('Remote server info must be a JSON object');
+  const websocketKeys = isPlainRecord(payload) && Object.hasOwn(payload, 'ws_port')
+    ? ['ws_port']
+    : [];
+  requireExactKeys(
+    payload,
+    ['version', 'type', 'format', 'host', 'port', 'n_cells', 'n_genes'],
+    websocketKeys,
+    'Remote server info'
+  );
+  if (payload.type !== 'anndata') {
+    throw new TypeError('Remote server info type must be exactly anndata');
   }
-  const websocketKeys = Object.hasOwn(payload, 'ws_port') ? ['ws_port'] : [];
-  if (health.type === 'exported') {
-    requireExactKeys(
-      payload,
-      ['version', 'host', 'port', 'mode'],
-      websocketKeys,
-      'Remote exported server info'
-    );
-    if (payload.mode !== 'standalone') {
-      throw new TypeError(
-        'Remote exported server mode must be exactly standalone'
-      );
-    }
-  } else {
-    requireExactKeys(
-      payload,
-      [
-        'version',
-        'type',
-        'format',
-        'host',
-        'port',
-        'n_cells',
-        'n_genes',
-        'is_backed'
-      ],
-      websocketKeys,
-      'Remote AnnData server info'
-    );
-    if (payload.type !== 'anndata') {
-      throw new TypeError(
-        'Remote AnnData server info type must be exactly anndata'
-      );
-    }
-    if (
-      payload.format !== health.format ||
-      payload.is_backed !== health.is_backed ||
-      payload.n_cells !== health.n_cells ||
-      payload.n_genes !== health.n_genes
-    ) {
-      throw new TypeError(
-        'Remote AnnData health and server info must describe the same dataset'
-      );
-    }
-  }
-
   requireExactText(payload.version, 'Remote server version');
   if (payload.version !== health.version) {
     throw new TypeError(
       'Remote health and server info versions must match exactly'
+    );
+  }
+  if (
+    payload.format !== health.format ||
+    payload.n_cells !== health.n_cells ||
+    payload.n_genes !== health.n_genes
+  ) {
+    throw new TypeError(
+      'Remote health and server info must describe the same dataset'
     );
   }
   requireExactText(payload.host, 'Remote server host');
@@ -348,128 +294,31 @@ function requireRemoteServerInfo(payload, health) {
   if (Object.hasOwn(payload, 'ws_port')) {
     requirePort(payload.ws_port, 'Remote WebSocket port');
   }
-  if (health.type === 'anndata') {
-    requireNonNegativeSafeInteger(
-      payload.n_cells,
-      'Remote AnnData server n_cells'
-    );
-    requireNonNegativeSafeInteger(
-      payload.n_genes,
-      'Remote AnnData server n_genes'
-    );
-    if (typeof payload.is_backed !== 'boolean') {
-      throw new TypeError(
-        'Remote AnnData server is_backed must be a boolean'
-      );
-    }
-  }
   return Object.freeze({ ...payload });
 }
 
-function requireDatasetCatalogPath(value, label) {
-  if (
-    typeof value !== 'string' ||
-    !/^\/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,179}\/)?$/.test(value)
-  ) {
-    throw new TypeError(
-      `${label} must be "/" or one exact portable dataset directory path`
-    );
-  }
-  const component = value === '/' ? null : value.slice(1, -1);
-  if (
-    component !== null &&
-    (component.endsWith('.') ||
-      /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(component))
-  ) {
-    throw new TypeError(`${label} contains a non-portable dataset directory`);
-  }
-  return value;
-}
-
-function requireDatasetStateCapability(entry, label) {
-  const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
-  const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
-  const hasStateBytes = Object.hasOwn(entry, 'state_bytes');
-  if (hasStateManifest !== hasStateSha256 || hasStateManifest !== hasStateBytes) {
-    throw new TypeError(
-      `${label} state_manifest, state_sha256 and state_bytes must be declared together`
-    );
-  }
-  if (!hasStateManifest) return null;
-  if (entry.state_manifest !== REMOTE_STATE_MANIFEST) {
-    throw new TypeError(
-      `${label}.state_manifest must be exactly ${REMOTE_STATE_MANIFEST}`
-    );
-  }
-  if (
-    typeof entry.state_sha256 !== 'string'
-    || !/^[0-9a-f]{64}$/.test(entry.state_sha256)
-  ) {
-    throw new TypeError(
-      `${label}.state_sha256 must be one lowercase SHA-256 digest`
-    );
-  }
-  if (!Number.isSafeInteger(entry.state_bytes) || entry.state_bytes < 1) {
-    throw new TypeError(
-      `${label}.state_bytes must be the default state's exact positive byte length`
-    );
-  }
-  return Object.freeze({
-    state_manifest: entry.state_manifest,
-    state_sha256: entry.state_sha256,
-    state_bytes: entry.state_bytes
-  });
-}
-
+/**
+ * The server's catalog: exactly one dataset, the AnnData store it serves.
+ */
 function requireDatasetCatalogPayload(payload) {
   requireExactKeys(payload, ['datasets'], [], 'Remote dataset listing');
-  if (!Array.isArray(payload.datasets)) {
-    throw new TypeError('Remote dataset listing datasets must be an array');
-  }
-  if (payload.datasets.length === 0) {
+  if (!Array.isArray(payload.datasets) || payload.datasets.length !== 1) {
     throw new TypeError(
-      'Remote dataset listing must declare at least one dataset'
+      'Remote dataset listing must declare exactly one dataset'
     );
   }
-
-  const ids = new Set();
-  const paths = new Set();
-  return Object.freeze(payload.datasets.map((entry, index) => {
-    const label = `Remote dataset listing datasets[${index}]`;
-    requireExactKeys(
-      entry,
-      ['id', 'path', 'name'],
-      ['state_manifest', 'state_sha256', 'state_bytes'],
-      label
-    );
-    const id = requireExactText(
-      entry.id,
-      `${label}.id`,
-      { allowWhitespace: true }
-    );
-    const path = requireDatasetCatalogPath(entry.path, `${label}.path`);
-    const name = requireExactText(
-      entry.name,
-      `${label}.name`,
-      { allowWhitespace: true }
-    );
-    const stateCapability = requireDatasetStateCapability(entry, label);
-    if (ids.has(id)) {
-      throw new TypeError(`Remote dataset listing contains duplicate id ${id}`);
-    }
-    if (paths.has(path)) {
-      throw new TypeError(
-        `Remote dataset listing contains duplicate path ${path}`
-      );
-    }
-    ids.add(id);
-    paths.add(path);
-    return Object.freeze(
-      stateCapability === null
-        ? { id, path, name }
-        : { id, path, name, ...stateCapability }
-    );
-  }));
+  const label = 'Remote dataset listing datasets[0]';
+  const entry = requireExactKeys(
+    payload.datasets[0],
+    ['id', 'name', 'anndata'],
+    [],
+    label
+  );
+  return Object.freeze([Object.freeze({
+    id: requireExactText(entry.id, `${label}.id`, { allowWhitespace: true }),
+    name: requireExactText(entry.name, `${label}.name`, { allowWhitespace: true }),
+    anndata: requireServedAnnData(entry.anndata, `${label}.anndata`),
+  })]);
 }
 
 async function requestJson(url, signal, label) {
@@ -586,60 +435,6 @@ function deliverCallbacks(callbacks, args) {
 }
 
 /**
- * Check whether a value declares the exact remote custom protocol prefix.
- *
- * @param {unknown} value
- * @returns {boolean}
- */
-export function isRemoteUrl(value) {
-  return (
-    typeof value === 'string' &&
-    (value.startsWith('remote://') || value.startsWith('remotes://'))
-  );
-}
-
-/**
- * Parse one canonical remote custom URL.
- *
- * @param {unknown} value
- * @returns {{serverUrl: string, path: string, secure: boolean}|null}
- */
-export function parseRemoteUrl(value) {
-  if (!isRemoteUrl(value) || value !== value.trim()) return null;
-  const match = /^(remote|remotes):\/\/([^/?#]+)(\/[^?#]*)$/.exec(value);
-  if (!match) return null;
-
-  const secure = match[1] === 'remotes';
-  const protocol = secure ? 'https:' : 'http:';
-  const candidate = `${protocol}//${match[2]}${match[3]}`;
-  let parsed;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    return null;
-  }
-  if (
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash ||
-    `${protocol}//${parsed.host}${parsed.pathname}` !== candidate
-  ) {
-    return null;
-  }
-  try {
-    requireCanonicalPathSegments(parsed.pathname, 'Remote URL');
-  } catch {
-    return null;
-  }
-  return Object.freeze({
-    serverUrl: `${protocol}//${parsed.host}`,
-    path: parsed.pathname.slice(1),
-    secure
-  });
-}
-
-/**
  * Data source for one explicit remote Cellucid server.
  */
 export class RemoteDataSource {
@@ -648,11 +443,29 @@ export class RemoteDataSource {
     this._serverUrl = null;
     /** @type {Object|null} */
     this._serverInfo = null;
+    /** @type {Object|null} The adopted health response */
+    this._health = null;
     this._connected = false;
-    /** @type {Map<string, string>} */
-    this._datasetPaths = new Map();
+    /**
+     * The open AnnData store of a server that serves one (`anndata` in its
+     * catalog entry), read in place by the browser's reader.
+     * @type {{key: string, datasetId: string, source: Object, metadata: Object, release: () => void}|null}
+     */
+    this._annData = null;
+    /** @type {string|null} Dataset whose base URL was handed out last */
+    this.datasetId = null;
+    /** @type {Map<string, Object>} Catalog entries by dataset id */
+    this._datasetEntries = new Map();
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
+    /**
+     * What the dataset list shows of each served store, by store
+     * (`servedStoreKey`): the list is read more than once (startup, then the
+     * data controls), and a store the server declares unchanged is described
+     * once. Cleared with the connection and on refresh.
+     * @type {Map<string, Promise<Object>>}
+     */
+    this._summaries = new Map();
     /** @type {Map<string, Object>} */
     this._metadataInFlight = new Map();
     /** @type {WebSocket|null} */
@@ -696,12 +509,68 @@ export class RemoteDataSource {
     return requireDatasetCatalogPayload(payload);
   }
 
+  /**
+   * Open a served AnnData store (once per connection and store) and return
+   * the metadata the reader reads from it.
+   *
+   * @private
+   */
+  async _openAnnDataMetadata(serverUrl, dataset) {
+    const key = servedStoreKey(serverUrl, dataset);
+    if (this._annData?.key === key) return this._annData.metadata;
+    const operationId = this._operationId;
+    const opened = await openServedAnnData({
+      serverUrl,
+      dataset,
+      sourceType: this.type
+    });
+    if (
+      !this._connected ||
+      this._operationId !== operationId ||
+      this._serverUrl !== serverUrl
+    ) {
+      opened.release();
+      throw new DataSourceError(
+        'Remote connection changed before the AnnData store was adopted',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
+    }
+    this._releaseAnnData();
+    this._annData = { key, datasetId: dataset.id, ...opened };
+    return opened.metadata;
+  }
+
+  /**
+   * One served store as the dataset list shows it, described once per store.
+   * A failed description is forgotten, so listing again retries it.
+   * @private
+   */
+  _describeStore(serverUrl, dataset, signal) {
+    const key = servedStoreKey(serverUrl, dataset);
+    let summary = this._summaries.get(key);
+    if (summary === undefined) {
+      summary = describeServedAnnData({ serverUrl, dataset, sourceType: this.type, signal });
+      this._summaries.set(key, summary);
+      summary.catch(() => {
+        if (this._summaries.get(key) === summary) this._summaries.delete(key);
+      });
+    }
+    return summary;
+  }
+
+  _releaseAnnData() {
+    const previous = this._annData;
+    this._annData = null;
+    if (this.datasetId === previous?.datasetId) this.datasetId = null;
+    previous?.release();
+  }
+
   _beginCatalogGeneration(reason) {
     const previousController = this._catalogController;
     const controller = new AbortController();
     this._catalogController = controller;
     const revision = ++this._catalogRevision;
-    this._metadataInFlight = new Map();
     previousController?.abort(new Error(reason));
     return { controller, revision };
   }
@@ -779,21 +648,6 @@ export class RemoteDataSource {
   }
 
   /**
-   * Whether the connected server serves an AnnData object (`cellucid serve`
-   * of an .h5ad or .zarr, or `serve_anndata()`) rather than prepared exports.
-   * Such a server publishes the data mapping it serves at
-   * `_cellucid/mapping/candidates.json` under the dataset base.
-   *
-   * @returns {boolean}
-   */
-  servesAnnData() {
-    if (!this._connected || this._serverInfo === null) {
-      throw new Error('Remote data source is not connected.');
-    }
-    return this._serverInfo.type === 'anndata';
-  }
-
-  /**
    * Establish one exact remote connection.
    *
    * @param {{url: string, timeout?: number}} config
@@ -841,9 +695,6 @@ export class RemoteDataSource {
         exactConfig.url,
         controller.signal
       );
-      const stagedPaths = new Map(
-        catalog.map(dataset => [dataset.id, dataset.path])
-      );
       stagedSocket = await this._openAdvertisedWebSocket(
         exactConfig.url,
         serverInfo,
@@ -859,10 +710,13 @@ export class RemoteDataSource {
       }
 
       const previousSocket = this._ws;
+      this._releaseAnnData();
       this._serverUrl = exactConfig.url;
       this._serverInfo = serverInfo;
-      this._datasetPaths = stagedPaths;
+      this._health = health;
+      this._datasetEntries = new Map(catalog.map(dataset => [dataset.id, dataset]));
       this._datasetCache = new Map();
+      this._summaries = new Map();
       this._ws = stagedSocket;
       this._connected = true;
       this._beginCatalogGeneration(
@@ -976,10 +830,13 @@ export class RemoteDataSource {
     const socket = this._ws;
     this._ws = null;
     this._connected = false;
+    this._releaseAnnData();
     this._serverUrl = null;
     this._serverInfo = null;
-    this._datasetPaths = new Map();
+    this._health = null;
+    this._datasetEntries = new Map();
     this._datasetCache = new Map();
+    this._summaries = new Map();
     this._endCatalogGeneration(
       'Remote catalog was retired by disconnect'
     );
@@ -1060,33 +917,13 @@ export class RemoteDataSource {
       serverUrl,
       catalogOwner.controller.signal
     );
-    const stagedPaths = new Map(
-      catalog.map(dataset => [dataset.id, dataset.path])
-    );
-    const metadataEntries = await loadMetadataBatchAtomically(
+    // The listing describes each store; it does not open one. Opening
+    // belongs to the dataset load (`getMetadata`), which a newer choice
+    // replaces.
+    const summaries = await loadMetadataBatchAtomically(
       catalog,
       catalogOwner.controller.signal,
-      async (dataset, signal) => {
-        const metadata = await loadDatasetMetadata(
-          `${serverUrl}${dataset.path}`,
-          dataset.id,
-          this.type,
-          { signal }
-        );
-        if (metadata.name !== dataset.name) {
-          throw new DataSourceError(
-            `Remote catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
-            DataSourceErrorCode.VALIDATION_ERROR,
-            this.type,
-            {
-              datasetId: dataset.id,
-              catalogName: dataset.name,
-              identityName: metadata.name
-            }
-          );
-        }
-        return [dataset.id, metadata];
-      },
+      (dataset, signal) => this._describeStore(serverUrl, dataset, signal),
       'Remote catalog metadata loading'
     );
 
@@ -1107,9 +944,9 @@ export class RemoteDataSource {
     this._beginCatalogGeneration(
       'Remote catalog metadata was adopted'
     );
-    this._datasetPaths = stagedPaths;
-    this._datasetCache = new Map(metadataEntries);
-    return metadataEntries.map(([, metadata]) => metadata);
+    this._datasetEntries = new Map(catalog.map(dataset => [dataset.id, dataset]));
+    this._datasetCache = new Map();
+    return summaries;
   }
 
   _requireDatasetId(datasetId) {
@@ -1120,9 +957,9 @@ export class RemoteDataSource {
     );
   }
 
-  _requireDeclaredDatasetPath(datasetId) {
+  _requireDeclaredDataset(datasetId) {
     const id = this._requireDatasetId(datasetId);
-    if (!this._datasetPaths.has(id)) {
+    if (!this._datasetEntries.has(id)) {
       throw new DataSourceError(
         `Remote dataset ${JSON.stringify(id)} is not declared by the current listing`,
         DataSourceErrorCode.NOT_FOUND,
@@ -1130,7 +967,7 @@ export class RemoteDataSource {
         { datasetId: id }
       );
     }
-    return this._datasetPaths.get(id);
+    return this._datasetEntries.get(id);
   }
 
   async hasDataset(datasetId) {
@@ -1142,7 +979,7 @@ export class RemoteDataSource {
       );
     }
     const id = this._requireDatasetId(datasetId);
-    if (this._datasetPaths.has(id)) return true;
+    if (this._datasetEntries.has(id)) return true;
     const datasets = await this.listDatasets();
     return datasets.some(dataset => dataset.id === id);
   }
@@ -1157,72 +994,56 @@ export class RemoteDataSource {
     }
     const id = this._requireDatasetId(datasetId);
     if (this._datasetCache.has(id)) return this._datasetCache.get(id);
-    const datasetPath = this._requireDeclaredDatasetPath(id);
+    const dataset = this._requireDeclaredDataset(id);
+    // Opening the store belongs to the connection, not to one listing: the
+    // dataset list is read again while a dataset opens, and that must not
+    // cancel the open. It stands while the connection lasts and the dataset
+    // still names the same store.
     const operationId = this._operationId;
     const serverUrl = this._serverUrl;
-    const catalogRevision = this._catalogRevision;
-    const catalogController = this._catalogController;
-    if (catalogController === null) {
-      throw new DataSourceError(
-        'Remote metadata loading requires an active catalog generation',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
-    }
-    const existing = this._metadataInFlight.get(id);
-    if (
-      existing?.operationId === operationId &&
-      existing.serverUrl === serverUrl &&
-      existing.catalogRevision === catalogRevision &&
-      existing.catalogController === catalogController &&
-      existing.datasetPath === datasetPath
-    ) {
+    const key = servedStoreKey(serverUrl, dataset);
+    const existing = this._metadataInFlight.get(key);
+    if (existing?.operationId === operationId && existing.serverUrl === serverUrl) {
       return existing.promise;
     }
 
-    const promise = (async () => {
-      const metadata = await loadDatasetMetadata(
-        `${serverUrl}${datasetPath}`,
-        id,
-        this.type,
-        { signal: catalogController.signal }
-      );
-      if (
-        !this._connected ||
-        this._operationId !== operationId ||
-        this._serverUrl !== serverUrl ||
-        this._catalogRevision !== catalogRevision ||
-        this._catalogController !== catalogController ||
-        catalogController.signal.aborted ||
-        this._datasetPaths.get(id) !== datasetPath
-      ) {
-        throw new DataSourceError(
-          'Remote connection changed before metadata adoption',
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type
-        );
+    const inFlight = { operationId, serverUrl, promise: null };
+    inFlight.promise = (async () => {
+      try {
+        const metadata = await this._openAnnDataMetadata(serverUrl, dataset);
+        const declared = this._datasetEntries.get(id);
+        if (
+          !this._connected ||
+          this._operationId !== operationId ||
+          this._serverUrl !== serverUrl ||
+          declared === undefined ||
+          servedStoreKey(serverUrl, declared) !== key
+        ) {
+          throw new DataSourceError(
+            'Remote connection changed before metadata adoption',
+            DataSourceErrorCode.NETWORK_ERROR,
+            this.type
+          );
+        }
+        this._datasetCache.set(id, metadata);
+        return metadata;
+      } finally {
+        if (this._metadataInFlight.get(key) === inFlight) {
+          this._metadataInFlight.delete(key);
+        }
       }
-      this._datasetCache.set(id, metadata);
-      return metadata;
     })();
-    const inFlight = {
-      operationId,
-      serverUrl,
-      catalogRevision,
-      catalogController,
-      datasetPath,
-      promise,
-    };
-    this._metadataInFlight.set(id, inFlight);
-    try {
-      return await promise;
-    } finally {
-      if (this._metadataInFlight.get(id) === inFlight) {
-        this._metadataInFlight.delete(id);
-      }
-    }
+    this._metadataInFlight.set(key, inFlight);
+    return inFlight.promise;
   }
 
+  /**
+   * The base URL of the dataset: the h5ad:// or zarr:// URL of the store the
+   * browser's reader opened, which its metadata load opens.
+   *
+   * @param {string} datasetId
+   * @returns {string}
+   */
   getBaseUrl(datasetId) {
     if (!this._connected || !this._serverUrl) {
       throw new DataSourceError(
@@ -1231,75 +1052,25 @@ export class RemoteDataSource {
         this.type
       );
     }
-    const id = this._requireDatasetId(datasetId);
-    const datasetPath = this._requireDeclaredDatasetPath(id);
-
-    const server = new URL(this._serverUrl);
-    const prefix = server.pathname === '/' ? '' : server.pathname;
-    const fullPath = `${prefix}${datasetPath}`;
-    const scheme = server.protocol === 'https:' ? 'remotes' : 'remote';
-    return `${scheme}://${server.host}${fullPath}`;
+    const id = this._requireDeclaredDataset(datasetId).id;
+    if (this._annData?.datasetId !== id) {
+      throw new DataSourceError(
+        `Remote dataset ${JSON.stringify(id)} is not open; load its metadata first`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { datasetId: id }
+      );
+    }
+    this.datasetId = id;
+    return this._annData.source.getBaseUrl(id);
   }
 
-  async resolveUrl(url) {
-    if (!this._connected || !this._serverUrl) {
-      throw new DataSourceError(
-        'Remote URL resolution requires an active connection',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
-    }
-    const parsed = parseRemoteUrl(url);
-    if (!parsed) {
-      throw new DataSourceError(
-        `Remote source cannot resolve a noncanonical remote URL: ${String(url)}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-
-    const connected = new URL(this._serverUrl);
-    const resolved = new URL(
-      parsed.path.length === 0 ? '/' : `/${parsed.path}`,
-      `${parsed.serverUrl}/`
-    );
-    const requiredPrefix = connected.pathname === '/' ? '/' : `${connected.pathname}/`;
-    if (
-      resolved.origin !== connected.origin ||
-      (
-        connected.pathname !== '/' &&
-        resolved.pathname !== requiredPrefix &&
-        !resolved.pathname.startsWith(requiredPrefix)
-      )
-    ) {
-      throw new DataSourceError(
-        'Remote URL does not belong to the active remote server',
-        DataSourceErrorCode.VALIDATION_ERROR,
-        this.type,
-        { url }
-      );
-    }
-
-    const serverPrefix =
-      connected.pathname === '/' ? '' : connected.pathname;
-    const belongsToDeclaredDataset = [
-      ...this._datasetPaths.values(),
-    ].some(datasetPath => {
-      const datasetPrefix = `${serverPrefix}${datasetPath}`;
-      return (
-        resolved.pathname === datasetPrefix ||
-        resolved.pathname.startsWith(datasetPrefix)
-      );
-    });
-    if (!belongsToDeclaredDataset) {
-      throw new DataSourceError(
-        'Remote URL does not belong to a currently declared dataset',
-        DataSourceErrorCode.VALIDATION_ERROR,
-        this.type,
-        { url }
-      );
-    }
-    return resolved.href;
+  /**
+   * The AnnData data source of the served store, once its metadata is loaded.
+   * @returns {Object|null}
+   */
+  getAnnDataSource() {
+    return this._annData?.source ?? null;
   }
 
   requiresManualReconnect() {
@@ -1311,6 +1082,7 @@ export class RemoteDataSource {
       'Remote metadata cache was refreshed'
     );
     this._datasetCache = new Map();
+    this._summaries = new Map();
   }
 
   onDeactivate() {

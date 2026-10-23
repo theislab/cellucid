@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=snapshot-connectivity-transparency-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=snapshot-connectivity-transparency-ci`;
 
 test('a pane\'s shown edges follow only its accepted transparency, through failure and retry', async ({
   page,
@@ -31,10 +31,34 @@ test('a pane\'s shown edges follow only its accepted transparency, through failu
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const proof = await page.evaluate(async () => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
     const ui = window._cellucidUi;
@@ -67,13 +91,9 @@ test('a pane\'s shown edges follow only its accepted transparency, through failu
     try {
       const pointCount = viewer.getPointCount();
       // Edge 0: cells 0-1. Edge 1: cells 1-2.
-      viewer.setupEdgesV2({
-        sources: Uint32Array.from([0, 1]),
-        destinations: Uint32Array.from([1, 2]),
-        weights: Float64Array.from([1, 0.5]),
-        nEdges: 2,
-        nCells: pointCount,
-      });
+      viewer.setupEdgesV2(
+        edgePayloadOf(Uint32Array.from([0, 1]), Uint32Array.from([1, 2]), Float32Array.from([1, 0.5]), pointCount),
+      );
       viewer.setEdgeVisibleTarget(2);
       const shown = viewId => viewer.getEdgeSelectionStatsForView(viewId).shownCount;
 

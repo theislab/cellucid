@@ -23,6 +23,7 @@ import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
 import { initHighlightControls } from '../modules/highlight-controls.js';
 import { initFieldSelector } from '../modules/field-selector.js';
+import { FieldSource } from '../../utils/field-constants.js';
 import { initViewControls } from '../modules/view-controls.js';
 import { initRepresentationControls } from '../modules/representation-controls.js';
 import { initDataMappingControls } from '../modules/data-mapping-controls.js';
@@ -158,8 +159,8 @@ export function createStableTerminalDestroy({
  */
 const DATA_SOURCE_STATUS_ID = 'data-source-status';
 const DATA_SOURCE_STATUS_READY =
-  'Data sources are ready. Load your own data, a server, or a GitHub '
-  + 'repository below.';
+  'Data sources are ready. Load your own data, a server, or open a '
+  + 'link below.';
 
 /**
  * @param {Document} documentOwner
@@ -272,7 +273,16 @@ export function initUI({
     canvas: dom.cellInfo.canvas
   });
 
-  const legend = initLegendRenderer({ state, viewer, dom: dom.display, dataSourceManager });
+  // The outlier filter's "Choose latent space" opens the Data mapping
+  // setting (created below, so it is looked up when clicked).
+  let dataMappingControls = null;
+  const legend = initLegendRenderer({
+    state,
+    viewer,
+    dom: dom.display,
+    dataSourceManager,
+    onChooseLatent: () => dataMappingControls?.reveal({ openSidebar: true, focusGroup: 'latent' }),
+  });
   const filterControls = initFilterControls({
     state,
     viewer,
@@ -305,7 +315,7 @@ export function initUI({
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
   });
-  const dataMappingControls = initDataMappingControls({
+  dataMappingControls = initDataMappingControls({
     state,
     root: dom.dataMapping.root
   });
@@ -506,6 +516,10 @@ export function initUI({
     dom: dom.session,
     sessionSerializer,
     datasetChanges,
+    currentDatasetIdentityId: () =>
+      dataSourceManager?.getCurrentIdentityId() ?? null,
+    // The dataset controls are made below; a session is only loaded later.
+    openDatasetSource: record => datasetControls.openDatasetSource(record),
     onAfterLoad: refreshUiAfterStateLoad
   });
   const { showSessionStatus } = sessionControls;
@@ -580,10 +594,12 @@ export function initUI({
     'visibility:changed',
     handleVisibilityChange
   );
-  const handleFieldChanged = () => {
-    fieldSelector.renderFieldSelects?.();
+  // A field change names its source: one obs field's change leaves the gene
+  // list as it is, and one gene's leaves the obs field selects as they are.
+  const handleFieldChanged = ({ source }) => {
+    if (source !== FieldSource.VAR) fieldSelector.renderFieldSelects?.();
     fieldSelector.renderDeletedFieldsSection?.();
-    fieldSelector.initGeneExpressionDropdown?.();
+    if (source !== FieldSource.OBS) fieldSelector.initGeneExpressionDropdown?.();
     fieldSelector.syncFromState?.();
     handleActiveFieldChanged();
     handleVisibilityChange();
@@ -611,7 +627,7 @@ export function initUI({
     () => {
       viewControls?.renderSplitViewBadges?.();
       datasetControls.updateMappedDatasetFacts({
-        connectivityEdges: state.getConnectivityEdgeCount(),
+        connectivity: state.getConnectivityGraphFact(),
         genes: state.getVarAxisGeneCount(),
       });
     }
@@ -864,10 +880,12 @@ export function initUI({
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    showLoadedConnectivityEdges: datasetControls.showLoadedConnectivityEdges,
     refreshDataMapping: dataMappingControls.datasetPublished,
     cycleRepresentation: representationControls.cycle,
     settleFieldInteractions: fieldSelector.settleAllInteractions,
     cinematicCamera,
+    figureExport: figureExportControls,
     publishSnapshotView: publishOwnedSnapshot,
     retireSnapshotView: retireOwnedSnapshot,
     clearSnapshotViews: clearOwnedSnapshots,

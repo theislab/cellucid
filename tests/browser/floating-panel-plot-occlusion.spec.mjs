@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { expectFloatingSettled } from './helpers/panels.mjs';
 
@@ -25,8 +25,8 @@ import { expectFloatingSettled } from './helpers/panels.mjs';
    read back after the screenshot. */
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=floating-panel-plot-occlusion-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=floating-panel-plot-occlusion-ci';
 
 test.use({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2 });
 
@@ -38,7 +38,7 @@ async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.evaluate(() => {
     for (const button of document.querySelectorAll('.notification-dismiss')) {

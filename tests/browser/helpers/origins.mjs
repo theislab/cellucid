@@ -8,7 +8,7 @@
 // fixtures at the old one, which fails the whole spec rather than the one
 // request. So a spec never writes an origin down, it asks for one here.
 //
-// Most fixture roots travel to the application inside the `exportsBaseUrl`
+// Most fixture roots travel to the application inside the `sampleCatalog`
 // query parameter and so arrive percent-encoded. `encodedAppUrl` builds that
 // form by encoding the resolved URL, never by editing an already-encoded
 // literal — substituting a port inside `http%3A%2F%2F…%3A<port>%2F…` is how the
@@ -81,10 +81,10 @@ export function encodedAppUrl(pathname) {
   return encodeURIComponent(appUrl(pathname));
 }
 
-/** Root the prepared export fixtures are served from. */
-export const EXPORTS_BASE_URL = appUrl('/tests/browser/fixtures/exports/');
+/** The browser tests' default sample catalog (`fixtures/catalog/`). */
+export const SAMPLE_CATALOG_URL = appUrl('/tests/browser/fixtures/catalog/');
 
-/** {@link EXPORTS_BASE_URL} as an `exportsBaseUrl` query-parameter value. */
-export const ENCODED_EXPORTS_BASE_URL = encodedAppUrl(
-  '/tests/browser/fixtures/exports/'
+/** {@link SAMPLE_CATALOG_URL} as an `sampleCatalog` query-parameter value. */
+export const ENCODED_SAMPLE_CATALOG_URL = encodedAppUrl(
+  '/tests/browser/fixtures/catalog/'
 );

@@ -5,12 +5,15 @@
     "test": "node scripts/run-web-tests.mjs",
     "test:browser": "playwright test",
     "test:browser:bounded": "node scripts/run-browser-shard-bounded.mjs",
-    "test:worker-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.community-annotations.jsonc"
+    "test:worker-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.community-annotations.jsonc",
+    "bench:anndata": "node scripts/benchmark-anndata.mjs",
+    "bench:hdf5": "node scripts/benchmark-hdf5-reader.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.0"
+    "@playwright/test": "1.62.0",
+    "h5wasm": "0.10.3"
   }
 }

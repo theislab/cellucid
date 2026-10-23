@@ -11,6 +11,20 @@ import { getHeatmapTraceType } from '../plotly-loader.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 
+/**
+ * Category counts summed over pages, categories in first-occurrence order
+ * across the pages in turn (the order counting every page's cells gives).
+ * @param {Array<Map<unknown, number>>} pageCounts
+ * @returns {Map<unknown, number>}
+ */
+function mergeCounts(pageCounts) {
+  const merged = new Map();
+  for (const counts of pageCounts) {
+    for (const [category, count] of counts) merged.set(category, (merged.get(category) || 0) + count);
+  }
+  return merged;
+}
+
 const heatmapDefinition = {
   id: 'heatmap',
   name: 'Heatmap',
@@ -45,15 +59,13 @@ const heatmapDefinition = {
     const { colorscale = 'Blues', showValues = true, normalize = 'row', sortRows = true } = options;
     const theme = getPlotTheme();
 
-    // Collect all categories across all pages
-    const globalCounts = new Map();
-    for (const pd of pageData) {
-      for (const value of pd.values) globalCounts.set(value, (globalCounts.get(value) || 0) + 1);
-    }
+    // Every category across all pages, merged from the counts each page was
+    // published with (no cell is visited on a redraw).
+    const pageCounts = pageData.map(pd => PlotHelpers.countCategories(pd.values));
+    const globalCounts = mergeCounts(pageCounts);
 
     const categories = sortRows ? PlotHelpers.sortCategories(globalCounts, 'count') : Array.from(globalCounts.keys());
     const pageNames = pageData.map(pd => pd.pageName);
-    const pageCounts = pageData.map(pd => PlotHelpers.countCategories(pd.values));
 
     // Calculate totals for normalization
     const rowTotals = categories.map(cat => pageCounts.reduce((sum, pc) => sum + (pc.get(cat) || 0), 0));
@@ -136,12 +148,11 @@ const heatmapDefinition = {
   exportCSV(pageData, options) {
     const { normalize = 'row', sortRows = true } = options;
 
-    const globalCounts = new Map();
-    for (const pd of pageData) for (const value of pd.values) globalCounts.set(value, (globalCounts.get(value) || 0) + 1);
+    const pageCounts = pageData.map(pd => PlotHelpers.countCategories(pd.values));
+    const globalCounts = mergeCounts(pageCounts);
 
     const categories = sortRows ? PlotHelpers.sortCategories(globalCounts, 'count') : Array.from(globalCounts.keys());
     const pageNames = pageData.map(pd => pd.pageName);
-    const pageCounts = pageData.map(pd => PlotHelpers.countCategories(pd.values));
     const rowTotals = categories.map(cat => pageCounts.reduce((sum, pc) => sum + (pc.get(cat) || 0), 0));
     const colTotals = pageCounts.map(pc => categories.reduce((sum, cat) => sum + (pc.get(cat) || 0), 0));
     const grandTotal = rowTotals.reduce((a, b) => a + b, 0);

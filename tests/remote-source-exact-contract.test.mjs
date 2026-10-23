@@ -1,16 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  RemoteDataSource,
-  isRemoteUrl,
-  parseRemoteUrl,
-} from '../assets/js/data/remote-source.js';
-import { loadMappingCandidates } from '../assets/js/data/data-loaders.js';
-import {
-  MAPPING_CANDIDATES_PATH,
-  resolveAnnDataMapping,
-} from '../assets/js/data/dataset-mapping.js';
+import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 
 function jsonResponse(value, status = 200) {
   return new Response(
@@ -23,32 +14,12 @@ function jsonResponse(value, status = 200) {
   );
 }
 
-function exportedHealth(overrides = {}) {
-  return {
-    status: 'ok',
-    type: 'exported',
-    version: '1.2.3',
-    ...overrides,
-  };
-}
-
-function exportedInfo(overrides = {}) {
-  return {
-    version: '1.2.3',
-    host: '127.0.0.1',
-    port: 8765,
-    mode: 'standalone',
-    ...overrides,
-  };
-}
-
 function anndataHealth(overrides = {}) {
   return {
     status: 'ok',
     type: 'anndata',
     version: '1.2.3',
     format: 'h5ad',
-    is_backed: true,
     n_cells: 3,
     n_genes: 2,
     ...overrides,
@@ -64,47 +35,12 @@ function anndataInfo(overrides = {}) {
     port: 8765,
     n_cells: 3,
     n_genes: 2,
-    is_backed: true,
     ...overrides,
   };
 }
 
-function catalog(
-  entries = [{ id: 'cells', path: '/', name: 'Cells' }]
-) {
+function catalog(entries = [servedAnnDataEntry()]) {
   return { datasets: entries };
-}
-
-function identity(id = 'cells', name = 'Cells') {
-  return {
-    version: 3,
-    id,
-    name,
-    description: 'Synthetic remote contract fixture',
-    cellucid_data_version: 'test-current',
-    stats: {
-      n_cells: 3,
-      n_genes: 2,
-      n_obs_fields: 0,
-      n_categorical_fields: 0,
-      n_continuous_fields: 0,
-      has_connectivity: false,
-      n_edges: null,
-    },
-    embeddings: {
-      default_dimension: 2,
-      defaults: { '2d': 'X_umap' },
-      items: {
-        X_umap: {
-          label: 'X_umap',
-          dimension: 2,
-          file: 'embeddings/0_2d.bin',
-          source: { key: 'X_umap', columns: [0, 1] },
-        },
-      },
-    },
-    obs_fields: [],
-  };
 }
 
 function installFetch(t, implementation) {
@@ -121,23 +57,19 @@ function installFetch(t, implementation) {
   return requests;
 }
 
-function installCanonicalExportedServer(
+function installCanonicalServer(
   t,
   {
     origin = 'http://127.0.0.1:8765',
-    health = exportedHealth(),
-    info = exportedInfo(),
+    health = anndataHealth(),
+    info = anndataInfo(),
     listing = catalog(),
-    datasetIdentity = identity(),
   } = {}
 ) {
   return installFetch(t, url => {
     if (url === `${origin}/_cellucid/health`) return jsonResponse(health);
     if (url === `${origin}/_cellucid/info`) return jsonResponse(info);
     if (url === `${origin}/_cellucid/datasets`) return jsonResponse(listing);
-    if (url === `${origin}/dataset_identity.json`) {
-      return jsonResponse(datasetIdentity);
-    }
     return jsonResponse({ error: 'not found' }, 404);
   });
 }
@@ -219,55 +151,6 @@ function installWebSocket(t, implementation) {
   });
 }
 
-test('remote custom URLs use one canonical explicit transport', () => {
-  assert.equal(isRemoteUrl('remote://example.test/data/'), true);
-  assert.equal(isRemoteUrl('remotes://example.test/data/'), true);
-  assert.equal(isRemoteUrl({ startsWith: () => true }), false);
-
-  assert.deepEqual(
-    parseRemoteUrl('remote://example.test:8765/data/embeddings/0_2d.bin'),
-    {
-      serverUrl: 'http://example.test:8765',
-      path: 'data/embeddings/0_2d.bin',
-      secure: false,
-    }
-  );
-  assert.deepEqual(
-    parseRemoteUrl('remotes://example.test/data/'),
-    {
-      serverUrl: 'https://example.test',
-      path: 'data/',
-      secure: true,
-    }
-  );
-  assert.deepEqual(
-    parseRemoteUrl(
-      'remotes://example.test/cell%20atlas/%E7%BB%86%E8%83%9E.bin'
-    ),
-    {
-      serverUrl: 'https://example.test',
-      path:
-        'cell%20atlas/%E7%BB%86%E8%83%9E.bin',
-      secure: true,
-    }
-  );
-
-  for (const malformed of [
-    'remote://example.test',
-    'remote://EXAMPLE.test/data/',
-    'remote://user@example.test/data/',
-    'remote://example.test/a/../data/',
-    'remote://example.test/%252e%252e/data/',
-    'remote://example.test/nested/%252fdata/',
-    'remote://example.test/nested/%255cdata/',
-    'remote://example.test/nested/%2541/',
-    'remote://example.test/data/?query=1',
-    ' remote://example.test/data/',
-  ]) {
-    assert.equal(parseRemoteUrl(malformed), null, malformed);
-  }
-});
-
 test('remote connection configuration rejects normalization and retired reconnect controls', async () => {
   const source = new RemoteDataSource();
   const invalidConfigs = [
@@ -307,12 +190,12 @@ test('HTTPS pages reject an HTTP remote URL instead of silently upgrading it', a
   );
 });
 
-test('connect adopts one complete exported server and exact catalog transaction', async t => {
-  const requests = installCanonicalExportedServer(t);
+test('connect adopts one complete server and exact catalog transaction', async t => {
+  const requests = installCanonicalServer(t);
   const source = new RemoteDataSource();
 
   const info = await source.connect({ url: 'http://127.0.0.1:8765' });
-  assert.deepEqual(info, exportedInfo());
+  assert.deepEqual(info, anndataInfo());
   assert.equal(Object.isFrozen(info), true);
   assert.equal(source.isConnected(), true);
   assert.deepEqual(
@@ -326,95 +209,30 @@ test('connect adopts one complete exported server and exact catalog transaction'
   assert.ok(requests.every(request => request.options.cache === 'no-store'));
   assert.ok(requests.every(request => request.options.redirect === 'error'));
 
-  assert.equal(source.getBaseUrl('cells'), 'remote://127.0.0.1:8765/');
-  assert.equal(
-    await source.resolveUrl('remote://127.0.0.1:8765/embeddings/0_2d.bin'),
-    'http://127.0.0.1:8765/embeddings/0_2d.bin'
-  );
-  await assert.rejects(
-    source.resolveUrl('remote://other.test/embeddings/0_2d.bin'),
-    /does not belong/i
-  );
   await assert.rejects(
     source.getMetadata('undeclared'),
     /not declared/i
   );
 });
 
-test('remote resolution is confined to current declared dataset paths', async t => {
-  const origin = 'http://127.0.0.1:8765/viewer';
-  installFetch(t, url => {
-    if (url === `${origin}/_cellucid/health`) {
-      return jsonResponse(exportedHealth());
-    }
-    if (url === `${origin}/_cellucid/info`) {
-      return jsonResponse(exportedInfo());
-    }
-    if (url === `${origin}/_cellucid/datasets`) {
-      return jsonResponse(catalog([
-        { id: 'cells', path: '/cells/', name: 'Cells' },
-      ]));
-    }
-    return jsonResponse({}, 404);
-  });
-
-  const source = new RemoteDataSource();
-  await source.connect({ url: origin });
-  assert.equal(
-    source.getBaseUrl('cells'),
-    'remote://127.0.0.1:8765/viewer/cells/'
-  );
-  assert.equal(
-    await source.resolveUrl(
-      'remote://127.0.0.1:8765/viewer/cells/embeddings/0_2d.bin'
-    ),
-    `${origin}/cells/embeddings/0_2d.bin`
-  );
-  assert.equal(
-    await source.resolveUrl(
-      `remote://127.0.0.1:8765/viewer/cells/${MAPPING_CANDIDATES_PATH}`
-    ),
-    `${origin}/cells/_cellucid/mapping/candidates.json`
-  );
-  for (const url of [
-    'remote://127.0.0.1:8765/viewer/retired/private.json',
-    'remote://127.0.0.1:8765/viewer/_cellucid/events',
-  ]) {
-    await assert.rejects(
-      source.resolveUrl(url),
-      /currently declared dataset/i,
-      url
-    );
-  }
-});
-
-function servedAnnDataCandidates() {
+function servedAnnDataEntry(overrides = {}) {
   return {
-    kind: 'anndata',
-    defaults: {
-      kind: 'anndata',
-      // The served slot is the 2D default; a second array is enabled beside it.
-      embeddings: {
-        enabled: [
-          { key: 'X_tsne', columns: [0, 1] },
-          { key: 'X_umap', columns: [0, 1] },
-        ],
-        defaults: {
-          '1d': null,
-          '2d': { key: 'X_umap', columns: [0, 1] },
-          '3d': null,
-        },
+    id: 'cells',
+    name: 'Cells',
+    anndata: {
+      file: {
+        url: '_cellucid/anndata/cells.h5ad',
+        kind: 'h5ad',
+        layout: 'file',
+        size: 1024,
       },
-      knn: null,
-      geneNames: 'index',
-      expression: 'X',
-      latent: null,
-      vectorFields: [],
+      defaults: { knn: 'connectivities', normalizeEmbeddings: true },
     },
+    ...overrides,
   };
 }
 
-function installAnnDataServer(t, { candidates = servedAnnDataCandidates() } = {}) {
+function installAnnDataServer(t, { entries = [servedAnnDataEntry()] } = {}) {
   return installFetch(t, url => {
     if (url.endsWith('/_cellucid/health')) {
       return jsonResponse(anndataHealth());
@@ -423,150 +241,102 @@ function installAnnDataServer(t, { candidates = servedAnnDataCandidates() } = {}
       return jsonResponse(anndataInfo());
     }
     if (url.endsWith('/_cellucid/datasets')) {
-      return jsonResponse(catalog());
-    }
-    if (url === 'http://127.0.0.1:8765/dataset_identity.json') {
-      return jsonResponse(identity());
-    }
-    if (
-      candidates !== null &&
-      url === `http://127.0.0.1:8765/${MAPPING_CANDIDATES_PATH}`
-    ) {
-      return jsonResponse(candidates);
+      return jsonResponse(catalog(entries));
     }
     return jsonResponse({}, 404);
   });
 }
 
-test('connect accepts the exact current AnnData health and info pair', async t => {
+test('connect accepts the exact current AnnData health, info and catalog', async t => {
   installAnnDataServer(t);
   const source = new RemoteDataSource();
-  assert.throws(() => source.servesAnnData(), /not connected/i);
   await source.connect({ url: 'http://127.0.0.1:8765' });
   assert.equal(source.isConnected(), true);
   assert.equal(source.getConnectionInfo().serverInfo.type, 'anndata');
-  assert.equal(source.servesAnnData(), true);
+  // The store is opened when its metadata is first asked for.
+  assert.equal(source.getAnnDataSource(), null);
+  assert.throws(() => source.getBaseUrl('cells'), /not open; load its metadata first/);
   source.disconnect();
-  assert.throws(() => source.servesAnnData(), /not connected/i);
+  assert.equal(source.getAnnDataSource(), null);
 });
 
-test('an exported server does not serve AnnData', async t => {
-  installCanonicalExportedServer(t);
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  assert.equal(source.servesAnnData(), false);
-});
-
-test('an AnnData server publishes the data mapping it serves under the dataset base', async t => {
-  const requests = installAnnDataServer(t);
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  const metadata = await source.getMetadata('cells');
-  const baseUrl = source.getBaseUrl('cells');
-  assert.equal(baseUrl, 'remote://127.0.0.1:8765/');
-
-  const candidates = await loadMappingCandidates(
-    `${baseUrl}${MAPPING_CANDIDATES_PATH}`,
-    { candidateAnnDataBinding: null, signal: null, stagedSource: source }
-  );
-  assert.equal(
-    requests.at(-1).url,
-    'http://127.0.0.1:8765/_cellucid/mapping/candidates.json'
-  );
-  assert.deepEqual(candidates, servedAnnDataCandidates());
-  assert.deepEqual(
-    resolveAnnDataMapping(candidates, metadata),
-    servedAnnDataCandidates().defaults
-  );
-});
-
-test('an AnnData server without the data-mapping route is refused, not guessed', async t => {
-  installAnnDataServer(t, { candidates: null });
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  assert.equal(source.servesAnnData(), true);
-  await assert.rejects(
-    loadMappingCandidates(
-      `${source.getBaseUrl('cells')}${MAPPING_CANDIDATES_PATH}`,
-      { candidateAnnDataBinding: null, signal: null, stagedSource: source }
-    ),
-    /404|not found/i
-  );
-});
-
-test('a served data mapping must agree with the identity served beside it', async t => {
-  const contradicting = servedAnnDataCandidates();
-  // The 2D default names other columns than the identity serves: enabled,
-  // so the mapping is valid, but not what the identity shows.
-  contradicting.defaults.embeddings.enabled.push({ key: 'X_umap', columns: [1, 0] });
-  contradicting.defaults.embeddings.defaults['2d'] = { key: 'X_umap', columns: [1, 0] };
-  installAnnDataServer(t, { candidates: contradicting });
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  const metadata = await source.getMetadata('cells');
-  const candidates = await loadMappingCandidates(
-    `${source.getBaseUrl('cells')}${MAPPING_CANDIDATES_PATH}`,
-    { candidateAnnDataBinding: null, signal: null, stagedSource: source }
-  );
-  assert.throws(
-    () => resolveAnnDataMapping(candidates, metadata),
-    /data mapping shows .*2d.*identity shows/i
-  );
+test('an AnnData catalog entry is closed and checked before anything is read', async t => {
+  const cases = [
+    ['no store', [{ id: 'cells', name: 'Cells' }], /missing anndata/],
+    ['a prepared-export directory', [{ ...servedAnnDataEntry(), path: '/' }], /unsupported path/],
+    ['two datasets', [servedAnnDataEntry(), servedAnnDataEntry({ id: 'other' })], /exactly one dataset/],
+    ['store outside the route', [servedAnnDataEntry({
+      anndata: { file: { url: '/etc/passwd', kind: 'h5ad', layout: 'file', size: 1 }, defaults: {} },
+    })], /route under _cellucid\/anndata\//],
+    ['a folder without its slash', [servedAnnDataEntry({
+      anndata: { file: { url: '_cellucid/anndata/cells.zarr', kind: 'zarr', layout: 'folder' }, defaults: {} },
+    })], /store folder, ending in "\/"/],
+    ['a sized folder', [servedAnnDataEntry({
+      anndata: { file: { url: '_cellucid/anndata/cells.zarr/', kind: 'zarr', layout: 'folder', size: 3 }, defaults: {} },
+    })], /unsupported size/],
+    ['an h5ad in a zip', [servedAnnDataEntry({
+      anndata: { file: { url: '_cellucid/anndata/cells.zip', kind: 'h5ad', layout: 'zip', size: 3 }, defaults: {} },
+    })], /h5ad file, a zipped Zarr store or a Zarr store folder/],
+    ['an unknown launch default', [servedAnnDataEntry({
+      anndata: { file: servedAnnDataEntry().anndata.file, defaults: { knnKey: 'connectivities' } },
+    })], /Unknown AnnData launch default/],
+    ['the expression in the panel vocabulary', [servedAnnDataEntry({
+      anndata: { file: servedAnnDataEntry().anndata.file, defaults: { expression: 'raw' } },
+    })], /'X', 'raw\/X', 'layers\/<name>' or null/],
+  ];
+  for (const [label, entries, match] of cases) {
+    await t.test(label, async t => {
+      installAnnDataServer(t, { entries });
+      const source = new RemoteDataSource();
+      await assert.rejects(source.connect({ url: 'http://127.0.0.1:8765' }), match);
+      assert.equal(source.isConnected(), false);
+    });
+  }
 });
 
 test('health, info, and catalog schemas are closed and cross-checked', async t => {
   const cases = [
     {
       label: 'health extra field',
-      health: exportedHealth({ message: 'fine' }),
-      info: exportedInfo(),
+      health: anndataHealth({ message: 'fine' }),
+      info: anndataInfo(),
       listing: catalog(),
       match: /health.*noncanonical|unsupported message/i,
     },
     {
       label: 'health noncanonical status',
-      health: exportedHealth({ status: 'healthy' }),
-      info: exportedInfo(),
+      health: anndataHealth({ status: 'healthy' }),
+      info: anndataInfo(),
       listing: catalog(),
       match: /status must be exactly ok/i,
     },
     {
+      label: 'the retired prepared-export server',
+      health: { status: 'ok', type: 'exported', version: '1.2.3' },
+      info: anndataInfo(),
+      listing: catalog(),
+      match: /missing format/i,
+    },
+    {
       label: 'server info version mismatch',
-      health: exportedHealth(),
-      info: exportedInfo({ version: '9.9.9' }),
+      health: anndataHealth(),
+      info: anndataInfo({ version: '9.9.9' }),
       listing: catalog(),
       match: /versions must match/i,
     },
     {
-      label: 'server info retired mode',
-      health: exportedHealth(),
-      info: exportedInfo({ mode: 'async' }),
+      label: 'health and info describe different stores',
+      health: anndataHealth(),
+      info: anndataInfo({ n_cells: 4 }),
       listing: catalog(),
-      match: /mode must be exactly standalone/i,
-    },
-    {
-      label: 'catalog missing path',
-      health: exportedHealth(),
-      info: exportedInfo(),
-      listing: catalog([{ id: 'cells', name: 'Cells' }]),
-      match: /missing path/i,
-    },
-    {
-      label: 'catalog duplicate path',
-      health: exportedHealth(),
-      info: exportedInfo(),
-      listing: catalog([
-        { id: 'first', path: '/same/', name: 'First' },
-        { id: 'second', path: '/same/', name: 'Second' },
-      ]),
-      match: /duplicate path/i,
+      match: /describe the same dataset/i,
     },
     {
       label: 'empty catalog',
-      health: exportedHealth(),
-      info: exportedInfo(),
+      health: anndataHealth(),
+      info: anndataInfo(),
       listing: catalog([]),
-      match: /at least one dataset/i,
+      match: /exactly one dataset/i,
     },
   ];
 
@@ -601,17 +371,17 @@ test('a failed replacement connection preserves the previous complete connection
   installFetch(t, url => {
     if (url.startsWith('http://first.test')) {
       if (url.endsWith('/_cellucid/health')) {
-        return jsonResponse(exportedHealth());
+        return jsonResponse(anndataHealth());
       }
       if (url.endsWith('/_cellucid/info')) {
-        return jsonResponse(exportedInfo());
+        return jsonResponse(anndataInfo());
       }
       if (url.endsWith('/_cellucid/datasets')) {
         return jsonResponse(catalog());
       }
     }
     if (url === 'http://second.test/_cellucid/health') {
-      return jsonResponse(exportedHealth({ status: 'not-ok' }));
+      return jsonResponse(anndataHealth({ status: 'not-ok' }));
     }
     return jsonResponse({}, 404);
   });
@@ -624,195 +394,7 @@ test('a failed replacement connection preserves the previous complete connection
   );
   assert.equal(source.isConnected(), true);
   assert.equal(source.getConnectionInfo().url, 'http://first.test');
-  assert.equal(source.getBaseUrl('cells'), 'remote://first.test/');
-});
-
-test('dataset listing failure propagates without fabricated metadata or partial adoption', async t => {
-  let identityStatus = 200;
-  const listing = catalog();
-  installFetch(t, url => {
-    if (url.endsWith('/_cellucid/health')) {
-      return jsonResponse(exportedHealth());
-    }
-    if (url.endsWith('/_cellucid/info')) {
-      return jsonResponse(exportedInfo());
-    }
-    if (url.endsWith('/_cellucid/datasets')) {
-      return jsonResponse(listing);
-    }
-    if (url.endsWith('/dataset_identity.json')) {
-      return identityStatus === 200
-        ? jsonResponse(identity())
-        : jsonResponse({}, identityStatus);
-    }
-    return jsonResponse({}, 404);
-  });
-
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  const datasets = await source.listDatasets();
-  assert.equal(datasets.length, 1);
-  assert.equal(datasets[0].stats.n_cells, 3);
-
-  identityStatus = 404;
-  await assert.rejects(
-    source.listDatasets(),
-    /dataset_identity|missing|required/i
-  );
-  assert.equal((await source.getMetadata('cells')).stats.n_cells, 3);
-});
-
-test('dataset catalog and identity names must agree exactly', async t => {
-  installCanonicalExportedServer(t, {
-    listing: catalog([
-      { id: 'cells', path: '/', name: 'Catalog name' },
-    ]),
-    datasetIdentity: identity('cells', 'Identity name'),
-  });
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  await assert.rejects(source.listDatasets(), /catalog name.*does not match/i);
-});
-
-test('remote listing aborts and drains metadata siblings after one exact failure', async t => {
-  let heldSignal = null;
-  let heldSettled = false;
-  installFetch(t, (url, options) => {
-    if (url.endsWith('/_cellucid/health')) {
-      return jsonResponse(exportedHealth());
-    }
-    if (url.endsWith('/_cellucid/info')) {
-      return jsonResponse(exportedInfo());
-    }
-    if (url.endsWith('/_cellucid/datasets')) {
-      return jsonResponse(catalog([
-        { id: 'invalid', path: '/invalid/', name: 'Invalid' },
-        { id: 'held', path: '/held/', name: 'Held' },
-      ]));
-    }
-    if (url.endsWith('/invalid/dataset_identity.json')) {
-      return jsonResponse({});
-    }
-    if (url.endsWith('/held/dataset_identity.json')) {
-      heldSignal = options.signal ?? null;
-      return new Promise((_resolve, reject) => {
-        heldSignal.addEventListener('abort', () => {
-          heldSettled = true;
-          reject(heldSignal.reason);
-        }, { once: true });
-      });
-    }
-    return jsonResponse({}, 404);
-  });
-
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  await assert.rejects(
-    source.listDatasets(),
-    /dataset_identity|missing required field/i
-  );
-  assert.ok(heldSignal instanceof AbortSignal);
-  assert.equal(heldSignal.aborted, true);
-  assert.equal(heldSettled, true);
-});
-
-test('concurrent remote metadata reads coalesce within one catalog owner', async t => {
-  let identityCalls = 0;
-  let releaseIdentity;
-  const identityResponse = new Promise(resolve => {
-    releaseIdentity = resolve;
-  });
-  installFetch(t, url => {
-    if (url.endsWith('/_cellucid/health')) {
-      return jsonResponse(exportedHealth());
-    }
-    if (url.endsWith('/_cellucid/info')) {
-      return jsonResponse(exportedInfo());
-    }
-    if (url.endsWith('/_cellucid/datasets')) {
-      return jsonResponse(catalog());
-    }
-    if (url.endsWith('/dataset_identity.json')) {
-      identityCalls += 1;
-      return identityResponse;
-    }
-    return jsonResponse({}, 404);
-  });
-
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-  const first = source.getMetadata('cells');
-  const second = source.getMetadata('cells');
-  assert.equal(identityCalls, 1);
-  releaseIdentity(jsonResponse(identity()));
-  const [firstMetadata, secondMetadata] = await Promise.all([
-    first,
-    second,
-  ]);
-  assert.equal(firstMetadata, secondMetadata);
-  assert.equal(await source.getMetadata('cells'), firstMetadata);
-  assert.equal(identityCalls, 1);
-});
-
-test('a newer remote catalog generation aborts and rejects stale metadata work', async t => {
-  let listing = catalog([
-    { id: 'cells', path: '/old/', name: 'Cells' },
-  ]);
-  let oldMetadataSignal = null;
-  let releaseOldMetadata;
-  let markOldMetadataStarted;
-  const oldMetadataStarted = new Promise(resolve => {
-    markOldMetadataStarted = resolve;
-  });
-  const oldMetadataResponse = new Promise(resolve => {
-    releaseOldMetadata = resolve;
-  });
-
-  installFetch(t, (url, options) => {
-    if (url.endsWith('/_cellucid/health')) {
-      return jsonResponse(exportedHealth());
-    }
-    if (url.endsWith('/_cellucid/info')) {
-      return jsonResponse(exportedInfo());
-    }
-    if (url.endsWith('/_cellucid/datasets')) {
-      return jsonResponse(listing);
-    }
-    if (url.endsWith('/old/dataset_identity.json')) {
-      oldMetadataSignal = options.signal ?? null;
-      markOldMetadataStarted();
-      return oldMetadataResponse;
-    }
-    if (url.endsWith('/new/dataset_identity.json')) {
-      const current = identity();
-      current.description = 'Current catalog generation';
-      return jsonResponse(current);
-    }
-    return jsonResponse({}, 404);
-  });
-
-  const source = new RemoteDataSource();
-  await source.connect({ url: 'http://127.0.0.1:8765' });
-
-  const staleMetadata = source.getMetadata('cells');
-  await oldMetadataStarted;
-  listing = catalog([
-    { id: 'cells', path: '/new/', name: 'Cells' },
-  ]);
-  const [currentMetadata] = await source.listDatasets();
-
-  assert.ok(oldMetadataSignal instanceof AbortSignal);
-  assert.equal(oldMetadataSignal.aborted, true);
-  releaseOldMetadata(jsonResponse(identity()));
-  await assert.rejects(staleMetadata, /abort|cancel|supersed/i);
-  assert.equal(
-    (await source.getMetadata('cells')).description,
-    currentMetadata.description
-  );
-  assert.equal(
-    source.getBaseUrl('cells'),
-    'remote://127.0.0.1:8765/new/'
-  );
+  assert.equal(source.getConnectionInfo().serverInfo.type, 'anndata');
 });
 
 test('remote JSON endpoints require exact HTTP and media-type success', async t => {
@@ -820,12 +402,12 @@ test('remote JSON endpoints require exact HTTP and media-type success', async t 
   installFetch(t, url => {
     if (!url.endsWith('/_cellucid/health')) return jsonResponse({}, 404);
     if (responseMode === 'status') {
-      return new Response(JSON.stringify(exportedHealth()), {
+      return new Response(JSON.stringify(anndataHealth()), {
         status: 201,
         headers: { 'Content-Type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify(exportedHealth()), {
+    return new Response(JSON.stringify(anndataHealth()), {
       status: 200,
       headers: { 'Content-Type': 'text/plain' },
     });
@@ -927,16 +509,12 @@ test('disconnected dataset operations fail instead of reporting empty success', 
   await assert.rejects(source.hasDataset('cells'), /active connection/i);
   await assert.rejects(source.getMetadata('cells'), /active connection/i);
   assert.throws(() => source.getBaseUrl('cells'), /active connection/i);
-  await assert.rejects(
-    source.resolveUrl('remote://example.test/data/'),
-    /active connection/i
-  );
 });
 
 test('an advertised WebSocket is required to open before connection adoption', async t => {
   installWebSocket(t, OpeningWebSocket);
-  installCanonicalExportedServer(t, {
-    info: exportedInfo({ ws_port: 9876 }),
+  installCanonicalServer(t, {
+    info: anndataInfo({ ws_port: 9876 }),
   });
   const source = new RemoteDataSource();
   const messages = [];
@@ -968,8 +546,8 @@ test('an advertised WebSocket is required to open before connection adoption', a
 
 test('an advertised WebSocket failure rejects the whole connection', async t => {
   installWebSocket(t, FailingWebSocket);
-  installCanonicalExportedServer(t, {
-    info: exportedInfo({ ws_port: 9876 }),
+  installCanonicalServer(t, {
+    info: anndataInfo({ ws_port: 9876 }),
   });
   const source = new RemoteDataSource();
   await assert.rejects(
@@ -982,8 +560,8 @@ test('an advertised WebSocket failure rejects the whole connection', async t => 
 
 test('advertised WebSocket closure is terminal and never reconnects', async t => {
   installWebSocket(t, OpeningWebSocket);
-  installCanonicalExportedServer(t, {
-    info: exportedInfo({ ws_port: 9876 }),
+  installCanonicalServer(t, {
+    info: anndataInfo({ ws_port: 9876 }),
   });
   const source = new RemoteDataSource();
   const losses = [];
@@ -1005,8 +583,8 @@ test('advertised WebSocket closure is terminal and never reconnects', async t =>
 
 test('malformed WebSocket messages terminate the advertised channel', async t => {
   installWebSocket(t, OpeningWebSocket);
-  installCanonicalExportedServer(t, {
-    info: exportedInfo({ ws_port: 9876 }),
+  installCanonicalServer(t, {
+    info: anndataInfo({ ws_port: 9876 }),
   });
   const source = new RemoteDataSource();
   const losses = [];

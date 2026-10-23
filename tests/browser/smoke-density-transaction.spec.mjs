@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const HARNESS_URL = '/tests/browser/fixtures/webgl-harness.html';
 const CURRENT_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-density-transaction`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-density-transaction`;
 
 test('GPU smoke density bounds uploads and draw submissions for large point sets', async ({
   page,
@@ -648,7 +648,7 @@ test('viewer publishes smoke atomically before completion and returns no owned t
   await page.goto(CURRENT_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const proof = await page.evaluate(async () => {
@@ -738,7 +738,7 @@ test('viewer invalidates smoke resources and requires reload after WebGL context
   await page.goto(CURRENT_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   const proof = await page.evaluate(async () => {
     const {

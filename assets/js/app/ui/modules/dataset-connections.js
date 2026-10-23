@@ -9,13 +9,12 @@
 
 import { formatCompactCount } from '../components/display-format.js';
 import {
+  isExplainedFailure,
   validateDatasetId,
-  validateDatasetIdentity
+  validateDatasetSummary
 } from '../../../data/data-source.js';
-import {
-  INVALID_GITHUB_PATH_MESSAGE,
-  parseGitHubPath
-} from '../../../data/github-data-source.js';
+import { getProviderRegistry } from '../../../data/sources/registry.js';
+import { initTransfersPanel } from './transfers-panel.js';
 import { validateRemoteServerUrl } from '../../../data/remote-source.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
@@ -153,7 +152,7 @@ function requireDatasetInventory(value, sourceType) {
         `${sourceType} connection published duplicate dataset id "${id}".`
       );
     }
-    validateDatasetIdentity(metadata, id, sourceType);
+    validateDatasetSummary(metadata, sourceType);
     seen.add(id);
     return metadata;
   });
@@ -176,8 +175,8 @@ function requireDatasetInventory(value, sourceType) {
  * possibilities and asks the user to check both.
  *
  * `too-large` is the row that must not be folded into `unreadable`. A byte
- * ceiling fires on a perfectly valid export that is merely bigger than the
- * browser will take, so "re-export it" is the one action guaranteed to fail:
+ * ceiling fires on a perfectly valid file that is merely bigger than the
+ * browser will take, so "write it again" is the one action guaranteed to fail:
  * the user regenerates a byte-identical file and meets the identical wall.
  * The loader tells the two apart — `TOO_LARGE` is published by whichever
  * ceiling refused — so the UI does not have to guess (CEL-0219).
@@ -204,12 +203,12 @@ const DATA_SOURCE_FAILURES = Object.freeze({
   'too-large': Object.freeze({
     cause: 'what is published there is larger than Cellucid opens in a browser.',
     action:
-      'Serve it with the Cellucid server, or publish a smaller export, then '
+      'Serve it with the Cellucid server, or publish a smaller file, then '
       + 'try again.'
   }),
   unreadable: Object.freeze({
     cause: 'what is published there is not in a format Cellucid can read.',
-    action: 'Re-export it with cellucid prepare, then try again.'
+    action: 'Write it again with anndata (or cellucid.prepare), then try again.'
   }),
   unreachable: Object.freeze({
     cause:
@@ -282,6 +281,11 @@ export function describeDataSourceFailure(subject, verb, error) {
   if (typeof verb !== 'string' || verb.length === 0) {
     throw new TypeError('Data source failure verb must be a non-empty string.');
   }
+  // A failure written for the person (a link naming several files, a file
+  // with nothing to plot) already says what is wrong and what to do.
+  if (isExplainedFailure(error)) {
+    return `${subject} could not be opened: ${explainedMessage(error)}`;
+  }
   const failure = classifyDataSourceFailure(error);
   if (failure === null) {
     return `${subject} ${verb}. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
@@ -311,9 +315,15 @@ function errorMessage(error) {
  * @returns {string}
  */
 export function dataSourceFailureDetail(error) {
-  return classifyDataSourceFailure(error) === null
+  return classifyDataSourceFailure(error) === null && !isExplainedFailure(error)
     ? ` Details: ${errorMessage(error)}`
     : '';
+}
+
+function explainedMessage(error) {
+  return error instanceof AggregateError && error.errors.length > 0
+    ? explainedMessage(error.errors[0])
+    : error.message;
 }
 
 /**
@@ -357,14 +367,20 @@ export function describeRemoteAddressProblem(value) {
  * @param {string} value
  * @returns {string|null}
  */
-export function describeGitHubPathProblem(value) {
-  return parseGitHubPath(value) === null ? INVALID_GITHUB_PATH_MESSAGE : null;
+export function describeDataLinkProblem(value) {
+  try {
+    getProviderRegistry().resolve(value);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 /**
- * The three ways a local dataset is read. The file inputs and a drop onto the
- * viewer share them, so a dropped file is read, validated, reported and
- * superseded exactly as a picked one is.
+ * The three ways a local dataset is read: an `.h5ad` file, an AnnData Zarr
+ * store folder, or a zipped one. The file inputs and a drop onto the viewer
+ * share them, so a dropped file is read, validated, reported and superseded
+ * exactly as a picked one is.
  */
 const LOCAL_LOADERS = Object.freeze({
   h5ad: Object.freeze({
@@ -379,16 +395,16 @@ const LOCAL_LOADERS = Object.freeze({
     load: (source, files) =>
       source.loadFromZarrArchive(files.length === 1 ? files[0] : null)
   }),
-  prepared: Object.freeze({
-    loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
-    loadingMessage: 'Loading prepared dataset...',
-    load: (source, files) => source.loadFromPreparedDirectory(files)
+  'zarr-folder': Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_FOLDER,
+    loadingMessage: 'Loading Zarr folder...',
+    load: (source, files) => source.loadFromZarrDirectory(files)
   })
 });
 
 /**
  * What a local choice is called while it is being read: the file, or the
- * folder a prepared export was chosen as.
+ * folder a Zarr store was chosen as.
  *
  * @param {FileList|File[]} files
  * @returns {string}
@@ -701,8 +717,8 @@ export function initDatasetConnections(options) {
       category: 'data'
     });
     // A newer dataset choice cancels the read itself, not only its result:
-    // the candidate's disconnect aborts a prepared folder mid-read and
-    // retires a parsed file instead of adopting it, and the read's progress
+    // the candidate's disconnect retires a parsed file instead of adopting
+    // it, and the read's progress
     // leaves the screen at once rather than when the read gets round to
     // noticing.
     const cancelRead = () => {
@@ -788,11 +804,6 @@ export function initDatasetConnections(options) {
     }
   }
 
-  const localPrepared = requireControlGroup(
-    dom,
-    ['userDataBrowseBtn', 'userDataFileInput'],
-    'Prepared-directory'
-  );
   const localH5ad = requireControlGroup(
     dom,
     ['userDataH5adBtn', 'userDataH5adInput'],
@@ -803,27 +814,32 @@ export function initDatasetConnections(options) {
     ['userDataZarrArchiveBtn', 'userDataZarrArchiveInput'],
     'Zarr ZIP'
   );
-
-  if (localPrepared !== null) {
-    const { userDataBrowseBtn, userDataFileInput } = localPrepared;
+  const localZarrFolder = requireControlGroup(
+    dom,
+    ['userDataZarrFolderBtn', 'userDataZarrFolderInput'],
+    'Zarr folder'
+  );
+  if (localZarrFolder !== null) {
+    const { userDataZarrFolderBtn, userDataZarrFolderInput } = localZarrFolder;
     listen(
-      userDataBrowseBtn,
+      userDataZarrFolderBtn,
       'click',
-      () => userDataFileInput.click()
+      () => userDataZarrFolderInput.click()
     );
-    listen(userDataFileInput, 'change', event => {
+    listen(userDataZarrFolderInput, 'change', event => {
       const files = event.target.files;
       if (!files || files.length === 0) return undefined;
       return launchOperation(async () => {
         await loadLocalUserSelection(
           pickedSelection(files),
-          LOCAL_LOADERS.prepared
+          LOCAL_LOADERS['zarr-folder']
         );
-        if (!destroyed) userDataFileInput.value = '';
-      }, 'Prepared-directory selection failed');
+        if (!destroyed) userDataZarrFolderInput.value = '';
+      }, 'Zarr folder selection failed');
     });
-    admitControls(userDataBrowseBtn, userDataFileInput);
+    admitControls(userDataZarrFolderBtn, userDataZarrFolderInput);
   }
+
   if (localH5ad !== null) {
     const { userDataH5adBtn, userDataH5adInput } = localH5ad;
     listen(
@@ -899,6 +915,9 @@ export function initDatasetConnections(options) {
         }
       });
 
+  /** @type {Map<string, (value: string) => Promise<boolean>>} */
+  const openers = new Map();
+
   function wireConnection(config) {
     const {
       connectButton,
@@ -908,6 +927,7 @@ export function initDatasetConnections(options) {
       disconnectContainer,
       emptyInputMessage,
       failureSubject,
+      failureVerb,
       inputLabel,
       loadMethod,
       sourceType
@@ -1163,7 +1183,7 @@ export function initDatasetConnections(options) {
 
     attachConnectionLoss(source);
 
-    async function handleConnectClick() {
+    async function handleConnectClick(clickLoadMethod = loadMethod) {
       if (dataSourceManager.getCurrentSourceType() === sourceType) {
         notifications.error(
           `${inputLabel} is the active dataset source. Disconnect it before reconnecting.`,
@@ -1179,7 +1199,7 @@ export function initDatasetConnections(options) {
       // An address the source would refuse unread is a typing problem, not a
       // connection failure: say what is wrong with it and do not start a
       // connection whose failure would be reported as if the data were at
-      // fault ("not in a format Cellucid can read ... re-export it").
+      // fault ("not in a format Cellucid can read ... write it again").
       const inputProblem = describeInputProblem(inputValue);
       if (inputProblem !== null) {
         notifications.error(inputProblem, { category: 'connectivity' });
@@ -1196,7 +1216,7 @@ export function initDatasetConnections(options) {
       const clickAction = datasetIntents.actionSequence();
       // A one-dataset connection's activation joins this request; a
       // connection that only lists datasets loads none and is canceled.
-      const dataLoad = analytics.openDataLoad(loadMethod, sourceType);
+      const dataLoad = analytics.openDataLoad(clickLoadMethod, sourceType);
       const connectNotifId = beginLoadingNotification(
         `Connecting to ${inputLabel}: ${inputValue}...`,
         { category: 'connectivity' }
@@ -1250,7 +1270,7 @@ export function initDatasetConnections(options) {
           settleLoadingNotification(
             'fail',
             connectNotifId,
-            `Connected ${inputLabel} has no datasets. Add a valid export and reconnect.`
+            `Connected ${inputLabel} has no datasets. Add an AnnData file and reconnect.`
           );
           return;
         }
@@ -1269,7 +1289,7 @@ export function initDatasetConnections(options) {
               activationIntent,
               datasets[0].id,
               sourceType,
-              loadMethod,
+              clickLoadMethod,
               candidate
             );
           } catch (error) {
@@ -1436,7 +1456,7 @@ export function initDatasetConnections(options) {
           connectNotifId,
           reportDataSourceFailure(
             failureSubject,
-            'could not be reached',
+            failureVerb,
             exactError
           )
         );
@@ -1536,6 +1556,36 @@ export function initDatasetConnections(options) {
       );
     });
 
+    /**
+     * Connect to `value` as if it had been typed and Connect clicked, for an
+     * action that names its data (a session file's recorded source). A
+     * different connection that is open is closed first. Failures are
+     * reported by the connect and disconnect paths themselves.
+     *
+     * @returns {Promise<boolean>} Whether `value` is now connected.
+     */
+    async function open(value, openLoadMethod) {
+      assertAlive();
+      const connectedTo = () =>
+        sourceConnected(source) && sourceInputValue(source) === value;
+      if (connectedTo()) return true;
+      if (dataSourceManager.getCurrentSourceType() === sourceType) {
+        await handleDisconnectClick();
+        if (dataSourceManager.getCurrentSourceType() === sourceType) {
+          return false;
+        }
+      }
+      connectionInput.value = value;
+      await handleConnectClick(openLoadMethod);
+      return !destroyed && connectedTo();
+    }
+    openers.set(sourceType, value =>
+      launchOperation(
+        () => open(value, DATA_LOAD_METHODS.SESSION_SOURCE),
+        `${inputLabel} open rejected`
+      )
+    );
+
     const initialConnected = sourceConnected(source);
     if (initialConnected && connectionInput.value.length === 0) {
       const value = sourceInputValue(source);
@@ -1573,37 +1623,47 @@ export function initDatasetConnections(options) {
         'Enter a remote server address, such as http://localhost:8765, '
         + 'before connecting.',
       failureSubject: 'The remote server',
-      inputLabel: 'Remote server',
+      failureVerb: 'could not be reached',
+      inputLabel: 'Server',
       loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
       sourceType: 'remote'
     });
   }
 
-  const github = requireControlGroup(
+  const dataLink = requireControlGroup(
     dom,
     [
-      'githubConnectBtn',
-      'githubDisconnectBtn',
-      'githubDisconnectContainer',
-      'githubRepoUrl'
+      'dataLinkConnectBtn',
+      'dataLinkDisconnectBtn',
+      'dataLinkDisconnectContainer',
+      'dataLinkUrl'
     ],
-    'GitHub'
+    'Data link'
   );
-  if (github !== null) {
+  if (dataLink !== null) {
     wireConnection({
-      connectButton: github.githubConnectBtn,
-      connectionInput: github.githubRepoUrl,
-      describeInputProblem: describeGitHubPathProblem,
-      disconnectButton: github.githubDisconnectBtn,
-      disconnectContainer: github.githubDisconnectContainer,
+      connectButton: dataLink.dataLinkConnectBtn,
+      connectionInput: dataLink.dataLinkUrl,
+      describeInputProblem: describeDataLinkProblem,
+      disconnectButton: dataLink.dataLinkDisconnectBtn,
+      disconnectContainer: dataLink.dataLinkDisconnectContainer,
       emptyInputMessage:
-        'Enter a GitHub repository path, such as owner/repo/exports, '
-        + 'before connecting.',
-      failureSubject: 'The GitHub repository',
-      inputLabel: 'GitHub repository',
-      loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT,
-      sourceType: 'github-repo'
+        'Paste a link or an id, such as a CELLxGENE dataset link, GSE123456, '
+        + 'or owner/repo/folder, before connecting.',
+      failureSubject: 'The linked data',
+      failureVerb: 'could not be opened',
+      inputLabel: 'Link',
+      loadMethod: DATA_LOAD_METHODS.LINK_CONNECT,
+      sourceType: 'link'
     });
+  }
+
+  if (dom.transfersBlock && dom.transfersList) {
+    const stopTransfers = initTransfersPanel({
+      container: dom.transfersBlock,
+      list: dom.transfersList,
+    });
+    lifecycleController.signal.addEventListener('abort', stopTransfers, { once: true });
   }
 
   function destroy() {
@@ -1664,5 +1724,22 @@ export function initDatasetConnections(options) {
     return destroyPromise;
   }
 
-  return Object.freeze({ destroy });
+  /**
+   * Open the connection of one source type at `value` (a data link's
+   * locator, a server address).
+   *
+   * @param {string} sourceType
+   * @param {string} value
+   * @returns {Promise<boolean>} Whether it is now connected.
+   */
+  function openConnection(sourceType, value) {
+    const opener = openers.get(sourceType);
+    if (opener === undefined) {
+      throw new Error(`No ${sourceType} connection control is wired.`);
+    }
+    validateDatasetId(value, `${sourceType} connection value`);
+    return opener(value);
+  }
+
+  return Object.freeze({ destroy, openConnection });
 }

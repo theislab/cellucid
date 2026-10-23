@@ -1,5 +1,5 @@
 {
- "_about": "Latent-space outlier quantiles: float32 values widened to float64, centroid sums in cell order, squared distances in column order, the share at that distance or closer as float32. Written by cellucid-python's scripts/generate_latent_outlier_conformance.py; kept byte for byte in cellucid-r and the web app.",
+ "_about": "Latent-space outlier quantiles: float32 values widened to float64, centroid sums in cell order, squared distances in column order, the share at that distance or closer as float32. Written by scripts/generate-latent-outlier-conformance.py, which computes them with numpy, independently of the browser's implementation.",
  "version": 1,
  "cases": [
   {

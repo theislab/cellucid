@@ -9,11 +9,9 @@ import { selectDataset } from './helpers/dataset-selection.mjs';
 
 function metadata(id) {
   return Object.freeze({
-    version: 3,
     id,
     name: id,
     description: '',
-    cellucid_data_version: '1.0.0',
     stats: Object.freeze({
       n_cells: 1,
       n_genes: 0,
@@ -30,7 +28,7 @@ function metadata(id) {
         X_umap: Object.freeze({
           label: 'X_umap',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: Object.freeze({ key: 'X_umap', columns: Object.freeze([0, 1]) }),
         }),
       }),
@@ -44,7 +42,6 @@ function source(
   {
     baseUrl = null,
     deactivateError = null,
-    identityId = null,
     metadataValue = null,
   } = {}
 ) {
@@ -64,9 +61,6 @@ function source(
     },
     getBaseUrl(datasetId) {
       return baseUrl ?? `https://datasets.test/${type}/${datasetId}/`;
-    },
-    getIdentityId(datasetId) {
-      return identityId ?? datasetId;
     },
     getType() {
       return type;
@@ -253,12 +247,8 @@ test('malformed source results fail before manager publication', async t => {
   const invalidBase = source('invalid-base', {
     baseUrl: ' https://datasets.test/invalid-base/dataset/',
   });
-  const invalidLocalIdentity = source('local-user', {
-    identityId: 'identity\u0000id',
-  });
   manager.registerSource('wrong-identity', wrongIdentity);
   manager.registerSource('invalid-base', invalidBase);
-  manager.registerSource('local-user', invalidLocalIdentity);
 
   await t.test('metadata id mismatch', async () => {
     await assert.rejects(
@@ -270,12 +260,6 @@ test('malformed source results fail before manager publication', async t => {
     await assert.rejects(
       manager.stageDatasetSelection('invalid-base', 'dataset'),
       /exact dataset base URL/i
-    );
-  });
-  await t.test('non-exact local identity id', async () => {
-    await assert.rejects(
-      manager.stageDatasetSelection('local-user', 'dataset'),
-      /exact dataset identity id/i
     );
   });
 
@@ -426,96 +410,6 @@ test('unpublished manager commit can roll back after runtime publication failure
     /unpublished manager commit/i
   );
 });
-
-test(
-  'custom-protocol staging resolves through the candidate without replacing the registry',
-  async t => {
-    for (const [sourceType, url] of [
-      ['local-user', 'local-user://dataset/exact/data.bin'],
-      ['remote', 'remote://server.test/exports/exact/data.bin'],
-      ['remote', 'remotes://server.test/exports/exact/data.bin'],
-      ['jupyter', 'jupyter://viewer/exact/data.bin'],
-    ]) {
-      await t.test(url.split('://')[0], async () => {
-        const manager = new DataSourceManager();
-        const priorCalls = [];
-        const candidateCalls = [];
-        const prior = {
-          getType() {
-            return sourceType;
-          },
-          async resolveUrl(input, signal) {
-            priorCalls.push({ input, signal });
-            return 'https://prior.test/data.bin';
-          },
-        };
-        const candidate = {
-          getType() {
-            return sourceType;
-          },
-          async resolveUrl(input, signal) {
-            candidateCalls.push({ input, signal });
-            return 'https://candidate.test/data.bin';
-          },
-        };
-        manager.registerSource(sourceType, prior);
-        const signal = new AbortController().signal;
-
-        assert.equal(
-          await manager.resolveUrlWithSource(
-            url,
-            signal,
-            candidate
-          ),
-          'https://candidate.test/data.bin'
-        );
-        assert.equal(manager.getSource(sourceType), prior);
-        assert.deepEqual(priorCalls, []);
-        assert.deepEqual(candidateCalls, [{ input: url, signal }]);
-
-        assert.equal(
-          await manager.resolveUrl(url, signal),
-          'https://prior.test/data.bin'
-        );
-        assert.equal(priorCalls.length, 1);
-        await assert.rejects(
-          manager.resolveUrlWithSource(
-            url,
-            signal,
-            {
-              getType() {
-                return sourceType === 'remote'
-                  ? 'jupyter'
-                  : 'remote';
-              },
-              async resolveUrl() {
-                throw new Error('wrong source must not run');
-              },
-            }
-          ),
-          /requires one exact.*source owner/i
-        );
-      });
-    }
-
-    const manager = new DataSourceManager();
-    await assert.rejects(
-      manager.resolveUrlWithSource(
-        'https://ordinary.test/data.bin',
-        null,
-        {
-          getType() {
-            return 'remote';
-          },
-          async resolveUrl() {
-            throw new Error('standard URL must not use a staged source');
-          },
-        }
-      ),
-      /requires one registered custom protocol URL/i
-    );
-  }
-);
 
 test(
   'the data source manager exposes exactly the members its consumers reach',

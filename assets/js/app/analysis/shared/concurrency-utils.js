@@ -69,3 +69,62 @@ export function createSlicedYield(sliceMs = MAIN_THREAD_SLICE_MS) {
     });
   };
 }
+
+/** One display frame at 60 Hz, in milliseconds. */
+export const FRAME_MS = 1000 / 60;
+
+/**
+ * Coalesce a stream of updates to at most one delivery per frame.
+ *
+ * A long analysis completes thousands of items a second; an update per item
+ * (a progress record, a formatted count, a partial result) costs more on this
+ * thread than the item did, and nobody sees more than one per frame. `push`
+ * takes a function that builds the update, so an update that is replaced
+ * before its frame is never built. The latest one is delivered at once when a
+ * frame has passed since the last delivery, otherwise when it has.
+ *
+ * @template T
+ * @param {(update: T) => void} deliver
+ * @param {number} [intervalMs=FRAME_MS]
+ * @returns {{push: (build: () => T) => void, flush: () => void, cancel: () => void}}
+ */
+export function createFrameThrottle(deliver, intervalMs = FRAME_MS) {
+  if (typeof deliver !== 'function') {
+    throw new TypeError('deliver must be a function');
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new TypeError('intervalMs must be a positive finite number');
+  }
+  let lastDelivery = -Infinity;
+  /** @type {(() => T)|null} */
+  let pending = null;
+  let timer = null;
+  const flush = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (pending === null) return;
+    const build = pending;
+    pending = null;
+    lastDelivery = performance.now();
+    deliver(build());
+  };
+  return {
+    push(build) {
+      pending = build;
+      const elapsed = performance.now() - lastDelivery;
+      if (elapsed >= intervalMs) {
+        flush();
+      } else if (timer === null) {
+        timer = setTimeout(flush, intervalMs - elapsed);
+      }
+    },
+    flush,
+    cancel() {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      pending = null;
+    }
+  };
+}

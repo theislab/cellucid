@@ -19,7 +19,6 @@
  *
  * Subclasses may override:
  * - _validateForm(formValues) - Custom form validation
- * - _getLoadingMessage() - Custom loading message
  * - _getSuccessMessage() - Custom success message
  * - _getRunButtonText() - Custom button text
  * - _getClassName() - CSS class prefix
@@ -33,7 +32,6 @@
 
 import { BaseAnalysisUI } from '../../base-analysis-ui.js';
 import { createButton, createStatusLine } from '../../../../ui/components/controls.js';
-import { runAnalysisWithLoadingState } from '../../../shared/analysis-utils.js';
 import {
   createAnalysisModal,
   openModal,
@@ -562,14 +560,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return 'form-analysis';
   }
 
-  /**
-   * Get loading notification message
-   * Override for custom message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    return 'Running analysis...';
-  }
 
   /**
    * Get success notification message
@@ -995,6 +985,47 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Render statistical annotations (bottom right)
     this._renderModalAnnotations(modal._annotationsContent);
     return true;
+  }
+
+  /**
+   * Show a result restored from a session through the same render and
+   * publication path a fresh run takes, so the two draw identically.
+   *
+   * @param {Object} result - The decoded result, shaped as `_runAnalysisImpl`
+   *   returns it.
+   * @param {Object} [options]
+   * @param {() => void} [options.beforePublish] - Restores the state a run
+   *   sets beside its result, after the render and before publication.
+   * @returns {Promise<void>}
+   * @protected
+   */
+  async _restoreAnalysisResult(result, { beforePublish = null } = {}) {
+    if (this._isDestroyed) {
+      throw new Error(`${this.constructor.name} was destroyed before its result was restored`);
+    }
+    if (!isPlainObject(result) || !Object.hasOwn(result, 'data')) {
+      throw new TypeError('A restored analysis result must be an object with data');
+    }
+    await this._discardFormResult();
+    const requestId = this._startAnalysisRequest();
+    if (requestId === null) {
+      throw new Error(`${this.constructor.name} could not start restoring its result`);
+    }
+    const releaseBusy = this._claimBusy();
+    try {
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        throw new Error(`Restoring the ${this.constructor.name} result was superseded`);
+      }
+      if (beforePublish !== null) beforePublish();
+      await this._publishAnalysisResult(result, requestId);
+      if (this.onResultChange !== null && this.onResultChange !== undefined) {
+        this.onResultChange(result);
+      }
+    } finally {
+      releaseBusy();
+      this._finishAnalysisRequest(requestId);
+    }
   }
 
   /**
@@ -1465,6 +1496,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._formContainer.className = `${this._getClassName()}-form-container`;
     this._container.appendChild(this._formContainer);
 
+    // The running, cancelled or failed state of the analysis's job.
+    this._container.appendChild(this._getJobStatusView().root);
+
     // Result container (hidden initially)
     this._resultContainer = document.createElement('div');
     this._resultContainer.className = `${this._getClassName()}-result-container`;
@@ -1523,8 +1557,30 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       className: 'analysis-run-btn',
       onClick: () => this._runAnalysis()
     }));
+    // What a run will cost, before it starts.
+    this._runCostLine = createStatusLine({ tone: 'muted' });
+    this._runCostLine.root.classList.add('analysis-run-cost');
+    wrapper.appendChild(this._runCostLine.root);
 
     this._formContainer.appendChild(wrapper);
+    this._updateRunCost();
+  }
+
+  /**
+   * What a run of the form as it stands will cost (`Tests 20,000 genes in
+   * 1,234 vs 5,678 cells`), or null when it cannot be said. Override where
+   * the cost is known before starting.
+   * @returns {string|null}
+   * @protected
+   */
+  _describeRunCost() {
+    return null;
+  }
+
+  /** Say what a run will cost under the run button. @protected */
+  _updateRunCost() {
+    if (!this._runCostLine) return;
+    this._runCostLine.set(this._describeRunCost() ?? '');
   }
 
   /**
@@ -1599,7 +1655,50 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Run the analysis with loading state management
+   * Run again after a cancel or a failure: the form's run.
+   * @override
+   */
+  _runAgain() {
+    if (this._isDestroyed) return;
+    this._trackInteractiveTask(this._runAnalysis(), this._getTitle());
+  }
+
+  /** @override */
+  _getJobTitle() {
+    return this._getTitle();
+  }
+
+  /**
+   * Hold the run button at "Running…" until `job` ends or its request is
+   * invalidated.
+   * @param {number} requestId
+   * @param {import('../../../../jobs/cancellable-job.js').CancellableJob} job
+   * @protected
+   */
+  _holdRunButton(requestId, job) {
+    const runBtn = this._formContainer?.querySelector('.analysis-run-btn') ?? null;
+    if (runBtn === null) return;
+    const originalText = runBtn.textContent;
+    runBtn.disabled = true;
+    runBtn.textContent = 'Running…';
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      runBtn.disabled = false;
+      runBtn.textContent = originalText;
+    };
+    const unsubscribe = job.subscribe(() => {
+      if (job.running) return;
+      unsubscribe();
+      restore();
+    });
+    this._registerAnalysisInvalidationCleanup(requestId, restore);
+  }
+
+  /**
+   * Run the analysis as a cancellable job: its status view shows what it is
+   * doing with Cancel, the result is shown only once it is complete.
    */
   async _runAnalysis() {
     if (this._isDestroyed) return;
@@ -1625,49 +1724,49 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (requestId === null) return;
     const releaseBusy = this._claimBusy();
     const discardTask = this._discardFormResult();
-    // Get run button for state management
-    const runBtn = this._formContainer.querySelector('.analysis-run-btn');
+    const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
+    this._holdRunButton(requestId, job);
 
     try {
-      const result = await runAnalysisWithLoadingState({
-        component: this,
-        runButton: runBtn,
-        loadingMessage: this._getLoadingMessage(),
-        successMessage: this._getSuccessMessage(),
-        analysisFunction: async () => {
-          if (discardTask && typeof discardTask.then === 'function') {
-            await discardTask;
-          }
-          if (!this._isCurrentAnalysisRequest(requestId)) return null;
-          return this._runAnalysisImpl(formValues, requestId);
-        },
-        isCurrent: () => this._isCurrentAnalysisRequest(requestId),
-        registerInvalidationCleanup: cleanup =>
-          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
-      });
-
-      if (result !== null) {
-        if (!isPlainObject(result)) {
-          throw new TypeError('Form-based analysis must return an exact result object');
-        }
-        if (!Object.hasOwn(result, 'data')) {
-          throw new TypeError('Form-based analysis result must contain data');
-        }
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-        await this._showResult(result, requestId);
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-
-        // Publish result/data only after the owned render transaction commits.
-        await this._publishAnalysisResult(result, requestId);
-
-        // Callback
-        if (this.onResultChange !== null && this.onResultChange !== undefined) {
-          if (typeof this.onResultChange !== 'function') {
-            throw new TypeError('onResultChange must be a function');
-          }
-          this.onResultChange(result);
-        }
+      if (discardTask && typeof discardTask.then === 'function') {
+        await discardTask;
       }
+      const result = this._isCurrentAnalysisRequest(requestId)
+        ? await this._runAnalysisImpl(formValues, requestId, job)
+        : null;
+
+      if (result === null || !this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
+      if (!isPlainObject(result)) {
+        throw new TypeError('Form-based analysis must return an exact result object');
+      }
+      if (!Object.hasOwn(result, 'data')) {
+        throw new TypeError('Form-based analysis result must contain data');
+      }
+      job.step('Drawing the result');
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
+
+      // Publish result/data only after the owned render transaction commits.
+      await this._publishAnalysisResult(result, requestId);
+      job.succeed(this._getSuccessMessage());
+
+      // Callback
+      if (this.onResultChange !== null && this.onResultChange !== undefined) {
+        if (typeof this.onResultChange !== 'function') {
+          throw new TypeError('onResultChange must be a function');
+        }
+        this.onResultChange(result);
+      }
+    } catch (error) {
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
+      // The job's status view and notification say why; a cancel is calm.
+      this._failAnalysisJob(job, error);
     } finally {
       releaseBusy();
       this._finishAnalysisRequest(requestId);
@@ -1685,6 +1784,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   _handleFormInputIntent() {
     if (this._isDestroyed) return;
     this._invalidateAnalysisRequest();
+    this._updateRunCost();
     const cleanup = this._discardFormResult();
     if (cleanup && typeof cleanup.then === 'function') {
       void cleanup.catch(error => {
@@ -1700,6 +1800,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _discardFormResult() {
     this._optionRenderRevision += 1;
+    this._clearJobStatus();
     const cleanupTasks = [];
     if (this._previewPlotSlot != null) {
       cleanupTasks.push(this._previewPlotSlot.invalidate());

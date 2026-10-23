@@ -23,20 +23,20 @@
  * - The multiview layout select had no accessible name.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=design-polish-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=design-polish-ci';
 
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
@@ -329,7 +329,7 @@ test.describe('short screen', () => {
     const modal = page.locator('#welcome-modal');
     await expect(modal).toBeVisible();
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await expect(page.locator('.notification').first()).toBeVisible();
     const covering = await page.evaluate(() => {

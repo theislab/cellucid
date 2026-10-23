@@ -2,22 +2,32 @@
  * The streaming analyses compute the same numbers in every engine.
  *
  * Differential expression and marker discovery stream one gene at a time: the
- * gene's gzip payload is inflated and dequantized in the decode worker, the two
+ * gene's column is read from the AnnData file in the reader worker, the two
  * groups are gathered through per-run plans, and the statistics run in the
  * analysis worker pool. Each of those steps was rewritten for speed, so this
  * pins the end result against references computed on the page itself from the
- * raw files — inflated on the main thread, decoded with the published formula
- * and tested with the shared two-sample kernels — and requires the same
- * IEEE-754 numbers, not close ones.
+ * expression the file was written with -- tested with the shared two-sample
+ * kernels -- and requires the same IEEE-754 numbers, not close ones.
  */
 import { expect, test } from './helpers/test.mjs';
-import { appUrl, encodedAppUrl } from './helpers/origins.mjs';
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
+import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const DATASET = 'synthetic-cell-types-2d';
-const DATASET_BASE = appUrl(
-  `/tests/browser/fixtures/demo-custom-exports/${DATASET}/`,
-);
+const DATASET = 'streaming-exact';
+const ROOT = appUrl('/tests/browser/fixtures/generated-streaming-exact/');
+const CELLS = 72;
+const GENES = Object.freeze(Array.from({ length: 8 }, (_, gene) => `GENE${gene + 1}`));
+const CATEGORIES = Object.freeze(['alpha', 'beta', 'gamma']);
+
+/** Dense expression, cells x genes: ties, zeros and a gene with one value. */
+const X = Float32Array.from({ length: CELLS * GENES.length }, (_, index) => {
+  const cell = Math.floor(index / GENES.length);
+  const gene = index % GENES.length;
+  if (gene === GENES.length - 1) return 1.5;
+  const value = ((cell * 31 + gene * 17) % 23) / 7 + (cell % 3 === gene % 3 ? gene : 0);
+  return value < 0.5 ? 0 : value;
+});
 
 test('streamed DE and marker statistics equal on-page references exactly', async ({
   page,
@@ -28,9 +38,27 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     if (message.type() === 'error') errors.push(`console: ${message.text()}`);
   });
 
+  await serveSyntheticCatalog(page, ROOT, {
+    id: DATASET,
+    name: 'Streaming exact fixture',
+    cells: CELLS,
+    genes: [...GENES],
+    X,
+    obs: {
+      cell_type: {
+        categories: [...CATEGORIES],
+        codes: Int8Array.from({ length: CELLS }, (_, cell) => cell % 3),
+      },
+    },
+    obsm: {
+      X_umap_2d: {
+        data: Float32Array.from({ length: CELLS * 2 }, (_, index) => Math.sin(index * 0.7) * 3),
+        columns: 2,
+      },
+    },
+  });
   await page.goto(
-    `/?exportsBaseUrl=${encodedAppUrl('/tests/browser/fixtures/demo-custom-exports/')}` +
-      `&dataset=${DATASET}`,
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET}`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -38,7 +66,7 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     () => window._comparisonModule?.state?.pointCount === 72,
   );
 
-  const proof = await page.evaluate(async datasetBase => {
+  const proof = await page.evaluate(async ({ genes: geneNames, expression }) => {
     const { computeDifferential } = await import(
       '/assets/js/app/analysis/compute/operation-handlers.js'
     );
@@ -57,24 +85,14 @@ test('streamed DE and marker statistics equal on-page references exactly', async
       return left.length === right.length && left.every((v, i) => v === right[i]);
     };
 
-    // Reference decode: the raw file, inflated here, decoded by the formula.
-    const manifest = await (await fetch(`${datasetBase}var_manifest.json`)).json();
+    // Reference: each gene's column of the expression the file was written with.
     const reference = new Map();
     const decodeMismatches = [];
-    for (const [index, key, minValue, maxValue] of manifest.fields) {
-      const path = manifest._varSchema.pathPattern.replace('{index}', String(index));
-      const compressed = await (await fetch(`${datasetBase}${path}`)).arrayBuffer();
-      const inflated = await new Response(
-        new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip')),
-      ).arrayBuffer();
-      const codes = new Uint8Array(inflated);
-      const expected = new Float32Array(codes.length);
-      const scale = (maxValue - minValue) / 254;
-      for (let i = 0; i < codes.length; i++) {
-        expected[i] = codes[i] === 255
-          ? NaN
-          : (minValue === maxValue ? minValue : minValue + codes[i] * scale);
-      }
+    for (const [gene, key] of geneNames.entries()) {
+      const expected = Float32Array.from(
+        { length: expression.length / geneNames.length },
+        (_, cell) => expression[cell * geneNames.length + gene],
+      );
       reference.set(key, expected);
       const loaded = await dataLayer.ensureGeneExpressionLoaded(key);
       if (!sameBits(loaded.values, expected)) decodeMismatches.push(key);
@@ -156,14 +174,14 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     }
 
     return {
-      genes: manifest.fields.length,
+      genes: geneNames.length,
       decodeMismatches,
       deChecks,
       deMismatches,
       markerChecks,
       markerMismatches,
     };
-  }, DATASET_BASE);
+  }, { genes: GENES, expression: Array.from(X) });
 
   expect(proof.genes).toBe(8);
   expect(proof.decodeMismatches).toEqual([]);

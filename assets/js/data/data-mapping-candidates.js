@@ -3,16 +3,29 @@
  * metadata an `.h5ad` or Zarr file declares (design §1.2), and the load-time
  * check every embedding passes before it is plotted (§1.3).
  *
- * The catalog has the same shape `cellucid serve` publishes at
- * `_cellucid/mapping/candidates.json` (`cellucid-python`
- * `data_mapping.build_anndata_candidates`), and the listing-time verdicts and
- * reasons below are the same strings, so one file reads the same way in the
- * browser and through the server. Everything here is metadata: shapes, storage
- * kinds and dtypes. No array value is read except by `embeddingLoadDefect`,
+ * The catalog is answered at the `candidates` route under the dataset's base,
+ * for a file opened here, from a link, or served by `cellucid serve` or a
+ * notebook (which hand the browser the file itself).
+ * Everything here is metadata: shapes, storage kinds and dtypes. No array value is read except by `embeddingLoadDefect`,
  * which judges values the caller already read.
  *
  * Routes address catalog entries by their position in these lists, never by
- * key, so a path never carries a dataset's vocabulary.
+ * key, so a path never carries a dataset's vocabulary. Every route names the
+ * AnnData element it reads, under the dataset's base (`h5ad://<id>/` or
+ * `zarr://<id>/`):
+ *
+ * - `obsm/{i}/{cols}` -- `obsm` entry `i` read at columns `cols` (`0-1`);
+ * - `vectors/{v}/{vcols}/{e}/{ecols}` -- `obsm` entry `v` at `vcols`, drawn
+ *   on the embedding `obsm/{e}/{ecols}`;
+ * - `obsp/{p}` -- the neighbour graph in `obsp` entry `p`;
+ * - `var/{axis}/{names}` -- the genes of one expression matrix (`X`, `raw`
+ *   or `layer-{k}`) named by one name source (`index` or `column-{k}`), and
+ *   `var/{axis}/{names}/{g}` gene `g` of that list;
+ * - `outliers/{l}/{f}` -- the outlier quantiles of categorical obs field `f`
+ *   in the latent space `obsm` entry `l`.
+ *
+ * The dataset's own defaults have their own routes beside these (`obs`,
+ * `var`, `var/{g}`, `obsp`; `data-loaders.js`).
  *
  * @module data/data-mapping-candidates
  */
@@ -27,14 +40,11 @@ import {
   defaultEmbeddingSlots,
   defaultExpression,
   defaultVectorBindings,
-  isVectorFieldKey,
+  parseVectorFieldKey,
   slotDimension,
   validateEmbeddingColumns,
-  VECTOR_KEY_PATTERN,
+  vectorFieldKeys,
 } from './data-mapping.js';
-
-/** Every data-mapping route lives under this prefix of a dataset base URL. */
-export const MAPPING_ROUTE_PREFIX = '_cellucid/mapping/';
 
 /**
  * The neighbour graph a file read in the browser opens with, when `obsp`
@@ -58,7 +68,7 @@ export function requireObspKey(key) {
 const STORAGE_KINDS = Object.freeze(['dense', 'csr', 'csc', 'dataframe', 'other']);
 const DECIMAL = '(?:0|[1-9][0-9]*)';
 const EMBEDDING_ROUTE = new RegExp(
-  `^${MAPPING_ROUTE_PREFIX}embeddings/(${DECIMAL})/(${DECIMAL}(?:-${DECIMAL}){0,2})\\.bin$`
+  `^obsm/(${DECIMAL})/(${DECIMAL}(?:-${DECIMAL}){0,2})$`
 );
 
 function formatCount(value) {
@@ -339,25 +349,38 @@ export function describeAnnDataProbes(probes) {
  * and refused: the browser has read those values, so its catalog lists them
  * as unusable with the load-time reason instead of the listing-time verdict.
  *
+ * `chosen` replaces the automatic `knn`, `geneNames`, `expression` and
+ * `latent` defaults with the ones a launch named (each only when given, and
+ * already checked against the file by the caller); a chosen expression
+ * matrix is not guessed.
+ *
  * @param {ReturnType<typeof describeAnnDataProbes>} described
  * @param {{slots: Object, guessed: ReadonlyArray<string>, rejected?: ReadonlyArray<[string, string]>}} resolution
+ * @param {{knn?: string|null, geneNames?: string, expression?: string|null, latent?: string|null}} [chosen]
  * @returns {Object} A deep-frozen candidate catalog.
  */
-export function assembleAnnDataCandidates(described, { slots, guessed, rejected = [] }) {
+export function assembleAnnDataCandidates(described, { slots, guessed, rejected = [] }, chosen = {}) {
   const defaults = {};
   for (const slot of DIMENSION_SLOTS) {
     const ref = slots[slot] ?? null;
     defaults[slot] = ref === null ? null : { key: ref.key, columns: [...ref.columns] };
   }
-  const usableKeys = described.obsm.filter(item => item.usable).map(item => item.key);
   const connectivities = described.obsp.find(item => item.key === DEFAULT_KNN_KEY);
   const loadFailures = new Map(rejected);
   // X when the file has it; otherwise raw, the only layer, or the best-named
   // layer (`defaultExpression`), recorded as guessed.
-  const expression = defaultExpression({
-    hasX: described.X !== null,
-    hasRaw: described.raw !== null && described.raw.X !== null,
-    layers: described.layers.filter(layer => layer.usable).map(layer => layer.key),
+  const expression = Object.hasOwn(chosen, 'expression')
+    ? { expression: chosen.expression, guessed: false }
+    : defaultExpression({
+      hasX: described.X !== null,
+      hasRaw: described.raw !== null && described.raw.X !== null,
+      layers: described.layers.filter(layer => layer.usable).map(layer => layer.key),
+    });
+  const latent = Object.hasOwn(chosen, 'latent') ? chosen.latent : null;
+  const entries = obsmEntries(described.obsm);
+  const enabled = defaultEnabledEmbeddings(entries, defaults, {
+    latentKey: latent,
+    rejected: rejected.map(([key]) => key),
   });
   const candidates = {
     kind: ANNDATA_KIND,
@@ -375,17 +398,16 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     defaults: {
       kind: ANNDATA_KIND,
       embeddings: {
-        enabled: defaultEnabledEmbeddings(obsmEntries(described.obsm), defaults, {
-          latentKey: null,
-          rejected: rejected.map(([key]) => key),
-        }),
+        enabled,
         defaults,
       },
-      knn: connectivities === undefined ? null : DEFAULT_KNN_KEY,
-      geneNames: 'index',
+      knn: Object.hasOwn(chosen, 'knn')
+        ? chosen.knn
+        : (connectivities === undefined ? null : DEFAULT_KNN_KEY),
+      geneNames: Object.hasOwn(chosen, 'geneNames') ? chosen.geneNames : 'index',
       expression: expression.expression,
-      latent: null,
-      vectorFields: defaultVectorBindings(usableKeys, defaults),
+      latent,
+      vectorFields: defaultVectorBindings(entries, enabled),
     },
     guessed: [...guessed, ...(expression.guessed ? ['expression'] : [])],
   };
@@ -426,7 +448,7 @@ export function mappingEmbeddingPath(obsmIndex, columns) {
   if (!Array.isArray(columns) || columns.length < 1 || columns.length > 3) {
     throw new TypeError('A mapped embedding reads 1 to 3 columns.');
   }
-  return `${MAPPING_ROUTE_PREFIX}embeddings/${obsmIndex}/${columns.join('-')}.bin`;
+  return `obsm/${obsmIndex}/${columns.join('-')}`;
 }
 
 /**
@@ -445,41 +467,37 @@ export function parseMappingEmbeddingPath(path) {
   };
 }
 
-const KNN_ROUTE = new RegExp(
-  `^${MAPPING_ROUTE_PREFIX}knn/(${DECIMAL})/connectivity_manifest\\.json$`
-);
+const GRAPH_ROUTE = new RegExp(`^obsp/(${DECIMAL})$`);
 
 /**
- * The directory of one mapped neighbour graph: `obsp` entry `obspIndex`,
- * whose `connectivity_manifest.json` and `connectivity/edges.*` files live
- * under it exactly as an export's do under the dataset base.
+ * The route of one mapped neighbour graph: `obsp` entry `obspIndex`, whose
+ * summary and edges are both read at it.
  *
  * @param {number} obspIndex
  * @returns {string}
  */
-export function mappingKnnBase(obspIndex) {
+export function mappingGraphPath(obspIndex) {
   if (!Number.isSafeInteger(obspIndex) || obspIndex < 0) {
     throw new TypeError('An obsp index must be a non-negative integer.');
   }
-  return `${MAPPING_ROUTE_PREFIX}knn/${obspIndex}/`;
+  return `obsp/${obspIndex}`;
 }
 
 /**
- * The `obsp` entry a mapped neighbour-graph manifest path names, or null for
- * any other path (the dataset's own `connectivity_manifest.json`).
+ * The `obsp` entry a mapped neighbour-graph route names, or null for any
+ * other path (the dataset's own graph, `obsp`).
  *
  * @param {string} path
  * @returns {number|null}
  */
-export function parseMappingKnnManifestPath(path) {
+export function parseMappingGraphPath(path) {
   if (typeof path !== 'string') return null;
-  const match = KNN_ROUTE.exec(path);
+  const match = GRAPH_ROUTE.exec(path);
   return match === null ? null : Number(match[1]);
 }
 
 const GENES_ROUTE = new RegExp(
-  `^${MAPPING_ROUTE_PREFIX}genes/(X|raw|layer-${DECIMAL})/(index|column-${DECIMAL})/` +
-  `(?:(var_manifest)\\.json|var/(${DECIMAL})\\.values\\.f32)$`
+  `^var/(X|raw|layer-${DECIMAL})/(index|column-${DECIMAL})(?:/(${DECIMAL}))?$`
 );
 
 /**
@@ -533,15 +551,15 @@ export function geneNamesRoute(candidates, axisRoute, geneNames) {
 }
 
 /**
- * The directory of one mapped gene list: its `var_manifest.json` and its
- * `var/{g}.values.f32` files, laid out as an export's are under its base.
+ * The route of one mapped gene list: the genes of one expression matrix
+ * named by one name source. Gene `g` of the list is at `{route}/{g}`.
  *
  * @param {string} axisRoute
  * @param {string} namesRoute
  * @returns {string}
  */
-export function mappingGenesBase(axisRoute, namesRoute) {
-  return `${MAPPING_ROUTE_PREFIX}genes/${axisRoute}/${namesRoute}/`;
+export function mappingGeneListPath(axisRoute, namesRoute) {
+  return `var/${axisRoute}/${namesRoute}`;
 }
 
 /**
@@ -549,7 +567,7 @@ export function mappingGenesBase(axisRoute, namesRoute) {
  *
  * @param {string} path
  * @returns {{axisRoute: string, namesRoute: string, gene: number|null}|null}
- *   `gene` is null for the var manifest.
+ *   `gene` is null for the gene list itself.
  */
 export function parseMappingGenesPath(path) {
   if (typeof path !== 'string') return null;
@@ -558,7 +576,7 @@ export function parseMappingGenesPath(path) {
   return {
     axisRoute: match[1],
     namesRoute: match[2],
-    gene: match[3] === undefined ? Number(match[4]) : null,
+    gene: match[3] === undefined ? null : Number(match[3]),
   };
 }
 
@@ -602,37 +620,43 @@ export function resolveCandidateRef(candidates, ref, dimension) {
 
 const COLUMN_LIST = `${DECIMAL}(?:-${DECIMAL}){0,2}`;
 const VECTOR_ROUTE = new RegExp(
-  `^${MAPPING_ROUTE_PREFIX}vectors/(${DECIMAL})/(${COLUMN_LIST})/(${DECIMAL})/(${COLUMN_LIST})\\.bin$`
+  `^vectors/(${DECIMAL})/(${COLUMN_LIST})/(${DECIMAL})/(${COLUMN_LIST})$`
 );
-const LATENT_ROUTE = new RegExp(
-  `^${MAPPING_ROUTE_PREFIX}latent/(${DECIMAL})/obs/(${DECIMAL})\\.outliers\\.f32$`
-);
+const LATENT_ROUTE = new RegExp(`^outliers/(${DECIMAL})/(${DECIMAL})$`);
 
 /**
  * The fewest cells a category needs for its cells to get outlier quantiles;
- * smaller categories get none (NaN). `prepare()` and `cellucid serve` default
- * to the same count.
+ * smaller categories get none (NaN). `prepare()` defaults to the same count.
  */
 export const LATENT_OUTLIER_MIN_POINTS = 10;
 
 /**
- * The id a vector field is listed under. `<field>_umap_<d>d` keys of every
- * dimension are one field, `<field>_umap`, as `prepare()` and `cellucid serve`
- * name it; any other `obsm` key is its own field.
+ * The id a vector field is listed under. A key bound to the embedding it is
+ * named for (`parseVectorFieldKey`) is its field, so the keys of one field on
+ * every basis are one field: `velocity_umap` on `X_umap` and
+ * `velocity_umap_3d` on `X_umap_3d` are both `velocity`, as `prepare()`
+ * names it. A key bound to any other embedding is its own field.
  *
- * @param {string} key
+ * @param {Object} candidates - An AnnData candidate catalog.
+ * @param {{key: string, embedding: {key: string}}} binding
  * @returns {string}
  */
-export function vectorFieldIdOf(key) {
-  return isVectorFieldKey(key) ? VECTOR_KEY_PATTERN.exec(key).groups.field : key;
+export function vectorFieldIdOf(candidates, binding) {
+  const parsed = parseVectorFieldKey(
+    binding.key,
+    new Set(candidates.obsm.map(item => item.key))
+  );
+  return parsed !== null && parsed.embeddingKey === binding.embedding.key
+    ? parsed.field
+    : binding.key;
 }
 
 /**
  * Resolve one AnnData vector binding `{key, embedding}` against a catalog:
  * the vector array is read at the embedding's own columns when both arrays
  * are equally wide (`velocity_pca` over `X_pca[2,3]`), or whole when it is
- * exactly as wide as the embedding's dimension (`velocity_umap_2d` over
- * `X_umap`), the rule `cellucid serve` applies to the same route.
+ * exactly as wide as the embedding's dimension (a 2-column `drift` over
+ * `X_pca[0,1]`).
  *
  * @param {Object} candidates - An AnnData candidate catalog.
  * @param {{key: string, embedding: {key: string, columns: ReadonlyArray<number>}}} binding
@@ -665,11 +689,11 @@ export function resolveVectorBinding(candidates, binding) {
   }
   return {
     ok: true,
-    fieldId: vectorFieldIdOf(binding.key),
+    fieldId: vectorFieldIdOf(candidates, binding),
     layoutKey: canonicalEmbeddingId(binding.embedding.key, embedding.columns, { width: embedding.width }),
     dimension,
-    path: `${MAPPING_ROUTE_PREFIX}vectors/${vectorIndex}/${vectorColumns.join('-')}/`
-      + `${embedding.obsmIndex}/${embedding.columns.join('-')}.bin`,
+    path: `vectors/${vectorIndex}/${vectorColumns.join('-')}/`
+      + `${embedding.obsmIndex}/${embedding.columns.join('-')}`,
   };
 }
 
@@ -693,8 +717,8 @@ export function parseMappingVectorPath(path) {
 
 /**
  * Why one `obsm` entry cannot be a latent space, or null when it can: it
- * must be usable and dense. Its size is not limited: the direct reader
- * streams it from the file, and `cellucid serve` uses the array it holds.
+ * must be usable and dense. Its size is not limited: the reader streams it
+ * from the file.
  *
  * @param {{key: string, usable: boolean, reason: string|null, storage: string, shape: number[]|null}} item
  * @returns {string|null}
@@ -707,7 +731,8 @@ export function latentCandidateReason(item) {
 
 /**
  * The route of the outlier quantiles of one categorical obs field (its
- * payload index) in one latent space (its catalog position).
+ * position in the obs field list) in one latent space (its catalog
+ * position).
  *
  * @param {number} obsmIndex
  * @param {number} fieldIndex
@@ -720,7 +745,7 @@ export function mappingLatentOutlierPath(obsmIndex, fieldIndex) {
   if (!Number.isSafeInteger(fieldIndex) || fieldIndex < 0) {
     throw new TypeError('An obs field index must be a non-negative integer.');
   }
-  return `${MAPPING_ROUTE_PREFIX}latent/${obsmIndex}/obs/${fieldIndex}.outliers.f32`;
+  return `outliers/${obsmIndex}/${fieldIndex}`;
 }
 
 /**
@@ -762,27 +787,6 @@ export function mappingLayoutDescriptor(candidates, ref, dimension) {
 }
 
 /**
- * The `obsm` arrays a view of `dimension` can show at their default columns,
- * in file order: usable dense arrays at least `dimension` columns wide that
- * are not vector fields.
- *
- * @param {Object} candidates
- * @param {number} dimension
- * @returns {Array<{key: string, columns: number[], width: number}>}
- */
-export function plottableObsmRefs(candidates, dimension) {
-  const refs = [];
-  for (const item of candidates.obsm) {
-    const width = obsmWidth(item);
-    if (!item.usable || width === null || width < dimension || isVectorFieldKey(item.key)) {
-      continue;
-    }
-    refs.push({ key: item.key, columns: defaultColumns(dimension), width });
-  }
-  return refs;
-}
-
-/**
  * A load-time refusal of one mapping choice: an array the catalog lists as
  * usable whose values cannot be shown or read as chosen (a NaN in an
  * embedding, a neighbour graph that is not symmetric, a latent space over the
@@ -790,8 +794,7 @@ export function plottableObsmRefs(candidates, dimension) {
  * `X`, `raw`, a layer or a `var` column -- so that one option is marked
  * unusable for the session while every other stays available.
  *
- * The browser adapters throw it directly; a served dataset's mapping route
- * answers HTTP 422 with `{"error", "key"}`, which the loaders turn into it.
+ * The browser adapters throw it.
  */
 export class MappingLoadError extends Error {
   /**
@@ -825,50 +828,9 @@ export class EmbeddingLoadError extends MappingLoadError {
 }
 
 /**
- * Turn one mapping route's HTTP 422 body (`{"error", "key", "reason"}`) into
- * the refusal it reports, or return null when the body is not a mapping
- * refusal. `error` is the full sentence; `reason` is the clause listed beside
- * the key, in the same words a file read in the browser gives.
- *
- * The route names what was refused, and so the refusal's type: an embedding
- * route's is an `EmbeddingLoadError` at the columns it read, exactly as the
- * browser adapters throw. One `obsm` key can be an embedding, a latent space
- * and a vector field at once, so the key alone cannot say which choice failed.
- *
- * @param {string|null} body - The response text.
- * @param {string} path - The route path, from `_cellucid/mapping/`.
- * @returns {MappingLoadError|null}
- */
-export function mappingRefusalFromBody(body, path) {
-  if (typeof body !== 'string') return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  if (
-    parsed === null ||
-    typeof parsed !== 'object' ||
-    Array.isArray(parsed) ||
-    Object.keys(parsed).sort().join(',') !== 'error,key,reason' ||
-    ['error', 'key', 'reason'].some(
-      name => typeof parsed[name] !== 'string' || parsed[name].length === 0
-    )
-  ) {
-    return null;
-  }
-  const embedding = parseMappingEmbeddingPath(path);
-  if (embedding !== null) {
-    return new EmbeddingLoadError(parsed.key, embedding.columns, parsed.reason);
-  }
-  return new MappingLoadError(parsed.key, parsed.reason, parsed.error);
-}
-
-/**
  * Return why the selected columns of one embedding cannot be plotted, or null.
  *
- * The rule is `cellucid serve`'s: every value is finite and representable as
+ * The rule is `prepare()`'s: every value is finite and representable as
  * float32 (a non-zero value that narrows to zero is not), and the columns span
  * a non-zero range. The first offending cell is named.
  *
@@ -899,7 +861,7 @@ export function embeddingLoadDefect(values, width) {
  * The first value of a row-major numeric array Cellucid cannot read, as the
  * clause a refusal names (`NaN at cell 17`, `not representable as float32 at
  * cell 4`), or null when every value is finite and representable as float32.
- * The words `cellucid serve` uses for the same array.
+ * The words `prepare()` uses for the same array.
  *
  * @param {ArrayLike<number|bigint>} values - Row-major, `width` values a cell.
  * @param {number} width

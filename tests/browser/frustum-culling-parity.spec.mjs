@@ -9,13 +9,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { pixelParityVerdict } from './helpers/pixel-parity.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=frustum-culling-parity-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=frustum-culling-parity-ci';
 // Large enough that the spatial index splits the cloud into many leaves.
 const POINT_COUNT = 60_000;
 

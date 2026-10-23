@@ -150,9 +150,9 @@ function createAbortError(message, cause = undefined) {
   return error;
 }
 
-function ownerAbortReason(signal, fallbackCause = undefined) {
+function ownerAbortReason(signal, defaultCause = undefined) {
   if (signal?.reason instanceof Error) return signal.reason;
-  return createAbortError('CAP request was cancelled', fallbackCause);
+  return createAbortError('CAP request was cancelled', defaultCause);
 }
 
 function createRequestAbortScope(signal, timeoutMs) {

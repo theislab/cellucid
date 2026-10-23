@@ -25,8 +25,10 @@ import {
   createSessionRestoreTransaction,
 } from '../assets/js/app/session/session-context.js';
 import {
-  createInMemoryDimensionManager,
-} from '../assets/js/data/dimension-manager.js';
+  createInMemoryAnnDataDimensionManager,
+  describeOwnVarCount,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 import { untilEntered } from './helpers/entered.mjs';
 
 const PUBLISHED_PROFILE = Object.freeze([
@@ -58,12 +60,30 @@ const PUBLISHED_PROFILE = Object.freeze([
     datasetDependent: false,
   }),
   Object.freeze({
-    id: 'analysis/windows',
-    contributorId: 'analysis-windows',
+    id: 'ui/figure-export',
+    contributorId: 'figure-export',
     priority: 'eager',
     kind: 'json',
     codec: 'gzip',
+    label: 'Figure export',
+    datasetDependent: false,
+  }),
+  Object.freeze({
+    id: 'analysis/windows',
+    contributorId: 'analysis-windows',
+    priority: 'eager',
+    kind: 'binary',
+    codec: 'gzip',
     label: 'Analysis windows',
+    datasetDependent: true,
+  }),
+  Object.freeze({
+    id: 'analysis/docked',
+    contributorId: 'analysis-docked',
+    priority: 'eager',
+    kind: 'binary',
+    codec: 'gzip',
+    label: 'Docked analysis',
     datasetDependent: true,
   }),
   Object.freeze({
@@ -78,18 +98,10 @@ const PUBLISHED_PROFILE = Object.freeze([
 ]);
 
 /**
- * The export data mapping of a dataset whose one embedding is an in-memory 3D
+ * The data mapping of a dataset whose one embedding is an in-memory 3D
  * layout (keyed "3d").
  */
-const IN_MEMORY_3D_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: {
-    enabled: [{ key: '3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
-  },
-  geneNames: 'index',
-  vectorFields: [],
-});
+const IN_MEMORY_3D_MAPPING = Object.freeze(inMemoryAnnDataMapping());
 
 /**
  * What a session fingerprint reads from a DataState besides its counts: the
@@ -97,7 +109,7 @@ const IN_MEMORY_3D_MAPPING = Object.freeze({
  * layout, the live layout key and the dataset's data mapping.
  */
 function fingerprintOwners(positionsArray) {
-  const dimensionManager = createInMemoryDimensionManager({
+  const dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: positionsArray,
     dimension: 3,
   });
@@ -105,14 +117,20 @@ function fingerprintOwners(positionsArray) {
     positionsArray,
     dimensionManager,
     getDataMapping: () => IN_MEMORY_3D_MAPPING,
+    describeMappingVarCount: describeOwnVarCount,
     getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
+    // The manifest's `requires` is read from the focused view's state.
+    getActiveViewId: () => 'live',
   };
 }
 
 function makeContributor(
   profile,
   restore = () => {},
-  payload = { chunkId: profile.id },
+  // A binary chunk's payload is bytes; a JSON chunk's is a record.
+  payload = profile.kind === 'binary'
+    ? new TextEncoder().encode(profile.id)
+    : { chunkId: profile.id },
 ) {
   return {
     id: profile.contributorId,
@@ -142,6 +160,7 @@ function makeSerializer(contributors) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -249,6 +268,7 @@ function makeOverlaySerializer(overlayOwner, coreRestore) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -399,9 +419,30 @@ function createCoreHarness(t, {
     getViewLayout(viewId = 'live') {
       return layoutKeyOf(viewId);
     },
+    // The restore preloads every embedding its views show, pinned until the
+    // views are rebuilt.
+    preloads: [],
+    pins: 0,
+    resolveRepresentation(ref) {
+      return embeddingLayoutKey(ref);
+    },
+    pinLayout(layoutKey) {
+      this.pins += 1;
+      let released = false;
+      return () => {
+        assert.equal(released, false, `the pin of "${layoutKey}" is released once`);
+        released = true;
+        this.pins -= 1;
+      };
+    },
+    async getPositions(layoutKey) {
+      this.preloads.push(layoutKey);
+      return new Float32Array(0);
+    },
   };
   const state = {
     pointCount: 3,
+    dimensionManager,
     obsData: { fields: [] },
     varData: { fields: [] },
     activeFieldIndex: -1,
@@ -515,6 +556,7 @@ function createCoreHarness(t, {
   };
 
   let camera = cameraState(3);
+  const centroidFlags = new Map();
   let camerasLocked = true;
   let layout = {
     mode: 'single',
@@ -551,6 +593,15 @@ function createCoreHarness(t, {
     },
     getViewCameraState() {
       return structuredClone(camera);
+    },
+    getCentroidFlags(viewId) {
+      return { ...(centroidFlags.get(viewId) ?? { points: false, labels: false }) };
+    },
+    setShowCentroidPoints(show, viewId) {
+      centroidFlags.set(viewId, { ...this.getCentroidFlags(viewId), points: show });
+    },
+    setShowCentroidLabels(show, viewId) {
+      centroidFlags.set(viewId, { ...this.getCentroidFlags(viewId), labels: show });
     },
     getViewDimension(viewId = 'live') {
       return embeddingDimension(viewEmbedding(viewId));
@@ -676,9 +727,9 @@ async function createSizedPublishedBundle(encodedByteLengths) {
     capture() {
       return [{
         ...profile,
-        payload: jsonPayloadWithEncodedBytes(
-          encodedByteLengths[index],
-        ),
+        payload: profile.kind === 'binary'
+          ? new Uint8Array(encodedByteLengths[index]).fill(0x20)
+          : jsonPayloadWithEncodedBytes(encodedByteLengths[index]),
       }];
     },
     restore() {},
@@ -770,7 +821,7 @@ function abortError() {
   return new DOMException('Aborted', 'AbortError');
 }
 
-test('published defaults accept only the exact ordered five-chunk static profile', async () => {
+test('published defaults accept only the exact ordered seven-chunk static profile', async () => {
   const validBundle = await createPublishedBundle();
   const restored = [];
   const serializer = makeSerializer(makeProfileContributors(
@@ -824,10 +875,7 @@ test('a published default has no size limit; each chunk is held to its declared 
   // Far above the former 32 KiB transport and 64 KiB uncompressed caps.
   const largeSizes = [
     256 * 1024,
-    11,
-    11,
-    11,
-    11,
+    ...Array(PUBLISHED_PROFILE.length - 1).fill(11),
   ];
   const largeBundle = await createSizedPublishedBundle(largeSizes);
   const restored = [];
@@ -864,14 +912,12 @@ test('a published default has no size limit; each chunk is held to its declared 
 test('published defaults stop a gzip stream that expands beyond its bounded declaration', async () => {
   const actualRawBytes = 128 * 1024;
   const minimumJsonBytes = 11;
+  const otherChunks = PUBLISHED_PROFILE.length - 1;
   const declaredFirstChunkBytes =
-    (64 * 1024) - (4 * minimumJsonBytes);
+    (64 * 1024) - (otherChunks * minimumJsonBytes);
   const sourceBundle = await createSizedPublishedBundle([
     actualRawBytes,
-    minimumJsonBytes,
-    minimumJsonBytes,
-    minimumJsonBytes,
-    minimumJsonBytes,
+    ...Array(otherChunks).fill(minimumJsonBytes),
   ]);
   const lyingBundle = await rewriteBundle(
     sourceBundle,
@@ -913,7 +959,7 @@ test('published defaults stop a gzip stream that expands beyond its bounded decl
       // envelope check refuses the chunk before anything is inflated; a forged
       // trailer is stopped by the bounded native read instead
       // (tests/session-gzip-codec.test.mjs).
-      /Gzip ISIZE 131072 does not match the exact 65492-byte contract/,
+      new RegExp(`Gzip ISIZE 131072 does not match the exact ${declaredFirstChunkBytes}-byte contract`),
     );
   });
   assert.deepEqual(restored, []);
@@ -1144,10 +1190,10 @@ test('real core state rolls back exact representation and camera after commit fa
     });
     const payload = structuredClone(chunk.payload);
     assert.deepEqual(payload.liveEmbedding, STARTING_EMBEDDING);
+    // The live view is the focused one, so its camera is the session camera.
     const targetCamera = cameraState(9);
-    payload.camera = targetCamera;
     payload.liveEmbedding = structuredClone(TARGET_EMBEDDING);
-    payload.multiview.liveCameraState = structuredClone(targetCamera);
+    payload.multiview.live.cameraState = structuredClone(targetCamera);
     return payload;
   }
 
@@ -1307,9 +1353,11 @@ test('multiview snapshots carry their embedding through capture and replay', asy
   assert.equal(Object.hasOwn(snapshot, 'dimensionLevel'), false);
   assert.deepEqual(snapshot.embedding, SNAPSHOT_EMBEDDING);
 
+  // The label is not saved: the restored state derives it again.
+  assert.equal(Object.hasOwn(snapshot, 'label'), false);
   const destination = createCoreHarness(t, {
     allowSnapshots: true,
-    snapshotLabels: [snapshot.label],
+    snapshotLabels: ['PCA 3 vs 1'],
   });
   await restoreCoreState(
     destination.context(null, new AbortController().signal),
@@ -1323,15 +1371,19 @@ test('multiview snapshots carry their embedding through capture and replay', asy
   assert.equal(destination.viewer.getViewLayoutKey('snap_1'), 'X_pca[3,1]');
   assert.equal(destination.dimension(), 3);
   assert.deepEqual(destination.embedding(), LIVE_EMBEDDING);
+  // One switch per view: the kept view is replayed on its embedding, then the
+  // live view takes its own. Nothing returns to a base state in between.
   assert.deepEqual(destination.embeddingRequests(), [
-    // core state: the live view.
-    { viewId: 'live', embedding: LIVE_EMBEDDING },
-    // multiview replay: back to the live base, then the snapshot's embedding.
-    { viewId: 'live', embedding: LIVE_EMBEDDING },
     { viewId: 'live', embedding: SNAPSHOT_EMBEDDING },
-    // and the live base once the graph is rebuilt.
     { viewId: 'live', embedding: LIVE_EMBEDDING },
   ]);
+  // Both embeddings were loaded in one wave before the views were rebuilt,
+  // and every pin was released.
+  assert.deepEqual(
+    [...destination.state.dimensionManager.preloads].sort(),
+    ['X_diffmap[0,1,2]', 'X_pca[3,1]'],
+  );
+  assert.equal(destination.state.dimensionManager.pins, 0);
 
   // A snapshot without its embedding, with a malformed one, or with the
   // retired dimension and override fields, is refused before any view is

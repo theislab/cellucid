@@ -9,11 +9,11 @@ import test from 'node:test';
 
 import {
   CellSet,
-  hasDuplicateCellIndex,
-  hasDuplicateIndex,
+  cellListFrom,
+  cellListsEqual,
+  requireCellList,
 } from '../assets/js/app/utils/cell-set.js';
 import { combineAnnotationCandidates } from '../assets/js/app/ui/modules/highlight/annotation-cells.js';
-import { buildKnnAdjacency } from '../assets/js/rendering/highlight-renderer.js';
 
 test('CellSet behaves as a Set of cell indices, iterating ascending', () => {
   const set = new CellSet(100);
@@ -71,13 +71,26 @@ test('a CellSet holds more cells than a JS Set can', () => {
   assert.equal(set.clone().intersectWith(set).size, cellCount);
 });
 
-test('duplicate checks need no Set', () => {
-  assert.equal(hasDuplicateCellIndex([0, 5, 2], 6), false);
-  assert.equal(hasDuplicateCellIndex([0, 5, 2, 5], 6), true);
-  assert.equal(hasDuplicateIndex([1, 2, 3]), false);
-  assert.equal(hasDuplicateIndex([3, 1, 2]), false);
-  assert.equal(hasDuplicateIndex([3, 1, 3]), true);
-  assert.equal(hasDuplicateIndex([]), false);
+test('a cell list is checked in one pass, with no Set', () => {
+  const list = Uint32Array.of(0, 2, 5);
+  assert.equal(requireCellList(list, 6, 'cells'), list);
+  assert.deepEqual(Array.from(CellSet.fromCellList(list, 6)), [0, 2, 5]);
+  assert.throws(() => requireCellList([0, 2, 5], 6, 'cells'), /Uint32Array/);
+  assert.throws(() => requireCellList(Uint32Array.of(0, 5, 2), 6, 'cells'), /ascending/);
+  assert.throws(() => requireCellList(Uint32Array.of(0, 2, 2), 6, 'cells'), /ascending/);
+  assert.throws(() => requireCellList(Uint32Array.of(0, 6), 6, 'cells'), /inside the current dataset of 6/);
+  assert.equal(requireCellList(new Uint32Array(0), 0, 'cells').length, 0);
+  assert.equal(cellListsEqual(Uint32Array.of(1, 4), Uint32Array.of(1, 4)), true);
+  assert.equal(cellListsEqual(Uint32Array.of(1, 4), Uint32Array.of(1, 5)), false);
+});
+
+test('cells from outside the page become one cell list, sorted once', () => {
+  assert.deepEqual(Array.from(cellListFrom([3, 1, 2], 4, 'cells')), [1, 2, 3]);
+  assert.deepEqual(Array.from(cellListFrom([], 4, 'cells')), []);
+  assert.throws(() => cellListFrom([3, 1, 3], 4, 'cells'), /duplicate/);
+  assert.throws(() => cellListFrom([1, 4], 4, 'cells'), /outside the current dataset of 4/);
+  assert.throws(() => cellListFrom([1, -1], 4, 'cells'), /non-negative integer/);
+  assert.throws(() => cellListFrom([1, 1.5], 4, 'cells'), /non-negative integer/);
 });
 
 test('annotation candidates combine as CellSets', () => {
@@ -93,7 +106,7 @@ test('annotation candidates combine as CellSets', () => {
   ];
   for (const [fieldKind, mode, cellIndices, expected] of cases) {
     const { candidates } = combineAnnotationCandidates({
-      candidates: start, cellIndices, mode, fieldKind, cellCount,
+      candidates: start, cellIndices: Uint32Array.from(cellIndices), mode, fieldKind, cellCount,
     });
     assert.ok(candidates instanceof CellSet, `${fieldKind} ${mode}`);
     assert.deepEqual(candidates.toArray(), expected, `${fieldKind} ${mode}`);
@@ -101,28 +114,10 @@ test('annotation candidates combine as CellSets', () => {
   assert.deepEqual(start.toArray(), [1, 2, 3], 'the standing candidates are never mutated');
   assert.throws(
     () => combineAnnotationCandidates({
-      candidates: new Set([1]), cellIndices: [], mode: 'union', fieldKind: 'continuous', cellCount,
+      candidates: new Set([1]), cellIndices: new Uint32Array(0), mode: 'union', fieldKind: 'continuous', cellCount,
     }),
     /CellSet or null/,
   );
-});
-
-test('the KNN adjacency is CSR arrays in both directions', () => {
-  const sources = Uint32Array.from([0, 0, 1, 1]);
-  const destinations = Uint32Array.from([1, 2, 2, 3]);
-  const adjacency = buildKnnAdjacency(sources, destinations, 4);
-  const forward = cell => Array.from(
-    adjacency.destinations.subarray(adjacency.forwardOffsets[cell], adjacency.forwardOffsets[cell + 1]),
-  ).sort();
-  const reverse = cell => Array.from(
-    adjacency.reverseSources.subarray(adjacency.reverseOffsets[cell], adjacency.reverseOffsets[cell + 1]),
-  ).sort();
-  assert.deepEqual(forward(0), [1, 2]);
-  assert.deepEqual(forward(1), [2, 3]);
-  assert.deepEqual(forward(3), []);
-  assert.deepEqual(reverse(2), [0, 1]);
-  assert.deepEqual(reverse(3), [1]);
-  assert.deepEqual(reverse(0), []);
 });
 
 test('selection modules hold no cell-keyed Set or Map', async () => {
@@ -134,6 +129,7 @@ test('selection modules hold no cell-keyed Set or Map', async () => {
     'app/ui/modules/highlight/continuous-selection-preview.js',
     'app/ui/modules/highlight/selection-state.js',
     'app/jupyter-command-handler.js',
+    'rendering/selection-gesture-queries.js',
   ];
   for (const path of modules) {
     const source = await readFile(new URL(`../assets/js/${path}`, import.meta.url), 'utf8');

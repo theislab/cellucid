@@ -16,7 +16,7 @@ test('Jupyter highlight delivery reports asynchronous failure exactly once', asy
         throw failure;
       }
     },
-    cellIndices: [1, 4, 9],
+    cellIndices: Uint32Array.of(1, 4, 9),
     source: 'lasso',
     onFailure(error) {
       observed.push(error);
@@ -34,7 +34,7 @@ test('Jupyter highlight delivery rejects a non-Promise transport contract', () =
           return undefined;
         }
       },
-      cellIndices: [2],
+      cellIndices: Uint32Array.of(2),
       source: 'knn',
       onFailure() {}
     }),

@@ -336,7 +336,7 @@ function bootstrapAndRestore(savedControls, { viewer: viewerOverrides } = {}) {
 const SAVED_SESSION = Object.freeze({
   'hp-lod-enabled': { type: 'checkbox', checked: true },
   'hp-frustum-culling': { type: 'checkbox', checked: true },
-  'hp-antialias': { type: 'checkbox', checked: true },
+  // No 'hp-antialias': a device capability, which a session never carries.
   'hp-shader-quality': { type: 'select', value: 'light' },
   'hp-lod-force': { type: 'range', value: '5' },
 });
@@ -449,7 +449,6 @@ test('restoring the values a control already holds publishes nothing', t => {
   const { rendererCalls } = bootstrapAndRestore({
     'hp-lod-enabled': { type: 'checkbox', checked: false },
     'hp-frustum-culling': { type: 'checkbox', checked: false },
-    'hp-antialias': { type: 'checkbox', checked: true },
     'hp-shader-quality': { type: 'select', value: 'full' },
     'hp-lod-force': { type: 'range', value: '-1' },
   });

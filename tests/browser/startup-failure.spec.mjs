@@ -3,12 +3,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 
 const catalogPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
-  'exports',
+  'catalog',
   'datasets.json',
 );
 
@@ -53,8 +53,7 @@ test('invalid explicit remote intent stops on one visible startup failure', asyn
  * of exactly that length is held; every other timer keeps its real length.
  *
  * The deadlines used to be shortened to 400 ms instead, which made every step
- * race them: on a macOS WebKit runner reading the dataset identity took
- * longer, and startup stalled there, before ever reaching the request the test
+ * race them: on a macOS WebKit runner reading the dataset took longer, and startup stalled there, before ever reaching the request the test
  * holds. Held, a step's deadline only fires when `expireStartupDeadlines` is
  * called, which the tests do once the request they hold is in flight; the
  * steps before it have released theirs by then.
@@ -130,13 +129,15 @@ test('a stalled published default session ends startup naming its phase and URL'
   page
 }) => {
   await holdStartupDeadlines(page);
-  // The catalog default advertises a published default session whose
-  // manifest request is held open forever.
+  // The catalog default advertises a published default session whose file
+  // request is held open forever.
   const catalog = JSON.parse(await readFile(catalogPath, 'utf8'));
-  catalog.datasets[0].state_manifest = 'state-snapshots.json';
-  catalog.datasets[0].state_sha256 = '0'.repeat(64);
-  catalog.datasets[0].state_bytes = 1;
-  await page.route('**/tests/browser/fixtures/exports/datasets.json', route =>
+  catalog.datasets[0].session = {
+    path: 'current-ui.cellucid-session',
+    bytes: 1,
+    sha256: '0'.repeat(64),
+  };
+  await page.route('**/tests/browser/fixtures/catalog/datasets.json', route =>
     route.fulfill({
       body: JSON.stringify(catalog),
       contentType: 'application/json',
@@ -145,12 +146,12 @@ test('a stalled published default session ends startup naming its phase and URL'
   );
   const stalled = await stallRequests(
     page,
-    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json'
+    '**/tests/browser/fixtures/catalog/current-ui.cellucid-session'
   );
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-      '&dataset=current-ui-prepared&acceptance=published-state-stall-ci',
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+      '&dataset=current-ui&acceptance=published-state-stall-ci',
     { waitUntil: 'domcontentloaded' }
   );
   await stalled.inFlight;
@@ -162,7 +163,7 @@ test('a stalled published default session ends startup naming its phase and URL'
     'Startup stalled while reading the published default session'
   );
   await expect(failure).toContainText(
-    '/current-ui-prepared/state-snapshots.json did not answer within 60 s'
+    '/catalog/current-ui.cellucid-session did not answer within 60 s'
   );
   await expect(failure).toHaveCount(1);
   await expect(page.locator('html')).toHaveAttribute(

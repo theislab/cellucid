@@ -5,10 +5,12 @@
  * publishes the exact cell and gene counts, and a categorical legend paints one
  * entry per category. A quiet console is not the acceptance.
  *
- * The prepared fixtures under `fixtures/demo-custom-exports/` are a byte copy of
- * the published `theislab/cellucid-demo-custom-datasets` export tree, so this
- * exercises the reference layout a user publishes for themselves: 1D, 2D and 3D
- * embeddings, connectivity, and vector fields.
+ * The catalog under `fixtures/demo-catalog/` holds the synthetic datasets of
+ * `theislab/cellucid-demo-custom-datasets` as zipped Zarr stores -- the
+ * layouts a user publishes for themselves: 1D, 2D and 3D embeddings,
+ * connectivity, and vector arrays -- and `fixtures/forms-catalog/` the 1D one
+ * in every form a catalog lists (`.h5ad`, `.zarr.zip`, Zarr store folder)
+ * (`scripts/generate-browser-catalog-fixtures.py`).
  */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,16 +29,18 @@ const zarrFixturePath = path.join(
   fixturesDirectory,
   'current-ui-smoke.zarr.zip',
 );
-const demoExportsDirectory = path.join(
+const zarrFolderPath = path.join(
   fixturesDirectory,
-  'demo-custom-exports',
+  'forms-catalog',
+  'forms-zarr.zarr',
 );
+const FORMS_CATALOG = appUrl('/tests/browser/fixtures/forms-catalog/');
 
-const SAME_ORIGIN_DEMO_EXPORTS = appUrl(
-  '/tests/browser/fixtures/demo-custom-exports/',
+const SAME_ORIGIN_DEMO_CATALOG = appUrl(
+  '/tests/browser/fixtures/demo-catalog/',
 );
-const CROSS_ORIGIN_DEMO_EXPORTS = sampleUrl(
-  '/tests/browser/fixtures/demo-custom-exports/',
+const CROSS_ORIGIN_DEMO_CATALOG = sampleUrl(
+  '/tests/browser/fixtures/demo-catalog/',
 );
 
 const DEMO_DATASETS = Object.freeze([
@@ -110,11 +114,11 @@ async function expectRenderedDataset(page, dataset) {
 
 for (const dataset of DEMO_DATASETS) {
   test(
-    `a published prepared export renders through the sample catalog: ${dataset.id}`,
+    `a published dataset renders through the sample catalog: ${dataset.id}`,
     async ({ page }) => {
       const errors = observeProductErrors(page);
       const url = new URL('/', APP_ORIGIN);
-      url.searchParams.set('exportsBaseUrl', SAME_ORIGIN_DEMO_EXPORTS);
+      url.searchParams.set('sampleCatalog', SAME_ORIGIN_DEMO_CATALOG);
       url.searchParams.set('dataset', dataset.id);
       await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
       await dismissWelcome(page);
@@ -126,13 +130,13 @@ for (const dataset of DEMO_DATASETS) {
   );
 }
 
-test('a cross-origin prepared export catalog renders the same dataset', async ({
+test('a cross-origin dataset catalog renders the same dataset', async ({
   page,
 }) => {
   const errors = observeProductErrors(page);
   const dataset = DEMO_DATASETS[1];
   const url = new URL('/', APP_ORIGIN);
-  url.searchParams.set('exportsBaseUrl', CROSS_ORIGIN_DEMO_EXPORTS);
+  url.searchParams.set('sampleCatalog', CROSS_ORIGIN_DEMO_CATALOG);
   url.searchParams.set('dataset', dataset.id);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -142,14 +146,14 @@ test('a cross-origin prepared export catalog renders the same dataset', async ({
   expect(errors).toEqual([]);
 });
 
-test('the sample-dataset selector switches between prepared exports', async ({
+test('the sample-dataset selector switches between datasets', async ({
   page,
 }) => {
   const errors = observeProductErrors(page);
   const first = DEMO_DATASETS[1];
   const second = DEMO_DATASETS[2];
   const url = new URL('/', APP_ORIGIN);
-  url.searchParams.set('exportsBaseUrl', SAME_ORIGIN_DEMO_EXPORTS);
+  url.searchParams.set('sampleCatalog', SAME_ORIGIN_DEMO_CATALOG);
   url.searchParams.set('dataset', first.id);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -178,26 +182,51 @@ test('the sample-dataset selector switches between prepared exports', async ({
  */
 function localCatalogUrl() {
   const url = new URL('/', APP_ORIGIN);
-  url.searchParams.set('exportsBaseUrl', SAME_ORIGIN_DEMO_EXPORTS);
+  url.searchParams.set('sampleCatalog', SAME_ORIGIN_DEMO_CATALOG);
   return url.toString();
 }
 
-test('a prepared directory chosen in the browser renders without a server', async ({
+for (const form of ['forms-h5ad', 'forms-zarr-zip', 'forms-zarr']) {
+  test(`a catalog dataset renders whatever form it is listed in: ${form}`, async ({
+    page,
+  }) => {
+    const errors = observeProductErrors(page);
+    const url = new URL('/', APP_ORIGIN);
+    url.searchParams.set('sampleCatalog', FORMS_CATALOG);
+    url.searchParams.set('dataset', form);
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
+    await dismissWelcome(page);
+    await openCollapsedPanels(page);
+    // The trajectory dataset under each form's own id and name.
+    await expectRenderedDataset(page, {
+      ...DEMO_DATASETS[0],
+      name: {
+        'forms-h5ad': 'Forms — .h5ad',
+        'forms-zarr-zip': 'Forms — Zarr ZIP',
+        'forms-zarr': 'Forms — Zarr folder',
+      }[form],
+    });
+    expect(errors).toEqual([]);
+  });
+}
+
+test('a Zarr store folder chosen in the browser renders without a server', async ({
   page,
 }) => {
   const errors = observeProductErrors(page);
-  const dataset = DEMO_DATASETS[2];
   await page.goto(localCatalogUrl(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
-  await chooseDirectory(
-    page.locator('#user-data-file-input'),
-    path.join(demoExportsDirectory, dataset.id),
-  );
+  // The folder picker hands over the store's hidden metadata files
+  // (`.zgroup`, `.zattrs`, `.zmetadata`) with the rest.
+  await chooseDirectory(page.locator('#user-data-zarr-folder-input'), zarrFolderPath);
 
-  await expectRenderedDataset(page, dataset);
+  await expectRenderedDataset(page, { ...DEMO_DATASETS[0], name: 'Forms — Zarr folder' });
+  await expect(page.locator('#dataset-select')).toHaveValue(
+    'dataset:local-user:forms-zarr',
+  );
   expect(errors).toEqual([]);
 });
 

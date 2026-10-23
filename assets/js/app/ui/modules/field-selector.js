@@ -311,7 +311,7 @@ export function initFieldSelector(options) {
     }
   }
   for (const methodName of [
-    'getCurrentDatasetId',
+    'getCurrentIdentityId',
     'offDatasetChange',
     'onDatasetChange'
   ]) {

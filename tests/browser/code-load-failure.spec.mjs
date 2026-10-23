@@ -1,9 +1,9 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
 test('a module that fails to download says so instead of starting forever', async ({
   page,
@@ -31,7 +31,7 @@ test('a page whose code loads never reports a code-load failure', async ({
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('html')).not.toHaveAttribute(
     'data-code-load-failed',

@@ -236,7 +236,7 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
     cellCount: CELL_COUNT,
   });
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -362,6 +362,30 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
 
   // LOD, frustum culling, picking and connectivity across the mixed panes.
   const interaction = await page.evaluate(async id => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const renderer = viewer.getHPRenderer();
     const frames = async count => {
@@ -410,17 +434,13 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
       sources[index] = index;
       destinations[index] = index + 1;
     }
-    const liveEdges = viewer.setupEdgesV2({
-      sources,
-      destinations,
-      weights: new Float64Array(nCells - 1).fill(1),
-      nEdges: nCells - 1,
-      nCells,
-    });
+    const liveEdges = viewer.setupEdgesV2(
+      edgePayloadOf(sources, destinations, new Float32Array(nCells - 1).fill(1), nCells),
+    );
     const snapshotEdges = viewer.setupEdgesV2ForView(id);
-    // Each pane gathers its shown edges from its own positions (3D live,
-    // 1D snapshot): records are xyz whatever the dimension, so a frame draws
-    // both panes and holds one record store a pane.
+    // Each pane reads its shown edges' positions from its own geometry (3D
+    // live, 1D snapshot): records are cells whatever the dimension, so a
+    // frame draws both panes and holds one record store a pane.
     viewer.setEdgeVisibleTarget(nCells - 1);
     viewer.refreshEdgeSelectionForView('live');
     viewer.refreshEdgeSelectionForView(id);
@@ -428,7 +448,7 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
     await frames(2);
     const memory = viewer.getConnectivityMemoryStats();
     const edgePanes = Object.fromEntries(
-      memory.panes.map(pane => [pane.viewId, pane.shownCount > 0 && pane.gpuBytes === pane.shownCount * 28]),
+      memory.panes.map(pane => [pane.viewId, pane.shownCount > 0 && pane.gpuBytes === pane.shownCount * 40]),
     );
     viewer.setShowConnectivity(false);
     viewer.clearEdgesV2();

@@ -23,15 +23,15 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const REPRESENTATIONS_H5AD = path.join(FIXTURES, 'data-mapping-representations.h5ad');
 const START_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=multi-representation-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=multi-representation-ci';
 
 function collectBrowserErrors(page) {
   const errors = [];
@@ -45,7 +45,7 @@ function collectBrowserErrors(page) {
 async function openRepresentations(page) {
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openCollapsedPanels(page);
   await page.locator('#user-data-h5ad-input').setInputFiles(REPRESENTATIONS_H5AD);
   await expect(page.locator('#dataset-name')).toHaveText('data-mapping-representations');

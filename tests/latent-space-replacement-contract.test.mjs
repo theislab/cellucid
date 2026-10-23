@@ -1,12 +1,13 @@
 /**
  * Replacing the latent space (`state/managers/latent-space.js`) on a real
  * DataState with a kept view:
- * - every categorical descriptor names the new outlier payload, so a field
- *   loaded later reads it;
- * - a loaded categorical field gets the new quantiles in every view, read
- *   before anything changes, and its outlier threshold is kept;
- * - a latent space no loaded field needs is still read once, to check it;
- * - None removes every field's outliers; rollback restores everything.
+ * - staging reads nothing; every categorical descriptor names the new
+ *   outlier route, so its quantiles are got in the new space;
+ * - every view drops the old space's quantiles; a field whose outlier filter
+ *   is in use keeps its threshold and gets the new quantiles at once, as an
+ *   ordinary outlier job (`outlier-quantiles.js`), in every view;
+ * - None removes every field's outliers and reads nothing; rollback restores
+ *   everything.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -16,19 +17,15 @@ import { createInMemoryDimensionManager } from '../assets/js/data/dimension-mana
 
 const N = 4;
 
-function categorical(key, payloadIndex) {
+function categorical(key, fieldIndex) {
   return {
     key,
     kind: 'category',
-    payloadIndex,
+    fieldIndex,
     categories: ['a', 'b'],
-    codesPath: `obs/${payloadIndex}.codes.u8`,
     codesDtype: 'uint8',
     codesMissingValue: 255,
     outlierQuantilesPath: null,
-    outlierDtype: null,
-    outlierQuantized: false,
-    centroidsByEmbedding: {},
   };
 }
 
@@ -65,6 +62,16 @@ function makeState() {
     ],
   };
   state._fieldDataCache.set('leiden', { codes: state.obsData.fields[0].codes, outlierQuantiles: old });
+  const reads = [];
+  state.fieldLoader = {
+    outlierMinPoints: 1,
+    loadOutlierQuantiles: async descriptor => {
+      reads.push(descriptor.outlierQuantilesPath);
+      return state.nextQuantiles;
+    },
+    describeOutlierQuantiles: async () => ({ source: 'held', latentKey: 'X_new' }),
+  };
+  state.reads = reads;
   state._resetViewContexts();
   state.setActiveField(0);
   state.createViewFromSource('live', 'snap_1');
@@ -80,26 +87,27 @@ const outliersOf = (state, viewId) => {
 test('a new latent space reaches every view, keeps thresholds, and rolls back', async () => {
   const { state, old } = makeState();
   const fresh = Float32Array.from([1, 0.5, 1, 0.5]);
-  const reads = [];
+  state.nextQuantiles = fresh;
   const step = await state.stageLatentReplacement({
-    outlierPathFor: index => `_cellucid/mapping/latent/3/obs/${index}.outliers.f32`,
-    loadOutliers: async descriptor => {
-      reads.push(descriptor.outlierQuantilesPath);
-      return fresh;
-    },
+    outlierPathFor: index => `outliers/3/${index}`,
   });
-  // Only the loaded field was read, and nothing changed yet.
-  assert.deepEqual(reads, ['_cellucid/mapping/latent/3/obs/0.outliers.f32']);
+  // Staging reads nothing and changes nothing.
+  assert.deepEqual(state.reads, []);
   assert.equal(outliersOf(state, 'live').outlierQuantiles, old);
 
   step.commit();
   assert.deepEqual(
-    state._obsFieldDescriptors.map(descriptor => [descriptor.outlierQuantilesPath, descriptor.outlierDtype]),
+    state._obsFieldDescriptors.map(descriptor => descriptor.outlierQuantilesPath),
     [
-      ['_cellucid/mapping/latent/3/obs/0.outliers.f32', 'float32'],
-      ['_cellucid/mapping/latent/3/obs/1.outliers.f32', 'float32'],
+      'outliers/3/0',
+      'outliers/3/1',
     ]
   );
+  // The old space's quantiles are gone at once; the filter in use is got again.
+  assert.equal(state._fieldDataCache.get('leiden').outlierQuantiles, undefined);
+  assert.equal(state.getOutlierFilterStatus(0).state, 'running');
+  await state.ensureOutlierQuantiles(0);
+  assert.deepEqual(state.reads, ['outliers/3/0']);
   for (const viewId of ['live', 'snap_1']) {
     assert.equal(outliersOf(state, viewId).outlierQuantiles, fresh, viewId);
     assert.equal(outliersOf(state, viewId)._outlierThreshold, 0.5, viewId);
@@ -115,39 +123,16 @@ test('a new latent space reaches every view, keeps thresholds, and rolls back', 
   assert.equal(state._fieldDataCache.get('leiden').outlierQuantiles, old);
 });
 
-test('None removes every outlier filter; a space no loaded field needs is still checked', async () => {
+test('None removes every outlier filter and reads nothing', async () => {
   const { state } = makeState();
-  const none = await state.stageLatentReplacement({
-    outlierPathFor: () => null,
-    loadOutliers: async () => {
-      throw new Error('nothing is read for None');
-    },
-  });
+  const none = await state.stageLatentReplacement({ outlierPathFor: () => null });
   none.commit();
+  assert.deepEqual(state.reads, []);
   assert.equal(Object.hasOwn(outliersOf(state, 'live'), 'outlierQuantiles'), false);
   assert.equal(state.isOutlierFilterEnabledForActiveField(), false);
-
-  // Unload the field: the next space is read once through the first field.
-  state.obsData.fields[0].loaded = false;
-  for (const context of state.viewContexts.values()) context.obsData.fields[0].loaded = false;
-  const reads = [];
-  await state.stageLatentReplacement({
-    outlierPathFor: index => `latent/${index}`,
-    loadOutliers: async descriptor => {
-      reads.push(descriptor.outlierQuantilesPath);
-      return new Float32Array(N);
-    },
-  });
-  assert.deepEqual(reads, ['latent/0']);
-  await assert.rejects(
-    state.stageLatentReplacement({
-      outlierPathFor: index => `latent/${index}`,
-      loadOutliers: async () => {
-        throw new Error('NaN at cell 2');
-      },
-    }),
-    /NaN at cell 2/
-  );
+  assert.equal(state.getOutlierFilterStatus(0).state, 'no-latent');
+  // The threshold is kept for when a latent space is chosen again.
+  assert.equal(outliersOf(state, 'live')._outlierThreshold, 0.5);
 });
 
 test('a categorical field still loading gets the new space, not the one it started with', async () => {
@@ -165,12 +150,12 @@ test('a categorical field still loading gets the new space, not the one it start
     };
   });
   const fresh = Float32Array.from([1, 1, 0.5, 0.5]);
-  const staging = state.stageLatentReplacement({
-    outlierPathFor: index => `latent/${index}`,
-    loadOutliers: async () => fresh,
-  });
+  state.nextQuantiles = fresh;
+  const staging = state.stageLatentReplacement({ outlierPathFor: index => `outliers/0/${index}` });
   finish();
   const step = await staging;
   step.commit();
+  assert.equal(await state.ensureOutlierQuantiles(0), fresh);
+  assert.deepEqual(state.reads, ['outliers/0/0']);
   assert.equal(state.obsData.fields[0].outlierQuantiles, fresh);
 });

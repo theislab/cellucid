@@ -4,15 +4,13 @@
  * Browsers don't provide a native way to write PNG iTXt metadata via Canvas,
  * so we post-process the encoded PNG and inject standard UTF-8 iTXt chunks.
  *
- * This is only executed on export and does not affect the render loop.
+ * It runs in the figure-export worker, beside the encoder, so reading and
+ * checksumming the encoded image never occupies the page's main thread.
  *
  * @module ui/modules/figure-export/utils/png-metadata
  */
 
-import {
-  awaitFigureExportAbortable,
-  throwIfFigureExportAborted,
-} from '../figure-export-contract.js';
+import { crc32 } from '../../../../../formats/zip/crc32.js';
 
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -38,30 +36,6 @@ function writeU32BE(bytes, offset, value) {
   bytes[offset + 1] = (value >>> 16) & 0xff;
   bytes[offset + 2] = (value >>> 8) & 0xff;
   bytes[offset + 3] = value & 0xff;
-}
-
-let crcTable = null;
-function getCrcTable() {
-  if (crcTable) return crcTable;
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    }
-    table[n] = c >>> 0;
-  }
-  crcTable = table;
-  return table;
-}
-
-function crc32(bytes) {
-  const table = getCrcTable();
-  let c = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    c = table[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
 }
 
 function asciiBytes(value, context) {
@@ -118,16 +92,9 @@ function makeTextChunk(keyword, text) {
  *
  * @param {Blob} blob
  * @param {Record<string, string>} textMap
- * @param {object} [options]
- * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<Blob>}
  */
-export async function embedPngTextChunks(
-  blob,
-  textMap,
-  { signal = null } = {}
-) {
-  throwIfFigureExportAborted(signal);
+export async function embedPngTextChunks(blob, textMap) {
   if (!(blob instanceof Blob) || blob.type !== 'image/png') {
     throw new TypeError('PNG metadata input must be an image/png Blob.');
   }
@@ -144,11 +111,7 @@ export async function embedPngTextChunks(
     throw new TypeError('PNG metadata must contain at least one entry.');
   }
 
-  const buffer = await awaitFigureExportAbortable(
-    signal,
-    blob.arrayBuffer()
-  );
-  throwIfFigureExportAborted(signal);
+  const buffer = await blob.arrayBuffer();
   const bytes = new Uint8Array(buffer);
   if (!isPng(bytes)) {
     throw new Error('PNG metadata input has an invalid PNG signature.');
@@ -183,17 +146,8 @@ export async function embedPngTextChunks(
   }
 
   const chunks = entries.map(([keyword, text]) => makeTextChunk(keyword, text));
-  const insertLen = chunks.reduce((sum, c) => sum + c.length, 0);
-
-  const out = new Uint8Array(bytes.length + insertLen);
-  out.set(bytes.subarray(0, iendOffset), 0);
-  let cursor = iendOffset;
-  for (const c of chunks) {
-    out.set(c, cursor);
-    cursor += c.length;
-  }
-  out.set(bytes.subarray(iendOffset), cursor);
-
-  throwIfFigureExportAborted(signal);
-  return new Blob([out], { type: 'image/png' });
+  return new Blob(
+    [bytes.subarray(0, iendOffset), ...chunks, bytes.subarray(iendOffset)],
+    { type: 'image/png' }
+  );
 }

@@ -114,11 +114,11 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
 
   for (const [name, search] of [
     ['bare catalog', ''],
-    ['configured catalog', 'exportsBaseUrl=https%3A%2F%2Fdata.test%2Fexports%2F'],
+    ['configured catalog', 'sampleCatalog=https%3A%2F%2Fdata.test%2Fanndata%2F'],
     ['explicit Suo sample', 'dataset=suo'],
     ['explicit local-demo sample', 'source=local-demo&dataset=suo'],
     ['remote lookalike', 'remotely=https%3A%2F%2Fserver.test'],
-    ['GitHub lookalike', 'githubRepo=owner%2Frepo%2Fexports'],
+    ['data link lookalike', 'dataset_link=gh%3Aowner%2Frepo'],
     ['Jupyter lookalike', 'jupyterMode=true'],
   ]) {
     await t.test(`${name} shows onboarding`, () => {
@@ -139,8 +139,8 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
     ['same-origin prepared server', 'source=remote', null],
     ['same-origin AnnData server', 'anndata=true', null],
     [
-      'explicit GitHub repository',
-      'github=owner%2Frepo%2Fexports',
+      'explicit data link',
+      'data=gh%3Aowner%2Frepo%2Fexports',
       null
     ],
     [
@@ -197,13 +197,14 @@ test('same-origin health advertisement has exact static and server identities', 
     }),
     'static'
   );
-  assert.equal(
-    classifySameOriginHealthAdvertisement({
+  // The prepared-export server is gone; its health is no server identity.
+  assert.throws(
+    () => classifySameOriginHealthAdvertisement({
       status: 'ok',
       type: 'exported',
       version: '1.2.3'
     }),
-    'server'
+    /no current server or static identity/
   );
   assert.equal(
     classifySameOriginHealthAdvertisement({
@@ -211,7 +212,6 @@ test('same-origin health advertisement has exact static and server identities', 
       type: 'anndata',
       version: '1.2.3',
       format: 'h5ad',
-      is_backed: true,
       n_cells: 3,
       n_genes: 2
     }),
@@ -401,11 +401,9 @@ function createManagerSource(type, {
   const source = {
     async getMetadata(datasetId) {
       return {
-        version: 3,
         id: datasetId,
         name: datasetId,
         description: '',
-        cellucid_data_version: '1.0.0',
         stats: {
           n_cells: 1,
           n_genes: 0,
@@ -422,7 +420,7 @@ function createManagerSource(type, {
             X_umap: {
               label: 'X_umap',
               dimension: 2,
-              file: 'embeddings/0_2d.bin',
+              path: 'obsm/0/0-1',
               source: { key: 'X_umap', columns: [0, 1] }
             }
           }

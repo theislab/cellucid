@@ -19,14 +19,18 @@ import {
 
 const page = query => `http://127.0.0.1:8765/?${query}`;
 
-test('samples, GitHub exports and reachable servers are shareable', () => {
+test('samples, data links and reachable servers are shareable', () => {
   assert.equal(
-    buildShareUrl('local-demo', page('source=local-demo&dataset=pancreas&exportsBaseUrl=x')),
+    buildShareUrl('local-demo', page('source=local-demo&dataset=pancreas&sampleCatalog=x')),
     `${PUBLIC_APP_URL}?dataset=pancreas&source=local-demo`,
   );
   assert.equal(
-    buildShareUrl('github-repo', page('github=owner%2Frepo%2Fexports&dataset=atlas')),
-    `${PUBLIC_APP_URL}?dataset=atlas&github=owner%2Frepo%2Fexports`,
+    buildShareUrl('link', page('data=gh%3Aowner%2Frepo%2Fexports&dataset=atlas')),
+    `${PUBLIC_APP_URL}?dataset=atlas&data=gh%3Aowner%2Frepo%2Fexports`,
+  );
+  assert.equal(
+    buildShareUrl('link', page('data=geo%3AGSE351300')),
+    `${PUBLIC_APP_URL}?data=geo%3AGSE351300`,
   );
   assert.equal(
     buildShareUrl('remote', page('remote=https%3A%2F%2Fdata.example.org&dataset=served')),
@@ -45,15 +49,20 @@ test('a file, a notebook and a server on this computer have no link', () => {
       host,
     );
   }
-  assert.equal(buildShareUrl('github-repo', page('dataset=atlas')), null, 'no repository');
+  assert.equal(buildShareUrl('link', page('dataset=atlas')), null, 'no link');
+  assert.equal(
+    buildShareUrl('link', page(`data=${encodeURIComponent('http://localhost:8000/a.h5ad')}`)),
+    null,
+    'a file on this computer',
+  );
   assert.equal(buildShareUrl('local-demo', page('source=local-demo')), null, 'no dataset');
 });
 
 test('the badge and the embed carry exactly the link', () => {
-  const url = `${PUBLIC_APP_URL}?dataset=atlas&github=owner%2Frepo`;
+  const url = `${PUBLIC_APP_URL}?dataset=atlas&data=gh%3Aowner%2Frepo`;
   assert.equal(badgeMarkdown(url), `[![Open in Cellucid](${BADGE_IMAGE_URL})](${url})`);
   const embed = embedHtml(url, 'Atlas "v2"');
-  assert.match(embed, /^<iframe src="https:\/\/www\.cellucid\.com\/\?dataset=atlas&amp;github=owner%2Frepo" /);
+  assert.match(embed, /^<iframe src="https:\/\/www\.cellucid\.com\/\?dataset=atlas&amp;data=gh%3Aowner%2Frepo" /);
   assert.match(embed, /title="Cellucid: Atlas &quot;v2&quot;"/);
   assert.match(embed, /width="100%" height="640"/);
   assert.match(embed, /allow="fullscreen" loading="lazy"><\/iframe>$/);

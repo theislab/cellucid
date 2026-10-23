@@ -55,7 +55,7 @@ test('the active-field publication names the field everywhere it is shown', () =
 test('every active-field refresh path uses that one publication', () => {
   const paths = [
     ['refreshUiAfterStateLoad', '  function refreshUiAfterStateLoad() {', '\n  }\n'],
-    ['handleFieldChanged', '  const handleFieldChanged = () => {', '\n  };\n'],
+    ['handleFieldChanged', '  const handleFieldChanged = ({ source }) => {', '\n  };\n'],
     // Each view carries its own active field — `setActiveView` restores
     // `ctx.activeFieldIndex` — so switching to a kept view is an active-field
     // change and needs the same publication, not a shorter copy of it.

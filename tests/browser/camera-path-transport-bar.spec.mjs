@@ -1,5 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import {
@@ -7,7 +7,7 @@ import {
 } from '../../assets/js/app/ui/modules/cinematic-camera/transport-bar.js';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=camera-transport-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=camera-transport-ci`;
 
 /* The assertions below straddle the product's own idle deadline. A margin of a
    fifth of it on either side of every boundary is far larger than input
@@ -39,7 +39,7 @@ async function openCameraPathWithTwoKeyframes(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
   await page.locator('#cinematic-camera-section > summary').click();
   await page.locator('#cinematic-save-btn').click();
@@ -182,7 +182,7 @@ test('navigation lives in its own panel, and Camera Path follows it', async ({
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   // One mode select, in the Navigation panel; Camera Path carries no copy.

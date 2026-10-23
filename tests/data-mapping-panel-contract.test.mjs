@@ -56,7 +56,7 @@ function anndataMapping({ enabled, defaults }) {
     geneNames: 'index',
     expression: 'X',
     latent: null,
-    vectorFields: [{ key: 'velocity_umap_2d', embedding: UMAP }],
+    vectorFields: [{ key: 'velocity_umap', embedding: UMAP }],
   };
 }
 
@@ -74,7 +74,7 @@ function anndataMapping({ enabled, defaults }) {
 function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
   const described = describeAnnDataProbes(mappingProbes({
     nObs: N_OBS,
-    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap_2d: 2 },
+    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2 },
     hasX: true,
   }));
   const candidates = assembleAnnDataCandidates(described, {
@@ -86,7 +86,7 @@ function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
     layoutKey: 'X_umap',
     dimension: 2,
     label: 'X_umap',
-    path: 'embeddings/0_2d.bin',
+    path: 'obsm/0/0-1',
     provenance: { key: 'X_umap', columns: [0, 1] },
     origin: 'identity',
   }]);
@@ -195,6 +195,7 @@ test('a dataset opens with its best-guess slots and every narrow array enabled',
     origin: 'default',
     embeddingCandidates: 3,
     enabledRepresentations: 2,
+    vectorFields: 1,
   });
 });
 
@@ -210,7 +211,7 @@ test('changing a default loads it first, then moves only the views that follow i
   assert.equal(manager.getLayout('X_pca[3,1]').origin, 'mapping');
   assert.equal(
     manager.getLayout('X_pca[3,1]').path,
-    '_cellucid/mapping/embeddings/2/3-1.bin'
+    'obsm/2/3-1'
   );
   assert.equal(manager.getDefaultLayout(2), 'X_pca[3,1]');
   assert.deepEqual(moves, [['live', 'X_pca[3,1]', true], ['snapshot-1', 'X_pca[3,1]', true]]);

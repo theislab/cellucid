@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { computeCorrelation } from '../assets/js/app/analysis/compute/operation-handlers.js';
-import { computeDistanceMatrix } from '../assets/js/app/analysis/shared/matrix-utils.js';
+import { pairwiseDistanceRows } from '../assets/js/app/analysis/compute/hierarchical-clustering.js';
 
 const ramp = Float32Array.from({ length: 100 }, (_, index) => index);
 
@@ -63,10 +63,11 @@ test('correlation distance treats a constant row as uncorrelated, never NaN', ()
       matrix[nCols + column] = Math.sin(column);
       matrix[2 * nCols + column] = 2 * Math.sin(column) + 1;
     }
-    const distances = computeDistanceMatrix(matrix, 3, nCols, 'correlation');
+    // Condensed pairs (0,1), (0,2), (1,2).
+    const distances = pairwiseDistanceRows(matrix, 3, nCols, 'correlation', 0, 2);
     for (const value of distances) assert.ok(Number.isFinite(value), String(value));
+    assert.equal(distances[0], 1);
     assert.equal(distances[1], 1);
-    assert.equal(distances[2], 1);
-    assert.ok(Math.abs(distances[5]) < 1e-6);
+    assert.ok(Math.abs(distances[2]) < 1e-12);
   }
 });

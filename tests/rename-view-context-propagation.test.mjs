@@ -33,6 +33,8 @@ function makeTwoViewState() {
   });
   state.activeDimensionLevel = 2;
   state.cellVisibilityMask = new Uint8Array([1, 1]);
+  state.categoryTransparency = new Uint8Array([1, 1]);
+  state.colorsArray = new Uint8Array(8);
   state.obsData = {
     fields: [{
       key: 'leiden',

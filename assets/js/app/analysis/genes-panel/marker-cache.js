@@ -1,47 +1,33 @@
 /**
  * Marker Cache
  *
- * Tiered caching system for marker discovery results.
- * - Hot cache: In-memory LRU for recent categories
- * - Warm cache: IndexedDB for persistence across sessions
- *
- * Features:
- * - Entries are addressed by the data generation they were computed over
- *   (see `identity` below), so a reload under the same dataset id never
- *   serves markers computed from other expression values
- * - TTL-based expiration for IndexedDB entries
- * - Memory-aware hot cache sizing
- * - Cache key generation from analysis parameters
+ * An in-memory LRU of marker discovery results, for the categories analysed
+ * most recently. Entries are addressed by the data generation they were
+ * computed over (see `identity` below), so a reload under the same dataset id
+ * never serves markers computed from other expression values. Nothing outlives
+ * the page: a dataset id does not identify the expression values a reload
+ * brings, so there is no generation key an entry could be trusted under there.
  *
  * @module genes-panel/marker-cache
  */
 
 import { DEFAULTS, CACHE_KEYS } from './constants.js';
 
-// =============================================================================
-// CONSTANTS
-// =============================================================================
-
-const DB_NAME = 'cellucid_marker_cache';
-
 function requireCacheIdentity(identity) {
   if (
     identity === null ||
     typeof identity !== 'object' ||
     Array.isArray(identity) ||
-    Object.keys(identity).sort().join(',') !== 'key,persistent' ||
+    Object.keys(identity).join(',') !== 'key' ||
     typeof identity.key !== 'string' ||
-    identity.key.trim().length === 0 ||
-    typeof identity.persistent !== 'boolean'
+    identity.key.trim().length === 0
   ) {
     throw new TypeError(
-      'MarkerCache dataset identity is required as exactly { key: non-empty string, persistent: boolean }'
+      'MarkerCache dataset identity is required as exactly { key: non-empty string }'
     );
   }
   return identity;
 }
-const DB_VERSION = 1;
-const STORE_NAME = 'markers';
 
 /**
  * Copy the mutable marker-result ownership envelopes while retaining the large
@@ -109,7 +95,8 @@ function cloneMarkerCacheData(data) {
       'groupIds',
       'pValuesByGroup',
       'adjustedPValuesByGroup',
-      'log2FoldChangeByGroup'
+      'log2FoldChangeByGroup',
+      'meanInGroupByGroup'
     ]) {
       if (Array.isArray(data.stats[key])) {
         clone.stats[key] = [...data.stats[key]];
@@ -127,8 +114,6 @@ function cloneMarkerCacheData(data) {
 /**
  * Marker Cache
  *
- * Provides tiered caching for marker discovery results.
- *
  * Every entry is addressed by the analysis parameters *and* by
  * `groupingDigest`, the digest of the exact per-cell category codes the
  * markers were computed over — see `computeCategoryGroupingDigest` in
@@ -138,11 +123,8 @@ function cloneMarkerCacheData(data) {
  * @example
  * const cache = new MarkerCache({
  *   maxCategories: 3,
- *   maxAgeDays: 7,
- *   cacheVersion: 1,
- *   identity: { key: 'pbmc3k@2026-01-01T00:00:00Z', persistent: true }
+ *   identity: { key: JSON.stringify(['load', 'pbmc3k', 1, geneAxis]) }
  * });
- * await cache.init();
  *
  * const params = {
  *   method: 'wilcox',
@@ -161,49 +143,23 @@ export class MarkerCache {
    * Create a MarkerCache
    *
    * @param {Object} [options]
-   * @param {number} [options.maxCategories=3] - Max categories in hot cache
-   * @param {number} [options.maxAgeDays=7] - TTL for IndexedDB entries
-   * @param {number} [options.cacheVersion=1] - Version to invalidate old caches
-   * @param {{ key: string, persistent: boolean }} options.identity - The
-   *   data generation entries belong to. `key` must change whenever the data
-   *   may have changed. `persistent` is true only when the key proves the
-   *   generation across page loads (a published export timestamp); otherwise
-   *   entries live in memory only, because a dataset id alone does not
-   *   identify the expression values a reload brings.
+   * @param {number} [options.maxCategories=3] - Max categories kept
+   * @param {{ key: string }} options.identity - The data generation entries
+   *   belong to. `key` must change whenever the data may have changed.
    */
   constructor(options = {}) {
-    /** @type {number} Max categories in hot cache */
+    /** @type {number} Max categories kept */
     this._maxCategories = options.maxCategories ?? DEFAULTS.cacheMaxCategories;
-
-    /** @type {number} TTL in days for warm cache */
-    this._maxAgeDays = options.maxAgeDays ?? DEFAULTS.cacheMaxAgeDays;
-
-    /** @type {number} Cache version */
-    this._cacheVersion = options.cacheVersion ?? DEFAULTS.cacheVersion;
 
     const identity = requireCacheIdentity(options.identity);
     /** @type {string} Data generation key */
     this._identityKey = identity.key;
-    /** @type {boolean} Whether entries may outlive this page */
-    this._persistent = identity.persistent;
     if (!Number.isSafeInteger(this._maxCategories) || this._maxCategories < 1) {
       throw new RangeError('MarkerCache maxCategories must be a positive integer');
     }
-    if (!Number.isFinite(this._maxAgeDays) || this._maxAgeDays <= 0) {
-      throw new RangeError('MarkerCache maxAgeDays must be a positive finite number');
-    }
-    if (!Number.isSafeInteger(this._cacheVersion) || this._cacheVersion < 1) {
-      throw new RangeError('MarkerCache cacheVersion must be a positive integer');
-    }
 
-    /** @type {Map<string, { data: any, timestamp: number }>} Hot cache (LRU) */
+    /** @type {Map<string, any>} Entries, least recently used first */
     this._hotCache = new Map();
-
-    /** @type {IDBDatabase|null} IndexedDB connection */
-    this._db = null;
-
-    /** @type {boolean} Whether IndexedDB is available */
-    this._indexedDBAvailable = typeof indexedDB !== 'undefined';
   }
 
   /**
@@ -212,37 +168,19 @@ export class MarkerCache {
    * Called before every lookup so a dataset switch, or a reload of the same
    * dataset id, can never be answered from another generation's entries.
    *
-   * @param {{ key: string, persistent: boolean }} identity
+   * @param {{ key: string }} identity
    * @returns {boolean} true if changed
    */
   setIdentity(identity) {
     const exact = requireCacheIdentity(identity);
-    if (
-      exact.key === this._identityKey &&
-      exact.persistent === this._persistent
-    ) {
+    if (exact.key === this._identityKey) {
       return false;
     }
     this._identityKey = exact.key;
-    this._persistent = exact.persistent;
-    // Hot cache entries are keyed by the generation; clearing keeps the
-    // in-memory LRU bounded and avoids wasting space on another generation.
+    // Entries are keyed by the generation; clearing keeps the LRU bounded and
+    // avoids wasting space on another generation.
     this._hotCache.clear();
     return true;
-  }
-
-  /**
-   * Initialize the cache (opens IndexedDB connection)
-   * @returns {Promise<void>}
-   */
-  async init() {
-    if (this._db !== null) return;
-    if (!this._indexedDBAvailable) {
-      return;
-    }
-
-    this._db = await this._openDatabase();
-    await this._cleanupExpired();
   }
 
   /**
@@ -256,26 +194,13 @@ export class MarkerCache {
   async get(category, params) {
     const cacheKey = this._buildCacheKey(category, params);
 
-    // Check hot cache first
     const hotEntry = this._hotCache.get(cacheKey);
     if (hotEntry) {
       // Move to end (LRU)
       this._hotCache.delete(cacheKey);
       this._hotCache.set(cacheKey, hotEntry);
-      return cloneMarkerCacheData(hotEntry.data);
+      return cloneMarkerCacheData(hotEntry);
     }
-
-    // Check warm cache (IndexedDB)
-    if (this._db && this._persistent) {
-      const warmEntry = await this._getFromIndexedDB(cacheKey);
-      if (warmEntry !== null) {
-        // Promote to hot cache
-        const ownedEntry = cloneMarkerCacheData(warmEntry);
-        this._setHotCache(cacheKey, ownedEntry);
-        return cloneMarkerCacheData(ownedEntry);
-      }
-    }
-
     return null;
   }
 
@@ -295,13 +220,7 @@ export class MarkerCache {
     const cacheKey = this._buildCacheKey(category, params);
     const ownedData = cloneMarkerCacheData(data);
 
-    // Store in hot cache
     this._setHotCache(cacheKey, ownedData);
-
-    // Store in warm cache (IndexedDB)
-    if (this._db && this._persistent) {
-      await this._setInIndexedDB(cacheKey, ownedData);
-    }
   }
 
   /**
@@ -313,18 +232,7 @@ export class MarkerCache {
    * @returns {Promise<boolean>}
    */
   async has(category, params) {
-    const cacheKey = this._buildCacheKey(category, params);
-
-    if (this._hotCache.has(cacheKey)) {
-      return true;
-    }
-
-    if (this._db && this._persistent) {
-      const entry = await this._getFromIndexedDB(cacheKey);
-      return entry !== null;
-    }
-
-    return false;
+    return this._hotCache.has(this._buildCacheKey(category, params));
   }
 
   /**
@@ -336,15 +244,7 @@ export class MarkerCache {
    * @returns {Promise<void>}
    */
   async invalidate(category, params) {
-    const cacheKey = this._buildCacheKey(category, params);
-
-    // Remove from hot cache
-    this._hotCache.delete(cacheKey);
-
-    // Remove from warm cache
-    if (this._db) {
-      await this._deleteFromIndexedDB(cacheKey);
-    }
+    this._hotCache.delete(this._buildCacheKey(category, params));
   }
 
   /**
@@ -353,10 +253,6 @@ export class MarkerCache {
    */
   async clear() {
     this._hotCache.clear();
-
-    if (this._db) {
-      await this._clearIndexedDB();
-    }
   }
 
   /**
@@ -367,9 +263,7 @@ export class MarkerCache {
     return {
       hotCacheSize: this._hotCache.size,
       maxCategories: this._maxCategories,
-      indexedDBAvailable: this._indexedDBAvailable,
-      identityKey: this._identityKey,
-      persistent: this._persistent
+      identityKey: this._identityKey
     };
   }
 
@@ -377,10 +271,6 @@ export class MarkerCache {
    * Close the cache (cleanup)
    */
   close() {
-    if (this._db) {
-      this._db.close();
-      this._db = null;
-    }
     this._hotCache.clear();
   }
 
@@ -426,7 +316,6 @@ export class MarkerCache {
     });
     return JSON.stringify([
       this._identityKey,
-      this._cacheVersion,
       CACHE_KEYS.MARKERS,
       category,
       entries
@@ -447,190 +336,6 @@ export class MarkerCache {
       this._hotCache.delete(oldest);
     }
 
-    // Add new entry
-    this._hotCache.set(key, {
-      data,
-      timestamp: Date.now()
-    });
-  }
-
-  /**
-   * Open IndexedDB database
-   * @private
-   */
-  _openDatabase() {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-
-        // Create object store if doesn't exist
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
-          store.createIndex('timestamp', 'timestamp', { unique: false });
-        }
-      };
-    });
-  }
-
-  /**
-   * Get entry from IndexedDB
-   * @private
-   */
-  async _getFromIndexedDB(key) {
-    if (!this._db) return null;
-
-    return new Promise((resolve, reject) => {
-      try {
-        const tx = this._db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.get(key);
-
-        request.onerror = () => reject(
-          request.error ?? new Error('MarkerCache IndexedDB read failed')
-        );
-        request.onsuccess = () => {
-          const entry = request.result;
-          if (!entry) {
-            resolve(null);
-            return;
-          }
-
-          // Check expiration
-          const ageMs = Date.now() - entry.timestamp;
-          const maxAgeMs = this._maxAgeDays * 24 * 60 * 60 * 1000;
-
-          if (ageMs > maxAgeMs) {
-            this._deleteFromIndexedDB(key).then(
-              () => resolve(null),
-              reject
-            );
-            return;
-          }
-
-          resolve(entry.data);
-        };
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * Set entry in IndexedDB
-   * @private
-   */
-  async _setInIndexedDB(key, data) {
-    if (!this._db) return;
-
-    return new Promise((resolve, reject) => {
-      try {
-        const tx = this._db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-
-        const entry = {
-          key,
-          data,
-          timestamp: Date.now()
-        };
-
-        const request = store.put(entry);
-        request.onerror = () => reject(
-          request.error ?? new Error('MarkerCache IndexedDB write failed')
-        );
-        request.onsuccess = () => resolve();
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * Delete entry from IndexedDB
-   * @private
-   */
-  async _deleteFromIndexedDB(key) {
-    if (!this._db) return;
-
-    return new Promise((resolve, reject) => {
-      try {
-        const tx = this._db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.delete(key);
-
-        request.onerror = () => reject(
-          request.error ?? new Error('MarkerCache IndexedDB delete failed')
-        );
-        request.onsuccess = () => resolve();
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * Clear all entries from IndexedDB
-   * @private
-   */
-  async _clearIndexedDB() {
-    if (!this._db) return;
-
-    return new Promise((resolve, reject) => {
-      try {
-        const tx = this._db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.clear();
-
-        request.onerror = () => reject(
-          request.error ?? new Error('MarkerCache IndexedDB clear failed')
-        );
-        request.onsuccess = () => resolve();
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * Clean up expired entries from IndexedDB
-   * @private
-   */
-  async _cleanupExpired() {
-    if (!this._db) return;
-
-    const maxAgeMs = this._maxAgeDays * 24 * 60 * 60 * 1000;
-    const cutoff = Date.now() - maxAgeMs;
-
-    return new Promise((resolve, reject) => {
-      try {
-        const tx = this._db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const index = store.index('timestamp');
-        const range = IDBKeyRange.upperBound(cutoff);
-        const request = index.openCursor(range);
-
-        request.onerror = () => reject(
-          request.error ?? new Error('MarkerCache IndexedDB cleanup scan failed')
-        );
-        request.onsuccess = (event) => {
-          const cursor = event.target.result;
-          if (cursor) {
-            const deleteRequest = cursor.delete();
-            deleteRequest.onerror = () => reject(
-              deleteRequest.error ?? new Error('MarkerCache IndexedDB cleanup delete failed')
-            );
-            cursor.continue();
-          } else {
-            resolve();
-          }
-        };
-      } catch (err) {
-        reject(err);
-      }
-    });
+    this._hotCache.set(key, data);
   }
 }

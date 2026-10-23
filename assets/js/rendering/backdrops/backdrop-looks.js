@@ -42,7 +42,7 @@ export const BACKDROP_AMBIENT_MAX_HZ = 30;
  *
  * - `surface`: exact 8-bit sRGB colour of the canvas clear, the CSS page and
  *   the look before its bake lands.
- * - `fallbackTints`: sRGB 0..1 tints used before (or without) data colours.
+ * - `defaultTints`: sRGB 0..1 tints used before (or without) data colours.
  *
  * Figure export redraws a look with the same renderer from the screen's
  * frozen state (`components/backdrop-look-export.js`).
@@ -55,7 +55,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'light',
     label: 'Atelier (light)',
     surface: Object.freeze([238, 235, 230]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([0.55, 0.52, 0.48]),
       Object.freeze([0.50, 0.52, 0.56]),
       Object.freeze([0.52, 0.50, 0.50]),
@@ -68,7 +68,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'dark',
     label: 'Nebula (dark)',
     surface: Object.freeze([7, 8, 14]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([0.36, 0.42, 0.95]),
       Object.freeze([0.85, 0.32, 0.62]),
       Object.freeze([0.20, 0.75, 0.80]),
@@ -81,7 +81,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'light',
     label: 'Abyss (light)',
     surface: Object.freeze([214, 234, 234]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([0.20, 0.70, 0.75]),
       Object.freeze([0.30, 0.55, 0.85]),
       Object.freeze([0.55, 0.80, 0.60]),
@@ -94,7 +94,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'dark',
     label: 'Abyss (dark)',
     surface: Object.freeze([3, 14, 21]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([0.15, 0.85, 0.85]),
       Object.freeze([0.25, 0.55, 1.00]),
       Object.freeze([0.45, 1.00, 0.70]),
@@ -107,7 +107,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'light',
     label: 'Aurora (light)',
     surface: Object.freeze([236, 234, 236]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([1.00, 0.72, 0.55]),
       Object.freeze([0.62, 0.72, 0.95]),
       Object.freeze([0.95, 0.65, 0.75]),
@@ -120,7 +120,7 @@ export const BACKDROP_LOOKS = Object.freeze({
     tone: 'dark',
     label: 'Aurora (dark)',
     surface: Object.freeze([6, 10, 22]),
-    fallbackTints: Object.freeze([
+    defaultTints: Object.freeze([
       Object.freeze([0.25, 1.00, 0.60]),
       Object.freeze([0.65, 0.35, 1.00]),
       Object.freeze([0.20, 0.80, 0.95]),

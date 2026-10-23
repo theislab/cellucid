@@ -2,18 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { FieldSummaryMethods } from '../assets/js/app/state/managers/field/summary.js';
-import {
-  MIN_VISIBLE_ALPHA_BYTE,
-  POINT_VISIBILITY_THRESHOLD,
-} from '../assets/js/rendering/alpha-visibility.js';
-
-function nextFloat32(value, direction) {
-  const view = new DataView(new ArrayBuffer(4));
-  view.setFloat32(0, value, true);
-  const bits = view.getUint32(0, true);
-  view.setUint32(0, bits + direction, true);
-  return view.getFloat32(0, true);
-}
 
 function continuousField({
   deleted = false,
@@ -117,7 +105,7 @@ test('deleted observation filters cannot reduce continuous or categorical counts
     kind: 'category'
   };
   owner.obsData.fields = [deletedFilter, categoryTarget];
-  owner.categoryTransparency = new Float32Array([1, 1, 1]);
+  owner.categoryTransparency = new Uint8Array([1, 1, 1]);
   owner.activeFieldIndex = 1;
 
   assert.deepEqual(
@@ -135,31 +123,17 @@ test('deleted observation filters cannot reduce continuous or categorical counts
   );
 });
 
-test('field summaries count exactly the Float32 values that encode to visible R8 bytes', () => {
-  const byte3Alpha = POINT_VISIBILITY_THRESHOLD;
-  const byte2Alpha = nextFloat32(byte3Alpha, -1);
-  assert.equal(
-    Math.round(byte2Alpha * 255),
-    MIN_VISIBLE_ALPHA_BYTE - 1,
-  );
-  assert.equal(
-    Math.round(byte3Alpha * 255),
-    MIN_VISIBLE_ALPHA_BYTE,
-  );
-
+test('field summaries count the cells whose one-byte transparency is 1', () => {
   const categoryTarget = {
     _categoryVisible: { 0: true, 1: true },
     _isDeleted: false,
-    categories: ['R8 byte 2', 'R8 byte 3'],
+    categories: ['hidden cell', 'shown cell'],
     codes: new Uint8Array([0, 1]),
     key: 'alpha_boundary',
     kind: 'category',
   };
   const owner = createCountOwner([categoryTarget], 2);
-  owner.categoryTransparency = Float32Array.from([
-    byte2Alpha,
-    byte3Alpha,
-  ]);
+  owner.categoryTransparency = Uint8Array.from([0, 1]);
 
   FieldSummaryMethods.prototype.updateFilteredCount.call(owner);
   assert.deepEqual(owner.filteredCount, { shown: 1, total: 2 });
@@ -176,4 +150,47 @@ test('field summaries count exactly the Float32 values that encode to visible R8
       visibleTotal: 1,
     },
   );
+});
+
+test('category counts match the per-cell rule for every code width and the missing code', () => {
+  for (const [Codes, missing] of [
+    [Uint8Array, 0xff],
+    [Uint16Array, 0xffff],
+    [Uint32Array, 0xffffffff],
+  ]) {
+    const pointCount = 997;
+    const categoryCount = 7;
+    const codes = new Codes(pointCount);
+    const alpha = new Uint8Array(pointCount);
+    for (let cell = 0; cell < pointCount; cell++) {
+      codes[cell] = cell % 11 === 10 ? missing : (cell * 7919) % categoryCount;
+      alpha[cell] = (cell * 31) % 5 === 0 ? 0 : 1;
+    }
+    const field = {
+      _categoryVisible: Object.fromEntries(
+        Array.from({ length: categoryCount }, (_, code) => [code, true])
+      ),
+      categories: Array.from({ length: categoryCount }, (_, code) => `c${code}`),
+      codes,
+      key: `codes_${Codes.name}`,
+      kind: 'category',
+    };
+    const owner = createCountOwner([field], pointCount);
+    owner.categoryTransparency = alpha;
+    const total = new Array(categoryCount).fill(0);
+    const visible = new Array(categoryCount).fill(0);
+    for (let cell = 0; cell < pointCount; cell++) {
+      if (codes[cell] === missing) continue;
+      total[codes[cell]]++;
+      visible[codes[cell]] += alpha[cell];
+    }
+    const counts = FieldSummaryMethods.prototype.computeCategoryCountsForField.call(
+      owner,
+      field,
+    );
+    assert.deepEqual(counts.total, total, Codes.name);
+    assert.deepEqual(counts.available, total, Codes.name);
+    assert.deepEqual(counts.visible, visible, Codes.name);
+    assert.equal(counts.visibleTotal, visible.reduce((a, b) => a + b, 0));
+  }
 });

@@ -27,6 +27,7 @@ import { applyLegendPosition } from '../shared/legend-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { escapeHtml } from '../../utils/dom-utils.js';
 import { isPlotlyPrecomputable, plotlyBoxSummary, sortLikePlotly } from './plotly-box-statistics.js';
+import { POINT_LAYER } from './point-layer.js';
 
 // Tick-label metrics, in multiples of the tick font size.
 //
@@ -517,19 +518,17 @@ export class PlotFactory {
       trace[valueAxis] = violinInput.sorted;
       if (violinInput.kde !== null) trace._precomputedKDE = violinInput.kde;
       // And the calcdata entry its box calc would build from them, which the
-      // vendored violin calc then takes instead of a record per value. Every
-      // value is still drawn when all points are shown, so that mode keeps
-      // Plotly's own calc.
-      if (showPoints !== 'all') {
-        const { pts, ...box } = violinInput.box;
-        trace._precomputedViolin = {
-          sorted: violinInput.sorted,
-          box,
-          // Plotly writes drawing state onto its point records: each trace
-          // gets its own.
-          pts: showPoints === 'outliers' ? pts.map(({ v, i }) => ({ v, i })) : []
-        };
-      }
+      // vendored violin calc then takes instead of a record per value. With
+      // all points shown the points are the sorted values themselves, which
+      // the point layer reads as they are (no record per value).
+      const { pts, ...box } = violinInput.box;
+      trace._precomputedViolin = {
+        sorted: violinInput.sorted,
+        box,
+        // Plotly writes drawing state onto its point records: each trace
+        // gets its own.
+        pts: showPoints === 'outliers' ? pts.map(({ v, i }) => ({ v, i })) : []
+      };
     } else if (boxStatistics === null) {
       // Plotly's raw-value calc sorts the values through a comparator; handed
       // them already in its own order (sortLikePlotly, linear time) that sort
@@ -545,6 +544,12 @@ export class PlotFactory {
 
     if (!isVertical) {
       trace.orientation = 'h';
+    }
+
+    // Points are laid out by Plotly and drawn as one image per box or violin
+    // (point-layer.js), never as one SVG path per point.
+    if (showPoints !== 'none') {
+      trace._cellucidPointLayer = POINT_LAYER;
     }
 
     // Box-specific options

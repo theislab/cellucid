@@ -1,11 +1,11 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { settleStyleTransitions } from './helpers/style-transitions.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=performance-panel-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=performance-panel-ci`;
 
 const STATUSES = Object.freeze(['good', 'warning', 'danger']);
 
@@ -109,7 +109,7 @@ for (const theme of ['light', 'dark']) {
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture'
+      'Current UI fixture'
     );
     await page.locator('#theme-select').selectOption(theme);
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);

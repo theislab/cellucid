@@ -6,12 +6,12 @@ import {
 } from './helpers/test.mjs';
 import {
   APP_ORIGIN,
-  ENCODED_EXPORTS_BASE_URL,
+  ENCODED_SAMPLE_CATALOG_URL,
 } from './helpers/origins.mjs';
 import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 
 const PREPARED_DATASET_URL =
-  `${APP_ORIGIN}/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=reduced-motion-camera-path-ci`;
+  `${APP_ORIGIN}/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=reduced-motion-camera-path-ci`;
 
 const VIEWPORT = { width: 1440, height: 1000 };
 const CANVAS_CLIP = { x: 420, y: 260, width: 480, height: 380 };
@@ -72,7 +72,7 @@ async function preparePath(page) {
   await page.keyboard.press('Escape');
   await expect(page.locator('#welcome-modal')).toBeHidden();
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   await page.locator('#cinematic-camera-section').evaluate(element => {

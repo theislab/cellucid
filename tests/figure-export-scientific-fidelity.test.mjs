@@ -51,6 +51,7 @@ import {
   buildSelectionBadge,
   countHighlightedVisiblePoints,
 } from '../assets/js/app/ui/modules/figure-export/utils/selection-badge.js';
+import './helpers/figure-export-worker-in-process.mjs';
 
 const figureExportRoot = new URL(
   '../assets/js/app/ui/modules/figure-export/',

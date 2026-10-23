@@ -295,7 +295,7 @@ test('WorkerPool makes transfer traversal failure terminal immediately', async t
   );
 });
 
-test('a running-task abort terminates the exact worker pool and rejects its queue', async t => {
+test('a running-task abort answers its caller and leaves the pool and its queue alone', async t => {
   const originalWorker = globalThis.Worker;
   const workers = [];
   class SilentWorker {
@@ -336,20 +336,23 @@ test('a running-task abort terminates the exact worker pool and rejects its queu
     OperationType.COMPUTE_CORRELATION, { xValues: [4, 5, 6], yValues: [4, 5, 6] },
     { transfer: false }
   );
-  const settled = Promise.allSettled([running, queued]);
+  let queuedSettled = false;
+  void queued.then(() => { queuedSettled = true; }, () => { queuedSettled = true; });
 
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(pool.pendingRequests.size, 1);
   assert.equal(pool.taskQueues[0].length, 1);
   controller.abort();
-  const results = await settled;
+  await assert.rejects(running, error => error.name === 'AbortError');
+  await new Promise(resolve => setImmediate(resolve));
 
-  assert.deepEqual(results.map(result => result.status), ['rejected', 'rejected']);
-  assert.equal(results[0].reason?.name, 'AbortError');
-  assert.equal(results[1].reason, results[0].reason);
-  assert.equal(pool.isReady(), false);
-  assert.equal(pool.getTerminalFailure(), results[0].reason);
-  assert.equal(workers[0].terminated, true);
+  // A cancel is not a failure: the pool is ready and the queued task waits
+  // for the worker (cooperatively, or for its replacement after the grace).
+  assert.equal(queuedSettled, false);
+  assert.equal(pool.isReady(), true);
+  assert.equal(pool.getTerminalFailure(), null);
+  assert.equal(workers[0].terminated, false);
+  assert.equal(pool.pendingRequests.get('pool-1').abandoned, true);
 });
 
 test('a worker crash has one terminal owner and never creates a replacement', async t => {
@@ -387,14 +390,15 @@ test('a worker crash has one terminal owner and never creates a replacement', as
 
   const pendingResult = new Promise(resolve => {
     pool.pendingRequests.set('pool-1', {
-      resolve: () => assert.fail('crashed work must not resolve'),
-      reject: error => resolve(error),
+      task: {
+        resolve: () => assert.fail('crashed work must not resolve'),
+        reject: error => resolve(error),
+      },
       timeoutId: null,
       workerIndex: 0,
       type: OperationType.COMPUTE_CORRELATION,
-      signal: null,
-      abortHandler: null,
-      startTime: 0
+      abandoned: false,
+      graceTimer: undefined
     });
   });
 
@@ -675,7 +679,9 @@ test('bounded analysis call sites contain no execution-failure backend switch', 
   assert.doesNotMatch(workerPool, /_fallbackExecute|fallback-operations|main thread fallback/i);
 });
 
-test('analysis worker lifecycle contains no worker replacement or heap-recycle path', async () => {
+// A failed worker is never revived or recycled; the one worker ever replaced
+// is one still running a task its caller cancelled (worker-pool.js).
+test('analysis worker lifecycle contains no failure restart or heap-recycle path', async () => {
   const [manager, workerPool, markerDiscovery, cleanup] = await Promise.all([
     readFile(new URL('compute-manager.js', COMPUTE_ROOT), 'utf8'),
     readFile(new URL('worker-pool.js', COMPUTE_ROOT), 'utf8'),

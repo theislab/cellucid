@@ -2,7 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -15,8 +15,8 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
  */
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=knn-missing-connectivity-warning-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=knn-missing-connectivity-warning-ci';
 
 const MISSING_GRAPH_MESSAGE = 'No neighbor graph available for this dataset';
 
@@ -74,7 +74,7 @@ async function openPreparedDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells',
@@ -237,7 +237,7 @@ test(
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      'Current UI fixture',
     );
     await recordPublishedWarnings(page);
     expect(await publishedWarnings(page)).toEqual([]);

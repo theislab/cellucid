@@ -19,7 +19,13 @@
  * The pass leaves every binding it touches as it found it.
  */
 
-import { createTransformFeedbackProgram, drawPointsInSegments } from '../gl-utils.js';
+import {
+  createTransformFeedbackProgram,
+  deleteProgramReleasingUse,
+  deleteTextureTracked,
+  drawPointsInSegments,
+  restorableTexture,
+} from '../gl-utils.js';
 import {
   LINEAR_TEXEL_GLSL,
   allocateLinearTexture,
@@ -126,12 +132,12 @@ export class GpuPermuter {
   dispose() {
     const gl = this.gl;
     for (const kind of PROGRAM_KINDS) {
-      if (this._programs[kind]) gl.deleteProgram(this._programs[kind]);
+      if (this._programs[kind]) deleteProgramReleasingUse(gl, this._programs[kind]);
     }
     if (this._vao) gl.deleteVertexArray(this._vao);
     if (this._anchor) gl.deleteBuffer(this._anchor);
     if (this._feedback) gl.deleteTransformFeedback(this._feedback);
-    if (this._dummyOrder) gl.deleteTexture(this._dummyOrder.texture);
+    if (this._dummyOrder) deleteTextureTracked(gl, this._dummyOrder.texture);
     this.abandon();
   }
 
@@ -250,11 +256,11 @@ export class GpuPermuter {
       }
       gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, saved.feedback);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, saved.textures[0]);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(saved.textures[0]));
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, saved.textures[1]);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(saved.textures[1]));
       gl.activeTexture(saved.activeTexture);
-      if (source !== null) gl.deleteTexture(source.texture);
+      if (source !== null) deleteTextureTracked(gl, source.texture);
       gl.useProgram(saved.program);
       gl.bindVertexArray(saved.vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, saved.arrayBuffer);
@@ -284,18 +290,17 @@ export class GpuPermuter {
           allocateLinearTexture(gl, gl.R32UI, plan);
         });
       }
+      // UNPACK_ROW_LENGTH and UNPACK_IMAGE_HEIGHT are never set in this app
+      // (they stay 0), and reading them is a synchronous round trip to the
+      // GPU process in Chrome; the other unpack state is read client-side.
       const unpack = {
         alignment: gl.getParameter(gl.UNPACK_ALIGNMENT),
-        rowLength: gl.getParameter(gl.UNPACK_ROW_LENGTH),
-        imageHeight: gl.getParameter(gl.UNPACK_IMAGE_HEIGHT),
         skipRows: gl.getParameter(gl.UNPACK_SKIP_ROWS),
         skipPixels: gl.getParameter(gl.UNPACK_SKIP_PIXELS),
         skipImages: gl.getParameter(gl.UNPACK_SKIP_IMAGES),
       };
       gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
-      gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_IMAGES, 0);
@@ -304,14 +309,12 @@ export class GpuPermuter {
       } finally {
         gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, unpack.alignment);
-        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, unpack.rowLength);
-        gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, unpack.imageHeight);
         gl.pixelStorei(gl.UNPACK_SKIP_ROWS, unpack.skipRows);
         gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, unpack.skipPixels);
         gl.pixelStorei(gl.UNPACK_SKIP_IMAGES, unpack.skipImages);
       }
     } catch (error) {
-      gl.deleteTexture(texture);
+      deleteTextureTracked(gl, texture);
       throw error;
     }
     return { texture, plan };

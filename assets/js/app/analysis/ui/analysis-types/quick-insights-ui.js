@@ -30,6 +30,7 @@ import { selectSorted } from '../../compute/math-utils.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { createSlicedYield } from '../../shared/concurrency-utils.js';
+import { CancellableJob, isCancellation } from '../../../jobs/cancellable-job.js';
 
 /**
  * Finite values from which Quick's quartiles and median are selected by an
@@ -42,7 +43,6 @@ import {
 } from '../../../ui/core/visibility-gate.js';
 import {
   createEmptyState,
-  createStatusLine,
   createDisclosure
 } from '../../../ui/components/controls.js';
 import { formatCells, formatCount } from '../../../ui/components/display-format.js';
@@ -79,7 +79,8 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // QuickInsights-specific state
     this._cache = new Map();
-    this._abortController = null;
+    /** @type {CancellableJob|null} The insights being computed */
+    this._job = null;
 
     // Debounce timer for page changes
     this._debounceTimer = null;
@@ -284,10 +285,9 @@ export class QuickInsights extends BaseAnalysisUI {
   _beginUpdateIntent() {
     this._currentRequestId++;
 
-    if (this._abortController) {
-      this._abortController.abort();
-      this._abortController = null;
-    }
+    // A newer request supersedes the job under way: its reads stop.
+    this._job?.cancel();
+    this._job = null;
 
     if (this._debounceTimer) {
       clearTimeout(this._debounceTimer);
@@ -524,23 +524,34 @@ export class QuickInsights extends BaseAnalysisUI {
       return;
     }
 
-    // Create new abort controller for this request
-    this._abortController = new AbortController();
-    const signal = this._abortController.signal;
+    // The request runs as a cancellable job: Cancel (in the panel or its
+    // notification) stops its reads and leaves a calm Cancelled with Run
+    // again; a newer request supersedes it.
+    const job = new CancellableJob({
+      title: 'Quick insights',
+      notifications: this._notifications,
+      onCancel: () => {
+        if (requestId !== this._currentRequestId) return;
+        this._currentRequestId++;
+        this._job = null;
+        this._renderJobOutcome(job);
+      }
+    });
+    this._job = job;
+    const signal = job.signal;
 
-    this._renderLoading();
+    this._renderLoading(job);
 
     try {
       const insights = await this._computeInsights(filteredPageIds, signal);
 
       // Check if this request is still current (prevents stale renders)
-      if (requestId !== this._currentRequestId) {
+      if (requestId !== this._currentRequestId || !job.running) {
         debug('QuickInsights', 'Discarding stale result for request', requestId);
         return;
       }
-
-      // Check if we were aborted
-      if (signal.aborted) return;
+      job.succeed();
+      if (this._job === job) this._job = null;
 
       // Final validation before render - ensure pages still exist
       const currentPages = this.dataLayer.getPages();
@@ -562,12 +573,40 @@ export class QuickInsights extends BaseAnalysisUI {
     } catch (err) {
       // Only show error if this is still the current request
       if (requestId !== this._currentRequestId) return;
-
-      if (err.name !== 'AbortError') {
-        console.error('[QuickInsights] Failed to compute insights:', err);
-        this._renderError(err.message);
+      if (this._job === job) this._job = null;
+      if (isCancellation(err)) {
+        // Cancelled, never a failure.
+        job.cancel();
+        return;
       }
+      console.error('[QuickInsights] Failed to compute insights:', err);
+      job.fail(err);
+      this._renderJobOutcome(job);
     }
+  }
+
+  /**
+   * Show how a job ended without insights: cancelled or failed, with Run
+   * again.
+   * @param {CancellableJob} job
+   * @private
+   */
+  _renderJobOutcome(job) {
+    this._setBusy(false);
+    if (!this._contentContainer) return;
+    this._destroyFieldPickers();
+    const view = this._getJobStatusView();
+    view.show(job);
+    this._contentContainer.replaceChildren(view.root);
+  }
+
+  /**
+   * Run again after a cancel or a failure.
+   * @override
+   */
+  _runAgain() {
+    if (this._isDestroyed) return;
+    this._trackInteractiveTask(this.updateForSelectedPages(), 'Quick insights');
   }
 
   /**
@@ -586,34 +625,18 @@ export class QuickInsights extends BaseAnalysisUI {
   }
 
   /**
-   * Render loading state
+   * Render loading state: the job's running state, with Cancel.
+   * @param {CancellableJob} job
    */
-  _renderLoading() {
+  _renderLoading(job) {
     this._setBusy(true);
     if (!this._contentContainer) return;
     this._destroyFieldPickers();
-    this._contentContainer.innerHTML = `
-      <p class="quick-insights-loading">
-        <span class="spinner" aria-hidden="true"></span>
-        <span>Computing insights…</span>
-      </p>
-    `;
+    const view = this._getJobStatusView();
+    view.show(job);
+    this._contentContainer.replaceChildren(view.root);
   }
 
-  /**
-   * Render error state
-   */
-  _renderError(message) {
-    this._setBusy(false);
-    if (!this._contentContainer) return;
-    this._destroyFieldPickers();
-    this._contentContainer.replaceChildren(
-      createStatusLine({
-        tone: 'danger',
-        text: `Failed to compute insights: ${message || 'Unknown error'}`
-      }).root
-    );
-  }
 
   /**
    * Compute insights for selected pages (supports multiple pages)
@@ -727,12 +750,14 @@ export class QuickInsights extends BaseAnalysisUI {
       throw new DOMException('Aborted', 'AbortError');
     }
 
+    this._job?.step(`Reading ${obsFields.length} observation field${obsFields.length === 1 ? '' : 's'}`);
     const bulkData = await this.dataLayer.fetchBulkObsFields({
       pageIds: validPageIds,
       obsFields,
       subsetPages: false,
-      includeCategoricalValues: false
+      signal
     });
+    this._job?.step('Summarizing');
 
     // Check abort after bulk load
     if (signal?.aborted) {
@@ -1049,9 +1074,8 @@ export class QuickInsights extends BaseAnalysisUI {
       ({ selected } = await manager.execute(
         OperationType.COMPUTE_ORDER_STATISTICS,
         { values: finite, positions },
-        { transfer: true }
+        { transfer: true, signal: signal ?? null }
       ));
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     } else {
       selected = selectSorted(finite, positions);
     }

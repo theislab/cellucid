@@ -227,7 +227,7 @@ function createViewer() {
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       };
     },
     onLodChanged() {

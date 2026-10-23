@@ -20,6 +20,7 @@ import { DataStateMappingMethods } from '../managers/mapping-manager.js';
 import { DataStateMappingGroupMethods } from '../managers/mapping-groups.js';
 import { DataStateVarAxisMethods } from '../managers/var-axis.js';
 import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
+import { DataStateOutlierQuantileMethods } from '../managers/outlier-quantiles.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -62,7 +63,6 @@ export class DataState extends EventEmitter {
     this.centroidPositions = new Float32Array(0);
     this.centroidColors = new Uint8Array(0); // RGBA uint8 (alpha packed in)
     this.centroidLabels = [];
-    this.centroidOutliers = new Float32Array(0);
 
     this._activeCategoryCounts = null;
     this.activeViewId = 'live';
@@ -88,8 +88,8 @@ export class DataState extends EventEmitter {
     this._mappingCandidates = null;
     this._mappingOrigin = null;
     this._mappingPublicationOrigin = null;
-    // Embeddings that failed their load-time check: obsm key or export id ->
-    // reason. They stay unusable for the rest of the dataset's session.
+    // Embeddings that failed their load-time check: obsm key -> reason.
+    // They stay unusable for the rest of the dataset's session.
     this._unusableEmbeddings = new Map();
     this._mappingChangeLock = null;
     // The other mapping groups (state/managers/mapping-groups.js): choices
@@ -151,6 +151,7 @@ applyMixin(DataState.prototype, DataStateMappingMethods.prototype);
 applyMixin(DataState.prototype, DataStateMappingGroupMethods.prototype);
 applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
 applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
+applyMixin(DataState.prototype, DataStateOutlierQuantileMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);

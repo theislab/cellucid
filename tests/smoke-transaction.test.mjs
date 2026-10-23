@@ -14,6 +14,8 @@ import {
 import {
   MAX_SMOKE_TARGET_PIXELS,
   SmokeRenderer,
+  captureSmokeInputs,
+  sameSmokeInputs,
   smokeTargetSize,
 } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
 import {
@@ -931,4 +933,44 @@ test('smoke never samples a float32 texture through filtering', async () => {
   );
   assert.match(atlas, /TEXTURE_MIN_FILTER, gl\.NEAREST/);
   assert.match(atlas, /TEXTURE_MAG_FILTER, gl\.NEAREST/);
+});
+
+test('a rebuild for inputs identical to the shown volume does no work; any changed byte rebuilds', async () => {
+  const positions = new Float32Array([-0.5, 0, 0.5, 0.5, 0, -0.5]);
+  const options = () => ({
+    colors: colorsFor(2),
+    dimension: 3,
+    gridSize: 8,
+    gamma: 0.7,
+    visibility: { alpha: new Uint8Array([1, 0]), outlierQuantiles: new Float32Array([0.2, 0.9]), outlierThreshold: 0.5 },
+  });
+  const source = options();
+  const built = captureSmokeInputs(positions, source, null, { empty: true, gridSize: 8 });
+  // The capture is a copy: rewriting the caller's arrays in place is seen.
+  assert.equal(sameSmokeInputs(built, positions, options()), true);
+  source.colors[5] = 7;
+  assert.equal(sameSmokeInputs(built, positions, source), false);
+  for (const change of [
+    o => { o.colors[0] = 1; },
+    o => { o.visibility.alpha[1] = 1; },
+    o => { o.visibility.outlierQuantiles[0] = 0.25; },
+    o => { o.visibility.outlierThreshold = 0.6; },
+    o => { o.gridSize = 16; },
+    o => { o.gamma = 0.75; },
+    o => { o.visibility = null; },
+  ]) {
+    const changed = options();
+    change(changed);
+    assert.equal(sameSmokeInputs(built, positions, changed), false, change.toString());
+  }
+  assert.equal(sameSmokeInputs(built, positions.slice(), options()), false, 'other positions');
+  // The build answers an identical request before any GPU work, and only
+  // while the volume it built is still the one shown.
+  const rendererSource = await readFile(
+    new URL('../assets/js/rendering/smoke-cloud/smoke-renderer.js', import.meta.url),
+    'utf8'
+  );
+  const body = rendererSource.slice(rendererSource.indexOf('  buildVolumeGPU(positions, options = {}) {'));
+  assert.ok(body.indexOf('sameSmokeInputs(built, positions, options)') < body.indexOf('buildDensityTextureGPU('));
+  assert.match(body, /built\.textureInfo === this\.textureInfo/);
 });

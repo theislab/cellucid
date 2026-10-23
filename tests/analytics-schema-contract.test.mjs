@@ -40,7 +40,7 @@ const PII_SHAPED = Object.freeze([
   'https://alice:ghp_secret@github.com/lab/private',
   'http://10.1.2.3:8765/?token=abc',
   'AML relapse donor 7',
-  'Failed to fetch https://lab.example/exports/patient7/embeddings/0_2d.bin',
+  'Failed to fetch https://lab.example/data/patient7.h5ad',
   'x'.repeat(101),
 ]);
 

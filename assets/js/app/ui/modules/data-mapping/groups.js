@@ -159,9 +159,8 @@ export function buildGroupSection(ownerDocument, section) {
 }
 
 /**
- * Show one built section's current choices. A field with no model is hidden
- * (a prepared export has gene names but no expression choice); a section
- * with no field shown is hidden.
+ * Show one built section's current choices. A field with no model is hidden;
+ * a section with no field shown is hidden.
  *
  * @param {ReturnType<typeof buildGroupSection>} node
  * @param {{

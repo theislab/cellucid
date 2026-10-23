@@ -94,8 +94,9 @@ function pageDensity(pageValues, bandwidthMult) {
  *
  * @param {Array<{values: ArrayLike<number>}>} pageData
  * @param {number} bandwidthMult
+ * @param {AbortSignal|null} [signal] - Cancels the worker tasks
  */
-async function ensurePageDensities(pageData, bandwidthMult) {
+async function ensurePageDensities(pageData, bandwidthMult, signal = null) {
   const work = [];
   const planned = [];
   for (const pd of pageData) {
@@ -128,7 +129,7 @@ async function ensurePageDensities(pageData, bandwidthMult) {
         bandwidthMult,
         maxKernelTerms: PARALLEL_MIN_KERNEL_TERMS
       },
-      { transfer: false }
+      { transfer: false, signal }
     );
     adoptFiniteNumbers(pd.values, finiteCount, finite);
     pageMeans.set(pd.values, pageMean);
@@ -155,7 +156,7 @@ async function ensurePageDensities(pageData, bandwidthMult) {
           bandwidth: plan.h,
           count: plan.n
         },
-        { transfer: false }
+        { transfer: false, signal }
       )
     )));
     const density = new Float64Array(xs.length);
@@ -252,8 +253,12 @@ const densityplotDefinition = {
     return layout;
   },
 
-  async render(pageData, options, container, layoutEngine) {
-    await ensurePageDensities(pageData, getBandwidthMultiplier(options.bandwidth));
+  /**
+   * `run.signal` (the detailed analysis's job) cancels the worker tasks the
+   * plot computes its statistics with; nothing partial is kept.
+   */
+  async render(pageData, options, container, layoutEngine, run = {}) {
+    await ensurePageDensities(pageData, getBandwidthMultiplier(options.bandwidth), run.signal ?? null);
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 

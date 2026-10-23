@@ -15,10 +15,8 @@ import { createStatusLine } from '../../../ui/components/controls.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { createSelectField } from '../../shared/dom-utils.js';
 import { createField } from '../../../ui/components/controls.js';
-import {
-  signatureScoresToCSV,
-  downloadCSV
-} from '../../shared/analysis-utils.js';
+import { downloadCSV } from '../../shared/analysis-utils.js';
+import { writePerCellCSV } from '../base-analysis-ui.js';
 // renderGeneChips moved inline to modal annotations
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
@@ -29,6 +27,12 @@ import {
   renderStatisticalAnnotations
 } from '../components/stats-display.js';
 import { createSlicedYield } from '../../shared/concurrency-utils.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetGenes,
+  requireDatasetPages
+} from '../../shared/analysis-result-session.js';
 
 /**
  * Gene Signature Score UI Component
@@ -101,6 +105,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     const requestId = this._startAnalysisRequest(scheduledRequestId);
     if (requestId === null) return;
     const releaseBusy = this._claimBusy();
+    let job = null;
     try {
       const formValues = structuredClone(this._getFormValues());
       const validation = this._validateForm(formValues);
@@ -108,18 +113,31 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         await this._showError(validation.error, requestId);
         return;
       }
-      const result = await this._runAnalysisImpl(formValues, requestId);
+      job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
+      const result = await this._runAnalysisImpl(formValues, requestId, job);
 
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
       if (result) {
+        job.step('Drawing the result');
         await this._showResult(result, requestId);
         if (!this._isCurrentAnalysisRequest(requestId)) return;
         await this._publishAnalysisResult(result, requestId);
       }
+      job.succeed(this._getSuccessMessage());
     } catch (err) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[GeneSignatureUI] Analysis failed:', err);
-      await this._showError('Analysis failed: ' + err.message, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job?.cancel();
+        return;
+      }
+      if (job === null) throw err;
+      // What the previous run showed no longer answers the inputs; the
+      // job's status view and notification say why (a cancel is calm).
+      await this._discardFormResult();
+      if (this._isCurrentAnalysisRequest(requestId)) this._failAnalysisJob(job, err);
+      else job.cancel();
     } finally {
       releaseBusy();
       this._finishAnalysisRequest(requestId);
@@ -211,15 +229,6 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    */
   _getClassName() {
     return 'gene-signature';
-  }
-
-  /**
-   * Get loading notification message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    const genes = this._getGeneList();
-    return `Computing signature score (${genes.length} genes)...`;
   }
 
   /**
@@ -444,13 +453,21 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @param {Object} formValues - Form values
    * @returns {Promise<Object>} Analysis result
    */
-  async _runAnalysisImpl(formValues, requestId = null) {
+  async _runAnalysisImpl(formValues, requestId = null, job = null) {
     const pageIds = [...this._selectedPages];
+    const cells = this.dataLayer.state?.pointCount;
+    if (Number.isSafeInteger(cells)) {
+      job?.setPlan(
+        `Reads ${formatCount(formValues.genes.length)} genes in every one of ` +
+        `${formatCount(cells)} cells`
+      );
+    }
     // Compute signature scores
     const signatureResults = await this.multiVariableAnalysis.computeSignatureScore({
       genes: formValues.genes,
       pageIds,
       method: formValues.method,
+      job,
       isCurrent: requestId === null
         ? undefined
         : () => this._isCurrentAnalysisRequest(requestId),
@@ -721,16 +738,73 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   /**
    * Export results as CSV (signature-specific format)
    */
-  _exportResultsCSV() {
+  async _exportResultsCSV() {
     if (!this._lastResult?.data) return;
 
-    const csv = signatureScoresToCSV(this._lastResult.data);
-    downloadCSV(csv, 'gene_signature_scores', this._notifications);
+    try {
+      const csv = await writePerCellCSV('signature-scores', this._lastResult.data);
+      downloadCSV(csv, 'gene_signature_scores', this._notifications);
+    } catch (err) {
+      this._notifications.error('CSV export failed: ' + err.message, { category: 'download' });
+    }
   }
 
   // ===========================================================================
   // Settings Export/Import
   // ===========================================================================
+
+  /**
+   * The shown result for a session: each page's scores as a typed column,
+   * the signature's genes by key.
+   * @returns {null|{kind: 'signature', version: number, payload: unknown}}
+   */
+  exportResult() {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    return createResultEnvelope('signature', this._lastResult);
+  }
+
+  /**
+   * Restore a result written by `exportResult()`; refused when it names a
+   * gene or cell group the open dataset lacks, or when a group's cell count
+   * no longer matches its scores.
+   * @param {null|Object} envelope
+   * @returns {Promise<void>}
+   */
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const result = readResultEnvelope(envelope, 'signature');
+    if (
+      result?.type !== 'signature' ||
+      !Array.isArray(result.data) ||
+      !Array.isArray(result.metadata?.genes)
+    ) {
+      throw new TypeError('A gene signature result must hold its pages and genes');
+    }
+    requireDatasetGenes(this.dataLayer, result.metadata.genes, 'The gene signature result');
+    requireDatasetPages(
+      this.dataLayer,
+      result.data.map(page => page?.pageId),
+      'The gene signature result'
+    );
+    for (const page of result.data) {
+      if (!ArrayBuffer.isView(page.values)) {
+        throw new TypeError(`Gene signature scores of "${page.pageId}" must be a typed array`);
+      }
+      const cellCount = this.dataLayer.getCellCountForPageId(page.pageId);
+      if (page.values.length !== cellCount) {
+        throw new RangeError(
+          `Gene signature result holds ${page.values.length} scores for cell group ` +
+          `"${page.pageId}", which now has ${cellCount} cells`
+        );
+      }
+    }
+    // The summary and tests the expanded view shows, as a fresh run prepares them.
+    await preparePageStatistics(result.data, 'continuous_obs');
+    await this._restoreAnalysisResult(result);
+  }
 
   exportSettings() {
     const base = super.exportSettings();

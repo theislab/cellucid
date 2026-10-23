@@ -12,7 +12,7 @@
  * @module shared/dom-utils
  */
 
-import { PerformanceConfig } from './performance-config.js';
+import { PerformanceConfig, analysisWorkerCount } from './performance-config.js';
 import {
   createDisclosure,
   createField,
@@ -171,32 +171,21 @@ export function createPerformanceSettings(options) {
     }))
   }).root);
 
-  // Parallelism selector
+  // Parallelism selector: every count up to the analysis workers this
+  // device runs (powers of two, and the whole pool).
+  const workers = analysisWorkerCount();
+  const counts = [];
+  for (let count = 1; count < workers; count *= 2) counts.push(count);
+  counts.push(workers);
   content.appendChild(createSelectField({
     label: 'Compute parallelism',
     name: 'parallelism',
     options: [
-    {
-      value: 'auto',
-      label: 'Auto',
-      selected: true
-    },
-    {
-      value: '1',
-      label: '1 core'
-    },
-    {
-      value: '2',
-      label: '2 cores'
-    },
-    {
-      value: '4',
-      label: '4 cores'
-    },
-    {
-      value: '8',
-      label: '8 cores'
-    }
+      { value: 'auto', label: 'Auto', selected: true },
+      ...counts.map(count => ({
+        value: String(count),
+        label: count === 1 ? '1 core' : `${count} cores`
+      }))
     ]
   }).root);
 

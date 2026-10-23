@@ -24,6 +24,7 @@
  * successfully" on top. A failed published sample view was announced twice as
  * well: by the restore's progress entry and by "Sample view unavailable".
  */
+import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -32,32 +33,29 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { writeBundle } from '../../assets/js/app/session/bundle/writer.js';
+import { NOT_A_SESSION_FILE_MESSAGE } from '../../assets/js/app/session/bundle/format.js';
 import {
   gzipCompress,
   gzipDecompress,
 } from '../../assets/js/app/session/codecs/gzip.js';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=session-restore-portability-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=session-restore-portability-ci';
 
-const PREPARED_CATALOG_PATH = path.join(
+const CATALOG_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
-  'exports',
+  'catalog',
   'datasets.json',
 );
 
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
-  'core/field-overlays',
-  'core/state',
-  'ui/dockable-layout',
-  'analysis/windows',
-  'highlights/meta',
-]);
+const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
+  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
+);
 
 const RESTORED = 'Session fully restored.';
 
@@ -77,7 +75,7 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
@@ -122,8 +120,9 @@ async function readChunks(bytes) {
 }
 
 /**
- * Rewrite the `core/state` chunk and, optionally, keep only `chunkIds`.
- * The rewritten chunk keeps its canonical codec.
+ * Rewrite the `core/state` chunk and, optionally, keep only `chunkIds` as a
+ * published default does: with no recorded source, since it is applied to the
+ * sample it ships beside. The rewritten chunk keeps its canonical codec.
  */
 async function rewriteSession(bytes, editCoreState, chunkIds = null) {
   const { manifest, chunks } = await readChunks(bytes);
@@ -162,7 +161,11 @@ async function rewriteSession(bytes, editCoreState, chunkIds = null) {
     });
   }
   const blob = writeBundle({
-    manifest: { ...manifest, chunks: rewritten.map(chunk => chunk.meta) },
+    manifest: {
+      ...manifest,
+      source: chunkIds === null ? manifest.source : null,
+      chunks: rewritten.map(chunk => chunk.meta),
+    },
     chunks: rewritten.map(chunk => chunk.bytes),
   });
   return Buffer.from(await blob.arrayBuffer());
@@ -190,8 +193,7 @@ function deriveInAnotherEngine(camera) {
 }
 
 function moveDerivedCameraBits(payload) {
-  deriveInAnotherEngine(payload.camera);
-  deriveInAnotherEngine(payload.multiview.liveCameraState);
+  deriveInAnotherEngine(payload.multiview.live.cameraState);
   for (const snapshot of payload.multiview.snapshots) {
     deriveInAnotherEngine(snapshot.cameraState);
   }
@@ -312,29 +314,121 @@ test('a session saved by another engine restores, and says so once', async ({
   expect(productErrors).toEqual([]);
 });
 
+test('a session saved on one route restores on the same dataset opened from a link', async ({
+  page,
+}, testInfo) => {
+  // A session belongs to the dataset, not to the way it was opened: the same
+  // catalog opened from a web address (another origin, the link source)
+  // accepts a session saved on the sample catalog.
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  await poseCamera(page);
+  const savedOrbit = await readLiveOrbit(page);
+  const sessionBytes = await saveSession(page, testInfo, 'catalog.cellucid-session');
+
+  const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/`;
+  await page.goto(
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(link)}&dataset=current-ui`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await forgetNotifications(page);
+
+  const chooserPromise = page.waitForEvent('filechooser');
+  await page.locator('#load-state-btn').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles({
+    name: 'catalog.cellucid-session',
+    mimeType: 'application/octet-stream',
+    buffer: sessionBytes,
+  });
+
+  await expectAnnounced(page, restored, 1, 'the session restores on the linked copy');
+  expect(await readLiveOrbit(page)).toEqual(savedOrbit);
+  expect(productErrors).toEqual([]);
+});
+
+async function loadSessionFile(page, name, bytes) {
+  const chooserPromise = page.waitForEvent('filechooser');
+  await page.locator('#load-state-btn').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles({
+    name,
+    mimeType: 'application/octet-stream',
+    buffer: bytes,
+  });
+}
+
+test('a session reopens the dataset it records, from a sample or a link', async ({
+  page,
+}, testInfo) => {
+  // The manifest records where the dataset was opened from, so loading the
+  // session with another dataset (or none) open opens its own one first.
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  await poseCamera(page);
+  const sampleOrbit = await readLiveOrbit(page);
+  const sampleSession = await saveSession(page, testInfo, 'sample.cellucid-session');
+  expect((await readChunks(sampleSession)).manifest.source).toEqual({
+    kind: 'sample',
+    dataset: 'current-ui',
+  });
+
+  await page.locator('#dataset-select').selectOption('__none__');
+  await expect(page.locator('#dataset-name')).not.toHaveText(
+    'Current UI fixture',
+  );
+  await forgetNotifications(page);
+  await loadSessionFile(page, 'sample.cellucid-session', sampleSession);
+  await expectAnnounced(page, restored, 1, 'the sample reopens and restores');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  expect(await readLiveOrbit(page)).toEqual(sampleOrbit);
+
+  // The same file, linked by its address: it states its id (current-ui).
+  const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/current-ui.h5ad`;
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(link)}`, {
+    waitUntil: 'domcontentloaded',
+  });
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await poseCamera(page);
+  const linkOrbit = await readLiveOrbit(page);
+  const linkSession = await saveSession(page, testInfo, 'link.cellucid-session');
+  expect((await readChunks(linkSession)).manifest.source).toEqual({
+    kind: 'link',
+    locator: link,
+    dataset: expect.any(String),
+  });
+
+  await openDataset(page);
+  await page.locator('#dataset-select').selectOption('__none__');
+  await forgetNotifications(page);
+  await loadSessionFile(page, 'link.cellucid-session', linkSession);
+  await expectAnnounced(page, restored, 1, 'the link reopens and restores');
+  await expect(page.locator('#data-link-url')).toHaveValue(link);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  expect(await readLiveOrbit(page)).toEqual(linkOrbit);
+  expect(productErrors).toEqual([]);
+});
+
 async function servePublishedDefault(page, stateBytes) {
-  const catalog = JSON.parse(await readFile(PREPARED_CATALOG_PATH, 'utf8'));
-  catalog.datasets[0].state_manifest = 'state-snapshots.json';
-  catalog.datasets[0].state_bytes = stateBytes.byteLength;
-  catalog.datasets[0].state_sha256 = createHash('sha256')
-    .update(stateBytes)
-    .digest('hex');
-  await page.route('**/tests/browser/fixtures/exports/datasets.json', route =>
+  const catalog = JSON.parse(await readFile(CATALOG_PATH, 'utf8'));
+  catalog.datasets[0].session = {
+    path: 'current-ui.cellucid-session',
+    bytes: stateBytes.byteLength,
+    sha256: createHash('sha256').update(stateBytes).digest('hex'),
+  };
+  await page.route('**/tests/browser/fixtures/catalog/datasets.json', route =>
     route.fulfill({
       body: JSON.stringify(catalog),
       contentType: 'application/json',
       status: 200,
     }));
   await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json',
-    route => route.fulfill({
-      body: JSON.stringify({ states: ['default.cellucid-session'] }),
-      contentType: 'application/json',
-      status: 200,
-    }),
-  );
-  await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/default.cellucid-session',
+    '**/tests/browser/fixtures/catalog/current-ui.cellucid-session',
     route => route.fulfill({
       body: stateBytes,
       contentType: 'application/octet-stream',
@@ -417,4 +511,62 @@ test('a published sample view that cannot be applied is reported once', async ({
     'the restore progress entry must not repeat the sample-view failure',
   ).toEqual([]);
   expect(published.filter(restored)).toEqual([]);
+});
+
+test('a published sample view applies when its catalog is opened from a link', async ({
+  page,
+}, testInfo) => {
+  // datasets.json is one format however it is opened: the same catalog
+  // linked with ?data= applies the default session it names.
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  await poseCamera(page);
+  const savedOrbit = await readLiveOrbit(page);
+  const stateBytes = await rewriteSession(
+    await saveSession(page, testInfo, 'published.cellucid-session'),
+    () => {},
+    PUBLISHED_DEFAULT_CHUNK_IDS,
+  );
+  await servePublishedDefault(page, stateBytes);
+
+  const link = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/`;
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(link)}`, { waitUntil: 'domcontentloaded' });
+  await openCollapsedPanels(page);
+  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await expectAnnounced(page, restored, 1, 'the linked catalog applies its starting view');
+  expect(await readLiveOrbit(page)).toEqual(savedOrbit);
+  expect(productErrors).toEqual([]);
+});
+
+test('a file without the format-2 signature is refused, and nothing changes', async ({
+  page,
+}, testInfo) => {
+  // Format 2 carries its version in the signature. A file with any other
+  // signature (here the unversioned "CELLUCID_SESSION\n") is refused with the
+  // one sentence naming the expected format; nothing of it is restored.
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  await poseCamera(page);
+  const orbit = await readLiveOrbit(page);
+  const current = await saveSession(page, testInfo, 'current.cellucid-session');
+  const signature = Buffer.from('CELLUCID_SESSION/2\n');
+  expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
+  const unversioned = Buffer.concat([
+    Buffer.from('CELLUCID_SESSION\n'),
+    current.subarray(signature.length),
+  ]);
+  await forgetNotifications(page);
+  await loadSessionFile(page, 'unversioned.cellucid-session', unversioned);
+  await expectAnnounced(
+    page,
+    ({ message }) => message.includes(NOT_A_SESSION_FILE_MESSAGE),
+    1,
+    'the file is refused once, naming the expected format',
+  );
+  expect((await publishedNotifications(page)).filter(restored)).toEqual([]);
+  expect(await readLiveOrbit(page)).toEqual(orbit);
+  expect(productErrors.filter(line => !line.includes(NOT_A_SESSION_FILE_MESSAGE))).toEqual([]);
 });

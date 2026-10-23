@@ -10,7 +10,9 @@
  *   copy and close buttons in the frame's header action bar beside the summary
  * - Copies are "floating-only" (not dockable back into the sidebar)
  * - Each window owns its own Analysis UI instance and must be cleaned up on close
- * - Settings are copied via UI exportSettings/importSettings (results intentionally excluded)
+ * - Settings are copied via UI exportSettings/importSettings; a copied window
+ *   starts without a result, while a session window also restores its result
+ *   (UI exportResult/importResult)
  */
 
 import { getDockableAccordions } from '../../dockable-accordions-registry.js';
@@ -212,13 +214,14 @@ export class AnalysisWindowManager {
    * Export all floating analysis windows as session restore descriptors.
    *
    * The session bundle stores analysis windows as eager JSON so the UI can be
-   * reconstructed quickly. Results are intentionally excluded; only settings
-   * and geometry are persisted.
+   * reconstructed quickly: geometry, settings and the shown result
+   * (`ui.exportResult()`: null, or `{kind, version, payload}` of JSON values
+   * and typed arrays; see shared/analysis-result-session.js).
    *
-   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>}
+   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, result: null|Object, headerTitle: string }>}
    */
   exportSessionWindows() {
-    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>} */
+    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, result: null|Object, headerTitle: string }>} */
     const out = [];
 
     for (const entry of this._windows.values()) {
@@ -251,6 +254,7 @@ export class AnalysisWindowManager {
         modeId: entry.modeId,
         rect,
         settings,
+        result: entry.ui.exportResult(),
         headerTitle: entry.headerTitle
       });
     }
@@ -259,16 +263,19 @@ export class AnalysisWindowManager {
   }
 
   /**
-   * Create a floating analysis window from a session restore descriptor.
+   * Create a floating analysis window from a session restore descriptor:
+   * its settings first, then its result. With a result the window ID comes
+   * once the result is shown; a refused result closes the window again.
    *
-   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string }} descriptor
-   * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
+   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, result: null|Object, headerTitle: string }} descriptor
+   * @returns {string|Promise<string>} windowId, or a promise of it (or of the
+   *   failure, after rollback)
    */
   createFromSessionDescriptor(descriptor) {
     this._assertWindowCreationAvailable();
     requireExactKeys(
       descriptor,
-      ['headerTitle', 'modeId', 'rect', 'settings'],
+      ['headerTitle', 'modeId', 'rect', 'result', 'settings'],
       'Analysis window descriptor'
     );
     requireNonEmptyString(descriptor.modeId, 'Analysis window descriptor modeId');
@@ -279,7 +286,12 @@ export class AnalysisWindowManager {
       'Analysis window descriptor headerTitle'
     );
 
-    return this._createWindow(descriptor.modeId, settings, {
+    const { result } = descriptor;
+    if (result !== null && !isPlainObject(result)) {
+      throw new TypeError('Analysis window descriptor result must be null or an object');
+    }
+
+    const created = this._createWindow(descriptor.modeId, settings, {
       left: descriptor.rect.left,
       top: descriptor.rect.top,
       preferredSize: {
@@ -288,6 +300,24 @@ export class AnalysisWindowManager {
       },
       headerTitle: descriptor.headerTitle
     });
+    if (result === null || typeof created !== 'string') return created;
+    const ui = this._windows.get(created)?.ui;
+    return Promise.resolve()
+      .then(() => ui.importResult(result))
+      .then(
+        () => created,
+        async error => {
+          try {
+            await this.closeWindow(created);
+          } catch (closeError) {
+            throw new AggregateError(
+              [error, closeError],
+              `Analysis window "${created}" result restore and its close both failed`
+            );
+          }
+          throw error;
+        }
+      );
   }
 
   /**
@@ -795,8 +825,10 @@ export class AnalysisWindowManager {
       }
       for (const method of [
         'destroy',
+        'exportResult',
         'exportSettings',
         'getSelectedPages',
+        'importResult',
         'importSettings',
         'onHighlightChanged',
         'onPageSelectionChange'

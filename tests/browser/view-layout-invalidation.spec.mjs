@@ -11,13 +11,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=view-layout-invalidation-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=view-layout-invalidation-ci';
 // Large enough that the live and kept views build spatial indices and LOD.
 const POINT_COUNT = 30_000;
 

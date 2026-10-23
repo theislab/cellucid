@@ -5,8 +5,7 @@
  * be shown with -- any `obsm` array of an `.h5ad` or Zarr file read in the
  * browser (an array of two or more columns at any selection of 1 to 3 of
  * them, chosen in its row's editor; one wider than three columns in as many
- * selections as wanted), or the embeddings a prepared dataset carries -- and
- * the user turns any number on, of any mix of 1D, 2D and 3D, and makes one per
+ * selections as wanted) -- and the user turns any number on, of any mix of 1D, 2D and 3D, and makes one per
  * dimension the default. Views then show any representation that is on (see
  * the Compare views picker). Choices are staged until Apply, so editing
  * columns does not load an array once per axis; turning a representation on
@@ -14,8 +13,7 @@
  * as one transaction; Revert drops the staged choices. The other groups the
  * dataset can change -- genes, neighbour graph, latent space, vector fields
  * -- follow as their own disclosures (`data-mapping/groups.js`), staged with
- * the embeddings and applied in the same transaction; what it cannot change
- * is listed under "Read from file".
+ * the embeddings and applied in the same transaction.
  *
  * When a file opens on a best guess (it has no default UMAP), this module
  * tells the user what was shown and where to change it, and opens the
@@ -26,7 +24,6 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import {
-  ANNDATA_KIND,
   DIMENSIONAL_UMAP_KEYS,
   DIMENSION_SLOTS,
   UNSUFFIXED_UMAP_KEY,
@@ -42,7 +39,6 @@ import { representationName } from '../../../data/representation-names.js';
 import {
   buildDataMappingPanel,
   createRepresentationRow,
-  renderFactRows,
   setText,
   syncChildren,
 } from './data-mapping/dom.js';
@@ -306,7 +302,7 @@ export function initDataMappingControls({ state, root }) {
         let choices = state.getMappingGroupChoices(group);
         if (choices === null) continue;
         // Gene names are columns of the axis of the expression shown.
-        if (group === 'geneNames' && mapping.kind === ANNDATA_KIND) {
+        if (group === 'geneNames') {
           choices = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'));
         }
         const value = shownGroupValue(mapping, group);
@@ -348,7 +344,7 @@ export function initDataMappingControls({ state, root }) {
    */
   function genesHint(mapping) {
     const pending = changedGroups(mapping).some(group => group === 'geneNames' || group === 'expression');
-    const set = pending ? null : namesInUse(mapping);
+    const set = pending ? null : namesInUse();
     const note = set === null
       ? null
       : uniqueNamesNote({
@@ -363,11 +359,8 @@ export function initDataMappingControls({ state, root }) {
   }
 
   /** The gene-name set the gene list in use was made from. */
-  function namesInUse(mapping) {
-    const sets = state.varData?.geneNameSets ?? [];
-    if (mapping.kind === ANNDATA_KIND) return sets[0] ?? null;
-    const source = mapping.geneNames === 'index' ? null : mapping.geneNames.slice('column:'.length);
-    return sets.find(set => set.source === source) ?? null;
+  function namesInUse() {
+    return state.varData?.geneNames ?? null;
   }
 
   /**
@@ -383,9 +376,7 @@ export function initDataMappingControls({ state, root }) {
     if (keys.length === 0) return '';
     const ensembl = keys.filter(key => /^ENS[A-Z]*G\d+/.test(key)).length;
     if (ensembl < 0.9 * keys.length) return '';
-    const symbol = (mapping.kind === ANNDATA_KIND
-      ? state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
-      : state.getMappingGroupChoices('geneNames') ?? [])
+    const symbol = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
       .find(choice => choice.usable && SYMBOL_COLUMNS.includes(choice.label));
     return symbol === undefined
       ? ''
@@ -484,46 +475,6 @@ export function initDataMappingControls({ state, root }) {
     return null;
   }
 
-  function factRows(mapping) {
-    const dimensionManager = state.getDimensionManager();
-    const nameOfRef = ref => {
-      try {
-        return representationName(dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref)));
-      } catch {
-        return ref.key;
-      }
-    };
-    const bindings = mapping.vectorFields.map(binding => (
-      `${binding.field ?? binding.key} → ${nameOfRef(binding.embedding)}`
-    ));
-    // Only what this dataset cannot change; every other group has its own
-    // disclosure above.
-    const rows = [];
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('knn')) {
-      rows.push({ label: 'Neighbour graph', value: mapping.knn === null ? 'None' : `obsp['${mapping.knn}']` });
-    }
-    if (!state.canChangeMappingGroup('geneNames')) {
-      rows.push({
-        label: 'Gene names',
-        value: mapping.geneNames === 'index' ? 'var index' : `var['${mapping.geneNames.slice(7)}']`,
-      });
-    }
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('expression')) {
-      let expression = 'None';
-      if (mapping.expression === 'X') expression = 'X';
-      else if (mapping.expression === 'raw') expression = 'raw.X';
-      else if (mapping.expression !== null) expression = `layers['${mapping.expression.slice(6)}']`;
-      rows.push({ label: 'Expression', value: expression });
-    }
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('latent')) {
-      rows.push({ label: 'Latent space', value: mapping.latent === null ? 'None' : `obsm['${mapping.latent}']` });
-    }
-    if (!state.canChangeMappingGroup('vectorFields')) {
-      rows.push({ label: 'Vector fields', value: bindings.length === 0 ? 'None' : bindings.join(', ') });
-    }
-    return rows;
-  }
-
   function describeCurrent(mapping) {
     const dimensionManager = state.getDimensionManager();
     const count = mapping.embeddings.enabled.length;
@@ -552,7 +503,6 @@ export function initDataMappingControls({ state, root }) {
       rowNodes.clear();
       setText(panel.description, '—');
       panel.rows.replaceChildren();
-      renderFactRows(panel.facts, []);
       for (const node of [...groupNodes.values(), vectorNode]) node.root.hidden = true;
       return;
     }
@@ -615,13 +565,6 @@ export function initDataMappingControls({ state, root }) {
     for (const uid of rowNodes.keys()) if (!listed.has(uid)) rowNodes.delete(uid);
     syncChildren(panel.rows, nodes);
     renderGroupSections(mapping);
-    const facts = factRows(mapping);
-    renderFactRows(panel.facts, facts);
-    panel.fixed.root.hidden = facts.length === 0;
-    setText(panel.fixedDescription, facts
-      .filter(fact => fact.value !== 'None')
-      .map(fact => fact.label)
-      .join(', ') || 'Nothing else');
 
     const next = nextMapping(mapping);
     const embeddingsChanged = !sameJson(next.embeddings, mapping.embeddings);
@@ -775,7 +718,7 @@ export function initDataMappingControls({ state, root }) {
       const bindings = shownGroupValue(mapping, VECTOR_SECTION.group)
         .filter(binding => bindingKey(binding) !== target.value);
       if (target.checked) bindings.push(JSON.parse(target.value));
-      stagedGroups.set(VECTOR_SECTION.group, sortVectorBindings(bindings, mapping.kind));
+      stagedGroups.set(VECTOR_SECTION.group, sortVectorBindings(bindings));
       render();
       return;
     }
@@ -785,7 +728,7 @@ export function initDataMappingControls({ state, root }) {
     groupErrors.delete(group);
     const value = decodeChoice(target.value);
     stagedGroups.set(group, value);
-    if (group === 'expression' && mapping.kind === ANNDATA_KIND) {
+    if (group === 'expression') {
       // Another axis keeps a gene-name column only if it has one of that
       // name (raw has its own var); otherwise the names come from its index.
       const names = shownGroupValue(mapping, 'geneNames');
@@ -815,8 +758,8 @@ export function initDataMappingControls({ state, root }) {
       if (destroyed) return;
       loadError = error instanceof Error ? error.message : String(error);
       if (error instanceof EmbeddingLoadError) {
-        // An embedding failed its load-time check (in the browser, or a
-        // server's 422): it stays off, with its reason. The type, not the
+        // An embedding failed its load-time check: it stays off, with its
+        // reason. The type, not the
         // key, says so: one obsm key can also be a latent space or a vector
         // field, whose refusal belongs to that group.
         unstage();
@@ -861,9 +804,10 @@ export function initDataMappingControls({ state, root }) {
   /**
    * Show the checklist: open the Session section and the Embeddings
    * disclosure, and on request the sidebar (the phone sheet), then bring it
-   * into view.
+   * into view. `focusGroup` (a group such as `latent`) brings that group's
+   * choice into view and focuses it instead.
    */
-  function reveal({ openSidebar = false } = {}) {
+  function reveal({ openSidebar = false, focusGroup = null } = {}) {
     if (destroyed) return;
     const sidebar = ownerDocument.getElementById('sidebar');
     if (openSidebar && sidebar?.classList.contains('hidden')) {
@@ -872,6 +816,15 @@ export function initDataMappingControls({ state, root }) {
     const section = ownerDocument.getElementById('session-section');
     if (section instanceof HTMLDetailsElement && !section.open) section.open = true;
     setExpanded(true);
+    const target = focusGroup === null ? null : ownerDocument.getElementById(`data-mapping-${focusGroup}`);
+    if (target !== null) {
+      // The group's own disclosure opens too.
+      const section = GROUP_SECTIONS.find(entry => entry.fields.some(field => field.group === focusGroup));
+      if (section !== undefined) groupNodes.get(section.id)?.disclosure.setExpanded(true);
+      target.scrollIntoView({ block: 'center' });
+      target.focus({ preventScroll: true });
+      return;
+    }
     panel.disclosure.root.scrollIntoView({ block: 'nearest' });
     if (openSidebar) panel.disclosure.header.focus({ preventScroll: true });
   }
@@ -946,6 +899,9 @@ export function initDataMappingControls({ state, root }) {
     droppedGenes = [...dropped];
   });
   const unsubscribeMapping = state.on('mapping:changed', onMappingChanged);
+  // A choice found unusable when it was read (a latent space with a NaN)
+  // is offered no more.
+  const unsubscribeChoices = state.on('mapping:choices-changed', () => render());
 
   datasetPublished();
 
@@ -958,6 +914,7 @@ export function initDataMappingControls({ state, root }) {
       destroyed = true;
       lifecycle.abort();
       unsubscribeMapping();
+      unsubscribeChoices();
       unsubscribeVarAxis();
       root.replaceChildren();
     },

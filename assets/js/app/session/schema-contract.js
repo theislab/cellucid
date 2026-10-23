@@ -146,11 +146,6 @@ export function assertSafeInteger(value, context, { minimum = 0, maximum = Numbe
   return value;
 }
 
-export function assertNullableSafeInteger(value, context, bounds) {
-  if (value === null) return value;
-  return assertSafeInteger(value, context, bounds);
-}
-
 export function assertArray(value, context) {
   if (!Array.isArray(value)) {
     throw new TypeError(`${context} must be an array.`);

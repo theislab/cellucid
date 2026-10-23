@@ -262,8 +262,9 @@ test('manual form invalidation immediately releases its button and suppresses st
   const run = ui._runAnalysis();
   assert.deepEqual(button, {
     disabled: true,
-    textContent: 'Running...',
+    textContent: 'Running…',
   });
+  const job = ui._shownJob;
 
   ui._invalidateAnalysisRequest();
   assert.deepEqual(
@@ -271,10 +272,13 @@ test('manual form invalidation immediately releases its button and suppresses st
     { disabled: false, textContent: 'Run Analysis' },
     'input invalidation must make the same visible Run control usable immediately',
   );
+  assert.equal(job.state, 'cancelled', 'the invalidated run\'s job is cancelled');
+  assert.equal(job.signal.aborted, true, 'and its reads and tasks are told to stop');
 
   implementation.reject(new Error('stale implementation failure'));
   await run;
-  assert.deepEqual(terminal, [['dismiss', 'manual-A']]);
+  assert.deepEqual(terminal, [], 'a run cancelled before its notification showed shows nothing');
+  assert.equal(job.state, 'cancelled', 'a stale failure never turns a cancel into a failure');
   assert.equal(ui.getLastResult(), null);
   assert.equal(ui.isLoading(), false);
 });
@@ -361,42 +365,6 @@ test('DE comparison changes invalidate active scientific ownership immediately',
 
   assert.equal(ui._isCurrentAnalysisRequest(requestId), false);
   assert.equal(cleanups, 1);
-});
-
-test('DE progress updates mutate only their request-local tracker', () => {
-  const calls = [];
-  const makeTracker = owner => ({
-    setPhase(value) {
-      calls.push([owner, 'phase', value]);
-    },
-    setTotalItems(value) {
-      calls.push([owner, 'total', value]);
-    },
-    setCompletedItems(value) {
-      calls.push([owner, 'completed', value]);
-    },
-    setMessage(value) {
-      calls.push([owner, 'message', value]);
-    },
-  });
-  const ui = Object.create(DEAnalysisUI.prototype);
-  const olderTracker = makeTracker('older');
-  ui._progressTracker = makeTracker('newer');
-
-  ui._updateProgress({
-    phase: 'Loading & Computing',
-    progress: 50,
-    loaded: 1,
-    total: 2,
-    message: 'One of two',
-  }, olderTracker);
-
-  assert.deepEqual(calls, [
-    ['older', 'phase', 'Loading & Computing'],
-    ['older', 'total', 2],
-    ['older', 'completed', 1],
-    ['older', 'message', 'One of two'],
-  ]);
 });
 
 test('differential expression stops before data access when its owner is stale', async () => {

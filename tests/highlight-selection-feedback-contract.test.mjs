@@ -177,7 +177,7 @@ function createState(field) {
           type,
           label,
           enabled: true,
-          cellIndices: [...cellIndices],
+          cellIndices: cellIndices.slice(),
           cellCount: cellIndices.length
         };
       },
@@ -195,10 +195,10 @@ function createState(field) {
         for (let cell = 0; cell < lookupField.codes.length; cell++) {
           if (lookupField.codes[cell] === categoryIndex) indices.push(cell);
         }
-        return indices;
+        return Uint32Array.from(indices);
       },
       getCellIndicesForRange() {
-        return [];
+        return new Uint32Array(0);
       },
       on(eventName, listener) {
         if (!listeners.has(eventName)) listeners.set(eventName, []);
@@ -405,16 +405,18 @@ test(
 );
 
 test('an unchanged candidate set is recognised however it is spelled', () => {
-  assert.equal(selectionUnchanged(null, []), true);
+  const list = (...cells) => Uint32Array.of(...cells);
+  assert.equal(selectionUnchanged(null, list()), true);
   assert.equal(selectionUnchanged(new CellSet(8), null), true);
-  assert.equal(selectionUnchanged([1, 2, 3], [3, 2, 1]), true);
-  assert.equal(selectionUnchanged(CellSet.from([2, 1], 8), [1, 2]), true);
+  assert.equal(selectionUnchanged(list(1, 2, 3), list(1, 2, 3)), true);
+  assert.equal(selectionUnchanged(CellSet.from([2, 1], 8), list(1, 2)), true);
   assert.equal(selectionUnchanged(CellSet.from([2, 1], 8), CellSet.from([1, 3], 8)), false);
-  assert.equal(selectionUnchanged([1, 2], [1, 3]), false);
-  assert.equal(selectionUnchanged([1, 2], [1, 2, 3]), false);
-  assert.equal(selectionUnchanged(null, [1]), false);
-  assert.throws(() => selectionUnchanged('nope', []), /CellSet, an array, or null/);
-  assert.throws(() => selectionUnchanged(new Set([1]), [1]), /CellSet, an array, or null/);
+  assert.equal(selectionUnchanged(list(1, 2), list(1, 3)), false);
+  assert.equal(selectionUnchanged(list(1, 2), list(1, 2, 3)), false);
+  assert.equal(selectionUnchanged(null, list(1)), false);
+  assert.throws(() => selectionUnchanged('nope', list()), /CellSet, a cell list, or null/);
+  assert.throws(() => selectionUnchanged(new Set([1]), list(1)), /CellSet, a cell list, or null/);
+  assert.throws(() => selectionUnchanged([1], list(1)), /CellSet, a cell list, or null/);
 });
 
 // ---------------------------------------------------------------------------
@@ -436,13 +438,13 @@ function buildSpatialTool(tool) {
     confirmLassoSelection() {},
     confirmProximitySelection() {},
     restoreKnnState(candidates, step) {
-      restoreCalls.push({ candidates, step });
+      restoreCalls.push({ candidates: candidates === null ? null : [...candidates], step });
     },
     restoreLassoState(candidates, step) {
-      restoreCalls.push({ candidates, step });
+      restoreCalls.push({ candidates: candidates === null ? null : [...candidates], step });
     },
     restoreProximityState(candidates, step) {
-      restoreCalls.push({ candidates, step });
+      restoreCalls.push({ candidates: candidates === null ? null : [...candidates], step });
     },
     setKnnCallback() {},
     setKnnPreviewCallback() {},
@@ -481,7 +483,9 @@ function buildSpatialTool(tool) {
     modeDescription,
     restoreCalls,
     selectionState,
-    step: (candidates, step) => withDocument(dom.document, () => {
+    // The renderer publishes a gesture's cells as a cell list.
+    step: (cells, step) => withDocument(dom.document, () => {
+      const candidates = Uint32Array.from(cells).sort();
       owner[handler]({
         step,
         candidateCount: candidates.length,
@@ -724,7 +728,7 @@ test('the bar names the missing field when an annotation tap cannot work', () =>
       inProgress: false,
       stepCount: 0,
       candidateCount: 0,
-      candidates: []
+      candidates: new Uint32Array(0)
     });
   });
   assert.equal(hint.textContent, SELECT_BAR_ANNOTATION_NEEDS_FIELD_HINT);
@@ -846,7 +850,7 @@ test(
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       });
     });
 
@@ -869,7 +873,7 @@ test(
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       });
     });
     assert.equal(tool.modeDescription.innerHTML, ANNOTATION_NEEDS_FIELD_COPY);
@@ -996,7 +1000,7 @@ function buildModeUi({ selectDom = createSelectModeDom() } = {}) {
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       };
     },
     restoreUnifiedState() {},

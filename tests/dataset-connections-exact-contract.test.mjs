@@ -145,11 +145,9 @@ function captureNotifications(t) {
 
 function dataset(index) {
   return {
-    version: 3,
     id: `dataset-${index}`,
     name: `Dataset ${index}`,
     description: '',
-    cellucid_data_version: '1.0.0',
     stats: {
       n_cells: index,
       n_genes: 0,
@@ -166,7 +164,7 @@ function dataset(index) {
         X_umap: {
           label: 'X_umap',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: { key: 'X_umap', columns: [0, 1] },
         },
       },
@@ -489,10 +487,10 @@ function makeLifecycleHarness(
     });
   } else {
     Object.assign(dom, {
-      githubConnectBtn: createButton(),
-      githubDisconnectBtn: createButton(),
-      githubDisconnectContainer: { style: {} },
-      githubRepoUrl: createInput('owner/repo/exports'),
+      dataLinkConnectBtn: createButton(),
+      dataLinkDisconnectBtn: createButton(),
+      dataLinkDisconnectContainer: { style: {} },
+      dataLinkUrl: createInput('owner/repo/exports'),
     });
   }
   const activations = [];
@@ -566,12 +564,12 @@ function makeLifecycleHarness(
     activations,
     clearCalls,
     connectButton:
-      type === 'remote' ? dom.remoteConnectBtn : dom.githubConnectBtn,
+      type === 'remote' ? dom.remoteConnectBtn : dom.dataLinkConnectBtn,
     datasetIntents,
     disconnectButton:
       type === 'remote'
         ? dom.remoteDisconnectBtn
-        : dom.githubDisconnectBtn,
+        : dom.dataLinkDisconnectBtn,
     connectionControls,
     dom,
     factory,
@@ -599,13 +597,13 @@ function makeHarness(t, type, count) {
   const githubValue = 'owner/repo/exports';
   const remote = createConnectionSource('remote', datasets, remoteValue);
   const github = createConnectionSource(
-    'github-repo',
+    'link',
     datasets,
     githubValue
   );
   const sources = new Map([
     ['remote', remote.registered],
-    ['github-repo', github.registered],
+    ['link', github.registered],
   ]);
   const registrations = [];
   const switchCalls = [];
@@ -641,10 +639,10 @@ function makeHarness(t, type, count) {
     remoteDisconnectBtn: createButton(),
     remoteDisconnectContainer: { style: {} },
     remoteServerUrl: createInput(remoteValue),
-    githubConnectBtn: createButton(),
-    githubDisconnectBtn: createButton(),
-    githubDisconnectContainer: { style: {} },
-    githubRepoUrl: createInput(githubValue),
+    dataLinkConnectBtn: createButton(),
+    dataLinkDisconnectBtn: createButton(),
+    dataLinkDisconnectContainer: { style: {} },
+    dataLinkUrl: createInput(githubValue),
   };
   const activations = [];
   const populationCalls = [];
@@ -670,9 +668,9 @@ function makeHarness(t, type, count) {
           serverUrl: connectionInfo.url,
         }).commit();
       } else {
-        prepareUrlForDataSource('github-repo', {
+        prepareUrlForDataSource('link', {
           datasetId,
-          path: connectionInfo.inputPath,
+          locator: connectionInfo.inputPath,
         }).commit();
       }
       return true;
@@ -693,7 +691,7 @@ function makeHarness(t, type, count) {
     browser,
     candidate: type === 'remote' ? remote.candidate : github.candidate,
     connectButton:
-      type === 'remote' ? dom.remoteConnectBtn : dom.githubConnectBtn,
+      type === 'remote' ? dom.remoteConnectBtn : dom.dataLinkConnectBtn,
     datasets,
     dom,
     infoUpdates,
@@ -712,7 +710,7 @@ function makeHarness(t, type, count) {
 }
 
 test('manual Remote and GitHub connections own exact zero/one/many behavior', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     for (const count of [0, 1, 2]) {
       await t.test(`${type} with ${count} datasets`, async t => {
         const harness = makeHarness(t, type, count);
@@ -742,7 +740,7 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
           assert.equal(harness.connectButton.textContent, 'Connect');
           assert.equal(
             harness.dom[
-              type === 'remote' ? 'remoteServerUrl' : 'githubRepoUrl'
+              type === 'remote' ? 'remoteServerUrl' : 'dataLinkUrl'
             ].disabled,
             false
           );
@@ -767,7 +765,7 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
         const displaced =
           type === 'remote'
             ? harness.dom.remoteServerUrl
-            : harness.dom.githubRepoUrl;
+            : harness.dom.dataLinkUrl;
         assert.equal(displaced.disabled, true);
 
         if (count === 1) {
@@ -776,13 +774,13 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
             loadMethod:
               type === 'remote'
                 ? DATA_LOAD_METHODS.REMOTE_CONNECT
-                : DATA_LOAD_METHODS.GITHUB_CONNECT,
+                : DATA_LOAD_METHODS.LINK_CONNECT,
             sourceType: type,
           }]);
           const url = new URL(harness.browser.href);
           assert.equal(url.searchParams.get('dataset'), 'dataset-1');
           assert.equal(
-            url.searchParams.get(type === 'remote' ? 'remote' : 'github'),
+            url.searchParams.get(type === 'remote' ? 'remote' : 'data'),
             type === 'remote'
               ? 'https://remote.test'
               : 'owner/repo/exports'
@@ -808,7 +806,7 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
 });
 
 test('active Remote and GitHub reconnects are rejected before candidate mutation', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     await t.test(type, async t => {
       const harness = makeLifecycleHarness(t, type, 1, {
         activeSourceType: type,
@@ -848,15 +846,15 @@ test('a typed address the source cannot read is refused before any connection st
     ['remote', '', /^Enter a remote server address, such as http:\/\/localhost:8765, before connecting\.$/],
     ['remote', 'https://remote.test/', /^The remote server address was not tried: remote server URL .*trailing slash\. Use the bare address the server prints as Local URL\.$/],
     ['remote', 'localhost:8765', /^The remote server address was not tried: .*HTTP\(S\).*\. Use the bare address the server prints as Local URL\.$/],
-    ['github-repo', '   ', /^Enter a GitHub repository path, such as owner\/repo\/exports, before connecting\.$/],
-    ['github-repo', 'not a repo', /^Invalid GitHub path\. Use format: owner\/repo\/exports/],
+    ['link', '   ', /^Paste a link or an id, such as a CELLxGENE dataset link, GSE123456, or owner\/repo\/folder, before connecting\.$/],
+    ['link', 'not a repo', /^Cellucid does not recognise "not a repo"\./],
   ];
   for (const [type, value, expected] of cases) {
     await t.test(`${type} ${JSON.stringify(value)}`, async t => {
       const harness = makeLifecycleHarness(t, type, 1);
       const input = type === 'remote'
         ? harness.dom.remoteServerUrl
-        : harness.dom.githubRepoUrl;
+        : harness.dom.dataLinkUrl;
       input.value = value;
       await harness.connectButton.activate();
 
@@ -880,7 +878,7 @@ test('failed connection candidates retire exactly once and preserve prior state'
     ['inventory', { listError: new Error('inventory rejected') }],
     ['activation', null],
   ];
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     for (const [stage, candidateBehavior] of failures) {
       await t.test(`${type} ${stage}`, async t => {
         const harness = makeLifecycleHarness(t, type, 1, {
@@ -912,7 +910,11 @@ test('failed connection candidates retire exactly once and preserve prior state'
         // The loader published no cause on these errors, so the notification
         // must say what happened without naming a cause it does not have, and
         // must still carry the raw text as the only evidence there is.
-        assert.match(terminal[0].message, /could not be reached/i);
+        // A server is reached; a link is opened.
+        assert.match(
+          terminal[0].message,
+          type === 'remote' ? /could not be reached/i : /could not be opened/i
+        );
         assert.doesNotMatch(terminal[0].message, /the server|the connection may/i);
         assert.match(terminal[0].message, /Details: .+ rejected/);
       });
@@ -997,7 +999,7 @@ test('failed connection candidates retire exactly once and preserve prior state'
 });
 
 test('multi-dataset cleanup failure retains the published candidate', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     await t.test(type, async t => {
       const cleanupError = new Error('prior transport release failed');
       const harness = makeLifecycleHarness(t, type, 2, {
@@ -1026,7 +1028,7 @@ test('multi-dataset cleanup failure retains the published candidate', async t =>
 });
 
 test('connected sources disconnect through exact active and non-active paths', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     for (const active of [false, true]) {
       await t.test(`${type} ${active ? 'active' : 'non-active'}`, async t => {
         const harness = makeLifecycleHarness(
@@ -1217,7 +1219,7 @@ test('Remote connection loss clears only active science and retires transport on
 });
 
 test('superseded one-dataset connections cannot revoke the newer candidate', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     await t.test(type, async t => {
       const firstActivation = createDeferred();
       let activationCount = 0;
@@ -1277,7 +1279,7 @@ test('superseded one-dataset connections cannot revoke the newer candidate', asy
 });
 
 test('an older multi-dataset inventory cannot publish after a newer connection', async t => {
-  for (const type of ['remote', 'github-repo']) {
+  for (const type of ['remote', 'link']) {
     await t.test(type, async t => {
       const firstInventory = createDeferred();
       const harness = makeLifecycleHarness(t, type, 2, {

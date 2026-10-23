@@ -2,11 +2,12 @@
  * H5AD Module for Cellucid
  *
  * The data source for one AnnData `.h5ad` file opened directly in the
- * browser. The file is read by `H5adLoader` (`h5ad-loader.js`) in the
- * AnnData reader worker, through `AnnDataReaderClient`: nothing is copied
- * into memory up front, only the datasets a view needs are read, and HDF5
- * never runs on the page's thread. The file size is not limited; the only
- * bound is the memory the arrays actually shown need.
+ * browser. The file is read by the AnnData reader (`anndata/reader.js`, over
+ * the HDF5 reader of `formats/hdf5`) in the AnnData reader worker, through
+ * `AnnDataReaderClient`: nothing is copied into memory up front, only the
+ * datasets a view needs are read, and HDF5 never runs on the page's thread.
+ * The file size is not limited; the only bound is the memory the arrays
+ * actually shown need.
  *
  * The bridge that routes the application's data requests to this source lives
  * in `anndata-provider.js`, which serves h5ad:// and zarr:// alike.
@@ -14,7 +15,7 @@
 
 import { getNotificationCenter } from '../app/notification-center.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
-import { BaseAnnDataAdapter } from './base-anndata-adapter.js';
+import { BaseAnnDataAdapter, requireAnnDataLaunchDefaults } from './base-anndata-adapter.js';
 import { AnnDataReaderClient } from './anndata-reader-client.js';
 import {
   getMetadataLoadSignal,
@@ -34,39 +35,6 @@ export function isH5adFile(file) {
   return file.name.toLowerCase().endsWith('.h5ad');
 }
 
-/**
- * One reader for one h5ad file. Long reads (indexing a row-major matrix by
- * gene, once per matrix) report progress in a notification.
- *
- * @param {{showProgress?: boolean}} [options]
- * @returns {AnnDataReaderClient}
- */
-export function createH5adLoader({ showProgress = true } = {}) {
-  let progressId = null;
-  let lastUpdate = 0;
-  const onProgress = showProgress
-    ? event => {
-        if (event?.kind !== 'transpose') return;
-        const notifications = getNotificationCenter();
-        const percent = event.total > 0 ? (100 * event.done) / event.total : 0;
-        if (progressId === null) {
-          progressId = notifications.progress(
-            `Indexing ${event.label} by gene (once per file)`,
-            percent
-          );
-          lastUpdate = Date.now();
-        } else if (event.done >= event.total) {
-          notifications.complete(progressId, `${event.label} is indexed by gene`);
-          progressId = null;
-        } else if (Date.now() - lastUpdate >= 100) {
-          notifications.updateProgress(progressId, percent);
-          lastUpdate = Date.now();
-        }
-      }
-    : null;
-  return new AnnDataReaderClient({ kind: 'h5ad', onProgress });
-}
-
 // ============================================================================
 // H5AD DATA SOURCE
 // ============================================================================
@@ -77,13 +45,6 @@ export function createH5adLoader({ showProgress = true } = {}) {
  */
 class H5adDataAdapter extends BaseAnnDataAdapter {
   static sourceType = 'h5ad';
-
-  /**
-   * @param {AnnDataReaderClient} loader - The h5ad reader
-   */
-  constructor(loader) {
-    super(loader);
-  }
 
   // H5adDataAdapter uses all methods from BaseAnnDataAdapter without modification.
   // Any h5ad-specific overrides can be added here if needed in the future.
@@ -142,12 +103,23 @@ export class H5adDataSource {
 
   /**
    * Load an h5ad file
-   * @param {File} file - File from file input
+   * @param {File|{url: string, size: number, name: string}} file - A file
+   *   from a file input, or a remote file read in place with range requests
    * @param {Object} [options]
    * @param {boolean} [options.showProgress=true]
-   * @param {string} [options.datasetId]
+   * @param {string} [options.datasetId] - The id the caller serves the
+   *   dataset under (a catalog's, a server's); without one, the id the file
+   *   states (`uns['cellucid']['id']`), else `defaultDatasetId`
+   * @param {string} [options.defaultDatasetId] - The id of a file that states
+   *   none; `h5ad_<file name>` by default
+   * @param {string} [options.name] - Display name; defaults to the file name
+   * @param {boolean} [options.preferFileName=false] - Name the dataset by
+   *   the name the file gives itself (`uns['cellucid']['name']`, else
+   *   `uns['title']`) when it has one
    * @param {string} [options.description]
    * @param {Object} [options.source]
+   * @param {Object} [options.defaults] - Launch defaults: the choices the
+   *   dataset opens with (`requireAnnDataLaunchDefaults`)
    * @returns {Promise<Object>}
    */
   async loadFromFile(file, options = {}) {
@@ -160,47 +132,55 @@ export class H5adDataSource {
     }
 
     const requestId = ++this._loadRequestId;
+    const remoteHost = typeof file.url === 'string' ? new URL(file.url).host : null;
     const {
       showProgress = true,
+      defaults = {},
       datasetId = null,
+      defaultDatasetId = `h5ad_${file.name.replace(/\.h5ad$/i, '')}`,
+      name = file.name.replace(/\.h5ad$/i, ''),
+      preferFileName = false,
       description = 'Loaded directly from H5AD file',
       source = {
         name: 'H5AD file',
         filename: file.name,
       },
     } = options;
+    // Launch defaults are checked before anything is read.
+    requireAnnDataLaunchDefaults(defaults);
     const notifications = showProgress ? getNotificationCenter() : null;
     const trackerId = notifications
       ? notifications.startDownload(file.name || 'H5AD file')
       : null;
 
     // Validate a candidate completely before releasing the working dataset.
-    const candidateLoader = createH5adLoader({ showProgress });
+    const candidateReader = new AnnDataReaderClient({ kind: 'h5ad' });
     let candidateAdapter = null;
     let adopted = false;
     try {
-      await candidateLoader.open(file);
+      await candidateReader.open(file);
       this._assertLoadRequest(requestId);
-      candidateAdapter = new H5adDataAdapter(candidateLoader);
+      candidateAdapter = new H5adDataAdapter(candidateReader, { defaults });
       await candidateAdapter.initialize();
       this._assertLoadRequest(requestId);
 
       const candidateFilename = file.name;
       const candidateDatasetId =
         datasetId ??
-        `h5ad_${file.name.replace(/\.h5ad$/i, '')}`;
+        candidateAdapter.getFileMetadata().id ??
+        defaultDatasetId;
       const candidateMetadata =
         await candidateAdapter.finalizeDirectIdentity({
           id: candidateDatasetId,
-          name: file.name.replace(/\.h5ad$/i, ''),
+          name,
+          preferFileName,
           description,
-          cellucidDataVersion: 'h5ad_loader',
           source,
         });
       this._assertLoadRequest(requestId);
 
       this._releaseCurrentSource();
-      this._loader = candidateLoader;
+      this._loader = candidateReader;
       this._adapter = candidateAdapter;
       this.filename = candidateFilename;
       this.datasetId = candidateDatasetId;
@@ -211,9 +191,10 @@ export class H5adDataSource {
       if (notifications !== null) {
         notifications.completeDownload(trackerId);
         notifications.info(
-          'Opened H5AD directly in the browser. It is read from disk as each view needs it ' +
-          'and gene expression is read unquantized; a row-major (CSR) matrix is indexed by ' +
-          'gene the first time a gene is shown.',
+          'Opened H5AD directly in the browser. It is read ' +
+          (remoteHost === null ? 'from disk' : `in place from ${remoteHost}`) +
+          ' as each view needs it; a row-major ' +
+          '(CSR) matrix is indexed by gene the first time a gene is shown.',
           { duration: 15000 }
         );
       }
@@ -231,7 +212,7 @@ export class H5adDataSource {
           if (candidateAdapter !== null) {
             candidateAdapter.close();
           } else {
-            candidateLoader.close();
+            candidateReader.close();
           }
         } catch (cleanupFailure) {
           terminalError = combineDatasetLifecycleFailures(
@@ -379,38 +360,38 @@ export class H5adDataSource {
   }
 
   /**
-   * Get obs manifest
+   * The obs field list (`BaseAnnDataAdapter.getObsFields`)
    * @returns {Object}
    */
-  getObsManifest() {
+  getObsFields() {
     if (!this._adapter) {
       throw new DataSourceError('No h5ad file loaded', DataSourceErrorCode.NOT_FOUND, this.type);
     }
-    return this._adapter.getObsManifest();
+    return this._adapter.getObsFields();
   }
 
   /**
-   * Get the var manifest of the gene list the file opens with
+   * The gene list the file opens with (`BaseAnnDataAdapter.getGeneList`)
    * @returns {Promise<Object>}
    */
-  getVarManifest() {
+  getGeneList() {
     if (!this._adapter) {
       throw new DataSourceError('No h5ad file loaded', DataSourceErrorCode.NOT_FOUND, this.type);
     }
-    return this._adapter.getVarManifest();
+    return this._adapter.getGeneList();
   }
 
   /**
-   * Get connectivity manifest
+   * The summary of the neighbour graph the file opens with, or null
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Object|null>}
    */
-  async getConnectivityManifest(options = {}) {
+  async getConnectivitySummary(options = {}) {
     const signal = getMetadataLoadSignal(
       options,
-      'H5AD connectivity manifest'
+      'H5AD connectivity summary'
     );
-    throwIfMetadataAborted(signal, 'H5AD connectivity manifest loading');
+    throwIfMetadataAborted(signal, 'H5AD connectivity summary loading');
     if (!this._adapter) {
       throw new DataSourceError(
         'No h5ad file loaded',
@@ -418,9 +399,9 @@ export class H5adDataSource {
         this.type
       );
     }
-    const manifest = this._adapter.getConnectivityManifest();
-    throwIfMetadataAborted(signal, 'H5AD connectivity manifest loading');
-    return manifest;
+    const summary = this._adapter.getConnectivitySummary();
+    throwIfMetadataAborted(signal, 'H5AD connectivity summary loading');
+    return summary;
   }
 
   /**

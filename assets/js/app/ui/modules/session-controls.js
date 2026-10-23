@@ -11,6 +11,9 @@ import { getNotificationCenter } from '../../notification-center.js';
 import {
   isSessionRestoreReportedError
 } from '../../session/session-serializer.js';
+import {
+  describeDatasetSourceRecord
+} from '../../session/dataset-source-record.js';
 
 /**
  * @param {object} options
@@ -26,12 +29,18 @@ import {
  *   for that load and is then applied to whatever dataset it produced.
  *   Choosing a session is also an action that decides the dataset: a slower
  *   connection the user started earlier must not replace it afterwards.
+ * @param {() => (string|null)} options.currentDatasetIdentityId
+ *   The identity id of the dataset that is open, or null.
+ * @param {(record: object) => Promise<boolean>} options.openDatasetSource
+ *   Opens the dataset a session file recorded; resolves whether it is open.
  * @param {(() => Promise<void>|void)|undefined} options.onAfterLoad
  */
 export function initSessionControls({
   dom,
   sessionSerializer,
   datasetChanges,
+  currentDatasetIdentityId,
+  openDatasetSource,
   onAfterLoad
 }) {
   if (
@@ -43,6 +52,14 @@ export function initSessionControls({
   ) {
     throw new TypeError(
       'Session controls require the dataset-change coordinator.'
+    );
+  }
+  if (
+    typeof currentDatasetIdentityId !== 'function' ||
+    typeof openDatasetSource !== 'function'
+  ) {
+    throw new TypeError(
+      'Session controls require the dataset identity and opener.'
     );
   }
   const { saveBtn: saveStateBtn, loadBtn: loadStateBtn } = dom || {};
@@ -131,6 +148,49 @@ export function initSessionControls({
     return ownsOperation(operationGeneration) && sessionLoad === loadGeneration;
   }
 
+  /**
+   * Make the session's own dataset the open one when the file records where
+   * it comes from and another dataset (or none) is open. A session saved on a
+   * local file or in a notebook is applied to whatever is open, and the
+   * restore names the dataset (and file) it needs.
+   *
+   * @param {File} file
+   * @param {number} operationGeneration
+   * @param {number} sessionLoad
+   * @returns {Promise<boolean>} Whether this file is still the one to restore.
+   */
+  async function prepareDatasetForSession(file, operationGeneration, sessionLoad) {
+    const current = () =>
+      ownsOperation(operationGeneration) && sessionLoad === loadGeneration;
+    if (!await awaitDatasetForSession(operationGeneration, sessionLoad)) {
+      return false;
+    }
+    const { datasetId, source } = await sessionSerializer.readSessionDataset(file);
+    if (!current()) return false;
+    // A local file cannot be opened from the session: the restore names it
+    // when the open dataset is not the one the session was saved on.
+    if (
+      source === null
+      || source.kind === 'file'
+      || currentDatasetIdentityId() === datasetId
+    ) {
+      return true;
+    }
+    const notifications = getNotificationCenter();
+    const openingId = notifications.loading(
+      `Opening the session's dataset from ${describeDatasetSourceRecord(source)}…`,
+      { category: 'session' }
+    );
+    let opened;
+    try {
+      opened = await openDatasetSource(source);
+    } finally {
+      if (!destroyed) notifications.dismiss(openingId);
+    }
+    // A source that could not be opened reported why where it failed.
+    return opened && current();
+  }
+
   if (loadStateBtn && sessionSerializer) {
     listen(loadStateBtn, 'click', () => {
       // IMPORTANT:
@@ -140,7 +200,8 @@ export function initSessionControls({
       const operation = (async () => {
       try {
         const picked = await sessionSerializer.loadSessionFromFile({
-          beforeRestore: () => awaitDatasetForSession(
+          beforeRestore: file => prepareDatasetForSession(
+            file,
             operationGeneration,
             ++loadGeneration
           )

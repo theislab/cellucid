@@ -12,7 +12,8 @@
 // rather than a hand-assembled one, so the fixture cannot drift away from the
 // format the reader accepts.
 
-import { createHash } from 'node:crypto';
+import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
+import { SESSION_BUNDLE_MAGIC_BYTES } from '../../assets/js/app/session/bundle/format.js';
 import { readFile } from 'node:fs/promises';
 
 import {
@@ -21,6 +22,7 @@ import {
   test,
 } from './helpers/test.mjs';
 
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -31,137 +33,7 @@ const DATASET_NAME = 'Deterministic dimension fixture';
 const CELL_COUNT = 12;
 const FIELD_KEY = 'lineage';
 const CATEGORIES = Object.freeze(['Progenitor', 'Differentiated']);
-const STATE_FILENAME = 'default.cellucid-session';
-
-const identity = {
-  version: 3,
-  id: DATASET_ID,
-  name: DATASET_NAME,
-  description: 'Exact synthetic fixture for navigation-mode ownership',
-  created_at: '2026-07-31T00:00:00Z',
-  cellucid_data_version: '0.0.9',
-  stats: {
-    n_cells: CELL_COUNT,
-    n_genes: 1,
-    n_obs_fields: 1,
-    n_categorical_fields: 1,
-    n_continuous_fields: 0,
-    has_connectivity: false,
-    n_edges: null,
-  },
-  embeddings: {
-    default_dimension: 3,
-    defaults: {
-      '1d': 'layout_1d',
-      '2d': 'layout_2d',
-      '3d': 'layout_3d',
-    },
-    items: {
-      layout_1d: {
-        label: 'Layout 1D',
-        dimension: 1,
-        file: 'embeddings/0_1d.bin',
-        source: { key: null, columns: [0] },
-      },
-      layout_2d: {
-        label: 'Layout 2D',
-        dimension: 2,
-        file: 'embeddings/1_2d.bin',
-        source: { key: null, columns: [0, 1] },
-      },
-      layout_3d: {
-        label: 'Layout 3D',
-        dimension: 3,
-        file: 'embeddings/2_3d.bin',
-        source: { key: null, columns: [0, 1, 2] },
-      },
-    },
-  },
-  obs_fields: [{
-    key: FIELD_KEY,
-    kind: 'category',
-    n_categories: CATEGORIES.length,
-  }],
-  export_settings: {
-    compression: null,
-    var_quantization: null,
-    obs_continuous_quantization: null,
-    obs_categorical_dtype: 'uint8',
-  },
-  source: {
-    name: 'Cellucid browser CI',
-  },
-};
-
-function centroidsFor(dimension) {
-  return CATEGORIES.map((category, categoryIndex) => ({
-    category,
-    position: Array.from(
-      { length: dimension },
-      (unused, axis) => (categoryIndex === 0 ? -0.5 : 0.5) + axis * 0.1,
-    ),
-    n_points: CELL_COUNT / CATEGORIES.length,
-  }));
-}
-
-const obsManifest = {
-  _format: 'compact_v2',
-  n_points: CELL_COUNT,
-  centroid_outlier_quantile: null,
-  latent_key: null,
-  compression: null,
-  _obsSchemas: {
-    categorical: {
-      codesPathPattern: 'obs/{index}.codes.{ext}',
-      outlierPathPattern: null,
-      outlierExt: null,
-      outlierDtype: null,
-      outlierQuantized: false,
-    },
-  },
-  _continuousFields: [],
-  _categoricalFields: [[
-    0,
-    FIELD_KEY,
-    CATEGORIES,
-    'uint8',
-    255,
-    {
-      layout_1d: centroidsFor(1),
-      layout_2d: centroidsFor(2),
-      layout_3d: centroidsFor(3),
-    },
-  ]],
-};
-
-// A session bundle fingerprints the var inventory as well as obs, so the
-// fixture publishes one gene rather than none.
 const GENE_KEY = 'Marker1';
-const varManifest = {
-  _format: 'compact_v2',
-  n_points: CELL_COUNT,
-  compression: null,
-  quantization: 8,
-  _varSchema: {
-    kind: 'continuous',
-    pathPattern: 'var/{index}.values.u8',
-    ext: 'u8',
-    dtype: 'uint8',
-    quantized: true,
-    quantizationBits: 8,
-  },
-  fields: [[0, GENE_KEY, 0, 1]],
-  gene_name_sets: [{
-    source: null,
-    filled_from_index: 0,
-    renamed: [],
-    names: null,
-  }],
-};
-
-const geneBytes = Buffer.from(
-  Array.from({ length: CELL_COUNT }, (unused, index) => index * 20),
-);
 
 const POINTS = Object.freeze([
   [0, 0, 0],
@@ -178,39 +50,22 @@ const POINTS = Object.freeze([
   [0.7, 0.7, -0.7],
 ]);
 
-function positionBytes(dimension) {
-  const buffer = Buffer.alloc(
-    CELL_COUNT * dimension * Float32Array.BYTES_PER_ELEMENT,
+function positions(dimension) {
+  return Float32Array.from(
+    { length: CELL_COUNT * dimension },
+    (unused, index) => POINTS[Math.floor(index / dimension)][index % dimension],
   );
-  for (let index = 0; index < CELL_COUNT; index++) {
-    for (let axis = 0; axis < dimension; axis++) {
-      buffer.writeFloatLE(
-        POINTS[index][axis],
-        ((index * dimension) + axis) * 4,
-      );
-    }
-  }
-  return buffer;
 }
 
-const codeBytes = Buffer.from(
-  Array.from({ length: CELL_COUNT }, (unused, index) => index % 2),
-);
-
-const BUNDLE_MAGIC = 'CELLUCID_SESSION\n';
+const BUNDLE_MAGIC = new TextDecoder().decode(SESSION_BUNDLE_MAGIC_BYTES);
 
 // The exact static profile a dataset may advertise as its starting state, in
-// order — see PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE in
-// `assets/js/app/session/session-serializer.js`. An interactive Save State
-// writes these plus chunks a published default must not carry (a camera path,
-// an analysis cache inventory), so the fixture keeps exactly this set.
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
-  'core/field-overlays',
-  'core/state',
-  'ui/dockable-layout',
-  'analysis/windows',
-  'highlights/meta',
-]);
+// order (PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE). An interactive Save State
+// writes these plus chunks a published default must not carry (a camera
+// path), so the fixture keeps exactly this set.
+const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
+  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
+);
 
 /**
  * Turn an interactive session bundle into the narrower published-default
@@ -251,8 +106,10 @@ function toPublishedDefault(bundle) {
   expect(offset).toBe(bundle.byteLength);
   expect(kept.map(entry => entry.id)).toEqual(PUBLISHED_DEFAULT_CHUNK_IDS);
 
+  // A published default is applied to the sample it ships beside, so it
+  // records no source.
   const manifestBytes = Buffer.from(
-    JSON.stringify({ ...manifest, chunks: kept }),
+    JSON.stringify({ ...manifest, source: null, chunks: kept }),
     'utf8',
   );
   const parts = [Buffer.from(BUNDLE_MAGIC, 'utf8')];
@@ -268,108 +125,38 @@ function toPublishedDefault(bundle) {
 }
 
 /**
- * Serve the fixture, optionally advertising a published starting state.
+ * Serve the fixture, optionally advertising a published starting state. A
+ * session bundle fingerprints the var inventory as well as obs, so the
+ * fixture has one gene rather than none.
  *
  * @param {import('@playwright/test').Page} page
  * @param {Buffer|null} publishedState Exact `.cellucid-session` bytes, or null.
  */
 async function installFixture(page, publishedState = null) {
-  const catalogEntry = {
+  await serveSyntheticCatalog(page, FIXTURE_ROOT, {
     id: DATASET_ID,
     name: DATASET_NAME,
-    path: `${DATASET_ID}/`,
-    n_cells: CELL_COUNT,
-    n_genes: 1,
-  };
-  const responses = new Map([
-    [
-      `${DATASET_ID}/dataset_identity.json`,
-      { body: Buffer.from(JSON.stringify(identity)), contentType: 'application/json; charset=utf-8' },
-    ],
-    [
-      `${DATASET_ID}/obs_manifest.json`,
-      { body: Buffer.from(JSON.stringify(obsManifest)), contentType: 'application/json; charset=utf-8' },
-    ],
-    [
-      `${DATASET_ID}/obs/0.codes.u8`,
-      { body: codeBytes, contentType: 'application/octet-stream' },
-    ],
-    [
-      `${DATASET_ID}/var_manifest.json`,
-      { body: Buffer.from(JSON.stringify(varManifest)), contentType: 'application/json; charset=utf-8' },
-    ],
-    [
-      `${DATASET_ID}/var/0.values.u8`,
-      { body: geneBytes, contentType: 'application/octet-stream' },
-    ],
-    [
-      `${DATASET_ID}/embeddings/0_1d.bin`,
-      { body: positionBytes(1), contentType: 'application/octet-stream' },
-    ],
-    [
-      `${DATASET_ID}/embeddings/1_2d.bin`,
-      { body: positionBytes(2), contentType: 'application/octet-stream' },
-    ],
-    [
-      `${DATASET_ID}/embeddings/2_3d.bin`,
-      { body: positionBytes(3), contentType: 'application/octet-stream' },
-    ],
-  ]);
-
-  if (publishedState !== null) {
-    catalogEntry.state_manifest = 'state-snapshots.json';
-    catalogEntry.state_bytes = publishedState.byteLength;
-    catalogEntry.state_sha256 = createHash('sha256')
-      .update(publishedState)
-      .digest('hex');
-    responses.set(
-      `${DATASET_ID}/state-snapshots.json`,
-      {
-        body: Buffer.from(JSON.stringify({ states: [STATE_FILENAME] })),
-        contentType: 'application/json; charset=utf-8',
+    description: 'Exact synthetic fixture for navigation-mode ownership',
+    session: publishedState,
+    cells: CELL_COUNT,
+    genes: [GENE_KEY],
+    X: Float32Array.from({ length: CELL_COUNT }, (unused, index) => index * 20),
+    obs: {
+      [FIELD_KEY]: {
+        categories: [...CATEGORIES],
+        codes: Int8Array.from({ length: CELL_COUNT }, (unused, index) => index % 2),
       },
-    );
-    responses.set(
-      `${DATASET_ID}/${STATE_FILENAME}`,
-      { body: publishedState, contentType: 'application/octet-stream' },
-    );
-  }
-
-  responses.set(
-    'datasets.json',
-    {
-      body: Buffer.from(JSON.stringify({
-        version: 1,
-        default: DATASET_ID,
-        datasets: [catalogEntry],
-      })),
-      contentType: 'application/json; charset=utf-8',
     },
-  );
-
-  const rootPath = new URL(FIXTURE_ROOT).pathname;
-  await page.route(`${FIXTURE_ROOT}**`, async route => {
-    const pathname = new URL(route.request().url()).pathname;
-    const response = responses.get(pathname.slice(rootPath.length));
-    if (response === undefined) {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/plain; charset=utf-8',
-        body: `Unexpected fixture request: ${pathname}\n`,
-      });
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: response.contentType,
-      body: response.body,
-    });
+    obsm: Object.fromEntries([1, 2, 3].map(dimension => [
+      `X_umap_${dimension}d`,
+      { data: positions(dimension), columns: dimension },
+    ])),
   });
 }
 
 function fixtureUrl(acceptance) {
   return (
-    `/?exportsBaseUrl=${encodeURIComponent(FIXTURE_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(FIXTURE_ROOT)}` +
     `&dataset=${DATASET_ID}&acceptance=${acceptance}`
   );
 }

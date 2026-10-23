@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -7,80 +8,8 @@ const SYNTHETIC_3D_ROOT = appUrl('/tests/browser/fixtures/generated-3d/');
 const DATASET_ID = 'deterministic-orbit-3d';
 const CELL_COUNT = 12;
 
-const catalog = {
-  version: 1,
-  default: DATASET_ID,
-  datasets: [{
-    id: DATASET_ID,
-    name: 'Deterministic 3-D orbit fixture',
-    path: `${DATASET_ID}/`,
-    n_cells: CELL_COUNT,
-    n_genes: 0,
-  }],
-};
-
-const identity = {
-  version: 3,
-  id: DATASET_ID,
-  name: 'Deterministic 3-D orbit fixture',
-  description: 'Exact synthetic browser fixture for fresh 3-D camera ownership',
-  created_at: '2026-07-26T00:00:00Z',
-  cellucid_data_version: '0.0.9',
-  stats: {
-    n_cells: CELL_COUNT,
-    n_genes: 0,
-    n_obs_fields: 0,
-    n_categorical_fields: 0,
-    n_continuous_fields: 0,
-    has_connectivity: false,
-    n_edges: null,
-  },
-  embeddings: {
-    default_dimension: 3,
-    defaults: {
-      '2d': 'orbit_2d',
-      '3d': 'orbit_3d',
-    },
-    items: {
-      orbit_2d: {
-        label: 'Orbit 2D',
-        dimension: 2,
-        file: 'embeddings/0_2d.bin',
-        source: { key: null, columns: [0, 1] },
-      },
-      orbit_3d: {
-        label: 'Orbit 3D',
-        dimension: 3,
-        file: 'embeddings/1_3d.bin',
-        source: { key: null, columns: [0, 1, 2] },
-      },
-    },
-  },
-  obs_fields: [],
-  export_settings: {
-    compression: null,
-    var_quantization: null,
-    obs_continuous_quantization: null,
-    obs_categorical_dtype: 'uint8',
-  },
-  source: {
-    name: 'Cellucid browser CI',
-  },
-};
-
-const obsManifest = {
-  _format: 'compact_v2',
-  n_points: CELL_COUNT,
-  centroid_outlier_quantile: null,
-  latent_key: null,
-  compression: null,
-  _obsSchemas: {},
-  _continuousFields: [],
-  _categoricalFields: [],
-};
-
 function createDeterministic3dPositions() {
-  const buffer = Buffer.alloc(CELL_COUNT * 3 * Float32Array.BYTES_PER_ELEMENT);
+  const positions = new Float32Array(CELL_COUNT * 3);
   const points = [
     [0, 0, 0],
     [1, 0, 0],
@@ -98,30 +27,25 @@ function createDeterministic3dPositions() {
   for (let index = 0; index < CELL_COUNT; index++) {
     const point = points[index];
     for (let axis = 0; axis < point.length; axis++) {
-      buffer.writeFloatLE(point[axis], ((index * 3) + axis) * 4);
+      positions[(index * 3) + axis] = point[axis];
     }
   }
-  return buffer;
+  return positions;
 }
 
 function createDeterministic2dPositions() {
   const positions3d = createDeterministic3dPositions();
-  const positions2d = Buffer.alloc(
-    CELL_COUNT * 2 * Float32Array.BYTES_PER_ELEMENT,
-  );
+  const positions2d = new Float32Array(CELL_COUNT * 2);
   for (let index = 0; index < CELL_COUNT; index++) {
     for (let axis = 0; axis < 2; axis++) {
-      positions2d.writeFloatLE(
-        positions3d.readFloatLE(((index * 3) + axis) * 4),
-        ((index * 2) + axis) * 4,
-      );
+      positions2d[(index * 2) + axis] = positions3d[(index * 3) + axis];
     }
   }
   return positions2d;
 }
 
-const position2dBytes = createDeterministic2dPositions();
-const positionBytes = createDeterministic3dPositions();
+const positions2d = createDeterministic2dPositions();
+const positions3d = createDeterministic3dPositions();
 
 function observeProductErrors(page) {
   const errors = [];
@@ -142,60 +66,15 @@ function observeProductErrors(page) {
 }
 
 async function installSynthetic3dFixture(page) {
-  const responses = new Map([
-    [
-      '/tests/browser/fixtures/generated-3d/datasets.json',
-      {
-        body: Buffer.from(JSON.stringify(catalog)),
-        contentType: 'application/json; charset=utf-8',
-      },
-    ],
-    [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/dataset_identity.json`,
-      {
-        body: Buffer.from(JSON.stringify(identity)),
-        contentType: 'application/json; charset=utf-8',
-      },
-    ],
-    [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/obs_manifest.json`,
-      {
-        body: Buffer.from(JSON.stringify(obsManifest)),
-        contentType: 'application/json; charset=utf-8',
-      },
-    ],
-    [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/embeddings/0_2d.bin`,
-      {
-        body: position2dBytes,
-        contentType: 'application/octet-stream',
-      },
-    ],
-    [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/embeddings/1_3d.bin`,
-      {
-        body: positionBytes,
-        contentType: 'application/octet-stream',
-      },
-    ],
-  ]);
-
-  await page.route(`${SYNTHETIC_3D_ROOT}**`, async route => {
-    const pathname = new URL(route.request().url()).pathname;
-    const response = responses.get(pathname);
-    if (response === undefined) {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/plain; charset=utf-8',
-        body: `Unexpected synthetic fixture request: ${pathname}\n`,
-      });
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: response.contentType,
-      body: response.body,
-    });
+  await serveSyntheticCatalog(page, SYNTHETIC_3D_ROOT, {
+    id: DATASET_ID,
+    name: 'Deterministic 3-D orbit fixture',
+    description: 'Exact synthetic browser fixture for fresh 3-D camera ownership',
+    cells: CELL_COUNT,
+    obsm: {
+      X_umap_2d: { data: positions2d, columns: 2 },
+      X_umap_3d: { data: positions3d, columns: 3 },
+    },
   });
 }
 
@@ -295,7 +174,7 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=fresh-3d-orbit-ci`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -325,7 +204,7 @@ test('snapshot dimension switches publish one exact geometry generation', async 
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=snapshot-dimension-generation`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -377,7 +256,7 @@ test('UI teardown fences an in-flight representation switch from the picker', as
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=representation-picker-terminal-owner`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -464,7 +343,7 @@ test('a navigation observer failure cannot enter dimension rollback', async ({
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=dimension-observer-boundary`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -522,7 +401,7 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=sidebar-aware-camera-center`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -669,7 +548,7 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=coarse-lod-picking-prefix`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -892,7 +771,7 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=per-pane-orbit-anchor`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -976,7 +855,7 @@ test('responsive sidebar CSS remains live and republishes the target center', as
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=responsive-sidebar-camera-center`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -1093,7 +972,7 @@ test('sidebar drag coalesces camera geometry without synchronous layout reads', 
   });
   await installSynthetic3dFixture(page);
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=sidebar-resize-performance`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -1150,7 +1029,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=viewer-public-control-contract`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -1411,7 +1290,7 @@ test('a failed GPU dataset publication preserves the complete live renderer', as
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=renderer-data-transaction`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -1495,7 +1374,7 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
   await installSynthetic3dFixture(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
       `&dataset=${DATASET_ID}&acceptance=renderer-lod-transaction`,
     { waitUntil: 'domcontentloaded' },
   );

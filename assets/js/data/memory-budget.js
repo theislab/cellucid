@@ -1,77 +1,157 @@
 /**
  * @fileoverview The one source of the memory budgets that decide what stays
- * resident: inactive field data, decoded positions, the AnnData adapter's
- * coordinate cache, decoded Zarr/HDF5 blocks and the gene-column index.
+ * resident: the gene-column index, decoded embedding positions of layouts no
+ * view shows, inactive field data, an analysis run's buffered genes, the
+ * AnnData adapter's cache, a latent space held for outlier quantiles, decoded
+ * chunk blocks, decode workers and selection undo history.
  *
- * Every budget here is a residency policy: it decides what is evicted and
- * reloaded later, never what can be opened or shown. Each is a share of the
- * memory the browser reports for the device -- `navigator.deviceMemory`
- * (Chromium; it reports at most 8 GiB), else the JavaScript heap limit
- * (`performance.memory`, Chromium) -- so a larger machine keeps more warm and
- * a smaller one evicts sooner, and the shares sum well below the whole
- * device. A browser that reports neither (Firefox, Safari) keeps the budgets
- * the app has always used, which are also the values at a reported 8 GiB.
+ * Every budget is a residency policy: it decides what is evicted, spilled to
+ * disk or read again later, never what can be opened or shown.
+ *
+ * - **The device** is what the browser lets a page learn of its memory
+ *   (`estimatedDeviceMemory`): `navigator.deviceMemory` (Chromium, secure
+ *   contexts; rounded down to a power of two, and capped at 8 GiB by earlier
+ *   Chromium releases: Chromium 151 reports 16 on a 16 GiB Mac), and the
+ *   JavaScript heap limit (`performance.memory.jsHeapSizeLimit`, Chromium),
+ *   which V8 sizes at about a quarter of physical memory (3.76 GB on that
+ *   Mac), up to its pointer-compression cage. The heap limit raises the
+ *   estimate past an 8 GiB report that may be a cap (that Mac is then
+ *   14 GiB, not 8) and stands in when deviceMemory is not reported. A browser
+ *   that reports neither (Firefox, Safari) is taken to be 8 GiB, the report
+ *   earlier Chromium gave any larger device. `performance.measureUserAgentSpecificMemory()`
+ *   is not used: it reports what the page uses, not what it may use, only in
+ *   cross-origin isolated pages (which Cellucid's hosts are not), and it
+ *   forces a garbage collection.
+ * - **The allowance** is half the device: everything the app keeps by choice
+ *   together. The other half is the system, the browser, other tabs and the
+ *   app's working set (the embedding a view shows, its colours, the fields
+ *   in use).
+ * - **The shares** (`RESIDENCY_SHARES`) divide the allowance and sum to
+ *   exactly one, so no two budgets count the same bytes and together they
+ *   never exceed it. No budget has a floor or ceiling of its own.
+ * - **A refused allocation** (`recordAllocationFailure`, reported by
+ *   `allocateTypedArray`) of fewer bytes than the allowance means the
+ *   estimate was too high for this page: the allowance of the thread that
+ *   saw it halves, for every budget read afterwards.
+ *
+ * Each thread (the page, the AnnData reader worker) evaluates its own
+ * budgets; the shares make them disjoint whichever thread holds the memory.
  *
  * @module data/memory-budget
  */
 
 const GIB = 1024 ** 3;
-const MIB = 1024 ** 2;
+
+/** The 8 GiB report earlier Chromium releases give any larger device. */
+const DEVICE_MEMORY_TOP_BUCKET_GIB = 8;
 
 /**
- * Shares of reported device memory, each with a floor (so a tiny report
- * never makes a cache useless) and a ceiling (so one cache never crowds out
- * the others).
+ * Physical memory per byte of JavaScript heap limit: V8 sizes the heap limit
+ * at about a quarter of physical memory (`Heap::HeapSizeFromPhysicalMemory`).
+ */
+const HEAP_TO_PHYSICAL_RATIO = 4;
+
+/** The device a browser that reports nothing is taken to be (Firefox, Safari). */
+const UNREPORTED_DEVICE_BYTES = DEVICE_MEMORY_TOP_BUCKET_GIB * GIB;
+
+/** The part of the device everything the app keeps by choice may use together. */
+const ALLOWANCE_OF_DEVICE = 1 / 2;
+
+/**
+ * Shares of the allowance. They sum to exactly one.
  */
 export const RESIDENCY_SHARES = Object.freeze({
-  /** Loaded but unused field arrays kept for fast re-selection. */
-  inactiveFields: Object.freeze({ share: 1 / 16, min: 128 * MIB, max: 4 * GIB, unreported: 512 * MIB }),
+  /** A gene-column index held in memory before it spills to disk (8 bytes per stored entry). */
+  columnIndex: 3 / 8,
   /** Decoded embedding positions of layouts no view shows. */
-  positions: Object.freeze({ share: 1 / 4, min: 512 * MIB, max: 8 * GIB, unreported: 512 * MIB }),
+  positions: 1 / 8,
+  /** Loaded but unused field arrays kept for fast re-selection. */
+  inactiveFields: 1 / 8,
+  /** Genes an analysis run buffers by default (marker discovery, differential expression). */
+  analysis: 1 / 8,
   /** The AnnData adapter's normalized coordinates and obs field payloads. */
-  adapterCache: Object.freeze({ share: 1 / 16, min: 128 * MIB, max: 4 * GIB, unreported: 512 * MIB }),
+  adapterCache: 1 / 16,
+  /** A latent space the reader worker holds for outlier quantiles. */
+  latentHold: 1 / 16,
   /** Decoded dense chunk blocks shared by the genes of one chunk strip. */
-  decodedBlocks: Object.freeze({ share: 1 / 32, min: 64 * MIB, max: 2 * GIB, unreported: 256 * MIB }),
-  /** A gene-column index held in memory before it spills to disk. */
-  columnIndex: Object.freeze({ share: 1 / 4, min: 256 * MIB, max: 16 * GIB, unreported: GIB }),
+  decodedBlocks: 1 / 16,
+  /** Decode workers while they decompress chunks (`formats/io/decode-pool.js`). */
+  decodeWorkers: 1 / 32,
   /** Earlier selection steps a highlight tool can undo to (every tool together). */
-  undoHistory: Object.freeze({ share: 1 / 32, min: 64 * MIB, max: 2 * GIB, unreported: 256 * MIB }),
+  undoHistory: 1 / 32,
 });
 
+/** How far refused allocations have lowered this thread's allowance (halved per refusal). */
+let allowanceScale = 1;
+
 /**
- * The device memory the browser reports, in bytes.
+ * The device memory this page can count on, in bytes, and where the estimate
+ * comes from.
  *
  * @param {Object} [environment] - `globalThis`, or a stand-in in tests
- * @returns {{bytes: number|null, source: 'deviceMemory'|'jsHeapSizeLimit'|'unreported'}}
+ * @returns {{bytes: number, source: 'deviceMemory'|'jsHeapSizeLimit'|'unreported'}}
  */
-export function reportedDeviceMemory(environment = globalThis) {
+export function estimatedDeviceMemory(environment = globalThis) {
   const deviceMemory = environment?.navigator?.deviceMemory;
-  if (typeof deviceMemory === 'number' && Number.isFinite(deviceMemory) && deviceMemory > 0) {
-    return { bytes: Math.floor(deviceMemory * GIB), source: 'deviceMemory' };
-  }
-  // The heap limit is a quarter to a half of the device on Chromium; twice
-  // it is a conservative estimate of the device.
+  const reported = typeof deviceMemory === 'number' && Number.isFinite(deviceMemory) && deviceMemory > 0
+    ? Math.floor(deviceMemory * GIB)
+    : null;
   const heapLimit = environment?.performance?.memory?.jsHeapSizeLimit;
-  if (typeof heapLimit === 'number' && Number.isFinite(heapLimit) && heapLimit > 0) {
-    return { bytes: Math.floor(heapLimit * 2), source: 'jsHeapSizeLimit' };
+  const fromHeap = typeof heapLimit === 'number' && Number.isFinite(heapLimit) && heapLimit > 0
+    ? Math.floor(heapLimit * HEAP_TO_PHYSICAL_RATIO)
+    : null;
+  // A report below 8 GiB names the device; one of 8 GiB or more may be a cap
+  // and says "at least", which the heap limit can raise.
+  if (reported !== null && (reported < DEVICE_MEMORY_TOP_BUCKET_GIB * GIB || fromHeap === null || fromHeap <= reported)) {
+    return { bytes: reported, source: 'deviceMemory' };
   }
-  return { bytes: null, source: 'unreported' };
+  if (fromHeap !== null) return { bytes: fromHeap, source: 'jsHeapSizeLimit' };
+  return { bytes: UNREPORTED_DEVICE_BYTES, source: 'unreported' };
 }
 
 /**
- * One residency budget in bytes.
+ * The memory everything the app keeps by choice may use together, in bytes.
+ *
+ * @param {Object} [environment]
+ * @returns {number}
+ */
+export function memoryAllowanceBytes(environment = globalThis) {
+  return Math.floor(estimatedDeviceMemory(environment).bytes * ALLOWANCE_OF_DEVICE * allowanceScale);
+}
+
+/**
+ * One residency budget in bytes: its share of the allowance.
  *
  * @param {keyof typeof RESIDENCY_SHARES} name
  * @param {Object} [environment]
  * @returns {number}
  */
 export function residencyBudgetBytes(name, environment = globalThis) {
-  const policy = RESIDENCY_SHARES[name];
-  if (policy === undefined) {
+  const share = RESIDENCY_SHARES[name];
+  if (share === undefined) {
     throw new TypeError(`Unknown residency budget '${String(name)}'`);
   }
-  const { bytes } = reportedDeviceMemory(environment);
-  // A browser that reports nothing keeps the budget the app has always used.
-  if (bytes === null) return policy.unreported;
-  return Math.floor(Math.min(policy.max, Math.max(policy.min, bytes * policy.share)));
+  return Math.floor(memoryAllowanceBytes(environment) * share);
+}
+
+/**
+ * A typed array of `bytes` could not be allocated. When it was smaller than
+ * the allowance, the estimate was more than this page can have: this
+ * thread's allowance halves for every budget read from now on. A refusal of
+ * more than the allowance (an array beyond what the engine allocates in one
+ * piece) says nothing about it.
+ *
+ * @param {number} bytes
+ * @param {Object} [environment]
+ * @returns {boolean} Whether the allowance was lowered
+ */
+export function recordAllocationFailure(bytes, environment = globalThis) {
+  if (!(bytes > 0) || bytes >= memoryAllowanceBytes(environment)) return false;
+  allowanceScale /= 2;
+  return true;
+}
+
+/** Forget refused allocations (tests). */
+export function resetAllocationFailures() {
+  allowanceScale = 1;
 }

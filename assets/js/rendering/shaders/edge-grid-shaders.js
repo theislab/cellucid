@@ -6,16 +6,20 @@
  */
 
 import { FOG_GLSL } from './fog-shaders.js';
+import { LINEAR_TEXEL_GLSL } from '../linear-texture.js';
 
 // ============================================================================
 // GPU-INSTANCED EDGE SHADER
 // ============================================================================
 // One 4-vertex triangle strip per shown edge. A pane's shown edges are
-// gathered on the CPU into one instance record each (both endpoints'
-// positions and the edge's relative strength, rendering/connectivity-edge-layer.js),
-// so the vertex shader fetches nothing: no texture reads, no index
-// arithmetic, and no per-instance visibility test (hidden edges are never in
-// the records). Fog is evaluated per vertex with the shared model
+// gathered on the GPU into one instance record each (both endpoints'
+// positions and the edge's relative strength: EDGE_GATHER_VS_SOURCE below,
+// rendering/connectivity-edge-layer.js), so the vertex shader fetches
+// nothing: no texture reads, no index arithmetic, and no per-instance
+// visibility test (hidden edges are never in the records). Positions come in
+// as attributes on purpose: the same arithmetic on texture-fetched values
+// rasterizes some lines differently on Metal, so the draw keeps its inputs
+// and the gather copies bits. Fog is evaluated per vertex with the shared model
 // (fog-shaders.js): it depends only on distance, which a line's two
 // endpoints bound, and it thins the line toward what is behind it rather than
 // tinting it.
@@ -30,8 +34,8 @@ precision highp float;
 // makes Firefox on desktop OpenGL emulate one per vertex, at real cost.
 layout(location = 0) in vec2 a_quadPos;
 // Per instance: the endpoints (missing axes are 0) and the relative edge
-// strength, derived from canonical Float64 weights by dividing every weight
-// by the graph maximum.
+// strength: its weight divided by the graph's largest, as the reader worker
+// computes it (data/connectivity-edges.js).
 layout(location = 1) in vec3 a_source;
 layout(location = 2) in vec3 a_destination;
 layout(location = 3) in float a_strength;
@@ -84,6 +88,53 @@ void main() {
   v_alpha = u_lineAlpha * a_strength * fogOpacity(fogTransmittance(length(eyePos.xyz)));
 }
 `;
+
+// Transform-feedback gather of the instance records: one point per shown
+// edge, reading its 12-byte selection record (both endpoints' cells and the
+// strength's float32 bits) and writing the 28-byte instance record the draw
+// reads (source xyz, destination xyz, strength). Every word is copied as
+// bits from the pane geometry's position texture (one texel a cell, the
+// published float32 values; missing axes read 0), so the records are exactly
+// what a CPU copy of the positions would write.
+export const EDGE_GATHER_VS_SOURCE = `#version 300 es
+precision highp float;
+precision highp int;
+
+layout(location = 0) in uint a_sourceCell;
+layout(location = 1) in uint a_destinationCell;
+layout(location = 2) in uint a_strengthBits;
+
+uniform highp sampler2DArray u_positions;
+uniform ivec2 u_positionsShape;
+${LINEAR_TEXEL_GLSL}
+flat out uvec3 v_source;
+flat out uvec3 v_destination;
+flat out uint v_strength;
+
+uvec3 cellPositionBits(uint cell) {
+  return floatBitsToUint(texelFetch(u_positions, linearTexel(int(cell), u_positionsShape), 0).xyz);
+}
+
+void main() {
+  v_source = cellPositionBits(a_sourceCell);
+  v_destination = cellPositionBits(a_destinationCell);
+  v_strength = a_strengthBits;
+  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}
+`;
+
+/** The gather writes no pixels (rasterizer discard). */
+export const EDGE_GATHER_FS_SOURCE = `#version 300 es
+precision lowp float;
+out vec4 fragColor;
+void main() {
+  fragColor = vec4(0.0);
+}
+`;
+
+/** The gather's outputs, in record order. */
+export const EDGE_GATHER_VARYINGS = Object.freeze(['v_source', 'v_destination', 'v_strength']);
 
 // Fragment shader for instanced edges
 export const LINE_INSTANCED_FS_SOURCE = `#version 300 es

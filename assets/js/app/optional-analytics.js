@@ -30,7 +30,7 @@ const QUEUE_LIMIT = 100;
 /**
  * @typedef {Object} DataLoadHandle
  * @property {(result: {datasetId: string|null, metadata: Object|null,
- *   stateStatus: string, mapping: {origin: string, embeddingCandidates: number, enabledRepresentations: number}|null}) => void} succeed
+ *   stateStatus: string, mapping: {origin: string, embeddingCandidates: number, enabledRepresentations: number, vectorFields: number}|null}) => void} succeed
  * @property {(error: unknown, context?: {datasetId?: string|null,
  *   metadata?: Object|null}) => void} fail
  * @property {() => void} cancel - superseded or abandoned: nothing is sent.

@@ -835,7 +835,7 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
   delete globalThis.self;
 });
 
-test('rank inference is invariant to the export quantisation it reads', async () => {
+test('rank inference is invariant to a strictly increasing affine map of its values', async () => {
   const messages = [];
   globalThis.self = { postMessage: message => messages.push(message) };
   await import('../assets/js/app/analysis/compute/data-worker.js?quantisation-invariance');
@@ -847,13 +847,10 @@ test('rank inference is invariant to the export quantisation it reads', async ()
     return message.result;
   };
 
-  // Published exports store expression quantised, and the loader dequantises
-  // with `minValue + code * (maxValue - minValue) / maxQuant` — a strictly
-  // increasing affine map whenever minValue < maxValue. (The format also allows
-  // minValue == maxValue for a constant field, but then every code is 0, so the
-  // codes and the values are equally tied and ranks are unaffected.)
-  // A rank test must therefore return the same probability whether it is handed
-  // the codes or the dequantised values.
+  // A rank test depends only on order: handed integer codes or the values of
+  // a strictly increasing affine map of them
+  // (`minValue + code * (maxValue - minValue) / maxQuant`, minValue < maxValue),
+  // it must return the same probability.
   const dequantize = (codes, minValue, maxValue, bits) => {
     const maxQuant = bits === 8 ? 254 : 65534;
     const scale = (maxValue - minValue) / maxQuant;

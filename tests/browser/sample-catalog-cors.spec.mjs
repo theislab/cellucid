@@ -1,13 +1,13 @@
 import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
 
-const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');
+const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/catalog/');
 const CORS_SAMPLE_SELECTION =
-  'dataset:local-demo:current-ui-prepared';
+  'dataset:local-demo:current-ui';
 
-function launchUrl(exportsBaseUrl, acceptance) {
+function launchUrl(sampleCatalog, acceptance) {
   return (
-    `/?exportsBaseUrl=${encodeURIComponent(exportsBaseUrl)}` +
+    `/?sampleCatalog=${encodeURIComponent(sampleCatalog)}` +
     `&acceptance=${acceptance}`
   );
 }
@@ -23,11 +23,13 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   page.on('pageerror', error => {
     browserErrors.push(`page: ${error.stack || error.message}`);
   });
-  page.on('request', request => {
+  // The AnnData reader reads in its worker: the context sees its requests.
+  page.context().on('request', request => {
     if (request.url().startsWith(CORS_SAMPLE_ROOT)) {
       sampleRequests.push({
         method: request.method(),
         url: request.url(),
+        range: request.headers().range ?? null,
       });
     }
   });
@@ -41,14 +43,14 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   const datasetSelect = page.locator('#dataset-select');
   await expect(
     datasetSelect.locator(`option[value="${CORS_SAMPLE_SELECTION}"]`),
-  ).toHaveText(/Current UI prepared fixture/);
+  ).toHaveText(/Current UI fixture/);
   await expect(datasetSelect).toHaveValue(CORS_SAMPLE_SELECTION);
   // Onboarding leads to the Session panel, never into the dropdown itself;
   // a click moves no focus, so nothing is ringed.
   await expect(page.locator('#session-section > summary')).not.toBeFocused();
   await expect(datasetSelect).not.toBeFocused();
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells',
@@ -71,24 +73,28 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   expect(
     await page.evaluate(() => window._cellucidViewer.getPointCount()),
   ).toBe(120);
-  expect(sampleRequests.every(request => request.method === 'GET')).toBe(true);
+  // The catalog is read once; its file is sized (HEAD, or a one-byte range)
+  // and read in place with ranged GETs, never downloaded whole.
   expect(
     sampleRequests.filter(
       request => request.url === `${CORS_SAMPLE_ROOT}datasets.json`,
     ),
   ).toHaveLength(1);
-  for (const requiredUrl of [
-    `${CORS_SAMPLE_ROOT}current-ui-prepared/dataset_identity.json`,
-    `${CORS_SAMPLE_ROOT}current-ui-prepared/embeddings/0_2d.bin`,
-    `${CORS_SAMPLE_ROOT}current-ui-prepared/obs_manifest.json`,
-  ]) {
-    expect(sampleRequests.some(request => request.url === requiredUrl)).toBe(true);
-  }
+  const fileReads = sampleRequests.filter(
+    request => request.url === `${CORS_SAMPLE_ROOT}current-ui.h5ad`,
+  );
+  expect(fileReads.some(request => request.method === 'GET')).toBe(true);
+  expect(
+    fileReads.filter(request => request.method === 'GET' && !/^bytes=\d+-\d+$/.test(request.range ?? '')),
+  ).toEqual([]);
+  expect(
+    sampleRequests.filter(request => !request.url.endsWith('datasets.json') && !request.url.endsWith('current-ui.h5ad')),
+  ).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
 
 test('a failed direct CORS catalog is explained inline and stays recoverable', async ({ page }) => {
-  const missingRoot = sampleUrl('/tests/browser/fixtures/missing-exports/');
+  const missingRoot = sampleUrl('/tests/browser/fixtures/missing-catalog/');
   const catalogRequests = [];
   page.on('request', request => {
     if (request.url() === `${missingRoot}datasets.json`) {
@@ -113,7 +119,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
 
   const notice = page.locator('.dataset-info[role="status"]');
   await expect(notice).toBeVisible();
-  await expect(notice).toContainText(/Sample datasets could not be loaded/);
+  await expect(notice).toContainText(/Sample datasets could not be (loaded|opened)/);
   // This root is absent rather than blocked, and the notice says so: the 404
   // the loader reported reaches the user as an address to check, not as a
   // network problem to wait out.

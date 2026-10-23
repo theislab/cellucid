@@ -2,7 +2,7 @@
  * @fileoverview One owner for the network awaits of application startup.
  *
  * Startup is a chain of awaits on servers the application does not control: a
- * health endpoint, a dataset catalog, a dataset's identity and manifests, its
+ * health endpoint, a dataset catalog, a dataset's identity and field lists, its
  * default embedding, and the published default session a sample advertises.
  * The interface is built after the catalog is read and before the startup
  * dataset loads, so the data controls are live — and can replace that load —
@@ -54,7 +54,7 @@ const PHASE_DESCRIPTIONS = Object.freeze({
   'sign-in': 'completing GitHub sign-in',
   health: 'checking the data server',
   catalog: 'reading the dataset catalog',
-  identity: 'reading the dataset identity and manifests',
+  identity: 'reading the dataset identity and field lists',
   positions: 'loading cell positions',
   ui: 'building the interface',
   session: 'reading the published default session',
@@ -131,13 +131,20 @@ export function createStartupPhaseOwner(options) {
      * that does not observe it is still raced against the deadline, so the
      * step ends either way.
      *
+     * A step whose work grows with the data (opening a linked file reads
+     * as much of it as its first view needs) passes `progress`: a
+     * subscription to evidence that bytes are still arriving. Each report
+     * restarts the deadline, so the step stalls only when nothing arrives
+     * for a whole interval, however long the step takes.
+     *
      * @template T
      * @param {string} phase
      * @param {string} target - URL or named endpoint, used in the stall error
      * @param {(signal: AbortSignal) => Promise<T>|T} operation
+     * @param {{progress?: (onProgress: () => void) => () => void}} [options]
      * @returns {Promise<T>}
      */
-    async step(phase, target, operation) {
+    async step(phase, target, operation, { progress = null } = {}) {
       enter(phase);
       if (typeof target !== 'string' || target.length === 0) {
         throw new TypeError('A startup step must name what it waits on.');
@@ -145,7 +152,11 @@ export function createStartupPhaseOwner(options) {
       if (typeof operation !== 'function') {
         throw new TypeError('A startup step requires an operation.');
       }
+      if (progress !== null && typeof progress !== 'function') {
+        throw new TypeError('A startup step progress source must be a subscription.');
+      }
       const deadline = createDeadline(deadlineMs);
+      const stopProgress = progress === null ? null : progress(() => deadline.extend());
       const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
       let onDeadline = null;
       const stalled = new Promise((_resolve, reject) => {
@@ -168,6 +179,7 @@ export function createStartupPhaseOwner(options) {
         }
         throw error;
       } finally {
+        stopProgress?.();
         deadline.release();
         deadline.signal.removeEventListener('abort', onDeadline);
       }

@@ -21,7 +21,11 @@
 
 import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { getWorkerPool } from '../compute/worker-pool.js';
-import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
+import {
+  createFrameThrottle,
+  createSlicedYield,
+  waitForAvailableSlot
+} from '../shared/concurrency-utils.js';
 import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './constants.js';
 import { benjaminiHochbergAdjusted } from '../stats/statistical-tests.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
@@ -326,7 +330,9 @@ export class MarkerDiscoveryEngine {
    * @param {Object} [options.batchConfig]
    * @param {Function} [options.onProgress]
    * @param {Function} [options.onPartialResults]
-   * @param {AbortSignal} [options.signal]
+   * @param {AbortSignal} [options.signal] - Stops the run's gene reads and
+   *   worker tasks
+   * @param {string|null} [options.readOwner] - The job the gene reads are for
    * @returns {Promise<MarkersByCategory>}
    */
   async discoverMarkers(options) {
@@ -334,9 +340,7 @@ export class MarkerDiscoveryEngine {
 
     if (
       typeof this.dataLayer.getAvailableVariables !== 'function' ||
-      typeof this.dataLayer.ensureGeneExpressionLoaded !== 'function' ||
-      typeof this.dataLayer.unloadGeneExpression !== 'function' ||
-      typeof this.dataLayer.invalidateVariable !== 'function'
+      typeof this.dataLayer.readGeneColumn !== 'function'
     ) {
       throw new TypeError(
         '[MarkerDiscoveryEngine] dataLayer must implement the exact gene data contract'
@@ -366,7 +370,8 @@ export class MarkerDiscoveryEngine {
       batchConfig = {},
       onProgress,
       onPartialResults,
-      signal
+      signal,
+      readOwner = null
     } = options;
 
     if (
@@ -668,7 +673,8 @@ export class MarkerDiscoveryEngine {
         codeToGroupIndex: codeToGroupIndex.slice(),
         groupCount
       }),
-      { timeout: 30000 }
+      // A worker replaced after a cancelled task gets the context again.
+      { timeout: 30000, signal: signal ?? null, retainAs: 'markers' }
     );
     throwIfAborted(signal);
 
@@ -681,6 +687,14 @@ export class MarkerDiscoveryEngine {
 
     // Store full per-gene stats so UI can re-threshold without recomputing.
     const log2FCByGroup = Array.from({ length: groupCount }, () => {
+      const arr = new Float32Array(geneCount);
+      arr.fill(NaN);
+      return arr;
+    });
+    // Every gene's mean in every group, which the heatmap shows: the workers
+    // compute it for every gene anyway, so the heatmap reads it from here
+    // instead of reading its genes again.
+    const meanInGroupByGroup = Array.from({ length: groupCount }, () => {
       const arr = new Float32Array(geneCount);
       arr.fill(NaN);
       return arr;
@@ -721,7 +735,8 @@ export class MarkerDiscoveryEngine {
     }
 
     const totalCells = obsCodes.length;
-    const bytesPerGene = totalCells * 4 * (method === 'wilcox' ? 2 : 1); // values + (wilcox) order scratch in worker
+    // An in-flight gene is one column on its way to a worker.
+    const bytesPerGene = totalCells * 4;
     const budgetBytes = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
     const maxByMemory = Math.floor(budgetBytes / bytesPerGene);
     if (maxByMemory < 1) {
@@ -739,7 +754,8 @@ export class MarkerDiscoveryEngine {
         networkConcurrency: effectiveBatchConfig.networkConcurrency,
         memoryBudgetMB: effectiveBatchConfig.memoryBudgetMB
       },
-      signal
+      signal,
+      owner: readOwner
     });
 
     let completedGenes = 0;
@@ -747,24 +763,36 @@ export class MarkerDiscoveryEngine {
     const inFlight = new Set();
     const executionErrors = [];
 
+    const progressRecord = () => ({
+      phase: ANALYSIS_PHASES.DISCOVERY,
+      progress: Math.round((completedGenes / geneCount) * 100),
+      loaded: completedGenes,
+      total: geneCount,
+      message: `Analyzing genes (${completedGenes.toLocaleString()}/${geneCount.toLocaleString()})`
+    });
+    // Genes complete by the thousand per second: progress and partial results
+    // reach the panel at most once per frame.
+    const progressUpdates = createFrameThrottle(record => {
+      if (!signal?.aborted && onProgress) onProgress(record);
+    });
+    const partialUpdates = createFrameThrottle(update => {
+      if (!signal?.aborted && onPartialResults) onPartialResults(update);
+    });
     const reportProgress = () => {
       if (signal?.aborted || !onProgress) return;
-      onProgress({
-        phase: ANALYSIS_PHASES.DISCOVERY,
-        progress: Math.round((completedGenes / geneCount) * 100),
-        loaded: completedGenes,
-        total: geneCount,
-        message: `Analyzing genes (${completedGenes.toLocaleString()}/${geneCount.toLocaleString()})`
-      });
+      progressUpdates.push(progressRecord);
     };
 
-    reportProgress();
+    if (onProgress) onProgress(progressRecord());
 
     const maybeEmitPartial = () => {
       if (signal?.aborted || !onPartialResults) return;
       if (completedGenes - lastPartialEmit < this._config.progressInterval) return;
       lastPartialEmit = completedGenes;
+      partialUpdates.push(buildPartial);
+    };
 
+    const buildPartial = () => {
       const partialGroups = this._buildMarkersFromHeaps({
         groups,
         heaps,
@@ -774,7 +802,7 @@ export class MarkerDiscoveryEngine {
         useAdjustedPValue: false
       });
 
-      onPartialResults({
+      return {
         markers: {
           obsCategory,
           method,
@@ -787,13 +815,13 @@ export class MarkerDiscoveryEngine {
         genesProcessed: completedGenes,
         totalGenes: geneCount,
         isComplete: false
-      });
+      };
     };
 
     let streamFailure;
     try {
       for await (
-        const { gene, values, index: geneIndex } of
+        const { gene, values, index: geneIndex, owned } of
         loader.streamGenesRaw(allGenes)
       ) {
         throwIfAborted(signal);
@@ -807,19 +835,21 @@ export class MarkerDiscoveryEngine {
           );
         }
 
-        // Copy now (bounded by maxInFlight) so DataLayer-owned buffers are
-        // never transferred or retained by worker execution.
-        const valuesCopyForWorker = new Float32Array(values);
+        // A column the run owns moves to the worker; one still shared (the
+        // gene a view shows, or one another run holds) is copied, so its
+        // owners keep their array.
+        const valuesForWorker = owned ? values : values.slice();
 
         let task;
         task = (async () => {
           try {
             const res = await pool.execute(
               'MARKERS_COMPUTE_GENE',
-              { values: valuesCopyForWorker, method, minCells },
+              { values: valuesForWorker, method, minCells },
               {
                 timeout: 120000,
-                transfer: true
+                transfer: true,
+                signal: signal ?? null
               }
             );
 
@@ -830,6 +860,7 @@ export class MarkerDiscoveryEngine {
               groups,
               pValuesByGroup,
               log2FCByGroup,
+              meanInGroupByGroup,
               heaps,
               result: res
             });
@@ -855,6 +886,10 @@ export class MarkerDiscoveryEngine {
         })
       )
     );
+    // The final count reaches the panel; a partial result is superseded by
+    // the complete one below.
+    progressUpdates.flush();
+    partialUpdates.cancel();
     const failures = [];
     const appendFailure = failure => {
       if (!failures.includes(failure)) failures.push(failure);
@@ -890,9 +925,15 @@ export class MarkerDiscoveryEngine {
     // denominator `m` — an untested gene is not a gene with p = 1, and counting
     // it would deflate every adjusted value in the group. The counts travel with
     // the group so the panel can report the denominator it actually used.
-    const correctionByGroup = pValuesByGroup.map(
-      (arr) => benjaminiHochbergAdjusted(arr)
-    );
+    // One group's correction is a sort of every gene's p-value; the page gets
+    // its turn between groups once a frame's slice is spent.
+    const correctionByGroup = [];
+    const yieldIfSliceSpent = createSlicedYield();
+    for (const arr of pValuesByGroup) {
+      correctionByGroup.push(benjaminiHochbergAdjusted(arr));
+      await yieldIfSliceSpent();
+      throwIfAborted(signal);
+    }
     const adjustedByGroup = correctionByGroup.map(
       (correction) => correction.adjustedPValues
     );
@@ -941,7 +982,8 @@ export class MarkerDiscoveryEngine {
         groupIds: groups.map(g => g.groupId),
         pValuesByGroup,
         adjustedPValuesByGroup: adjustedByGroup,
-        log2FoldChangeByGroup: log2FCByGroup
+        log2FoldChangeByGroup: log2FCByGroup,
+        meanInGroupByGroup
       }
     };
     } finally {
@@ -1077,7 +1119,7 @@ export class MarkerDiscoveryEngine {
     }
   }
 
-  _ingestGeneResult({ gene, geneIndex, groups, pValuesByGroup, log2FCByGroup, heaps, result }) {
+  _ingestGeneResult({ gene, geneIndex, groups, pValuesByGroup, log2FCByGroup, meanInGroupByGroup, heaps, result }) {
     if (
       typeof gene !== 'string' ||
       gene.length === 0 ||
@@ -1187,6 +1229,7 @@ export class MarkerDiscoveryEngine {
       }
       pValuesByGroup[g][geneIndex] = p;
       log2FCByGroup[g][geneIndex] = fc;
+      meanInGroupByGroup[g][geneIndex] = meanInGroup[g];
 
       // An untested gene has no rank, so it never competes for a Top-N slot.
       if (!tested) continue;

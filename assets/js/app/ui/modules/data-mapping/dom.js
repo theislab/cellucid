@@ -25,8 +25,6 @@ import {
 } from '../../components/controls.js';
 
 const AXES = Object.freeze(['x', 'y', 'z']);
-// The facts each box was last drawn from (see `renderFactRows`).
-const drawnFacts = new WeakMap();
 
 function element(ownerDocument, tag, className, text) {
   const node = ownerDocument.createElement(tag);
@@ -66,17 +64,7 @@ export function buildDataMappingPanel(ownerDocument, { expanded, onToggle, group
   rows.setAttribute('aria-label', 'Embeddings this dataset can show');
   disclosure.content.appendChild(rows);
 
-  const fixed = createDisclosure({
-    title: 'Read from file',
-    description: '—',
-    tip: 'data-mapping-fixed',
-    expanded: false,
-  });
-  fixed.root.id = 'data-mapping-fixed';
-  const fixedDescription = fixed.header.querySelector('.disclosure-desc');
-  const facts = element(ownerDocument, 'div', 'control-box dataset-info data-mapping-facts');
-  fixed.content.appendChild(facts);
-  list.append(disclosure.root, ...groupSections, fixed.root);
+  list.append(disclosure.root, ...groupSections);
 
   const status = createStatusLine();
   status.root.classList.add('data-mapping-status');
@@ -97,9 +85,6 @@ export function buildDataMappingPanel(ownerDocument, { expanded, onToggle, group
     emptyState,
     body,
     rows,
-    fixedDescription,
-    fixed,
-    facts,
     status,
     revert,
     apply,
@@ -368,23 +353,4 @@ export function syncChildren(parent, nodes) {
   }
 }
 
-/**
- * Replace the read-only facts with one row per name and value.
- *
- * @param {HTMLElement} box
- * @param {Array<{label: string, value: string}>} rows
- */
-export function renderFactRows(box, rows) {
-  const facts = JSON.stringify(rows);
-  if (drawnFacts.get(box) === facts) return;
-  drawnFacts.set(box, facts);
-  const ownerDocument = box.ownerDocument;
-  box.replaceChildren(...rows.map(({ label, value }) => {
-    const row = element(ownerDocument, 'div', 'dataset-info-row');
-    const name = element(ownerDocument, 'span', 'dataset-info-label', label);
-    const text = element(ownerDocument, 'span', 'dataset-info-value', value);
-    text.title = value;
-    row.append(name, text);
-    return row;
-  }));
-}
+

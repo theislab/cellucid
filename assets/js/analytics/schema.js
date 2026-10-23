@@ -12,7 +12,7 @@
  *
  * `page_view` - sent once per page load by the `config` call in
  * `app/ui/core/ga-init.js`, with `page_location` reduced to origin + path. The
- * query string (dataset ids, `remote`/`github` addresses, `exportsBaseUrl`) is
+ * query string (dataset ids, `remote` addresses and `data` links, `sampleCatalog`) is
  * never part of it. GA4's own "enhanced measurement" adds further automatic
  * events (history-change page views, scrolls, outbound clicks); those are
  * configured in the GA4 admin, not here.
@@ -47,7 +47,6 @@
  *   - `field_count` (int): number of obs fields.
  *   - `dimensions` (enum DIMENSIONS): embedding dimensions, e.g. `'2+3'`.
  *   - `has_connectivity`, `has_vector_field` (0|1).
- *   - `data_version` (x.y.z): the writer version that prepared the export.
  *   - `state_restore` (enum STATE_RESTORES): the dataset's published
  *     default session, success only.
  *   - `mapping_origin` (enum MAPPING_ORIGINS): whether the embeddings shown
@@ -133,7 +132,7 @@ const SNAKE_CASE = /^[a-z][a-z0-9_]*$/;
 export const LOAD_METHODS = Object.freeze(Object.values(DATA_LOAD_METHODS));
 
 export const SOURCE_TYPES = Object.freeze([
-  'local-demo', 'local-user', 'remote', 'github-repo', 'jupyter',
+  'local-demo', 'local-user', 'remote', 'link', 'jupyter',
 ]);
 
 export const STARTUP_PHASES = Object.freeze([
@@ -241,10 +240,6 @@ const DATASET_ID = Object.freeze({
   kind: 'pattern',
   pattern: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/,
 });
-const VERSION = Object.freeze({
-  kind: 'pattern',
-  pattern: /^\d{1,3}\.\d{1,3}\.\d{1,3}$/,
-});
 
 const ERROR_PARAMS = Object.freeze({
   error_code: enumOf(ERROR_CODES),
@@ -293,7 +288,6 @@ export const EVENTS = Object.freeze({
       dimensions: enumOf(DIMENSIONS),
       has_connectivity: FLAG,
       has_vector_field: FLAG,
-      data_version: VERSION,
       state_restore: enumOf(STATE_RESTORES),
       mapping_origin: enumOf(MAPPING_ORIGINS),
       embedding_candidates: enumOf(EMBEDDING_CANDIDATE_BUCKETS),
@@ -328,7 +322,7 @@ export const EVENTS = Object.freeze({
 export const GA4_CUSTOM_DEFINITIONS = Object.freeze({
   eventDimensions: Object.freeze([
     'load_method', 'source_type', 'outcome', 'duration_bucket', 'dataset_id',
-    'cell_bucket', 'gene_bucket', 'dimensions', 'data_version',
+    'cell_bucket', 'gene_bucket', 'dimensions',
     'state_restore', 'mapping_origin', 'embedding_candidates',
     'enabled_representations', 'error_code',
     'error_name', 'startup_phase',

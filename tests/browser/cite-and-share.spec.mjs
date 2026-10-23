@@ -7,10 +7,10 @@
  * Escape closes them and focus returns to the control that opened them.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const DATASET_URL = `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
 async function expectedCitation(page) {
   return page.evaluate(async () => {
@@ -23,7 +23,7 @@ async function expectedCitation(page) {
 test('the footer Cite link opens the citation read from CITATION.cff', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   const expected = await expectedCitation(page);
 
   const opener = page.locator('#footer-cite-link');
@@ -46,19 +46,19 @@ test('the footer Cite link opens the citation read from CITATION.cff', async ({ 
 test('a sample dataset can be shared as a link, a badge and an embed', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   const share = page.locator('#share-dataset-btn');
   await expect(share).toBeVisible();
   await share.click();
   const dialog = page.locator('#share-dialog');
   await expect(dialog).toBeVisible();
-  const link = 'https://www.cellucid.com/?dataset=current-ui-prepared&source=local-demo';
+  const link = 'https://www.cellucid.com/?dataset=current-ui&source=local-demo';
   await expect(page.locator('#share-link')).toHaveValue(link);
   await expect(page.locator('#share-badge')).toHaveValue(
     `[![Open in Cellucid](https://www.cellucid.com/assets/img/open-in-cellucid.svg)](${link})`,
   );
   await expect(page.locator('#share-embed')).toHaveValue(
-    new RegExp(`^<iframe src="${link.replace('&', '&amp;').replace(/[.?]/g, '\\$&')}" title="Cellucid: Current UI prepared fixture"`),
+    new RegExp(`^<iframe src="${link.replace('&', '&amp;').replace(/[.?]/g, '\\$&')}" title="Cellucid: Current UI fixture"`),
   );
   // The badge image the snippet points at is served by the site.
   const badge = await page.request.get('/assets/img/open-in-cellucid.svg');
@@ -73,7 +73,7 @@ test('a sample dataset can be shared as a link, a badge and an embed', async ({ 
 test('an (i) tip inside a dialog opens over it, and Escape closes the tip first', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#share-dataset-btn').click();
   const dialog = page.locator('#share-dialog');
   await expect(dialog).toBeVisible();

@@ -163,7 +163,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
     gestureFieldKind = null;
-    viewer.restoreUnifiedState([], 0);
+    viewer.restoreUnifiedState(new Uint32Array(0), 0);
   }
 
   function handleAnnotationStep(stepEvent) {
@@ -241,7 +241,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationStepCount += 1;
 
     viewer.restoreUnifiedState(
-      selectionState.annotationCandidateSet.toArray(),
+      selectionState.annotationCandidateSet.toUint32Array(),
       selectionState.annotationStepCount
     );
 
@@ -252,7 +252,7 @@ export function initAnnotationSelection(options) {
     });
 
     if (selectionState.annotationCandidateSet.size > 0) {
-      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toUint32Array());
     } else {
       state.clearPreviewHighlight();
     }
@@ -267,7 +267,7 @@ export function initAnnotationSelection(options) {
       return;
     }
 
-    const cellIndices = selectionState.annotationCandidateSet.toArray();
+    const cellIndices = selectionState.annotationCandidateSet.toUint32Array();
     const stepsLabel = selectionState.annotationStepCount > 1 ? ` (${selectionState.annotationStepCount} steps)` : '';
 
     const savedGroup = state.addHighlightDirect({
@@ -308,8 +308,8 @@ export function initAnnotationSelection(options) {
     const prevState =
       selectionState.annotationHistory[selectionState.annotationHistory.length - 1];
     const restoredCandidates = prevState.candidates === null
-      ? []
-      : prevState.candidates.toArray();
+      ? new Uint32Array(0)
+      : prevState.candidates.toUint32Array();
     viewer.restoreUnifiedState(
       restoredCandidates,
       restoredCandidates.length === 0 ? 0 : prevState.step
@@ -330,7 +330,7 @@ export function initAnnotationSelection(options) {
         candidateCount: selectionState.annotationCandidateSet.size,
         restored: true
       });
-      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toUint32Array());
     } else {
       updateAnnotationUI({
         step: 0,
@@ -348,8 +348,8 @@ export function initAnnotationSelection(options) {
     const redoState =
       selectionState.annotationRedoStack[selectionState.annotationRedoStack.length - 1];
     const restoredCandidates = redoState.candidates === null
-      ? []
-      : redoState.candidates.toArray();
+      ? new Uint32Array(0)
+      : redoState.candidates.toUint32Array();
     viewer.restoreUnifiedState(
       restoredCandidates,
       restoredCandidates.length === 0 ? 0 : redoState.step
@@ -370,7 +370,7 @@ export function initAnnotationSelection(options) {
         candidateCount: selectionState.annotationCandidateSet.size,
         restored: true
       });
-      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toUint32Array());
     } else {
       updateAnnotationUI({
         step: 0,
@@ -436,7 +436,7 @@ export function initAnnotationSelection(options) {
       candidateCount: candidates.size,
       restored: true
     }, notice);
-    state.setPreviewHighlightFromIndices(candidates.toArray());
+    state.setPreviewHighlightFromIndices(candidates.toUint32Array());
   }
 
   /**
@@ -533,7 +533,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationRedoStack = [];
     gestureFieldKind = null;
     selectionState.annotationCandidateSet = unifiedState.inProgress
-      ? CellSet.from(unifiedState.candidates, state.pointCount)
+      ? CellSet.fromCellList(unifiedState.candidates, state.pointCount)
       : null;
     selectionState.annotationStepCount = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

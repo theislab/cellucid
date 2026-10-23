@@ -37,8 +37,8 @@
  *                        engine exposes them; frame times of a timed window are
  *                        perturbed by the queries)
  *   --source spec        override every scenario's data source:
- *                        synthetic | fixture | demo:<id> | export:<baseUrl>#<id>
- *   --data-root dir      also serve <dir> at /__data/ (for export:/__data/…#id)
+ *                        synthetic | fixture | demo:<id> | catalog:<folderUrl>#<id>
+ *   --data-root dir      also serve <dir> at /__data/ (for catalog:/__data/…#id)
  *   --idle-ms N          length of idle windows (2000)
  *   --orbit-frames N     frames of orbit windows (120)
  *   --out file           JSON output (test-results/render-scenarios/…json)
@@ -66,9 +66,9 @@ import { openCollapsedPanels } from '../tests/browser/helpers/panels.mjs';
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROBES_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
-const FIXTURE_EXPORTS = '/tests/browser/fixtures/exports/';
-const DEMO_EXPORTS = '/tests/browser/fixtures/demo-custom-exports/';
-const FIXTURE_DATASET = 'current-ui-prepared';
+const FIXTURE_CATALOG = '/tests/browser/fixtures/catalog/';
+const DEMO_CATALOG = '/tests/browser/fixtures/demo-catalog/';
+const FIXTURE_DATASET = 'current-ui';
 const DEMO_3D_DATASET = 'synthetic-development-3d';
 const VIEWPORT = Object.freeze({ width: 1440, height: 1000 });
 const SCENARIO_ORDER = Object.freeze([
@@ -90,7 +90,7 @@ const DEFAULT_SOURCES = Object.freeze({
   edges: `demo:${DEMO_3D_DATASET}`,
   selection: 'fixture',
   session: 'fixture',
-  // A prepared fixture, so the figure carries a legend and axes; a synthetic
+  // The fixture dataset, so the figure carries a legend and axes; a synthetic
   // cloud (--source synthetic --points N) measures export at any size.
   export: 'fixture'
 });
@@ -113,7 +113,6 @@ const CONTENT_TYPES = new Map([
   ['.txt', 'text/plain; charset=utf-8'],
   ['.u8', 'application/octet-stream'],
   ['.u16', 'application/octet-stream'],
-  ['.wasm', 'application/wasm'],
   ['.webmanifest', 'application/manifest+json; charset=utf-8'],
   ['.webp', 'image/webp'],
   ['.woff', 'font/woff'],
@@ -325,16 +324,16 @@ function launchBrowser(engine, headed) {
 function sourceUrl(origin, source) {
   const encode = value => encodeURIComponent(new URL(value, origin).href);
   if (source === 'synthetic' || source === 'fixture') {
-    return `/?exportsBaseUrl=${encode(FIXTURE_EXPORTS)}&dataset=${FIXTURE_DATASET}`;
+    return `/?sampleCatalog=${encode(FIXTURE_CATALOG)}&dataset=${FIXTURE_DATASET}`;
   }
   if (source.startsWith('demo:')) {
-    return `/?exportsBaseUrl=${encode(DEMO_EXPORTS)}&dataset=${encodeURIComponent(source.slice(5))}`;
+    return `/?sampleCatalog=${encode(DEMO_CATALOG)}&dataset=${encodeURIComponent(source.slice(5))}`;
   }
-  if (source.startsWith('export:')) {
-    const spec = source.slice(7);
+  if (source.startsWith('catalog:')) {
+    const spec = source.slice(8);
     const hash = spec.lastIndexOf('#');
-    if (hash < 0) throw new Error('--source export:<baseUrl>#<datasetId>');
-    return `/?exportsBaseUrl=${encode(spec.slice(0, hash))}&dataset=${encodeURIComponent(spec.slice(hash + 1))}`;
+    if (hash < 0) throw new Error('--source catalog:<folderUrl>#<datasetId>');
+    return `/?sampleCatalog=${encode(spec.slice(0, hash))}&dataset=${encodeURIComponent(spec.slice(hash + 1))}`;
   }
   throw new Error(`Unknown source "${source}".`);
 }

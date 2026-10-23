@@ -8,8 +8,9 @@
  * load ran before any control was wired), or to lose to it (a file still being
  * read published over a sample chosen after it).
  *
- * Each case holds the load in flight at the transport, makes the second
- * choice, and then lets the held requests go. The end state must be exactly the
+ * Each case holds the load in flight -- an opening at the AnnData reader
+ * worker (`holdOpening`), a file read at its reader's transport -- makes the
+ * second choice, and then lets what it held go. The end state must be exactly the
  * last choice — the dataset select, the dataset panel, the viewer and the
  * startup phase agree — and the superseded load must never publish, never
  * leave a progress notification or a pending select entry behind, and never
@@ -22,34 +23,36 @@ import {
   test,
 } from './helpers/test.mjs';
 import { chooseDirectory } from './helpers/directory-upload.mjs';
-import { SAMPLE_ORIGIN, SAMPLE_PORT, appUrl } from './helpers/origins.mjs';
+import { serveAnnDataServer } from './helpers/anndata-server.mjs';
+import { APP_ORIGIN, SAMPLE_ORIGIN, SAMPLE_PORT, appUrl } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import {
   DEVELOPMENT,
-  EXPORTS,
   H5AD,
   H5AD_PATH,
   NONE,
   PENDING_OPTION,
+  SAMPLE_CATALOG,
   START,
   TRAJECTORY,
+  ZARR_FOLDER,
   chooseSessionFile,
-  demoExportsDirectory,
+  demoCatalogDirectory,
   expectAnnouncedOnce,
   expectNeverPublished,
   expectNoFailureAnnounced,
   expectSettledOn,
+  holdOpening,
   holdRequests,
   jsonResponse,
   observePage,
   openStarted,
   openWithHeldStart,
-  openingPositionsFile,
   readRecord,
   releaseAndDrain,
   savedSessionFor,
+  serveDemoFile,
   serveOneDatasetRemote,
-  servePreparedExport,
   startUrl,
 } from './helpers/dataset-loading.mjs';
 
@@ -71,18 +74,14 @@ test('a file chosen while the startup dataset loads replaces it', async ({
   expect(productErrors).toEqual([]);
 });
 
-test('a prepared folder chosen while the startup dataset loads replaces it', async ({
+test('a Zarr folder chosen while the startup dataset loads replaces it', async ({
   page,
 }) => {
   const { held, productErrors } = await openWithHeldStart(page);
-  await chooseDirectory(
-    page.locator('#user-data-file-input'),
-    path.join(demoExportsDirectory, TRAJECTORY.id),
-  );
-  const folder = { ...TRAJECTORY, select: /^dataset:local-user:/ };
-  await expectSettledOn(page, folder);
+  await chooseDirectory(page.locator('#user-data-zarr-folder-input'), ZARR_FOLDER.path);
+  await expectSettledOn(page, ZARR_FOLDER);
   await releaseAndDrain(page, held);
-  await expectSettledOn(page, folder);
+  await expectSettledOn(page, ZARR_FOLDER);
   await expectNeverPublished(page, START.name);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
@@ -196,24 +195,18 @@ test('a one-dataset GitHub repository connected while the startup dataset loads 
   page,
 }) => {
   const rawPrefix =
-    'https://raw.githubusercontent.com/cellucid-tests/one/main/exports/';
+    'https://raw.githubusercontent.com/cellucid-tests/one/HEAD/catalog/';
   await page.route(`${rawPrefix}datasets.json`, route =>
     jsonResponse(route, {
-      version: 1,
+      schema: 2,
       default: TRAJECTORY.id,
-      datasets: [{
-        id: TRAJECTORY.id,
-        name: TRAJECTORY.name,
-        path: `${TRAJECTORY.id}/`,
-        n_cells: TRAJECTORY.cells,
-        n_genes: 6,
-      }],
+      datasets: [{ id: TRAJECTORY.id, path: `${TRAJECTORY.id}.zarr.zip` }],
     }));
-  await servePreparedExport(page, `${rawPrefix}${TRAJECTORY.id}/`, TRAJECTORY.id);
+  await serveDemoFile(page, `${rawPrefix}${TRAJECTORY.id}.zarr.zip`, TRAJECTORY);
   const { held, productErrors } = await openWithHeldStart(page);
-  await page.locator('#github-repo-url').fill('cellucid-tests/one/exports');
-  await page.locator('#github-connect-btn').click();
-  const github = { ...TRAJECTORY, select: /^dataset:github-repo:/ };
+  await page.locator('#data-link-url').fill('cellucid-tests/one/catalog');
+  await page.locator('#data-link-connect-btn').click();
+  const github = { ...TRAJECTORY, select: /^dataset:link:/ };
   await expectSettledOn(page, github);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, github);
@@ -228,7 +221,7 @@ test('a one-dataset GitHub repository connected while the startup dataset loads 
 
 test('a file chosen while a sample loads replaces it', async ({ page }) => {
   const productErrors = await openStarted(page);
-  const held = await holdRequests(page, `${EXPORTS}${DEVELOPMENT.id}/`);
+  const held = await holdOpening(page, DEVELOPMENT);
   const since = (await readRecord(page)).names.length;
   await page.locator('#dataset-select').selectOption(DEVELOPMENT.select);
   await expect.poll(() => held.started).toBeGreaterThan(0);
@@ -241,9 +234,12 @@ test('a file chosen while a sample loads replaces it', async ({ page }) => {
   expect(productErrors).toEqual([]);
 });
 
-// The H5AD read is held by holding its hdf5 library, which the reader worker
-// fetches. Firefox does not route the requests a dedicated worker makes, so
+// The H5AD read is held by holding the HDF5 reader (`formats/hdf5`), which
+// the AnnData reader worker imports when it starts. Every file opened gets
+// its own worker, so only the first import after the hold (the chosen file's)
+// is held. Firefox does not route the requests a dedicated worker makes, so
 // there it cannot be held; Chromium and WebKit run these two cases.
+const HDF5_READER = /\/assets\/js\/formats\/hdf5\/index\.js$/;
 const FIREFOX_WORKER_ROUTING =
   'Firefox does not route requests made by the AnnData reader worker';
 
@@ -253,9 +249,9 @@ test('a sample chosen while a file is still being read replaces it', async ({
 }) => {
   test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
   const productErrors = await openStarted(page);
-  // The H5AD reader's library is fetched on first use, so holding it holds
-  // the read itself.
-  const held = await holdRequests(page, /\/assets\/external\/hdf5_hl\.js/);
+  // The HDF5 reader is fetched when the reader worker starts, so holding it
+  // holds the read itself.
+  const held = await holdRequests(page, HDF5_READER, { first: 1 });
   await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
   await expect.poll(() => held.started).toBeGreaterThan(0);
   // The select shows what is being opened while it is read.
@@ -279,7 +275,7 @@ test('None chosen while a file is still being read clears the dataset', async ({
 }) => {
   test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
   const productErrors = await openStarted(page);
-  const held = await holdRequests(page, /\/assets\/external\/hdf5_hl\.js/);
+  const held = await holdRequests(page, HDF5_READER, { first: 1 });
   await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
   await expect.poll(() => held.started).toBeGreaterThan(0);
   await page.locator('#dataset-select').selectOption(NONE.select);
@@ -293,7 +289,7 @@ test('None chosen while a file is still being read clears the dataset', async ({
 
 test('None chosen while a sample loads clears the dataset', async ({ page }) => {
   const productErrors = await openStarted(page);
-  const held = await holdRequests(page, `${EXPORTS}${DEVELOPMENT.id}/`);
+  const held = await holdOpening(page, DEVELOPMENT);
   const since = (await readRecord(page)).names.length;
   await page.locator('#dataset-select').selectOption(DEVELOPMENT.select);
   await expect.poll(() => held.started).toBeGreaterThan(0);
@@ -320,7 +316,7 @@ test('a session chosen while a sample loads is applied to that sample', async ({
   const second = await context.newPage();
   try {
     const productErrors = await openStarted(second);
-    const held = await holdRequests(second, `${EXPORTS}${TRAJECTORY.id}/`);
+    const held = await holdOpening(second, TRAJECTORY);
     await second.locator('#dataset-select').selectOption(TRAJECTORY.select);
     await expect.poll(() => held.started).toBeGreaterThan(0);
     await chooseSessionFile(second, sessionPath);
@@ -515,7 +511,7 @@ test('a connection lost while a newer choice loads lets that choice land', async
   page,
 }) => {
   const { productErrors, remote } = await connectOneDatasetRemote(page);
-  const held = await holdRequests(page, `${EXPORTS}${DEVELOPMENT.id}/`);
+  const held = await holdOpening(page, DEVELOPMENT);
   await page.locator('#dataset-select').selectOption(DEVELOPMENT.select);
   await expect.poll(() => held.started).toBeGreaterThan(0);
 
@@ -541,15 +537,19 @@ test('a connection lost while a newer choice loads lets that choice land', async
 });
 
 test('a connection lost while a newer choice loads clears its dataset if that choice fails', async ({
+  browserName,
   page,
 }) => {
+  test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
   const { productErrors, remote } = await connectOneDatasetRemote(page);
   let releaseFailure = () => {};
   const failureHeld = new Promise(resolve => {
     releaseFailure = resolve;
   });
   let failingRequests = 0;
-  await page.route(`${EXPORTS}${DEVELOPMENT.id}/**`, async route => {
+  // Opening the chosen sample fails. The catalog was listed at startup, so
+  // every read of its file from here on opens it.
+  await page.route(`${SAMPLE_CATALOG}${DEVELOPMENT.id}.zarr.zip`, async route => {
     failingRequests += 1;
     await failureHeld;
     await route.fulfill({ status: 503, body: 'unavailable' }).catch(() => {});
@@ -595,21 +595,10 @@ test('a connection lost while a newer choice loads clears its dataset if that ch
  * one dataset, and record every event the viewer posts to Python.
  */
 async function serveJupyterBridge(page, target) {
-  const events = [];
-  await page.route(appUrl('/_cellucid/health'), route =>
-    jsonResponse(route, { status: 'ok', type: 'exported', version: '0.9.1' }));
-  await page.route(appUrl('/_cellucid/datasets'), route =>
-    jsonResponse(route, {
-      datasets: [{ id: target.id, path: '/jupyter-one/', name: target.name }],
-    }));
-  await page.route(appUrl('/_cellucid/events'), async route => {
-    events.push(JSON.parse(route.request().postData() ?? 'null'));
-    await jsonResponse(route, { status: 'ok', delivered: true });
-  });
-  // A current notebook server publishes what it accepts on the wire.
-  await page.route(appUrl('/_cellucid/protocol'), route =>
-    jsonResponse(route, { events: ['ready'], commands: [] }));
-  await servePreparedExport(page, appUrl('/jupyter-one/'), target.id);
+  const { events } = await serveAnnDataServer(page, APP_ORIGIN, {
+    ...target,
+    file: path.join(demoCatalogDirectory, `${target.id}.zarr.zip`),
+  }, { jupyter: true });
   return events;
 }
 
@@ -645,10 +634,7 @@ test('a file chosen while the notebook dataset loads replaces it and Python is n
 }) => {
   const productErrors = await observePage(page);
   const events = await serveJupyterBridge(page, TRAJECTORY);
-  const held = await holdRequests(
-    page,
-    appUrl(`/jupyter-one/${await openingPositionsFile(TRAJECTORY.id)}`),
-  );
+  const held = await holdOpening(page, TRAJECTORY);
   await page.goto(jupyterUrl(), { waitUntil: 'domcontentloaded' });
   await expect.poll(() => held.started).toBeGreaterThan(0);
   await expect(page.locator('#user-data-h5ad-input')).toBeEnabled();

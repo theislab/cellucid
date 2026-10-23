@@ -23,7 +23,12 @@ import {
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 import { getNotificationCenter } from '../app/notification-center.js';
-import { configureStraightAlphaBlending, drawPointsInSegments } from './gl-utils.js';
+import {
+  configureStraightAlphaBlending,
+  deleteGlObject,
+  drawPointsInSegments,
+  restorableTexture,
+} from './gl-utils.js';
 import {
   requireDimensionLevel,
   requireFiniteNumber,
@@ -962,10 +967,11 @@ export class HighPerfRenderer {
       );
     }
 
+    // UNPACK_ROW_LENGTH and UNPACK_IMAGE_HEIGHT are never set in this app
+    // (they stay 0), and reading them is a synchronous round trip to the GPU
+    // process in Chrome; the state below is read client-side.
     const pixelStoreParameters = [
       gl.UNPACK_ALIGNMENT,
-      gl.UNPACK_ROW_LENGTH,
-      gl.UNPACK_IMAGE_HEIGHT,
       gl.UNPACK_SKIP_PIXELS,
       gl.UNPACK_SKIP_ROWS,
       gl.UNPACK_SKIP_IMAGES,
@@ -993,8 +999,6 @@ export class HighPerfRenderer {
     try {
       gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
-      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
-      gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_IMAGES, 0);
@@ -1986,7 +1990,7 @@ export class HighPerfRenderer {
         const handle = entry.handle;
         if (handle === null) continue;
         try {
-          gl[deleteMethod](handle);
+          deleteGlObject(gl, deleteMethod, handle);
           entry.handle = null;
           // GPU memory was released: a tree build refused for memory may
           // succeed now (`_requestSpatialIndex`).
@@ -2307,6 +2311,22 @@ export class HighPerfRenderer {
       return pooled;
     }
     return this._acquireIndependentSnapshotGeometry(positions, dimension);
+  }
+
+  /**
+   * Whether the renderer holds a geometry over these positions: the live
+   * view's, or one pooled for a view or retained for a quick switch back.
+   * Overlays keep their own uploads of the same positions as long.
+   *
+   * @param {Float32Array} positions
+   * @returns {boolean}
+   */
+  holdsGeometryFor(positions) {
+    if (this._positions === positions) return true;
+    for (const geometry of this._snapshotGeometryPools?.values() ?? []) {
+      if (geometry.positions === positions) return true;
+    }
+    return false;
   }
 
   /**
@@ -2782,7 +2802,7 @@ export class HighPerfRenderer {
       const handle = retirement[property];
       if (handle === null) return;
       try {
-        this.gl[deleteMethod](handle);
+        deleteGlObject(this.gl, deleteMethod, handle);
         retirement[property] = null;
       } catch (error) {
         let stillAlive = true;
@@ -3887,7 +3907,7 @@ export class HighPerfRenderer {
       this._releaseDormantSnapshotStores();
       gl.bindVertexArray(vertexArray);
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(texture));
       allocate();
       code = gl.getError();
     }
@@ -4182,27 +4202,32 @@ export class HighPerfRenderer {
       this._alphaUploadRegions = regions;
     }
 
-    // Row-major traversal. It visits exactly the same indices in exactly the
-    // same order as a flat scan — same first rejection, same bytes written —
-    // and records which rows moved without a division per point.
+    // Row-major traversal that records which rows moved without a division
+    // per point. A cell's byte is 255 for 1 and 0 for 0 (`-value & 255`,
+    // exactly `Math.round(value * 255)` for those values); the loop does not
+    // branch per cell: it ORs every value (anything above 1 is rejected at
+    // the row's end, naming the first such cell) and every moved bit.
     let dirtyRowCount = 0;
     for (let y = 0; y < height; y++) {
       const rowStart = y * width;
       const rowEnd = rowStart + width < n ? rowStart + width : n;
-      let rowChanged = false;
+      let seen = 0;
+      let moved = 0;
       for (let i = rowStart; i < rowEnd; i++) {
         const value = alphas[i];
-        // One comparison pair rejects NaN, infinities and out-of-range values.
-        if (!(value >= 0 && value <= 1)) {
-          throw new RangeError(
-            `HighPerfRenderer alpha value at index ${i} must be finite and in [0, 1]; received ${String(value)}.`
-          );
-        }
-        const byte = Math.round(value * 255);
+        seen |= value;
+        const byte = -value & 255;
         candidate[i] = byte;
-        rowChanged ||= byte !== accepted[i];
+        moved |= byte ^ accepted[i];
       }
-      if (rowChanged) {
+      if (seen > 1) {
+        let i = rowStart;
+        while (alphas[i] <= 1) i++;
+        throw new RangeError(
+          `HighPerfRenderer alpha value at index ${i} must be exactly 0 or 1; received ${alphas[i]}.`
+        );
+      }
+      if (moved !== 0) {
         dirtyRows[y] = 1;
         dirtyRowCount++;
       }
@@ -6223,7 +6248,8 @@ export class HighPerfRenderer {
    *
    * Resolves true when the view has an index for its current positions, built
    * now or already there; false when the positions changed before the tree
-   * came back, or are too large to copy to a worker.
+   * came back, or a build for them already failed. Rejects with the build's
+   * error when this build fails (it is also notified).
    *
    * @param {string} viewId - 'live' or a snapshot id.
    * @returns {Promise<boolean>}
@@ -6233,11 +6259,11 @@ export class HighPerfRenderer {
     const exactId = requireViewId(viewId, 'HighPerfRenderer background spatial-index view id');
     const target = this._spatialIndexTarget(exactId);
     if (target === null) return Promise.resolve(true);
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       this._requestSpatialIndex(
         target.live ? { kind: 'live' } : { kind: 'snapshot', id: exactId },
         this._needsLodResources(-1),
-        installed => resolve(installed)
+        (installed, error) => (error === null ? resolve(installed) : reject(error))
       );
     });
   }
@@ -6333,8 +6359,9 @@ export class HighPerfRenderer {
    *
    * @param {{kind: 'live'}|{kind: 'snapshot', id: string}} target
    * @param {boolean} needsLOD
-   * @param {(installed: boolean) => void} [settled] - Called once with
-   *   whether a tree for the target's current positions is installed.
+   * @param {(installed: boolean, error: Error|null) => void} [settled] -
+   *   Called once with whether a tree for the target's current positions is
+   *   installed, and the error of a build that failed.
    * @private
    */
   _requestSpatialIndex(target, needsLOD, settled = null) {
@@ -6342,7 +6369,7 @@ export class HighPerfRenderer {
     const positions = target.kind === 'live' ? this._positions : snapshot?.positions;
     const dimensionLevel = target.kind === 'live' ? this.currentDimensionLevel : snapshot?.dimensionLevel;
     if (!(positions instanceof Float32Array) || positions.length === 0) {
-      settled?.(false);
+      settled?.(false, null);
       return;
     }
     this._treeBuilds ??= new WeakMap();
@@ -6360,7 +6387,7 @@ export class HighPerfRenderer {
       (failed.needsLOD || !needsLOD) &&
       failed.epoch === (this._releaseEpoch ?? 0)
     ) {
-      settled?.(false);
+      settled?.(false, null);
       return;
     }
     const pointCount = target.kind === 'live' ? this.pointCount : snapshot.pointCount;
@@ -6368,9 +6395,9 @@ export class HighPerfRenderer {
     const label = target.kind === 'live' ? 'live view' : 'a kept view';
     const notifications = getNotificationCenter();
     const build = { needsLOD, settled: settled ? [settled] : [] };
-    const finish = installed => {
+    const finish = (installed, error = null) => {
       if (this._treeBuilds?.get(positions) === build) this._treeBuilds.delete(positions);
-      for (const callback of build.settled) callback(installed);
+      for (const callback of build.settled) callback(installed, error);
     };
     let notifId = null;
     try {
@@ -6378,7 +6405,7 @@ export class HighPerfRenderer {
     } catch (error) {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
       notifications.error(describeError(error));
-      finish(false);
+      finish(false, error);
       return;
     }
     this._treeBuilds.set(positions, build);
@@ -6387,31 +6414,34 @@ export class HighPerfRenderer {
       'spatial'
     );
     const startTime = performance.now();
-    this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
-      if (this._disposed === true || this._contextLost === true) {
-        finish(false);
-        return;
-      }
-      let installed = false;
-      try {
-        installed = this._installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, result);
-      } catch (error) {
-        this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
-        settleCalculationNotification(notifications, notifId, 'failCalculation',
-          `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
-        finish(false);
-        return;
-      }
-      settleCalculationNotification(notifications, notifId, 'completeCalculation',
-        `${dimensionLevel}D ${treeNames[dimensionLevel]} ready (${label})`, performance.now() - startTime);
-      finish(installed);
-      if (installed) this.onAsyncTreeReady?.();
-    }, error => {
+    const failBuild = error => {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
       settleCalculationNotification(notifications, notifId, 'failCalculation',
         `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
-      finish(false);
-    });
+      finish(false, error);
+    };
+    try {
+      this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
+        if (this._disposed === true || this._contextLost === true) {
+          finish(false);
+          return;
+        }
+        let installed = false;
+        try {
+          installed = this._installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, result);
+        } catch (error) {
+          failBuild(error);
+          return;
+        }
+        settleCalculationNotification(notifications, notifId, 'completeCalculation',
+          `${dimensionLevel}D ${treeNames[dimensionLevel]} ready (${label})`, performance.now() - startTime);
+        finish(installed);
+        if (installed) this.onAsyncTreeReady?.();
+      }, failBuild);
+    } catch (error) {
+      // Handing the positions to the worker failed before it could answer.
+      failBuild(error);
+    }
   }
 
   /**
@@ -6459,27 +6489,7 @@ export class HighPerfRenderer {
       onDone(result);
       return;
     }
-    if (!this._spatialTreeWorker) {
-      this._spatialTreeWorker = new Worker(
-        new URL('./high-perf/spatial-tree-worker.js', import.meta.url),
-        { type: 'module' }
-      );
-      this._spatialTreeRequests = new Map();
-      this._spatialTreeRequestId = 0;
-      this._spatialTreeWorker.onmessage = ({ data }) => {
-        const pending = this._spatialTreeRequests.get(data.id);
-        if (!pending) return;
-        this._spatialTreeRequests.delete(data.id);
-        if (data.error) pending.onError(new Error(`Background spatial index failed: ${data.error}`));
-        else pending.onDone({ tree: data.tree, order: data.order });
-      };
-      this._spatialTreeWorker.onerror = event => {
-        const error = new Error(`Background spatial index worker failed: ${event.message || 'unknown error'}`);
-        const pending = [...this._spatialTreeRequests.values()];
-        this._spatialTreeRequests.clear();
-        for (const entry of pending) entry.onError(error);
-      };
-    }
+    this._ensureSpatialTreeWorker();
     const id = ++this._spatialTreeRequestId;
     const worker = this._spatialTreeWorker;
     this._spatialTreeRequests.set(id, { onDone, onError });
@@ -6501,12 +6511,48 @@ export class HighPerfRenderer {
       }
       worker.postMessage({ id, kind: 'build', ...request });
     };
-    if (total === 0) {
-      worker.postMessage({ id, kind: 'positions', offset: 0, total: 0, slice: new Float32Array(0) });
-      worker.postMessage({ id, kind: 'build', ...request });
-    } else {
-      sendSlice();
+    try {
+      if (total === 0) {
+        worker.postMessage({ id, kind: 'positions', offset: 0, total: 0, slice: new Float32Array(0) });
+        worker.postMessage({ id, kind: 'build', ...request });
+      } else {
+        sendSlice();
+      }
+    } catch (error) {
+      // The request never reached the worker: it answers nothing for it.
+      this._spatialTreeRequests.delete(id);
+      throw error;
     }
+  }
+
+  /**
+   * The spatial-tree worker and its message handlers. They are made here, not
+   * in a build: a closure keeps the whole scope it was made in, and handlers
+   * made beside a build's `positions` kept the first dataset's positions for
+   * as long as the worker lived.
+   * @private
+   */
+  _ensureSpatialTreeWorker() {
+    if (this._spatialTreeWorker) return;
+    this._spatialTreeWorker = new Worker(
+      new URL('./high-perf/spatial-tree-worker.js', import.meta.url),
+      { type: 'module' }
+    );
+    this._spatialTreeRequests = new Map();
+    this._spatialTreeRequestId = 0;
+    this._spatialTreeWorker.onmessage = ({ data }) => {
+      const pending = this._spatialTreeRequests.get(data.id);
+      if (!pending) return;
+      this._spatialTreeRequests.delete(data.id);
+      if (data.error) pending.onError(new Error(`Background spatial index failed: ${data.error}`));
+      else pending.onDone({ tree: data.tree, order: data.order });
+    };
+    this._spatialTreeWorker.onerror = event => {
+      const error = new Error(`Background spatial index worker failed: ${event.message || 'unknown error'}`);
+      const pending = [...this._spatialTreeRequests.values()];
+      this._spatialTreeRequests.clear();
+      for (const entry of pending) entry.onError(error);
+    };
   }
 
   _retireSpatialTreeWorker() {
@@ -7339,39 +7385,48 @@ export class HighPerfRenderer {
         );
       }
     }
-    // Row-major, so a moved row is marked without a division per point; the
-    // same indices are visited in the same order as a flat scan (same first
-    // rejection, same bytes). Texels past the last point are padding, 255.
+    // Row-major, so a moved row is marked without a division per point.
+    // Texels past the last point are padding, 255. Neither loop branches per
+    // cell: a 0/1 transparency byte becomes 0 or 255 (`-value & 255`,
+    // exactly `Math.round(value * 255)` for those values), every value is
+    // ORed so anything above 1 is rejected at the row's end (naming the first
+    // such cell), and every moved bit is ORed.
     const reference = accepted === null ? target : accepted;
     const pointCount = this.pointCount;
     const width = dirtyRows === null ? target.length : rowWidth;
     let changed = false;
     for (let rowStart = 0, row = 0; rowStart < target.length; rowStart += width, row++) {
       const rowEnd = Math.min(rowStart + width, target.length);
-      let rowChanged = false;
-      for (let index = rowStart; index < rowEnd; index++) {
-        let byte = 255;
-        if (index < pointCount) {
-          if (exactAlphas === null) {
-            byte = exactColors[index * 4 + 3];
-          } else {
-            const value = exactAlphas[index];
-            if (
-              !Number.isFinite(value) ||
-              value < 0 ||
-              value > 1
-            ) {
-              throw new RangeError(
-                `${owner} alpha value at index ${index} must be finite and in [0, 1].`
-              );
-            }
-            byte = Math.round(value * 255);
-          }
+      const pointEnd = Math.max(rowStart, Math.min(rowEnd, pointCount));
+      let moved = 0;
+      if (exactAlphas === null) {
+        for (let index = rowStart; index < pointEnd; index++) {
+          const byte = exactColors[index * 4 + 3];
+          moved |= byte ^ reference[index];
+          target[index] = byte;
         }
-        if (reference[index] !== byte) rowChanged = true;
-        target[index] = byte;
+      } else {
+        let seen = 0;
+        for (let index = rowStart; index < pointEnd; index++) {
+          const value = exactAlphas[index];
+          seen |= value;
+          const byte = -value & 255;
+          moved |= byte ^ reference[index];
+          target[index] = byte;
+        }
+        if (seen > 1) {
+          let index = rowStart;
+          while (exactAlphas[index] <= 1) index++;
+          throw new RangeError(
+            `${owner} alpha value at index ${index} must be exactly 0 or 1.`
+          );
+        }
       }
-      if (rowChanged) {
+      for (let index = pointEnd; index < rowEnd; index++) {
+        moved |= 255 ^ reference[index];
+        target[index] = 255;
+      }
+      if (moved !== 0) {
         changed = true;
         if (dirtyRows !== null) dirtyRows[row] = 1;
       }

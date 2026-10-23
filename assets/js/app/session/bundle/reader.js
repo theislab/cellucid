@@ -14,6 +14,7 @@
 
 import {
   MAX_FRAME_BYTES,
+  NOT_A_SESSION_FILE_MESSAGE,
   SESSION_BUNDLE_MAGIC_BYTES,
   U32_BYTES,
   bytesToU32LE
@@ -26,9 +27,6 @@ import {
 } from '../schema-contract.js';
 
 /**
- * @param {AbortSignal | null | undefined} signal
- */
-/**
  * The byte stream ended before a read it was asked for. Kept distinct so the
  * header check can tell "too short to be a session file" from a real failure.
  */
@@ -39,8 +37,9 @@ class UnexpectedEndOfFileError extends Error {
   }
 }
 
-const NOT_A_SESSION_FILE_MESSAGE = 'Invalid session file (bad MAGIC header).';
-
+/**
+ * @param {AbortSignal | null | undefined} signal
+ */
 function throwIfAborted(signal) {
   if (signal !== null && signal.aborted) {
     throw new DOMException('Aborted', 'AbortError');
@@ -266,10 +265,8 @@ export async function readBundle(source, options) {
       }
       throw error;
     }
-    for (let i = 0; i < SESSION_BUNDLE_MAGIC_BYTES.byteLength; i++) {
-      if (magic[i] !== SESSION_BUNDLE_MAGIC_BYTES[i]) {
-        throw new Error(NOT_A_SESSION_FILE_MESSAGE);
-      }
+    if (!SESSION_BUNDLE_MAGIC_BYTES.every((byte, i) => magic[i] === byte)) {
+      throw new Error(NOT_A_SESSION_FILE_MESSAGE);
     }
 
     // 2) Manifest length

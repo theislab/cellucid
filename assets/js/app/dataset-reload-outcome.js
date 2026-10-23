@@ -106,9 +106,9 @@ function requireExactKeys(value, expectedKeys, label) {
  * holds (`rendering/position-layout.js`).
  *
  * Finiteness is not re-checked here: every coordinate is refused at the one
- * decode boundary it enters through (`loadPointsBinary()` for fetched and
- * staged payloads, the AnnData adapters for direct files, and the in-memory
- * DimensionManager), before any normalization can see it.
+ * decode boundary it enters through (the AnnData adapter for a dataset, the
+ * in-memory DimensionManager for a synthetic scene), before any
+ * normalization can see it.
  *
  * @param {object} options
  * @param {Float32Array} options.positions
@@ -126,7 +126,7 @@ export function validateDatasetPositionPayload(options) {
   const nCells = identity?.stats?.n_cells;
   if (!Number.isSafeInteger(nCells) || nCells <= 0) {
     throw new Error(
-      'dataset_identity.json stats.n_cells must be a positive safe integer.'
+      'The dataset identity stats.n_cells must be a positive safe integer.'
     );
   }
   if (
@@ -153,7 +153,7 @@ export function validateDatasetPositionPayload(options) {
   ) {
     throw new Error(
       `${dimension}D dataset positions contain ${positions.length} ` +
-      `coordinates; dataset_identity.json stats.n_cells (${nCells}) ` +
+      `coordinates; the dataset identity stats.n_cells (${nCells}) ` +
       `requires exactly ${expectedLength} (${nCells} × ${dimension}).`
     );
   }
@@ -168,7 +168,6 @@ export function validateDatasetPositionPayload(options) {
  * @param {object} options
  * @param {object} options.generation
  * @param {object} options.dimensionManager
- * @param {boolean} options.showProgress
  * @param {AbortSignal} options.signal
  * @returns {Promise<Readonly<{
  *   defaultDimension: number,
@@ -178,20 +177,14 @@ export function validateDatasetPositionPayload(options) {
 export async function stageDatasetPositionPayload(options) {
   requireExactKeys(
     options,
-    ['generation', 'dimensionManager', 'showProgress', 'signal'],
+    ['generation', 'dimensionManager', 'signal'],
     'dataset position staging'
   );
   const {
     generation,
     dimensionManager,
-    showProgress,
     signal
   } = options;
-  if (typeof showProgress !== 'boolean') {
-    throw new TypeError(
-      'Dataset position staging showProgress must be a boolean.'
-    );
-  }
   if (
     typeof dimensionManager?.getDefaultLayoutKey !== 'function' ||
     typeof dimensionManager?.getLayout !== 'function' ||
@@ -225,10 +218,7 @@ export async function stageDatasetPositionPayload(options) {
       throw new Error('The dataset names no opening representation to stage.');
     }
     const defaultDimension = dimensionManager.getLayout(defaultLayoutKey).dimension;
-    const rawPositions = await dimensionManager.loadLayout(
-      defaultLayoutKey,
-      { showProgress }
-    );
+    const rawPositions = await dimensionManager.loadLayout(defaultLayoutKey);
     if (signal.aborted) {
       throw createDatasetReloadSupersededError(
         RELOAD_SUPERSEDED_MESSAGE
@@ -240,10 +230,7 @@ export async function stageDatasetPositionPayload(options) {
       dimension: defaultDimension
     });
 
-    const positions = await dimensionManager.getPositions(
-      defaultLayoutKey,
-      { showProgress: false }
-    );
+    const positions = await dimensionManager.getPositions(defaultLayoutKey);
     if (signal.aborted) {
       throw createDatasetReloadSupersededError(
         RELOAD_SUPERSEDED_MESSAGE
@@ -257,7 +244,7 @@ export async function stageDatasetPositionPayload(options) {
     if (dimensionManager.nCells !== generation.identity.stats.n_cells) {
       throw new Error(
         `DimensionManager cell count (${dimensionManager.nCells}) must equal ` +
-        `dataset_identity.json stats.n_cells ` +
+        `the dataset identity stats.n_cells ` +
         `(${generation.identity.stats.n_cells}).`
       );
     }

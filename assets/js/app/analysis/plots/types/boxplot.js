@@ -50,8 +50,9 @@ function precomputedPointsMode(options) {
  *
  * @param {Object[]} pageData
  * @param {Object} options
+ * @param {AbortSignal|null} [signal] - Cancels the worker tasks
  */
-async function ensureBoxSummaries(pageData, options) {
+async function ensureBoxSummaries(pageData, options, signal = null) {
   const mode = precomputedPointsMode(options);
   if (mode === null) return;
   const work = [];
@@ -69,7 +70,7 @@ async function ensureBoxSummaries(pageData, options) {
     const { summary, finiteCount, finite } = await manager.execute(
       OperationType.COMPUTE_BOX_STATISTICS,
       { values: ArrayBuffer.isView(pd.values) ? pd.values : Float64Array.from(pd.values), points: mode },
-      { transfer: !ArrayBuffer.isView(pd.values) }
+      { transfer: !ArrayBuffer.isView(pd.values), signal }
     );
     adoptFiniteNumbers(pd.values, finiteCount, finite);
     if (summary !== null && !summaries.has(mode)) summaries.set(mode, summary);
@@ -166,8 +167,12 @@ const boxplotDefinition = {
     return layout;
   },
 
-  async render(pageData, options, container, layoutEngine) {
-    await ensureBoxSummaries(pageData, options);
+  /**
+   * `run.signal` (the detailed analysis's job) cancels the worker tasks the
+   * plot computes its statistics with; nothing partial is kept.
+   */
+  async render(pageData, options, container, layoutEngine, run = {}) {
+    await ensureBoxSummaries(pageData, options, run.signal ?? null);
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 

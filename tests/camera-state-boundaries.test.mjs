@@ -128,6 +128,10 @@ test('session capture publishes each view\'s camera as the viewer reports it', t
       getViewCameraState(viewId) {
         assert.equal(viewId, 'live');
         return structuredClone(currentCamera);
+      },
+      getCentroidFlags(viewId) {
+        assert.equal(viewId, 'live');
+        return { points: true, labels: false };
       }
     },
     sidebar: {
@@ -137,8 +141,11 @@ test('session capture publishes each view\'s camera as the viewer reports it', t
     }
   });
 
-  assert.deepEqual(chunk.payload.camera, currentCamera);
-  assert.deepEqual(chunk.payload.multiview.liveCameraState, currentCamera);
+  // The focused view's camera is the one its view record holds; the session
+  // stores it once.
+  assert.equal(Object.hasOwn(chunk.payload, 'camera'), false);
+  assert.deepEqual(chunk.payload.multiview.live.cameraState, currentCamera);
+  assert.deepEqual(chunk.payload.multiview.live.centroids, { points: true, labels: false });
   // The live view's geometry is one embedding reference, captured as a plain
   // JSON copy; its dimension is the reference's and is not stored.
   assert.equal(Object.hasOwn(chunk.payload, 'liveDimensionLevel'), false);
@@ -447,7 +454,7 @@ test('session, snapshot, and figure-export boundaries assert exact camera state'
   );
   assert.match(
     coreStateSource,
-    /assertCameraState\([\s\S]*?viewer\.getCameraState\(\)/
+    /assertCameraState\([\s\S]*?focusedCameraState\(sessionState\.multiview\)/
   );
   assert.doesNotMatch(
     coreStateSource,
@@ -460,7 +467,7 @@ test('session, snapshot, and figure-export boundaries assert exact camera state'
   );
   assert.match(
     byPath.get('../assets/js/app/state-serializer/multiview.js'),
-    /assertCameraState\(multiview\.liveCameraState/
+    /assertCameraState\(multiview\.live\.cameraState/
   );
   assert.match(
     byPath.get('../assets/js/app/ui/modules/figure-export/figure-export-engine.js'),

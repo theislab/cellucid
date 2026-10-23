@@ -38,20 +38,59 @@
  * }
  */
 
-import { createStatusLine } from '../../ui/components/controls.js';
 import { createVisibilityGatedRender } from '../../ui/core/visibility-gate.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import {
   validatePageRequirements,
   getRequirementText,
-  pageDataToCSV,
   downloadCSV
 } from '../shared/analysis-utils.js';
+import { getComputeManager } from '../compute/compute-manager.js';
+import { OperationType } from '../compute/operations.js';
+import {
+  joinPerCellCSV,
+  perCellCSVHeader,
+  splitPerCellRows
+} from '../compute/csv-export.js';
+import { analysisWorkerCount } from '../shared/performance-config.js';
 import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
 import { createAnalysisModal, openModal, closeModal } from './components/modal.js';
 import { createControlScope } from './components/control-accessibility.js';
 import { purgePlot, downloadImage } from '../plots/plotly-loader.js';
-import { createRequestIdTracker } from '../shared/cancellable-operation.js';
+import { CancellableJob, createRequestIdTracker, isCancellation } from '../../jobs/cancellable-job.js';
+import { createJobStatusView } from '../../jobs/job-status-view.js';
+
+/**
+ * A per-cell CSV file written by the analysis workers (compute/csv-export.js),
+ * so the main thread neither builds nor holds its text: the rows are split
+ * into consecutive ranges, one per worker, each written as a Blob, and the
+ * Blobs are joined after the header. The bytes are those of writing every row
+ * in order.
+ *
+ * @param {'page-data'|'signature-scores'} layout
+ * @param {Array<{pageName: string, values: ArrayLike<unknown>, cellIndices?: ArrayLike<number>, categories?: string[], missingCode?: number}>} pageData
+ * @param {string} [variableName]
+ * @returns {Promise<Blob>}
+ */
+export async function writePerCellCSV(layout, pageData, variableName) {
+  const header = perCellCSVHeader(layout, variableName);
+  const pages = pageData.map(pd => ({
+    pageName: pd.pageName,
+    values: pd.values,
+    cellIndices: pd.cellIndices ?? null,
+    categories: pd.categories ?? null,
+    missingCode: pd.missingCode ?? null
+  }));
+  const manager = getComputeManager();
+  const ranges = splitPerCellRows(pages, analysisWorkerCount());
+  const parts = await Promise.all(ranges.map(range => manager.execute(
+    OperationType.COMPUTE_CSV_EXPORT,
+    { layout, pages: range },
+    // Each range's slices are its own copies.
+    { transfer: true }
+  )));
+  return joinPerCellCSV(header, parts.map(part => part.rows));
+}
 
 function cloneSettings(value) {
   return structuredClone(value);
@@ -241,9 +280,14 @@ export class BaseAnalysisUI {
     this._isDestroyed = false;
 
     // One monotonic owner for analysis intent, computation, and publication.
-    // Generations are deliberately used instead of worker AbortSignals because
-    // aborting one running task is terminal for the shared worker pool.
+    // A request that computes runs as a cancellable job (`_startAnalysisJob`)
+    // whose signal stops its reads and worker tasks; invalidating the request
+    // cancels the job.
     this._analysisRequestTracker = createRequestIdTracker();
+    /** @type {ReturnType<typeof createJobStatusView>|null} */
+    this._jobStatus = null;
+    /** @type {CancellableJob|null} The job the status view shows */
+    this._shownJob = null;
     this._activeAnalysisRequestId = null;
     this._analysisInvalidationOwner = null;
     this._interactiveTasks = new Set();
@@ -466,6 +510,31 @@ export class BaseAnalysisUI {
       'Analysis settings'
     );
     this._applyBaseSettings(this._requireBaseSettings(settings));
+  }
+
+  /**
+   * The current result for a session, or null. An analysis whose result is
+   * recomputed from its settings when it is shown (Quick, Detailed) keeps no
+   * result in a session; the analyses that are costly to rerun override this
+   * (`shared/analysis-result-session.js`).
+   * @returns {null|{kind: string, version: number, payload: unknown}}
+   */
+  exportResult() {
+    return null;
+  }
+
+  /**
+   * Restore a result written by `exportResult()`.
+   * @param {null|Object} result
+   * @returns {Promise<void>}
+   */
+  async importResult(result) {
+    if (result !== null) {
+      throw new TypeError(
+        `${this.constructor.name} recomputes its result from its settings; ` +
+        'a session result for it must be null'
+      );
+    }
   }
 
   // ===========================================================================
@@ -800,6 +869,92 @@ export class BaseAnalysisUI {
     this._isLoading = false;
   }
 
+  // ===========================================================================
+  // Cancellable jobs
+  // ===========================================================================
+
+  /**
+   * The view of this UI's running, cancelled or failed job (Cancel, Run
+   * again), created on first use; the UI places `root` where its result
+   * appears.
+   * @returns {ReturnType<typeof createJobStatusView>}
+   * @protected
+   */
+  _getJobStatusView() {
+    this._jobStatus ??= createJobStatusView({
+      onRunAgain: () => this._runAgain()
+    });
+    return this._jobStatus;
+  }
+
+  /**
+   * Run the analysis again after it was cancelled or failed (Run again).
+   * @protected
+   */
+  _runAgain() {
+    if (this._isDestroyed) return;
+    this._trackInteractiveTask(this._runAnalysisIfValid(), 'Analysis');
+  }
+
+  /**
+   * Run request `requestId`'s computation as a cancellable job
+   * (`app/jobs/cancellable-job.js`): its signal goes to every read and worker
+   * task; Cancel (in the status view or the job's notification), a new
+   * request, closing the window or switching the dataset cancel it.
+   * Cancelling invalidates the request, so nothing of it is published.
+   *
+   * @param {number} requestId
+   * @param {{title: string, plan?: string|null}} options
+   * @returns {CancellableJob}
+   * @protected
+   */
+  _startAnalysisJob(requestId, { title, plan = null }) {
+    const job = new CancellableJob({
+      title,
+      plan,
+      readKind: 'analysis',
+      notifications: this._notifications,
+      onCancel: () => {
+        if (this._isCurrentAnalysisRequest(requestId)) this._invalidateAnalysisRequest();
+      }
+    });
+    this._registerAnalysisInvalidationCleanup(requestId, () => job.cancel());
+    this._shownJob = job;
+    // A UI without a document (a headless test) has no view to show.
+    if (typeof document !== 'undefined') this._getJobStatusView().show(job);
+    return job;
+  }
+
+  /**
+   * End `job` by the outcome of its request: a failure is shown in the
+   * status view and its notification (once), a cancellation is a calm
+   * Cancelled. Returns whether it failed.
+   *
+   * @param {CancellableJob} job
+   * @param {unknown} error
+   * @returns {boolean}
+   * @protected
+   */
+  _failAnalysisJob(job, error) {
+    if (isCancellation(error) || !job.running) {
+      job.cancel();
+      return false;
+    }
+    console.error(`[${this.constructor.name}] ${job.title} failed:`, error);
+    job.fail(error);
+    return true;
+  }
+
+  /**
+   * Stop showing an ended job (the inputs changed): a running one stays.
+   * @protected
+   */
+  _clearJobStatus() {
+    if (this._shownJob?.running) return;
+    this._shownJob = null;
+    this._jobStatus?.show(null);
+  }
+
   /**
    * Run analysis if configuration is valid (override for custom logic)
    */
@@ -813,25 +968,44 @@ export class BaseAnalysisUI {
     }
     if (!this._canRunAnalysis()) {
       const invalidationRequestId = this._invalidateAnalysisRequest();
+      this._clearJobStatus();
       await this._hidePreview(invalidationRequestId);
       return;
     }
 
     const requestId = this._startAnalysisRequest(scheduledRequestId);
     if (requestId === null) return;
+    const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
     try {
-      await this._runAnalysis(requestId);
+      await this._runAnalysis(requestId, job);
+      if (this._isCurrentAnalysisRequest(requestId)) job.succeed();
+      else job.cancel();
     } catch (err) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error(`[${this.constructor.name}] Analysis failed:`, err);
-      await this._showError('Analysis failed: ' + err.message, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId) || isCancellation(err)) {
+        job.cancel();
+        return;
+      }
+      // The job's status view and notification say why; what the previous
+      // run showed no longer answers the inputs.
+      this._failAnalysisJob(job, err);
+      await this._hidePreview(requestId);
     } finally {
       this._finishAnalysisRequest(requestId);
     }
   }
 
   /**
-   * Run the analysis (override in subclass)
+   * What this UI's job is called (its mode's name).
+   * @returns {string}
+   * @protected
+   */
+  _getJobTitle() {
+    return 'Analysis';
+  }
+
+  /**
+   * Run the analysis (override in subclass): `job` is the request's
+   * cancellable job, whose signal its reads and tasks take.
    */
   async _runAnalysis() {
     throw new Error('_runAnalysis() must be implemented by subclass');
@@ -942,26 +1116,6 @@ export class BaseAnalysisUI {
     }
   }
 
-  /**
-   * Show error message
-   * @param {string} message
-   */
-  _showError(message) {
-    if (this._previewContainer) {
-      this._previewContainer.classList.remove('loading');
-      this._previewContainer.classList.add('empty');
-      this._previewContainer.textContent = '';
-      this._previewContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message ?? '' }).root
-      );
-    }
-    if (this._actionsContainer) {
-      this._actionsContainer.hidden = true;
-    }
-
-    this._notifications.error(message, { category: 'data', title: 'Analysis error' });
-  }
-
   // ===========================================================================
   // Export Functionality
   // ===========================================================================
@@ -1024,7 +1178,7 @@ export class BaseAnalysisUI {
     if (!pageData || pageData.length === 0) return;
 
     try {
-      const csv = pageDataToCSV(pageData, variableName || 'value');
+      const csv = await writePerCellCSV('page-data', pageData, variableName || 'value');
       const baseName = String(filename || 'analysis-data').replace(/\.csv$/i, '');
       downloadCSV(csv, baseName, this._notifications);
     } catch (err) {
@@ -1149,6 +1303,9 @@ export class BaseAnalysisUI {
     } catch (error) {
       errors.push(error);
     }
+    this._jobStatus?.destroy();
+    this._jobStatus = null;
+    this._shownJob = null;
     if (this._updateTimer) {
       try {
         clearTimeout(this._updateTimer);

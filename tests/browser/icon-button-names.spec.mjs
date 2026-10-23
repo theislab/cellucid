@@ -6,12 +6,12 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=icon-button-names-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=icon-button-names-ci';
 
 const FIELD_ACTION_NAMES = Object.freeze({
   'copy-categorical-field': 'Duplicate the selected categorical obs field',

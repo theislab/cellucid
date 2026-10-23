@@ -367,49 +367,8 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
 });
 
 test(
-  'field-loader factories preserve their configured abort owner without a runtime override',
+  'field-loader factories preserve a configured abort owner without a runtime override',
   async t => {
-    const originalFetch = globalThis.fetch;
-    let fetchCalls = 0;
-    globalThis.fetch = async () => {
-      fetchCalls++;
-      return new Response(new Float32Array([1, 2]));
-    };
-    t.after(() => {
-      globalThis.fetch = originalFetch;
-    });
-    const controller = new AbortController();
-    controller.abort(new Error('configured field-loader owner retired'));
-    const options = { fetchInit: { signal: controller.signal } };
-    const obsLoader = createObsFieldLoader(
-      'https://example.test/obs/manifest.json',
-      options,
-    );
-    const varLoader = createVarFieldLoader(
-      'https://example.test/var/manifest.json',
-      options,
-    );
-    const obsField = {
-      centroids: null,
-      key: 'score',
-      kind: 'continuous',
-      outlierQuantilesPath: null,
-      quantized: false,
-      valuesDtype: 'float32',
-      valuesPath: 'score.values.f32',
-    };
-    const varField = {
-      key: 'GAPDH',
-      kind: 'continuous',
-      quantized: false,
-      valuesDtype: 'float32',
-      valuesPath: 'GAPDH.values.f32',
-    };
-
-    await assert.rejects(obsLoader(obsField), /cancel|abort/i);
-    await assert.rejects(varLoader(varField), /cancel|abort/i);
-    assert.equal(fetchCalls, 0);
-
     const manager = getDataSourceManager();
     const previousSource = manager.activeSource;
     const previousDatasetId = manager.activeDatasetId;
@@ -422,7 +381,7 @@ test(
           kind: 'continuous',
         };
       },
-      async getGeneExpression() {
+      async getGeneValues() {
         directCalls++;
         return Float32Array.from([1, 2]);
       },
@@ -437,71 +396,32 @@ test(
       manager.activeSource = previousSource;
       manager.activeDatasetId = previousDatasetId;
     });
-
-    const directObsLoader = createObsFieldLoader(
-      'zarr://configured-owner/obs/manifest.json',
-      options,
-    );
-    const directVarLoader = createVarFieldLoader(
-      'zarr://configured-owner/var/manifest.json',
-      options,
-    );
-    await assert.rejects(directObsLoader(obsField), /cancel|abort/i);
-    await assert.rejects(directVarLoader(varField), /cancel|abort/i);
-    assert.equal(directCalls, 0);
-  },
-);
-
-test(
-  'field-loader factories preserve a configured top-level abort owner',
-  async t => {
-    const originalFetch = globalThis.fetch;
-    let fetchCalls = 0;
-    globalThis.fetch = async () => {
-      fetchCalls++;
-      return new Response(new Float32Array([1, 2]));
-    };
-    t.after(() => {
-      globalThis.fetch = originalFetch;
-    });
     const controller = new AbortController();
-    const exactAbort = new Error('top-level field-loader owner retired');
-    controller.abort(exactAbort);
+    controller.abort(new Error('configured field-loader owner retired'));
     const options = { signal: controller.signal };
-    const obsLoader = createObsFieldLoader(
-      'https://example.test/obs/manifest.json',
-      options,
-    );
-    const varLoader = createVarFieldLoader(
-      'https://example.test/var/manifest.json',
-      options,
-    );
     const obsField = {
-      centroids: null,
       key: 'score',
       kind: 'continuous',
+      fieldIndex: 0,
       outlierQuantilesPath: null,
-      quantized: false,
-      valuesDtype: 'float32',
-      valuesPath: 'score.values.f32',
     };
     const varField = {
       key: 'GAPDH',
       kind: 'continuous',
-      quantized: false,
-      valuesDtype: 'float32',
-      valuesPath: 'GAPDH.values.f32',
+      path: 'var/0',
     };
 
-    await assert.rejects(
-      obsLoader(obsField),
-      error => error?.name === 'AbortError',
+    const obsLoader = createObsFieldLoader(
+      'zarr://configured-owner/obs',
+      options,
     );
-    await assert.rejects(
-      varLoader(varField),
-      error => error?.name === 'AbortError',
+    const varLoader = createVarFieldLoader(
+      'zarr://configured-owner/var',
+      options,
     );
-    assert.equal(fetchCalls, 0);
+    await assert.rejects(obsLoader(obsField), error => error?.name === 'AbortError');
+    await assert.rejects(varLoader(varField), error => error?.name === 'AbortError');
+    assert.equal(directCalls, 0);
   },
 );
 
@@ -1190,12 +1110,15 @@ test(
 );
 
 const SESSION_DATA_MAPPING = Object.freeze({
-  kind: 'export',
+  kind: 'anndata',
   embeddings: {
-    enabled: [{ key: 'X_umap_3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: 'X_umap_3d', columns: null } },
+    enabled: [{ key: 'X_umap_3d', columns: [0, 1, 2] }],
+    defaults: { '1d': null, '2d': null, '3d': { key: 'X_umap_3d', columns: [0, 1, 2] } },
   },
+  knn: null,
   geneNames: 'index',
+  expression: 'X',
+  latent: null,
   vectorFields: [],
 });
 
@@ -1210,8 +1133,8 @@ function withFingerprintOwners(state, mapping = SESSION_DATA_MAPPING) {
     layoutKey: 'X_umap_3d',
     dimension: 3,
     label: 'UMAP 3D',
-    path: 'embeddings/0_3d.bin',
-    provenance: null,
+    path: 'obsm/0/0-1-2',
+    provenance: { key: 'X_umap_3d', columns: [0, 1, 2] },
     origin: 'identity',
   }]);
   dimensionManager.setRepresentations(['X_umap_3d'], new Map([[3, 'X_umap_3d']]));
@@ -1222,6 +1145,8 @@ function withFingerprintOwners(state, mapping = SESSION_DATA_MAPPING) {
     assert.equal(viewId, 'live');
     return 'X_umap_3d';
   };
+  // The manifest's `requires` is read from the focused view's state.
+  state.getActiveViewId = () => 'live';
   return state;
 }
 
@@ -1241,6 +1166,7 @@ function createSessionSerializer(contributor) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors: [contributor],
   });
 }
@@ -1325,6 +1251,7 @@ test(
       comparisonModule: null,
       analysisWindowManager: null,
       cinematicCamera: null,
+      figureExport: null,
       contributors: [{
         id: 'dataset-owned',
         async capture() {
@@ -1387,6 +1314,7 @@ test(
       comparisonModule: null,
       analysisWindowManager: null,
       cinematicCamera: null,
+      figureExport: null,
       contributors: [{
         id: 'dataset-owned',
         async capture() {
@@ -1736,3 +1664,32 @@ test(
     assert.match(confirmDialogSource, /return cancel;/);
   },
 );
+
+test('a field whose categories are found on load adopts them, renamed, and every later load reuses them', async () => {
+  const { FieldOverlayInternalMethods } = await import('../assets/js/app/state/managers/field/overlay-internals.js');
+  const field = { key: 'label', kind: 'category', categories: null, loaded: false };
+  const descriptor = Object.freeze({ key: 'label', kind: 'category', categories: null });
+  const state = createFieldLoadingState({ obsFields: [field], obsDescriptors: [descriptor] });
+  state._renameRegistry = {
+    getDisplayCategory: (_source, _key, label) => (label === 'a' ? 'Alpha' : label),
+  };
+  state._applyCategoryOverlay = FieldOverlayInternalMethods.prototype._applyCategoryOverlay;
+  state._syncCentroidCategoryLabels = () => {};
+  let loads = 0;
+  state.fieldLoader = async () => {
+    loads++;
+    return { codes: Uint8Array.from([1, 0]), categories: ['a', 'b'] };
+  };
+  await state.ensureFieldLoaded(0, { silent: true });
+  assert.deepEqual(field.categories, ['Alpha', 'b']);
+  assert.deepEqual(field._originalCategories, ['a', 'b']);
+  assert.deepEqual(Array.from(field.codes), [1, 0]);
+
+  // Another view's copy of the field, made before the load, takes them from
+  // the loaded data without loading again.
+  const clone = { key: 'label', kind: 'category', categories: null, loaded: false };
+  state.obsData = { fields: [clone] };
+  await state.ensureFieldLoaded(0, { silent: true });
+  assert.equal(loads, 1);
+  assert.deepEqual(clone.categories, ['Alpha', 'b']);
+});

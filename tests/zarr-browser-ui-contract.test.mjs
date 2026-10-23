@@ -51,23 +51,23 @@ const BROWSER_IDENTITIES = Object.freeze({
 
 function staticZarrChooserContract(_userAgent) {
   return {
-    directory:
-      indexHtml.includes('id="user-data-zarr-btn"') ||
-      indexHtml.includes('id="user-data-zarr-input"'),
+    folder:
+      indexHtml.includes('id="user-data-zarr-folder-btn"') &&
+      indexHtml.includes('id="user-data-zarr-folder-input"'),
     zip:
       indexHtml.includes('id="user-data-zarr-archive-btn"') &&
       indexHtml.includes('id="user-data-zarr-archive-input"'),
   };
 }
 
-test('the browser Zarr chooser is ZIP-only for every browser identity', async t => {
+test('the browser Zarr choosers are the same for every browser identity: a folder and a ZIP', async t => {
   for (const [browser, userAgent] of Object.entries(
     BROWSER_IDENTITIES
   )) {
     await t.test(browser, () => {
       assert.deepEqual(
         staticZarrChooserContract(userAgent),
-        { directory: false, zip: true }
+        { folder: true, zip: true }
       );
     });
   }
@@ -128,20 +128,35 @@ test('the portable Zarr chooser exposes exact guidance through the compact infor
     assert.match(tipText, new RegExp(browser, 'i'));
   }
 
+  // A Zarr store folder is chosen with a folder input; its hidden metadata
+  // files (.zgroup, .zattrs, .zmetadata) are part of the selection.
+  const folderButton = indexHtml.match(
+    /<button\b[^>]*id="user-data-zarr-folder-btn"[^>]*>[\s\S]*?<\/button>/
+  )?.[0];
+  assert.ok(folderButton, 'Zarr folder button is required');
+  assert.match(folderButton, />Zarr folder<\/button>/);
+  const folderInput = indexHtml.match(
+    /<input\b[^>]*id="user-data-zarr-folder-input"[^>]*>/
+  )?.[0];
+  assert.ok(folderInput, 'Zarr folder input is required');
+  assert.match(folderInput, /\btype="file"/);
+  assert.match(folderInput, /\bwebkitdirectory\b/);
+
   assert.doesNotMatch(indexHtml, /id="user-data-zarr-help"/);
-  assert.doesNotMatch(indexHtml, /Zarr folder/i);
   assert.doesNotMatch(indexHtml, /user-data-zarr-(?:btn|input)/);
 });
 
-test('DOM and event wiring expose no browser directory-load branch', () => {
+test('DOM and event wiring open a Zarr folder and a Zarr ZIP through their own pickers', () => {
   assert.doesNotMatch(
     domCacheSource,
     /userDataZarr(?:Btn|Input)/
   );
   assert.doesNotMatch(
     connectionSource,
-    /userDataZarr(?:Btn|Input)|loadFromZarrDirectory|LOCAL_ZARR_DIRECTORY/
+    /userDataZarr(?:Btn|Input)|LOCAL_ZARR_DIRECTORY/
   );
+  assert.match(connectionSource, /source\.loadFromZarrDirectory\(files\)/);
+  assert.match(connectionSource, /LOCAL_ZARR_FOLDER/);
   assert.match(
     connectionSource,
     /source\.loadFromZarrArchive\([\s\S]*files\.length === 1 \? files\[0\] : null/
@@ -162,6 +177,14 @@ test('DOM and event wiring expose no browser directory-load branch', () => {
   assert.equal(
     dom.dataset.userDataZarrArchiveInput.id,
     'user-data-zarr-archive-input'
+  );
+  assert.equal(
+    dom.dataset.userDataZarrFolderBtn.id,
+    'user-data-zarr-folder-btn'
+  );
+  assert.equal(
+    dom.dataset.userDataZarrFolderInput.id,
+    'user-data-zarr-folder-input'
   );
   assert.equal(
     Object.hasOwn(dom.dataset, 'userDataZarrBtn'),

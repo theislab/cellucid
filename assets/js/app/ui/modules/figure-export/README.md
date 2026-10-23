@@ -6,7 +6,7 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 
 - **Exact request semantics**: export format and SVG representation are never inferred, changed, retried, or substituted.
 - **View fidelity**: camera, filters, colors, framing, the reference layer (grid box or studio backdrop), and atmospheric fog come from the current view; PNG and Hybrid preserve the shader-rendered point pass, while vector strategies preserve their explicitly documented circle representation.
-- **Performance-safe**: heavy work runs only on explicit preview/export actions.
+- **Performance-safe**: heavy work runs only on explicit preview/export actions, and an export's per-cell passes and encodes run in the export worker, so the page's main thread stays responsive.
 - **DRY + extensible**: shared layout/components are reused across SVG + PNG.
 
 ### Main pieces
@@ -14,17 +14,20 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 - `index.js`: module entry point (wires UI + engine).
 - `figure-export-ui.js`: sidebar panel (collects user inputs + triggers export/preview).
 - `figure-export-engine.js`: snapshots current view buffers + orchestrates rendering/download/notifications.
+- `utils/figure-export-worker.js` + `utils/figure-export-worker-client.js`: the export's worker. Every per-cell pass and every encode runs there, never on the page's main thread: axis bounds, the shader-accurate point pass (on OffscreenCanvas WebGL2 contexts the worker keeps for the page's lifetime, one per antialiasing setting), the vector point markup, and PNG encoding with `OffscreenCanvas.convertToBlob` plus the `iTXt` metadata. Each rendered file opens a session: a typed array is copied to the worker once per session however many passes read it, and closing the session releases it. A request outliving its export's abort rejects at once; the worker's late answer is discarded (a frame closed). Node contract tests run the same handler in-process (`tests/helpers/figure-export-worker-in-process.mjs`).
   - Includes optional **framing crop** (photography-style overlay) so users can export a chosen sub-region of the current view without changing the camera.
   - Framing is locked to the selected plot size aspect; resizing the frame changes the exported region (zoom) without changing the camera.
 
 ### Renderers
 
-- `renderers/svg-renderer.js`: string-based SVG generator (no DOM) with:
+- `renderers/svg-renderer.js`: SVG generator (no DOM). The page writes the annotations as strings; the worker writes the points (`renderers/svg-point-markup.js`) and returns them as one Blob; the file is assembled from Blob parts, never joined into one string. Strategies:
   - **Full vector** (`full-vector`): every visible point is an SVG circle, exactly as requested.
   - **Optimized vector** (`optimized-vector`): density-preserving reduction to the user-entered target count, exactly as requested.
   - **Hybrid** (`hybrid`): points are embedded as a shader-rendered PNG while annotations remain vectors.
-- `renderers/png-renderer.js`: HTML Canvas exporter with embedded UTF-8 PNG `iTXt` metadata (`buildPngTextMetadata()` publishes the exact chunk map so it can be compared with the SVG's).
-  - Points are rasterized via WebGL2 using the same shader variants as the viewer, so 3D “sphere” shading exports correctly (not as flat dots).
+- `renderers/png-renderer.js`: HTML Canvas composer with embedded UTF-8 PNG `iTXt` metadata (`buildPngTextMetadata()` publishes the exact chunk map so it can be compared with the SVG's).
+  - Points are rasterized in the worker via WebGL2 using the same shader variants as the viewer, so 3D “sphere” shading exports correctly (not as flat dots); the frame comes back as an ImageBitmap and is copied one to one onto the plot's device pixels.
+  - The composed canvas crosses to the worker as an ImageBitmap and is encoded there with `OffscreenCanvas.convertToBlob`, the encoder `toBlob` uses: the bytes are those `toBlob` wrote (verified in Chromium, Firefox and WebKit).
+- `renderers/svg-point-markup.js`: the `<circle>` markup of Full Vector and Optimized Vector, encoded in the worker straight into a reused 1 MiB buffer whose contents become Blob parts, so memory is the file plus one buffer, and the markup is never a string.
 
 ### Components (shared building blocks)
 
@@ -70,16 +73,18 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 - `utils/fog.js`: the viewer's Beer-Lambert atmospheric fog, reproduced for the vector strategies. The `full` shader thins every point with distance (the one fog model of `rendering/shaders/fog-shaders.js`), so it fades into whatever is behind it — the paper, in a figure — and `fogDensity` starts at 0.5 — that is the depth cue a 3D scatter reads by. PNG and Hybrid run the shader; Full Vector and Optimized Vector project in JavaScript and would otherwise emit raw colours, flattening the depth axis. The sphere-impostor lighting term has no flat-disc equivalent and is not reproduced; it applies equally to every point regardless of depth, and the strategy hint says so.
 - `utils/figure-ink.js`: the ink a figure writes its annotations in. Title, ticks, axis labels, panel letters, legend text, plot frame, selection badge, and the "No visible cells" notice used to be hard-coded near-black on a near-white frame — correct on white paper and unreadable on any dark figure, including every `Background: Match viewer` export taken from `Grid (dark)` or `Black`. Ink is now derived from the figure's own background luminance, using the same grey family mirrored across the midpoint. A transparent figure keeps the light palette, matching the assumption the centroid-label halo already makes.
 - `utils/point-size.js`: the point diameter the figure is drawn with. `getEffectivePointDiameterPx()` applies the viewer's per-LOD size multiplier; `scalePointDiameterToRaster()` turns that into the diameter for a raster `s` times the on-screen viewport. `u_pointSize` is a *scale* and the rendered size is linear in it, so the only faithful answer is the exact product — a one-pixel floor inflates rather than protects (a dataset of around 400,000 cells opens at a point size of 0.75 and the default export is half the viewport, so a 150-DPI PNG asks for 0.586 and a floor would draw 1). The shaders' own `clamp(gl_PointSize, 0.5, 128.0)` is the minimum that keeps a point visible, applied to the rendered size where it belongs. PNG and Hybrid SVG resolve every raster point size here, so they cannot disagree about how big a cell is.
-- `utils/point-projector.js`: hot-path projection helper (supports optional depth sorting).
+- `utils/point-projector.js`: hot-path projection helper. A requested depth sort is an O(N) binned sort and is honoured at every point count.
 - `utils/density-reducer.js`: viewport-space density-preserving reduction (reservoir sampling).
 - `utils/coordinate-mapper.js`: reverse normalization for real-coordinate axes.
-- `utils/png-metadata.js`: validates the encoded PNG and injects UTF-8 `iTXt` chunks. The keyword set is built by `buildPngTextMetadata()` in `renderers/png-renderer.js`: `Software`, `Website`, `Creation Time`, `Dataset`, `Dataset ID`, `Color Field`, `Source File`, `Description`, `Comment`. Nothing else is written — no session identifier, no page URL, no user agent, no credential. `Source File` is whatever the data source published: a dataset URL, or, for a locally opened dataset, the directory or file **name** the browser exposes. Browsers never hand a page an absolute path, so none is embedded.
+- `utils/png-metadata.js`: runs in the worker; validates the encoded PNG (every chunk CRC, with the shared slicing-by-16 CRC-32 of `formats/zip/crc32.js`) and injects UTF-8 `iTXt` chunks. The keyword set is built by `buildPngTextMetadata()` in `renderers/png-renderer.js`: `Software`, `Website`, `Creation Time`, `Dataset`, `Dataset ID`, `Color Field`, `Source File`, `Description`, `Comment`. Nothing else is written — no session identifier, no page URL, no user agent, no credential. `Source File` is whatever the data source published: a dataset URL, or, for a locally opened dataset, the directory or file **name** the browser exposes. Browsers never hand a page an absolute path, so none is embedded.
 - `utils/colorblindness.js`: preview-only colorblind simulation (matrix transform).
-- `utils/webgl-point-rasterizer.js`: shader-accurate point rasterization for PNG + Hybrid SVG. Its context is created with the antialiasing the viewer is drawing with **at the moment of the export** (`viewer.getAntialiasing()`), carried through the render state. Antialiasing is a live setting that also follows the dataset, and the viewer's own control measures the difference at 18% of pixels at point size 0.75 and 32% with ultra-light square points, so a fixed `true` here — or a value read once at startup — would publish a smoother cloud than the screen ever drew.
+- `utils/webgl-point-rasterizer.js`: shader-accurate point rasterization for PNG + Hybrid SVG, run only in the worker on OffscreenCanvas; a pass returns its frame with `transferToImageBitmap()` and its canvas shrinks to one pixel. Its context is created with the antialiasing the viewer is drawing with **at the moment of the export** (`viewer.getAntialiasing()`), carried through the render state. Antialiasing is a live setting that also follows the dataset, and the viewer's own control measures the difference at 18% of pixels at point size 0.75 and 32% with ultra-light square points, so a fixed `true` here — or a value read once at startup — would publish a smoother cloud than the screen ever drew.
 
 ### Performance notes
 
-- SVG export is **string-based** to avoid DOM overhead at 50k+ points.
+- SVG export writes strings, not DOM, and the points as Blob parts in the worker: no main-thread task formats a point or holds the whole file as one string.
+- A batch ZIP checksums each entry 4 MiB at a time, one slice per task, with the shared CRC-32, and takes the entry Blobs themselves as its parts (no copy).
+- `utils/session-settings.js`: the panel's settings as a session records them (`exportSessionSettings()` / `importSessionSettings()` on the panel): one versioned plain object, read strictly, without derived values. A number box half-way through an edit contributes its last valid value.
 - Every SVG export requires an explicit point strategy. Cellucid never changes Full Vector, Optimized Vector, or Hybrid based on data size, view dimension, renderer availability, or a render failure.
 - Full Vector and Optimized Vector intentionally represent points as editable circles; Hybrid intentionally preserves the WebGL shader point pass. Cellucid does not override or block a valid vector choice merely because Hybrid would look closer to a shaded 3D viewport.
 - PNG-only requests carry no SVG strategy. Mixed SVG + PNG requests use the explicitly selected strategy only for the SVG job.

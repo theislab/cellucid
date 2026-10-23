@@ -159,7 +159,7 @@ test('restoring a session reproduces its exact state instead of merging onto the
 
   // --- Load session A back into that same tab.
   const outcome = await serializer.restoreFilters(sessionA, { signal: null });
-  assert.deepEqual(outcome, { restored: 1 });
+  assert.deepEqual(outcome, { restored: 1, outliersNotRestored: [] });
 
   assert.deepEqual(
     snapshotEffectiveState(state),

@@ -17,11 +17,11 @@ import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
-const SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');
+const SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/catalog/');
 
 function launchUrl() {
   return (
-    `/?exportsBaseUrl=${encodeURIComponent(SAMPLE_ROOT)}` +
+    `/?sampleCatalog=${encodeURIComponent(SAMPLE_ROOT)}` +
     '&acceptance=stats-line-active-field'
   );
 }
@@ -41,7 +41,7 @@ test('the statistics line names the active field of the view being shown', async
   await page.goto(launchUrl(), { waitUntil: 'domcontentloaded' });
   await page.getByRole('button', { name: /Choose a dataset/ }).click();
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const stats = page.locator('#stats');

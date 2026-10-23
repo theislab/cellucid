@@ -87,34 +87,30 @@ function renderState({ antialias = true } = {}) {
 }
 
 /**
- * A document whose canvas records the context attributes and then declines.
+ * An OffscreenCanvas that records the context attributes and then declines.
  *
  * Declining is what keeps this a real exercise of the shipped path rather than
- * a source sweep: the rasterizer asks for its context exactly once, with the
- * attributes it decided on, before anything needs a GPU.
+ * a source sweep: the rasterizer (which runs in the figure-export worker, on an
+ * OffscreenCanvas) asks for its context exactly once, with the attributes it
+ * decided on, before anything needs a GPU.
  */
-function recordingDocument(record) {
-  return {
-    createElement(tagName) {
-      assert.equal(tagName, 'canvas');
-      return {
-        width: 0,
-        height: 0,
-        getContext(type, attributes) {
-          record.push({ type, attributes });
-          return null;
-        },
-      };
-    },
+function recordingOffscreenCanvas(record) {
+  return class RecordingOffscreenCanvas {
+    constructor(width, height) {
+      this.width = width;
+      this.height = height;
+    }
+
+    getContext(type, attributes) {
+      record.push({ type, attributes });
+      return null;
+    }
   };
 }
 
 function rasterizeWith(state, record) {
-  const previousDocument = Object.getOwnPropertyDescriptor(
-    globalThis,
-    'document'
-  );
-  globalThis.document = recordingDocument(record);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
+  globalThis.OffscreenCanvas = recordingOffscreenCanvas(record);
   try {
     rasterizePointsWebgl({
       positions: Float32Array.from([0, 0, 0]),
@@ -127,8 +123,8 @@ function rasterizeWith(state, record) {
       pointSizePx: 4,
     });
   } finally {
-    if (previousDocument === undefined) delete globalThis.document;
-    else Object.defineProperty(globalThis, 'document', previousDocument);
+    if (previous === undefined) delete globalThis.OffscreenCanvas;
+    else Object.defineProperty(globalThis, 'OffscreenCanvas', previous);
   }
 }
 

@@ -32,9 +32,10 @@ import {
 import { GenesPanelController } from '../../genes-panel/genes-panel-controller.js';
 import { encodeGroupName } from '../../genes-panel/expression-matrix-builder.js';
 import { HoverContext } from '../components/hover-context.js';
-import { ProgressTracker } from '../../shared/progress-tracker.js';
+import { CancellableJob, isCancellation } from '../../../jobs/cancellable-job.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import { downloadCSV, toCSVCell } from '../../shared/analysis-utils.js';
+import { downloadCSV } from '../../shared/analysis-utils.js';
+import { toCSVCell } from '../../compute/csv-export.js';
 import {
   DEFAULTS,
   DISTANCE_OPTIONS,
@@ -43,6 +44,12 @@ import {
   ANALYSIS_PHASES
 } from '../../genes-panel/constants.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetGenes,
+  requireDatasetVariable
+} from '../../shared/analysis-result-session.js';
 
 // =============================================================================
 // GENES PANEL UI
@@ -53,6 +60,172 @@ import { setOwnDataProperty } from '../../../../utils/exact-record.js';
  *
  * @extends FormBasedAnalysisUI
  */
+/** Prefix of a marker group's synthetic ID, `category-code:<code>`. */
+const GROUP_ID_PREFIX = 'category-code:';
+/** Prefix of a marker group in a session result: the category, by value. */
+const GROUP_KEY_PREFIX = 'category:';
+
+function isPlainRecord(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isDendrogramNode(value) {
+  return isPlainRecord(value) && typeof value.isLeaf === 'boolean' && Number.isSafeInteger(value.id);
+}
+
+/**
+ * A dendrogram as typed columns: leaves are IDs 0..n-1, merge k is node
+ * n + k with children `left[k]`, `right[k]` at `height[k]`.
+ * @param {Object} root
+ * @returns {{leafCount: number, left: Int32Array, right: Int32Array, height: Float64Array}}
+ */
+function flattenDendrogram(root) {
+  const internal = [];
+  let leafCount = 0;
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!isDendrogramNode(node)) throw new TypeError('Marker dendrogram holds an invalid node');
+    if (node.isLeaf) {
+      leafCount++;
+      continue;
+    }
+    internal.push(node);
+    stack.push(node.right, node.left);
+  }
+  const merges = internal.length;
+  if (merges !== leafCount - 1) throw new TypeError('Marker dendrogram is not a binary tree');
+  const left = new Int32Array(merges);
+  const right = new Int32Array(merges);
+  const height = new Float64Array(merges);
+  const seen = new Uint8Array(merges);
+  for (const node of internal) {
+    const k = node.id - leafCount;
+    if (k < 0 || k >= merges || seen[k] === 1) {
+      throw new TypeError('Marker dendrogram node IDs must number the merges after the leaves');
+    }
+    seen[k] = 1;
+    left[k] = node.left.id;
+    right[k] = node.right.id;
+    height[k] = node.height;
+  }
+  return { leafCount, left, right, height };
+}
+
+function rebuildDendrogram(flat) {
+  const { leafCount, left, right, height } = flat;
+  if (
+    !Number.isSafeInteger(leafCount) || leafCount < 2 ||
+    !(left instanceof Int32Array) || !(right instanceof Int32Array) ||
+    !(height instanceof Float64Array) ||
+    left.length !== leafCount - 1 || right.length !== left.length || height.length !== left.length
+  ) {
+    throw new TypeError('A restored marker dendrogram must hold one merge per leaf but one');
+  }
+  const nodes = new Array(2 * leafCount - 1);
+  for (let id = 0; id < leafCount; id++) {
+    nodes[id] = { id, isLeaf: true, height: 0, left: null, right: null };
+  }
+  for (let k = 0; k < left.length; k++) {
+    const id = leafCount + k;
+    const a = nodes[left[k]];
+    const b = nodes[right[k]];
+    if (left[k] >= id || right[k] >= id || a === undefined || b === undefined) {
+      throw new TypeError('A restored marker dendrogram merges a node before it exists');
+    }
+    nodes[id] = { id, isLeaf: false, height: height[k], left: a, right: b };
+  }
+  return nodes[nodes.length - 1];
+}
+
+/**
+ * Copy a marker result for a session: group IDs (codes) become their
+ * categories by value, and dendrograms become typed columns. Shared objects
+ * stay shared; the live result is not changed.
+ *
+ * @param {unknown} value
+ * @param {(groupId: string) => string} groupKeyOf
+ * @returns {unknown}
+ */
+function markerResultForSession(value, groupKeyOf) {
+  const copies = new Map();
+  const visit = (node, key) => {
+    if (node === null || typeof node !== 'object' || ArrayBuffer.isView(node)) {
+      if ((key === 'groupId') && typeof node === 'string') return groupKeyOf(node);
+      return node;
+    }
+    if (copies.has(node)) return copies.get(node);
+    if ((key === 'rowDendrogram' || key === 'colDendrogram') && isDendrogramNode(node)) {
+      const flat = flattenDendrogram(node);
+      copies.set(node, flat);
+      return flat;
+    }
+    if (Array.isArray(node)) {
+      const out = [];
+      copies.set(node, out);
+      for (const item of node) {
+        out.push(key === 'groupIds' && typeof item === 'string' ? groupKeyOf(item) : visit(item, null));
+      }
+      return out;
+    }
+    if (!isPlainRecord(node)) return node;
+    const out = {};
+    copies.set(node, out);
+    const rekey = key === 'groups' && Object.values(node).every(
+      group => isPlainRecord(group) && typeof group.groupId === 'string'
+    );
+    for (const [childKey, child] of Object.entries(node)) {
+      setOwnDataProperty(out, rekey ? groupKeyOf(childKey) : childKey, visit(child, childKey));
+    }
+    return out;
+  };
+  return visit(value, null);
+}
+
+/**
+ * Undo `markerResultForSession` on a decoded value, in place.
+ *
+ * @param {unknown} value
+ * @param {(groupKey: string) => string} groupIdOf
+ */
+function markerResultFromSession(value, groupIdOf) {
+  const seen = new Set();
+  const visit = node => {
+    if (node === null || typeof node !== 'object' || ArrayBuffer.isView(node) || seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      const child = node[key];
+      if (key === 'groupId' && typeof child === 'string') {
+        node[key] = groupIdOf(child);
+      } else if (key === 'groupIds' && Array.isArray(child)) {
+        if (seen.has(child)) continue;
+        seen.add(child);
+        for (let i = 0; i < child.length; i++) child[i] = groupIdOf(child[i]);
+      } else if ((key === 'rowDendrogram' || key === 'colDendrogram') && isPlainRecord(child) && 'leafCount' in child) {
+        node[key] = rebuildDendrogram(child);
+      } else if (key === 'groups' && isPlainRecord(child) && Object.values(child).every(
+        group => isPlainRecord(group) && typeof group.groupId === 'string'
+      )) {
+        const entries = Object.entries(child);
+        for (const [groupKey] of entries) delete child[groupKey];
+        for (const [groupKey, group] of entries) {
+          visit(group);
+          setOwnDataProperty(child, groupIdOf(groupKey), group);
+        }
+      } else {
+        visit(child);
+      }
+    }
+  };
+  visit(value);
+}
+
 export class GenesPanelUI extends FormBasedAnalysisUI {
   /**
    * Get page requirements for this analysis type
@@ -96,8 +269,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     /** @type {Map<HTMLElement, { context: HoverContext, binding: Object }>} */
     this._hoverOwners = new Map();
 
-    /** @type {ProgressTracker|null} */
-    this._progressTracker = null;
+    /** @type {CancellableJob|null} The heatmap's gene reads after a run (Top N) */
+    this._heatmapJob = null;
 
     /** @type {HTMLElement|null} Custom genes textarea */
     this._customGenesInput = null;
@@ -151,6 +324,28 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /**
+   * What a run costs: every gene (or the custom list) read in every cell,
+   * each category of the chosen field tested against the rest (or, for a
+   * custom list, averaged per category).
+   * @override
+   */
+  _describeRunCost() {
+    const form = this._formContainer?.querySelector('.analysis-form');
+    const field = form?.querySelector('[name="obsCategory"]')?.value ?? '';
+    const mode = form?.querySelector('[name="mode"]')?.value ?? '';
+    const cells = this.dataLayer.state?.pointCount;
+    if (field.length === 0 || !Number.isSafeInteger(cells)) return null;
+    const genes = mode === 'custom'
+      ? (this._customGenesInput?.value ?? '').split(/[\n,]+/).filter(gene => gene.trim().length > 0).length
+      : this.dataLayer.getAvailableVariables('gene_expression').length;
+    if (genes === 0) return null;
+    return mode === 'custom'
+      ? `Reads ${formatCount(genes)} genes in ${formatCount(cells)} cells, averaged per category of ${field}.`
+      : `Reads ${formatCount(genes)} genes in ${formatCount(cells)} cells, ` +
+        `testing each category of ${field} against the rest.`;
+  }
+
+  /**
    * @override
    */
   _getClassName() {
@@ -162,13 +357,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    */
   _getRunButtonText() {
     return 'Discover markers';
-  }
-
-  /**
-   * @override
-   */
-  _getLoadingMessage() {
-    return 'Discovering marker genes...';
   }
 
   /**
@@ -370,8 +558,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /**
-   * Override _runAnalysis to use ProgressTracker for detailed progress notifications.
-   * This replaces the base class's runAnalysisWithLoadingState with proper progress tracking.
+   * Run marker discovery as a cancellable job: the status view and the job's
+   * notification say which phase runs and how many genes are done, with
+   * Cancel; the result is shown and cached only once it is complete.
    * @override
    */
   async _runAnalysis() {
@@ -390,166 +579,67 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const requestId = this._startAnalysisRequest();
     if (requestId === null) return;
-
-    // Get run button for state management
-    const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
-    const originalText = runBtn?.textContent;
-    let buttonRestored = false;
-    const restoreButton = () => {
-      if (!runBtn || buttonRestored) return;
-      runBtn.disabled = false;
-      runBtn.textContent = originalText;
-      buttonRestored = true;
-    };
-
-    // Update button state
-    if (runBtn) {
-      runBtn.disabled = true;
-      runBtn.textContent = 'Running...';
-    }
-
-    // Create progress tracker with phases matching the controller
-    const progressTracker = new ProgressTracker({
-      totalItems: 1, // Updated dynamically once totals are known
-      phases: [
-        ANALYSIS_PHASES.INIT,
-        ANALYSIS_PHASES.DISCOVERY,
-        ANALYSIS_PHASES.MATRIX,
-        ANALYSIS_PHASES.CLUSTERING,
-        ANALYSIS_PHASES.RENDER
-      ],
-      title: 'Marker gene discovery',
-      category: 'calculation',
-      showNotification: true
-    });
-
-    this._progressTracker = progressTracker;
-    progressTracker.start();
-    let progressSettled = false;
-    const controllerRunOwner = {
-      controller: null,
-      active: false
-    };
-    this._registerAnalysisInvalidationCleanup(requestId, () => {
-      const cleanupErrors = [];
-      if (controllerRunOwner.active) {
-        controllerRunOwner.active = false;
-        try {
-          controllerRunOwner.controller.abort();
-        } catch (error) {
-          cleanupErrors.push(error);
-        }
-      }
-      if (!progressSettled) {
-        try {
-          progressTracker.cancel();
-        } catch (error) {
-          cleanupErrors.push(error);
-        }
-        progressSettled = true;
-      }
-      if (this._progressTracker === progressTracker) {
-        this._progressTracker = null;
-      }
-      try {
-        restoreButton();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-      if (cleanupErrors.length === 1) throw cleanupErrors[0];
-      if (cleanupErrors.length > 1) {
-        throw new AggregateError(
-          cleanupErrors,
-          'Genes Panel request invalidation cleanup failed'
-        );
-      }
-    });
+    const discardTask = this._discardFormResult();
+    const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
+    this._holdRunButton(requestId, job);
 
     try {
-      const analysisOutput = await this._runAnalysisImpl(
-        formValues,
-        requestId,
-        progressTracker,
-        controllerRunOwner
-      );
+      if (discardTask && typeof discardTask.then === 'function') {
+        await discardTask;
+      }
+      const analysisOutput = this._isCurrentAnalysisRequest(requestId)
+        ? await this._runAnalysisImpl(formValues, requestId, job)
+        : null;
+      if (analysisOutput === null || !this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
+      const { result, fullMatrix } = analysisOutput;
 
-      if (analysisOutput) {
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-        const { result, fullMatrix } = analysisOutput;
+      job.step(ANALYSIS_PHASES.RENDER);
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
 
-        await this._showResult(result, requestId);
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
+      this._fullMatrix = fullMatrix;
+      this._committedGeneListMode = this._modalGeneListMode;
+      await this._publishAnalysisResult(result, requestId);
+      job.succeed('Marker genes discovery complete');
 
-        progressTracker.complete('Marker genes discovery complete');
-        progressSettled = true;
-        this._fullMatrix = fullMatrix;
-        this._committedGeneListMode = this._modalGeneListMode;
-        await this._publishAnalysisResult(result, requestId);
-
-        // Callback
-        if (this.onResultChange) {
-          this.onResultChange(result);
-        }
+      // Callback
+      if (this.onResultChange) {
+        this.onResultChange(result);
       }
     } catch (error) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[GenesPanelUI] Analysis error:', error);
-      progressTracker.fail(`Analysis failed: ${error.message}`);
-      progressSettled = true;
-    } finally {
-      if (
-        this._isCurrentAnalysisRequest(requestId) &&
-        this._progressTracker === progressTracker
-      ) {
-        this._progressTracker = null;
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
       }
+      // The job's status view and notification say why; a cancel is calm.
+      this._failAnalysisJob(job, error);
+    } finally {
       this._finishAnalysisRequest(requestId);
-      if (!this._isLoading) restoreButton();
     }
   }
 
   /**
    * @override
    */
-  async _runAnalysisImpl(
-    formValues,
-    requestId,
-    progressTracker,
-    controllerRunOwner = null
-  ) {
-    // Initialize controller if needed
-    if (!this._controller) {
-      this._controller = new GenesPanelController({
-        dataLayer: this.dataLayer
-      });
-      await this._controller.init();
-    }
+  async _runAnalysisImpl(formValues, requestId, job) {
+    await this._ensureController();
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
-    // Run analysis with progress updates
+    // Run analysis with progress updates; the job's signal cancels it.
     const controller = this._controller;
-    if (controllerRunOwner !== null) {
-      controllerRunOwner.controller = controller;
-      controllerRunOwner.active = true;
-    }
-    let panelResult;
-    try {
-      panelResult = await controller.runAnalysis({
-        ...formValues,
-        onProgress: (progress) => {
-          if (this._isCurrentAnalysisRequest(requestId)) {
-            this._updateProgress(progress, progressTracker);
-          }
+    const panelResult = await controller.runAnalysis({
+      ...formValues,
+      signal: job.signal,
+      readOwner: job.id,
+      onProgress: (progress) => {
+        if (this._isCurrentAnalysisRequest(requestId)) {
+          this._updateProgress(progress, job);
         }
-      });
-    } finally {
-      if (
-        controllerRunOwner !== null &&
-        controllerRunOwner.controller === controller
-      ) {
-        controllerRunOwner.active = false;
       }
-    }
+    });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
     let fullMatrix = panelResult.matrix;
@@ -570,17 +660,21 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         selectedGenes.length > 0 &&
         !this._matrixCoversGenes(fullMatrix, selectedGenes)
       ) {
-        const { groups } = await controller.getGroupsAndCodes(
+        const { groups, obsCodes } = await controller.getGroupsAndCodes(
           formValues.obsCategory,
-          {}
+          { signal: job.signal }
         );
         if (!this._isCurrentAnalysisRequest(requestId)) return null;
         fullMatrix = await controller.buildMatrixForGenes({
           genes: selectedGenes,
           groups,
+          markers: panelResult.markers,
+          obsCodes,
           transform: formValues.transform,
           batchConfig: panelResult.metadata?.batchConfig || {},
-          onProgress: null
+          onProgress: null,
+          signal: job.signal,
+          readOwner: job.id
         });
         if (!this._isCurrentAnalysisRequest(requestId)) return null;
         if (!this._matrixCoversGenes(fullMatrix, selectedGenes)) {
@@ -1715,7 +1809,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
           'Missing marker genes require an exact matrix rebuild owner'
         );
       }
-      const { groups } = await ownedController.getGroupsAndCodes(
+      const { groups, obsCodes } = await ownedController.getGroupsAndCodes(
         obsCategory,
         {}
       );
@@ -1726,13 +1820,43 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       )) {
         return null;
       }
-      canonicalMatrix = await ownedController.buildMatrixForGenes({
-        genes: wantedGenes,
-        groups,
-        transform: targetTransform,
-        batchConfig: ownedResult.metadata?.batchConfig || {},
-        onProgress: null
+      // The genes the heatmap now shows that the run did not read: one job,
+      // superseded by the next change, cancelled with the panel.
+      this._heatmapJob?.cancel();
+      const job = new CancellableJob({
+        title: 'Marker genes heatmap',
+        readKind: 'analysis',
+        notifications: this._notifications
       });
+      this._heatmapJob = job;
+      job.step('Reading genes');
+      try {
+        canonicalMatrix = await ownedController.buildMatrixForGenes({
+          genes: wantedGenes,
+          groups,
+          markers: ownedResult.markers,
+          obsCodes,
+          transform: targetTransform,
+          batchConfig: ownedResult.metadata?.batchConfig || {},
+          onProgress: progress => {
+            if (Number.isFinite(progress?.loaded) && progress.total > 0) {
+              job.items(progress.loaded, progress.total, 'genes');
+            }
+          },
+          signal: job.signal,
+          readOwner: job.id
+        });
+        job.succeed(`Marker genes heatmap: ${formatCount(wantedGenes.length)} genes`);
+      } catch (error) {
+        if (isCancellation(error)) {
+          job.cancel();
+          return null;
+        }
+        job.fail(error);
+        throw error;
+      } finally {
+        if (this._heatmapJob === job) this._heatmapJob = null;
+      }
       if (!this._isGeneHeatmapIntentCurrent(
         revision,
         ownedResult,
@@ -2481,50 +2605,26 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /**
-   * Update progress display via ProgressTracker
-   * Called by the controller during analysis with { phase, progress, message }
+   * Tell the run's job what the controller reports: the phase, and genes
+   * done of how many while genes are read.
    * @private
-   * @param {Object} progress - Progress info from controller
-   * @param {string} progress.phase - Current phase name
-   * @param {number} progress.progress - Progress percentage (0-100)
-   * @param {string} progress.message - Progress message
+   * @param {{phase?: string, progress?: number, loaded?: number, total?: number, message?: string}} progress
+   * @param {import('../../../jobs/cancellable-job.js').CancellableJob} job
    */
-  _updateProgress(progress, progressTracker = this._progressTracker) {
-    if (!progressTracker) return;
-
-    const { phase, progress: percent, loaded, total, message } = progress || {};
-
-    // Keep the ProgressTracker's phase in sync with controller emissions so the
-    // notification doesn't appear "stuck" on the initial phase.
-    if (typeof phase === 'string' && phase.length > 0) {
-      // If phase changes, reset the per-phase counters for a sane ETA.
-      const prevPhase = progressTracker.getStats()?.phase;
-      if (prevPhase !== phase) {
-        progressTracker.setPhase(phase);
-        progressTracker.setTotalItems(100);
-        progressTracker.setCompletedItems(0);
-      } else {
-        progressTracker.setPhase(phase);
-      }
+  _updateProgress(progress, job) {
+    const { phase, loaded, total, message } = progress || {};
+    if (Number.isFinite(loaded) && Number.isFinite(total) && total > 0) {
+      job.items(loaded, total, 'genes');
+      job.step(typeof phase === 'string' && phase.length > 0 ? phase : 'Reading genes');
+      return;
     }
-
-    if (Number.isFinite(total) && total > 0) {
-      progressTracker.setTotalItems(total);
-    }
-
-    if (Number.isFinite(loaded)) {
-      progressTracker.setCompletedItems(loaded);
-    } else if (Number.isFinite(percent)) {
-      // For phases that only report percentage (e.g., init/clustering), treat
-      // the phase total as 100.
-      if (!Number.isFinite(total) || total <= 0) {
-        progressTracker.setTotalItems(100);
-      }
-      progressTracker.setCompletedItems(Math.floor(percent));
-    }
-
-    const displayMessage = message || (phase ? `${phase}...` : 'Working...');
-    progressTracker.setMessage(displayMessage);
+    // A phase counted in percent only (groups, clustering).
+    job.items(0, 0);
+    job.step(
+      typeof message === 'string' && message.length > 0
+        ? message.replace(/\.\.\.$|…$/, '')
+        : (phase ?? 'Working')
+    );
   }
 
   /**
@@ -2533,15 +2633,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   destroy() {
     if (this._destroyPromise != null) return this._destroyPromise;
     const errors = [];
-    const progressTracker = this._progressTracker;
-    this._progressTracker = null;
-    if (progressTracker !== null) {
-      try {
-        progressTracker.cancel();
-      } catch (error) {
-        errors.push(error);
-      }
-    }
+    this._heatmapJob?.cancel();
+    this._heatmapJob = null;
     try {
       this._teardownHoverContext();
     } catch (error) {
@@ -2576,6 +2669,120 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     this._destroyPromise = destruction;
     void destruction.catch(() => {});
     return destruction;
+  }
+
+  /**
+   * Create and open the controller marker runs and heatmap changes use.
+   * @returns {Promise<GenesPanelController>}
+   * @private
+   */
+  async _ensureController() {
+    if (!this._controller) {
+      this._controller = new GenesPanelController({
+        dataLayer: this.dataLayer
+      });
+      await this._controller.init();
+    }
+    return this._controller;
+  }
+
+  /**
+   * The shown result for a session: the heatmap result, the full matrix
+   * behind it and the gene list it was committed for. Marker groups are named
+   * by their category value (`category:<JSON value>`) instead of the
+   * category's code, genes by key, and dendrograms as typed merge columns.
+   * @returns {null|{kind: 'markers', version: number, payload: unknown}}
+   */
+  exportResult() {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    const obsCategory = this._lastResult.metadata?.obsCategory;
+    const categories = requireDatasetVariable(
+      this.dataLayer,
+      'categorical_obs',
+      obsCategory,
+      'The marker genes result'
+    ).categories;
+    if (!Array.isArray(categories)) {
+      throw new Error(`Marker genes field "${obsCategory}" has no loaded categories`);
+    }
+    const groupKeyOf = groupId => {
+      const code = groupId.startsWith(GROUP_ID_PREFIX)
+        ? Number(groupId.slice(GROUP_ID_PREFIX.length))
+        : NaN;
+      if (!Number.isSafeInteger(code) || code < 0 || code >= categories.length) {
+        throw new RangeError(`Marker group "${groupId}" names no category of "${obsCategory}"`);
+      }
+      return GROUP_KEY_PREFIX + JSON.stringify(categories[code]);
+    };
+    return createResultEnvelope('markers', markerResultForSession({
+      result: this._lastResult,
+      fullMatrix: this._fullMatrix,
+      committedGeneListMode: this._committedGeneListMode
+    }, groupKeyOf));
+  }
+
+  /**
+   * Restore a result written by `exportResult()`; refused when it names a
+   * gene, the grouping field or a category the open dataset lacks.
+   * @param {null|Object} envelope
+   * @returns {Promise<void>}
+   */
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const payload = readResultEnvelope(envelope, 'markers');
+    const keys = isPlainRecord(payload) ? Object.keys(payload).sort().join(',') : '';
+    if (keys !== 'committedGeneListMode,fullMatrix,result') {
+      throw new TypeError(
+        'A marker genes result must hold exactly result, fullMatrix and committedGeneListMode'
+      );
+    }
+    const { result } = payload;
+    const obsCategory = result?.metadata?.obsCategory;
+    if (result?.type !== 'genes_panel' || result.plotType !== 'gene-heatmap') {
+      throw new TypeError('A marker genes result must hold a gene heatmap result');
+    }
+    requireDatasetVariable(this.dataLayer, 'categorical_obs', obsCategory, 'The marker genes result');
+    await this.dataLayer.ensureObsFieldLoaded(obsCategory);
+    const categories = this.dataLayer.getVariableInfo('categorical_obs', obsCategory)?.categories;
+    if (!Array.isArray(categories)) {
+      throw new Error(`Marker genes field "${obsCategory}" has no categories`);
+    }
+    const codeOf = new Map();
+    for (let code = 0; code < categories.length; code++) {
+      codeOf.set(JSON.stringify(categories[code]), code);
+    }
+    markerResultFromSession(payload, groupKey => {
+      if (typeof groupKey !== 'string' || !groupKey.startsWith(GROUP_KEY_PREFIX)) {
+        throw new TypeError(`Marker group "${String(groupKey)}" is not named by its category`);
+      }
+      const code = codeOf.get(groupKey.slice(GROUP_KEY_PREFIX.length));
+      if (code === undefined) {
+        throw new Error(
+          `The marker genes result names category ${groupKey.slice(GROUP_KEY_PREFIX.length)}, ` +
+          `which field "${obsCategory}" lacks`
+        );
+      }
+      return GROUP_ID_PREFIX + code;
+    });
+    const genes = [];
+    for (const matrix of [result.data?.matrix, payload.fullMatrix]) {
+      if (Array.isArray(matrix?.genes)) genes.push(...matrix.genes);
+    }
+    for (const group of Object.values(result.markers?.groups ?? {})) {
+      for (const marker of group?.markers ?? []) genes.push(marker?.gene);
+    }
+    if (Array.isArray(result.markers?.stats?.genes)) genes.push(...result.markers.stats.genes);
+    requireDatasetGenes(this.dataLayer, genes, 'The marker genes result');
+    await this._ensureController();
+    await this._restoreAnalysisResult(result, {
+      beforePublish: () => {
+        this._fullMatrix = payload.fullMatrix;
+        this._committedGeneListMode = payload.committedGeneListMode;
+      }
+    });
   }
 
   exportSettings() {

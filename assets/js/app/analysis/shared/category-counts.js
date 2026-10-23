@@ -53,3 +53,18 @@ export function adoptCategoryCounts(values, counts) {
   }
   countsByValues.set(values, counts);
 }
+
+/**
+ * The value a page holds for its `index`-th cell: a categorical page's label
+ * (its codes decoded through `categories`, null for `missingCode`), or the
+ * value itself.
+ *
+ * @param {{values: ArrayLike<unknown>, categories?: string[], missingCode?: number}} page
+ * @param {number} index
+ * @returns {unknown}
+ */
+export function pageValueAt(page, index) {
+  const value = page.values[index];
+  if (!Array.isArray(page.categories)) return value;
+  return value === page.missingCode ? null : page.categories[value];
+}

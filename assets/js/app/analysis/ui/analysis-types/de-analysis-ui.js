@@ -28,7 +28,12 @@ import {
 // (_renderModalStats, _renderModalAnnotations), which is the only DE result view.
 import { createPageComparisonSelector } from '../components/index.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
-import { ProgressTracker } from '../../shared/progress-tracker.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetGenes,
+  requireDatasetPages
+} from '../../shared/analysis-result-session.js';
 
 /**
  * Differential Expression Analysis UI Component
@@ -76,9 +81,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     // Bind handlers
     this._handleComparisonChange = this._handleComparisonChange.bind(this);
-
-    /** @type {ProgressTracker|null} */
-    this._progressTracker = null;
   }
 
   /**
@@ -125,27 +127,22 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   }
 
   /**
+   * What a run costs: every gene, tested in the two pages' cells.
+   * @override
+   */
+  _describeRunCost() {
+    if (!Array.isArray(this._comparisonPages) || this._comparisonPages.length !== 2) return null;
+    const genes = this.dataLayer.getAvailableVariables('gene_expression').length;
+    const [a, b] = this._comparisonPages.map(pageId => this.dataLayer.getCellCountForPageId(pageId));
+    return `Tests ${formatCount(genes)} genes in ${formatCount(a)} vs ${formatCount(b)} cells.`;
+  }
+
+  /**
    * Get CSS class prefix
    * @returns {string}
    */
   _getClassName() {
     return 'de-analysis';
-  }
-
-  /**
-   * Get loading notification message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    return 'Running differential expression...';
-  }
-
-  /**
-   * Get success notification message
-   * @returns {string}
-   */
-  _getSuccessMessage() {
-    return 'Differential expression complete';
   }
 
   /**
@@ -231,9 +228,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   /**
    * Run the differential expression analysis
    * @param {Object} formValues - Form values
-   * @returns {Promise<Object>} Analysis result
+   * @param {number} requestId
+   * @param {import('../../../jobs/cancellable-job.js').CancellableJob} job -
+   *   The run's job: told every gene tested; its signal stops the gene
+   *   reads and the worker tasks
+   * @returns {Promise<Object|null>} Analysis result
    */
-  async _runAnalysisImpl(formValues, requestId, progressTracker) {
+  async _runAnalysisImpl(formValues, requestId, job) {
     if (
       !Array.isArray(this._comparisonPages) ||
       this._comparisonPages.length !== 2
@@ -266,11 +267,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       method: formValues.method,
       parallelism: formValues.parallelism,
       batchConfig: formValues.batchConfig,
-      onProgress: (progress) => {
-        if (this._isCurrentAnalysisRequest(requestId)) {
-          this._updateProgress(progress, progressTracker);
-        }
-      },
+      job,
       isCurrent: () => this._isCurrentAnalysisRequest(requestId),
       registerInvalidationCleanup: cleanup =>
         this._registerAnalysisInvalidationCleanup(requestId, cleanup)
@@ -299,119 +296,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   }
 
   /**
-   * Override _runAnalysis to use the same progress bar UX as Marker Analysis.
+   * The success notification: how many genes are significant.
    * @override
    */
-  async _runAnalysis() {
-    if (this._isDestroyed) return;
-
-    const formValues = structuredClone(this._getFormValues());
-    const validation = this._validateForm(formValues);
-    if (!validation.valid) {
-      this._invalidateAnalysisRequest();
-      this._notifications.error(validation.error || 'Invalid form values');
-      return;
-    }
-
-    const requestId = this._startAnalysisRequest();
-    if (requestId === null) return;
-
-    const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
-    const originalText = runBtn?.textContent;
-    let buttonRestored = false;
-    const restoreButton = () => {
-      if (!runBtn || buttonRestored) return;
-      runBtn.disabled = false;
-      runBtn.textContent = originalText;
-      buttonRestored = true;
-    };
-    if (runBtn) {
-      runBtn.disabled = true;
-      runBtn.textContent = 'Running...';
-    }
-    const progressTracker = new ProgressTracker({
-      totalItems: 1,
-      phases: ['Loading & Computing', 'Multiple Testing Correction'],
-      title: 'Differential expression',
-      category: 'calculation',
-      showNotification: true
-    });
-    this._progressTracker = progressTracker;
-    progressTracker.start();
-    let progressSettled = false;
-    this._registerAnalysisInvalidationCleanup(requestId, () => {
-      if (!progressSettled) {
-        progressTracker.cancel();
-        progressSettled = true;
-      }
-      if (this._progressTracker === progressTracker) {
-        this._progressTracker = null;
-      }
-      restoreButton();
-    });
-
-    try {
-      const result = await this._runAnalysisImpl(
-        formValues,
-        requestId,
-        progressTracker
-      );
-      if (!result || !this._isCurrentAnalysisRequest(requestId)) return;
-
-      await this._showResult(result, requestId);
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-
-      await this._publishAnalysisResult(result, requestId);
-      progressTracker.complete('Differential expression complete');
-      progressSettled = true;
-
-      if (this.onResultChange) this.onResultChange(result);
-    } catch (error) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[DEAnalysisUI] Analysis error:', error);
-      progressTracker.fail(`Analysis failed: ${error.message}`);
-      progressSettled = true;
-    } finally {
-      if (this._isCurrentAnalysisRequest(requestId)) {
-        if (this._progressTracker === progressTracker) {
-          this._progressTracker = null;
-        }
-      }
-      this._finishAnalysisRequest(requestId);
-      if (!this._isLoading) restoreButton();
-    }
-  }
-
-  /**
-   * Keep the DE ProgressTracker in sync with MultiVariableAnalysis progress emissions.
-   * @private
-   * @param {{ phase: string, progress: number, loaded: number, total: number, message: string }} progress
-   */
-  _updateProgress(progress, progressTracker = this._progressTracker) {
-    if (!progressTracker) return;
-    if (!progress || typeof progress !== 'object' || Array.isArray(progress)) {
-      throw new TypeError('Differential expression progress must be an object');
-    }
-    const { phase, progress: percent, loaded, total, message } = progress;
-    if (typeof phase !== 'string' || phase.length === 0) {
-      throw new TypeError('Differential expression progress phase must be non-empty text');
-    }
-    if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-      throw new RangeError('Differential expression progress percent must be between 0 and 100');
-    }
-    if (!Number.isSafeInteger(total) || total < 1) {
-      throw new RangeError('Differential expression progress total must be a positive integer');
-    }
-    if (!Number.isSafeInteger(loaded) || loaded < 0 || loaded > total) {
-      throw new RangeError('Differential expression progress loaded must be within total');
-    }
-    if (typeof message !== 'string' || message.length === 0) {
-      throw new TypeError('Differential expression progress message must be non-empty text');
-    }
-    progressTracker.setPhase(phase);
-    progressTracker.setTotalItems(total);
-    progressTracker.setCompletedItems(loaded);
-    progressTracker.setMessage(message);
+  _getSuccessMessage() {
+    const summary = this._lastResult?.data?.summary;
+    return summary
+      ? `Differential expression: ${formatCount(summary.significantGenes)} significant genes`
+      : 'Differential expression complete';
   }
 
   // ===========================================================================
@@ -706,6 +598,52 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     const csv = deResultsToCSV(this._lastResult.data.results);
     downloadCSV(csv, 'differential_expression', this._notifications);
+  }
+
+  /**
+   * The shown result for a session: the volcano result whose table names
+   * genes by key and pages by ID.
+   * @returns {null|{kind: 'differential', version: number, payload: unknown}}
+   */
+  exportResult() {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    return createResultEnvelope('differential', this._lastResult);
+  }
+
+  /**
+   * Restore a result written by `exportResult()`; refused when it names a
+   * gene or cell group the open dataset lacks.
+   * @param {null|Object} envelope
+   * @returns {Promise<void>}
+   */
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const result = readResultEnvelope(envelope, 'differential');
+    const results = result?.data?.results;
+    const summary = result?.data?.summary;
+    if (
+      result?.type !== 'differential' ||
+      result.plotType !== 'volcanoplot' ||
+      !Array.isArray(results) ||
+      summary === null ||
+      typeof summary !== 'object'
+    ) {
+      throw new TypeError('A differential expression result must hold a volcano result table');
+    }
+    requireDatasetGenes(
+      this.dataLayer,
+      results.map(row => row?.gene),
+      'The differential expression result'
+    );
+    requireDatasetPages(
+      this.dataLayer,
+      [summary.pageA, summary.pageB],
+      'The differential expression result'
+    );
+    await this._restoreAnalysisResult(result);
   }
 
   exportSettings() {

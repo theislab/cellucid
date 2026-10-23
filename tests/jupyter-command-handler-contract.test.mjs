@@ -18,6 +18,7 @@ test('Jupyter commands mutate the exact current viewer state', async () => {
     { key: 'score', loaded: true },
   ];
   const state = {
+    pointCount: 5,
     ensureHighlightPage() {
       calls.push('ensure-page');
     },
@@ -92,7 +93,7 @@ test('Jupyter commands mutate the exact current viewer state', async () => {
     ['add-highlight', {
       type: 'annotation',
       label: 'Python selection (2 cells)',
-      cellIndices: [1, 2],
+      cellIndices: Uint32Array.of(1, 2),
     }],
     ['load-field', 0],
     ['active-field', 0],

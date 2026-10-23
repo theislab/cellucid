@@ -6,6 +6,7 @@ import {
   hideWelcomeModal,
   isWelcomeModalVisible
 } from './ui/onboarding/welcome-modal.js';
+import { isExplainedFailure } from '../data/data-source.js';
 
 /**
  * Convert JavaScript's unrestricted thrown-value channel into the sole
@@ -209,7 +210,14 @@ export function publishStartupFailure(options) {
     links.append(link);
   }
 
-  card.append(title, message, action, links);
+  // A refusal written for the person already says what to do; the generic
+  // advice would only repeat it less precisely.
+  card.append(
+    title,
+    message,
+    ...(isExplainedFailure(error) ? [] : [action]),
+    links
+  );
   surface.appendChild(card);
   documentOwner.body.appendChild(surface);
   // Retracting onboarding takes focus off a control that no longer exists, so

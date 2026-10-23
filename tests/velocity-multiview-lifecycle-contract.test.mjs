@@ -105,6 +105,9 @@ test('velocity disposal retains failed handles and only publishes disposed after
   let failProgramOnce = true;
   const gl = {
     deleteBuffer() {},
+    // Nothing is current: no program is unbound before its deletion.
+    CURRENT_PROGRAM: 0x8b8d,
+    getParameter: () => null,
     deleteProgram(handle) {
       deleteCalls.set(handle, (deleteCalls.get(handle) ?? 0) + 1);
       if (handle === program && failProgramOnce) {
@@ -1282,9 +1285,13 @@ function createPositionTextureGl() {
   };
 }
 
-test('shared position-array mutation republishes one view without corrupting snapshot GPU ownership', () => {
+test('a position texture no view uses stays exactly while the renderer holds its geometry', () => {
+  // Published positions are never written: a texture is its array's exact
+  // snapshot, kept for a switch back while the renderer keeps the geometry.
   const fixture = createPositionTextureGl();
   const positions = new Float32Array([0, 1, 2, 3, 4, 5]);
+  const other = new Float32Array([5, 4, 3, 2, 1, 0]);
+  const held = new Set([positions, other]);
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     gl: fixture.gl,
     _fboByView: new Map(),
@@ -1295,29 +1302,30 @@ test('shared position-array mutation republishes one view without corrupting sna
     _residentFBOBytes: 0n,
     _spawnByView: new Map(),
   });
+  overlay.setPositionRetention(array => held.has(array));
 
-  const oldTexture = overlay._ensurePositionTexture('live', positions, 3);
-  const sharedTexture = overlay._ensurePositionTexture('snap_1', positions, 3);
-  const oldEntry = overlay._positionsRefByView.get('snap_1');
-  assert.equal(sharedTexture, oldTexture);
-  assert.equal(oldEntry.refs, 2);
+  const first = overlay._ensurePositionTexture('live', positions, 3);
+  const shared = overlay._ensurePositionTexture('snap_1', positions, 3);
+  assert.equal(shared, first);
+  assert.equal(overlay._positionsRefByView.get('snap_1').refs, 2);
 
-  positions[0] = 42;
+  // The live view switches layout: the texture stays pooled (still held).
   overlay.markGeometryDirty('live');
+  overlay._ensurePositionTexture('live', other, 3);
+  overlay.markGeometryDirty('snap_1');
+  assert.equal(overlay._positionTexturePool.get(positions).refs, 0);
+  assert.equal(fixture.deletedTextures.includes(first.texture), false);
+  const uploads = fixture.uploadedRows.length;
 
-  assert.equal(oldEntry.refs, 1);
-  assert.equal(overlay._positionsRefByView.get('snap_1'), oldEntry);
+  // Switching back uploads nothing.
+  assert.equal(overlay._ensurePositionTexture('snap_1', positions, 3), first);
+  assert.equal(fixture.uploadedRows.length, uploads);
+
+  // Once the renderer lets the geometry go, the unused texture is deleted.
+  overlay.markGeometryDirty('snap_1');
+  held.delete(positions);
+  overlay._ensurePositionTexture('snap_1', other, 3);
   assert.equal(overlay._positionTexturePool.has(positions), false);
-  assert.equal(fixture.deletedTextures.includes(oldTexture.texture), false);
-
-  const newTexture = overlay._ensurePositionTexture('live', positions, 3);
-  const newEntry = overlay._positionsRefByView.get('live');
-  assert.notEqual(newTexture.texture, oldTexture.texture);
-  assert.notEqual(newEntry, oldEntry);
-  assert.equal(newEntry.refs, 1);
-  assert.equal(overlay._positionTexturePool.get(positions), newEntry);
-  assert.equal(fixture.uploadedRows.at(-1)[0], 42);
-  assert.equal(fixture.deletedTextures.includes(oldTexture.texture), false);
 });
 
 test('a 2D or 1D view uploads one position channel per embedding axis', () => {
@@ -1566,7 +1574,8 @@ test('disable retires every derived view texture exactly and retries failed dele
     _spawnByView: new Map([['live', spawn]]),
   });
 
-  assert.equal(overlay._getResidentDerivedTextureBytes(), 40n);
+  // Positions 2 x 3 x 4 bytes, spawn table 2 x 4, visibility 2 x 1 (R8UI).
+  assert.equal(overlay._getResidentDerivedTextureBytes(), 34n);
   assert.throws(
     () => overlay.setEnabled(false),
     /synthetic visibility deletion failure/,
@@ -1580,7 +1589,7 @@ test('disable retires every derived view texture exactly and retries failed dele
   assert.equal(spawn.tableSize, 0);
   assert.equal(spawn.ready, false);
   assert.equal(spawn.version, 2);
-  assert.equal(overlay._getResidentDerivedTextureBytes(), 8n);
+  assert.equal(overlay._getResidentDerivedTextureBytes(), 2n);
 
   overlay.setEnabled(false);
 

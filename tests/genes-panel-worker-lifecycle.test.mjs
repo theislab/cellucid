@@ -6,18 +6,23 @@ import { computeCategoryGroupingDigest } from '../assets/js/app/analysis/data/da
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
 import { MarkerCache } from '../assets/js/app/analysis/genes-panel/marker-cache.js';
 import { MarkerDiscoveryEngine } from '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js';
-import { ProgressTracker } from '../assets/js/app/analysis/shared/progress-tracker.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
 
 // The data mapping of the open dataset: marker results are cached per gene
 // list, so every controller reads it from its data layer's state.
-const EXPORT_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: { '1d': null, '2d': { key: 'umap', columns: null }, '3d': null },
+const DATA_MAPPING = Object.freeze({
+  kind: 'anndata',
+  embeddings: {
+    enabled: [{ key: 'X_umap', columns: [0, 1] }],
+    defaults: { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': null },
+  },
+  knn: null,
   geneNames: 'index',
+  expression: 'X',
+  latent: null,
   vectorFields: [],
 });
-const getDataMapping = () => EXPORT_MAPPING;
+const getDataMapping = () => DATA_MAPPING;
 
 function deferred() {
   let resolve;
@@ -58,27 +63,6 @@ async function withPatchedWorkerPool(overrides, callback) {
   }
 }
 
-async function withoutProgressNotifications(callback) {
-  const previous = Object.getOwnPropertyDescriptor(
-    ProgressTracker.prototype,
-    '_initNotification',
-  );
-  Object.defineProperty(ProgressTracker.prototype, '_initNotification', {
-    configurable: true,
-    writable: true,
-    value() {},
-  });
-  try {
-    return await callback();
-  } finally {
-    Object.defineProperty(
-      ProgressTracker.prototype,
-      '_initNotification',
-      previous,
-    );
-  }
-}
-
 function createMarkerDataLayer(gene, values) {
   return {
     state: {
@@ -93,22 +77,15 @@ function createMarkerDataLayer(gene, values) {
     async prefetchGenePayload() {
       return null;
     },
-    async ensureGeneExpressionLoaded(requestedGene, options) {
+    async readGeneColumn(requestedGene, options) {
       assert.equal(requestedGene, gene);
-      // One of a long run's loads, under the run's own download signal.
-      assert.deepEqual(Object.keys(options).sort(), ['priority', 'signal', 'silent']);
-      assert.equal(options.silent, true);
+      // One of a long run's reads, under the run's own download signal, for
+      // the run's job (none here).
+      assert.deepEqual(Object.keys(options).sort(), ['owner', 'priority', 'signal']);
+      assert.equal(options.owner, null);
       assert.equal(options.priority, 'bulk');
       assert.ok(options.signal instanceof AbortSignal);
-      return { values };
-    },
-    unloadGeneExpression(requestedGene) {
-      assert.equal(requestedGene, gene);
-      return true;
-    },
-    invalidateVariable(kind, requestedGene) {
-      assert.equal(kind, 'gene_expression');
-      assert.equal(requestedGene, gene);
+      return { fieldIndex: 0, values, owned: true };
     },
   };
 }
@@ -209,7 +186,7 @@ function readyPoolOverrides({ broadcast, execute }) {
   };
 }
 
-test('marker discovery keeps cooperative cancellation out of the shared worker pool', async () => {
+test('marker discovery hands its signal to every worker task and keeps its context for replaced workers', async () => {
   const { engine, options } = createDiscoveryFixture();
   const controller = new AbortController();
   const workerOptions = [];
@@ -242,12 +219,10 @@ test('marker discovery keeps cooperative cancellation out of the shared worker p
     ['broadcast', 'execute'],
   );
   for (const [owner, executionOptions] of workerOptions) {
-    assert.equal(
-      Object.hasOwn(executionOptions, 'signal'),
-      false,
-      `${owner} must not receive a cooperative AbortSignal`,
-    );
+    // Cancelling stops a task and never ends the pool (worker-pool.js).
+    assert.equal(executionOptions.signal, controller.signal, `${owner} is cancelled with the run`);
   }
+  assert.equal(workerOptions[0][1].retainAs, 'markers', 'a replaced worker gets the context again');
 });
 
 test('marker discovery preserves every prototype-named group id as an ordinary own result', async () => {
@@ -302,13 +277,12 @@ test('marker discovery preserves every prototype-named group id as an ordinary o
   );
 });
 
-test('marker abort drains a running worker task without publishing stale results or poisoning the pool', async () => {
+test('marker abort stops a running worker task without publishing stale results or ending the pool', async () => {
   const { engine, options } = createDiscoveryFixture();
   const taskStarted = deferred();
   const taskGate = deferred();
   const abortController = new AbortController();
   const abortReason = new DOMException('Superseded marker request', 'AbortError');
-  let poolUsable = true;
   let ingestCount = 0;
   const progressEvents = [];
   const partialEvents = [];
@@ -325,25 +299,16 @@ test('marker abort drains a running worker task without publishing stale results
         return [true];
       },
       async execute(type, _payload, executionOptions) {
-        if (type === 'UNRELATED_POOL_TASK') {
-          if (!poolUsable) {
-            throw new Error('shared worker pool was poisoned by marker abort');
-          }
-          return { ok: true };
-        }
+        if (type === 'UNRELATED_POOL_TASK') return { ok: true };
 
         assert.equal(type, 'MARKERS_COMPUTE_GENE');
-        if (executionOptions.signal !== undefined) {
-          executionOptions.signal.addEventListener(
-            'abort',
-            () => {
-              poolUsable = false;
-            },
-            { once: true },
-          );
-        }
+        // As the pool does: the caller is answered at the cancel.
+        const { signal } = executionOptions;
         taskStarted.resolve();
-        return taskGate.promise;
+        return new Promise((resolve, reject) => {
+          taskGate.promise.then(resolve);
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
       },
     }),
     async pool => {
@@ -371,16 +336,10 @@ test('marker abort drains a running worker task without publishing stale results
       const progressAtAbort = progressEvents.length;
       const partialAtAbort = partialEvents.length;
       abortController.abort(abortReason);
-      await nextTurn();
-
-      assert.equal(
-        settled,
-        false,
-        'marker cancellation must drain the already-dispatched worker task',
-      );
-      taskGate.resolve(createWorkerMarkerResult());
-
       await assert.rejects(operation, error => error === abortReason);
+      assert.equal(settled, true, 'the run ends without waiting for its task');
+      taskGate.resolve(createWorkerMarkerResult());
+      await nextTurn();
       assert.equal(ingestCount, 0, 'an aborted result must not be ingested');
       assert.equal(
         progressEvents.length,
@@ -392,7 +351,6 @@ test('marker abort drains a running worker task without publishing stale results
         partialAtAbort,
         'an aborted result must not emit partial markers',
       );
-      assert.equal(poolUsable, true);
       await assert.doesNotReject(
         pool.execute('UNRELATED_POOL_TASK', {}, { timeout: 1 }),
       );
@@ -636,57 +594,22 @@ test('final marker partial callback abort rejects with the exact reason', async 
 });
 
 test('concurrent controller initialization creates one engine and cache set', async () => {
-  const previousIndexedDB = Object.getOwnPropertyDescriptor(
-    globalThis,
-    'indexedDB',
-  );
-  Object.defineProperty(globalThis, 'indexedDB', {
-    configurable: true,
-    writable: true,
-    value: undefined,
-  });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
+  controller._getDatasetId = () => 'init-lifecycle-dataset';
 
-  try {
-    const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
-    controller._getDatasetId = () => 'init-lifecycle-dataset';
+  const firstInit = controller.init();
+  const firstSet = {
+    discoveryEngine: controller._discoveryEngine,
+    matrixBuilder: controller._matrixBuilder,
+    clusteringEngine: controller._clusteringEngine,
+    cache: controller._cache,
+  };
+  const secondInit = controller.init();
 
-    const firstInit = controller.init();
-    const firstSet = {
-      discovery: controller._discoveryEngine,
-      matrix: controller._matrixBuilder,
-      clustering: controller._clusteringEngine,
-      cache: controller._cache,
-    };
-    const secondInit = controller.init();
-    const secondSet = {
-      discovery: controller._discoveryEngine,
-      matrix: controller._matrixBuilder,
-      clustering: controller._clusteringEngine,
-      cache: controller._cache,
-    };
-
-    await Promise.all([firstInit, secondInit]);
-    for (const key of Object.keys(firstSet)) {
-      assert.ok(firstSet[key], `${key} must be created during initialization`);
-      assert.strictEqual(
-        secondSet[key],
-        firstSet[key],
-        `concurrent init replaced the ${key} owner`,
-      );
-      assert.strictEqual(controller[`_${key === 'discovery'
-        ? 'discoveryEngine'
-        : key === 'matrix'
-          ? 'matrixBuilder'
-          : key === 'clustering'
-            ? 'clusteringEngine'
-            : 'cache'}`], firstSet[key]);
-    }
-  } finally {
-    if (previousIndexedDB === undefined) {
-      delete globalThis.indexedDB;
-    } else {
-      Object.defineProperty(globalThis, 'indexedDB', previousIndexedDB);
-    }
+  await Promise.all([firstInit, secondInit]);
+  for (const [key, owner] of Object.entries(firstSet)) {
+    assert.ok(owner, `${key} must be created during initialization`);
+    assert.strictEqual(controller[`_${key}`], owner, `a second init replaced the ${key} owner`);
   }
 });
 
@@ -1149,21 +1072,19 @@ test('Genes Panel invalidation during controller init cannot start stale discove
   ui._buildHeatmapMatrixForMode = () => ({ genes: ['GENE'] });
 
   try {
-    await withoutProgressNotifications(async () => {
-      const operation = ui._runAnalysis();
-      await nextTurn();
-      assert.equal(initCalls, 1);
+    const operation = ui._runAnalysis();
+    await nextTurn();
+    assert.equal(initCalls, 1);
 
-      ui._invalidateAnalysisRequest();
-      initGate.resolve();
-      await operation;
+    ui._invalidateAnalysisRequest();
+    initGate.resolve();
+    await operation;
 
-      assert.equal(
-        discoveryCalls,
-        0,
-        'an intent invalidated during init must not start marker discovery',
-      );
-    });
+    assert.equal(
+      discoveryCalls,
+      0,
+      'an intent invalidated during init must not start marker discovery',
+    );
   } finally {
     Object.defineProperty(
       GenesPanelController.prototype,
@@ -1179,28 +1100,23 @@ test('Genes Panel invalidation during controller init cannot start stale discove
   }
 });
 
-test('Genes Panel invalidation aborts its active discovery owner', async () => {
+test('Genes Panel invalidation cancels its job, which stops marker discovery', async () => {
   const discoveryStarted = deferred();
-  const discoveryGate = deferred();
-  const abortReason = new DOMException(
-    'Marker UI request invalidated',
-    'AbortError',
-  );
-  let abortCount = 0;
-  let settleDiscovery = null;
+  let discoverySignal = null;
+  let discoveryReadOwner = null;
 
   const ui = new GenesPanelUI({
     comparisonModule: {},
     dataLayer: { state: { getDataMapping } },
   });
   ui._controller = {
-    runAnalysis() {
+    runAnalysis({ signal, readOwner }) {
+      discoverySignal = signal;
+      discoveryReadOwner = readOwner;
       discoveryStarted.resolve();
-      return discoveryGate.promise;
-    },
-    abort() {
-      abortCount++;
-      settleDiscovery?.reject(abortReason);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
     },
   };
   ui._getFormValues = () => ({
@@ -1209,29 +1125,17 @@ test('Genes Panel invalidation aborts its active discovery owner', async () => {
   });
   ui._validateForm = () => ({ valid: true });
 
-  await withoutProgressNotifications(async () => {
-    const operation = ui._runAnalysis();
-    await discoveryStarted.promise;
-    settleDiscovery = discoveryGate;
-    ui._invalidateAnalysisRequest();
-    await nextTurn();
-
-    const observedAbortCount = abortCount;
-    if (observedAbortCount === 0) {
-      discoveryGate.resolve({
-        matrix: { genes: ['GENE'] },
-        markers: null,
-        clustering: null,
-        metadata: {},
-      });
-    }
-    await operation;
-    assert.equal(
-      observedAbortCount,
-      1,
-      'request invalidation must cooperatively abort stale marker discovery',
-    );
-  });
+  const operation = ui._runAnalysis();
+  await discoveryStarted.promise;
+  const job = ui._shownJob;
+  assert.equal(job.running, true);
+  assert.equal(discoverySignal, job.signal, 'discovery runs under the job\'s signal');
+  assert.equal(discoveryReadOwner, job.id, 'discovery reads are the job\'s own');
+  ui._invalidateAnalysisRequest();
+  await operation;
+  assert.equal(discoverySignal.aborted, true, 'invalidation stops marker discovery');
+  assert.equal(discoverySignal.reason.name, 'AbortError');
+  assert.equal(job.state, 'cancelled', 'a superseded run is cancelled, never failed');
 });
 
 function createMarkerCacheKeyAuditController(minCells, observedParams) {
@@ -1301,7 +1205,7 @@ test('marker hot cache isolates mutable result envelopes from UI threshold rebui
     groupingDigest: computeCategoryGroupingDigest(Uint16Array.from([0, 1])),
   };
   const cache = new MarkerCache({
-    identity: { key: 'cache-ownership-audit', persistent: false },
+    identity: { key: 'cache-ownership-audit' },
     maxCategories: 1,
   });
 
@@ -1487,7 +1391,7 @@ test('category grouping digest is the exact per-cell code assignment', () => {
 
 test('marker cache entries are addressed by the grouping they were computed over', async () => {
   const cache = new MarkerCache({
-    identity: { key: 'grouping-identity-audit', persistent: false },
+    identity: { key: 'grouping-identity-audit' },
     maxCategories: 4,
   });
   const baseParams = {
@@ -1643,18 +1547,15 @@ function createUntestableMarkerFixture() {
     async prefetchGenePayload() {
       return null;
     },
-    async ensureGeneExpressionLoaded(gene, options) {
-      // One of a long run's loads, under the run's own download signal.
-      assert.deepEqual(Object.keys(options).sort(), ['priority', 'signal', 'silent']);
-      assert.equal(options.silent, true);
+    async readGeneColumn(gene, options) {
+      // One of a long run's reads, under the run's own download signal, for
+      // the run's job (none here).
+      assert.deepEqual(Object.keys(options).sort(), ['owner', 'priority', 'signal']);
+      assert.equal(options.owner, null);
       assert.equal(options.priority, 'bulk');
       assert.ok(options.signal instanceof AbortSignal);
-      return { values: Float32Array.from(UNTESTABLE_GENES[gene]) };
+      return { fieldIndex: 0, values: Float32Array.from(UNTESTABLE_GENES[gene]), owned: true };
     },
-    unloadGeneExpression() {
-      return true;
-    },
-    invalidateVariable() {},
   };
 
   const engine = new MarkerDiscoveryEngine({

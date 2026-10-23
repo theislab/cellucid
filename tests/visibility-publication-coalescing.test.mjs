@@ -85,10 +85,8 @@ function makePublicationHarness(viewId) {
         ._writeCategoryColors.call(this, field, writeTransparency);
     },
     updateColorsContinuous(_field, options) {
-      assert.deepEqual(options, {
-        resetTransparency: true,
-      });
-      this.categoryTransparency.fill(1);
+      // Coloring never writes visibility: computeGlobalVisibility owns it.
+      assert.equal(options, undefined);
     },
     updateFilterSummary() {},
   };

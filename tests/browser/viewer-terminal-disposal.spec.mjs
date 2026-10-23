@@ -1,16 +1,16 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-terminal-disposal-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=viewer-terminal-disposal-ci`;
 
 test.beforeEach(async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.evaluate(async () => {
     const ui = window._cellucidUi;
@@ -493,6 +493,30 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   const proof = await page.evaluate(async () => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
     const renderer = viewer.getHPRenderer();
@@ -532,13 +556,8 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
       meta: { filtersText: snapshotPayload.filtersText },
       cameraState: viewer.getViewCameraState('live'),
     };
-    const edgeData = {
-      sources: Uint32Array.from([0]),
-      destinations: Uint32Array.from([1]),
-      weights: Float64Array.from([1]),
-      nEdges: 1,
-      nCells: dataPositions.length / 3,
-    };
+    const edgeCells = dataPositions.length / 3;
+    const edgeData = edgePayloadOf(Uint32Array.from([0]), Uint32Array.from([1]), Float32Array.from([1]), edgeCells);
     const highlightData = new Uint8Array(dataPositions.length / 3);
     highlightData[0] = 255;
     const guardedMethodNames = [

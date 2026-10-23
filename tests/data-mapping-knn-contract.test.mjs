@@ -3,10 +3,10 @@
  * ZIP in the browser readers (Phase E).
  *
  * - Every square `obsp` matrix is listed; any of them is read by key, through
- *   the same `_cellucid/mapping/knn/{p}/` route a server answers.
- * - A graph's canonical edges are byte-identical to what `cellucid-python`
- *   serves for the same file (`data-mapping-full.expected.json`, written by
- *   `scripts/generate-data-mapping-fixtures.py` from cellucid itself).
+ *   its `obsp/{p}` route.
+ * - A graph's canonical edges are byte-identical to the numpy reference for
+ *   the same file (`data-mapping-full.expected.json`, computed by
+ *   `scripts/generate-data-mapping-fixtures.py` independently of this code).
  * - A graph that is not symmetric is refused with the server's words and is
  *   never repaired; the file's own graph keeps working.
  * - Switching graphs keeps at most the default graph and one other in memory.
@@ -22,9 +22,10 @@ import { H5adDataSource } from '../assets/js/data/h5ad.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
 import {
   MappingLoadError,
-  mappingKnnBase,
-  parseMappingKnnManifestPath,
+  mappingGraphPath,
+  parseMappingGraphPath,
 } from '../assets/js/data/data-mapping-candidates.js';
+import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
 const FIXTURE = new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url);
 const ZARR_FIXTURE = new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url);
@@ -88,14 +89,15 @@ for (const [format, open] of [['H5AD', openH5ad], ['Zarr ZIP', openZarr]]) {
     for (const [index, item] of candidates.obsp.entries()) {
       const expected = EXPECTED.knn[item.key];
       if (expected.refused) continue;
-      const manifest = await adapter.getMappedConnectivityManifest(index);
-      assert.equal(manifest.n_cells, EXPECTED.n_obs);
-      assert.equal(manifest.n_edges, expected.n_edges, item.key);
-      assert.equal(manifest.max_neighbors, expected.max_neighbors, item.key);
+      const summary = await adapter.getMappedConnectivitySummary(index);
+      assert.equal(summary.n_cells, EXPECTED.n_obs);
+      assert.equal(summary.n_edges, expected.n_edges, item.key);
+      assert.equal(summary.max_neighbors, expected.max_neighbors, item.key);
       const edges = await adapter.getConnectivityEdges({ key: item.key });
-      assert.equal(sha256(edges.sources), expected.sources, `${item.key} sources`);
-      assert.equal(sha256(edges.destinations), expected.destinations, `${item.key} destinations`);
-      assert.equal(sha256(edges.weights), expected.weights, `${item.key} weights`);
+      assert.equal(sha256(edgeListOf(edges).sources), expected.sources, `${item.key} sources`);
+      assert.equal(sha256(edgeListOf(edges).destinations), expected.destinations, `${item.key} destinations`);
+      assert.equal(sha256(edgeListOf(edges).strength), expected.strength, `${item.key} strength`);
+      assert.equal(edges.maxWeight, expected.max_weight, `${item.key} largest weight`);
     }
   });
 
@@ -104,7 +106,7 @@ for (const [format, open] of [['H5AD', openH5ad], ['Zarr ZIP', openZarr]]) {
     const index = adapter.getMappingCandidates().obsp.findIndex(item => item.key === 'distances');
     assert.equal(EXPECTED.knn.distances.refused, true);
     await assert.rejects(
-      adapter.getMappedConnectivityManifest(index),
+      adapter.getMappedConnectivitySummary(index),
       error => (
         error instanceof MappingLoadError &&
         error.key === 'distances' &&
@@ -115,36 +117,38 @@ for (const [format, open] of [['H5AD', openH5ad], ['Zarr ZIP', openZarr]]) {
     // Refusing one graph changes nothing about the file's own.
     const own = await adapter.getConnectivityEdges();
     assert.equal(own.nEdges, EXPECTED.knn.connectivities.n_edges);
-    await assert.rejects(adapter.getMappedConnectivityManifest(99), RangeError);
+    await assert.rejects(adapter.getMappedConnectivitySummary(99), RangeError);
   });
 }
 
-test('switching graphs keeps the file\'s own graph and at most one other', async t => {
+test('switching graphs keeps only the graph asked for last', async t => {
+  // The viewer holds the graph it shows (the same payload), so the adapter
+  // keeps no other.
   const adapter = await openH5ad(t);
   const own = await adapter.getConnectivityEdges();
+  assert.deepEqual([...adapter._connectivityCache.keys()], ['connectivities']);
+  assert.equal(await adapter.getConnectivityEdges(), own, 'asking again reads nothing');
   const scvi = await adapter.getConnectivityEdges({ key: 'scvi_connectivities' });
-  assert.deepEqual([...adapter._connectivityCache.keys()].sort(), ['connectivities', 'scvi_connectivities']);
-  // Asking again for a graph in memory reads nothing.
+  assert.deepEqual([...adapter._connectivityCache.keys()], ['scvi_connectivities']);
   assert.equal(await adapter.getConnectivityEdges({ key: 'scvi_connectivities' }), scvi);
-  assert.equal(await adapter.getConnectivityEdges(), own);
   // A refused graph is never retained.
   await assert.rejects(adapter.getConnectivityEdges({ key: 'distances' }), MappingLoadError);
-  assert.deepEqual([...adapter._connectivityCache.keys()].sort(), ['connectivities', 'scvi_connectivities']);
+  assert.deepEqual([...adapter._connectivityCache.keys()], ['scvi_connectivities']);
   assert.equal(await adapter.getConnectivityEdges({ key: 'absent' }), null);
-  assert.deepEqual([...adapter._connectivityCache.keys()].sort(), ['absent', 'connectivities']);
+  assert.deepEqual([...adapter._connectivityCache.keys()], ['absent']);
   await assert.rejects(adapter.getConnectivityEdges({ key: '' }), TypeError);
 });
 
 test('mapped graph routes name a catalog position, never a key', () => {
-  assert.equal(mappingKnnBase(2), '_cellucid/mapping/knn/2/');
-  assert.equal(parseMappingKnnManifestPath('_cellucid/mapping/knn/2/connectivity_manifest.json'), 2);
+  assert.equal(mappingGraphPath(2), 'obsp/2');
+  assert.equal(parseMappingGraphPath('obsp/2'), 2);
   for (const path of [
-    'connectivity_manifest.json',
-    '_cellucid/mapping/knn/02/connectivity_manifest.json',
-    '_cellucid/mapping/knn/connectivities/connectivity_manifest.json',
-    '_cellucid/mapping/knn/2/connectivity/edges.src.bin',
+    'obsp',
+    'obsp/02',
+    'obsp/connectivities',
+    'obsp/2/edges',
   ]) {
-    assert.equal(parseMappingKnnManifestPath(path), null, path);
+    assert.equal(parseMappingGraphPath(path), null, path);
   }
-  assert.throws(() => mappingKnnBase(-1), TypeError);
+  assert.throws(() => mappingGraphPath(-1), TypeError);
 });

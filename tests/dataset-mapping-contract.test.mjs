@@ -6,16 +6,18 @@ import {
   layoutEmbeddingRef,
   resolveAnnDataMapping,
   resolveEmbeddingRefLayout,
-  resolveExportDataMapping,
 } from '../assets/js/data/dataset-mapping.js';
 import {
   assembleAnnDataCandidates,
   describeAnnDataProbes,
 } from '../assets/js/data/data-mapping-candidates.js';
-import { createDimensionManager } from '../assets/js/data/dimension-manager.js';
+import {
+  createDimensionManager,
+  createInMemoryDimensionManager,
+} from '../assets/js/data/dimension-manager.js';
 import { validateDataMapping } from '../assets/js/data/data-mapping.js';
 
-function exportIdentity() {
+function layoutIdentity() {
   return {
     stats: { n_cells: 3, n_genes: 2, has_connectivity: true, n_edges: 1 },
     embeddings: {
@@ -23,69 +25,21 @@ function exportIdentity() {
       defaults: { '2d': 'X_umap', '3d': 'X_umap_3d' },
       items: {
         X_tsne: {
-          label: 't-SNE', dimension: 2, file: 'embeddings/0_2d.bin',
+          label: 't-SNE', dimension: 2, path: 'obsm/0/0-1',
           source: { key: 'X_tsne', columns: [0, 1] },
         },
         X_umap: {
-          label: 'UMAP', dimension: 2, file: 'embeddings/1_2d.bin',
-          source: { key: null, columns: [0, 1] },
+          label: 'UMAP', dimension: 2, path: 'obsm/1/0-1',
+          source: { key: 'X_umap', columns: [0, 1] },
         },
         X_umap_3d: {
-          label: 'UMAP', dimension: 3, file: 'embeddings/2_3d.bin',
+          label: 'UMAP', dimension: 3, path: 'obsm/2/0-1-2',
           source: { key: 'X_umap_3d', columns: [0, 1, 2] },
-        },
-      },
-    },
-    vector_fields: {
-      default_field: 'velocity',
-      fields: {
-        drift: { label: 'drift', files: { X_tsne: 'vectors/0_0.bin' } },
-        velocity: {
-          label: 'velocity',
-          files: { X_umap: 'vectors/1_1.bin', X_umap_3d: 'vectors/1_2.bin' },
         },
       },
     },
   };
 }
-
-function varManifest(source) {
-  return { geneNameSets: [{ source, names: ['A', 'B'], filledFromIndex: 0, renamed: [] }] };
-}
-
-test('an export enables every embedding, defaults each dimension, and binds every declared field', () => {
-  const mapping = resolveExportDataMapping(exportIdentity(), varManifest('gene_symbols'));
-  assert.deepEqual(mapping, {
-    kind: 'export',
-    embeddings: {
-      enabled: [
-        { key: 'X_tsne', columns: null },
-        { key: 'X_umap', columns: null },
-        { key: 'X_umap_3d', columns: null },
-      ],
-      defaults: {
-        '1d': null,
-        '2d': { key: 'X_umap', columns: null },
-        '3d': { key: 'X_umap_3d', columns: null },
-      },
-    },
-    geneNames: 'column:gene_symbols',
-    vectorFields: [
-      { field: 'drift', embedding: { key: 'X_tsne', columns: null } },
-      { field: 'velocity', embedding: { key: 'X_umap', columns: null } },
-      { field: 'velocity', embedding: { key: 'X_umap_3d', columns: null } },
-    ],
-  });
-  assert.deepEqual(validateDataMapping(mapping), mapping);
-});
-
-test('an export without genes names its genes by the index', () => {
-  const identity = exportIdentity();
-  delete identity.vector_fields;
-  const mapping = resolveExportDataMapping(identity, null);
-  assert.equal(mapping.geneNames, 'index');
-  assert.deepEqual(mapping.vectorFields, []);
-});
 
 function directIdentity() {
   return {
@@ -95,24 +49,16 @@ function directIdentity() {
       defaults: { '2d': 'X_umap_2d', '3d': 'X_umap_3d' },
       items: {
         X_umap_2d: {
-          label: 'X_umap_2d', dimension: 2, file: 'embeddings/0_2d.bin',
+          label: 'X_umap_2d', dimension: 2, path: 'obsm/0/0-1',
           source: { key: 'X_umap_2d', columns: [0, 1] },
         },
         X_umap_3d: {
-          label: 'X_umap_3d', dimension: 3, file: 'embeddings/1_3d.bin',
+          label: 'X_umap_3d', dimension: 3, path: 'obsm/1/0-1-2',
           source: { key: 'X_umap_3d', columns: [0, 1, 2] },
         },
       },
     },
-    vector_fields: {
-      default_field: 'velocity_umap',
-      fields: {
-        velocity_umap: {
-          label: 'velocity_umap',
-          files: { X_umap_2d: 'vectors/0_0.bin', X_umap_3d: 'vectors/0_1.bin' },
-        },
-      },
-    },
+    vector_field_default: 'velocity_umap',
   };
 }
 
@@ -238,48 +184,52 @@ function registry(identity) {
   return manager;
 }
 
-test('layouts are named per kind and named references resolve back to them', () => {
-  const manager = registry(exportIdentity());
+test('layouts are named by their obsm provenance and named references resolve back to them', () => {
+  const manager = registry(layoutIdentity());
   assert.deepEqual(
-    layoutEmbeddingRef(manager, 'X_tsne', 'export'),
-    { key: 'X_tsne', columns: null }
-  );
-  assert.deepEqual(
-    layoutEmbeddingRef(manager, 'X_tsne', 'anndata'),
+    layoutEmbeddingRef(manager, 'X_tsne'),
     { key: 'X_tsne', columns: [0, 1] }
   );
+  assert.deepEqual(
+    layoutEmbeddingRef(manager, 'X_umap'),
+    { key: 'X_umap', columns: [0, 1] }
+  );
+  // A layout made in memory (no file behind it) has no obsm key to name.
+  const generated = createInMemoryDimensionManager({
+    positions: new Float32Array([0, 0, 1, 1]),
+    dimension: 2,
+  });
   assert.throws(
-    () => layoutEmbeddingRef(manager, 'X_umap', 'anndata'),
+    () => layoutEmbeddingRef(generated, '2d'),
     /no AnnData obsm provenance/
   );
   assert.equal(
-    resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: null }, 'export', 2, 'ref'),
+    resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: [0, 1] }, 2, 'ref'),
     'X_tsne'
   );
+  assert.throws(
+    () => resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: [0, 1] }, 3, 'ref'),
+    /exactly 3 columns/
+  );
   assert.equal(
-    resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: null }, 'export', 3, 'ref'),
+    resolveEmbeddingRefLayout(manager, { key: 'missing', columns: [0, 1] }, null, 'ref'),
     null
   );
   assert.equal(
-    resolveEmbeddingRefLayout(manager, { key: 'missing', columns: null }, 'export', null, 'ref'),
-    null
-  );
-  assert.equal(
-    resolveEmbeddingRefLayout(manager, { key: 'X_umap_3d', columns: [0, 1, 2] }, 'anndata', 3, 'ref'),
+    resolveEmbeddingRefLayout(manager, { key: 'X_umap_3d', columns: [0, 1, 2] }, 3, 'ref'),
     'X_umap_3d'
   );
   assert.equal(
-    resolveEmbeddingRefLayout(manager, { key: 'X_umap_3d', columns: [2, 1, 0] }, 'anndata', 3, 'ref'),
+    resolveEmbeddingRefLayout(manager, { key: 'X_umap_3d', columns: [2, 1, 0] }, 3, 'ref'),
     null
   );
   assert.throws(
-    () => resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: [0, 1] }, 'export', 2, 'ref'),
+    () => resolveEmbeddingRefLayout(manager, { key: 'X_tsne', columns: null }, 2, 'ref'),
     /columns/
   );
 });
 
 test('embedding references read the way a refusal names them', () => {
-  assert.equal(describeEmbeddingRef({ key: 'X_tsne', columns: null }), "embedding 'X_tsne'");
   assert.equal(
     describeEmbeddingRef({ key: 'X_pca', columns: [3, 1] }),
     "obsm['X_pca'] columns [3, 1]"

@@ -35,6 +35,7 @@
  */
 
 import { BACKDROP_LOOK_PROGRAMS } from './backdrop-look-shaders.js';
+import { deleteProgramReleasingUse, deleteTextureTracked } from '../gl-utils.js';
 import {
   ATELIER_KEY_LIGHT,
   ATELIER_PAPER_GAP,
@@ -603,7 +604,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
       const levelStart = now();
       for (let face = 0; face < 6; face++) {
         const done = yield* bakeTarget(state, bake, face, candidate, size, rowsPerBandFor(size, rate), job, level);
-        if (!done) { gl.deleteTexture(candidate); return; }
+        if (!done) { deleteTextureTracked(gl, candidate); return; }
       }
       level.wallMs = now() - levelStart;
       stats.levels.push(level);
@@ -657,7 +658,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
           complete = yield* bakeTarget(state, bake, face, candidate, next, rowsPerBandFor(next, rate), job, level);
         }
         if (!complete) {
-          gl.deleteTexture(candidate);
+          deleteTextureTracked(gl, candidate);
           state.candidateCube = null;
           return;
         }
@@ -666,7 +667,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
         rate = level.gpuMs / level.texels;
         stats.texelRateMs = rate;
         // Swap between frames: the next frame samples the sharper sky.
-        gl.deleteTexture(state.cube);
+        deleteTextureTracked(gl, state.cube);
         state.cube = candidate;
         state.candidateCube = null;
         textureBytes += next * next * 6 * 4 - size * size * 6 * 4;
@@ -708,9 +709,9 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
       cancelJob(state.job);
       state.job = null;
       if (state.cube || state.tile) textureBytes -= state.stats?.bytes ?? 0;
-      if (state.cube) gl.deleteTexture(state.cube);
-      if (state.candidateCube) gl.deleteTexture(state.candidateCube);
-      if (state.tile) gl.deleteTexture(state.tile);
+      if (state.cube) deleteTextureTracked(gl, state.cube);
+      if (state.candidateCube) deleteTextureTracked(gl, state.candidateCube);
+      if (state.tile) deleteTextureTracked(gl, state.tile);
       if (state.framebuffer) gl.deleteFramebuffer(state.framebuffer);
       state.cube = null;
       state.cubeSize = 0;
@@ -757,7 +758,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
   }
 
   function lookTintsLinear(look) {
-    return look.fallbackTints.map((srgb) => shapeBackdropTint(srgb, 0.85));
+    return look.defaultTints.map((srgb) => shapeBackdropTint(srgb, 0.85));
   }
 
   function* computeTints(viewId, source, look, job) {
@@ -1340,7 +1341,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     cancelJob(pane.shadowJob);
     for (const texture of [pane.shadowTexture, pane.shadowSpare]) {
       if (texture === null) continue;
-      gl.deleteTexture(texture);
+      deleteTextureTracked(gl, texture);
       textureBytes -= SHADOW_MAP_SIZE * SHADOW_MAP_SIZE * 4;
     }
     panes.delete(viewId);
@@ -1360,21 +1361,21 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     readyWaiters.clear();
     if (!deleteObjects) return;
     for (const record of programs.values()) {
-      gl.deleteProgram(record.program);
+      deleteProgramReleasingUse(gl, record.program);
       gl.deleteShader(record.vs);
       gl.deleteShader(record.fs);
     }
     for (const state of families.values()) {
-      if (state.cube) gl.deleteTexture(state.cube);
-      if (state.candidateCube) gl.deleteTexture(state.candidateCube);
-      if (state.tile) gl.deleteTexture(state.tile);
+      if (state.cube) deleteTextureTracked(gl, state.cube);
+      if (state.candidateCube) deleteTextureTracked(gl, state.candidateCube);
+      if (state.tile) deleteTextureTracked(gl, state.tile);
       if (state.framebuffer) gl.deleteFramebuffer(state.framebuffer);
     }
     for (const pane of panes.values()) {
-      if (pane.shadowTexture) gl.deleteTexture(pane.shadowTexture);
-      if (pane.shadowSpare) gl.deleteTexture(pane.shadowSpare);
+      if (pane.shadowTexture) deleteTextureTracked(gl, pane.shadowTexture);
+      if (pane.shadowSpare) deleteTextureTracked(gl, pane.shadowSpare);
     }
-    if (frozenShadowTexture) gl.deleteTexture(frozenShadowTexture);
+    if (frozenShadowTexture) deleteTextureTracked(gl, frozenShadowTexture);
     gl.deleteVertexArray(triangleVao);
     gl.deleteBuffer(triangleBuffer);
     if (moteVao) gl.deleteVertexArray(moteVao);

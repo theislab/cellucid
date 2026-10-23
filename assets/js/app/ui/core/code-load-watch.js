@@ -23,10 +23,10 @@
   const sourceType = () => {
     const params = new URLSearchParams(window.location.search);
     if (params.has('remote')) return 'remote';
-    if (params.has('github')) return 'github-repo';
+    if (params.has('data')) return 'link';
     const source = params.get('source');
     return [
-      'local-demo', 'local-user', 'remote', 'github-repo', 'jupyter',
+      'local-demo', 'local-user', 'remote', 'link', 'jupyter',
     ].includes(source) ? source : 'local-demo';
   };
 

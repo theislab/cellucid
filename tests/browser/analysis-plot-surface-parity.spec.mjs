@@ -45,7 +45,7 @@ function panelSelect(page, optionValue) {
 }
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${encodedAppUrl('/tests/browser/fixtures/demo-custom-exports/')}`
+  `/?sampleCatalog=${encodedAppUrl('/tests/browser/fixtures/demo-catalog/')}`
   + '&dataset=synthetic-development-3d&acceptance=analysis-plot-surface-parity';
 const VIEWPORT = { width: 1440, height: 1000 };
 const RETIREMENT_CYCLES = 20;

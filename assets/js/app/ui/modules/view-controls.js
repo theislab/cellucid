@@ -171,11 +171,6 @@ function requireSnapshotPayload(payload) {
     Uint8Array,
     'Snapshot centroid colors'
   );
-  requireNullableTypedArray(
-    payload.centroidOutliers,
-    Float32Array,
-    'Snapshot centroid outliers'
-  );
   const centroidCount = payload.centroidPositions === null
     ? 0
     : payload.centroidPositions.length / 3;
@@ -184,14 +179,9 @@ function requireSnapshotPayload(payload) {
       'Snapshot centroid positions must contain complete XYZ triples.'
     );
   }
-  if (
-    (payload.centroidPositions === null) !==
-      (payload.centroidColors === null) ||
-    (payload.centroidPositions === null) !==
-      (payload.centroidOutliers === null)
-  ) {
+  if ((payload.centroidPositions === null) !== (payload.centroidColors === null)) {
     throw new TypeError(
-      'Snapshot centroid positions, colors, and outliers must be published together.'
+      'Snapshot centroid positions and colors must be published together.'
     );
   }
   if (
@@ -200,14 +190,6 @@ function requireSnapshotPayload(payload) {
   ) {
     throw new TypeError(
       'Snapshot centroid colors must contain one RGBA tuple per centroid.'
-    );
-  }
-  if (
-    payload.centroidOutliers !== null &&
-    payload.centroidOutliers.length !== centroidCount
-  ) {
-    throw new TypeError(
-      'Snapshot centroid outliers must contain one value per centroid.'
     );
   }
   if (

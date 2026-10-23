@@ -34,8 +34,8 @@ const SECOND = 'Synthetic branching development — 3D';
 function sessionUrl(origin) {
   const url = new URL('/', origin);
   url.searchParams.set(
-    'exportsBaseUrl',
-    `${origin}/tests/browser/fixtures/demo-custom-exports/`,
+    'sampleCatalog',
+    `${origin}/tests/browser/fixtures/demo-catalog/`,
   );
   url.searchParams.set('dataset', 'synthetic-cell-types-2d');
   return url.toString();
@@ -190,7 +190,7 @@ test('a production session sends exactly the declared events', async ({
   ]);
   const [startupLoad, , , , switchLoad, localLoad, failedLoad] = appEvents
     .map(entry => entry[2]);
-  // A catalog chosen with ?exportsBaseUrl= is not the public sample catalog.
+  // A catalog chosen with ?sampleCatalog= is not the public sample catalog.
   expect(startupLoad.dataset_id).toBeUndefined();
   expect(startupLoad).toMatchObject({
     source_type: 'local-demo',
@@ -221,7 +221,7 @@ test('a production session sends exactly the declared events', async ({
   const sent = JSON.stringify(dataLayer);
   for (const fragment of [
     'AML_relapse', 'donor7', 'current-ui-smoke', 'Synthetic', 'synthetic-',
-    'exportsBaseUrl', 'tests/browser', '.h5ad', 'cell_type',
+    'sampleCatalog', 'tests/browser', '.h5ad', 'cell_type',
   ]) {
     expect(sent, fragment).not.toContain(fragment);
   }

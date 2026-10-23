@@ -952,9 +952,9 @@ export function initVelocityOverlayControls(options) {
       }
       if (destroyed) return error;
       const secondaryFailures = [];
-      const collectFailure = (value, fallbackMessage) => {
+      const collectFailure = (value, defaultMessage) => {
         secondaryFailures.push(
-          value instanceof Error ? value : new Error(fallbackMessage)
+          value instanceof Error ? value : new Error(defaultMessage)
         );
       };
 

@@ -14,9 +14,10 @@ import * as userDefinedCodes from './contributors/user-defined-codes.js';
 import * as coreState from './contributors/core-state.js';
 import * as dockableLayout from './contributors/dockable-layout.js';
 import * as analysisWindows from './contributors/analysis-windows.js';
+import * as analysisDocked from './contributors/analysis-docked.js';
+import * as figureExport from './contributors/figure-export.js';
 import * as highlightsMeta from './contributors/highlights-meta.js';
 import * as highlightsCells from './contributors/highlights-cells.js';
-import * as analysisArtifacts from './contributors/analysis-artifacts.js';
 import * as cinematicCamera from './contributors/cinematic-camera.js';
 import { assertExactKeys } from './schema-contract.js';
 
@@ -46,10 +47,11 @@ export function createSessionSerializer(options) {
     cinematicCamera,
     coreState,
     dockableLayout,
+    figureExport,
     analysisWindows,
+    analysisDocked,
     highlightsMeta,
-    highlightsCells,
-    analysisArtifacts
+    highlightsCells
   ];
   return new SessionSerializer({
     state: options.state,
@@ -59,6 +61,7 @@ export function createSessionSerializer(options) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors
   });
 }

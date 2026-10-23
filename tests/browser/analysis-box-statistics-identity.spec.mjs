@@ -8,7 +8,11 @@
  * the same autorange and the same hover text. Outliers are drawn without
  * jitter, so identical outliers land on one spot and the application draws at
  * most `COINCIDENT_OUTLIER_COPIES` of them: its points are the raw trace's
- * points with every run of an identical outlier cut to that many copies.
+ * points with every run of an identical outlier cut to that many copies. The
+ * application's points are drawn by the point layer (one image per box,
+ * plots/point-layer.js) from the positions Plotly lays out, so they are read
+ * from the calcdata and mapped through the axes, where the raw trace's are
+ * read from its SVG paths.
  */
 import { expect, test } from './helpers/test.mjs';
 import { openPlotHarness } from './helpers/plot-harness.mjs';
@@ -78,6 +82,15 @@ test('precomputed box statistics draw exactly the raw-value box', async ({ page 
     };
     const failures = [];
     let precomputedTraces = 0;
+    // The drawn points of a calcdata entry as [value, x, y]: Plotly's records,
+    // or the typed arrays the point layer keeps for a box of every value.
+    const drawnOf = entry => {
+      if (!entry._cellucidPos) return entry.pts2.map(p => [p.v, p.x, p.y]);
+      const horizontal = entry.trace?.orientation === 'h';
+      return Array.from(entry._cellucidVals, (v, k) => (
+        horizontal ? [v, v, entry._cellucidPos[k]] : [v, entry._cellucidPos[k], v]
+      ));
+    };
     let cappedStacks = 0;
     for (const [name, values] of Object.entries(fixtures)) {
       for (const variant of variants) {
@@ -96,6 +109,8 @@ test('precomputed box statistics draw exactly the raw-value box', async ({ page 
         const raw = fresh.map((trace, index) => {
           const copy = { ...trace };
           for (const key of ['q1', 'median', 'q3', 'lowerfence', 'upperfence', 'mean', 'sd', 'notchspan']) delete copy[key];
+          // Plotly's own SVG points.
+          delete copy._cellucidPointLayer;
           const numeric = Array.from(pageData[index].values).filter(Number.isFinite);
           const vertical = options.orientation !== 'horizontal';
           copy[vertical ? 'y' : 'x'] = numeric;
@@ -124,7 +139,7 @@ test('precomputed box statistics draw exactly the raw-value box', async ({ page 
           // A raw-value box (no points, or notched) is drawn by Plotly from
           // every value, uncapped.
           const uncapped = options.showPoints === 'all' || !Array.isArray(fresh[t].q1);
-          const pa = a.pts2.map(p => [p.v, p.x, p.y]);
+          const pa = drawnOf(a);
           const pb = capped(b.pts2.map(p => [p.v, p.x, p.y]), b.pts2.map(p => p.v), uncapped);
           if (JSON.stringify(pa) !== JSON.stringify(pb)) failures.push(`${label} trace ${t} drawn points differ (${pa.length} vs ${pb.length})`);
           if (b.pts2.length > pb.length) cappedStacks++;
@@ -137,13 +152,19 @@ test('precomputed box statistics draw exactly the raw-value box', async ({ page 
         // Box, whisker and mean paths; the drawn points are compared below.
         const geometry = div => [...div.querySelectorAll('.boxlayer path:not(.point)')].map(node => node.getAttribute('d') ?? node.getAttribute('transform'));
         if (JSON.stringify(geometry(mine)) !== JSON.stringify(geometry(theirs))) failures.push(`${label} box geometry differs`);
-        // Point elements are drawn trace by trace, in drawn-point order.
-        const points = (div, cap) => [...div.querySelectorAll('.boxlayer .trace')].flatMap((node, t) => {
+        // Point elements are drawn trace by trace, in drawn-point order: the
+        // raw trace's SVG translations, and the axis pixels of the layer's.
+        const points = div => [...div.querySelectorAll('.boxlayer .trace')].flatMap((node, t) => {
           const drawn = [...node.querySelectorAll('.point')].map(point => point.getAttribute('transform'));
           const uncapped = options.showPoints === 'all' || !Array.isArray(fresh[t].q1);
-          return cap ? capped(drawn, div.calcdata[t][0].pts2.map(p => p.v), uncapped) : drawn;
+          return capped(drawn, div.calcdata[t][0].pts2.map(p => p.v), uncapped);
         });
-        if (JSON.stringify(points(mine, false)) !== JSON.stringify(points(theirs, true))) failures.push(`${label} point geometry differs`);
+        // A box without points keeps its outliers' records but draws none.
+        const layerPoints = div => (options.showPoints === 'none' ? [] : div.calcdata).flatMap(cd => drawnOf(cd[0]).map(([, x, y]) => (
+          `translate(${div._fullLayout.xaxis.c2p(x)},${div._fullLayout.yaxis.c2p(y)})`
+        )));
+        if (mine.querySelector('.boxlayer path.point')) failures.push(`${label} draws SVG points`);
+        if (JSON.stringify(layerPoints(mine)) !== JSON.stringify(points(theirs))) failures.push(`${label} point geometry differs`);
         const hoverText = div => {
           const vertical = options.orientation !== 'horizontal';
           const positionAxis = div._fullLayout[vertical ? 'xaxis' : 'yaxis'];

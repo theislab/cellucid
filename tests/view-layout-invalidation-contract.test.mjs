@@ -17,12 +17,16 @@ import test from 'node:test';
 
 import { createDataState } from '../assets/js/app/state/core/data-state.js';
 import { DimensionManager } from '../assets/js/data/dimension-manager.js';
-import { resolveExportDataMapping } from '../assets/js/data/dataset-mapping.js';
+import {
+  assembleAnnDataCandidates,
+  describeAnnDataProbes,
+} from '../assets/js/data/data-mapping-candidates.js';
 import {
   createVectorFieldManager,
   resolveVectorFields,
 } from '../assets/js/data/vector-field-manager.js';
 import { VelocityOverlay } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
+import { loadsAsReader } from './helpers/dimension-loads.mjs';
 
 const viewerSource = readFileSync(
   new URL('../assets/js/rendering/viewer.js', import.meta.url),
@@ -45,19 +49,19 @@ const EMBEDDINGS = Object.freeze({
     X_tsne: {
       label: 't-SNE',
       dimension: 2,
-      file: 'embeddings/0_2d.bin',
+      path: 'obsm/0/0-1',
       source: { key: 'X_tsne', columns: [0, 1] },
     },
     X_umap: {
       label: 'UMAP',
       dimension: 2,
-      file: 'embeddings/1_2d.bin',
+      path: 'obsm/1/0-1',
       source: { key: 'X_umap', columns: [0, 1] },
     },
     X_umap_3d: {
       label: 'X_umap_3d',
       dimension: 3,
-      file: 'embeddings/2_3d.bin',
+      path: 'obsm/2/0-1-2',
       source: { key: 'X_umap_3d', columns: [0, 1, 2] },
     },
   },
@@ -65,8 +69,8 @@ const EMBEDDINGS = Object.freeze({
 
 async function createTwoLayoutManager() {
   const manager = new DimensionManager({ embeddingsMetadata: EMBEDDINGS });
-  manager.loadLayout = async layoutKey =>
-    Float32Array.from(RAW_LAYOUTS[layoutKey]);
+  loadsAsReader(manager, async layoutKey =>
+    Float32Array.from(RAW_LAYOUTS[layoutKey]));
   manager.publishCellCount(2);
   return manager;
 }
@@ -130,10 +134,9 @@ async function createScene(viewerOptions = {}) {
   return { manager, notifications, positions, state, viewer };
 }
 
-// An export embedding is named by its id; an AnnData obsm array by its key
-// and the columns plotted, which is the layout's provenance.
-const TSNE = Object.freeze({ key: 'X_tsne', columns: null });
-const TSNE_BY_PROVENANCE = Object.freeze({ key: 'X_tsne', columns: [0, 1] });
+// An embedding is named by its obsm key and the columns plotted, which is the
+// layout's provenance.
+const TSNE = Object.freeze({ key: 'X_tsne', columns: [0, 1] });
 
 test('two layouts of one dimension are distinct registry entries with their own caches', async () => {
   const manager = await createTwoLayoutManager();
@@ -147,7 +150,10 @@ test('two layouts of one dimension are distinct registry entries with their own 
   assert.equal(manager.getDefaultLayout(2), 'X_umap');
   assert.deepEqual(manager.getEnabledLayoutKeys(), ['X_tsne', 'X_umap', 'X_umap_3d']);
   assert.equal(manager.resolveRepresentation(TSNE), 'X_tsne');
-  assert.equal(manager.resolveRepresentation(TSNE_BY_PROVENANCE), 'X_tsne');
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_tsne', columns: null }),
+    /must list the columns it plots/,
+  );
 
   const umap = await manager.getPositions('X_umap', { showProgress: false });
   const tsne = await manager.getPositions('X_tsne', { showProgress: false });
@@ -218,7 +224,7 @@ test('a same-dimension layout switch is a complete live-view publication', async
 
   // The same layout named by its provenance is the same publication.
   viewer.calls.length = 0;
-  await state.setViewEmbedding('live', TSNE_BY_PROVENANCE);
+  await state.setViewEmbedding('live', TSNE);
   assert.deepEqual(viewer.calls, [
     ['updatePositions', tsne, 2],
     ['setViewEmbedding', 'live', { dimension: 2, layoutKey: 'X_tsne' }],
@@ -348,7 +354,7 @@ test('a kept view switches layout on its own and the switch rolls back atomicall
   assert.equal(manager._layoutPins.size, 0);
 });
 
-test('centroids are built for the layout a view shows, from that layout\'s transform', async () => {
+test('centroids are built for the layout a view shows, from that layout\'s positions', async () => {
   const viewer = createRecordingViewer();
   const state = createDataState({ viewer, labelLayer: null });
   const manager = await createTwoLayoutManager();
@@ -356,100 +362,97 @@ test('centroids are built for the layout a view shows, from that layout\'s trans
   const positions = await manager.getPositions('X_umap', { showProgress: false });
   await manager.getPositions('X_tsne', { showProgress: false });
   await manager.getPositions('X_umap_3d', { showProgress: false });
-  const umapCentroids = [
-    { category: 'a', position: [0, 0], n_points: 1 },
-    { category: 'b', position: [2, 2], n_points: 1 },
-  ];
-  const tsneCentroids = [
-    { category: 'a', position: [0, 0], n_points: 1 },
-    { category: 'b', position: [10, -10], n_points: 1 },
-  ];
   state.initScene(positions, {
     fields: [{
       key: 'group',
       kind: 'category',
       categories: ['a', 'b'],
       codes: Uint8Array.from([0, 1]),
-      // compact_v2 keys centroids by embedding id, the layout key: each
-      // declared embedding carries its own, in its own coordinates. The 3D
-      // embedding has none.
-      centroidsByEmbedding: { X_tsne: tsneCentroids, X_umap: umapCentroids },
     }],
   });
   const field = state.obsData.fields[0];
-  assert.equal(Object.hasOwn(field, 'centroidsByEmbedding'), false);
-  assert.deepEqual([...field.centroidsByLayout.keys()], ['X_tsne', 'X_umap']);
+  assert.ok(field.centroidsByLayout instanceof Map);
+  assert.equal(field.centroidsByLayout.size, 0, 'centroids are computed in the browser, never listed');
 
-  state.buildCentroidsForField(field, { viewId: 'other', layoutKey: 'X_umap' });
-  assert.deepEqual([...state.centroidPositions], [-1, -1, 0, 1, 1, 0]);
-  assert.deepEqual([...field._normalizedLayouts], ['X_umap']);
-  assert.deepEqual(umapCentroids[1].position, [2, 2], 'the manifest is not rewritten');
-
-  // The second 2D layout shows its own centroids, normalized with its own
-  // transform, never the slot layout's.
-  state.buildCentroidsForField(field, { viewId: 'other', layoutKey: 'X_tsne' });
-  assert.deepEqual([...state.centroidPositions], [-1, 1, 0, 1, -1, 0]);
-  assert.deepEqual([...field._normalizedLayouts], ['X_umap', 'X_tsne']);
-  assert.deepEqual(tsneCentroids[1].position, [10, -10]);
-
-  // A layout with no manifest centroids (an embedding the mapping enabled)
-  // gets its own, computed from the codes and that layout's resident
-  // normalized positions -- never another layout's at the wrong coordinates
-  // -- and keeps them, already normalized.
-  const umap3d = manager.getResidentPositions('X_umap_3d');
-  state.buildCentroidsForField(field, { viewId: 'other', layoutKey: 'X_umap_3d' });
-  assert.deepEqual([...state.centroidPositions], [...umap3d]);
-  assert.deepEqual(
-    field.centroidsByLayout.get('X_umap_3d').map(centroid => centroid.category),
-    ['a', 'b'],
-  );
-  assert.deepEqual([...field._normalizedLayouts], ['X_umap', 'X_tsne', 'X_umap_3d']);
+  // Each layout gets its own centroids, computed from the codes and that
+  // layout's resident normalized positions -- never another layout's at the
+  // wrong coordinates -- and keeps them, already normalized. One cell per
+  // category: each centroid is its cell.
+  const layouts = ['X_umap', 'X_tsne', 'X_umap_3d'];
+  for (const layoutKey of layouts) {
+    state.buildCentroidsForField(field, { viewId: 'other', layoutKey });
+    const resident = manager.getResidentPositions(layoutKey);
+    const dimension = manager.getLayout(layoutKey).dimension;
+    const padded = [];
+    for (let cell = 0; cell < 2; cell++) {
+      for (let axis = 0; axis < 3; axis++) padded.push(axis < dimension ? resident[cell * dimension + axis] : 0);
+    }
+    assert.deepEqual([...state.centroidPositions], padded, layoutKey);
+    assert.deepEqual(field.centroidsByLayout.get(layoutKey).map(centroid => centroid.category), ['a', 'b']);
+  }
+  assert.deepEqual([...field._normalizedLayouts], layouts);
   const cached = field.centroidsByLayout.get('X_umap_3d');
   state.buildCentroidsForField(field, { viewId: 'other', layoutKey: 'X_umap_3d' });
   assert.equal(field.centroidsByLayout.get('X_umap_3d'), cached, 'computed once per layout');
-  assert.deepEqual([...state.centroidPositions], [...umap3d]);
 });
 
-test('vector bindings belong to exactly the embeddings their files name', async () => {
+test('vector bindings belong to exactly the embeddings their mapping names', async () => {
   const manager = await createTwoLayoutManager();
-  const identity = {
-    version: 3,
-    embeddings: EMBEDDINGS,
-    vector_fields: {
-      default_field: 'velocity_umap',
-      fields: {
-        // Field index 0, bound to X_tsne (item 0) only.
-        drift: {
-          label: 'drift',
-          files: { X_tsne: 'vectors/0_0.bin' },
-        },
-        // Field index 1, bound to X_umap (item 1) only.
-        velocity_umap: {
-          label: 'velocity_umap',
-          files: { X_umap: 'vectors/1_1.bin' },
-        },
-      },
+  const dense = (key, width) => ({
+    key, storage: 'dense', shape: [2, width], dtype: 'float32', numeric: true,
+  });
+  const candidates = assembleAnnDataCandidates(describeAnnDataProbes({
+    nObs: 2,
+    nVars: 0,
+    obsm: [
+      dense('X_tsne', 2),
+      dense('X_umap', 2),
+      dense('X_umap_3d', 3),
+      dense('drift_tsne', 2),
+      dense('velocity_umap', 2),
+    ],
+    obsp: [],
+    varColumns: [],
+    X: null,
+    layers: [],
+    raw: null,
+  }), {
+    slots: {
+      '1d': null,
+      '2d': { key: 'X_umap', columns: [0, 1] },
+      '3d': { key: 'X_umap_3d', columns: [0, 1, 2] },
     },
-  };
+    guessed: [],
+  });
   const vectors = createVectorFieldManager({
-    baseUrl: 'https://example.test/dataset/',
+    baseUrl: 'h5ad://dataset/',
     vectorFields: resolveVectorFields({
-      identity,
-      // The export mapping uses every binding the identity declares.
-      mapping: resolveExportDataMapping(identity, null),
-      candidates: null,
+      // drift_tsne is bound to X_tsne only, velocity_umap to X_umap only.
+      mapping: {
+        kind: 'anndata',
+        vectorFields: [
+          { key: 'drift_tsne', embedding: { key: 'X_tsne', columns: [0, 1] } },
+          { key: 'velocity_umap', embedding: { key: 'X_umap', columns: [0, 1] } },
+        ],
+      },
+      candidates,
       dimensionManager: manager,
     }),
     dimensionManager: manager,
   });
 
-  assert.equal(vectors.hasFieldLayout('velocity_umap', 'X_umap'), true);
-  assert.equal(vectors.hasFieldLayout('velocity_umap', 'X_tsne'), false);
-  // A second layout of the same dimension is bound only when a field says so.
+  // Each field is named for its prefix (scVelo's `<field>_<basis>`).
+  assert.deepEqual(vectors.getAvailableFields(), [
+    { id: 'drift', label: 'drift', layoutKeys: ['X_tsne'] },
+    { id: 'velocity', label: 'velocity', layoutKeys: ['X_umap'] },
+  ]);
+  assert.equal(vectors.hasFieldLayout('velocity', 'X_umap'), true);
+  assert.equal(vectors.hasFieldLayout('velocity', 'X_tsne'), false);
+  // A second layout of the same dimension is bound only when a binding says so.
   assert.equal(vectors.hasFieldLayout('drift', 'X_tsne'), true);
   assert.equal(vectors.hasFieldLayout('drift', 'X_umap'), false);
   await assert.rejects(
-    vectors.loadField('velocity_umap', 'X_tsne', { showProgress: false }),
+    vectors.loadField('velocity', 'X_tsne'),
     /declares no data for layout "X_tsne"/,
   );
 
@@ -457,10 +460,10 @@ test('vector bindings belong to exactly the embeddings their files name', async 
   // layout has no binding, instead of the slot layout's vectors.
   const released = [];
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
-    _activeFieldId: 'velocity_umap',
+    _activeFieldId: 'velocity',
     _contextLost: false,
     _fieldsById: new Map([
-      ['velocity_umap', new Map([['X_umap', { cellCount: 2, components: 2 }]])],
+      ['velocity', new Map([['X_umap', { cellCount: 2, components: 2 }]])],
     ]),
     _spawnByView: new Map([['live', { dirty: false, ready: true, version: 3 }]]),
     _assertMutableLifecycle() {},
@@ -468,8 +471,8 @@ test('vector bindings belong to exactly the embeddings their files name', async 
     _disposeParticleState: viewId => released.push(['particles', viewId]),
     _disposeFBOs: viewId => released.push(['trails', viewId]),
   });
-  assert.equal(overlay.hasFieldForLayout('velocity_umap', 'X_umap'), true);
-  assert.equal(overlay.hasFieldForLayout('velocity_umap', 'X_tsne'), false);
+  assert.equal(overlay.hasFieldForLayout('velocity', 'X_umap'), true);
+  assert.equal(overlay.hasFieldForLayout('velocity', 'X_tsne'), false);
 
   overlay._doUpdate(1 / 60, {
     dimensionLevel: 2,

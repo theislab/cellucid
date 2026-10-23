@@ -14,38 +14,35 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-10-21.046a66a9" />
+  <meta name="cellucid-web-build-id" content="2026-10-23.09344b5e" />
   <!--
     The release version the web app shares with the Python and R packages. A
     deployment is still identified by the build id above; the version names
     the release line the three ship together, and the footer prints both.
   -->
-  <meta name="cellucid-version" content="0.9.4" /> <!-- CELLUCID_VERSION -->
+  <meta name="cellucid-version" content="0.9.5" /> <!-- CELLUCID_VERSION -->
 
   <!--
-    CELLUCID_EXPORTS_BASE_URL
-    ------------------------
-    The web app's built-in sample datasets (the "local-demo" source) are now
-    hosted outside the web app repo, typically in a separate `cellucid-datasets`
-    repo/site. This URL must point at an exports root that contains:
-      - datasets.json
-      - <dataset-id>/dataset_identity.json
-      - <dataset-id>/obs_manifest.json
-      - ...
+    CELLUCID_SAMPLE_CATALOG
+    -----------------------
+    The web app's built-in sample datasets (the "local-demo" source) are hosted
+    outside the web app repo, in the `cellucid-datasets` site. This URL names a
+    dataset catalog folder: its `datasets.json` lists the AnnData files (Zarr
+    store folders, `.h5ad` or `.zarr.zip`) beside it, each read in place by the
+    browser (data/sources/anndata-catalog.js).
 
-    This exact meta element is the canonical deployed configuration. The
-    canonical `exportsBaseUrl` query field may replace it for a single launch.
-    Every sample artifact uses one direct HTTP request. Cross-origin sample
-    hosts must publish the matching CORS response headers.
+    This exact meta element is the canonical deployed configuration. One
+    `sampleCatalog` query field may replace it for a single launch.
+    Cross-origin catalog hosts must publish the matching CORS response headers.
   -->
-  <meta name="cellucid-exports-base-url" content="https://theislab.github.io/cellucid-datasets/exports-v3/" />
+  <meta name="cellucid-sample-catalog" content="https://theislab.github.io/cellucid-datasets/anndata/" />
 
 	  <!-- Security policy for the static application shell -->
 	  <!--
     This policy is expressed in markup so it is enforced on static hosts.
     The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
-    block below (SEO structured data) without enabling `'unsafe-inline'`. `wasm-unsafe-eval` permits
-    compilation of the bundled h5wasm module without granting general JavaScript `unsafe-eval`.
+    block below (SEO structured data) without enabling `'unsafe-inline'`. No WebAssembly is compiled,
+    so neither `'unsafe-eval'` nor `'wasm-unsafe-eval'` is granted.
     If you change that JSON, regenerate the hash or the browser blocks the block;
     tests/seo-head-contract.test.mjs recomputes it and fails while they disagree.
   -->
@@ -53,7 +50,7 @@
     default-src 'self';
     base-uri 'none';
     object-src 'none';
-    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com 'sha256-4y3wF9J5HFXyJveARnyuajDo7heTbmBXPU8rXS5xifQ=';
+    script-src 'self' https://www.googletagmanager.com 'sha256-MjWK9VBGU/2U/nGIJV4J7Rj2kXutScQQlqS59UHVf5c=';
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https:;
     font-src 'self' data:;
@@ -98,13 +95,13 @@
     "@type": "WebApplication",
     "name": "Cellucid",
     "alternateName": "cellucid",
-    "description": "Free, open-source web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, gene expression and metadata coloring, filtering, RNA-velocity overlays, figure export and community annotation. Opens AnnData (.h5ad) files directly, and exports prepared with the Python package (Scanpy/AnnData) or the R package (Seurat, SingleCellExperiment).",
+    "description": "Free, open-source web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, gene expression and metadata coloring, filtering, RNA-velocity overlays, figure export and community annotation. Opens AnnData files (.h5ad and Zarr) directly, including files prepared with the Python package (Scanpy/AnnData) or the R package (Seurat, SingleCellExperiment).",
     "url": "https://www.cellucid.com/",
     "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
     "applicationCategory": "ScientificApplication",
     "applicationSubCategory": "Single-cell data visualization",
     "operatingSystem": "Web browser",
-    "softwareVersion": "0.9.4",
+    "softwareVersion": "0.9.5",
     "browserRequirements": "Requires WebGL2",
     "isAccessibleForFree": true,
     "license": "https://opensource.org/licenses/BSD-3-Clause",
@@ -200,7 +197,7 @@
       <li>Community annotation voting with optional GitHub sync</li>
     </ul>
     <h2>Data sources</h2>
-    <p>Open an AnnData <code>.h5ad</code> file or a <code>.zarr.zip</code> archive directly in the browser, or prepare an export from Scanpy/AnnData with the <code>cellucid</code> Python package or from Seurat and SingleCellExperiment with the <code>cellucid</code> R package. Data can also be served from a Python server or a Jupyter notebook.</p>
+    <p>Open an AnnData <code>.h5ad</code> file, a Zarr store or a <code>.zarr.zip</code> archive directly in the browser. The <code>cellucid</code> Python package prepares one from Scanpy/AnnData, and the <code>cellucid</code> R package from Seurat and SingleCellExperiment. Data can also be served from a Python server or a Jupyter notebook.</p>
     <h2>Use cases</h2>
     <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
     <h2>Learn more</h2>
@@ -475,6 +472,10 @@
                 <span id="dataset-url" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
               </div>
               <div class="dataset-info-row">
+                <span class="dataset-info-label">Citation</span>
+                <span id="dataset-citation" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+              </div>
+              <div class="dataset-info-row">
                 <span class="dataset-info-label">Cells</span>
                 <span id="dataset-cells" class="dataset-info-value">–</span>
               </div>
@@ -524,11 +525,11 @@
               <div class="user-data-grid">
                 <button type="button" id="user-data-h5ad-btn" class="btn data-btn" title="Load single .h5ad file" disabled aria-describedby="data-source-status">H5AD</button>
                 <button type="button" id="user-data-zarr-archive-btn" class="btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser" disabled aria-describedby="data-source-status">Zarr ZIP</button>
-                <button type="button" id="user-data-browse-btn" class="btn data-btn data-btn-wide" title="Load prepared directory" disabled aria-describedby="data-source-status">Prepared</button>
+                <button type="button" id="user-data-zarr-folder-btn" class="btn data-btn data-btn-wide" title="Load an AnnData Zarr store folder (.zarr)" disabled aria-describedby="data-source-status">Zarr folder</button>
                 <!-- Hidden file inputs -->
-                <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
                 <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" disabled />
                 <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" disabled />
+                <input type="file" id="user-data-zarr-folder-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
               </div>
 
             </div>
@@ -549,20 +550,28 @@
               </div>
 
             </div>
-            <div class="control-block relative" id="github-repo-block" data-state-serializer-skip="true">
+            <div class="control-block relative" id="data-link-block" data-state-serializer-skip="true">
               <div class="field-label-row">
-                <label for="github-repo-url" id="github-title">GitHub</label>
-                <button type="button" id="github-info-btn" class="info-btn" aria-label="About GitHub data" aria-controls="github-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+                <label for="data-link-url" id="data-link-title">Open from link</label>
+                <button type="button" id="data-link-info-btn" class="info-btn" aria-label="About opening data from a link" aria-controls="data-link-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
-              <div id="github-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="github-info-btn" tabindex="-1" data-info-tip="github-data" hidden></div>
+              <div id="data-link-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-link-info-btn" tabindex="-1" data-info-tip="data-link" hidden></div>
               <div class="user-data-row">
-                <input type="text" id="github-repo-url" class="obs-select" aria-labelledby="github-title"
-                       placeholder="owner/repo/path/to/exports" disabled
+                <input type="text" id="data-link-url" class="obs-select" aria-labelledby="data-link-title"
+                       placeholder="Link, DOI, GSE…, hf:user/repo, owner/repo/path" disabled
                        aria-describedby="data-source-status" />
-                <button type="button" id="github-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
+                <button type="button" id="data-link-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
               </div>
-              <div id="github-disconnect-container" class="user-data-row" hidden>
-                <button type="button" id="github-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
+              <div id="data-link-disconnect-container" class="user-data-row" hidden>
+                <button type="button" id="data-link-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
+              </div>
+              <div id="transfers-block" data-state-serializer-skip="true" hidden>
+                <div class="field-label-row">
+                  <span id="transfers-title">Transfers</span>
+                  <button type="button" id="transfers-info-btn" class="info-btn" aria-label="About transfers" aria-controls="transfers-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+                </div>
+                <div id="transfers-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="transfers-info-btn" tabindex="-1" data-info-tip="transfers" hidden></div>
+                <ul id="transfers-list" class="transfers-list" aria-labelledby="transfers-title" aria-live="off"></ul>
               </div>
 
             </div>
@@ -1501,7 +1510,8 @@
                 Show labels
               </label>
             </div>
-            <!-- Outlier filter: shown for categorical fields whose export has outlier scores. -->
+            <!-- Outlier filter: shown for every categorical field of the file; the
+                 note says what it can do and why (ui/modules/outlier-filter-control.js). -->
             <div class="control-block" id="outlier-filter-container" hidden>
               <div class="field-label-row">
                 <label for="outlier-filter">Outlier filter</label>
@@ -1509,9 +1519,14 @@
               </div>
               <div id="outlier-filter-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="outlier-filter-info-btn" tabindex="-1" data-info-tip="outlier-filter" hidden></div>
               <div class="slider-row">
-                <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
+                <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" aria-describedby="outlier-filter-note" />
                 <span id="outlier-filter-display" class="slider-value">100%</span>
               </div>
+              <div id="outlier-filter-progress" class="job-progress" role="progressbar" aria-label="Outlier distances" aria-valuemin="0" aria-valuemax="100" hidden>
+                <div id="outlier-filter-progress-bar" class="job-progress-bar"></div>
+              </div>
+              <p id="outlier-filter-note" class="outlier-filter-note" aria-live="polite" hidden></p>
+              <button type="button" id="outlier-filter-action" class="btn btn-compact outlier-filter-action" hidden>Cancel</button>
             </div>
             <div id="legend"></div>
           </div>
@@ -1984,7 +1999,7 @@
   <!--
     Shown across the viewer while files are dragged over the page
     (ui/modules/dataset-drop.js). Purely visual: keyboard and screen-reader
-    users open data with the H5AD, Zarr ZIP and Prepared buttons, and the
+    users open data with the H5AD, Zarr ZIP and Zarr folder buttons, and the
     outcome of a drop is announced by the notification it produces.
   -->
   <div id="dataset-drop-overlay" class="dataset-drop-overlay" aria-hidden="true" hidden>
@@ -1995,7 +2010,7 @@
         <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>
       </svg>
       <p class="dataset-drop-title">Drop to open</p>
-      <p class="dataset-drop-hint">One .h5ad file, one .zarr.zip archive, or one prepared export folder</p>
+      <p class="dataset-drop-hint">One .h5ad file, one .zarr folder, or one .zarr.zip archive</p>
     </div>
   </div>
 

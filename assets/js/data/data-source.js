@@ -10,7 +10,9 @@ import {
   throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 import { compareCodePoints } from './data-mapping.js';
+import { parseMappingEmbeddingPath } from './data-mapping-candidates.js';
 import { StateValidator } from '../app/utils/state-validator.js';
+import { getTransferLog } from './transfer-log.js';
 
 /**
  * @typedef {Object} DatasetStats
@@ -20,64 +22,78 @@ import { StateValidator } from '../app/utils/state-validator.js';
  * @property {number} n_categorical_fields - Number of categorical fields
  * @property {number} n_continuous_fields - Number of continuous fields
  * @property {boolean} has_connectivity - Whether KNN data exists
- * @property {number|null} n_edges - Edge count, or null without connectivity
+ * @property {number|null} n_edges - Edge count; null without connectivity, or for a graph read straight from a file until its edges are read
  */
 
 /**
  * @typedef {Object} DatasetObsField
  * @property {string} key - Field key/name
  * @property {'category'|'continuous'} kind - Field type
- * @property {number} [n_categories] - Number of categories (for categorical)
- */
-
-/**
- * @typedef {Object} DatasetExportSettings
- * @property {number|null} compression - Gzip compression level
- * @property {number|null} var_quantization - Gene expression quantization bits
- * @property {number|null} obs_continuous_quantization - Continuous obs quantization bits
- * @property {string} obs_categorical_dtype - Categorical dtype ('uint8', 'uint16' or 'uint32')
+ * @property {number|null} [n_categories] - Number of categories (for
+ *   categorical); null when they are found on first load (a direct AnnData
+ *   string or boolean column)
  */
 
 /**
  * @typedef {Object} DatasetSource
- * @property {string} [name] - Source name
- * @property {string} [url] - Source URL
- * @property {string} [citation] - Citation text
+ * @property {string} name - Where the data comes from
+ * @property {string} [url] - Its address
+ * @property {string} [filename] - The file it was read from
  */
 
 /**
+ * @typedef {Object} DatasetCitation
+ * @property {string} text - How to cite the dataset
+ * @property {string} [url] - Its DOI or page
+ */
+
+/**
+ * The identity of one open dataset: what the AnnData adapter states about the
+ * file it reads (`BaseAnnDataAdapter.finalizeDirectIdentity`).
+ *
  * @typedef {Object} DatasetMetadata
- * @property {number} version - Exact dataset identity version
- * @property {string} id - Unique identifier (directory name)
+ * @property {string} id - The dataset id
  * @property {string} name - Human-readable display name
  * @property {string} description - Description (may be empty)
- * @property {string} [created_at] - ISO timestamp of export
- * @property {string} cellucid_data_version - Version of the cellucid package (Python or R) that wrote the export
  * @property {DatasetStats} stats - Dataset statistics
  * @property {Object} embeddings - Exact available/default embedding metadata
  * @property {DatasetObsField[]} obs_fields - List of observation fields
- * @property {DatasetExportSettings} [export_settings] - Export configuration
  * @property {DatasetSource} [source] - Data source information
+ * @property {DatasetCitation} [citation] - How to cite it
+ * @property {string} [vector_field_default] - The vector field the dataset
+ *   opens with (a launch's `vectorFieldDefault`)
  */
 
 /**
- * Configuration constants for data loading
+ * What a dataset list shows about a dataset before it is opened: a catalog
+ * describes its files from their metadata (`sources/anndata-catalog.js`); a
+ * source that has opened its dataset lists the identity, which holds the
+ * same members.
+ *
+ * @typedef {Object} DatasetSummary
+ * @property {string} id
+ * @property {string} name
+ * @property {string} description
+ * @property {{n_cells: number, n_genes: number}} stats
  */
-const EXPORTS_QUERY_KEY = 'exportsBaseUrl';
-const EXPORTS_META_SELECTOR =
-  'meta[name="cellucid-exports-base-url"]';
 
-function exportsConfigurationError(message) {
+/**
+ * The sample catalog: the folder holding the `datasets.json` of the Sample
+ * dataset list (`sources/anndata-catalog.js`), named by the page's one
+ * `cellucid-sample-catalog` meta element, or for one launch by one
+ * `sampleCatalog` query field.
+ */
+const SAMPLE_CATALOG_QUERY_KEY = 'sampleCatalog';
+const SAMPLE_CATALOG_META_SELECTOR =
+  'meta[name="cellucid-sample-catalog"]';
+
+function sampleCatalogConfigurationError(message) {
   const error = new Error(`Sample dataset configuration: ${message}`);
   error.name = 'ConfigurationError';
   return error;
 }
 
-function requireCanonicalPathSegments(
-  pathname,
-  owner,
-  createError = message => new TypeError(message)
-) {
+function requireCanonicalPathSegments(pathname, owner) {
   const segments = pathname.split('/').slice(1);
   if (segments.at(-1) === '') segments.pop();
   for (const segment of segments) {
@@ -85,7 +101,7 @@ function requireCanonicalPathSegments(
     try {
       decoded = decodeURIComponent(segment);
     } catch {
-      throw createError(
+      throw sampleCatalogConfigurationError(
         `${owner} contains invalid percent encoding`
       );
     }
@@ -93,26 +109,25 @@ function requireCanonicalPathSegments(
       segment.length === 0 ||
       decoded === '.' ||
       decoded === '..' ||
-      decoded.includes('%') ||
       decoded.includes('/') ||
       decoded.includes('\\') ||
       /[\u0000-\u001f\u007f]/.test(decoded) ||
       encodeURIComponent(decoded) !== segment
     ) {
-      throw createError(
+      throw sampleCatalogConfigurationError(
         `${owner} contains a non-canonical path segment`
       );
     }
   }
 }
 
-function validateExportsBaseUrl(value, owner) {
+function validateSampleCatalogUrl(value, owner) {
   if (
     typeof value !== 'string' ||
     value.length === 0 ||
     value !== value.trim()
   ) {
-    throw exportsConfigurationError(
+    throw sampleCatalogConfigurationError(
       `${owner} must contain one exact non-empty URL`
     );
   }
@@ -120,7 +135,7 @@ function validateExportsBaseUrl(value, owner) {
   try {
     parsed = new URL(value);
   } catch {
-    throw exportsConfigurationError(
+    throw sampleCatalogConfigurationError(
       `${owner} must be an absolute HTTP(S) URL`
     );
   }
@@ -133,105 +148,85 @@ function validateExportsBaseUrl(value, owner) {
     !parsed.pathname.endsWith('/') ||
     parsed.href !== value
   ) {
-    throw exportsConfigurationError(
-      `${owner} must be one canonical HTTP(S) directory URL with a trailing /`
+    throw sampleCatalogConfigurationError(
+      `${owner} must be one canonical HTTP(S) folder URL with a trailing /`
     );
   }
-  requireCanonicalPathSegments(
-    parsed.pathname,
-    owner,
-    exportsConfigurationError
-  );
+  requireCanonicalPathSegments(parsed.pathname, owner);
   return parsed.href;
 }
 
-function readExportsConfiguration() {
+function readSampleCatalogConfiguration() {
   if (
     typeof window === 'undefined' ||
     typeof window.location?.href !== 'string'
   ) {
-    return { baseUrl: null, error: null };
+    return { url: null, error: null };
   }
   try {
     const pageUrl = new URL(window.location.href);
     const queryValues =
-      pageUrl.searchParams.getAll(EXPORTS_QUERY_KEY);
+      pageUrl.searchParams.getAll(SAMPLE_CATALOG_QUERY_KEY);
     if (queryValues.length > 1) {
-      throw exportsConfigurationError(
-        `exactly one '${EXPORTS_QUERY_KEY}' query field is allowed`
+      throw sampleCatalogConfigurationError(
+        `exactly one '${SAMPLE_CATALOG_QUERY_KEY}' query field is allowed`
       );
     }
     if (queryValues.length === 1) {
       return {
-        baseUrl: validateExportsBaseUrl(
+        url: validateSampleCatalogUrl(
           queryValues[0],
-          EXPORTS_QUERY_KEY
+          SAMPLE_CATALOG_QUERY_KEY
         ),
         error: null,
       };
     }
 
     if (typeof document === 'undefined') {
-      return { baseUrl: null, error: null };
+      return { url: null, error: null };
     }
-    const metas = document.querySelectorAll(EXPORTS_META_SELECTOR);
+    const metas = document.querySelectorAll(SAMPLE_CATALOG_META_SELECTOR);
     if (metas.length > 1) {
-      throw exportsConfigurationError(
-        'exactly one cellucid-exports-base-url meta element is allowed'
+      throw sampleCatalogConfigurationError(
+        'exactly one cellucid-sample-catalog meta element is allowed'
       );
     }
     if (metas.length === 0) {
-      return { baseUrl: null, error: null };
+      return { url: null, error: null };
     }
-    const content = metas[0].getAttribute('content');
     return {
-      baseUrl: validateExportsBaseUrl(
-        content,
-        'cellucid-exports-base-url meta content'
+      url: validateSampleCatalogUrl(
+        metas[0].getAttribute('content'),
+        'cellucid-sample-catalog meta content'
       ),
       error: null,
     };
   } catch (error) {
     return {
-      baseUrl: null,
+      url: null,
       error: error instanceof Error
         ? error
-        : exportsConfigurationError(String(error)),
+        : sampleCatalogConfigurationError(String(error)),
     };
   }
 }
 
-const exportsConfiguration = readExportsConfiguration();
+const sampleCatalogConfiguration = readSampleCatalogConfiguration();
 
 export const DATA_CONFIG = {
-  // Base paths
-  EXPORTS_BASE_URL: exportsConfiguration.baseUrl,
-  EXPORTS_CONFIGURATION_ERROR: exportsConfiguration.error,
-  DATASETS_MANIFEST: 'datasets.json',
-
-  // Required files for a valid dataset
-  REQUIRED_FILES: [
-    'dataset_identity.json',
-    'obs_manifest.json'
-  ],
-
-  // Metadata file name
-  DATASET_IDENTITY_FILE: 'dataset_identity.json',
-
-  // Supported schema versions
-  SUPPORTED_MANIFEST_VERSIONS: [1],
-  SUPPORTED_IDENTITY_VERSIONS: [3]
+  /** The sample catalog folder, or null when the page names none. */
+  SAMPLE_CATALOG_URL: sampleCatalogConfiguration.url,
+  /** Why the page's sample catalog configuration was refused, or null. */
+  SAMPLE_CATALOG_CONFIGURATION_ERROR: sampleCatalogConfiguration.error,
 };
 
 // ============================================================================
 // PAYLOAD SIZES
 // ============================================================================
-// Datasets are untrusted input: a user opens somebody else's GitHub repository
-// the same way they open their own directory. A binary payload's size is not
-// capped by a fixed number: every one is declared exactly by its manifest
-// (cells x item size, edges x item size), checked against the transfer and the
-// gzip envelope, and the only limit is the memory the browser grants. A
-// refused allocation is reported as a TOO_LARGE load error naming the bytes.
+// A response read whole (a catalog, a session, a served dataset list) is not
+// capped by a fixed number: the only limit is the memory the browser grants,
+// and a refused allocation is reported as a TOO_LARGE load error naming the
+// bytes. A caller that knows a document's exact bound passes it.
 
 /**
  * The exact error a byte ceiling refuses with.
@@ -257,23 +252,6 @@ export function payloadTooLargeError(message, details = {}) {
 }
 
 /**
- * Validate a manifest-declared payload length.
- *
- * @param {number} expectedBytes - Manifest-declared decoded length
- * @param {string} label - Payload identity for the error message
- * @returns {number} The validated length
- */
-export function requireDeclaredPayloadLength(expectedBytes, label) {
-  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
-    throw new RangeError(
-      `${label}: declared payload length must be a non-negative safe integer, ` +
-      `received ${String(expectedBytes)}`
-    );
-  }
-  return expectedBytes;
-}
-
-/**
  * Allocate a payload buffer, reporting a refused allocation as a TOO_LARGE
  * load error that names the bytes (the browser's memory, not a fixed cap,
  * is the limit).
@@ -295,22 +273,6 @@ export function allocatePayloadBytes(byteLength, label) {
   }
 }
 
-/**
- * Largest gzip member that can legally encode `expectedBytes` of output.
- *
- * DEFLATE's worst case is a stored block per 65535 input bytes, each costing
- * five bytes, plus the ten-byte header, the eight-byte trailer, and room for
- * an optional file name. Anything larger cannot be a faithful encoding of the
- * declared payload, so the transfer is refused without inflating a byte.
- *
- * @param {number} expectedBytes
- * @returns {number}
- */
-export function maxGzipTransferBytes(expectedBytes) {
-  const storedBlocks = Math.ceil(expectedBytes / 65535) + 1;
-  return expectedBytes + storedBlocks * 5 + 18 + 1024;
-}
-
 function requireByteCeiling(maxBytes, label) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw new RangeError(
@@ -327,8 +289,8 @@ function requireByteCeiling(maxBytes, label) {
  *
  * This enforces a *ceiling*, which is deliberately not the same contract as
  * the exact-output-length reader owned by the session gzip codec
- * (`app/session/codecs/gzip.js`): a transfer's encoded size is not knowable
- * from a manifest, so it can only be capped. Exact-length enforcement of
+ * (`app/session/codecs/gzip.js`): a transfer's encoded size is not known
+ * before it arrives, so it can only be capped. Exact-length enforcement of
  * decompressed payloads is delegated to that codec's `gzipDecompress()`.
  *
  * @param {Response} response
@@ -480,252 +442,105 @@ export async function readBoundedJson(response, options) {
 }
 
 // ============================================================================
-// SAMPLE EXPORT TRANSPORT
+// CATALOG FILES
 // ============================================================================
 
-const REQUEST_METHODS = new Set(['GET', 'HEAD']);
+/**
+ * The one HTTP cache mode of every file a dataset catalog names
+ * (`datasets.json`, a default session): revalidated with its host on every
+ * request. A catalog republished at the same address lists files by path, and
+ * a session is pinned by its digest; a copy reused without asking the host
+ * (hosts such as GitHub Pages cache for minutes) would pair a new catalog with
+ * an old session and refuse it. An unchanged file costs a conditional request
+ * answered with 304.
+ */
+export const CATALOG_FILE_CACHE = 'no-cache';
 
 /**
- * The one HTTP cache mode of every dataset artifact: catalogs, identities,
- * manifests and binary payloads alike.
- *
- * A dataset republished at the same URL keeps its payload paths. A path is an
- * index, not a name, so a re-export that adds one gene renumbers `var/`: the
- * file at `var/3.values.u8.gz` then holds another gene with exactly the same
- * byte length, and no length check can tell. A cached copy reused without
- * asking the origin (`force-cache`, or `default` within a host's max-age) would
- * draw the old gene's values under the new manifest's name. Revalidating
- * every request keeps the bytes and the manifests that describe them from one
- * publication; an unchanged file costs a conditional request answered with 304.
+ * How long to wait before asking a busy host again (HTTP 429 or 503), each
+ * try waiting longer, unless the host's `Retry-After` names the wait: the
+ * byte reader's schedule for the same answers. A policy for a host that
+ * sheds load for a moment (GitHub Pages answers a burst of requests with an
+ * occasional 503), not a limit on what is read.
  */
-export const DATASET_ARTIFACT_CACHE = 'no-cache';
-const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/;
-const SAMPLE_CORS_TRANSPORT = Object.freeze({
-  credentials: 'omit',
-  mode: 'cors',
-  redirect: 'error',
-});
+const BUSY_RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
 
-function getAbsoluteUrl(url) {
-  if (typeof url !== 'string' || url.length === 0) {
-    throw new TypeError('Fetch URL must be a non-empty string.');
-  }
-  const documentUrl =
-    typeof globalThis.window?.location?.href === 'string'
-      ? globalThis.window.location.href
-      : undefined;
-  return documentUrl === undefined
-    ? new URL(url).href
-    : new URL(url, documentUrl).href;
+/** Milliseconds a `Retry-After` value asks for (seconds or an HTTP date), or null. */
+function retryAfterMs(value) {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }
 
-function getAbsoluteExportsBaseUrl() {
-  const base = DATA_CONFIG.EXPORTS_BASE_URL;
-  if (base === null) return null;
-  validateExportsBaseUrl(base, 'DATA_CONFIG.EXPORTS_BASE_URL');
-  return getAbsoluteUrl(base);
-}
-
-function isExportsUrl(url) {
-  const exportsBase = getAbsoluteExportsBaseUrl();
-  if (!exportsBase) return false;
-  const target = new URL(getAbsoluteUrl(url));
-  const root = new URL(exportsBase);
-  return (
-    target.origin === root.origin &&
-    target.search === '' &&
-    target.hash === '' &&
-    target.pathname.startsWith(root.pathname) &&
-    target.pathname !== root.pathname
-  );
-}
-
-function requireCanonicalExportsFileUrl(originalUrl, absoluteUrl) {
-  if (originalUrl !== absoluteUrl) {
-    throw new TypeError(
-      'Sample request URL must be one canonical absolute URL.'
-    );
-  }
-  const exportsBase = getAbsoluteExportsBaseUrl();
-  if (exportsBase === null) {
-    throw new Error('Sample exports root is not configured.');
-  }
-  const target = new URL(absoluteUrl);
-  const root = new URL(exportsBase);
-  if (
-    target.origin !== root.origin ||
-    target.search !== '' ||
-    target.hash !== '' ||
-    !target.pathname.startsWith(root.pathname) ||
-    target.pathname === root.pathname
-  ) {
-    throw new TypeError(
-      'Sample request URL must identify one file below the exact exports root.'
-    );
-  }
-  const relativePath =
-    target.pathname.slice(root.pathname.length);
-  requireCanonicalPathSegments(
-    `/${relativePath}`,
-    'Sample request URL'
-  );
-  return absoluteUrl;
-}
-
-function validateExportsRequestOptions(init) {
-  if (
-    init !== undefined &&
-    (
-      init === null ||
-      typeof init !== 'object' ||
-      Array.isArray(init)
-    )
-  ) {
-    throw new TypeError(
-      'Sample request options must be an object when provided.'
-    );
-  }
-  const value = init ?? {};
-  const allowedKeys = new Set([
-    'method',
-    'cache',
-    'headers',
-    'signal',
-    'priority',
-  ]);
-  const unsupported = Object.keys(value).filter(
-    key => !allowedKeys.has(key)
-  );
-  if (unsupported.length > 0) {
-    throw new TypeError(
-      `Sample request contains unsupported option(s): ${unsupported.join(', ')}`
-    );
-  }
-  const method = Object.hasOwn(value, 'method')
-    ? value.method
-    : 'GET';
-  const signal = Object.hasOwn(value, 'signal')
-    ? value.signal
-    : null;
-  if (!REQUEST_METHODS.has(method)) {
-    throw new TypeError(
-      'Sample request method must be exactly GET or HEAD.'
-    );
-  }
-  if (
-    signal !== null &&
-    !(signal instanceof AbortSignal)
-  ) {
-    throw new TypeError(
-      'Sample request signal must be an AbortSignal or null.'
-    );
-  }
-  // The fetch priority hint (see data/fetch-scheduler.js).
-  const priority = Object.hasOwn(value, 'priority') ? value.priority : 'auto';
-  if (priority !== 'high' && priority !== 'low' && priority !== 'auto') {
-    throw new TypeError(
-      'Sample request priority must be exactly "high", "low" or "auto".'
-    );
-  }
-
-  const headersValue = Object.hasOwn(value, 'headers')
-    ? value.headers
-    : {};
-  if (
-    headersValue === null ||
-    typeof headersValue !== 'object' ||
-    Array.isArray(headersValue) ||
-    Object.getPrototypeOf(headersValue) !== Object.prototype
-  ) {
-    throw new TypeError(
-      'Sample request headers must be a plain object.'
-    );
-  }
-  const headers = Object.entries(headersValue)
-    .sort(([left], [right]) => left.localeCompare(right));
-  let previous = null;
-  for (const [name, headerValue] of headers) {
-    if (
-      name !== name.toLowerCase() ||
-      !HEADER_NAME.test(name) ||
-      previous === name ||
-      typeof headerValue !== 'string' ||
-      /[\r\n\u0000]/.test(headerValue)
-    ) {
-      throw new TypeError(
-        'Sample request headers require unique lowercase names and string values.'
-      );
+function waitMs(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
     }
-    previous = name;
-  }
-  return Object.freeze({
-    method,
-    headers,
-    signal,
-    priority,
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
 /**
- * Fetch one data artifact. Files owned by the configured sample root use its
- * single current public transport: direct HTTP with browser CORS enforcement.
- * Other data sources retain the caller-provided HTTP transport options. Every
- * artifact is revalidated with its origin ({@link DATASET_ARTIFACT_CACHE});
- * a caller cannot choose another cache mode.
+ * `fetch`, asked again while the host answers that it is busy (HTTP 429 or
+ * 503), waiting as its `Retry-After` asks (when the host lets this page read
+ * it) or longer each time. The last answer is returned as it is, busy or
+ * not; the caller reports it.
  *
  * @param {string} url
  * @param {RequestInit} [init]
  * @returns {Promise<Response>}
  */
-export async function fetchSampleArtifact(url, init) {
-  if (init !== undefined && init !== null && Object.hasOwn(init, 'cache')) {
-    throw new TypeError(
-      'Dataset artifacts are always revalidated; a request cannot choose its cache mode.'
-    );
+export async function fetchWhenNotBusy(url, init = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(url, init);
+    if ((response.status !== 429 && response.status !== 503) || attempt >= BUSY_RETRY_DELAYS_MS.length) {
+      return response;
+    }
+    await response.body?.cancel?.().catch(() => {});
+    await waitMs(retryAfterMs(response.headers?.get?.('Retry-After')) ?? BUSY_RETRY_DELAYS_MS[attempt], init.signal ?? null);
   }
-  const absUrl = getAbsoluteUrl(url);
-
-  if (!isExportsUrl(absUrl)) {
-    return fetch(absUrl, { ...init, cache: DATASET_ARTIFACT_CACHE });
-  }
-
-  requireCanonicalExportsFileUrl(url, absUrl);
-  const request = validateExportsRequestOptions(init);
-  return fetch(absUrl, {
-    ...SAMPLE_CORS_TRANSPORT,
-    method: request.method,
-    cache: DATASET_ARTIFACT_CACHE,
-    headers: request.headers,
-    signal: request.signal,
-    priority: request.priority,
-  });
 }
 
 /**
- * Validate that a manifest/identity version is supported
- * @param {number|undefined} version - Version from the JSON
- * @param {number[]} supportedVersions - Array of supported versions
- * @param {string} context - Context for error message (e.g., 'datasets.json')
- * @throws {DataSourceError} If version is not supported
+ * Fetch one file a dataset catalog names, revalidated with its host
+ * ({@link CATALOG_FILE_CACHE}); a caller cannot choose another cache mode.
+ * What it transfers is counted in the Transfers log under the link that owns
+ * the URL, if any.
+ *
+ * A busy host is asked again ({@link fetchWhenNotBusy}) unless `askOnce` is
+ * set. A person's "Try again" sets it: once a failure is on screen the person
+ * decides when to ask again, so their retry is one request whose answer is
+ * shown at once, not a schedule of requests running behind their notice.
+ *
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @param {{askOnce?: boolean}} [options]
+ * @returns {Promise<Response>}
  */
-export function validateSchemaVersion(version, supportedVersions, context) {
-  if (version === undefined) {
-    throw new DataSourceError(
-      `Missing required version field in ${context}`,
-      DataSourceErrorCode.INVALID_FORMAT,
-      null,
-      { version, supportedVersions, context }
+export async function fetchCatalogFile(url, init, options = {}) {
+  if (init !== undefined && init !== null && Object.hasOwn(init, 'cache')) {
+    throw new TypeError(
+      'Catalog files are always revalidated; a request cannot choose its cache mode.'
     );
   }
-
-  if (!supportedVersions.includes(version)) {
-    throw new DataSourceError(
-      `Unsupported ${context} version: ${version}. Supported versions: ${supportedVersions.join(', ')}`,
-      DataSourceErrorCode.INVALID_FORMAT,
-      null,
-      { version, supportedVersions, context }
-    );
-  }
+  const askOnce = requireAskOnce(options, 'Catalog file request');
+  const request = { ...init, cache: CATALOG_FILE_CACHE };
+  const response = await (askOnce ? fetch(url, request) : fetchWhenNotBusy(url, request));
+  const length = Number(response.headers?.get?.('Content-Length'));
+  getTransferLog().record(url, { bytes: Number.isSafeInteger(length) ? length : 0 });
+  return response;
 }
 
 /**
@@ -754,7 +569,7 @@ export const DataSourceErrorCode = {
 export const ERROR_MESSAGES = {
   [DataSourceErrorCode.NOT_FOUND]: 'Dataset not found. Check that the directory exists.',
   [DataSourceErrorCode.FILE_NOT_FOUND]: 'Dataset file not found.',
-  [DataSourceErrorCode.INVALID_FORMAT]: 'Invalid dataset format. Missing required files.',
+  [DataSourceErrorCode.INVALID_FORMAT]: 'Invalid dataset format.',
   [DataSourceErrorCode.PERMISSION_DENIED]: 'Cannot access directory. Please grant permission.',
   [DataSourceErrorCode.NETWORK_ERROR]: 'Failed to load dataset. Check your connection.',
   [DataSourceErrorCode.TOO_LARGE]: 'Dataset is larger than Cellucid opens in a browser.',
@@ -790,6 +605,36 @@ export class DataSourceError extends Error {
 }
 
 /**
+ * A failure whose message is written for the person who asked for the data:
+ * it says what is wrong with *their* data and what to do (a link that names
+ * two files, a file with nothing to plot, an AnnData file too old to read).
+ * It is shown as it is, never replaced by a generic cause. The mark is a
+ * detail, so it survives the AnnData reader worker's error serialization.
+ *
+ * @param {string} message
+ * @param {string} code - From DataSourceErrorCode
+ * @param {string} [source]
+ * @param {Object} [details]
+ * @returns {DataSourceError}
+ */
+export function explainedFailure(message, code, source, details = {}) {
+  return new DataSourceError(message, code, source, { ...details, explained: true });
+}
+
+/**
+ * Whether a failure (or the first of an AggregateError) is explained.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isExplainedFailure(error) {
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    return isExplainedFailure(error.errors[0]);
+  }
+  return error?.details?.explained === true;
+}
+
+/**
  * Resolve a relative URL against a base URL
  * @param {string} base - Base URL
  * @param {string} relative - Relative path
@@ -815,23 +660,52 @@ export function resolveUrl(base, relative) {
 }
 
 /**
+ * Read `options.askOnce` of a catalog request: absent, or a boolean.
+ *
+ * @param {Object} options
+ * @param {string} label
+ * @returns {boolean}
+ */
+function requireAskOnce(options, label) {
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError(`${label} options must be an object`);
+  }
+  const unexpected = Object.keys(options).filter(key => key !== 'askOnce');
+  if (unexpected.length > 0) {
+    throw new TypeError(`${label} options contain unexpected key(s): ${unexpected.join(', ')}`);
+  }
+  const askOnce = Object.hasOwn(options, 'askOnce') ? options.askOnce : false;
+  if (typeof askOnce !== 'boolean') {
+    throw new TypeError(`${label} options.askOnce must be a boolean`);
+  }
+  return askOnce;
+}
+
+/**
  * Fetch JSON data from a URL with error handling
  * @param {string} url - URL to fetch
  * @param {string} [sourceType] - Source type for error context
- * @param {{signal?: AbortSignal|null}} [options] - Exact request owner
+ * @param {{signal?: AbortSignal|null, askOnce?: boolean}} [options] - Exact
+ *   request owner, and whether a busy host is asked only once
+ *   ({@link fetchCatalogFile})
  * @returns {Promise<any>}
  */
 export async function fetchJson(url, sourceType, options = {}) {
-  const signal = getMetadataLoadSignal(options, 'JSON loader');
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('JSON loader options must be an object');
+  }
+  const { askOnce = false, ...signalOptions } = options;
+  if (typeof askOnce !== 'boolean') {
+    throw new TypeError('JSON loader options.askOnce must be a boolean');
+  }
+  const signal = getMetadataLoadSignal(signalOptions, 'JSON loader');
   try {
     throwIfMetadataAborted(signal, 'JSON loading');
-    // Metadata is revalidated like every dataset artifact
-    // (DATASET_ARTIFACT_CACHE): hosts such as GitHub Pages cache it for
-    // minutes, and a stale catalog or manifest beside freshly deployed presets
-    // and payloads makes a dataset fail to open until the cache expires.
-    const response = await fetchSampleArtifact(
+    // Revalidated like every catalog file (CATALOG_FILE_CACHE).
+    const response = await fetchCatalogFile(
       url,
-      signal === null ? undefined : { signal }
+      signal === null ? undefined : { signal },
+      { askOnce }
     );
     throwIfMetadataAborted(signal, 'JSON loading');
     if (!response.ok) {
@@ -870,7 +744,7 @@ export async function fetchJson(url, sourceType, options = {}) {
 
 function invalidDatasetIdentity(message, sourceType, details = {}) {
   return new DataSourceError(
-    `Invalid dataset_identity.json: ${message}`,
+    `Invalid dataset identity: ${message}`,
     DataSourceErrorCode.INVALID_FORMAT,
     sourceType,
     details
@@ -994,7 +868,9 @@ function validateIdentityStats(stats, sourceType) {
     );
   }
   if (stats.has_connectivity) {
-    requireCount(stats.n_edges, 'stats.n_edges', sourceType);
+    // Null: a graph read straight from a file, counted when its edges are
+    // first read.
+    if (stats.n_edges !== null) requireCount(stats.n_edges, 'stats.n_edges', sourceType);
   } else if (stats.n_edges !== null) {
     throw invalidDatasetIdentity(
       'stats.n_edges must be null when has_connectivity is false',
@@ -1002,46 +878,6 @@ function validateIdentityStats(stats, sourceType) {
       { value: stats.n_edges }
     );
   }
-}
-
-/**
- * The exact payload path of one embedding item: its position in item order and
- * its dimension, plus `.gz` exactly when the export was compressed. Both
- * writers derive the path this way and the reader accepts no other string.
- *
- * @param {number} index
- * @param {number} dimension
- * @param {number|null} compression
- * @returns {string}
- */
-export function embeddingPayloadPath(index, dimension, compression) {
-  return `embeddings/${index}_${dimension}d.bin${compression === null ? '' : '.gz'}`;
-}
-
-/**
- * The exact payload path of one vector field bound to one embedding item.
- *
- * @param {number} fieldIndex - Position of the field in `vector_fields.fields`.
- * @param {number} embeddingIndex - Position of the bound item in `embeddings.items`.
- * @param {number|null} compression
- * @returns {string}
- */
-export function vectorPayloadPath(fieldIndex, embeddingIndex, compression) {
-  return `vectors/${fieldIndex}_${embeddingIndex}.bin${compression === null ? '' : '.gz'}`;
-}
-
-/**
- * The gzip level an identity's payload paths are derived with: the export's
- * `export_settings.compression`, or null when the identity records no export
- * settings (a dataset served straight from AnnData was never compressed).
- *
- * @param {Object} identity
- * @returns {number|null}
- */
-export function identityPayloadCompression(identity) {
-  return Object.hasOwn(identity, 'export_settings')
-    ? identity.export_settings.compression
-    : null;
 }
 
 function requireDisplayIdentity(value, label, sourceType) {
@@ -1058,13 +894,7 @@ function requireDisplayIdentity(value, label, sourceType) {
 
 function validateEmbeddingSource(source, dimension, label, sourceType) {
   assertExactKeys(source, ['key', 'columns'], [], `${label}.source`, sourceType);
-  if (source.key !== null && (typeof source.key !== 'string' || source.key.length === 0)) {
-    throw invalidDatasetIdentity(
-      `${label}.source.key must be null or a non-empty string`,
-      sourceType,
-      { value: source.key }
-    );
-  }
+  requireNonEmptyString(source.key, `${label}.source.key`, sourceType);
   const columns = source.columns;
   if (
     !Array.isArray(columns) ||
@@ -1081,25 +911,23 @@ function validateEmbeddingSource(source, dimension, label, sourceType) {
 }
 
 /**
- * The sole `embeddings` rule of dataset identity version 3.
+ * The sole `embeddings` rule of a dataset identity.
  *
  * `embeddings` holds exactly `default_dimension`, `defaults`, and `items`:
  * - every item id obeys the field-identity rule; items are ordered by
- *   dimension ascending, then id in code-point order, and an item's position
- *   in that order is its payload index;
+ *   dimension ascending, then id in code-point order;
  * - an item holds exactly `label` (display text), `dimension` (1, 2 or 3),
- *   `file` (exactly `embeddings/{index}_{dimension}d.bin`, plus `.gz` when the
- *   export is compressed) and `source` (`key`: string or null; `columns`:
- *   `dimension` distinct 0-based indices);
+ *   `path` (its `obsm/{i}/{cols}` route, `mappingEmbeddingPath`) and `source`
+ *   (`key`: the `obsm` key; `columns`: `dimension` distinct 0-based indices,
+ *   the columns its path reads);
  * - `defaults` has exactly one key per item dimension, ascending, each naming
  *   an item of that dimension;
  * - `default_dimension` is a key of `defaults`.
  *
  * @param {unknown} embeddings
- * @param {number|null} compression
  * @param {string} [sourceType]
  */
-function validateIdentityEmbeddings(embeddings, compression, sourceType) {
+function validateIdentityEmbeddings(embeddings, sourceType) {
   assertExactKeys(
     embeddings,
     ['default_dimension', 'defaults', 'items'],
@@ -1116,11 +944,10 @@ function validateIdentityEmbeddings(embeddings, compression, sourceType) {
   }
   const dimensions = [];
   let previous = null;
-  let index = 0;
   for (const [id, item] of Object.entries(items)) {
     const label = `embeddings.items.${id}`;
     requireDisplayIdentity(id, 'Embedding id', sourceType);
-    assertExactKeys(item, ['label', 'dimension', 'file', 'source'], [], label, sourceType);
+    assertExactKeys(item, ['label', 'dimension', 'path', 'source'], [], label, sourceType);
     requireDisplayIdentity(item.label, `${label}.label`, sourceType);
     if (!Number.isSafeInteger(item.dimension) || item.dimension < 1 || item.dimension > 3) {
       throw invalidDatasetIdentity(
@@ -1142,20 +969,23 @@ function validateIdentityEmbeddings(embeddings, compression, sourceType) {
         { previous: previous.id, next: id }
       );
     }
-    const expectedFile = embeddingPayloadPath(index, item.dimension, compression);
-    if (item.file !== expectedFile) {
+    validateEmbeddingSource(item.source, item.dimension, label, sourceType);
+    const route = parseMappingEmbeddingPath(item.path);
+    if (
+      route === null ||
+      route.columns.length !== item.source.columns.length ||
+      route.columns.some((column, position) => column !== item.source.columns[position])
+    ) {
       throw invalidDatasetIdentity(
-        `${label}.file must be exactly "${expectedFile}"`,
+        `${label}.path must be the obsm route of its source columns`,
         sourceType,
-        { value: item.file, expected: expectedFile }
+        { value: item.path }
       );
     }
-    validateEmbeddingSource(item.source, item.dimension, label, sourceType);
     if (dimensions[dimensions.length - 1] !== item.dimension) {
       dimensions.push(item.dimension);
     }
     previous = { id, dimension: item.dimension };
-    index += 1;
   }
 
   const defaults = embeddings.defaults;
@@ -1197,65 +1027,16 @@ function validateIdentityEmbeddings(embeddings, compression, sourceType) {
   }
 }
 
-function validateIdentityExportSettings(settings, sourceType) {
-  assertExactKeys(
-    settings,
-    [
-      'compression',
-      'var_quantization',
-      'obs_continuous_quantization',
-      'obs_categorical_dtype',
-    ],
-    [],
-    'export_settings',
-    sourceType
-  );
-  if (
-    settings.compression !== null &&
-    (
-      !Number.isSafeInteger(settings.compression) ||
-      settings.compression < 1 ||
-      settings.compression > 9
-    )
-  ) {
-    throw invalidDatasetIdentity(
-      'export_settings.compression must be null or an integer from 1 to 9',
-      sourceType
-    );
-  }
-  for (const key of [
-    'var_quantization',
-    'obs_continuous_quantization',
-  ]) {
-    if (
-      settings[key] !== null &&
-      settings[key] !== 8 &&
-      settings[key] !== 16
-    ) {
-      throw invalidDatasetIdentity(
-        `export_settings.${key} must be null, 8, or 16`,
-        sourceType
-      );
-    }
-  }
-  if (!['uint8', 'uint16', 'uint32'].includes(settings.obs_categorical_dtype)) {
-    throw invalidDatasetIdentity(
-      'export_settings.obs_categorical_dtype must be uint8, uint16 or uint32',
-      sourceType
-    );
-  }
-}
-
 function validateIdentitySource(source, sourceType) {
   assertExactKeys(
     source,
     ['name'],
-    ['url', 'citation', 'filename'],
+    ['url', 'filename'],
     'source',
     sourceType
   );
   requireNonEmptyString(source.name, 'source.name', sourceType);
-  for (const key of ['url', 'citation', 'filename']) {
+  for (const key of ['url', 'filename']) {
     if (Object.hasOwn(source, key)) {
       requireNonEmptyString(
         source[key],
@@ -1266,132 +1047,12 @@ function validateIdentitySource(source, sourceType) {
   }
 }
 
-/**
- * The sole `vector_fields` rule.
- *
- * `dataset_identity.json["vector_fields"]` is validated here and nowhere else,
- * so the hosted-catalog reader, the local prepared-export reader, and the
- * runtime VectorFieldManager cannot drift apart. Every rule below is stated by
- * the output format specification:
- *
- * - `vector_fields` holds exactly `default_field` and `fields`; `fields` is a
- *   non-empty object whose ids are in code-point order;
- * - a field entry holds exactly `label` and `files`, and `label` is the field
- *   id character for character;
- * - `files` maps each embedding id the field is bound to — a non-empty subset
- *   of `embeddings.items`, in item order — to exactly
- *   `vectors/{fieldIndex}_{embeddingIndex}.bin`, plus `.gz` when the export is
- *   compressed.
- *
- * @param {unknown} vectorFields
- * @param {{embeddingItems: Object, compression: number|null, sourceType?: string}} options
- *   `embeddingItems` is the identity's validated `embeddings.items`.
- * @returns {Object} the validated vector_fields object
- */
-export function validateVectorFieldsMetadata(vectorFields, options) {
-  if (
-    !isPlainRecord(options) ||
-    !isPlainRecord(options.embeddingItems) ||
-    !(options.compression === null || Number.isSafeInteger(options.compression))
-  ) {
-    throw new TypeError(
-      'validateVectorFieldsMetadata requires the identity embedding items and its compression.'
-    );
+function validateIdentityCitation(citation, sourceType) {
+  assertExactKeys(citation, ['text'], ['url'], 'citation', sourceType);
+  requireNonEmptyString(citation.text, 'citation.text', sourceType);
+  if (Object.hasOwn(citation, 'url')) {
+    requireNonEmptyString(citation.url, 'citation.url', sourceType);
   }
-  const { embeddingItems, compression, sourceType = undefined } = options;
-  assertExactKeys(
-    vectorFields,
-    ['default_field', 'fields'],
-    [],
-    'vector_fields',
-    sourceType
-  );
-  if (
-    !isPlainRecord(vectorFields.fields) ||
-    Object.keys(vectorFields.fields).length === 0
-  ) {
-    throw invalidDatasetIdentity(
-      'vector_fields.fields must be a non-empty object',
-      sourceType
-    );
-  }
-  if (vectorFields.default_field !== null) {
-    requireNonEmptyString(
-      vectorFields.default_field,
-      'vector_fields.default_field',
-      sourceType
-    );
-    if (!Object.hasOwn(
-      vectorFields.fields,
-      vectorFields.default_field
-    )) {
-      throw invalidDatasetIdentity(
-        'vector_fields.default_field must be null or name a declared field',
-        sourceType
-      );
-    }
-  }
-  const embeddingIndex = new Map(
-    Object.keys(embeddingItems).map((id, index) => [id, index])
-  );
-  let previousFieldId = null;
-  let fieldIndex = 0;
-  for (const [fieldId, field] of Object.entries(vectorFields.fields)) {
-    requireDisplayIdentity(fieldId, 'Vector field id', sourceType);
-    if (previousFieldId !== null && compareCodePoints(previousFieldId, fieldId) >= 0) {
-      throw invalidDatasetIdentity(
-        'vector_fields.fields must be ordered by id in code-point order',
-        sourceType,
-        { previous: previousFieldId, next: fieldId }
-      );
-    }
-    const label = `vector_fields.fields.${fieldId}`;
-    assertExactKeys(field, ['label', 'files'], [], label, sourceType);
-    if (field.label !== fieldId) {
-      throw invalidDatasetIdentity(
-        `${label}.label must be the field id "${fieldId}" exactly`,
-        sourceType,
-        { value: field.label }
-      );
-    }
-    const files = field.files;
-    if (!isPlainRecord(files) || Object.keys(files).length === 0) {
-      throw invalidDatasetIdentity(
-        `${label}.files must be a non-empty object`,
-        sourceType
-      );
-    }
-    let previousIndex = -1;
-    for (const [embeddingId, path] of Object.entries(files)) {
-      const index = embeddingIndex.get(embeddingId);
-      if (index === undefined) {
-        throw invalidDatasetIdentity(
-          `${label}.files binds embedding "${embeddingId}", which embeddings.items does not declare`,
-          sourceType,
-          { embeddingId }
-        );
-      }
-      if (index <= previousIndex) {
-        throw invalidDatasetIdentity(
-          `${label}.files must list its embeddings in embeddings.items order`,
-          sourceType,
-          { embeddingId }
-        );
-      }
-      previousIndex = index;
-      const expected = vectorPayloadPath(fieldIndex, index, compression);
-      if (path !== expected) {
-        throw invalidDatasetIdentity(
-          `${label}.files.${embeddingId} must be exactly "${expected}"`,
-          sourceType,
-          { value: path, expected }
-        );
-      }
-    }
-    previousFieldId = fieldId;
-    fieldIndex += 1;
-  }
-  return vectorFields;
 }
 
 function validateIdentityObsFields(obsFields, stats, sourceType) {
@@ -1429,11 +1090,15 @@ function validateIdentityObsFields(obsFields, stats, sourceType) {
         label,
         sourceType
       );
-      requireCount(
-        field.n_categories,
-        `${label}.n_categories`,
-        sourceType
-      );
+      // Null: a string or boolean column, whose categories are found when
+      // it is first loaded.
+      if (field.n_categories !== null) {
+        requireCount(
+          field.n_categories,
+          `${label}.n_categories`,
+          sourceType
+        );
+      }
       categoricalCount++;
     } else if (field.kind === 'continuous') {
       assertExactKeys(
@@ -1479,7 +1144,7 @@ function validateIdentityObsFields(obsFields, stats, sourceType) {
 }
 
 /**
- * Validate the sole current dataset_identity.json version 3 contract.
+ * Validate one dataset identity, as the AnnData adapter builds it.
  *
  * @param {unknown} identity
  * @param {string} datasetId
@@ -1503,28 +1168,20 @@ export function validateDatasetIdentity(
   assertExactKeys(
     identity,
     [
-      'version',
       'id',
       'name',
       'description',
-      'cellucid_data_version',
       'stats',
       'embeddings',
       'obs_fields',
     ],
     [
-      'created_at',
-      'export_settings',
       'source',
-      'vector_fields',
+      'citation',
+      'vector_field_default',
     ],
     'dataset identity',
     sourceType
-  );
-  validateSchemaVersion(
-    identity.version,
-    DATA_CONFIG.SUPPORTED_IDENTITY_VERSIONS,
-    'dataset_identity.json'
   );
   requireNonEmptyString(identity.name, 'name', sourceType);
   if (typeof identity.description !== 'string') {
@@ -1534,12 +1191,6 @@ export function validateDatasetIdentity(
       { value: identity.description }
     );
   }
-  requireNonEmptyString(
-    identity.cellucid_data_version,
-    'cellucid_data_version',
-    sourceType
-  );
-
   try {
     validateDatasetId(identity.id, 'Dataset identity id');
   } catch (error) {
@@ -1558,270 +1209,77 @@ export function validateDatasetIdentity(
   }
 
   validateIdentityStats(identity.stats, sourceType);
-  if (Object.hasOwn(identity, 'export_settings')) {
-    validateIdentityExportSettings(
-      identity.export_settings,
-      sourceType
-    );
-  }
-  const compression = identityPayloadCompression(identity);
-  validateIdentityEmbeddings(identity.embeddings, compression, sourceType);
+  validateIdentityEmbeddings(identity.embeddings, sourceType);
   validateIdentityObsFields(
     identity.obs_fields,
     identity.stats,
     sourceType
   );
 
-  if (Object.hasOwn(identity, 'created_at')) {
-    if (
-      typeof identity.created_at !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(
-        identity.created_at
-      ) ||
-      !Number.isFinite(Date.parse(identity.created_at)) ||
-      new Date(identity.created_at).toISOString().replace('.000Z', 'Z') !==
-        identity.created_at
-    ) {
-      throw invalidDatasetIdentity(
-        'created_at must be a valid UTC timestamp',
-        sourceType,
-        { value: identity.created_at }
-      );
-    }
-  }
   if (Object.hasOwn(identity, 'source')) {
     validateIdentitySource(identity.source, sourceType);
   }
-  if (Object.hasOwn(identity, 'vector_fields')) {
-    validateVectorFieldsMetadata(identity.vector_fields, {
-      embeddingItems: identity.embeddings.items,
-      compression,
-      sourceType,
-    });
+  if (Object.hasOwn(identity, 'citation')) {
+    validateIdentityCitation(identity.citation, sourceType);
+  }
+  if (Object.hasOwn(identity, 'vector_field_default')) {
+    requireDisplayIdentity(identity.vector_field_default, 'vector_field_default', sourceType);
   }
   return identity;
 }
 
 /**
- * Load and validate exact metadata from dataset_identity.json.
- * @param {string} baseUrl - Base URL of the dataset
- * @param {string} datasetId - Dataset identifier
- * @param {string} [sourceType] - Source type for context
- * @param {{signal?: AbortSignal|null}} [options] - Exact request owner
- * @returns {Promise<DatasetMetadata>}
+ * Validate what a dataset list shows about one dataset (`DatasetSummary`): a
+ * catalog's description of a file, or an open dataset's identity, which
+ * holds the same members.
+ *
+ * @param {unknown} summary
+ * @param {string} [sourceType]
+ * @returns {DatasetSummary}
  */
-export async function loadDatasetMetadata(
-  baseUrl,
-  datasetId,
-  sourceType,
-  options = {}
-) {
-  const signal = getMetadataLoadSignal(
-    options,
-    'Dataset metadata loader'
-  );
-  // Try to load dataset_identity.json first
-  const identityUrl = resolveUrl(baseUrl, DATA_CONFIG.DATASET_IDENTITY_FILE);
-
+export function validateDatasetSummary(summary, sourceType) {
+  if (!isPlainRecord(summary)) {
+    throw invalidDatasetIdentity('a listed dataset must be an object', sourceType);
+  }
   try {
-    const identity = await fetchJson(
-      identityUrl,
-      sourceType,
-      { signal }
-    );
-    throwIfMetadataAborted(signal, 'Dataset metadata loading');
-    validateDatasetIdentity(identity, datasetId, sourceType);
-    return { ...identity, id: datasetId };
-  } catch (err) {
-    throwIfMetadataAborted(signal, 'Dataset metadata loading');
-    if (err instanceof DataSourceError && err.code === DataSourceErrorCode.NOT_FOUND) {
-      throw new DataSourceError(
-        'Missing required dataset_identity.json',
-        DataSourceErrorCode.INVALID_FORMAT,
-        sourceType,
-        { datasetId, baseUrl, identityUrl }
-      );
-    }
-    throw err;
+    validateDatasetId(summary.id, 'Listed dataset id');
+  } catch (error) {
+    throw invalidDatasetIdentity(error.message, sourceType, { value: summary.id });
   }
+  requireNonEmptyString(summary.name, 'name', sourceType);
+  if (typeof summary.description !== 'string') {
+    throw invalidDatasetIdentity('description must be a string', sourceType, { value: summary.description });
+  }
+  if (!isPlainRecord(summary.stats)) {
+    throw invalidDatasetIdentity('stats must be an object', sourceType);
+  }
+  requireCount(summary.stats.n_cells, 'stats.n_cells', sourceType);
+  requireCount(summary.stats.n_genes, 'stats.n_genes', sourceType);
+  return summary;
 }
 
 /**
- * Check if a URL uses the local-user:// protocol
- * @param {string} url - URL to check
- * @returns {boolean}
+ * The data source interface (duck typed: a source is any object with these
+ * methods). Every dataset a source offers is an AnnData file, read by the
+ * AnnData reader through an `h5ad.js` or `zarr.js` source.
+ *
+ * Required:
+ * - `getType(): string` -- the source type ('local-demo', 'local-user',
+ *   'link', 'remote', 'jupyter').
+ * - `listDatasets(): Promise<DatasetSummary[]>` -- what the dataset list
+ *   shows; an open dataset's identity is a summary too.
+ * - `getMetadata(datasetId): Promise<DatasetMetadata>` -- the dataset's
+ *   identity, opening its file first when a catalog lists it unopened.
+ * - `getBaseUrl(datasetId): string` -- its `h5ad://<id>/` or `zarr://<id>/`
+ *   base, under which the data loaders address its parts.
+ *
+ * Optional:
+ * - `isAvailable(): Promise<boolean>`, `hasDataset(datasetId)`, `refresh()`,
+ *   `requiresManualReconnect()`, `onDeactivate()`.
+ * - `getAnnDataSource(datasetId)` -- the `h5ad.js`/`zarr.js` source a wrapper
+ *   source reads `datasetId` from (`anndata-provider.js`).
+ * - `getStateDescriptor(datasetId)` -- the default view a catalog names for a
+ *   dataset (`app/session/catalog-default-session.js`), or null.
+ * - `releaseExcept(datasetId)` -- release every open dataset but this one
+ *   (null: all); called once a selection from the source is shown.
  */
-export function isLocalUserUrl(url) {
-  return url?.startsWith('local-user://');
-}
-
-/**
- * Data Source Interface Documentation
- *
- * This module uses duck typing - data sources don't need to extend a base class.
- * Any object implementing the following methods can be used as a data source:
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * REQUIRED METHODS (must implement)
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * getType(): string
- *   Returns the source type identifier (e.g., 'local-demo', 'local-user', 'remote', 'jupyter')
- *
- * listDatasets(): Promise<DatasetMetadata[]>
- *   Lists all available datasets from this source
- *
- * getMetadata(datasetId): Promise<DatasetMetadata>
- *   Gets full metadata for a specific dataset
- *
- * getBaseUrl(datasetId): string
- *   Gets the base URL for loading dataset files. May return custom protocol URLs
- *   (e.g., 'local-user://datasetId/', 'remote://host/path/', 'jupyter://kernel/')
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * OPTIONAL METHODS (recommended)
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * isAvailable(): Promise<boolean>
- *   Checks if the source is available/accessible (default: true)
- *
- * hasDataset(datasetId): Promise<boolean>
- *   Checks if a specific dataset exists
- *
- * refresh(): void
- *   Clears any cached data (manifests, metadata, etc.)
- *
- * requiresManualReconnect(): boolean
- *   Returns true if this source cannot be auto-restored from saved state
- *   (e.g., user directories require re-selection due to browser security,
- *    remote servers may need re-authentication)
- *
- * resolveUrl(url): Promise<string>
- *   Resolves a custom protocol URL (e.g., 'local-user://...') to a fetchable URL
- *   Called by DataSourceManager.resolveUrl() for protocol handling
- *
- * getFileUrl(filename): Promise<string>
- *   Gets a fetchable URL for a specific file within the current dataset
- *   Useful for sources that need to create Object URLs or signed URLs
- *
- * onDeactivate(): void
- *   Called when switching away from this source. Use for cleanup like:
- *   - Revoking Object URLs
- *   - Closing connections
- *   - Clearing temporary caches
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * REMOTE SERVER SOURCE INTERFACE (future: RemoteDataSource)
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * For sources that connect to remote servers (SSH tunnels, WebSocket APIs):
- *
- * connect(config): Promise<void>
- *   Establish connection to remote server
- *   @param config - Connection configuration (host, port, credentials, etc.)
- *
- * disconnect(): void
- *   Close connection cleanly
- *
- * isConnected(): boolean
- *   Check if currently connected
- *
- * getConnectionInfo(): {host: string, port: number, status: string}
- *   Get current connection details for debugging/display
- *
- * onConnectionLost(callback): void
- *   Register callback for connection loss events (for auto-reconnect UI)
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * JUPYTER BRIDGE SOURCE INTERFACE (future: JupyterBridgeDataSource)
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * For sources that communicate with a Jupyter kernel via the cellucid Python package:
- *
- * connectToKernel(kernelId): Promise<void>
- *   Connect to a specific Jupyter kernel
- *
- * sendCommand(command, params): Promise<any>
- *   Send a command to the Python side (e.g., recompute, filter, export)
- *
- * onMessage(callback): void
- *   Register callback for messages from Python side (updates, progress, errors)
- *
- * getKernelStatus(): {kernelId: string, status: 'idle'|'busy'|'disconnected'}
- *   Get current kernel connection status
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * STREAMING/CHUNKED DATA INTERFACE (future extension)
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * For large datasets that need progressive loading:
- *
- * supportsStreaming(): boolean
- *   Returns true if this source supports chunked/streaming data
- *
- * loadChunk(datasetId, chunkSpec): Promise<ArrayBuffer>
- *   Load a specific chunk of data (e.g., range of points, subset of genes)
- *   @param chunkSpec - {type: 'points'|'obs'|'var', offset: number, limit: number}
- *
- * getChunkManifest(datasetId): Promise<ChunkManifest>
- *   Get information about available chunks for progressive loading
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * PROTOCOL REGISTRATION
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * Data sources using custom URL protocols should register them with DataSourceManager:
- *
- *   const manager = getDataSourceManager();
- *   manager.registerSource('remote', remoteSource);
- *   manager.registerProtocol('remote://', 'remote');
- *
- * This allows data-loaders.js to automatically resolve URLs like:
- *   'remote://server.example.com/dataset/embeddings/0_3d.bin'
- */
-
-/**
- * Example base class showing the interface (not required to extend)
- * @abstract
- */
-class BaseDataSource {
-  constructor() {
-    if (new.target === BaseDataSource) {
-      throw new Error('BaseDataSource is abstract - use duck typing instead');
-    }
-  }
-
-  /** @returns {string} */
-  getType() {
-    throw new Error('getType() must be implemented');
-  }
-
-  /** @returns {Promise<boolean>} */
-  async isAvailable() {
-    return true;
-  }
-
-  /** @returns {Promise<DatasetMetadata[]>} */
-  async listDatasets() {
-    throw new Error('listDatasets() must be implemented');
-  }
-
-  /** @param {string} _datasetId @returns {Promise<DatasetMetadata>} */
-  async getMetadata(_datasetId) {
-    throw new Error('getMetadata() must be implemented');
-  }
-
-  /** @param {string} _datasetId @returns {string} */
-  getBaseUrl(_datasetId) {
-    throw new Error('getBaseUrl() must be implemented');
-  }
-
-  /**
-   * Whether this source requires manual reconnection (cannot be auto-restored from saved state).
-   * Override this in sources like local-user or remote servers that need re-authentication.
-   * @returns {boolean}
-   */
-  requiresManualReconnect() {
-    return false;
-  }
-}

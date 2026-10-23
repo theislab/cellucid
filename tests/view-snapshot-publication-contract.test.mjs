@@ -76,7 +76,6 @@ function createOwners() {
           cellVisibilityMask: Uint8Array.from([1, 1]),
           centroidPositions: new Float32Array(),
           centroidColors: new Uint8Array(),
-          centroidOutliers: new Float32Array(),
           centroidLabels: [],
           filteredCount: { shown: 2, total: 2 },
         },
@@ -172,7 +171,6 @@ function createConfig(overrides = {}) {
     fieldKey: null,
     fieldKind: null,
     label: 'Exact snapshot',
-    meta: { filtersText: [] },
     sourceViewId: 'live',
     transparency: Uint8Array.from([0, 1]),
     ...overrides,
@@ -205,6 +203,7 @@ function createRestoreOwners() {
   let camerasLocked = false;
   let activeCamera = cameraState();
   const viewCameras = new Map([['live', cameraState()]]);
+  const centroidFlags = new Map();
   let layout = {
     mode: 'single',
     activeId: 'live',
@@ -255,6 +254,12 @@ function createRestoreOwners() {
     setViewLayout(mode, activeId) {
       layout = { ...layout, mode, activeId };
     },
+    setShowCentroidPoints(show, viewId) {
+      centroidFlags.set(viewId, { ...centroidFlags.get(viewId), points: show });
+    },
+    setShowCentroidLabels(show, viewId) {
+      centroidFlags.set(viewId, { ...centroidFlags.get(viewId), labels: show });
+    },
   });
 
   const colors = Uint8Array.from([
@@ -265,6 +270,13 @@ function createRestoreOwners() {
   const centroids = Float32Array.from([0.5, -0.25, 0]);
   const centroidColors = Uint8Array.from([50, 60, 70, 255]);
   Object.assign(state, {
+    batchDepth: 0,
+    beginBatch() {
+      this.batchDepth++;
+    },
+    endBatch() {
+      this.batchDepth--;
+    },
     captureCurrentContext() {
       return viewContextCoreMethods._cloneViewContext.call(
         this,
@@ -351,6 +363,7 @@ function createRestoreOwners() {
     ...owners,
     embeddingSwitches,
     activeCamera: () => structuredClone(activeCamera),
+    centroidFlags,
     layout: () => ({ ...layout }),
     publishedConfigs,
     viewCamera: viewId =>
@@ -365,13 +378,10 @@ function multiviewSnapshot(overrides = {}) {
       activeFieldSource: null,
     },
     cameraState: cameraState(),
+    centroids: { points: false, labels: false },
     embedding: UMAP,
-    fieldKey: null,
-    fieldKind: null,
     filters: {},
     id: 'snap_9',
-    label: 'All cells',
-    meta: { filtersText: [] },
     ...overrides,
   };
   return {
@@ -381,8 +391,20 @@ function multiviewSnapshot(overrides = {}) {
       liveViewHidden: false,
       mode: 'grid',
     },
-    liveCameraState: cameraState(),
+    live: {
+      cameraState: cameraState(),
+      centroids: { points: true, labels: false },
+    },
     snapshots: [snapshot],
+  };
+}
+
+/** The live view's own saved state, applied after the kept views. */
+function liveViewState(embedding = UMAP) {
+  return {
+    embedding,
+    filters: {},
+    activeFields: { activeFieldKey: null, activeFieldSource: null },
   };
 }
 
@@ -411,7 +433,6 @@ test('snapshot publication installs exact renderer attributes in every owner', (
     Array.from(context.centroidPositions),
     Array.from(config.centroidPositions),
   );
-  assert.deepEqual(Array.from(context.centroidOutliers), [-1]);
   assert.deepEqual(context.centroidLabels, []);
 
   // Centroids are written in place, so they are the context's own copy.
@@ -673,25 +694,43 @@ test('complete snapshot clearing retires contexts and dimension mappings', () =>
 
 test('multiview same-dimension restore publishes every exact snapshot owner', async () => {
   const {
+    centroidFlags,
     dimensionManager,
     publishedConfigs,
     state,
     viewer,
   } = createRestoreOwners();
-  const saved = multiviewSnapshot();
+  const saved = multiviewSnapshot({ centroids: { points: true, labels: true } });
+  const replayed = [];
 
   await restoreMultiview({
     state,
     viewer,
-    async restoreActiveFields() {},
-    async restoreFilters() {},
-    pushViewerState() {},
-  }, saved);
+    async restoreActiveFields() {
+      replayed.push(['activeFields', state.batchDepth]);
+    },
+    async restoreFilters() {
+      replayed.push(['filters', state.batchDepth]);
+    },
+  }, saved, liveViewState());
 
+  // Each view's filters and active field are replayed inside one batch, so
+  // its visibility is computed once, when the batch ends.
+  assert.deepEqual(replayed, [
+    ['filters', 1], ['activeFields', 1],
+    ['filters', 1], ['activeFields', 1],
+  ]);
+  assert.equal(state.batchDepth, 0);
+
+  // The label is the state's own, recomputed from the restored field and
+  // filters; the session does not store it.
   assert.deepEqual(viewer.getSnapshotViews(), [{
     id: 'snap_1',
     label: 'All cells',
   }]);
+  // Centroid toggles are restored per view.
+  assert.deepEqual(centroidFlags.get('snap_1'), { points: true, labels: true });
+  assert.deepEqual(centroidFlags.get('live'), { points: true, labels: false });
   assert.equal(dimensionManager.getViewDimension('snap_1'), 2);
   assert.equal(dimensionManager.getViewLayout('snap_1'), 'X_umap');
   assert.equal(viewer.getViewLayoutKey('snap_1'), 'X_umap');
@@ -723,7 +762,6 @@ test('multiview restore rolls back the whole graph after a later publication fai
     cameraState: cameraState(8),
     filters: {},
     id: 'snap_10',
-    meta: { filtersText: [] },
   });
   saved.layout.activeId = 'snap_10';
 
@@ -742,8 +780,7 @@ test('multiview restore rolls back the whole graph after a later publication fai
       viewer,
       async restoreActiveFields() {},
       async restoreFilters() {},
-      pushViewerState() {},
-    }, saved),
+    }, saved, liveViewState()),
     error => error === publicationFailure,
   );
   assert.deepEqual(snapshots, []);
@@ -754,7 +791,7 @@ test('multiview restore rolls back the whole graph after a later publication fai
   assert.equal(viewer.getViewDimension('live'), 2);
   assert.deepEqual(
     viewer.getViewCameraState('live'),
-    saved.liveCameraState,
+    saved.live.cameraState,
   );
 });
 
@@ -766,8 +803,8 @@ test('multiview restore replays every snapshot on its own embedding and returns 
     state,
     viewer,
   } = createRestoreOwners();
-  // The live view itself shows the second 2D embedding, chosen for it, when
-  // restore begins.
+  // The live view shows the second 2D embedding, chosen for it, when restore
+  // begins, and the session saved it showing that embedding too.
   await state.setViewRepresentation('live', 'X_tsne', { followsDefault: false });
   embeddingSwitches.length = 0;
 
@@ -778,15 +815,13 @@ test('multiview restore replays every snapshot on its own embedding and returns 
       activeFields: { ...saved.snapshots[0].activeFields },
       embedding: UMAP,
       id: 'snap_10',
-      meta: { filtersText: [] },
-    },
+      },
     {
       ...saved.snapshots[0],
       activeFields: { ...saved.snapshots[0].activeFields },
       embedding: UMAP_3D,
       id: 'snap_11',
-      meta: { filtersText: [] },
-    },
+      },
   );
 
   await restoreMultiview({
@@ -794,8 +829,7 @@ test('multiview restore replays every snapshot on its own embedding and returns 
     viewer,
     async restoreActiveFields() {},
     async restoreFilters() {},
-    pushViewerState() {},
-  }, saved);
+  }, saved, liveViewState(TSNE));
 
   // Each kept view shows the layout its record names, in every owner, and
   // follows its dimension's default exactly when it shows that default.
@@ -815,20 +849,17 @@ test('multiview restore replays every snapshot on its own embedding and returns 
     publishedConfigs.map(config => config.dimensionLevel),
     [2, 2, 3],
   );
-  // The live view returns to the embedding chosen for it, not to the 2D
+  // The live view shows the embedding its own record names, not the 2D
   // default.
   assert.equal(dimensionManager.getViewLayout('live'), 'X_tsne');
   assert.equal(viewer.getViewLayoutKey('live'), 'X_tsne');
   assert.equal(state.viewContexts.get('live').followsDefault, false);
-  // Every switch went through the one representation transaction.
+  // Every switch went through the one representation transaction, once per
+  // view: each kept view, then the live view. Nothing is reset to a base
+  // state between views.
   assert.deepEqual(
     embeddingSwitches.map(entry => entry.layoutKey),
-    [
-      'X_tsne', 'X_tsne',
-      'X_tsne', 'X_umap',
-      'X_tsne', 'X_umap_3d',
-      'X_tsne',
-    ],
+    ['X_tsne', 'X_umap', 'X_umap_3d', 'X_tsne'],
   );
 });
 
@@ -849,8 +880,7 @@ test('a snapshot naming an embedding this dataset does not have rolls back', asy
       viewer,
       async restoreActiveFields() {},
       async restoreFilters() {},
-      pushViewerState() {},
-    }, saved),
+    }, saved, liveViewState()),
     /no embedding "X_phate"/,
   );
   assert.deepEqual(snapshots, []);
@@ -883,8 +913,7 @@ test('a replay whose owner silently shows another embedding is refused and rolle
       viewer,
       async restoreActiveFields() {},
       async restoreFilters() {},
-      pushViewerState() {},
-    }, multiviewSnapshot({ embedding: TSNE })),
+    }, multiviewSnapshot({ embedding: TSNE }), liveViewState()),
     /Replayed snapshot "snap_9" did not restore its exact embedding/,
   );
   assert.deepEqual(snapshots, []);
@@ -904,15 +933,14 @@ test('mixed-dimension restore reapplies distinct unlocked live and snapshot came
     cameraState: cameraState(7),
     embedding: UMAP_3D,
   });
-  saved.liveCameraState = cameraState(4);
+  saved.live.cameraState = cameraState(4);
 
   await restoreMultiview({
     state,
     viewer,
     async restoreActiveFields() {},
     async restoreFilters() {},
-    pushViewerState() {},
-  }, saved);
+  }, saved, liveViewState());
 
   assert.equal(dimensionManager.getViewDimension('live'), 2);
   assert.equal(dimensionManager.getViewDimension('snap_1'), 3);
@@ -932,7 +960,7 @@ test('final multiview failure rolls back every snapshot and returns the live cam
     cameraState: cameraState(7),
     embedding: UMAP_3D,
   });
-  saved.liveCameraState = cameraState(4);
+  saved.live.cameraState = cameraState(4);
   const layoutFailure =
     new Error('synthetic final live-view visibility failure');
   viewer.setLiveViewHidden = () => {
@@ -945,8 +973,7 @@ test('final multiview failure rolls back every snapshot and returns the live cam
       viewer,
       async restoreActiveFields() {},
       async restoreFilters() {},
-      pushViewerState() {},
-    }, saved),
+    }, saved, liveViewState()),
     error => error === layoutFailure,
   );
 
@@ -999,22 +1026,21 @@ test('a live camera saved by another engine restores: derived free-fly bits are 
     cameraState: cameraState(7),
     embedding: UMAP_3D,
   });
-  saved.liveCameraState = cameraState(4);
-  saved.liveCameraState.freefly.pitch = -0.16539816339745403;
+  saved.live.cameraState = cameraState(4);
+  saved.live.cameraState.freefly.pitch = -0.16539816339745403;
 
   await restoreMultiview({
     state,
     viewer,
     async restoreActiveFields() {},
     async restoreFilters() {},
-    pushViewerState() {},
-  }, saved);
+  }, saved, liveViewState());
 
   assert.deepEqual(snapshots.map(snapshot => snapshot.id), ['snap_1']);
   assert.equal(state.activeViewId, 'snap_1');
   assert.deepEqual(
     viewer.getViewCameraState('live').orbit,
-    saved.liveCameraState.orbit,
+    saved.live.cameraState.orbit,
   );
 });
 
@@ -1034,7 +1060,7 @@ test('a live camera the viewer cannot hold fails once and rolls back completely'
     setViewCameraState(viewId, held);
   };
   const saved = multiviewSnapshot();
-  saved.liveCameraState = cameraState(80);
+  saved.live.cameraState = cameraState(80);
 
   let failure = null;
   await assert.rejects(
@@ -1043,8 +1069,7 @@ test('a live camera the viewer cannot hold fails once and rolls back completely'
       viewer,
       async restoreActiveFields() {},
       async restoreFilters() {},
-      pushViewerState() {},
-    }, saved),
+    }, saved, liveViewState()),
     error => {
       failure = error;
       return true;

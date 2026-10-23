@@ -160,21 +160,16 @@ async function waitFor(condition, label) {
 function jupyterHealthResponse() {
   return new Response(JSON.stringify({
     status: 'ok',
-    type: 'exported',
+    type: 'anndata',
     version: '1.0.0',
+    format: 'h5ad',
+    n_cells: 3,
+    n_genes: 2,
   }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
 }
-
-const CURRENT_IDENTITY = JSON.parse(readFileSync(
-  new URL(
-    './browser/fixtures/exports/current-ui-prepared/dataset_identity.json',
-    import.meta.url,
-  ),
-  'utf8',
-));
 
 test('Jupyter configuration requires one exact viewer id and token', async t => {
   await t.test('current Python URL', () => {
@@ -228,7 +223,6 @@ test('Jupyter initialization validates both exact Python health variants', async
       type: 'anndata',
       version: '1.2.3',
       format: 'h5ad',
-      is_backed: false,
       n_cells: 120,
       n_genes: 6,
     }), { status: 200 });
@@ -238,12 +232,28 @@ test('Jupyter initialization validates both exact Python health variants', async
 
   for (const [name, payload] of [
     ['fabricated type', { status: 'ok', type: 'prepared', version: '1.2.3' }],
-    ['missing version', { status: 'ok', type: 'exported' }],
-    ['AnnData default field missing', {
+    ['retired prepared-export server', { status: 'ok', type: 'exported', version: '1.2.3' }],
+    ['AnnData format missing', {
+      status: 'ok',
+      type: 'anndata',
+      version: '1.2.3',
+      n_cells: 120,
+      n_genes: 6,
+    }],
+    ['AnnData retired is_backed field', {
       status: 'ok',
       type: 'anndata',
       version: '1.2.3',
       format: 'h5ad',
+      is_backed: false,
+      n_cells: 120,
+      n_genes: 6,
+    }],
+    ['AnnData retired in-memory format', {
+      status: 'ok',
+      type: 'anndata',
+      version: '1.2.3',
+      format: 'in-memory',
       n_cells: 120,
       n_genes: 6,
     }],
@@ -252,7 +262,6 @@ test('Jupyter initialization validates both exact Python health variants', async
       type: 'anndata',
       version: '1.2.3',
       format: 'h5ad',
-      is_backed: false,
       n_cells: '120',
       n_genes: 6,
     }],
@@ -513,8 +522,11 @@ test('Jupyter initialization accepts one exact current server health response', 
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   globalThis.fetch = async () => new Response(JSON.stringify({
     status: 'ok',
-    type: 'exported',
+    type: 'anndata',
     version: '1.0.0',
+    format: 'h5ad',
+    n_cells: 3,
+    n_genes: 2,
   }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
@@ -712,440 +724,6 @@ test(
   },
 );
 
-test('Jupyter dataset listing rejects server and metadata failures atomically', async t => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  source._datasetPaths.set('retained', '/retained/');
-  source._datasetCache.set('retained', { id: 'retained' });
-
-  await t.test('HTTP failure', async () => {
-    globalThis.fetch = async () => new Response('down', { status: 503 });
-    await assert.rejects(source.listDatasets(), /dataset listing.*503/i);
-    assert.equal(source._datasetPaths.get('retained'), '/retained/');
-    assert.deepEqual(source._datasetCache.get('retained'), { id: 'retained' });
-  });
-
-  await t.test('metadata failure', async () => {
-    globalThis.fetch = async url => {
-      if (String(url).endsWith('/_cellucid/datasets')) {
-        return new Response(JSON.stringify({
-          datasets: [{ id: 'current', path: '/current/', name: 'Current' }],
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      return new Response('broken metadata', { status: 500 });
-    };
-    await assert.rejects(
-      source.listDatasets(),
-      error => error?.details?.status === 500
-    );
-    assert.equal(source._datasetPaths.get('retained'), '/retained/');
-    assert.equal(source._datasetPaths.has('current'), false);
-    assert.deepEqual(source._datasetCache.get('retained'), { id: 'retained' });
-  });
-});
-
-test('Jupyter dataset listing rejects noncanonical entries before metadata work', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  let calls = 0;
-  globalThis.fetch = async () => {
-    calls += 1;
-    return new Response(JSON.stringify({
-      datasets: [{ id: 'current', name: 'Current' }],
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  };
-  await assert.rejects(source.listDatasets(), /dataset.*path/i);
-  assert.equal(calls, 1);
-});
-
-test('Jupyter dataset listing publishes one complete exact generation', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  source._datasetPaths.set('retained', '/retained/');
-  source._datasetCache.set('retained', { id: 'retained' });
-  const calls = [];
-  globalThis.fetch = async url => {
-    calls.push(String(url));
-    if (String(url).endsWith('/_cellucid/datasets')) {
-      return new Response(JSON.stringify({
-        datasets: [{
-          id: CURRENT_IDENTITY.id,
-          path: '/current-ui-prepared/',
-          name: CURRENT_IDENTITY.name,
-        }],
-      }), { status: 200 });
-    }
-    return new Response(JSON.stringify(CURRENT_IDENTITY), { status: 200 });
-  };
-
-  const datasets = await source.listDatasets();
-  assert.deepEqual(datasets, [CURRENT_IDENTITY]);
-  assert.deepEqual(calls, [
-    'http://127.0.0.1:8765/viewer/_cellucid/datasets',
-    'http://127.0.0.1:8765/viewer/current-ui-prepared/dataset_identity.json',
-  ]);
-  assert.deepEqual(
-    [...source._datasetPaths],
-    [[CURRENT_IDENTITY.id, '/current-ui-prepared/']],
-  );
-  assert.equal(source._datasetCache.get(CURRENT_IDENTITY.id), datasets[0]);
-  assert.equal(
-    source.getBaseUrl(CURRENT_IDENTITY.id),
-    'jupyter://viewer-1/current-ui-prepared/',
-  );
-  assert.equal(
-    await source.resolveUrl(
-      'jupyter://viewer-1/current-ui-prepared/embeddings/0_2d.bin',
-    ),
-    'http://127.0.0.1:8765/viewer/current-ui-prepared/embeddings/0_2d.bin',
-  );
-  assert.throws(
-    () => source.getBaseUrl('undeclared'),
-    /not declared/i,
-  );
-  await assert.rejects(
-    source.resolveUrl(
-      'jupyter://other-viewer/current-ui-prepared/embeddings/0_2d.bin',
-    ),
-    /viewer id/i,
-  );
-  assert.equal(
-    await source.resolveUrl(
-      'jupyter://viewer-1/current-ui-prepared/nested%20artifact.bin',
-    ),
-    'http://127.0.0.1:8765/viewer/current-ui-prepared/nested%20artifact.bin',
-  );
-  for (const url of [
-    'jupyter://viewer-1/%2e%2e/private.json',
-    'jupyter://viewer-1/%252e%252e/private.json',
-    'jupyter://viewer-1/current-ui-prepared/%2fprivate.json',
-    'jupyter://viewer-1/current-ui-prepared/%255cprivate.json',
-    'jupyter://viewer-1/retired/private.json',
-  ]) {
-    await assert.rejects(
-      source.resolveUrl(url),
-      /invalid Jupyter artifact path|currently declared dataset/i,
-      url,
-    );
-  }
-});
-
-test('Jupyter catalog and identity names must agree exactly', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  globalThis.fetch = async url => {
-    if (String(url).endsWith('/_cellucid/datasets')) {
-      return new Response(JSON.stringify({
-        datasets: [{
-          id: CURRENT_IDENTITY.id,
-          path: '/current-ui-prepared/',
-          name: 'Contradictory catalog name',
-        }],
-      }), { status: 200 });
-    }
-    return new Response(JSON.stringify(CURRENT_IDENTITY), {
-      status: 200,
-    });
-  };
-
-  await assert.rejects(
-    source.listDatasets(),
-    /catalog name.*does not match.*dataset_identity/i,
-  );
-  assert.deepEqual([...source._datasetPaths], []);
-  assert.deepEqual([...source._datasetCache], []);
-});
-
-test('Jupyter listing aborts and drains metadata siblings after one exact failure', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  let heldSignal = null;
-  let heldSettled = false;
-  globalThis.fetch = async (input, options = {}) => {
-    const url = String(input);
-    if (url.endsWith('/_cellucid/datasets')) {
-      return new Response(JSON.stringify({
-        datasets: [
-          { id: 'invalid', path: '/invalid/', name: 'Invalid' },
-          { id: 'held', path: '/held/', name: 'Held' },
-        ],
-      }), { status: 200 });
-    }
-    if (url.endsWith('/invalid/dataset_identity.json')) {
-      return new Response(JSON.stringify({}), { status: 200 });
-    }
-    if (url.endsWith('/held/dataset_identity.json')) {
-      heldSignal = options.signal ?? null;
-      return new Promise((_resolve, reject) => {
-        heldSignal.addEventListener('abort', () => {
-          heldSettled = true;
-          reject(heldSignal.reason);
-        }, { once: true });
-      });
-    }
-    return new Response('', { status: 404 });
-  };
-
-  await assert.rejects(
-    source.listDatasets(),
-    /dataset_identity|missing required field/i,
-  );
-  assert.ok(heldSignal instanceof AbortSignal);
-  assert.equal(heldSignal.aborted, true);
-  assert.equal(heldSettled, true);
-});
-
-test('concurrent Jupyter metadata reads coalesce within one catalog owner', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  source._datasetPaths.set(
-    CURRENT_IDENTITY.id,
-    '/current-ui-prepared/',
-  );
-  let identityCalls = 0;
-  let releaseIdentity;
-  const identityResponse = new Promise(resolve => {
-    releaseIdentity = resolve;
-  });
-  globalThis.fetch = async () => {
-    identityCalls += 1;
-    return identityResponse;
-  };
-
-  const first = source.getMetadata(CURRENT_IDENTITY.id);
-  const second = source.getMetadata(CURRENT_IDENTITY.id);
-  assert.equal(identityCalls, 1);
-  releaseIdentity(new Response(JSON.stringify(CURRENT_IDENTITY), {
-    status: 200,
-  }));
-  const [firstMetadata, secondMetadata] = await Promise.all([
-    first,
-    second,
-  ]);
-  assert.equal(firstMetadata, secondMetadata);
-  assert.equal(
-    await source.getMetadata(CURRENT_IDENTITY.id),
-    firstMetadata,
-  );
-  assert.equal(identityCalls, 1);
-});
-
-test('coalesced Jupyter metadata callers share one lifecycle cancellation', async () => {
-  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
-  const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
-  source._connected = true;
-  source._datasetPaths.set(
-    CURRENT_IDENTITY.id,
-    '/current-ui-prepared/',
-  );
-  let metadataSignal = null;
-  globalThis.fetch = async (_input, options = {}) => {
-    metadataSignal = options.signal ?? null;
-    return new Promise((_resolve, reject) => {
-      metadataSignal.addEventListener('abort', () => {
-        reject(metadataSignal.reason);
-      }, { once: true });
-    });
-  };
-
-  const first = source.getMetadata(CURRENT_IDENTITY.id);
-  const second = source.getMetadata(CURRENT_IDENTITY.id);
-  assert.ok(metadataSignal instanceof AbortSignal);
-  source.refresh();
-
-  const [firstOutcome, secondOutcome] = await Promise.allSettled([
-    first,
-    second,
-  ]);
-  assert.equal(firstOutcome.status, 'rejected');
-  assert.equal(secondOutcome.status, 'rejected');
-  assert.equal(firstOutcome.reason, secondOutcome.reason);
-  assert.equal(
-    firstOutcome.reason.code,
-    'CELLUCID_JUPYTER_LIFECYCLE_SUPERSEDED',
-  );
-  assert.match(firstOutcome.reason.message, /superseded/i);
-  assert.equal(source._datasetCache.has(CURRENT_IDENTITY.id), false);
-});
-
-test(
-  'Jupyter dataset listings cannot publish across reconnect or a newer listing',
-  async t => {
-    await t.test('reconnect retirement', async () => {
-      installWindow(
-        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
-      );
-      const source = new JupyterBridgeDataSource(getJupyterConfig());
-      globalThis.fetch = async () => jupyterHealthResponse();
-      await source.initialize();
-
-      const staleCatalog = deferred();
-      let staleCatalogSignal = null;
-      globalThis.fetch = async (url, init = {}) => {
-        if (String(url).endsWith('/_cellucid/datasets')) {
-          staleCatalogSignal = init.signal ?? null;
-          return staleCatalog.promise;
-        }
-        throw new Error(`Unexpected stale-listing URL: ${String(url)}`);
-      };
-      const staleListing = source.listDatasets();
-      const staleRejection = assert.rejects(
-        staleListing,
-        /superseded|connection/i,
-      );
-
-      source.disconnect();
-      assert.ok(staleCatalogSignal instanceof AbortSignal);
-      assert.equal(staleCatalogSignal.aborted, true);
-      globalThis.fetch = async url => {
-        if (String(url).endsWith('/_cellucid/health')) {
-          return jupyterHealthResponse();
-        }
-        if (String(url).endsWith('/dataset_identity.json')) {
-          return new Response(JSON.stringify(CURRENT_IDENTITY), {
-            status: 200,
-          });
-        }
-        throw new Error(`Unexpected reconnected URL: ${String(url)}`);
-      };
-      assert.equal(await source.initialize(), true);
-
-      staleCatalog.resolve(new Response(JSON.stringify({
-        datasets: [{
-          id: CURRENT_IDENTITY.id,
-          path: '/current-ui-prepared/',
-          name: CURRENT_IDENTITY.name,
-        }],
-      }), { status: 200 }));
-      await staleRejection;
-      assert.deepEqual([...source._datasetPaths], []);
-      assert.deepEqual([...source._datasetCache], []);
-      source.disconnect();
-    });
-
-    await t.test('newest listing ownership', async () => {
-      installWindow(
-        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
-      );
-      const source = new JupyterBridgeDataSource(getJupyterConfig());
-      globalThis.fetch = async () => jupyterHealthResponse();
-      await source.initialize();
-
-      const firstCatalog = deferred();
-      const secondCatalog = deferred();
-      const firstIdentity = {
-        ...CURRENT_IDENTITY,
-        id: 'first',
-        name: 'First',
-      };
-      const secondIdentity = {
-        ...CURRENT_IDENTITY,
-        id: 'second',
-        name: 'Second',
-      };
-      let catalogCalls = 0;
-      const catalogSignals = [];
-      globalThis.fetch = async (url, init = {}) => {
-        const href = String(url);
-        if (href.endsWith('/_cellucid/datasets')) {
-          catalogCalls += 1;
-          catalogSignals.push(init.signal ?? null);
-          return catalogCalls === 1
-            ? firstCatalog.promise
-            : secondCatalog.promise;
-        }
-        if (href.endsWith('/first/dataset_identity.json')) {
-          return new Response(JSON.stringify(firstIdentity), { status: 200 });
-        }
-        if (href.endsWith('/second/dataset_identity.json')) {
-          return new Response(JSON.stringify(secondIdentity), { status: 200 });
-        }
-        throw new Error(`Unexpected concurrent-listing URL: ${href}`);
-      };
-
-      const firstListing = source.listDatasets();
-      const firstRejection = assert.rejects(
-        firstListing,
-        /superseded/i,
-      );
-      const secondListing = source.listDatasets();
-      assert.ok(catalogSignals[0] instanceof AbortSignal);
-      assert.equal(catalogSignals[0].aborted, true);
-      secondCatalog.resolve(new Response(JSON.stringify({
-        datasets: [{
-          id: 'second',
-          path: '/second/',
-          name: 'Second',
-        }],
-      }), { status: 200 }));
-      assert.deepEqual(await secondListing, [secondIdentity]);
-
-      firstCatalog.resolve(new Response(JSON.stringify({
-        datasets: [{
-          id: 'first',
-          path: '/first/',
-          name: 'First',
-        }],
-      }), { status: 200 }));
-      await firstRejection;
-      assert.deepEqual([...source._datasetPaths], [['second', '/second/']]);
-      assert.equal(source._datasetCache.get('second').id, 'second');
-      assert.equal(source._datasetCache.has('first'), false);
-      source.disconnect();
-    });
-
-    await t.test('metadata cache refresh retirement', async () => {
-      installWindow(
-        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
-      );
-      const source = new JupyterBridgeDataSource(getJupyterConfig());
-      globalThis.fetch = async () => jupyterHealthResponse();
-      await source.initialize();
-      source._datasetPaths.set(
-        CURRENT_IDENTITY.id,
-        '/current-ui-prepared/',
-      );
-
-      const identity = deferred();
-      let metadataSignal = null;
-      globalThis.fetch = async (_url, init = {}) => {
-        metadataSignal = init.signal ?? null;
-        return identity.promise;
-      };
-      const metadata = source.getMetadata(CURRENT_IDENTITY.id);
-      const rejection = assert.rejects(metadata, /superseded/i);
-      source.refresh();
-      assert.ok(metadataSignal instanceof AbortSignal);
-      assert.equal(metadataSignal.aborted, true);
-      identity.resolve(new Response(JSON.stringify(CURRENT_IDENTITY), {
-        status: 200,
-      }));
-      await rejection;
-      assert.equal(source._datasetCache.has(CURRENT_IDENTITY.id), false);
-      source.disconnect();
-    });
-  },
-);
-
 test('Jupyter bridge has no unused frontend-to-parent request protocol', () => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
@@ -1240,7 +818,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
     () => source._handleMessage({
       data: {
         type: 'highlight',
-        cells: [1, 1],
+        cells: '1,2',
         color: '#ff0000',
         viewerId: 'viewer-1',
         viewerToken: 'secret-1',
@@ -1248,8 +826,10 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
       origin: 'https://notebook.example',
       source: window.parent,
     }),
-    /duplicate/i,
+    /must be an array/i,
   );
+  // Indices are checked against the dataset, and ordered once, by the state
+  // that applies them (`cellListFrom`, `setCellVisibility`), not here.
   assert.equal(highlightCalls, 0);
   assert.throws(
     () => source._handleMessage({
@@ -1329,7 +909,7 @@ test('Jupyter ready and selection events reject invented defaults', async () => 
   );
 
   await assert.rejects(source.notifyReady({}), /nCells.*dimensions/i);
-  await assert.rejects(source.notifySelection([1, 2]), /source/i);
+  await assert.rejects(source.notifySelection(Uint32Array.of(1, 2)), /source/i);
 });
 
 test('Jupyter browser notifications publish only exact current payloads', async () => {
@@ -1353,7 +933,7 @@ test('Jupyter browser notifications publish only exact current payloads', async 
     );
   };
 
-  await source.notifySelection([1, 2], 'lasso');
+  await source.notifySelection(Uint32Array.of(1, 2), 'lasso');
   await source.notifyHover(1, { x: 1, y: 2, z: 3 });
   await source.notifyHover(null, null);
   await source.notifyClick(2, {
@@ -1418,7 +998,7 @@ test('a selection travels as exact little-endian uint32 bytes on its own route',
 
   await t.test('the wire form is pinned byte for byte', async () => {
     requests.length = 0;
-    await source.notifySelection([42, 0, 10], 'lasso');
+    await source.notifySelection(Uint32Array.of(0, 10, 42), 'lasso');
     assert.equal(requests.length, 1);
     const [{ url, init }] = requests;
     assert.equal(url.origin + url.pathname, 'http://127.0.0.1:8765/viewer/_cellucid/selection');
@@ -1439,13 +1019,15 @@ test('a selection travels as exact little-endian uint32 bytes on its own route',
   await t.test('a selection far above 64 KiB round-trips exactly', async () => {
     // 1,000,000 cells: 4 MB as uint32, well past the 64 KiB keepalive budget
     // and the 1 MiB JSON event limit that stopped selections before. The
-    // input is unordered; Python receives the same set, ascending.
+    // selection tools hand over a cell list (ascending), up to the largest
+    // uint32 index.
     const count = 1_000_000;
-    const cells = new Array(count);
+    const cells = new Uint32Array(count);
     for (let index = 0; index < count; index++) {
       cells[index] = (index * 7_919) % 4_000_003;
     }
     cells[count - 1] = 0xFFFFFFFF;
+    cells.sort();
     requests.length = 0;
     await source.notifySelection(cells, 'annotation');
     const [{ init }] = requests;
@@ -1464,28 +1046,22 @@ test('a selection travels as exact little-endian uint32 bytes on its own route',
 
   await t.test('invalid selections are refused before any request', async () => {
     requests.length = 0;
-    const holey = [1, 2];
-    holey.length = 3;
     for (const [cells, pattern] of [
-      [[], /at least one cell/],
-      [[3, 1, 3], /duplicate/],
-      [[1, -1], /\[1\] must be a non-negative integer/],
-      [[1, 1.5], /\[1\] must be a non-negative integer/],
-      [[1, '2'], /\[1\] must be a non-negative integer/],
-      [holey, /holes/],
-      [[0x1_0000_0000], /largest selectable cell index/],
-      [new Uint32Array([1, 2]), /must be an array/],
+      [new Uint32Array(0), /at least one cell/],
+      [Uint32Array.of(1, 3, 3), /unique cell indices in ascending order/],
+      [Uint32Array.of(3, 1), /unique cell indices in ascending order/],
+      [[1, 2], /must be a cell list \(Uint32Array\)/],
     ]) {
       await assert.rejects(source.notifySelection(cells, 'lasso'), pattern);
     }
-    await assert.rejects(source.notifySelection([1], ''), /source/);
+    await assert.rejects(source.notifySelection(Uint32Array.of(1), ''), /source/);
     assert.equal(requests.length, 0);
   });
 
   await t.test('a refused delivery names its route and status', async () => {
     globalThis.fetch = async () => new Response('Viewer is not registered', { status: 404 });
     await assert.rejects(
-      source.notifySelection([1], 'lasso'),
+      source.notifySelection(Uint32Array.of(1), 'lasso'),
       /Jupyter selection delivery failed with HTTP 404/,
     );
   });
@@ -1508,16 +1084,20 @@ test('selection encoding and cell validation build no per-cell hash set', () => 
     const end = text.indexOf('\n}\n', start);
     return text.slice(start, end);
   };
+  const cellSet = readFileSync(
+    new URL('../assets/js/app/utils/cell-set.js', import.meta.url),
+    'utf8',
+  );
   for (const body of [
     bodyOf(source, 'export function encodeJupyterSelectionCells('),
-    bodyOf(source, 'function requireCellIndices('),
+    bodyOf(cellSet, 'export function cellListFrom('),
     bodyOf(notification, 'function requireDelivery('),
   ]) {
     assert.doesNotMatch(body, /new (?:Set|Map)\b/);
   }
   assert.doesNotMatch(source, /keepalive\s*:/);
 
-  const many = new Array(17_000_000);
+  const many = new Uint32Array(17_000_000);
   for (let index = 0; index < many.length; index++) many[index] = index;
   const encoded = encodeJupyterSelectionCells(many);
   assert.equal(encoded.byteLength, many.length * 4);
@@ -1644,7 +1224,7 @@ test('Jupyter mode does not register or enumerate the unrelated demo catalog', a
     registerDemoCatalog: false,
   });
 
-  assert.deepEqual(manager.getSourceTypes(), ['jupyter', 'github-repo']);
+  assert.deepEqual(manager.getSourceTypes(), ['jupyter', 'link']);
   assert.deepEqual(await manager.getAllDatasets(), [{
     sourceType: 'jupyter',
     datasets: [{ id: 'python-dataset', name: 'Python dataset' }],
@@ -1653,7 +1233,7 @@ test('Jupyter mode does not register or enumerate the unrelated demo catalog', a
   assert.equal(jupyterAvailabilityCalls, 1);
   assert.equal(jupyterListingCalls, 1);
   assert.equal(manager.getSource('local-demo'), null);
-  assert.notEqual(manager.getSource('github-repo'), null);
+  assert.notEqual(manager.getSource('link'), null);
 });
 
 test('main binds bridge initialization and session upload to one captured config', () => {

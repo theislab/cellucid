@@ -120,32 +120,32 @@ export class DataStateVarAxisMethods {
    * and return the steps that publish it and restore the current one.
    *
    * @param {{
-   *   varManifest: Object,
+   *   geneList: Object,
    *   varFieldLoader: Function|null,
    *   sameAxis: boolean,
    *   sameMatrix: boolean
-   * }} axis - The expanded manifest of the new gene list and its loader;
+   * }} axis - The checked new gene list (`loadGeneList`) and its loader;
    *   whether it is the same var axis (gene `i` is the same column), and
    *   whether its values are those of the current matrix.
    * @returns {Promise<{dropped: string[], commit: () => void, rollback: () => void}>}
    */
-  async stageVarAxisReplacement({ varManifest, varFieldLoader, sameAxis, sameMatrix }) {
-    if (!Array.isArray(varManifest?.fields)) {
-      throw new TypeError('A var axis requires its expanded manifest.');
+  async stageVarAxisReplacement({ geneList, varFieldLoader, sameAxis, sameMatrix }) {
+    if (!Array.isArray(geneList?.fields)) {
+      throw new TypeError('A var axis requires its gene list.');
     }
     // An empty gene list (no expression matrix) has nothing to load.
-    const loader = varManifest.fields.length === 0 && varFieldLoader === null
+    const loader = geneList.fields.length === 0 && varFieldLoader === null
       ? null
       : requireLoader(varFieldLoader);
     if (sameMatrix && !sameAxis) {
       throw new TypeError('One matrix has one var axis.');
     }
-    const newIndexByKey = new Map(varManifest.fields.map((field, index) => [field.key, index]));
+    const newIndexByKey = new Map(geneList.fields.map((field, index) => [field.key, index]));
     const geneCount = this.getVarAxisGeneCount();
     // Where each coloured view's gene is on the new list, or undefined.
     const resolve = view => {
       if (sameAxis && view.position < geneCount && view.field._isUserDefined !== true) {
-        return view.position < varManifest.fields.length ? view.position : undefined;
+        return view.position < geneList.fields.length ? view.position : undefined;
       }
       return newIndexByKey.get(view.key);
     };
@@ -166,7 +166,7 @@ export class DataStateVarAxisMethods {
         staged.set(index, carried.values);
         continue;
       }
-      const loaded = await loader(varManifest.fields[index], { signal: null });
+      const loaded = await loader(geneList.fields[index], { signal: null });
       const values = loaded?.values;
       if (!(values instanceof Float32Array) || values.length !== this.pointCount) {
         throw new Error(`Gene "${key}" did not load one value per cell.`);
@@ -195,7 +195,7 @@ export class DataStateVarAxisMethods {
       dropped,
       commit: () => {
         this._publishVarAxis({
-          varManifest,
+          geneList,
           loader,
           staged,
           resolveView: (viewId) => {
@@ -230,9 +230,9 @@ export class DataStateVarAxisMethods {
    * Publish a staged var axis to the state and every view.
    * @private
    */
-  _publishVarAxis({ varManifest, loader, staged, resolveView }) {
+  _publishVarAxis({ geneList, loader, staged, resolveView }) {
     this.setVarFieldLoader(loader);
-    this.initVarData(varManifest);
+    this.initVarData(geneList);
     for (const [index, values] of staged) {
       const field = this.varData.fields[index];
       field.values = values;

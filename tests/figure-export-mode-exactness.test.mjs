@@ -150,7 +150,9 @@ test('figure-export UI never chooses or changes an SVG strategy automatically', 
 
   assert.doesNotMatch(uiSource, /promptLargeDatasetStrategy|Large data:\s*Ask/);
   assert.doesNotMatch(uiSource, /value:\s*['"]hybrid['"][^)]*selected:\s*true/s);
-  assert.doesNotMatch(uiSource, /strategySelect\.value\s*=/);
+  // The only assignment restores the person's own saved choice from a session.
+  assert.doesNotMatch(uiSource, /strategySelect\.value\s*=(?!=)(?!\s*exact\.svgStrategy \?\? '';)/);
+  assert.equal(uiSource.match(/strategySelect\.value\s*=(?!=)/g)?.length, 1);
   assert.doesNotMatch(uiSource, /strategy\s*!==\s*['"]hybrid['"]|requires Hybrid/i);
   assert.match(uiSource, /value:\s*['"]['"][^)]*Choose SVG strategy/);
 
@@ -167,10 +169,21 @@ test('SVG renderer has explicit branches and no strategy normalization', async (
     svgSource,
     /optimizedTargetCount\s*\|\||Math\.max\(\s*1000,\s*Math\.floor\(\s*opts\.optimizedTargetCount/
   );
-  assert.match(svgSource, /else if \(strategy === ['"]full-vector['"]\)/);
+  assert.match(
+    svgSource,
+    /else if \(strategy === ['"]full-vector['"] \|\| strategy === ['"]optimized-vector['"]\)/
+  );
   assert.doesNotMatch(
     svgSource,
-    /else\s*\{\s*(?:\/\/[^\n]*\n\s*)?(?:const\s+pointScale|forEachProjectedPoint)/s
+    /else\s*\{\s*(?:\/\/[^\n]*\n\s*)*(?:const\s+pointScale|forEachProjectedPoint|parts\.push\(await requestSvgPointMarkup)/s
+  );
+  // The worker's markup writer names both vector strategies and rejects any
+  // other: nothing is normalized on either side of the worker boundary.
+  const markupSource = await source('renderers/svg-point-markup.js');
+  assert.match(markupSource, /if \(strategy === ['"]optimized-vector['"]\)/);
+  assert.match(
+    markupSource,
+    /if \(strategy !== ['"]full-vector['"]\) \{\s*throw new TypeError/
   );
 });
 
@@ -283,12 +296,16 @@ test('batch ZIP preserves exact entry bytes in deterministic order', async () =>
 });
 
 test('batch ZIP cancellation settles while a staged Blob read is pending', async () => {
+  // Entries are read slice by slice; this one's first slice never arrives
+  // until the test releases it.
   let releaseRead;
   class DeferredBlob extends Blob {
-    arrayBuffer() {
-      return new Promise((resolve) => {
-        releaseRead = () => resolve(new Uint8Array([1, 2, 3]).buffer);
-      });
+    slice() {
+      return {
+        arrayBuffer: () => new Promise((resolve) => {
+          releaseRead = () => resolve(new Uint8Array([1, 2, 3]).buffer);
+        }),
+      };
     }
   }
 
@@ -310,8 +327,12 @@ test('batch ZIP cancellation settles while a staged Blob read is pending', async
 
 test('batch ZIP rejects invalid or unreadable staging atomically', async () => {
   class RejectingBlob extends Blob {
-    async arrayBuffer() {
-      throw new Error('staged artifact read failed');
+    slice() {
+      return {
+        arrayBuffer: async () => {
+          throw new Error('staged artifact read failed');
+        },
+      };
     }
   }
 
@@ -343,7 +364,14 @@ test('PNG renderer uses one browser backend and metadata failures are terminal',
     source('utils/png-metadata.js'),
   ]);
 
-  assert.doesNotMatch(pngSource, /OffscreenCanvas|convertToBlob/);
+  // The page composes; the worker encodes, on the one encoder every browser
+  // gives a worker. Nothing encodes on the page's main thread.
+  const workerSource = await source('utils/figure-export-worker.js');
+  assert.doesNotMatch(pngSource, /\.toBlob\(|\.toDataURL\(|\.convertToBlob\(/);
+  assert.match(pngSource, /createImageBitmap\(canvas\)/);
+  assert.match(pngSource, /requestPngEncoding\(/);
+  assert.match(workerSource, /convertToBlob\(\{ type: 'image\/png' \}\)/);
+  assert.match(workerSource, /embedPngTextChunks\(blob, textMap\)/);
   assert.match(pngSource, /payload\.format !== ['"]png['"]/);
   assert.doesNotMatch(metadataSource, /catch\s*\{|return blob/);
 

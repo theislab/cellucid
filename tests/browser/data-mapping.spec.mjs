@@ -12,7 +12,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL, encodedAppUrl } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN, encodedAppUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -22,8 +22,8 @@ const GUESS_ZARR = path.join(FIXTURES, 'data-mapping-guess.zarr.zip');
 const WIDE_H5AD = path.join(FIXTURES, 'data-mapping-wide.h5ad');
 const MULTI_H5AD = path.join(FIXTURES, 'data-mapping-multi.h5ad');
 const START_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=data-mapping-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=data-mapping-ci';
 
 /** Open one group's disclosure in the Data mapping panel. */
 async function openGroup(page, section) {
@@ -43,11 +43,22 @@ function collectBrowserErrors(page) {
 async function openApp(page) {
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 }
 
+/**
+ * Open one fixture file. `input` is a file input to pick it with, or 'link' to
+ * open it in place from the sample server (CORS, range requests), as a data
+ * link: the data mapping must behave the same on both.
+ */
 async function openFile(page, input, file, name) {
-  await page.locator(input).setInputFiles(file);
+  if (input === 'link') {
+    const address = `${SAMPLE_ORIGIN}/tests/browser/fixtures/${path.basename(file)}`;
+    await page.locator('#data-link-url').fill(address);
+    await page.locator('#data-link-connect-btn').click();
+  } else {
+    await page.locator(input).setInputFiles(file);
+  }
   await expect(page.locator('#dataset-name')).toHaveText(name);
   await expect.poll(() => page.evaluate(
     () => window._cellucidState.getMappingCandidates() !== null
@@ -92,10 +103,13 @@ const guessNotification = page => page
 for (const [format, input, file] of [
   ['H5AD', '#user-data-h5ad-input', GUESS_H5AD],
   ['Zarr ZIP', '#user-data-zarr-archive-input', GUESS_ZARR],
+  ['linked H5AD', 'link', GUESS_H5AD],
+  ['linked Zarr ZIP', 'link', GUESS_ZARR],
 ]) {
   test(`a ${format} without a UMAP opens on a best guess, says so, and opens the checklist`, async ({ page }) => {
     const errors = collectBrowserErrors(page);
     await openApp(page);
+    await openCollapsedPanels(page);
     await openFile(page, input, file, 'data-mapping-guess');
 
     // X_umap_old ranks first but holds a NaN, so the guess shows X_tsne.
@@ -142,10 +156,12 @@ for (const [format, input, file] of [
   });
 }
 
-test('a wide X_pca is guessed at columns 0 and 1, and a column swap redraws it', async ({ page }) => {
+for (const [opened, input] of [['picked', '#user-data-h5ad-input'], ['linked', 'link']]) {
+test(`a ${opened} wide X_pca is guessed at columns 0 and 1, and a column swap redraws it`, async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await openApp(page);
-  await openFile(page, '#user-data-h5ad-input', WIDE_H5AD, 'data-mapping-wide');
+  await openCollapsedPanels(page);
+  await openFile(page, input, WIDE_H5AD, 'data-mapping-wide');
   await expect(guessNotification(page)).toContainText("Showing columns 0 and 1 of 'X_pca' as 2D.");
   expect(await viewLayout(page, 'live')).toBe('X_pca[0,1]');
   const pca = checklistRow(page, 'PCA 1,2');
@@ -195,6 +211,7 @@ test('a wide X_pca is guessed at columns 0 and 1, and a column swap redraws it',
   await expect(page.locator('#data-mapping-revert')).toBeDisabled();
   expect(errors).toEqual([]);
 });
+}
 
 test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view', async ({ page }) => {
   const errors = collectBrowserErrors(page);
@@ -254,8 +271,9 @@ test('a session saved with the vector-field controls on one embedding restores o
   const velocity = page.locator('#velocity-overlay-enabled');
   const field = page.locator('#velocity-field');
 
-  // Saved with the overlay on, on UMAP, where velocity_umap_2d is bound.
-  await expect(field).toHaveValue('velocity_umap');
+  // Saved with the overlay on, on UMAP, where velocity_umap is bound: the
+  // field `velocity`.
+  await expect(field).toHaveValue('velocity');
   await velocity.check();
   await expect(page.locator('#velocity-overlay-settings')).toBeVisible();
   let downloadPromise = page.waitForEvent('download');
@@ -280,7 +298,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await openApp(page);
   await openCollapsedPanels(page);
   await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
-  await expect(field).toHaveValue('velocity_umap');
+  await expect(field).toHaveValue('velocity');
   let chooserPromise = page.waitForEvent('filechooser');
   await page.locator('#load-state-btn').click();
   await (await chooserPromise).setFiles(onTsne);
@@ -303,7 +321,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await page.locator('#load-state-btn').click();
   await (await chooserPromise).setFiles(onUmap);
   await expect.poll(() => viewLayout(page, 'live')).toBe('X_umap');
-  await expect(field).toHaveValue('velocity_umap');
+  await expect(field).toHaveValue('velocity');
   await expect(velocity).toBeChecked();
   await expect(page.locator('#velocity-overlay-settings')).toBeVisible();
   await expect(page.locator('.notification-error')).toHaveCount(0);
@@ -372,57 +390,40 @@ test('a session restores the data mapping and every view’s embedding', async (
   expect(errors).toEqual([]);
 });
 
-test('a prepared dataset switches between the embeddings it was exported with', async ({ page }) => {
+test('a catalog dataset opens on the embedding its file names, and switches to another it holds', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await page.goto(
-    `/?exportsBaseUrl=${encodedAppUrl('/tests/browser/fixtures/demo-custom-exports/')}`
-      + '&dataset=synthetic-cell-types-2d&acceptance=data-mapping-export-ci',
+    `/?sampleCatalog=${encodedAppUrl('/tests/browser/fixtures/demo-catalog/')}`
+      + '&dataset=synthetic-cell-types-2d&acceptance=data-mapping-catalog-ci',
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Synthetic cell-type islands — 2D');
-  expect(await mappingDefault(page, '2d')).toEqual({ key: 'islands', columns: null });
+  // uns['cellucid']['defaults']['embedding2d'] names X_islands: a default,
+  // not a guess (its file has no UMAP).
+  expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_islands', columns: [0, 1] });
+  await expect(guessNotification(page)).toHaveCount(0);
 
-  // Every exported embedding is on, and the gene-name sets it was exported
-  // with are offered; graph, expression and latent space are fixed at export.
   await page.locator('#data-mapping-disclosure .disclosure-header').click();
-  await expect(page.locator('.data-mapping-row .data-mapping-name')).toHaveText([
-    'Island layout',
-    'Marker scores',
-  ]);
-  await expect(page.locator('.data-mapping-row .data-mapping-enable:checked')).toHaveCount(2);
-  await expect(page.locator('.data-mapping-row .data-mapping-dim')).toHaveText(['2D', '2D']);
-  await openGroup(page, 'genes');
-  await expect(page.locator('#data-mapping-expression')).toBeHidden();
-  await expect(page.locator('#data-mapping-gene-names option')).toHaveText(['symbol', 'gene_id']);
-  await expect(page.locator('#data-mapping-gene-names')).toHaveValue('column:symbol');
-  await expect(page.locator('.data-mapping-facts .dataset-info-label')).toHaveText([
-    'Vector fields',
-  ]);
-
-  // The live view shows the other embedding, and back: no mapping change.
-  const picker = page.locator('#view-representation-select');
-  await picker.selectOption('marker_scores');
-  await expect.poll(() => viewLayout(page, 'live')).toBe('marker_scores');
-  await picker.selectOption('islands');
-  await expect.poll(() => viewLayout(page, 'live')).toBe('islands');
-
-  // A new default changes no view that was turned to an embedding explicitly.
-  await checklistRow(page, 'Marker scores').locator('.data-mapping-default').click();
-  await expect(page.locator('.data-mapping-status')).toHaveText('Apply offers these embeddings to every view.');
+  const markerScores = checklistRow(page, 'marker scores');
+  await expect(markerScores).toHaveCount(1);
+  await markerScores.locator('.data-mapping-enable').check();
+  await markerScores.locator('.data-mapping-default').click();
   await page.locator('#data-mapping-apply').click();
   await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
-  expect(await mappingDefault(page, '2d')).toEqual({ key: 'marker_scores', columns: null });
-  expect(await viewLayout(page, 'live')).toBe('islands');
-  await expect(picker.locator('option')).toHaveText(['Marker scores · 2D', 'Island layout · 2D']);
-  await expect(page.locator('#data-mapping-disclosure .disclosure-desc')).toHaveText('2 on · Marker scores 2D');
-  // Key 2 now shows the new default first.
-  await page.locator('#glcanvas').click({ position: { x: 700, y: 400 } });
-  await page.keyboard.press('2');
-  await expect.poll(() => viewLayout(page, 'live')).toBe('marker_scores');
+  expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_marker_scores', columns: [0, 1] });
 
-  // The other exported name set relabels the same genes: a view coloured by
+  // The live view shows either embedding.
+  const picker = page.locator('#view-representation-select');
+  const layouts = await picker.locator('option').evaluateAll(options => options.map(option => option.value));
+  expect(layouts).toHaveLength(2);
+  for (const layout of layouts) {
+    await picker.selectOption(layout);
+    await expect.poll(() => viewLayout(page, 'live')).toBe(layout);
+  }
+
+  // The var column of accessions renames the same genes: a view coloured by
   // a gene keeps that gene, now under its id, with the same values.
   const activeGene = () => page.evaluate(() => {
     const state = window._cellucidState;
@@ -436,6 +437,7 @@ test('a prepared dataset switches between the embeddings it was exported with', 
   await search.press('Enter');
   await expect.poll(() => activeGene().then(gene => gene?.key ?? null)).toBe('SYN_MARKER_B');
   const before = await activeGene();
+  await openGroup(page, 'genes');
   await page.locator('#data-mapping-gene-names').selectOption('column:gene_id');
   await page.locator('#data-mapping-apply').click();
   await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');

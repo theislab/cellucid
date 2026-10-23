@@ -1077,10 +1077,13 @@ test('figure export never changes format, strategy, backend, or fidelity', async
     /strategy adjusted|fall back to flat circles|value:\s*['"]raster['"]|value\s*=\s*['"]hybrid['"]/i
   );
   assert.doesNotMatch(warningSource, /Export anyway/i);
+  // One backend: the figure-export worker's OffscreenCanvas, never a page
+  // canvas beside it and never a CPU substitute.
   assert.doesNotMatch(
     rasterizerSource,
-    /OffscreenCanvas|falling back to CPU|use flat circles/i
+    /document\.createElement|HTMLCanvasElement|falling back to CPU|use flat circles/i
   );
+  assert.match(rasterizerSource, /new OffscreenCanvas\(1, 1\)/);
   assert.doesNotMatch(
     pngSource,
     /WebGL rasterizer returned null[\s\S]{0,100}Canvas2D flat circles/i

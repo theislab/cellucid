@@ -1,3 +1,9 @@
+/**
+ * The Sample dataset list (`LocalDemoDataSource`): the AnnData dataset
+ * catalog the page names, listed from each file's metadata and opened when
+ * chosen; and what a rejected catalog leaves usable.
+ */
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -13,26 +19,137 @@ import {
   DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 import { LocalDemoDataSource } from '../assets/js/data/local-demo-source.js';
+import { serveFixtureHost } from './helpers/fixture-web-host.mjs';
 
-function manifest(overrides = {}) {
-  return {
-    version: 1,
-    default: 'first',
-    datasets: [
-      { id: 'first', path: 'first/', name: 'First' },
-      { id: 'second', path: 'second/', name: 'Second' },
-    ],
-    ...overrides,
-  };
+const BASE = 'https://catalog.cellucid.test/anndata/';
+const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
+const SESSION_SHA = 'b'.repeat(64);
+
+function quiet(t) {
+  const { log, warn } = console;
+  console.log = () => {};
+  console.warn = () => {};
+  t.after(() => {
+    console.log = log;
+    console.warn = warn;
+  });
 }
+
+function serveCatalog(t, catalog) {
+  return serveFixtureHost(t, {
+    prefix: BASE,
+    root: FIXTURES,
+    files: new Map([['datasets.json', JSON.stringify(catalog)]]),
+  });
+}
+
+const CATALOG = Object.freeze({
+  schema: 2,
+  default: 'tiny-ready',
+  datasets: [
+    {
+      id: 'tiny-ready',
+      path: 'ready.zarr/',
+      session: { path: 'tiny-ready.cellucid-session', bytes: 7, sha256: SESSION_SHA },
+    },
+  ],
+});
+
+test('an unconfigured page has no sample list, and a misconfigured one says how to configure it', async () => {
+  const unconfigured = new LocalDemoDataSource(null, null);
+  assert.equal(await unconfigured.isAvailable(), false);
+  const misconfigured = new LocalDemoDataSource(null, new Error('Sample dataset configuration: exactly one meta'));
+  await assert.rejects(misconfigured.isAvailable(), /exactly one meta/);
+  assert.throws(() => new LocalDemoDataSource('https://x.test/no-slash'), /folder URL/);
+});
+
+test('the sample list names each dataset from its own file, reading its metadata only', async t => {
+  quiet(t);
+  const host = serveCatalog(t, CATALOG);
+  const source = new LocalDemoDataSource(BASE, null);
+  assert.equal(await source.isAvailable(), true);
+  assert.equal(await source.getDefaultDatasetId(), 'tiny-ready');
+  assert.equal(await source.hasDataset('tiny-ready'), true);
+  assert.equal(await source.hasDataset('other'), false);
+  const [first, second] = await Promise.all([source.listDatasets(), source.listDatasets()]);
+  assert.strictEqual(first, second, 'concurrent listings share one generation');
+  assert.deepEqual(first, [{
+    id: 'tiny-ready',
+    name: 'Tiny ready dataset',
+    description: 'Six cells written for the Cellucid web contract tests.',
+    stats: { n_cells: 6, n_genes: 3 },
+  }]);
+  assert.equal(host.requests.filter(request => request.url.endsWith('/datasets.json')).length, 1);
+  // Metadata documents only: no chunk of a matrix, an obs column or an
+  // embedding (a `.zarray`/`.zattrs`/`.zgroup`/`zarr.json` describes one).
+  assert.deepEqual(
+    host.requests
+      .map(request => request.url)
+      .filter(url => /ready\.zarr\/(X|layers|obs|obsm|obsp|var|varm|varp)\//.test(url))
+      .filter(url => !/\/(\.zarray|\.zattrs|\.zgroup|zarr\.json)$/.test(url)),
+    [],
+    'listing reads no data'
+  );
+  assert.equal(source.getStateDescriptor('tiny-ready').sessionUrl, `${BASE}tiny-ready.cellucid-session`);
+});
+
+test('choosing a sample opens its file once; its default view and AnnData source follow', async t => {
+  quiet(t);
+  serveCatalog(t, CATALOG);
+  const source = new LocalDemoDataSource(BASE, null);
+  assert.throws(() => source.getBaseUrl('tiny-ready'), /is not open/);
+  const metadata = await source.getMetadata('tiny-ready');
+  assert.equal(metadata.id, 'tiny-ready');
+  assert.equal(metadata.source.name, 'Example lab', 'the file names its source');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/');
+  assert.equal(source.datasetId, 'tiny-ready');
+  const annData = source.getAnnDataSource('tiny-ready');
+  assert.equal(annData.getType(), 'zarr');
+  assert.strictEqual(await source.getMetadata('tiny-ready'), metadata, 'opened once');
+  assert.deepEqual(source.getStateDescriptor('tiny-ready'), {
+    sessionUrl: `${BASE}tiny-ready.cellucid-session`,
+    sessionBytes: 7,
+    sessionSha256: SESSION_SHA,
+  });
+  await assert.rejects(source.getMetadata('missing'), /not found/);
+  source.onDeactivate();
+  assert.equal(source.getAnnDataSource('tiny-ready'), null, 'another source shown releases it');
+});
+
+test('a refresh reads the catalog again while the dataset shown stays readable', async t => {
+  quiet(t);
+  const host = serveCatalog(t, CATALOG);
+  const source = new LocalDemoDataSource(BASE, null);
+  await source.getMetadata('tiny-ready');
+  const shown = source.getAnnDataSource('tiny-ready');
+  source.refresh();
+  assert.strictEqual(source.getAnnDataSource('tiny-ready'), shown);
+  await source.listDatasets();
+  assert.equal(host.requests.filter(request => request.url.endsWith('/datasets.json')).length, 2);
+  source.releaseExcept('tiny-ready');
+  assert.strictEqual(source.getAnnDataSource('tiny-ready'), shown, 'the shown dataset is kept');
+  source.releaseExcept(null);
+  assert.equal(source.getAnnDataSource('tiny-ready'), null);
+});
+
+test('a listing failure names its dataset and is kept until a refresh', async t => {
+  quiet(t);
+  const host = serveCatalog(t, { schema: 2, default: 'tiny-ready', datasets: [{ id: 'tiny-ready', path: 'missing.h5ad' }] });
+  const source = new LocalDemoDataSource(BASE, null);
+  const error = await source.listDatasets().catch(failure => failure);
+  assert.match(error.message, /Dataset 'tiny-ready' \(missing\.h5ad\) cannot be listed/);
+  assert.strictEqual(await source.listDatasets().catch(failure => failure), error);
+  const before = host.requests.length;
+  source.refresh();
+  await source.listDatasets().catch(() => {});
+  assert.ok(host.requests.length > before, 'a refresh tries again');
+});
 
 function identity(id, name, cells) {
   return {
-    version: 3,
     id,
     name,
     description: `${name} description`,
-    cellucid_data_version: 'test-current',
     stats: {
       n_cells: cells,
       n_genes: 2,
@@ -49,7 +166,7 @@ function identity(id, name, cells) {
         X_umap: {
           label: 'X_umap',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: { key: 'X_umap', columns: [0, 1] },
         },
       },
@@ -57,1259 +174,6 @@ function identity(id, name, cells) {
     obs_fields: [],
   };
 }
-
-function embeddingItem(dimension, file, key = null) {
-  return {
-    label: key ?? `item ${dimension}d`,
-    dimension,
-    file,
-    source: {
-      key,
-      columns: Array.from({ length: dimension }, (_, column) => column),
-    },
-  };
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, reject, resolve };
-}
-
-function identityWithObsFields() {
-  const value = identity('invalid', 'Fields identity', 3);
-  value.stats.n_obs_fields = 2;
-  value.stats.n_categorical_fields = 1;
-  value.stats.n_continuous_fields = 1;
-  value.obs_fields = [
-    { key: 'batch', kind: 'category', n_categories: 2 },
-    { key: 'score', kind: 'continuous' },
-  ];
-  return value;
-}
-
-function sourceWithManifest(value) {
-  const source = new LocalDemoDataSource(
-    'https://catalog.cellucid.test/exports/'
-  );
-  source._manifest = value;
-  return source;
-}
-
-function installIdentityFetch(t, responses) {
-  const originalFetch = globalThis.fetch;
-  const requested = [];
-  globalThis.fetch = async input => {
-    const url = String(input);
-    requested.push(url);
-    const response = responses.get(url);
-    if (!response) {
-      return new Response('', {
-        status: 404,
-        statusText: 'Not Found',
-      });
-    }
-    return new Response(JSON.stringify(response), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-  return requested;
-}
-
-async function expectIdentityRejection(t, value, pattern) {
-  const source = sourceWithManifest(
-    manifest({
-      default: 'invalid',
-      datasets: [{ id: 'invalid', path: 'invalid/' }],
-    })
-  );
-  installIdentityFetch(t, new Map([
-    [
-      'https://catalog.cellucid.test/exports/invalid/dataset_identity.json',
-      value,
-    ],
-  ]));
-  await assert.rejects(source.listDatasets(), pattern);
-  assert.equal(source._datasets, null);
-}
-
-test('demo catalog requires one explicit existing default dataset', async t => {
-  await t.test('missing default is rejected', async () => {
-    const source = sourceWithManifest(
-      manifest({ default: undefined })
-    );
-    await assert.rejects(
-      source.getDefaultDatasetId(),
-      /datasets\.json.*default|required.*default/i
-    );
-  });
-
-  await t.test('unknown default is rejected', async () => {
-    const source = sourceWithManifest(
-      manifest({ default: 'not-listed' })
-    );
-    await assert.rejects(
-      source.getDefaultDatasetId(),
-      /default.*not-listed.*not.*datasets|unknown.*default/i
-    );
-  });
-});
-
-test('demo catalog metadata adoption is atomic across every advertised entry', async t => {
-  const source = sourceWithManifest(manifest());
-  installIdentityFetch(t, new Map([
-    [
-      'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-      identity('first', 'First identity', 3),
-    ],
-  ]));
-
-  await assert.rejects(
-    source.listDatasets(),
-    /second.*dataset_identity|dataset_identity.*second/i
-  );
-  assert.equal(source._datasets, null);
-});
-
-test('concurrent cold demo listings share one complete catalog generation', async t => {
-  const originalFetch = globalThis.fetch;
-  const catalogResponse = deferred();
-  let catalogCalls = 0;
-  let identityCalls = 0;
-  globalThis.fetch = async input => {
-    const url = String(input);
-    if (url.endsWith('/datasets.json')) {
-      catalogCalls += 1;
-      return catalogResponse.promise;
-    }
-    if (url.endsWith('/first/dataset_identity.json')) {
-      identityCalls += 1;
-      return new Response(
-        JSON.stringify(identity('first', 'First identity', 3)),
-        {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      );
-    }
-    return new Response('', { status: 404 });
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  const source = new LocalDemoDataSource(
-    'https://catalog.cellucid.test/exports/'
-  );
-  const firstListing = source.listDatasets();
-  const secondListing = source.listDatasets();
-  await Promise.resolve();
-
-  assert.equal(catalogCalls, 1);
-  catalogResponse.resolve(new Response(JSON.stringify(manifest({
-    datasets: [{
-      id: 'first',
-      path: 'first/',
-      name: 'First',
-    }],
-  })), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-  }));
-
-  const [first, second] = await Promise.all([
-    firstListing,
-    secondListing,
-  ]);
-  assert.equal(first, second);
-  assert.equal(first, source._datasets);
-  assert.equal(source._manifest.default, 'first');
-  assert.deepEqual(first.map(dataset => dataset.id), ['first']);
-  assert.equal(identityCalls, 1);
-});
-
-test('demo catalog resolves only explicitly declared dataset paths', () => {
-  const source = sourceWithManifest(manifest());
-  assert.equal(
-    source.getBaseUrl('first'),
-    'https://catalog.cellucid.test/exports/first/'
-  );
-  assert.throws(
-    () => source.getBaseUrl('not-listed'),
-    /not-listed.*not.*datasets|dataset.*not-listed.*not found/i
-  );
-  const fileLikePathSource = sourceWithManifest(
-    manifest({
-      datasets: [
-        { id: 'first', path: 'first', name: 'First' },
-      ],
-    })
-  );
-  assert.throws(
-    () => fileLikePathSource.getBaseUrl('first'),
-    /relative directory ending in '\/'/i
-  );
-});
-
-test('demo catalog paths cannot escape or reinterpret the configured exports root', () => {
-  const unsafePaths = [
-    '%2e%2e/escape/',
-    '%2E%2E/escape/',
-    'nested/%2e%2e/escape/',
-    'nested/%2Fescape/',
-    'nested/%5cescape/',
-    '%252e%252e/escape/',
-    'nested/%252fescape/',
-    'nested/%255cescape/',
-    'nested/%2541/',
-    'safe/?query=/',
-    'safe/#fragment/',
-    'safe path/',
-  ];
-
-  for (const path of unsafePaths) {
-    const source = sourceWithManifest(
-      manifest({
-        default: 'unsafe',
-        datasets: [{ id: 'unsafe', path }],
-      })
-    );
-    assert.throws(
-      () => source.getBaseUrl('unsafe'),
-      /safe relative path|canonical.*directory path/i,
-      path
-    );
-  }
-});
-
-test('demo catalog preserves canonical spaces and single-encoded Unicode', () => {
-  const path =
-    'cell%20atlas/%E7%BB%86%E8%83%9E/';
-  const source = sourceWithManifest(
-    manifest({
-      default: 'encoded',
-      datasets: [{
-        id: 'encoded',
-        path,
-        name: 'Encoded',
-      }],
-    })
-  );
-
-  assert.equal(
-    source.getBaseUrl('encoded'),
-    `https://catalog.cellucid.test/exports/${path}`
-  );
-});
-
-test('demo catalog opts into one exact per-dataset state manifest', () => {
-  const source = sourceWithManifest(
-    manifest({
-      datasets: [
-        {
-          id: 'first',
-          path: 'first/',
-          name: 'First',
-          state_manifest: 'state-snapshots.json',
-          state_sha256: 'a'.repeat(64),
-          state_bytes: 3268,
-        },
-        { id: 'second', path: 'second/', name: 'Second' },
-      ],
-    })
-  );
-  assert.deepEqual(
-    source.getStateDescriptor('first'),
-    {
-      manifestUrl:
-        'https://catalog.cellucid.test/exports/first/state-snapshots.json',
-      stateBytes: 3268,
-      stateSha256: 'a'.repeat(64),
-    },
-  );
-  assert.equal(source.getStateDescriptor('second'), null);
-
-  const manager = new DataSourceManager();
-  manager.activeSource = source;
-  manager.activeDatasetId = 'first';
-  manager.activeIdentityId = 'first-generation';
-  manager.activeBaseUrl = source.getBaseUrl('first');
-  assert.deepEqual(
-    manager.getCurrentStateDescriptor(),
-    {
-      baseUrl: 'https://catalog.cellucid.test/exports/first/',
-      datasetId: 'first',
-      identityId: 'first-generation',
-      manifestUrl:
-        'https://catalog.cellucid.test/exports/first/state-snapshots.json',
-      selectionRevision: 0,
-      sourceType: 'local-demo',
-      stateBytes: 3268,
-      stateSha256: 'a'.repeat(64),
-    },
-  );
-  manager.activeDatasetId = 'second';
-  manager.activeIdentityId = 'second-generation';
-  manager.activeBaseUrl = source.getBaseUrl('second');
-  assert.equal(manager.getCurrentStateDescriptor(), null);
-
-  for (const [stateManifest, stateSha256, stateBytes = 3268] of [
-    ['states.json', 'a'.repeat(64)],
-    ['../state-snapshots.json', 'a'.repeat(64)],
-    ['/state-snapshots.json', 'a'.repeat(64)],
-    [' state-snapshots.json', 'a'.repeat(64)],
-    ['state-snapshots.json', 'A'.repeat(64)],
-    ['state-snapshots.json', 'short'],
-    ['state-snapshots.json', undefined],
-    [undefined, 'a'.repeat(64)],
-    ['state-snapshots.json', 'a'.repeat(64), null],
-    ['state-snapshots.json', 'a'.repeat(64), 0],
-    ['state-snapshots.json', 'a'.repeat(64), 1.5],
-  ]) {
-    const entry = {
-      id: 'first',
-      path: 'first/',
-    };
-    if (stateManifest !== undefined) {
-      entry.state_manifest = stateManifest;
-    }
-    if (stateSha256 !== undefined) {
-      entry.state_sha256 = stateSha256;
-    }
-    if (stateBytes !== null) {
-      entry.state_bytes = stateBytes;
-    }
-    const invalid = sourceWithManifest(
-      manifest({
-        datasets: [entry],
-        default: 'first',
-      })
-    );
-    assert.throws(
-      () => invalid.getStateDescriptor('first'),
-      /state_manifest|state_sha256|state_bytes|state-snapshots\.json|sha-256/i
-    );
-  }
-});
-
-test('demo catalog rejects incomplete identities and count contradictions', async t => {
-  await t.test('identity required fields cannot be defaulted', async t => {
-    const source = sourceWithManifest(
-      manifest({
-        default: 'broken',
-        datasets: [{ id: 'broken', path: 'broken/' }],
-      })
-    );
-    installIdentityFetch(t, new Map([
-      [
-        'https://catalog.cellucid.test/exports/broken/dataset_identity.json',
-        { version: 3 },
-      ],
-    ]));
-
-    await assert.rejects(
-      source.listDatasets(),
-      /broken.*dataset_identity|dataset_identity.*(stats|embeddings|name)/i
-    );
-    assert.equal(source._datasets, null);
-  });
-
-  await t.test('catalog counts must equal identity counts', async t => {
-    const source = sourceWithManifest(
-      manifest({
-        default: 'conflict',
-        datasets: [{
-          id: 'conflict',
-          path: 'conflict/',
-          n_cells: 99,
-          n_genes: 77,
-        }],
-      })
-    );
-    installIdentityFetch(t, new Map([
-      [
-        'https://catalog.cellucid.test/exports/conflict/dataset_identity.json',
-        identity('conflict', 'Identity', 3),
-      ],
-    ]));
-
-    await assert.rejects(
-      source.listDatasets(),
-      /conflict.*(n_cells|n_genes)|n_cells.*99.*3|n_genes.*77.*2/i
-    );
-    assert.equal(source._datasets, null);
-  });
-});
-
-test('dataset identity v3 rejects every incomplete scientific summary', async t => {
-  await t.test('undeclared top-level fields are rejected', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.legacy_stats = {};
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*unsupported field.*legacy_stats/i
-    );
-  });
-
-  await t.test('an identity id cannot contradict its catalog id', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.id = 'different';
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*different.*catalog id.*invalid/i
-    );
-  });
-
-  await t.test('an identity id cannot be omitted', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    delete value.id;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*missing required field.*id/i
-    );
-  });
-
-  await t.test('description is required and must remain a string', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    delete value.description;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*description/i
-    );
-  });
-
-  await t.test('cellucid data version cannot be empty', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.cellucid_data_version = ' ';
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*cellucid_data_version/i
-    );
-  });
-
-  await t.test('all stats fields are required', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    delete value.stats.n_edges;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*stats.*n_edges/i
-    );
-  });
-
-  await t.test('field summary counts must add up', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.stats.n_obs_fields = 1;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*n_obs_fields.*categorical.*continuous/i
-    );
-  });
-
-  await t.test('false connectivity requires an exact null edge count', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.stats.n_edges = 0;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*n_edges.*null.*has_connectivity.*false/i
-    );
-  });
-
-  await t.test('true connectivity requires an exact integer edge count', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.stats.has_connectivity = true;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*n_edges.*non-negative safe integer/i
-    );
-  });
-});
-
-test('dataset identity v3 requires exact embedding metadata', async t => {
-  await t.test('alias-resolution metadata is not part of the current identity', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.umap_resolution = {
-      source_key: 'X_umap',
-      action: 'used_as',
-    };
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*embeddings.*unsupported field.*umap_resolution/i
-    );
-  });
-
-  await t.test('version-2 embedding keys are not part of the current identity', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.available_dimensions = [2];
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*embeddings.*unsupported field.*available_dimensions/i
-    );
-  });
-
-  await t.test('embedding items must be a non-empty object', async t => {
-    for (const items of [[], {}, null]) {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings.items = items;
-      await expectIdentityRejection(
-        t,
-        value,
-        /dataset_identity.*embeddings\.items.*non-empty object/i
-      );
-    }
-  });
-
-  await t.test('embedding items must be ordered by dimension, then id', async t => {
-    const byDimension = identity('invalid', 'Identity', 3);
-    byDimension.embeddings = {
-      default_dimension: 3,
-      defaults: { '2d': 'X_umap', '3d': 'X_tsne' },
-      items: {
-        X_tsne: embeddingItem(3, 'embeddings/0_3d.bin'),
-        X_umap: embeddingItem(2, 'embeddings/1_2d.bin', 'X_umap'),
-      },
-    };
-    await expectIdentityRejection(
-      t,
-      byDimension,
-      /dataset_identity.*embeddings\.items.*ordered by dimension.*code-point/i
-    );
-
-    const byId = identity('invalid', 'Identity', 3);
-    byId.embeddings = {
-      default_dimension: 2,
-      defaults: { '2d': 'X_umap' },
-      items: {
-        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
-        X_pca: embeddingItem(2, 'embeddings/1_2d.bin', 'X_pca'),
-      },
-    };
-    await expectIdentityRejection(
-      t,
-      byId,
-      /dataset_identity.*embeddings\.items.*ordered by dimension.*code-point/i
-    );
-  });
-
-  await t.test('embedding items hold exactly label, dimension, file, and source', async t => {
-    const extra = identity('invalid', 'Identity', 3);
-    extra.embeddings.items.X_umap.basis = 'umap';
-    await expectIdentityRejection(
-      t,
-      extra,
-      /dataset_identity.*embeddings\.items\.X_umap.*unsupported field.*basis/i
-    );
-
-    const missing = identity('invalid', 'Identity', 3);
-    delete missing.embeddings.items.X_umap.source;
-    await expectIdentityRejection(
-      t,
-      missing,
-      /dataset_identity.*embeddings\.items\.X_umap.*missing required field.*source/i
-    );
-  });
-
-  await t.test('embedding ids and labels must be exact display text', async t => {
-    const paddedId = identity('invalid', 'Identity', 3);
-    paddedId.embeddings.items = {
-      ' X_umap': paddedId.embeddings.items.X_umap,
-    };
-    paddedId.embeddings.defaults['2d'] = ' X_umap';
-    await expectIdentityRejection(
-      t,
-      paddedId,
-      /dataset_identity.*Embedding id.*cannot be displayed exactly/i
-    );
-
-    const emptyLabel = identity('invalid', 'Identity', 3);
-    emptyLabel.embeddings.items.X_umap.label = '';
-    await expectIdentityRejection(
-      t,
-      emptyLabel,
-      /dataset_identity.*embeddings\.items\.X_umap\.label.*cannot be displayed exactly/i
-    );
-  });
-
-  await t.test('embedding dimensions must be 1, 2, or 3', async t => {
-    for (const dimension of [0, 4, 2.5, '2']) {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings.items.X_umap.dimension = dimension;
-      await expectIdentityRejection(
-        t,
-        value,
-        /dataset_identity.*embeddings\.items\.X_umap\.dimension.*1, 2, or 3/i
-      );
-    }
-  });
-
-  await t.test('default dimension must be named in defaults', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.default_dimension = 3;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*default_dimension.*embeddings\.defaults/i
-    );
-  });
-
-  await t.test('defaults must use exact dimensional keys, one per item dimension', async t => {
-    for (const defaults of [
-      { 2: 'X_umap' },
-      {},
-      { '2d': 'X_umap', '3d': 'X_umap' },
-    ]) {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings.defaults = defaults;
-      await expectIdentityRejection(
-        t,
-        value,
-        /dataset_identity.*embeddings\.defaults.*exactly one item per embedding dimension/i
-      );
-    }
-  });
-
-  await t.test('defaults must name an item of their own dimension', async t => {
-    const unknown = identity('invalid', 'Identity', 3);
-    unknown.embeddings.defaults['2d'] = 'X_missing';
-    await expectIdentityRejection(
-      t,
-      unknown,
-      /dataset_identity.*embeddings\.defaults\.2d.*item of that dimension/i
-    );
-
-    const wrongDimension = identity('invalid', 'Identity', 3);
-    wrongDimension.embeddings = {
-      default_dimension: 3,
-      defaults: { '2d': 'X_umap', '3d': 'X_umap' },
-      items: {
-        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
-        X_umap_3d: embeddingItem(3, 'embeddings/1_3d.bin'),
-      },
-    };
-    await expectIdentityRejection(
-      t,
-      wrongDimension,
-      /dataset_identity.*embeddings\.defaults\.3d.*item of that dimension/i
-    );
-  });
-
-  await t.test('embedding files must be the exact producer path', async t => {
-    for (const path of [
-      '../points_2d.bin',
-      'points_2d.bin',
-      '%2e%2e/embeddings/0_2d.bin',
-      'embeddings/%30_2d.bin',
-      'embeddings/1_2d.bin',
-      'embeddings/0_3d.bin',
-      'embeddings/0_2d.bin.gz',
-      'embeddings/0_2d.bin?download=1',
-      'embeddings/0_2d.bin#fragment',
-      './embeddings/0_2d.bin',
-      'embeddings/X_umap.bin',
-      ' embeddings/0_2d.bin',
-    ]) {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings.items.X_umap.file = path;
-      await expectIdentityRejection(
-        t,
-        value,
-        /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin"/i
-      );
-    }
-  });
-
-  await t.test('a compressed export carries .gz on every embedding path', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.export_settings = {
-      compression: 6,
-      var_quantization: null,
-      obs_continuous_quantization: null,
-      obs_categorical_dtype: 'uint8',
-    };
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin\.gz"/i
-    );
-
-    const uncompressed = identity('invalid', 'Identity', 3);
-    uncompressed.export_settings = {
-      compression: null,
-      var_quantization: null,
-      obs_continuous_quantization: null,
-      obs_categorical_dtype: 'uint8',
-    };
-    uncompressed.embeddings.items.X_umap.file = 'embeddings/0_2d.bin.gz';
-    await expectIdentityRejection(
-      t,
-      uncompressed,
-      /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin"/i
-    );
-  });
-
-  await t.test('embedding source holds an optional key and one distinct column per axis', async t => {
-    for (const source of [
-      { key: 'X_umap' },
-      { key: 'X_umap', columns: [0, 1], basis: 'umap' },
-      { key: '', columns: [0, 1] },
-      { key: 7, columns: [0, 1] },
-      { key: 'X_umap', columns: [0] },
-      { key: 'X_umap', columns: [0, 0] },
-      { key: 'X_umap', columns: [0, -1] },
-      { key: 'X_umap', columns: [0, 1.5] },
-      { key: 'X_umap', columns: null },
-    ]) {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings.items.X_umap.source = source;
-      await expectIdentityRejection(
-        t,
-        value,
-        /dataset_identity.*embeddings\.items\.X_umap\.source/i
-      );
-    }
-  });
-
-  await t.test(
-    'multi-item embeddings with spaces and single-encoded Unicode ids remain exact',
-    async t => {
-      const value = identity('invalid', 'Identity', 3);
-      value.embeddings = {
-        default_dimension: 3,
-        defaults: { '1d': 'pseudotime', '2d': 'cell atlas 细胞', '3d': 'X_umap_3d' },
-        items: {
-          pseudotime: embeddingItem(1, 'embeddings/0_1d.bin'),
-          X_umap: embeddingItem(2, 'embeddings/1_2d.bin', 'X_umap'),
-          'cell atlas 细胞': {
-            label: 'Cell atlas 细胞',
-            dimension: 2,
-            file: 'embeddings/2_2d.bin',
-            source: { key: 'X_atlas', columns: [3, 1] },
-          },
-          X_umap_3d: embeddingItem(3, 'embeddings/3_3d.bin'),
-        },
-      };
-      const source = sourceWithManifest(
-        manifest({
-          default: 'invalid',
-          datasets: [{
-            id: 'invalid',
-            path: 'invalid/',
-          }],
-        })
-      );
-      installIdentityFetch(t, new Map([
-        [
-          'https://catalog.cellucid.test/exports/invalid/dataset_identity.json',
-          value,
-        ],
-      ]));
-
-      const datasets = await source.listDatasets();
-      assert.deepEqual(datasets[0].embeddings, value.embeddings);
-      assert.deepEqual(
-        Object.keys(datasets[0].embeddings.items),
-        ['pseudotime', 'X_umap', 'cell atlas 细胞', 'X_umap_3d']
-      );
-    }
-  );
-});
-
-test('dataset identity v3 requires exact observation summaries', async t => {
-  await t.test('obs_fields length must match stats', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.obs_fields.push({ key: 'score', kind: 'continuous' });
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*obs_fields length.*n_obs_fields/i
-    );
-  });
-
-  await t.test('categorical fields require category counts', async t => {
-    const value = identityWithObsFields();
-    delete value.obs_fields[0].n_categories;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*obs_fields\[0\].*n_categories/i
-    );
-  });
-
-  await t.test('continuous fields cannot carry categorical summaries', async t => {
-    const value = identityWithObsFields();
-    value.obs_fields[1].n_categories = 2;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*obs_fields\[1\].*unsupported.*n_categories/i
-    );
-  });
-
-  await t.test('field keys must be unique', async t => {
-    const value = identityWithObsFields();
-    value.obs_fields[1].key = 'batch';
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*duplicate key.*batch/i
-    );
-  });
-
-  await t.test('field kinds must agree with aggregate stats', async t => {
-    const value = identityWithObsFields();
-    value.stats.n_categorical_fields = 2;
-    value.stats.n_continuous_fields = 0;
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*obs_fields kinds.*stats/i
-    );
-  });
-});
-
-test('optional identity metadata is preserved only when valid', async t => {
-  await t.test('valid optional metadata is preserved exactly', async t => {
-    const source = sourceWithManifest(
-      manifest({
-        default: 'first',
-        datasets: [{ id: 'first', path: 'first/' }],
-      })
-    );
-    const value = identity('first', 'Identity', 3);
-    value.created_at = '2026-07-25T00:00:00Z';
-    value.export_settings = {
-      compression: 6,
-      var_quantization: 8,
-      obs_continuous_quantization: null,
-      obs_categorical_dtype: 'uint8',
-    };
-    value.source = {
-      name: 'Public source',
-      url: 'https://example.test/data',
-    };
-    value.embeddings.items.X_umap.file = 'embeddings/0_2d.bin.gz';
-    value.vector_fields = {
-      default_field: 'velocity',
-      fields: {
-        velocity: {
-          label: 'velocity',
-          files: {
-            X_umap: 'vectors/0_0.bin.gz',
-          },
-        },
-      },
-    };
-    installIdentityFetch(t, new Map([
-      [
-        'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-        value,
-      ],
-    ]));
-
-    const metadata = await source.getMetadata('first');
-    assert.equal(metadata.created_at, value.created_at);
-    assert.deepEqual(metadata.export_settings, value.export_settings);
-    assert.deepEqual(metadata.source, value.source);
-    assert.deepEqual(metadata.vector_fields, value.vector_fields);
-    assert.deepEqual(metadata.embeddings, value.embeddings);
-  });
-
-  await t.test('vector fields obey the exact version-3 binding rule', async t => {
-    function withVectors(fields, embeddings = null) {
-      const value = identity('invalid', 'Identity', 3);
-      if (embeddings) value.embeddings = embeddings;
-      value.vector_fields = {
-        default_field: Object.keys(fields)[0],
-        fields,
-      };
-      return value;
-    }
-    const twoItems = {
-      default_dimension: 3,
-      defaults: { '2d': 'X_umap', '3d': 'X_umap_3d' },
-      items: {
-        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
-        X_umap_3d: embeddingItem(3, 'embeddings/1_3d.bin'),
-      },
-    };
-    const cases = [
-      [
-        { velocity: { label: 'Velocity (UMAP)', files: { X_umap: 'vectors/0_0.bin' } } },
-        null,
-        /vector_fields\.fields\.velocity\.label.*field id "velocity" exactly/i,
-      ],
-      [
-        {
-          velocity: {
-            label: 'velocity',
-            basis: 'umap',
-            files: { X_umap: 'vectors/0_0.bin' },
-          },
-        },
-        null,
-        /vector_fields\.fields\.velocity.*unsupported field.*basis/i,
-      ],
-      [
-        {
-          velocity: {
-            label: 'velocity',
-            available_dimensions: [2],
-            default_dimension: 2,
-            files: { X_umap: 'vectors/0_0.bin' },
-          },
-        },
-        null,
-        /vector_fields\.fields\.velocity.*unsupported field.*available_dimensions/i,
-      ],
-      [
-        { velocity: { label: 'velocity', files: {} } },
-        null,
-        /vector_fields\.fields\.velocity\.files.*non-empty object/i,
-      ],
-      [
-        { velocity: { label: 'velocity', files: { X_tsne: 'vectors/0_0.bin' } } },
-        null,
-        /vector_fields\.fields\.velocity\.files binds embedding "X_tsne"/i,
-      ],
-      [
-        { velocity: { label: 'velocity', files: { '2d': 'vectors/0_0.bin' } } },
-        null,
-        /vector_fields\.fields\.velocity\.files binds embedding "2d"/i,
-      ],
-      [
-        { velocity: { label: 'velocity', files: { X_umap: 'vectors/velocity_umap_2d.bin' } } },
-        null,
-        /vector_fields\.fields\.velocity\.files\.X_umap.*exactly "vectors\/0_0\.bin"/i,
-      ],
-      [
-        { velocity: { label: 'velocity', files: { X_umap: 'vectors/0_0.bin.gz' } } },
-        null,
-        /vector_fields\.fields\.velocity\.files\.X_umap.*exactly "vectors\/0_0\.bin"/i,
-      ],
-      [
-        {
-          velocity: {
-            label: 'velocity',
-            files: {
-              X_umap_3d: 'vectors/0_1.bin',
-              X_umap: 'vectors/0_0.bin',
-            },
-          },
-        },
-        twoItems,
-        /vector_fields\.fields\.velocity\.files.*embeddings\.items order/i,
-      ],
-      [
-        {
-          velocity: { label: 'velocity', files: { X_umap: 'vectors/0_0.bin' } },
-          acceleration: { label: 'acceleration', files: { X_umap: 'vectors/1_0.bin' } },
-        },
-        null,
-        /vector_fields\.fields.*ordered by id in code-point order/i,
-      ],
-      [
-        {
-          acceleration: { label: 'acceleration', files: { X_umap: 'vectors/0_0.bin' } },
-          velocity: { label: 'velocity', files: { X_umap_3d: 'vectors/0_1.bin' } },
-        },
-        twoItems,
-        /vector_fields\.fields\.velocity\.files\.X_umap_3d.*exactly "vectors\/1_1\.bin"/i,
-      ],
-    ];
-    for (const [fields, embeddings, pattern] of cases) {
-      await expectIdentityRejection(
-        t,
-        withVectors(fields, embeddings),
-        new RegExp(`dataset_identity.*${pattern.source}`, 'i')
-      );
-    }
-
-    const source = sourceWithManifest(
-      manifest({
-        default: 'first',
-        datasets: [{ id: 'first', path: 'first/' }],
-      })
-    );
-    const valid = withVectors({
-      acceleration: { label: 'acceleration', files: { X_umap_3d: 'vectors/0_1.bin' } },
-      velocity: {
-        label: 'velocity',
-        files: { X_umap: 'vectors/1_0.bin', X_umap_3d: 'vectors/1_1.bin' },
-      },
-    }, twoItems);
-    valid.id = 'first';
-    installIdentityFetch(t, new Map([
-      [
-        'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-        valid,
-      ],
-    ]));
-    const metadata = await source.getMetadata('first');
-    assert.deepEqual(metadata.vector_fields, valid.vector_fields);
-    assert.deepEqual(metadata.embeddings, valid.embeddings);
-  });
-
-  await t.test('malformed optional containers are rejected', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.source = [];
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*source.*object/i
-    );
-  });
-
-  await t.test('malformed export settings are rejected', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.export_settings = [];
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*export_settings.*object/i
-    );
-  });
-
-  await t.test('malformed timestamps are rejected', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.created_at = 'not-a-time';
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*created_at.*UTC timestamp/i
-    );
-  });
-});
-
-test('zero-valued catalog counts are assertions, not absent defaults', async t => {
-  const source = sourceWithManifest(
-    manifest({
-      default: 'conflict',
-      datasets: [{
-        id: 'conflict',
-        path: 'conflict/',
-        n_cells: 0,
-      }],
-    })
-  );
-  installIdentityFetch(t, new Map([
-    [
-      'https://catalog.cellucid.test/exports/conflict/dataset_identity.json',
-      identity('conflict', 'Identity', 3),
-    ],
-  ]));
-
-  await assert.rejects(
-    source.listDatasets(),
-    /conflict.*n_cells=0.*n_cells=3/i
-  );
-  assert.equal(source._datasets, null);
-});
-
-test('valid current demo catalog exposes exact metadata and default', async t => {
-  const source = sourceWithManifest(manifest());
-  const requested = installIdentityFetch(t, new Map([
-    [
-      'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-      identity('first', 'First identity', 3),
-    ],
-    [
-      'https://catalog.cellucid.test/exports/second/dataset_identity.json',
-      identity('second', 'Second identity', 5),
-    ],
-  ]));
-
-  assert.equal(await source.getDefaultDatasetId(), 'first');
-  assert.deepEqual(
-    (await source.listDatasets()).map(dataset => [
-      dataset.id,
-      dataset.name,
-      dataset.stats.n_cells,
-    ]),
-    [
-      ['first', 'First', 3],
-      ['second', 'Second', 5],
-    ]
-  );
-  assert.deepEqual(requested, [
-    'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-    'https://catalog.cellucid.test/exports/second/dataset_identity.json',
-  ]);
-  assert.equal(await source.hasDataset('second'), true);
-  assert.equal(await source.hasDataset('missing'), false);
-
-  const firstMetadata = await source.getMetadata('first');
-  assert.deepEqual(firstMetadata.embeddings, {
-    default_dimension: 2,
-    defaults: { '2d': 'X_umap' },
-    items: {
-      X_umap: {
-        label: 'X_umap',
-        dimension: 2,
-        file: 'embeddings/0_2d.bin',
-        source: { key: 'X_umap', columns: [0, 1] },
-      },
-    },
-  });
-  assert.equal(Object.hasOwn(firstMetadata, 'created_at'), false);
-  assert.equal(Object.hasOwn(firstMetadata, 'export_settings'), false);
-  assert.equal(Object.hasOwn(firstMetadata, 'source'), false);
-});
-
-test('demo catalog identities are read as one batch, not one round trip each', async t => {
-  const originalFetch = globalThis.fetch;
-  const identityUrls = [];
-  const gates = [];
-  globalThis.fetch = async input => {
-    const url = String(input);
-    if (url.endsWith('/datasets.json')) {
-      return new Response(JSON.stringify(manifest()), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    identityUrls.push(url);
-    const id = url.includes('/first/') ? 'first' : 'second';
-    const gate = deferred();
-    gates.push(() => gate.resolve(
-      new Response(
-        JSON.stringify(identity(id, `${id} identity`, 3)),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      )
-    ));
-    return gate.promise;
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  const source = new LocalDemoDataSource(
-    'https://catalog.cellucid.test/exports/'
-  );
-  const listing = source.listDatasets();
-  // Drain the microtask queue without advancing any clock: whatever requests a
-  // batched reader intends to issue are all in flight by now. A reader that
-  // awaits one identity before requesting the next would have issued exactly
-  // one, and this assertion is what fails if that regresses.
-  for (let turn = 0; turn < 64; turn += 1) {
-    await Promise.resolve();
-  }
-  assert.deepEqual(identityUrls, [
-    'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-    'https://catalog.cellucid.test/exports/second/dataset_identity.json',
-  ]);
-
-  for (const release of gates) release();
-  assert.deepEqual(
-    (await listing).map(dataset => dataset.id),
-    ['first', 'second']
-  );
-});
-
-test('a failed demo identity still names its own dataset and adopts nothing', async t => {
-  const source = sourceWithManifest(manifest());
-  installIdentityFetch(t, new Map([
-    [
-      'https://catalog.cellucid.test/exports/first/dataset_identity.json',
-      identity('first', 'First identity', 3),
-    ],
-  ]));
-
-  await assert.rejects(
-    source.listDatasets(),
-    error => (
-      error.code === 'INVALID_FORMAT' &&
-      error.details?.datasetId === 'second' &&
-      /^Dataset 'second' is invalid: /.test(error.message)
-    )
-  );
-  assert.equal(source._datasets, null);
-  // The cached failure is the same exact error, so a second listing repeats the
-  // diagnosis instead of degrading it to a bare empty catalog.
-  await assert.rejects(
-    source.listDatasets(),
-    error => error.details?.datasetId === 'second'
-  );
-});
-
-test('refresh aborts a stale sample metadata generation before it can refill caches', async t => {
-  const originalFetch = globalThis.fetch;
-  let phase = 'stale';
-  let staleSignal = null;
-  let releaseStaleIdentity;
-  let markStaleIdentityStarted;
-  const staleIdentityStarted = new Promise(resolve => {
-    markStaleIdentityStarted = resolve;
-  });
-  const staleIdentityResponse = new Promise(resolve => {
-    releaseStaleIdentity = resolve;
-  });
-  globalThis.fetch = async (input, init = {}) => {
-    const url = String(input);
-    if (url.endsWith('/datasets.json')) {
-      return new Response(JSON.stringify({
-        version: 1,
-        default: 'first',
-        datasets: [{ id: 'first', path: 'first/' }],
-      }), { status: 200 });
-    }
-    if (url.endsWith('/first/dataset_identity.json')) {
-      if (phase === 'stale') {
-        staleSignal = init.signal ?? null;
-        markStaleIdentityStarted();
-        return staleIdentityResponse;
-      }
-      const current = identity('first', 'Current identity', 5);
-      current.description = 'Current catalog generation';
-      return new Response(JSON.stringify(current), { status: 200 });
-    }
-    return new Response('', { status: 404 });
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  const source = new LocalDemoDataSource(
-    'https://catalog.cellucid.test/exports/'
-  );
-  const staleLoad = source.listDatasets();
-  await staleIdentityStarted;
-  source.refresh();
-
-  assert.ok(staleSignal instanceof AbortSignal);
-  assert.equal(staleSignal.aborted, true);
-  phase = 'current';
-  releaseStaleIdentity(
-    new Response(
-      JSON.stringify(identity('first', 'Stale identity', 3)),
-      { status: 200 }
-    )
-  );
-  await assert.rejects(staleLoad, /abort|cancel|supersed/i);
-  assert.equal(source._datasets, null);
-  assert.equal(source._datasetError, null);
-
-  const [current] = await source.listDatasets();
-  assert.equal(current.description, 'Current catalog generation');
-  assert.equal(current.stats.n_cells, 5);
-});
 
 test('startup publishes the empty runtime and loads its selection as one dataset change', async () => {
   const mainSource = await readFile(
@@ -1329,7 +193,7 @@ test('startup publishes the empty runtime and loads its selection as one dataset
   // startup selected, and nothing here stages or publishes a dataset.
   assert.match(
     emptyBootstrap,
-    /publishEmptyDatasetRuntime\(\{ clearViews: false \}\);/
+    /publishEmptyDatasetRuntime\(\);/
   );
   assert.doesNotMatch(
     emptyBootstrap,
@@ -1351,7 +215,6 @@ test('startup publishes the empty runtime and loads its selection as one dataset
     reloadStart
   );
   const reloadSource = mainSource.slice(reloadStart, reloadEnd);
-  assert.match(reloadSource, /showProgress: isStartupLoad,/);
   assert.match(
     reloadSource,
     /const stagePhases = isStartupLoad \? startup : RELOAD_STAGE_PHASES;/
@@ -1500,9 +363,9 @@ test('single-representation adoption publishes the exact picker option', t => {
 });
 
 test(
-  'a rejected sample catalog leaves explicit H5AD, Zarr ZIP, prepared, and server loaders usable',
+  'a rejected sample catalog leaves explicit H5AD, Zarr ZIP, Zarr folder, and server loaders usable',
   async t => {
-    const originalExportsBaseUrl = DATA_CONFIG.EXPORTS_BASE_URL;
+    const originalCatalogUrl = DATA_CONFIG.SAMPLE_CATALOG_URL;
     const originalFetch = globalThis.fetch;
     const originalDocument = globalThis.document;
     const originalHistory = globalThis.history;
@@ -1515,7 +378,7 @@ test(
       loading: notifications.loading,
     };
     t.after(() => {
-      DATA_CONFIG.EXPORTS_BASE_URL = originalExportsBaseUrl;
+      DATA_CONFIG.SAMPLE_CATALOG_URL = originalCatalogUrl;
       globalThis.fetch = originalFetch;
       if (originalDocument === undefined) delete globalThis.document;
       else globalThis.document = originalDocument;
@@ -1526,8 +389,8 @@ test(
       Object.assign(notifications, originalNotifications);
     });
 
-    DATA_CONFIG.EXPORTS_BASE_URL =
-      'https://catalog.cellucid.test/exports/';
+    DATA_CONFIG.SAMPLE_CATALOG_URL =
+      'https://catalog.cellucid.test/anndata/';
     globalThis.window = {
       addEventListener() {},
       location: {
@@ -1536,35 +399,16 @@ test(
         search: '',
       },
     };
-    const invalidIdentity = identity(
-      'rejected',
-      'Rejected sample',
-      3
-    );
-    invalidIdentity._cellucid_version_marker = 'stale';
+    // A catalog that does not state its schema: refused as a whole.
     let invalidIdentityRequests = 0;
     globalThis.fetch = async input => {
       const url = String(input);
-      if (url === 'https://catalog.cellucid.test/exports/datasets.json') {
-        return new Response(JSON.stringify({
-          version: 1,
-          default: 'rejected',
-          datasets: [{
-            id: 'rejected',
-            path: 'rejected/',
-            name: 'Rejected sample',
-          }],
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      if (
-        url ===
-        'https://catalog.cellucid.test/exports/rejected/dataset_identity.json'
-      ) {
+      if (url === 'https://catalog.cellucid.test/anndata/datasets.json') {
         invalidIdentityRequests++;
-        return new Response(JSON.stringify(invalidIdentity), {
+        return new Response(JSON.stringify({
+          default: 'rejected',
+          datasets: [{ id: 'rejected', path: 'rejected.h5ad' }],
+        }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -1574,14 +418,14 @@ test(
 
     const failingCatalogManager = new DataSourceManager();
     await failingCatalogManager.initialize();
-    assert.equal(invalidIdentityRequests, 0);
+    assert.equal(invalidIdentityRequests, 0, 'registering the source reads nothing');
     const firstPass = await failingCatalogManager.getAllDatasets();
     const firstDemoFailure = firstPass.find(
       entry => entry.sourceType === 'local-demo'
     );
     assert.match(
       firstDemoFailure.error.message,
-      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+      /datasets\.json.*missing 'schema'/i
     );
     assert.deepEqual(firstDemoFailure.datasets, []);
     assert.equal(invalidIdentityRequests, 1);
@@ -1600,9 +444,9 @@ test(
       'Local Zarr ZIP',
       3
     );
-    const preparedMetadata = identity(
+    const folderMetadata = identity(
       'local-user',
-      'Local prepared',
+      'Local Zarr folder',
       4
     );
     const localCandidates = [];
@@ -1618,16 +462,12 @@ test(
         },
         getBaseUrl(datasetId) {
           assert.equal(datasetId, 'local-user');
-          return 'local-user://selection/';
+          return 'h5ad://local-user/';
         },
         async getMetadata(datasetId) {
           assert.equal(datasetId, 'local-user');
           assert.ok(activeMetadata);
           return activeMetadata;
-        },
-        getIdentityId(datasetId) {
-          assert.equal(datasetId, 'local-user');
-          return 'local-user';
         },
         getType() {
           return 'local-user';
@@ -1643,12 +483,12 @@ test(
           activeMetadata = localMetadata;
           return activeMetadata;
         },
-        async loadFromPreparedDirectory(files) {
+        async loadFromZarrDirectory(files) {
           assert.deepEqual(
-            Array.from(files, file => file.name),
-            ['dataset_identity.json', '0_2d.bin']
+            Array.from(files, file => file.webkitRelativePath),
+            ['working.zarr/.zgroup', 'working.zarr/.zmetadata']
           );
-          activeMetadata = preparedMetadata;
+          activeMetadata = folderMetadata;
           return activeMetadata;
         },
         async loadFromZarrArchive(file) {
@@ -1675,7 +515,7 @@ test(
     );
     assert.match(
       rejectedEntry.error.message,
-      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+      /datasets\.json.*missing 'schema'/i
     );
     const rejectedCatalogError = rejectedEntry.error;
     assert.equal(
@@ -1694,7 +534,7 @@ test(
     assert.equal(manager.getCurrentDatasetId(), null);
     assert.equal(manager.getCurrentSourceType(), null);
     assert.ok(manager.getSource('local-demo'));
-    assert.ok(manager.getSource('github-repo'));
+    assert.ok(manager.getSource('link'));
     assert.equal(manager.getSource('local-user'), localSource);
     assert.equal(
       invalidIdentityRequests,
@@ -1734,7 +574,7 @@ test(
     };
     const h5adInput = createInput();
     const zarrInput = createInput();
-    const preparedInput = createInput();
+    const folderInput = createInput();
     globalThis.document = { addEventListener() {} };
     globalThis.window = {
       addEventListener() {},
@@ -1791,12 +631,12 @@ test(
       dataSourceManager: manager,
       dom: {
         select,
-        userDataBrowseBtn: createButton(),
-        userDataFileInput: preparedInput,
         userDataH5adBtn: createButton(),
         userDataH5adInput: h5adInput,
         userDataZarrArchiveBtn: createButton(),
         userDataZarrArchiveInput: zarrInput,
+        userDataZarrFolderBtn: createButton(),
+        userDataZarrFolderInput: folderInput,
       },
       noneDatasetValue: '__none__',
       populateDatasetDropdown: failedCatalogOutcome,
@@ -1812,21 +652,21 @@ test(
         files: [{ name: 'working.zarr.zip' }],
       },
     });
-    await preparedInput.listeners.get('change')({
+    await folderInput.listeners.get('change')({
       target: {
         files: [
-          { name: 'dataset_identity.json' },
-          { name: '0_2d.bin' },
+          { name: '.zgroup', webkitRelativePath: 'working.zarr/.zgroup' },
+          { name: '.zmetadata', webkitRelativePath: 'working.zarr/.zmetadata' },
         ],
       },
     });
 
     assert.equal(h5adInput.value, '');
     assert.equal(zarrInput.value, '');
-    assert.equal(preparedInput.value, '');
+    assert.equal(folderInput.value, '');
     assert.deepEqual(
       activatedMetadata,
-      [localMetadata, zarrMetadata, preparedMetadata]
+      [localMetadata, zarrMetadata, folderMetadata]
     );
     assert.equal(localCandidates.length, 4);
     assert.equal(manager.getCurrentSourceType(), 'local-user');
@@ -1857,7 +697,7 @@ test(
         },
         getBaseUrl(datasetId) {
           assert.equal(datasetId, 'served');
-          return 'http://127.0.0.1:8765/';
+          return 'h5ad://served/';
         },
         getConnectionInfo() {
           return {

@@ -400,7 +400,7 @@ export function initCategoricalLegend(options) {
   }
   requireMethod(
     dataSourceManager,
-    'getCurrentDatasetId',
+    'getCurrentIdentityId',
     'Categorical legend dataSourceManager'
   );
   const ownerDocument = (
@@ -1637,9 +1637,23 @@ export function initCategoricalLegend(options) {
     });
   }
 
+  /**
+   * The legend shows something else (a continuous field, or nothing): its
+   * rows, field and model are let go, so a field of a dataset no longer shown
+   * is not kept alive with its codes and quantiles.
+   */
+  function releaseCategoricalLegend() {
+    closeTransientInteractions();
+    renderedRows = new Map();
+    renderedField = null;
+    renderedModel = null;
+    renderedAnnotating = false;
+  }
+
   return {
     refreshCategoryCounts,
     renderCategoricalLegend,
+    releaseCategoricalLegend,
     destroy: () => {
       if (destroyed) return;
       destroyed = true;

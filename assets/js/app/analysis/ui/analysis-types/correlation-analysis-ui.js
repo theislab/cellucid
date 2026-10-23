@@ -18,6 +18,12 @@ import { createVariableSelectorComponent } from '../shared/variable-selector.js'
 import { PageSelectorComponent } from '../shared/page-selector.js';
 import { applyFormControlAccessibility } from '../components/control-accessibility.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetPages,
+  requireDatasetVariable
+} from '../../shared/analysis-result-session.js';
 
 function requireCorrelationVariable(variable, label) {
   if (
@@ -144,10 +150,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     return 'correlation-analysis';
   }
 
-  _getLoadingMessage() {
-    return 'Computing correlation...';
-  }
-
   _getSuccessMessage() {
     return 'Correlation analysis complete';
   }
@@ -236,19 +238,31 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     const requestId = this._startAnalysisRequest(scheduledRequestId);
     if (requestId === null) return;
     const releaseBusy = this._claimBusy();
+    const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
     try {
-      const result = await this._runAnalysisImpl(formValues, requestId);
+      const result = await this._runAnalysisImpl(formValues, requestId, job);
 
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
       if (result) {
+        job.step('Drawing the result');
         await this._showResult(result, requestId);
         if (!this._isCurrentAnalysisRequest(requestId)) return;
         await this._publishAnalysisResult(result, requestId);
       }
+      job.succeed(this._getSuccessMessage());
     } catch (err) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[CorrelationAnalysisUI] Analysis failed:', err);
-      await this._showError('Analysis failed: ' + err.message, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
+      // What the previous run showed no longer answers the inputs; the
+      // job's status view and notification say why (a cancel is calm).
+      await this._discardFormResult();
+      if (this._isCurrentAnalysisRequest(requestId)) this._failAnalysisJob(job, err);
+      else job.cancel();
     } finally {
       releaseBusy();
       this._finishAnalysisRequest(requestId);
@@ -260,27 +274,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    */
   _hideResult() {
     return this._discardFormResult();
-  }
-
-  /**
-   * Show error message
-   */
-  async _showError(message, requestId = null) {
-    await this._discardFormResult();
-    if (
-      requestId !== null &&
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return false;
-    }
-    if (this._resultContainer) {
-      this._resultContainer.hidden = false;
-      this._resultContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message }).root
-      );
-    }
-    this._notifications?.error?.(message, { category: 'analysis' });
-    return true;
   }
 
   // ===========================================================================
@@ -517,8 +510,11 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   /**
    * Run the correlation analysis
    * @param {CorrelationFormValues} formValues
+   * @param {number|null} [requestId]
+   * @param {import('../../../jobs/cancellable-job.js').CancellableJob|null} [job] -
+   *   The run's job: its signal stops the reads and the worker tasks
    */
-  async _runAnalysisImpl(formValues, requestId = null) {
+  async _runAnalysisImpl(formValues, requestId = null, job = null) {
     if (!this.multiVariableAnalysis?.correlationAnalysis) {
       throw new Error('Correlation analysis module not available');
     }
@@ -571,7 +567,13 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     // compute request. This is one execution path: readiness failure terminates
     // the analysis, and no alternate render or delayed second attempt is scheduled.
     for (const request of readinessRequests) {
-      const readyPageData = await this.dataLayer.getDataForPages(request);
+      job?.step(`Reading ${request.variableKey}`);
+      const readyPageData = await this.dataLayer.getDataForPages({
+        ...request,
+        silent: true,
+        signal: job?.signal ?? null,
+        owner: job?.id ?? null
+      });
       if (
         requestId !== null &&
         !this._isCurrentAnalysisRequest(requestId)
@@ -591,6 +593,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       pageIds,
       method: formValues.method,
       colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null,
+      job,
       isCurrent: requestId === null
         ? undefined
         : () => this._isCurrentAnalysisRequest(requestId),
@@ -874,6 +877,77 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     this._destroyPromise = destruction;
     void destruction.catch(() => {});
     return destruction;
+  }
+
+  /**
+   * The shown result for a session: each page's statistics and plotted
+   * points, variables by key.
+   * @returns {null|{kind: 'correlation', version: number, payload: unknown}}
+   */
+  exportResult() {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    return createResultEnvelope('correlation', this._lastResult);
+  }
+
+  /**
+   * Restore a result written by `exportResult()`; refused when it names a
+   * variable, cell group or colour category the open dataset lacks.
+   * @param {null|Object} envelope
+   * @returns {Promise<void>}
+   */
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const result = readResultEnvelope(envelope, 'correlation');
+    const metadata = result?.metadata;
+    if (
+      result?.type !== 'correlation' ||
+      !Array.isArray(result.data) ||
+      metadata === null ||
+      typeof metadata !== 'object'
+    ) {
+      throw new TypeError('A correlation result must hold its pages and variables');
+    }
+    requireCorrelationVariable(metadata.variableX, 'Correlation result X variable');
+    requireCorrelationVariable(metadata.variableY, 'Correlation result Y variable');
+    requireDatasetVariable(
+      this.dataLayer,
+      metadata.variableX.type,
+      metadata.variableX.key,
+      'The correlation result'
+    );
+    requireDatasetVariable(
+      this.dataLayer,
+      metadata.variableY.type,
+      metadata.variableY.key,
+      'The correlation result'
+    );
+    requireDatasetPages(
+      this.dataLayer,
+      result.data.map(page => page?.pageId),
+      'The correlation result'
+    );
+    if (metadata.colorBy !== null) {
+      requireDatasetVariable(this.dataLayer, 'categorical_obs', metadata.colorBy, 'The correlation result');
+      await this.dataLayer.ensureObsFieldLoaded(metadata.colorBy);
+      const categories = new Set(
+        this.dataLayer.getVariableInfo('categorical_obs', metadata.colorBy)?.categories ?? []
+      );
+      for (const page of result.data) {
+        if (!Array.isArray(page.colorValues)) continue;
+        for (const label of page.colorValues) {
+          if (label !== null && !categories.has(label)) {
+            throw new Error(
+              `The correlation result colours by category "${String(label)}", ` +
+              `which field "${metadata.colorBy}" lacks`
+            );
+          }
+        }
+      }
+    }
+    await this._restoreAnalysisResult(result);
   }
 
   exportSettings() {

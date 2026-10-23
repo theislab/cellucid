@@ -807,25 +807,34 @@ test('Detailed invalid and failed reruns retire preview and modal scientific sta
     assert.equal(invalid.annotations.innerHTML, '');
 
     const failed = createOwner();
-    const requestId = failed.ui._startAnalysisRequest();
-    await failed.ui._showError('replacement failed', requestId);
+    failed.ui._canRunAnalysis = () => true;
+    const failure = new Error('replacement failed');
+    failed.ui._runAnalysis = async () => {
+      throw failure;
+    };
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      await failed.ui._runAnalysisIfValid();
+    } finally {
+      console.error = originalError;
+    }
 
     assert.deepEqual(failed.invalidations, { modal: 1, preview: 1 });
     assert.equal(failed.ui._currentPageData, null);
     assert.equal(failed.ui._committedView, null);
     assert.equal(failed.stats.innerHTML, '');
     assert.equal(failed.annotations.innerHTML, '');
-    assert.ok(
-      failed.ui._previewContainer.querySelector('.status-line'),
-    );
-    failed.ui._finishAnalysisRequest(requestId);
+    // Why it failed is the run's job's to say, once.
+    assert.equal(failed.ui._shownJob.state, 'failed');
+    assert.equal(failed.ui._shownJob.message, 'replacement failed');
   });
 });
 
-test('Detailed stale error publication cannot append after a newer request starts', { concurrency: false }, async () => {
+test('Detailed stale failure is a cancel once a newer request starts', { concurrency: false }, async () => {
   await withFakeDOM(async ({ document }) => {
-    const retirement = deferred();
-    const retirementStarted = deferred();
+    const gate = deferred();
+    const started = deferred();
     const ui = new DetailedAnalysisUI({
       comparisonModule: {},
       dataLayer: {},
@@ -835,12 +844,6 @@ test('Detailed stale error publication cannot append after a newer request start
       'analysis-preview-container',
     );
     ui._actionsContainer = attachRoot(document, 'analysis-actions');
-    ui._previewPlotSlot = {
-      invalidate() {
-        retirementStarted.resolve();
-        return retirement.promise;
-      },
-    };
     ui._modal = null;
     let notifications = 0;
     ui._notifications = {
@@ -848,20 +851,23 @@ test('Detailed stale error publication cannot append after a newer request start
         notifications += 1;
       },
     };
+    ui._canRunAnalysis = () => true;
+    ui._runAnalysis = () => {
+      started.resolve();
+      return gate.promise;
+    };
 
-    const staleRequest = ui._startAnalysisRequest();
-    const publishingError = ui._showError(
-      'stale request failed',
-      staleRequest,
-    );
-    await retirementStarted.promise;
+    const staleRun = ui._runAnalysisIfValid();
+    await started.promise;
+    const staleJob = ui._shownJob;
 
     const currentRequest = ui._startAnalysisRequest();
     const currentData = [{ pageId: 'current-page' }];
     ui._currentPageData = currentData;
-    retirement.resolve();
-    await publishingError;
+    gate.reject(new Error('stale request failed'));
+    await staleRun;
 
+    assert.equal(staleJob.state, 'cancelled', 'a superseded run never fails');
     assert.equal(
       ui._previewContainer.querySelector('.status-line'),
       null,
@@ -873,7 +879,6 @@ test('Detailed stale error publication cannot append after a newer request start
 });
 
 for (const [label, UIClass] of [
-  ['Correlation', CorrelationAnalysisUI],
   ['Gene Signature', GeneSignatureUI],
 ]) {
   test(`${label} stale error publication cannot append after a newer request starts`, { concurrency: false }, async () => {
@@ -916,3 +921,43 @@ for (const [label, UIClass] of [
     });
   });
 }
+
+test('Correlation stale failure is a cancel once a newer request starts', { concurrency: false }, async () => {
+  await withFakeDOM(async ({ document }) => {
+    const gate = deferred();
+    const started = deferred();
+    const ui = new CorrelationAnalysisUI({
+      comparisonModule: {},
+      dataLayer: {},
+      multiVariableAnalysis: {},
+    });
+    ui._resultContainer = attachRoot(document, 'analysis-result');
+    let notifications = 0;
+    ui._notifications = {
+      error() {
+        notifications += 1;
+      },
+    };
+    ui._canRunAnalysis = () => true;
+    ui._getFormValues = () => ({
+      variableX: { type: 'continuous_obs', key: 'x' },
+      variableY: { type: 'continuous_obs', key: 'y' },
+    });
+    ui._runAnalysisImpl = () => {
+      started.resolve();
+      return gate.promise;
+    };
+
+    const staleRun = ui._runAnalysisIfValid();
+    await started.promise;
+    const staleJob = ui._shownJob;
+    const currentRequest = ui._startAnalysisRequest();
+    gate.reject(new Error('stale request failed'));
+    await staleRun;
+
+    assert.equal(staleJob.state, 'cancelled', 'a superseded run never fails');
+    assert.equal(ui._resultContainer.querySelector('.status-line'), null);
+    assert.equal(notifications, 0);
+    ui._finishAnalysisRequest(currentRequest);
+  });
+});

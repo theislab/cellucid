@@ -16,7 +16,8 @@ import {
   configureStraightAlphaBlending,
   createProgram,
   createProgramBatch,
-  createCanvasResizeObserver
+  createCanvasResizeObserver,
+  deleteProgramReleasingUse
 } from './gl-utils.js';
 import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
 import { STUDIO_VS_SOURCE, STUDIO_FS_SOURCE } from './shaders/studio-shaders.js';
@@ -35,7 +36,7 @@ import { createBackdropLookRenderer } from './backdrops/backdrop-look-renderer.j
 import { backdropLookSurface01, isBackdropLook } from './backdrops/backdrop-looks.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
-import { isContextLostError, requireCleanWebGLState } from './gl-errors.js';
+import { isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
@@ -650,6 +651,7 @@ export function createViewer({
     overlayManager?.retryRetirement(VELOCITY_OVERLAY_ID);
     const candidate = new VelocityOverlay(gl);
     candidate.setFailureHandler(reportVelocityRenderFailure);
+    candidate.setPositionRetention(positions => hpRenderer.holdsGeometryFor(positions));
     try {
       candidate.init();
       ensureOverlayManager().register(candidate);
@@ -692,6 +694,7 @@ export function createViewer({
   const edgeLayer = createConnectivityEdgeLayer({
     gl,
     getViewGeometry: viewId => getCertifiedEdgeGeometry(viewId),
+    retainsPositions: positions => hpRenderer.holdsGeometryFor(positions),
     onVisibleCount: (viewId, stats) => {
       for (const listener of edgeVisibleCountListeners) {
         try {
@@ -836,6 +839,10 @@ export function createViewer({
   // === Scene Variables ===
   let pointCount = 0;
   let centroidCount = 0;
+  // Bytes the live centroid buffers hold: a publication that fits is written
+  // in place, with no allocation and so no error read (a GPU round trip).
+  let centroidPositionCapacity = 0;
+  let centroidColorCapacity = 0;
   let defaultShowCentroidPoints = false;
   let defaultShowCentroidLabels = false;
   const viewCentroidFlags = new Map();
@@ -1500,12 +1507,19 @@ export function createViewer({
 	    });
 	  }
 
+      /**
+       * The exact owner of one view's spatial queries: its published
+       * positions, transparency and dimension, and its tree when one is
+       * installed (null before). `requestLargeIndex` asks for a large view's
+       * missing tree to be built off the main thread; the caller answers
+       * this query without it.
+       */
       function getSpatialQueryOwner(
         viewId,
-        ensureLargeIndex = false
+        requestLargeIndex = false
       ) {
         const exactViewId = assertKnownViewId(viewId);
-        if (typeof ensureLargeIndex !== 'boolean') {
+        if (typeof requestLargeIndex !== 'boolean') {
           throw new TypeError(
             'Spatial-query index preparation state must be an exact boolean.'
           );
@@ -1528,38 +1542,23 @@ export function createViewer({
                 dimensionLevel
               )
         );
-        let spatialIndex = resolveIndex();
+        const spatialIndex = resolveIndex();
 
         if (
-          ensureLargeIndex &&
+          requestLargeIndex &&
           spatialIndex === null &&
           pointCountForView >=
             INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD
         ) {
-          if (exactViewId === LIVE_VIEW_ID) {
-            hpRenderer.ensureSpatialIndex(dimensionLevel);
-          } else {
-            hpRenderer.rebuildSnapshotSpatialIndex(
-              exactViewId,
-              dimensionLevel,
-              false
-            );
-            // Snapshots sharing the current live geometry resolve the main
-            // generation's tree instead of owning a duplicate copy.
-            if (resolveIndex() === null) {
-              hpRenderer.ensureSpatialIndex(dimensionLevel);
-            }
-          }
-          spatialIndex = resolveIndex();
-          if (spatialIndex === null) {
-            throw new Error(
-              `Large view "${exactViewId}" did not publish its prepared spatial index.`
-            );
-          }
+          // Never built on the main thread (tens of milliseconds a million
+          // cells): the worker builds it and installs it when it lands.
+          hpRenderer.buildSpatialIndexInBackground(exactViewId).catch(error => {
+            console.warn('[Viewer] Background spatial index failed:', error);
+          });
         }
 
-        // Index construction is synchronous today, but verify all publication
-        // identities so a future yielding builder cannot return a mixed owner.
+        // Verify every publication identity, so a reader never gets a mixed
+        // owner.
         if (
           getExactViewPositions(exactViewId) !== publishedPositions ||
           getExactViewTransparency(exactViewId) !== transparency ||
@@ -1957,7 +1956,6 @@ export function createViewer({
   let pendingShot = false;
   let pendingShotViewportInfo = null;  // Cached viewport info for pointer lock shots
   let projectileBuildGeneration = 0;
-  let projectileBuildTimer = null;
   let projectileBuildCompletion = null;
   const PROJECTILE_CONTEXT_LOSS_MESSAGE =
     'Projectile preparation was cancelled because the WebGL context was lost.';
@@ -2255,6 +2253,8 @@ export function createViewer({
     // illegal/no-op GL calls on some browser backends.
     centroidPositionBuffer = null;
     centroidColorBuffer = null;
+    centroidPositionCapacity = 0;
+    centroidColorCapacity = 0;
     centroidVao = null;
     centroidCount = 0;
     gridProgram = null;
@@ -3199,10 +3199,6 @@ export function createViewer({
 
   function detachPendingProjectileBuild() {
     projectileBuildGeneration += 1;
-    if (projectileBuildTimer !== null) {
-      clearTimeout(projectileBuildTimer);
-      projectileBuildTimer = null;
-    }
     const completion = projectileBuildCompletion;
     projectileBuildCompletion = null;
     return completion;
@@ -3840,7 +3836,8 @@ export function createViewer({
   /**
    * The positions a pane's connectivity edges are drawn from: the renderer's
    * published source-order positions of that view, with their geometry
-   * generation (the edge layer re-gathers its records when it moves).
+   * generation (the edge layer uploads a position texture the first time a
+   * pane draws new positions).
    */
   function getCertifiedEdgeGeometry(viewId) {
     const vid = assertViewId(viewId);
@@ -4319,8 +4316,24 @@ export function createViewer({
       colorView[byteOffset + 3] = colors[i * 4 + 3];
     }
 
+    const existing = centroidSnapshotBuffers.get(vid) ?? null;
+    if (existing !== null && buffer.byteLength <= existing.byteCapacity) {
+      // Accepted storage that holds the new centroids is written in place:
+      // no allocation, so only a lost context refuses it and no error is
+      // read back (a GPU round trip). Its vertex array still describes it.
+      requireLiveContext(gl, 'Centroid snapshot publication');
+      gl.bindBuffer(gl.ARRAY_BUFFER, existing.buffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, buffer);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      requireLiveContext(gl, 'Centroid snapshot publication');
+      existing.count = count;
+      existing.colorsOwner = colors;
+      existing.positionsOwner = positions;
+      return true;
+    }
+
     // Create GPU buffer (STATIC_DRAW - uploaded once)
-    requireCleanWebGLState(gl, 'Centroid snapshot publication');
+    requireLiveContext(gl, 'Centroid snapshot publication');
     let glBuffer = null;
     let vao = null;
     try {
@@ -4355,13 +4368,13 @@ export function createViewer({
       );
       gl.bindVertexArray(null);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      // The one read: a refused allocation must not stay resident.
       requireCleanWebGLState(gl, 'Candidate centroid snapshot publication');
     } catch (error) {
       const rollbackFailures = [];
       for (const operation of [
         () => gl.bindVertexArray(null),
         () => gl.bindBuffer(gl.ARRAY_BUFFER, null),
-        () => gl.getError(),
       ]) {
         try {
           operation();
@@ -4388,11 +4401,12 @@ export function createViewer({
     const candidate = {
       vao,
       buffer: glBuffer,
+      byteCapacity: buffer.byteLength,
       count,
       colorsOwner: colors,
       positionsOwner: positions,
     };
-    const previous = centroidSnapshotBuffers.get(vid) || null;
+    const previous = existing;
     centroidSnapshotBuffers.set(vid, candidate);
     if (previous) {
       queueCentroidSnapshotRetirement(previous);
@@ -4662,8 +4676,10 @@ export function createViewer({
       viewId: clickedViewId
     } = viewport;
 
-    // Large panes lazily build one exact, notified spatial owner on first
-    // interaction. Small panes retain the lower-overhead direct scan.
+    // A large pane's click before its tree lands scans every point (the
+    // same exact pick, a few milliseconds a million cells) and asks for the
+    // tree off the main thread; a hover read waits for the tree. Small panes
+    // always scan.
     const queryOwner = getSpatialQueryOwner(clickedViewId, buildIndex);
     const positions = queryOwner.positions;
     if (
@@ -7176,8 +7192,7 @@ export function createViewer({
 
     /**
      * Update positions for dimension switching (maintains same point count and indices).
-     * Connectivity edges re-gather their endpoints from the new positions on
-     * their next draw.
+     * Connectivity edges read the new positions on their next draw.
      * @param {Float32Array} positions - New positions (n_points * dimensionLevel)
      * @param {number} dimensionLevel - Dimension owned by this position generation.
      */
@@ -7418,7 +7433,7 @@ export function createViewer({
     /**
      * Set positions for a specific view (for multi-dimensional support in multiview)
      * Updates the snapshot buffer with new positions if the view has one.
-     * Connectivity edges re-gather their endpoints on their next draw.
+     * Connectivity edges read the new positions on their next draw.
      * @param {string} viewId - View identifier
      * @param {Float32Array} positions - Positions (n_points * dimensionLevel)
      * @param {number} dimensionLevel - Dimension owned by this position generation.
@@ -7851,9 +7866,10 @@ export function createViewer({
       return highlightTools.getKnnState();
     },
 
-    // Load KNN edges over the published cells and build their adjacency.
-    loadKnnEdges(sources, destinations) {
-      return highlightTools.loadKnnEdges(sources, destinations, pointCount);
+    // Load the k-NN tool's graph: the edge payload's adjacency over the
+    // published cells (`ConnectivityEdges`).
+    loadKnnEdges(edgeData) {
+      return highlightTools.loadKnnEdges(edgeData, pointCount);
     },
 
     clearKnnEdges() {
@@ -7901,25 +7917,29 @@ export function createViewer({
       colors,
       count: nextCentroidCount
     } = assertCentroidPayload(payload);
+    // The buffers keep their storage when a field has no centroids: the next
+    // field's usually fit, and drawing reads only `centroidCount` points.
     if (nextCentroidCount === 0) {
-      const previousPositions = centroidPositionBuffer;
-      const previousColors = centroidColorBuffer;
-      centroidPositionBuffer = null;
-      centroidColorBuffer = null;
       centroidCount = 0;
-      queueCentroidSnapshotRetirement({
-        buffer: previousPositions,
-      });
-      queueCentroidSnapshotRetirement({
-        buffer: previousColors,
-      });
-      reportCommittedRetirementFailures(
-        drainCentroidSnapshotRetirements(),
-        'Empty live centroid generation committed with pending prior-buffer retirement.'
-      );
       return;
     }
-    requireCleanWebGLState(gl, 'Viewer centroid publication');
+    if (
+      positions.byteLength <= centroidPositionCapacity &&
+      colors.byteLength <= centroidColorCapacity
+    ) {
+      // Writes into accepted storage allocate nothing: only a lost context
+      // refuses them, so no error is read back.
+      requireLiveContext(gl, 'Viewer centroid publication');
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, positions);
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      requireLiveContext(gl, 'Viewer centroid publication');
+      centroidCount = nextCentroidCount;
+      return;
+    }
+    requireLiveContext(gl, 'Viewer centroid publication');
     let candidatePositions = null;
     let candidateColors = null;
     try {
@@ -7935,18 +7955,14 @@ export function createViewer({
       gl.bindBuffer(gl.ARRAY_BUFFER, candidateColors);
       gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      // The one read: a refused allocation must not stay resident.
       requireCleanWebGLState(gl, 'Viewer candidate centroid publication');
     } catch (error) {
       const rollbackFailures = [];
-      for (const operation of [
-        () => gl.bindBuffer(gl.ARRAY_BUFFER, null),
-        () => gl.getError(),
-      ]) {
-        try {
-          operation();
-        } catch (rollbackError) {
-          rollbackFailures.push(rollbackError);
-        }
+      try {
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      } catch (rollbackError) {
+        rollbackFailures.push(rollbackError);
       }
       queueCentroidSnapshotRetirement({
         buffer: candidatePositions,
@@ -7970,6 +7986,8 @@ export function createViewer({
     const previousColors = centroidColorBuffer;
     centroidPositionBuffer = candidatePositions;
     centroidColorBuffer = candidateColors;
+    centroidPositionCapacity = positions.byteLength;
+    centroidColorCapacity = colors.byteLength;
     centroidCount = nextCentroidCount;
     queueCentroidSnapshotRetirement({
       buffer: previousPositions,
@@ -8313,54 +8331,51 @@ export function createViewer({
 
       const generation = projectileBuildGeneration;
       projectileBuildCompletion = completion;
-      projectileBuildTimer = setTimeout(() => {
-        projectileBuildTimer = null;
-        if (
-          generation !== projectileBuildGeneration ||
-          getPublishedDimensionLevel(LIVE_VIEW_ID) !== dimLevel
-        ) {
+      const stale = () => (
+        generation !== projectileBuildGeneration ||
+        getPublishedDimensionLevel(LIVE_VIEW_ID) !== dimLevel
+      );
+      const fail = detail => {
+        const ownedCompletion = projectileBuildCompletion;
+        projectileBuildCompletion = null;
+        projectileSystem.setEnabled(false);
+        if (isWebGLContextLostForAsyncCommit()) {
+          publishProjectileBuildResult(
+            ownedCompletion,
+            'cancelled',
+            PROJECTILE_CONTEXT_LOSS_MESSAGE
+          );
           return;
         }
+        publishProjectileBuildResult(
+          ownedCompletion,
+          'error',
+          `Projectile preparation failed: ${detail}`
+        );
+      };
+      // The collision tree is built off the main thread; projectiles are
+      // ready when it lands.
+      Promise.resolve().then(
+        () => hpRenderer.buildSpatialIndexInBackground(LIVE_VIEW_ID)
+      ).then(installed => {
+        if (stale()) return;
         if (isWebGLContextLostForAsyncCommit()) {
           const ownedCompletion = projectileBuildCompletion;
           projectileBuildCompletion = null;
           publishProjectileContextLossCancellation(ownedCompletion);
           return;
         }
-        try {
-          hpRenderer.ensureSpatialIndex(dimLevel);
-          if (
-            generation !== projectileBuildGeneration ||
-            getPublishedDimensionLevel(LIVE_VIEW_ID) !== dimLevel
-          ) {
-            return;
-          }
-          const ownedCompletion = projectileBuildCompletion;
-          projectileBuildCompletion = null;
-          settleProjectileBuildAsReady(ownedCompletion);
-        } catch (error) {
-          if (generation !== projectileBuildGeneration) return;
-          const ownedCompletion = projectileBuildCompletion;
-          projectileBuildCompletion = null;
-          projectileSystem.setEnabled(false);
-          if (isWebGLContextLostForAsyncCommit()) {
-            publishProjectileBuildResult(
-              ownedCompletion,
-              'cancelled',
-              PROJECTILE_CONTEXT_LOSS_MESSAGE
-            );
-            return;
-          }
-          const detail = error instanceof Error && error.message.length > 0
-            ? error.message
-            : String(error);
-          publishProjectileBuildResult(
-            ownedCompletion,
-            'error',
-            `Projectile preparation failed: ${detail}`
-          );
+        if (!installed || !hpRenderer.hasSpatialIndex(dimLevel)) {
+          fail(`the ${dimLevel}D spatial index could not be built.`);
+          return;
         }
-      }, 10);
+        const ownedCompletion = projectileBuildCompletion;
+        projectileBuildCompletion = null;
+        settleProjectileBuildAsReady(ownedCompletion);
+      }, error => {
+        if (generation !== projectileBuildGeneration) return;
+        fail(error instanceof Error && error.message.length > 0 ? error.message : String(error));
+      });
     },
     isProjectileSpatialIndexReady() {
       const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
@@ -8436,10 +8451,10 @@ export function createViewer({
 
     /**
      * Publish one connectivity graph and show it in the live pane. Endpoints
-     * are kept as loaded (no copy, no shuffle); the Float64 weights are read
-     * once into Float32 relative strengths. Nothing is shown until the edge
-     * target is set (`setEdgeVisibleTarget`).
-     * @param {{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number, nCells: number}} edgeData
+     * and Float32 relative strengths are kept as loaded (no copy, no
+     * shuffle). Nothing is shown until the edge target is set
+     * (`setEdgeVisibleTarget`).
+     * @param {import('../data/connectivity-edges.js').ConnectivityEdges} edgeData
      */
     setupEdgesV2(edgeData) {
       if (
@@ -9503,6 +9518,7 @@ export function createViewer({
       overlayManager?.retryRetirement(VELOCITY_OVERLAY_ID);
       const candidate = new VelocityOverlay(gl);
       candidate.setFailureHandler(reportVelocityRenderFailure);
+      candidate.setPositionRetention(positions => hpRenderer.holdsGeometryFor(positions));
       try {
         candidate.setVectorFieldData(fieldId, layoutKey, fieldData);
         ensureOverlayManager().register(candidate);
@@ -10217,7 +10233,7 @@ export function createViewer({
 
 	      attempt('grid program', () => {
 	        if (!webglContextLost && gridProgram) {
-	          gl.deleteProgram(gridProgram);
+	          deleteProgramReleasingUse(gl, gridProgram);
 	        }
 	        gridProgram = null;
 	        for (const key of Object.keys(gridUniformLocations)) {
@@ -10226,7 +10242,7 @@ export function createViewer({
 	      });
 	      attempt('studio backdrop program', () => {
 	        if (!webglContextLost && studioProgram) {
-	          gl.deleteProgram(studioProgram);
+	          deleteProgramReleasingUse(gl, studioProgram);
 	        }
 	        studioProgram = null;
 	        for (const key of Object.keys(studioUniformLocations)) {
@@ -10251,7 +10267,7 @@ export function createViewer({
 	      });
 	      attempt('centroid program', () => {
 	        if (!webglContextLost && centroidProgram) {
-	          gl.deleteProgram(centroidProgram);
+	          deleteProgramReleasingUse(gl, centroidProgram);
 	        }
 	        centroidProgram = null;
 	        for (const key of Object.keys(centroidUniformLocations)) {
@@ -10263,6 +10279,8 @@ export function createViewer({
 	          gl.deleteBuffer(centroidPositionBuffer);
 	          centroidPositionBuffer = null;
 	        }
+	        centroidPositionCapacity = 0;
+	        centroidColorCapacity = 0;
 	      });
 	      attempt('centroid color buffer', () => {
 	        if (centroidColorBuffer) {

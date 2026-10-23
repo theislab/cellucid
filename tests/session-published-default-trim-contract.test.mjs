@@ -1,14 +1,14 @@
 /**
- * Save State and a published `default.cellucid-session` are different
+ * Save State and a published sample preset (`anndata/<id>.cellucid-session`) are different
  * documents, and nothing said so (CEL-0248).
  *
- * Save State writes every chunk the registered contributors emit — seven for a
+ * Save State writes every chunk the registered contributors emit — eight for a
  * session with nothing kept. `restorePublishedDefaultState()` accepts exactly
- * five, in one order, and refuses a cinematic chunk by name before anything
- * else. So publishing a preset means dropping `cinematic/camera` and
- * `analysis/cache-inventory`, and that drop is lossless only while both are
- * empty: a recorded camera path dropped from a save is gone, the file that
- * ships still loads, and nothing downstream ever notices.
+ * seven, in one order, and refuses a cinematic chunk by name before anything
+ * else. So publishing a preset means dropping `cinematic/camera`, and that
+ * drop is lossless only while it is empty: a recorded camera path dropped from
+ * a save is gone, the file that ships still loads, and nothing downstream ever
+ * notices.
  *
  * That was done by hand, correctly, once. This file makes both halves
  * executable:
@@ -21,15 +21,16 @@
  *    no room for and refuses when a dropped chunk carries anything.
  *
  * Nothing below restates which chunks are accepted or which are dropped. The
- * seven-chunk save is built out of `CURRENT_GENERIC_STATIC_CHUNK_PROFILES`, the
- * five expected survivors out of `PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE`, and
- * the two casualties out of `PUBLISHED_DEFAULT_DROPPED_CHUNK_PROFILES`, which is
- * itself the difference between the two. An eighth chunk added to the session
- * joins this file's fixtures the day it lands.
+ * full save is built out of `CURRENT_GENERIC_STATIC_CHUNK_PROFILES`, the
+ * expected survivors out of `PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE`, and the
+ * casualties out of `PUBLISHED_DEFAULT_DROPPED_CHUNK_PROFILES`, which is itself
+ * the difference between the two. A singleton chunk added to the session joins
+ * this file's fixtures the day it lands.
  */
 
 import assert from 'node:assert/strict';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -41,7 +42,6 @@ import {
 import {
   CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
   PUBLISHED_DEFAULT_DROPPED_CHUNK_PROFILES,
-  PUBLISHED_DEFAULT_SOURCE_TYPE,
   PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
   STATIC_CHUNK_PROFILE_KEYS,
   assertPublishedDefaultChunkProfile,
@@ -52,12 +52,13 @@ import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
-  createInMemoryDimensionManager,
-} from '../assets/js/data/dimension-manager.js';
+  createInMemoryAnnDataDimensionManager,
+  describeOwnVarCount,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 
 const PRESET_REPOSITORY_URL = new URL('../../cellucid-datasets/', import.meta.url);
-const PRESET_EXPORTS_URL = new URL('exports-v3/', PRESET_REPOSITORY_URL);
-const PRESET_FILENAME = 'default.cellucid-session';
+const PRESET_CATALOG_URL = new URL('anndata/datasets.json', PRESET_REPOSITORY_URL);
 
 const KEPT_IDS = PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(
   profile => profile.id,
@@ -82,7 +83,6 @@ const DROPPED_IDS = PUBLISHED_DEFAULT_DROPPED_CHUNK_PROFILES.map(
  * first test asserts, so this object cannot fall behind the derived set.
  */
 const EMPTY_DROPPED_PAYLOADS = Object.freeze({
-  'analysis/cache-inventory': Object.freeze({ artifactIds: [] }),
   'cinematic/camera': Object.freeze({
     keyframes: [],
     nextIndex: 1,
@@ -160,27 +160,19 @@ test('every chunk a save can drop has a fixture that says what empty means', () 
 /**
  * A serializer whose contributors emit exactly the given chunks.
  *
- * `identity` is what the data-source manager would report. A capture takes it
- * from the source it was captured through and a published default is read
- * under the catalog's, so the two differ by construction — a serializer that
- * could not express that could not restore a published preset at all.
+ * `identity` is what the data-source manager would report. A capture may be
+ * taken under another id than the one it is published under, so the two can
+ * differ — a serializer that could not express that could not restore a
+ * published preset at all.
  *
  * @param {{ profile: object, payload: any }[]} emissions
- * @param {{ sourceType: string, datasetId: string }|null} [identity]
+ * @param {{ datasetId: string }|null} [identity]
  */
 /**
- * The export data mapping of the serializer's dataset, whose one embedding is
+ * The data mapping of the serializer's dataset, whose one embedding is
  * an in-memory 3D layout (keyed "3d").
  */
-const IN_MEMORY_3D_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: {
-    enabled: [{ key: '3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
-  },
-  geneNames: 'index',
-  vectorFields: [],
-});
+const IN_MEMORY_3D_MAPPING = Object.freeze(inMemoryAnnDataMapping());
 
 function makeSerializer(emissions, identity = null) {
   const byContributor = new Map();
@@ -199,7 +191,7 @@ function makeSerializer(emissions, identity = null) {
   }));
 
   const positionsArray = new Float32Array(9);
-  const dimensionManager = createInMemoryDimensionManager({
+  const dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: positionsArray,
     dimension: 3,
   });
@@ -212,18 +204,22 @@ function makeSerializer(emissions, identity = null) {
       positionsArray,
       dimensionManager,
       getDataMapping: () => IN_MEMORY_3D_MAPPING,
+      describeMappingVarCount: describeOwnVarCount,
       getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
+      getActiveViewId: () => 'live',
       varData: { fields: [] },
     },
     viewer: {},
     sidebar: {},
     dataSourceManager: identity === null ? null : {
-      getCurrentSourceType: () => identity.sourceType,
+      getCurrentIdentityId: () => identity.datasetId,
+      getCurrentSourceType: () => 'local-demo',
       getCurrentDatasetId: () => identity.datasetId,
     },
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -239,7 +235,11 @@ function captureSave(overrides = {}, extras = []) {
     profile,
     payload: Object.hasOwn(overrides, profile.id)
       ? overrides[profile.id]
-      : EMPTY_DROPPED_PAYLOADS[profile.id] ?? { chunkId: profile.id },
+      : EMPTY_DROPPED_PAYLOADS[profile.id] ?? (
+        profile.kind === 'binary'
+          ? new TextEncoder().encode(profile.id)
+          : { chunkId: profile.id }
+      ),
   }));
   return makeSerializer([...emissions, ...extras]).createSessionBundle();
 }
@@ -278,7 +278,6 @@ async function publishedIdentityFor(save, overrides = {}) {
   const { manifest } = await readBundleParts(save);
   return {
     ...manifest.datasetFingerprint,
-    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: PUBLISHED_DATASET_ID,
     ...overrides,
   };
@@ -293,7 +292,7 @@ async function publish(save, overrides = {}) {
 }
 
 /* ------------------------------------------------------------------ *
- * 1. A seven-chunk save fails the check.
+ * 1. A full save fails the check.
  * ------------------------------------------------------------------ */
 
 test('a save carries more chunks than a published default accepts', async () => {
@@ -333,27 +332,17 @@ test('a save carries more chunks than a published default accepts', async () => 
   });
 });
 
-test('a save trimmed of only the cinematic chunk still fails the count', async () => {
-  // Dropping the chunk the reader names, and stopping there, is the plausible
-  // wrong trim: the loud refusal goes away and a six-chunk file remains.
+test('a save without its cinematic chunk is exactly the published profile', async () => {
+  // The camera path is the only chunk a published default has no room for, so
+  // dropping it (and only it) leaves exactly what the reader accepts.
   const save = await captureSave();
   const { manifest } = await readBundleParts(save);
   const withoutCinematic = manifest.chunks.filter(
     chunk => chunk.contributorId !== 'cinematic-camera',
   );
-
-  assert.equal(
-    withoutCinematic.length,
-    PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.length + 1,
-    'exactly one chunk must be cinematic, or this case is testing something '
-      + 'other than the half-done trim',
-  );
-  assert.throws(
-    () => assertPublishedDefaultChunkProfile(withoutCinematic),
-    /must match the exact static profile/,
-    'the check must still refuse a save that dropped only the chunk it was '
-      + 'told about by name',
-  );
+  assert.equal(manifest.chunks.length, withoutCinematic.length + 1);
+  assert.deepEqual(withoutCinematic.map(chunk => chunk.id), KEPT_IDS);
+  assert.doesNotThrow(() => assertPublishedDefaultChunkProfile(withoutCinematic));
 });
 
 /* ------------------------------------------------------------------ *
@@ -399,19 +388,6 @@ test('the trim refuses to discard a recorded camera path', async () => {
   );
 });
 
-test('the trim refuses to discard a non-empty analysis cache inventory', async () => {
-  const save = await captureSave({
-    'analysis/cache-inventory': {
-      artifactIds: ['analysis/artifacts/bulk-gene/page_1/CD8A'],
-    },
-  });
-
-  const refusal = await refusalOf(() => publish(save));
-  assert.ok(refusal !== null, 'the trim must refuse a save with cached artifacts');
-  assert.match(refusal, /analysis\/cache-inventory/);
-  assert.match(refusal, /artifactIds holds 1 entry/);
-});
-
 test('the trim refuses a chunk that is not one of the droppable singletons', async () => {
   // Highlight membership, user-defined codes and cached artifacts are user
   // content by construction: the published profile has no chunk to carry them,
@@ -445,7 +421,10 @@ test('the trim refuses a dropped chunk whose payload shape is unrecognised', asy
   // shape-based emptiness rule has never seen. It refuses rather than walking
   // past it.
   const save = await captureSave({
-    'analysis/cache-inventory': { artifactIds: [], pending: { gene: 'CD8A' } },
+    'cinematic/camera': {
+      ...EMPTY_DROPPED_PAYLOADS['cinematic/camera'],
+      pending: { gene: 'CD8A' },
+    },
   });
 
   const refusal = await refusalOf(() => publish(save));
@@ -465,38 +444,41 @@ test('the trim refuses a dropped chunk whose payload shape is unrecognised', asy
  * ------------------------------------------------------------------ */
 
 /**
- * The data mapping of a prepared export that enables PCA beside UMAP and
+ * The data mapping of an AnnData file that enables PCA beside UMAP and
  * defaults to UMAP in 2D and 3D.
  */
 function suoDataMapping() {
   return {
-    kind: 'export',
+    kind: 'anndata',
     embeddings: {
       enabled: [
-        { key: 'X_pca', columns: null },
-        { key: 'X_umap_2d', columns: null },
-        { key: 'X_umap_3d', columns: null },
+        { key: 'X_pca', columns: [0, 1] },
+        { key: 'X_umap_2d', columns: [0, 1] },
+        { key: 'X_umap_3d', columns: [0, 1, 2] },
       ],
       defaults: {
         '1d': null,
-        '2d': { key: 'X_umap_2d', columns: null },
-        '3d': { key: 'X_umap_3d', columns: null },
+        '2d': { key: 'X_umap_2d', columns: [0, 1] },
+        '3d': { key: 'X_umap_3d', columns: [0, 1, 2] },
       },
     },
+    knn: 'connectivities',
     geneNames: 'index',
+    expression: 'X',
+    latent: null,
     vectorFields: [],
   };
 }
 
-/** A capture of the Suo generation, served locally, on its 3D UMAP. */
+/** A capture of the Suo generation, under another id, on its 3D UMAP. */
 function suoCapture() {
   return {
-    sourceType: 'local-user',
-    datasetId: 'local-user:suo',
+    datasetId: 'suo-capture',
+    name: 'Suo (local capture)',
     cellCount: 561_947,
     varCount: 5_103,
     cellOrder: {
-      embedding: { key: 'X_umap_3d', columns: null },
+      embedding: { key: 'X_umap_3d', columns: [0, 1, 2] },
       dimension: 3,
       digest: 'a229f7d3347dbb46',
     },
@@ -508,17 +490,19 @@ test('publishing rebinds a local capture to the identity it ships under', async 
   const captured = suoCapture();
   const rebound = rebindPublishedDefaultFingerprint(captured, {
     ...structuredClone(captured),
-    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: 'suo',
+    name: 'Suo et al. 2022',
   });
 
+  // The id and the name are the generation's; everything the capture was
+  // taken against is the capture's.
   assert.deepEqual(rebound, {
-    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: 'suo',
+    name: 'Suo et al. 2022',
     cellCount: 561_947,
     varCount: 5_103,
     cellOrder: {
-      embedding: { key: 'X_umap_3d', columns: null },
+      embedding: { key: 'X_umap_3d', columns: [0, 1, 2] },
       dimension: 3,
       digest: 'a229f7d3347dbb46',
     },
@@ -540,7 +524,6 @@ test('publishing refuses to restate what a capture was taken against', async () 
   const captured = suoCapture();
   const published = {
     ...suoCapture(),
-    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: 'suo',
   };
   const cellOrder = changes => ({ cellOrder: { ...captured.cellOrder, ...changes } });
@@ -550,8 +533,7 @@ test('publishing refuses to restate what a capture was taken against', async () 
   const corruptions = [
     ['cell count', { cellCount: 561_946 }],
     ['gene count', { varCount: 5_102 }],
-    ['cell-order embedding', cellOrder({ embedding: { key: 'X_umap_2d', columns: null } })],
-    ['embedding dimension', cellOrder({ dimension: 2 })],
+    ['cell-order embedding', cellOrder({ embedding: { key: 'X_pca', columns: [0, 1, 2] } })],
     ['cell-order digest', cellOrder({ digest: '0000000000000000' })],
     ['data mapping', { dataMapping: { ...suoDataMapping(), geneNames: 'column:gene_symbols' } }],
     [
@@ -559,7 +541,7 @@ test('publishing refuses to restate what a capture was taken against', async () 
       {
         dataMapping: {
           ...suoDataMapping(),
-          vectorFields: [{ field: 'velocity', embedding: { key: 'X_umap_3d', columns: null } }],
+          vectorFields: [{ key: 'velocity_umap_3d', embedding: { key: 'X_umap_3d', columns: [0, 1, 2] } }],
         },
       },
     ],
@@ -578,55 +560,40 @@ test('publishing refuses to restate what a capture was taken against', async () 
   }
 });
 
-test('publishing refuses a capture taken before sessions recorded a data mapping', async () => {
-  // The fingerprint every session written before data mappings carries: a
-  // cell order with no embedding, and no mapping. Such a capture cannot be
-  // rebound, because there is no embedding or mapping to verify and the
-  // reader refuses the file whatever identity it is given.
+test('publishing refuses a capture whose fingerprint is not a format-2 record', async () => {
+  // A record without its data mapping and cell-order embedding cannot be
+  // verified, so it cannot be rebound whatever identity it is given.
   const { dataMapping: _dataMapping, ...withoutMapping } = suoCapture();
-  const preMapping = {
+  const incomplete = {
     ...withoutMapping,
     cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
   };
   assert.throws(
-    () => rebindPublishedDefaultFingerprint(preMapping, {
+    () => rebindPublishedDefaultFingerprint(incomplete, {
       ...suoCapture(),
-      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
       datasetId: 'suo',
     }),
-    error => error instanceof RangeError
-      && /before sessions recorded which stored embeddings/.test(error.message),
+    /exact keys/,
   );
 });
 
-test('publishing refuses an identity a published default is never read under', async () => {
+test('publishing refuses a published identity that names no generation', async () => {
   const captured = {
     ...suoCapture(),
     cellCount: 3,
     varCount: 0,
     cellOrder: {
-      embedding: { key: 'X_umap_3d', columns: null },
+      embedding: { key: 'X_umap_3d', columns: [0, 1, 2] },
       dimension: 3,
       digest: '0123456789abcdef',
     },
   };
-  assert.throws(
-    () => rebindPublishedDefaultFingerprint(captured, {
-      ...captured,
-      sourceType: 'remote',
-      datasetId: 'suo',
-    }),
-    /cannot be published as "remote"/,
-    'a published default is fetched from a generation directory that only an '
-      + 'advertised catalog entry has, so no other source type can read it',
-  );
   // `null` is the identity a viewer with no data-source manager reports, and
   // the fingerprint schema permits it, so this is the one the rebinding itself
   // has to refuse rather than the schema.
   assert.throws(
     () => rebindPublishedDefaultFingerprint(captured, {
       ...captured,
-      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
       datasetId: null,
     }),
     /must name the generation it ships beside/,
@@ -634,7 +601,6 @@ test('publishing refuses an identity a published default is never read under', a
   assert.throws(
     () => rebindPublishedDefaultFingerprint(captured, {
       ...captured,
-      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
       datasetId: '',
     }),
     /datasetId must be a nonempty trimmed string/,
@@ -650,13 +616,13 @@ test('the trim will not publish a capture without an identity to publish it unde
     refusal !== null,
     'omitting the identity must be refused rather than producing a file that '
       + 'carries the capture identity by default -- that default is exactly '
-      + 'what shipped five inert presets',
+      + 'what once shipped five inert presets',
   );
   assert.match(refusal, /Published dataset fingerprint/);
 });
 
 /* ------------------------------------------------------------------ *
- * 3. A correct five-chunk preset passes.
+ * 3. A correct preset passes.
  * ------------------------------------------------------------------ */
 
 test('the trim turns an empty save into a preset the application accepts', async () => {
@@ -683,7 +649,6 @@ test('the trim turns an empty save into a preset the application accepts', async
     trimmedParts.manifest.datasetFingerprint,
     {
       ...saveParts.manifest.datasetFingerprint,
-      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
       datasetId: PUBLISHED_DATASET_ID,
     },
     'publishing renames the capture and changes nothing else about what it '
@@ -709,9 +674,11 @@ test('the trim turns an empty save into a preset the application accepts', async
   const reader = makeSerializer(
     PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => ({
       profile,
-      payload: { chunkId: profile.id },
+      payload: profile.kind === 'binary'
+        ? new TextEncoder().encode(profile.id)
+        : { chunkId: profile.id },
     })),
-    { sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE, datasetId: PUBLISHED_DATASET_ID },
+    { datasetId: PUBLISHED_DATASET_ID },
   );
   for (const contributor of reader._contributors) {
     contributor.restore = (_ctx, meta) => restored.push(meta.id);
@@ -728,9 +695,11 @@ test('the trim turns an empty save into a preset the application accepts', async
  * ------------------------------------------------------------------ */
 
 /**
- * The committed presets, or `null` when the sibling repository is not checked
- * out. Only an absent *repository* is a reason to skip; a repository that is
- * present but publishes nothing is a defect, and is left to fail.
+ * The presets the sample catalog advertises, or `null` when the sibling
+ * repository is not checked out. Each is read at its `anndata/datasets.json`
+ * session path and held to the byte length and SHA-256 the catalog declares,
+ * as the viewer holds it. Only an absent *repository* is a reason to skip; a
+ * present repository whose catalog advertises nothing is a defect and fails.
  */
 async function readPublishedPresets() {
   try {
@@ -739,23 +708,20 @@ async function readPublishedPresets() {
     return null;
   }
 
-  const entries = await readdir(PRESET_EXPORTS_URL, { withFileTypes: true });
+  const catalog = JSON.parse(await readFile(PRESET_CATALOG_URL, 'utf8'));
+  assert.equal(catalog.schema, 2, 'the sample catalog must be schema 2');
   const presets = [];
-  for (const entry of entries.filter(candidate => candidate.isDirectory())) {
-    const presetUrl = new URL(
-      `${entry.name}/${PRESET_FILENAME}`,
-      PRESET_EXPORTS_URL,
+  for (const entry of catalog.datasets) {
+    if (entry.session === undefined) continue;
+    const label = `anndata/${entry.session.path}`;
+    const bytes = await readFile(new URL(entry.session.path, PRESET_CATALOG_URL));
+    assert.equal(bytes.byteLength, entry.session.bytes, `${label} must be the byte length the catalog declares`);
+    assert.equal(
+      createHash('sha256').update(bytes).digest('hex'),
+      entry.session.sha256,
+      `${label} must have the SHA-256 the catalog declares`,
     );
-    let bytes;
-    try {
-      bytes = await readFile(presetUrl);
-    } catch {
-      continue;
-    }
-    presets.push({
-      label: `${entry.name}/${PRESET_FILENAME}`,
-      blob: new Blob([bytes]),
-    });
+    presets.push({ label, blob: new Blob([bytes]) });
   }
   return presets.sort((left, right) => left.label.localeCompare(right.label));
 }
@@ -771,8 +737,8 @@ test('every published preset carries exactly the accepted chunks', async (t) => 
   }
   assert.ok(
     presets.length > 0,
-    `${PRESET_EXPORTS_URL.pathname} exists but publishes no ${PRESET_FILENAME}; `
-      + 'an empty exports tree must not read as agreement',
+    `${PRESET_CATALOG_URL.pathname} advertises no session; a catalog without `
+      + 'presets must not read as agreement',
   );
 
   for (const preset of presets) {

@@ -7,17 +7,16 @@
  * `cellucid` Python server, and the GitHub case talks to the real published
  * repository over the network.
  *
- * Start the dependencies before running this file. Each export root is a
- * directory holding `datasets.json` plus the dataset directories it names; the
- * Jupyter root must name exactly one dataset, because the Jupyter URL contract
- * rejects a `dataset` parameter.
+ * Start the dependencies before running this file. The Jupyter bridge serves
+ * one AnnData file, the demo catalog's `synthetic-development-3d`
+ * (`fixtures/demo-catalog/synthetic-development-3d.zarr.zip`), because the
+ * Jupyter URL contract rejects a `dataset` parameter.
  *
- *   cellucid serve <exports-root-with-one-pancreas-dataset> --port 8765 \
- *       --no-browser --no-web-ui
  *   cellucid serve <some>.h5ad --dataset-name "Miller lung (real h5ad)" \
  *       --dataset-id miller --port 8766 --no-browser --no-web-ui
- *   python jupyter-bridge-server.py <single-dataset-exports-root> 8769 \
- *       viewer-obj7 token-obj7
+ *   python jupyter-bridge-server.py \
+ *       tests/browser/fixtures/demo-catalog/synthetic-development-3d.zarr.zip \
+ *       8769 viewer-obj7 token-obj7
  *
  * `jupyter-bridge-server.py` starts the same `CellucidServer` the CLI runs and
  * registers one viewer with `register_event_callback`, which is what makes
@@ -40,20 +39,18 @@ import {
   formatCount,
 } from '../../assets/js/app/ui/components/display-format.js';
 
-const LOCAL_EXPORTS =
-  `${ORIGIN}/tests/browser/fixtures/demo-custom-exports/`;
+const LOCAL_CATALOG =
+  `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
 
-const EXPORTED_SERVER = 'http://127.0.0.1:8765';
 const ANNDATA_SERVER = 'http://127.0.0.1:8766';
 const JUPYTER_SERVER = 'http://127.0.0.1:8769';
-const JUPYTER_DATASET_ID = 'synthetic-development-3d';
 const JUPYTER_VIEWER_ID = 'viewer-obj7';
 const JUPYTER_VIEWER_TOKEN = 'token-obj7';
 
-const GITHUB_REPOSITORY = 'theislab/cellucid-demo-custom-datasets/exports';
+const GITHUB_REPOSITORY = 'theislab/cellucid-demo-custom-datasets/catalog';
 const GITHUB_CATALOG_URL =
   'https://raw.githubusercontent.com/theislab/'
-  + 'cellucid-demo-custom-datasets/main/exports/datasets.json';
+  + 'cellucid-demo-custom-datasets/HEAD/catalog/datasets.json';
 
 async function reachable(url, init) {
   try {
@@ -102,69 +99,7 @@ async function expectRendered(page, { name, cells, genes, field, entries }) {
 }
 
 /* ------------------------------------------------------------------ *
- * remote-source.js — a real `cellucid serve` over a prepared export
- * ------------------------------------------------------------------ */
-
-test('a prepared export streamed from a real Python server renders', async ({
-  page,
-}) => {
-  test.skip(
-    !(await reachable(`${EXPORTED_SERVER}/_cellucid/health`)),
-    `No cellucid server on ${EXPORTED_SERVER}`,
-  );
-  const errors = observeProductErrors(page);
-  const url = new URL('/', ORIGIN);
-  url.searchParams.set('source', 'remote');
-  url.searchParams.set('remote', EXPORTED_SERVER);
-  url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
-  await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
-
-  // A remote startup intent must never paint onboarding.
-  await expect(page.locator('#welcome-modal')).toBeHidden();
-  await expectRendered(page, {
-    name: 'Pancreatic endocrinogenesis (scVelo)',
-    cells: 3696,
-    genes: 3753,
-    field: 'cell_type',
-    entries: 8,
-  });
-  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 3D$/);
-  expect(errors).toEqual([]);
-});
-
-test('the sidebar Connect control adopts a real Python server', async ({
-  page,
-}) => {
-  test.skip(
-    !(await reachable(`${EXPORTED_SERVER}/_cellucid/health`)),
-    `No cellucid server on ${EXPORTED_SERVER}`,
-  );
-  const url = new URL('/', ORIGIN);
-  url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
-  await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
-  await dismissWelcome(page);
-  await openCollapsedPanels(page);
-  // The sidebar connection controls are wired only after the startup dataset
-  // publishes; clicking before that is silently discarded (see OBJ-7 report).
-  await expect(page.locator('#dataset-name')).toHaveText(
-    'Synthetic cell-type islands — 2D',
-  );
-
-  await page.locator('#remote-server-url').fill(EXPORTED_SERVER);
-  await page.locator('#remote-connect-btn').click();
-
-  await expectRendered(page, {
-    name: 'Pancreatic endocrinogenesis (scVelo)',
-    cells: 3696,
-    genes: 3753,
-    field: 'cell_type',
-    entries: 8,
-  });
-  await expect(page.locator('#remote-disconnect-btn')).toBeVisible();
-});
-
-/* ------------------------------------------------------------------ *
- * anndata server — a real .h5ad parsed by Python and streamed
+ * anndata server — a real .h5ad the viewer reads in place from Python
  * ------------------------------------------------------------------ */
 
 test('a real .h5ad served in AnnData mode renders', async ({ page }) => {
@@ -172,23 +107,28 @@ test('a real .h5ad served in AnnData mode renders', async ({ page }) => {
     !(await reachable(`${ANNDATA_SERVER}/_cellucid/health`)),
     `No AnnData cellucid server on ${ANNDATA_SERVER}`,
   );
-  // The server serves identity version 3 and publishes the data mapping it
-  // serves at _cellucid/mapping/candidates.json; the viewer reads that
-  // mapping, so a session saved here records the arrays this server chose.
+  // The server declares the store and its launch defaults in its catalog;
+  // the viewer reads the file itself with range requests, under the
+  // server's dataset id and name.
   const url = new URL('/', ORIGIN);
   url.searchParams.set('source', 'remote');
   url.searchParams.set('remote', ANNDATA_SERVER);
   url.searchParams.set('anndata', 'true');
-  url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
+  url.searchParams.set('sampleCatalog', LOCAL_CATALOG);
   const catalogResponse = page.waitForResponse(
-    response => response.url() === `${ANNDATA_SERVER}/_cellucid/mapping/candidates.json`,
+    response => response.url() === `${ANNDATA_SERVER}/_cellucid/datasets`,
+  );
+  const rangeResponse = page.waitForResponse(
+    response =>
+      response.url().startsWith(`${ANNDATA_SERVER}/_cellucid/anndata/`) &&
+      response.status() === 206,
   );
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
 
-  const catalog = await catalogResponse;
-  expect(catalog.status()).toBe(200);
-  const { defaults } = await catalog.json();
-  expect(defaults.kind).toBe('anndata');
+  const catalog = await (await catalogResponse).json();
+  expect(catalog.datasets).toHaveLength(1);
+  expect(catalog.datasets[0].anndata.file.kind).toBe('h5ad');
+  expect((await rangeResponse).headers()['content-range']).toMatch(/^bytes \d+-\d+\/\d+$/);
 
   await expect(page.locator('#welcome-modal')).toBeHidden();
   await expectRendered(page, {
@@ -198,17 +138,45 @@ test('a real .h5ad served in AnnData mode renders', async ({ page }) => {
     field: 'cell_type',
     entries: 10,
   });
-  // The mapping the viewer adopted is the one the server published.
   expect(
-    await page.evaluate(() => JSON.stringify(window._cellucidState.getDataMapping())),
-  ).toBe(JSON.stringify(defaults));
+    await page.evaluate(() => window._cellucidState.getDataMapping().kind),
+  ).toBe('anndata');
+});
+
+test('the sidebar Connect control adopts a real Python server', async ({
+  page,
+}) => {
+  test.skip(
+    !(await reachable(`${ANNDATA_SERVER}/_cellucid/health`)),
+    `No AnnData cellucid server on ${ANNDATA_SERVER}`,
+  );
+  const url = new URL('/', ORIGIN);
+  url.searchParams.set('sampleCatalog', LOCAL_CATALOG);
+  await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Synthetic cell-type islands — 2D',
+  );
+
+  await page.locator('#remote-server-url').fill(ANNDATA_SERVER);
+  await page.locator('#remote-connect-btn').click();
+
+  await expectRendered(page, {
+    name: 'Miller lung (real h5ad)',
+    cells: 7405,
+    genes: 8192,
+    field: 'cell_type',
+    entries: 10,
+  });
+  await expect(page.locator('#remote-disconnect-btn')).toBeVisible();
 });
 
 /* ------------------------------------------------------------------ *
  * github-data-source.js — the real published demo repository
  * ------------------------------------------------------------------ */
 
-test('a published GitHub export renders from a startup intent', async ({
+test('a published GitHub catalog renders from a startup intent', async ({
   page,
 }) => {
   test.skip(
@@ -217,10 +185,9 @@ test('a published GitHub export renders from a startup intent', async ({
   );
   const errors = observeProductErrors(page);
   const url = new URL('/', ORIGIN);
-  url.searchParams.set('source', 'github-repo');
-  url.searchParams.set('github', GITHUB_REPOSITORY);
+  url.searchParams.set('data', `gh:${GITHUB_REPOSITORY}`);
   url.searchParams.set('dataset', 'synthetic-trajectory-1d');
-  url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
+  url.searchParams.set('sampleCatalog', LOCAL_CATALOG);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
 
   await expect(page.locator('#welcome-modal')).toBeHidden();
@@ -234,7 +201,7 @@ test('a published GitHub export renders from a startup intent', async ({
   expect(errors).toEqual([]);
 });
 
-test('the sidebar GitHub control loads a published repository', async ({
+test('the Open from link control loads a published GitHub repository', async ({
   page,
 }) => {
   test.skip(
@@ -242,7 +209,7 @@ test('the sidebar GitHub control loads a published repository', async ({
     'raw.githubusercontent.com is not reachable',
   );
   const url = new URL('/', ORIGIN);
-  url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
+  url.searchParams.set('sampleCatalog', LOCAL_CATALOG);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
@@ -250,15 +217,15 @@ test('the sidebar GitHub control loads a published repository', async ({
     'Synthetic cell-type islands — 2D',
   );
 
-  await page.locator('#github-repo-url').fill(GITHUB_REPOSITORY);
-  await page.locator('#github-connect-btn').click();
+  await page.locator('#data-link-url').fill(GITHUB_REPOSITORY);
+  await page.locator('#data-link-connect-btn').click();
 
   await expect(
     page.locator('#notification-center .notification')
-      .filter({ hasText: 'Connected to theislab/cellucid-demo-custom-datasets' }),
+      .filter({ hasText: 'Connected - 3 datasets found' }),
   ).toHaveCount(1, { timeout: 60_000 });
   await expect(
-    page.locator('#dataset-select optgroup[label="GitHub data"] option'),
+    page.locator('#dataset-select optgroup[label="Linked data"] option'),
   ).toHaveCount(3);
 });
 
@@ -275,20 +242,15 @@ test('an authenticated Jupyter bridge renders and delivers its ready event', asy
   );
 
   const forwarded = [];
-  for (const pattern of [
-    `${ORIGIN}/_cellucid/**`,
-    `${ORIGIN}/${JUPYTER_DATASET_ID}/**`,
-  ]) {
-    await page.route(pattern, async route => {
-      const request = route.request();
-      const target = new URL(request.url());
-      forwarded.push(`${request.method()} ${target.pathname}`);
-      const response = await route.fetch({
-        url: `${JUPYTER_SERVER}${target.pathname}${target.search}`,
-      });
-      await route.fulfill({ response });
+  await page.route(`${ORIGIN}/_cellucid/**`, async route => {
+    const request = route.request();
+    const target = new URL(request.url());
+    forwarded.push(`${request.method()} ${target.pathname}`);
+    const response = await route.fetch({
+      url: `${JUPYTER_SERVER}${target.pathname}${target.search}`,
     });
-  }
+    await route.fulfill({ response });
+  });
   // The Jupyter URL contract forbids every parameter except jupyter/viewerId/
   // viewerToken, so the sample catalog cannot be pointed anywhere local. Deny
   // the public catalog to prove the Jupyter dataset still renders without it.
@@ -326,22 +288,17 @@ test('a Jupyter bridge that stops is reported, not silently frozen', async ({
   );
 
   let serverUp = true;
-  for (const pattern of [
-    `${ORIGIN}/_cellucid/**`,
-    `${ORIGIN}/${JUPYTER_DATASET_ID}/**`,
-  ]) {
-    await page.route(pattern, async route => {
-      const target = new URL(route.request().url());
-      if (!serverUp) {
-        await route.abort('connectionrefused');
-        return;
-      }
-      const response = await route.fetch({
-        url: `${JUPYTER_SERVER}${target.pathname}${target.search}`,
-      });
-      await route.fulfill({ response });
+  await page.route(`${ORIGIN}/_cellucid/**`, async route => {
+    const target = new URL(route.request().url());
+    if (!serverUp) {
+      await route.abort('connectionrefused');
+      return;
+    }
+    const response = await route.fetch({
+      url: `${JUPYTER_SERVER}${target.pathname}${target.search}`,
     });
-  }
+    await route.fulfill({ response });
+  });
   await page.route('https://theislab.github.io/**', route => route.abort());
 
   const url = new URL('/', ORIGIN);

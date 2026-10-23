@@ -368,26 +368,46 @@ const geneHeatmapDefinition = {
       const xs = [];
       const ys = [];
 
-      const walk = (node) => {
+      // Post-order over an explicit stack: a dendrogram can be a chain as
+      // deep as its leaf count (single linkage), deeper than the call stack.
+      const placed = new Map();
+      const place = node => {
         if (!node || typeof node !== 'object') {
           throw new TypeError(`Heatmap ${axisName} dendrogram contains an invalid node`);
         }
-        if (node.isLeaf) {
-          if (!leafPos.has(node.id)) {
-            throw new RangeError(
-              `Heatmap ${axisName} dendrogram leaf ${String(node.id)} is absent from its order`
-            );
-          }
-          const x = leafPos.get(node.id);
-          return { x, y: 0 };
+        if (!node.isLeaf) return null;
+        if (!leafPos.has(node.id)) {
+          throw new RangeError(
+            `Heatmap ${axisName} dendrogram leaf ${String(node.id)} is absent from its order`
+          );
+        }
+        return { x: leafPos.get(node.id), y: 0 };
+      };
+      const stack = [dendrogram];
+      while (stack.length > 0) {
+        const node = stack[stack.length - 1];
+        const leaf = place(node);
+        if (leaf !== null) {
+          placed.set(node, leaf);
+          stack.pop();
+          continue;
         }
         if (!Number.isFinite(node.height) || node.height < 0) {
           throw new TypeError(`Heatmap ${axisName} dendrogram heights must be finite and non-negative`);
         }
-
-        const left = walk(node.left);
-        const right = walk(node.right);
-        const x = (left.x + right.x) / 2;
+        const left = placed.get(node.left) ?? (place(node.left) || null);
+        if (left === null) {
+          stack.push(node.left);
+          continue;
+        }
+        placed.set(node.left, left);
+        const right = placed.get(node.right) ?? (place(node.right) || null);
+        if (right === null) {
+          stack.push(node.right);
+          continue;
+        }
+        placed.set(node.right, right);
+        stack.pop();
         const y = node.height;
 
         // vertical left
@@ -400,10 +420,8 @@ const geneHeatmapDefinition = {
         xs.push(left.x, right.x, null);
         ys.push(y, y, null);
 
-        return { x, y };
-      };
-
-      walk(dendrogram);
+        placed.set(node, { x: (left.x + right.x) / 2, y });
+      }
 
       if (axisName === 'row') {
         traces.push({

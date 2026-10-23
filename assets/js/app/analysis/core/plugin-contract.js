@@ -11,7 +11,7 @@
  * - Plugin discovery and introspection
  */
 
-import { categoryCounts } from '../shared/category-counts.js';
+import { categoryCounts, pageValueAt } from '../shared/category-counts.js';
 import {
   validatePluginContract,
   validateOptionsAgainstSchema,
@@ -334,7 +334,7 @@ export class PlotPluginRegistry extends BasePluginRegistry {
             rows.push({
               page: pd.pageName,
               cell_index: pd.cellIndices?.[i] ?? i,
-              value: pd.values[i]
+              value: pageValueAt(pd, i)
             });
           }
         }

@@ -16,8 +16,7 @@ import {
   H5AD,
   H5AD_PATH,
   START,
-  TRAJECTORY,
-  demoExportsDirectory,
+  ZARR_FOLDER,
   expectNeverPublished,
   expectNoFailureAnnounced,
   expectSettledOn,
@@ -162,16 +161,17 @@ test('a dropped .h5ad file opens like a picked one', async ({ page }) => {
   expect(productErrors).toEqual([]);
 });
 
-test('a dropped prepared export folder opens like a picked one', async ({ page }) => {
+test('a dropped Zarr store folder opens like a picked one', async ({ page }) => {
   const productErrors = await openStarted(page);
+  // Every file of the store, its hidden metadata files (`.zgroup`,
+  // `.zattrs`, `.zmetadata`) with the rest, as a real folder drop lists them.
+  const files = await folderPayload(ZARR_FOLDER.path);
+  expect(files.some(file => file.path.endsWith('/.zmetadata'))).toBe(true);
   const drag = await createDrag(page, {
-    folder: {
-      name: TRAJECTORY.id,
-      files: await folderPayload(path.join(demoExportsDirectory, TRAJECTORY.id)),
-    },
+    folder: { name: path.basename(ZARR_FOLDER.path), files },
   });
   await dragAndDrop(page, drag);
-  await expectSettledOn(page, { ...TRAJECTORY, select: /^dataset:local-user:/ });
+  await expectSettledOn(page, ZARR_FOLDER);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -241,7 +241,7 @@ test('before the data controls exist a dropped file is refused and never navigat
   const catalogHeld = new Promise(resolve => {
     releaseCatalog = resolve;
   });
-  await page.route(/\/demo-custom-exports\/datasets\.json/, async route => {
+  await page.route(/\/demo-catalog\/datasets\.json/, async route => {
     await catalogHeld;
     await route.continue().catch(() => {});
   });

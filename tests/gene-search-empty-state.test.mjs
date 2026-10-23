@@ -63,6 +63,16 @@ class FakeNode {
     for (const node of nodes) this.appendChild(node);
   }
 
+  insertBefore(child, reference) {
+    const index = this.children.indexOf(reference);
+    if (index === -1) throw new Error('reference node is not a child');
+    const nodes = child instanceof FakeFragment ? [...child.children] : [child];
+    if (child instanceof FakeFragment) child.children = [];
+    for (const node of nodes) node.parentNode = this;
+    this.children.splice(index, 0, ...nodes);
+    return child;
+  }
+
   replaceChildren(...nodes) {
     for (const child of this.children) child.parentNode = null;
     this.children = [];
@@ -326,7 +336,7 @@ test('a gene search with no match explains the dataset gene panel', () => {
     new RegExp(`This dataset publishes ${(6).toLocaleString()} gene names`)
   );
   // It says the panel is decided upstream, at preparation time.
-  assert.match(text, /chosen when it was prepared/);
+  assert.match(text, /chosen when its file was written/);
   assert.match(text, /possibly a subset of the source data/);
   // It offers the other cause it cannot rule out, and claims neither.
   assert.match(text, /Check for typos too\./);
@@ -477,12 +487,26 @@ test('gene results are a keyboard-navigable listbox whose Enter picks the active
     options.map(option => option.getAttribute('aria-selected')),
     ['false', 'true', 'false']
   );
+  assert.deepEqual(
+    options.map(option => option.classList.contains('active')),
+    [false, true, false]
+  );
+  assert.deepEqual(
+    options.map(option => [option.getAttribute('aria-posinset'), option.getAttribute('aria-setsize')]),
+    [['1', '3'], ['2', '3'], ['3', '3']]
+  );
   keydown('ArrowDown');
   keydown('ArrowDown');
   assert.equal(
     dom.geneSearch.getAttribute('aria-activedescendant'),
+    options[0].getAttribute('id'),
+    'ArrowDown wraps from the last option to the first'
+  );
+  keydown('ArrowUp');
+  assert.equal(
+    dom.geneSearch.getAttribute('aria-activedescendant'),
     options[2].getAttribute('id'),
-    'ArrowDown stops at the last option'
+    'ArrowUp wraps from the first option to the last'
   );
   keydown('ArrowUp');
 
@@ -529,4 +553,57 @@ test('a gene kept active for a moment is prefetched, and moving on cancels it', 
   assert.deepEqual(loads.map(load => load.index), [1, 2, 2]);
   api.destroy();
   assert.equal(loads[1].signal.aborted, true, 'destroying the selector cancels its prefetch');
+});
+
+test('a long gene list builds only the options near the active one', () => {
+  const loaded = [];
+  const keys = Array.from({ length: 8192 }, (_, index) => `G${index}`);
+  const { dom } = mountGeneSelector(
+    exportedGenes(...keys),
+    { onLoad: index => loaded.push(index) }
+  );
+  const keydown = key => dom.geneSearch.dispatch('keydown', { key, preventDefault() {} });
+  const built = () => dom.geneDropdown.children.filter(
+    child => child.classList.contains('dropdown-item')
+  );
+  const activeText = () => {
+    const id = dom.geneSearch.getAttribute('aria-activedescendant');
+    return built().find(option => option.getAttribute('id') === id)?.textContent ?? null;
+  };
+
+  search(dom, 'G');
+  assert.equal(built().length, 100, 'the list opens with one page');
+  assert.equal(built()[0].getAttribute('aria-setsize'), '8192');
+
+  // End reaches the last match without building every one before it.
+  keydown('End');
+  assert.equal(activeText(), 'G8191');
+  assert.ok(built().length <= 400);
+  keydown('ArrowUp');
+  assert.equal(activeText(), 'G8190');
+  assert.deepEqual(
+    built().filter(option => option.getAttribute('aria-selected') === 'true')
+      .map(option => option.textContent),
+    ['G8190'],
+  );
+
+  // Home goes back to the top; arrowing past a page builds the next one.
+  keydown('Home');
+  assert.equal(activeText(), 'G0');
+  for (let step = 0; step < 150; step++) keydown('ArrowDown');
+  assert.equal(activeText(), 'G150');
+  assert.ok(built().length <= 400);
+
+  // ArrowUp with nothing active starts at the last match.
+  search(dom, 'G');
+  keydown('ArrowUp');
+  assert.equal(activeText(), 'G8191');
+  assert.ok(built().length <= 400);
+  keydown('Home');
+  for (let step = 0; step < 150; step++) keydown('ArrowDown');
+
+  // Enter chooses the active match.
+  keydown('Enter');
+  assert.deepEqual(loaded, [150]);
+  assert.equal(dom.geneSearch.value, 'G150');
 });

@@ -14,7 +14,7 @@ function updateUrlForDataSource(sourceType, sourceInfo) {
 const INITIAL_URL =
   'https://viewer.example.test/app?' +
   'dataset=old&source=old&remote=https%3A%2F%2Fold.example.test' +
-  '&github=old%2Frepo&anndata=true&annotations=team%2Flabels%40main#selected';
+  '&data=gh%3Aold%2Frepo&anndata=true&annotations=team%2Flabels%40main#selected';
 
 function installBrowser(initialHref = INITIAL_URL, replaceImplementation = null) {
   const previousWindow = globalThis.window;
@@ -95,7 +95,7 @@ test('local-demo publishes exactly its source and dataset URL state', async () =
     // Python server hosts, so the sample catalog has to be named explicitly.
     assert.equal(url.searchParams.get('source'), 'local-demo');
     assert.equal(url.searchParams.has('remote'), false);
-    assert.equal(url.searchParams.has('github'), false);
+    assert.equal(url.searchParams.has('data'), false);
   });
 });
 
@@ -128,23 +128,36 @@ test('remote publishes exactly its server and dataset URL state', async () => {
     );
     assert.equal(url.searchParams.get('dataset'), 'served');
     assert.equal(url.searchParams.has('source'), false);
-    assert.equal(url.searchParams.has('github'), false);
+    assert.equal(url.searchParams.has('data'), false);
   });
 });
 
-test('github-repo publishes exactly its repository and dataset URL state', async () => {
+test('link publishes exactly its locator and, for a catalog, its dataset', async () => {
   await withBrowser(browser => {
-    updateUrlForDataSource('github-repo', {
+    updateUrlForDataSource('link', {
       datasetId: 'atlas',
-      path: 'cellucid/data/example',
+      locator: 'gh:cellucid/data/example',
     });
 
     assert.equal(browser.calls.length, 1);
     const url = assertPreservedApplicationState(browser.href);
-    assert.equal(url.searchParams.get('github'), 'cellucid/data/example');
+    assert.equal(url.searchParams.get('data'), 'gh:cellucid/data/example');
     assert.equal(url.searchParams.get('dataset'), 'atlas');
     assert.equal(url.searchParams.has('source'), false);
     assert.equal(url.searchParams.has('remote'), false);
+  });
+  await withBrowser(browser => {
+    updateUrlForDataSource('link', {
+      datasetId: null,
+      locator: 'cellxgene:0819e386-e7fd-4212-b732-60e468689f89',
+    });
+
+    const url = assertPreservedApplicationState(browser.href);
+    assert.equal(
+      url.searchParams.get('data'),
+      'cellxgene:0819e386-e7fd-4212-b732-60e468689f89'
+    );
+    assert.equal(url.searchParams.has('dataset'), false);
   });
 });
 
@@ -158,7 +171,7 @@ for (const sourceType of ['local-user', 'jupyter']) {
       assert.equal(url.searchParams.has('dataset'), false);
       assert.equal(url.searchParams.has('source'), false);
       assert.equal(url.searchParams.has('remote'), false);
-      assert.equal(url.searchParams.has('github'), false);
+      assert.equal(url.searchParams.has('data'), false);
     });
   });
 }
@@ -172,7 +185,7 @@ test('null publishes the exact empty-dataset state', async () => {
     assert.equal(url.searchParams.has('dataset'), false);
     assert.equal(url.searchParams.has('source'), false);
     assert.equal(url.searchParams.has('remote'), false);
-    assert.equal(url.searchParams.has('github'), false);
+    assert.equal(url.searchParams.has('data'), false);
   });
 });
 
@@ -213,14 +226,14 @@ test('invalid, empty, partial, and unknown source records preserve the prior URL
     () => updateUrlForDataSource('remote', {
       serverUrl: 'https://data.test',
     }),
-    () => updateUrlForDataSource('github-repo', {}),
-    () => updateUrlForDataSource('github-repo', { path: ' ' }),
-    () => updateUrlForDataSource('github-repo', {
+    () => updateUrlForDataSource('link', {}),
+    () => updateUrlForDataSource('link', { datasetId: null, locator: ' ' }),
+    () => updateUrlForDataSource('link', {
       datasetId: '',
-      path: 'owner/repo',
+      locator: 'gh:owner/repo',
     }),
-    () => updateUrlForDataSource('github-repo', {
-      path: 'owner/repo',
+    () => updateUrlForDataSource('link', {
+      locator: 'gh:owner/repo',
     }),
     () => updateUrlForDataSource('local-user', { datasetId: 'local' }),
     () => updateUrlForDataSource('jupyter', { serverUrl: 'https://data.test' }),
@@ -322,9 +335,9 @@ test('an older URL publication cannot restore over a newer committed generation'
       datasetId: 'remote-a',
       serverUrl: 'https://remote-a.test',
     });
-    const newer = prepareUrlForDataSource('github-repo', {
+    const newer = prepareUrlForDataSource('link', {
       datasetId: 'github-b',
-      path: 'owner/repo/exports',
+      locator: 'gh:owner/repo/exports',
     });
 
     older.commit();

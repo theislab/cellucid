@@ -1,244 +1,42 @@
 /**
- * LocalDemoDataSource - Data source for demo datasets at an exports base URL
+ * LocalDemoDataSource - the Sample dataset list: the dataset catalog the page
+ * names (`DATA_CONFIG.SAMPLE_CATALOG_URL`, from the `cellucid-sample-catalog`
+ * meta element or one `sampleCatalog` query field), read by
+ * `sources/anndata-catalog.js`.
  *
- * Reads datasets.json manifest listing available datasets.
+ * In production the catalog is the `cellucid-datasets` site: a folder of
+ * AnnData files with its `datasets.json`.
  */
 
 import {
   DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
-  fetchJson,
-  loadDatasetMetadata,
   resolveUrl,
-  validateSchemaVersion
 } from './data-source.js';
+import { createMetadataAbortError } from './metadata-load-contract.js';
 import {
-  createMetadataAbortError,
-  loadMetadataBatchAtomically,
-} from './metadata-load-contract.js';
+  AnnDataCatalog,
+  CATALOG_FILENAME,
+  fetchAnnDataCatalog,
+} from './sources/anndata-catalog.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
+ * @typedef {import('./data-source.js').DatasetSummary} DatasetSummary
  */
 
-function invalidDemoManifest(message, source, details = {}) {
-  return new DataSourceError(
-    `Invalid datasets.json: ${message}`,
-    DataSourceErrorCode.INVALID_FORMAT,
-    source,
-    details
-  );
-}
+/** What the dataset panel names the source of a sample that names none. */
+const SAMPLE_SOURCE_NAME = 'Cellucid sample datasets';
 
-function validateDemoDatasetPath(value, id, source) {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    value !== value.trim() ||
-    value.startsWith('/') ||
-    value.includes('\\') ||
-    value.includes('?') ||
-    value.includes('#') ||
-    /[\u0000-\u001f\u007f]/.test(value) ||
-    /^[A-Za-z]:/.test(value)
-  ) {
-    throw invalidDemoManifest(
-      `dataset '${id}' must declare a safe relative path`,
-      source,
-      { id, path: value }
-    );
-  }
-  if (!value.endsWith('/')) {
-    throw invalidDemoManifest(
-      `dataset '${id}' path must be a relative directory ending in '/'`,
-      source,
-      { id, path: value }
-    );
-  }
-  const parts = value.split('/');
-  if (parts.at(-1) === '') parts.pop();
-  if (parts.length === 0 || parts.some(part => part.length === 0)) {
-    throw invalidDemoManifest(
-      `dataset '${id}' must declare a safe relative path`,
-      source,
-      { id, path: value }
-    );
-  }
-  for (const part of parts) {
-    let decoded;
-    try {
-      decoded = decodeURIComponent(part);
-    } catch {
-      throw invalidDemoManifest(
-        `dataset '${id}' must declare a canonical relative directory path`,
-        source,
-        { id, path: value }
-      );
-    }
-    if (
-      decoded === '.' ||
-      decoded === '..' ||
-      decoded.includes('%') ||
-      decoded.includes('/') ||
-      decoded.includes('\\') ||
-      /[\u0000-\u001f\u007f]/.test(decoded) ||
-      encodeURIComponent(decoded) !== part
-    ) {
-      throw invalidDemoManifest(
-        `dataset '${id}' must declare a canonical relative directory path`,
-        source,
-        { id, path: value }
-      );
-    }
-  }
-  return value;
-}
-
-function validateDemoManifestContract(manifest, source) {
-  if (
-    !manifest ||
-    typeof manifest !== 'object' ||
-    Array.isArray(manifest) ||
-    !Array.isArray(manifest.datasets) ||
-    manifest.datasets.length === 0
-  ) {
-    throw invalidDemoManifest(
-      'datasets must be a non-empty array',
-      source
-    );
-  }
-
-  const ids = new Set();
-  const paths = new Set();
-  for (const entry of manifest.datasets) {
-    if (
-      !entry ||
-      typeof entry !== 'object' ||
-      Array.isArray(entry) ||
-      typeof entry.id !== 'string' ||
-      entry.id.length === 0 ||
-      ids.has(entry.id)
-    ) {
-      throw invalidDemoManifest(
-        'every dataset requires a unique non-empty string id',
-        source
-      );
-    }
-    ids.add(entry.id);
-    const path = validateDemoDatasetPath(entry.path, entry.id, source);
-    if (paths.has(path)) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' reuses path '${path}'`,
-        source,
-        { id: entry.id, path }
-      );
-    }
-    paths.add(path);
-    if (
-      Object.hasOwn(entry, 'name') &&
-      (typeof entry.name !== 'string' || entry.name.length === 0)
-    ) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' has an invalid name`,
-        source,
-        { id: entry.id }
-      );
-    }
-    for (const countKey of ['n_cells', 'n_genes']) {
-      if (
-        Object.hasOwn(entry, countKey) &&
-        (
-          !Number.isSafeInteger(entry[countKey]) ||
-          entry[countKey] < 0
-        )
-      ) {
-        throw invalidDemoManifest(
-          `dataset '${entry.id}' has an invalid ${countKey}`,
-          source,
-          { id: entry.id, key: countKey, value: entry[countKey] }
-        );
-      }
-    }
-    const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
-    const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
-    const hasStateBytes = Object.hasOwn(entry, 'state_bytes');
-    if (hasStateManifest !== hasStateSha256 || hasStateManifest !== hasStateBytes) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' state_manifest, state_sha256 and state_bytes must be declared together`,
-        source,
-        { id: entry.id }
-      );
-    }
-    if (
-      hasStateBytes
-      && (!Number.isSafeInteger(entry.state_bytes) || entry.state_bytes < 1)
-    ) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' state_bytes must be the default state's exact positive byte length`,
-        source,
-        { id: entry.id, stateBytes: entry.state_bytes }
-      );
-    }
-    if (
-      hasStateManifest
-      && entry.state_manifest !== 'state-snapshots.json'
-    ) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' state_manifest must be exactly state-snapshots.json`,
-        source,
-        { id: entry.id, stateManifest: entry.state_manifest }
-      );
-    }
-    if (
-      hasStateSha256
-      && (
-        typeof entry.state_sha256 !== 'string'
-        || !/^[0-9a-f]{64}$/.test(entry.state_sha256)
-      )
-    ) {
-      throw invalidDemoManifest(
-        `dataset '${entry.id}' state_sha256 must be one lowercase SHA-256 digest`,
-        source,
-        { id: entry.id, stateSha256: entry.state_sha256 }
-      );
-    }
-  }
-
-  if (
-    typeof manifest.default !== 'string' ||
-    manifest.default.length === 0
-  ) {
-    throw invalidDemoManifest(
-      'an explicit default dataset id is required',
-      source
-    );
-  }
-  if (!ids.has(manifest.default)) {
-    throw invalidDemoManifest(
-      `default '${manifest.default}' is not present in datasets`,
-      source,
-      { default: manifest.default }
-    );
-  }
-  return manifest;
-}
-
-/**
- * Data source for demo datasets stored in an exports directory.
- *
- * Note: in production, exports are typically hosted outside the web app repo
- * (e.g. a separate `cellucid-datasets` repo/site). The base URL is configured
- * via `DATA_CONFIG.EXPORTS_BASE_URL` (index.html meta tag or query param).
- */
 export class LocalDemoDataSource {
   /**
-   * @param {string|null} [baseUrl] - Exact exports directory URL
+   * @param {string|null} [baseUrl] - The catalog folder URL
    * @param {Error|null} [configurationError] - Parsed startup configuration failure
    */
   constructor(
-    baseUrl = DATA_CONFIG.EXPORTS_BASE_URL,
-    configurationError = DATA_CONFIG.EXPORTS_CONFIGURATION_ERROR
+    baseUrl = DATA_CONFIG.SAMPLE_CATALOG_URL,
+    configurationError = DATA_CONFIG.SAMPLE_CATALOG_CONFIGURATION_ERROR
   ) {
     if (
       baseUrl !== null &&
@@ -251,7 +49,7 @@ export class LocalDemoDataSource {
       )
     ) {
       throw new TypeError(
-        'LocalDemoDataSource baseUrl must be one exact absolute directory URL or null.'
+        'LocalDemoDataSource baseUrl must be one exact absolute folder URL or null.'
       );
     }
     if (
@@ -264,25 +62,36 @@ export class LocalDemoDataSource {
     }
     this.baseUrl = baseUrl;
     this.configurationError = configurationError;
-    this.manifestUrl = this.baseUrl === null
+    this.catalogUrl = this.baseUrl === null
       ? null
-      : resolveUrl(
-          this.baseUrl,
-          DATA_CONFIG.DATASETS_MANIFEST
-        );
+      : resolveUrl(this.baseUrl, CATALOG_FILENAME);
     this.type = 'local-demo';
 
-    // Cache
-    this._manifest = null;
+    /** @type {AnnDataCatalog|null} */
+    this._catalog = null;
+    /**
+     * The catalog a refresh replaced: its open datasets stay readable until
+     * the next selection is shown.
+     * @type {AnnDataCatalog|null}
+     */
+    this._retired = null;
+    /** @type {DatasetSummary[]|null} */
     this._datasets = null;
     this._datasetError = null;
-    this._availabilityChecked = false;
-    this._isAvailable = false;
     this._availabilityError = null;
     this._catalogRevision = 0;
     this._catalogController = new AbortController();
-    this._manifestInFlight = null;
+    this._catalogInFlight = null;
     this._datasetsInFlight = null;
+    /**
+     * Whether the catalog is read again because the person asked
+     * (`refresh()`): their retry is one request, never a schedule of
+     * requests behind the failure they are looking at.
+     */
+    this._askOnce = false;
+
+    /** @type {string|null} Dataset whose base URL was handed out last */
+    this.datasetId = null;
   }
 
   _captureCatalogGeneration() {
@@ -298,67 +107,40 @@ export class LocalDemoDataSource {
       owner.controller !== this._catalogController ||
       owner.revision !== this._catalogRevision
     ) {
-      throw createMetadataAbortError(
-        'Sample catalog generation'
-      );
+      throw createMetadataAbortError('Sample catalog generation');
     }
   }
 
-  /**
-   * Get the type identifier for this data source
-   * @returns {string}
-   */
   getType() {
     return this.type;
   }
 
   /**
-   * Check if this data source is available
-   * Uses _loadManifest() to cache the manifest on first check, avoiding duplicate fetches.
+   * Whether the page names a sample catalog that loads.
    * @returns {Promise<boolean>}
    */
   async isAvailable() {
-    if (
-      this.manifestUrl === null &&
-      this.configurationError === null
-    ) {
-      this._availabilityChecked = true;
-      this._isAvailable = false;
+    if (this.catalogUrl === null && this.configurationError === null) {
       return false;
     }
-
-    if (this._availabilityChecked) {
-      if (this._availabilityError !== null) {
-        throw this._availabilityError;
-      }
-      return this._isAvailable;
-    }
-
-    console.log(`[LocalDemoDataSource] isAvailable() checking manifest: ${this.manifestUrl}`);
+    if (this._availabilityError !== null) throw this._availabilityError;
     const owner = this._captureCatalogGeneration();
-
     try {
-      await this._loadManifest(owner);
-      this._assertCatalogGeneration(owner);
-      console.log('[LocalDemoDataSource] Manifest loaded and cached, available=true');
-      this._availabilityChecked = true;
-      this._isAvailable = true;
+      await this._loadCatalog(owner);
       return true;
-    } catch (err) {
+    } catch (error) {
       this._assertCatalogGeneration(owner);
-      this._availabilityChecked = true;
-      this._isAvailable = false;
-      this._availabilityError = err;
-      throw err;
+      this._availabilityError = error;
+      throw error;
     }
   }
 
   /**
-   * Load the datasets manifest
-   * @returns {Promise<Object>}
+   * Load `datasets.json` once per catalog generation.
+   * @returns {Promise<AnnDataCatalog>}
    * @private
    */
-  async _loadManifest(owner = this._captureCatalogGeneration()) {
+  async _loadCatalog(owner = this._captureCatalogGeneration()) {
     this._assertCatalogGeneration(owner);
     if (this.configurationError !== null) {
       throw new DataSourceError(
@@ -368,197 +150,96 @@ export class LocalDemoDataSource {
         { cause: this.configurationError }
       );
     }
-    if (!this.manifestUrl) {
+    if (this.baseUrl === null) {
       throw new DataSourceError(
-        'Sample datasets are not configured. Set exactly one ?exportsBaseUrl=https://host/exports/ query field or one cellucid-exports-base-url meta element.',
+        'Sample datasets are not configured. Set exactly one ?sampleCatalog=https://host/folder/ ' +
+        'query field or one cellucid-sample-catalog meta element.',
         DataSourceErrorCode.INVALID_FORMAT,
         this.type,
-        { hint: 'configure cellucid-exports-base-url' }
+        { hint: 'configure cellucid-sample-catalog' }
       );
     }
-
-    if (this._manifest !== null) {
-      return this._manifest;
-    }
-
-    const current = this._manifestInFlight;
-    if (
-      current?.controller === owner.controller &&
-      current.revision === owner.revision
-    ) {
+    if (this._catalog !== null) return this._catalog;
+    const current = this._catalogInFlight;
+    if (current?.controller === owner.controller && current.revision === owner.revision) {
       return current.promise;
     }
-
     const promise = (async () => {
-      const candidateManifest = await fetchJson(
-        this.manifestUrl,
+      const catalog = await fetchAnnDataCatalog(
+        this.baseUrl,
         this.type,
-        { signal: owner.controller.signal }
+        owner.controller.signal,
+        { askOnce: this._askOnce }
       );
       this._assertCatalogGeneration(owner);
-
-      validateSchemaVersion(
-        candidateManifest.version,
-        DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-        'datasets.json'
-      );
-      validateDemoManifestContract(candidateManifest, this.type);
-      this._assertCatalogGeneration(owner);
-      this._manifest = candidateManifest;
-
-      console.log(`[LocalDemoDataSource] Loaded datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
-      return this._manifest;
+      this._catalog = new AnnDataCatalog({
+        baseUrl: this.baseUrl,
+        catalog,
+        sourceType: this.type,
+        sourceName: SAMPLE_SOURCE_NAME,
+      });
+      return this._catalog;
     })();
-    const inFlight = {
-      controller: owner.controller,
-      revision: owner.revision,
-      promise,
-    };
-    this._manifestInFlight = inFlight;
+    const inFlight = { controller: owner.controller, revision: owner.revision, promise };
+    this._catalogInFlight = inFlight;
     try {
       return await promise;
     } finally {
-      if (this._manifestInFlight === inFlight) {
-        this._manifestInFlight = null;
-      }
+      if (this._catalogInFlight === inFlight) this._catalogInFlight = null;
     }
   }
 
   /**
-   * List all available datasets from this source
-   * @returns {Promise<DatasetMetadata[]>}
+   * What the Sample dataset list shows: every dataset's name and counts, read
+   * from its file's metadata.
+   * @returns {Promise<DatasetSummary[]>}
    */
   async listDatasets() {
-    if (this._datasets) {
-      return this._datasets;
-    }
-    if (this._datasetError !== null) {
-      throw this._datasetError;
-    }
-
+    if (this._datasets) return this._datasets;
+    if (this._datasetError !== null) throw this._datasetError;
     const owner = this._captureCatalogGeneration();
     const current = this._datasetsInFlight;
-    if (
-      current?.controller === owner.controller &&
-      current.revision === owner.revision
-    ) {
+    if (current?.controller === owner.controller && current.revision === owner.revision) {
       return current.promise;
     }
-
-    const promise = this._loadDatasets(owner);
-    const inFlight = {
-      controller: owner.controller,
-      revision: owner.revision,
-      promise,
-    };
+    const promise = (async () => {
+      const catalog = await this._loadCatalog(owner);
+      try {
+        const datasets = await catalog.describe(owner.controller.signal);
+        this._assertCatalogGeneration(owner);
+        this._datasets = datasets;
+        return datasets;
+      } catch (error) {
+        this._assertCatalogGeneration(owner);
+        this._datasetError = error;
+        throw error;
+      }
+    })();
+    const inFlight = { controller: owner.controller, revision: owner.revision, promise };
     this._datasetsInFlight = inFlight;
     try {
       return await promise;
     } finally {
-      if (this._datasetsInFlight === inFlight) {
-        this._datasetsInFlight = null;
-      }
+      if (this._datasetsInFlight === inFlight) this._datasetsInFlight = null;
     }
-  }
-
-  async _loadDatasets(owner) {
-    const manifest = await this._loadManifest(owner);
-    this._assertCatalogGeneration(owner);
-    validateDemoManifestContract(manifest, this.type);
-
-    // Multi-dataset mode: adopt every advertised identity as one atomic
-    // generation. The entries are independent reads, so they are issued as one
-    // batch rather than one round trip after another — the sample picker costs
-    // one network latency instead of one per dataset. loadMetadataBatchAtomically
-    // owns the exactness: the first failure cancels every sibling, no partial
-    // catalog is ever adopted, and results keep manifest order. Same contract
-    // remote-source.js and jupyter-source.js already use for their catalogs.
-    let datasets;
-    try {
-      datasets = await loadMetadataBatchAtomically(
-        manifest.datasets,
-        owner.controller.signal,
-        async (entry, entrySignal) => {
-          try {
-            const datasetBaseUrl = resolveUrl(this.baseUrl, entry.path);
-            const metadata = await loadDatasetMetadata(
-              datasetBaseUrl,
-              entry.id,
-              this.type,
-              { signal: entrySignal }
-            );
-
-            // Override name from manifest if provided (allows short names in manifest)
-            if (entry.name) {
-              metadata.name = entry.name;
-            }
-
-            // Catalog counts are duplicate assertions, never metadata defaults.
-            for (const countKey of ['n_cells', 'n_genes']) {
-              if (
-                Object.hasOwn(entry, countKey) &&
-                entry[countKey] !== metadata.stats[countKey]
-              ) {
-                throw new DataSourceError(
-                  `Dataset '${entry.id}' catalog ${countKey}=${entry[countKey]} does not match dataset_identity.json ${countKey}=${metadata.stats[countKey]}`,
-                  DataSourceErrorCode.INVALID_FORMAT,
-                  this.type,
-                  {
-                    datasetId: entry.id,
-                    key: countKey,
-                    catalogValue: entry[countKey],
-                    identityValue: metadata.stats[countKey],
-                  }
-                );
-              }
-            }
-
-            return metadata;
-          } catch (err) {
-            if (err?.name === 'AbortError') {
-              throw err;
-            }
-            throw new DataSourceError(
-              `Dataset '${entry.id}' is invalid: ${err?.message || err}`,
-              DataSourceErrorCode.INVALID_FORMAT,
-              this.type,
-              { datasetId: entry.id, cause: err }
-            );
-          }
-        },
-        'Sample catalog metadata loading'
-      );
-    } catch (err) {
-      this._assertCatalogGeneration(owner);
-      this._datasetError = err;
-      throw this._datasetError;
-    }
-
-    this._assertCatalogGeneration(owner);
-    this._datasets = datasets;
-    return this._datasets;
   }
 
   /**
-   * Get the explicit current default dataset ID.
+   * The catalog's default dataset id.
    * @returns {Promise<string>}
    */
   async getDefaultDatasetId() {
-    const manifest = await this._loadManifest();
-    validateDemoManifestContract(manifest, this.type);
-    return manifest.default;
+    return (await this._loadCatalog()).defaultDatasetId;
   }
 
   /**
-   * Get metadata for a specific dataset
-   * @param {string} datasetId - Dataset identifier
+   * One dataset's identity: its file is opened (once) to build it.
+   * @param {string} datasetId
    * @returns {Promise<DatasetMetadata>}
    */
   async getMetadata(datasetId) {
-    const datasets = await this.listDatasets();
-    const dataset = datasets.find(d => d.id === datasetId);
-
-    if (!dataset) {
+    const catalog = await this._loadCatalog();
+    if (!catalog.has(datasetId)) {
       throw new DataSourceError(
         `Dataset '${datasetId}' not found`,
         DataSourceErrorCode.NOT_FOUND,
@@ -566,122 +247,114 @@ export class LocalDemoDataSource {
         { datasetId }
       );
     }
-
-    return dataset;
+    return (await catalog.open(datasetId)).metadata;
   }
 
   /**
-   * Get the base URL for loading a dataset's files
-   * @param {string} datasetId - Dataset identifier
+   * @param {string} datasetId
+   * @returns {Promise<boolean>}
+   */
+  async hasDataset(datasetId) {
+    return (await this._loadCatalog()).has(datasetId);
+  }
+
+  /** @private */
+  _openedSource(datasetId) {
+    return this._catalog?.openedSource(datasetId) ?? this._retired?.openedSource(datasetId) ?? null;
+  }
+
+  /**
+   * The base URL of one opened dataset: its h5ad:// or zarr:// URL.
+   * @param {string} datasetId
    * @returns {string}
    */
   getBaseUrl(datasetId) {
-    if (!this._manifest) {
+    const source = this._openedSource(datasetId);
+    if (source === null) {
       throw new DataSourceError(
-        'Dataset catalog has not been loaded',
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-    validateDemoManifestContract(this._manifest, this.type);
-    const entry = this._manifest.datasets.find(
-      dataset => dataset.id === datasetId
-    );
-    if (!entry) {
-      throw new DataSourceError(
-        `Dataset '${datasetId}' not found in datasets.json`,
+        `Sample dataset '${datasetId}' is not open; its metadata is read first`,
         DataSourceErrorCode.NOT_FOUND,
         this.type,
         { datasetId }
       );
     }
-    return resolveUrl(this.baseUrl, entry.path);
+    this.datasetId = datasetId;
+    return source.getBaseUrl(datasetId);
   }
 
   /**
-   * Resolve the explicitly advertised default-state manifest for a dataset.
-   * Catalogs without this current optional capability are never probed.
-   *
-   * @param {string} datasetId - Dataset identifier
-   * @returns {string|null}
+   * The AnnData source one opened dataset is read from (`anndata-provider.js`).
+   * @param {string} datasetId
+   * @returns {Object|null}
+   */
+  getAnnDataSource(datasetId) {
+    return this._openedSource(datasetId);
+  }
+
+  /**
+   * The default view the catalog names for one dataset, or null.
+   * @param {string} datasetId
+   * @returns {{sessionUrl: string, sessionBytes: number, sessionSha256: string}|null}
    */
   getStateDescriptor(datasetId) {
-    const baseUrl = this.getBaseUrl(datasetId);
-    const entry = this._manifest.datasets.find(
-      dataset => dataset.id === datasetId
-    );
-    if (!Object.hasOwn(entry, 'state_manifest')) return null;
-    return {
-      manifestUrl: resolveUrl(baseUrl, entry.state_manifest),
-      stateBytes: entry.state_bytes,
-      stateSha256: entry.state_sha256,
-    };
+    if (this._catalog === null || !this._catalog.has(datasetId)) return null;
+    const session = this._catalog.sessionOf(datasetId);
+    return session === null
+      ? null
+      : { sessionUrl: session.url, sessionBytes: session.bytes, sessionSha256: session.sha256 };
   }
 
   /**
-   * Check if a specific dataset exists
-   * @param {string} datasetId - Dataset identifier
-   * @returns {Promise<boolean>}
+   * Release every open dataset but `keepId` (null releases all).
+   * @param {string|null} keepId
    */
-  async hasDataset(datasetId) {
-    const datasets = await this.listDatasets();
-    return datasets.some(d => d.id === datasetId);
+  releaseExcept(keepId) {
+    this._catalog?.releaseExcept(keepId);
+    if (this._retired !== null && this._retired.openedSource(keepId) === null) {
+      this._retired.close();
+      this._retired = null;
+    }
   }
 
   /**
-   * Refresh the datasets list (clear cache)
+   * Read the catalog again, as one new generation, because the person asked.
+   * The datasets already open stay readable until another is shown.
    */
   refresh() {
+    this._askOnce = true;
     const previousController = this._catalogController;
     this._catalogController = new AbortController();
     this._catalogRevision += 1;
-    previousController.abort(
-      new Error('Sample catalog cache was refreshed')
-    );
-    this._manifestInFlight = null;
+    previousController.abort(new Error('Sample catalog cache was refreshed'));
+    this._catalogInFlight = null;
     this._datasetsInFlight = null;
-    this._manifest = null;
+    if (this._catalog !== null) {
+      this._retired?.close();
+      this._retired = this._catalog;
+    }
+    this._catalog = null;
     this._datasets = null;
     this._datasetError = null;
-    this._availabilityChecked = false;
-    this._isAvailable = false;
     this._availabilityError = null;
   }
 
-  /**
-   * Whether this source requires manual reconnection.
-   * Demo source uses standard HTTP URLs and doesn't need reconnection.
-   * @returns {boolean}
-   */
   requiresManualReconnect() {
     return false;
   }
 
-  /**
-   * Resolve a URL (no-op for demo source as it uses standard HTTP URLs)
-   * @param {string} url - URL to resolve
-   * @returns {Promise<string>}
-   */
-  async resolveUrl(url) {
-    return url;
-  }
-
-  /**
-   * Called when this source is deactivated
-   * No cleanup needed for demo source
-   */
+  /** Another source is shown: its datasets are released. */
   onDeactivate() {
-    // No cleanup needed for demo source
+    this.releaseExcept(null);
   }
 }
 
 /**
- * Create a LocalDemoDataSource instance with the default configuration
+ * A LocalDemoDataSource for the page's sample catalog.
  * @returns {LocalDemoDataSource}
  */
 export function createLocalDemoDataSource() {
   return new LocalDemoDataSource(
-    DATA_CONFIG.EXPORTS_BASE_URL,
-    DATA_CONFIG.EXPORTS_CONFIGURATION_ERROR
+    DATA_CONFIG.SAMPLE_CATALOG_URL,
+    DATA_CONFIG.SAMPLE_CATALOG_CONFIGURATION_ERROR
   );
 }

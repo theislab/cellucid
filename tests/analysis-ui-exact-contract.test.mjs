@@ -19,14 +19,19 @@ import { CorrelationAnalysisUI } from '../assets/js/app/analysis/ui/analysis-typ
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
-import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
+import { createRequestIdTracker } from '../assets/js/app/jobs/cancellable-job.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import {
   capture as captureAnalysisWindows,
   restore as restoreAnalysisWindows,
 } from '../assets/js/app/session/contributors/analysis-windows.js';
 import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
-import { createInMemoryDimensionManager } from '../assets/js/data/dimension-manager.js';
+import { encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
+import {
+  createInMemoryAnnDataDimensionManager,
+  describeOwnVarCount,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
 import { createPageComparisonSelector } from '../assets/js/app/analysis/ui/components/selectors.js';
@@ -758,6 +763,10 @@ function createWindowManagerHarness() {
             exportSettings() {
               return structuredClone(this.importedSettings);
             },
+            exportResult() {
+              return null;
+            },
+            async importResult() {},
             getSelectedPages() {
               return [...this.importedSettings.selectedPages];
             },
@@ -912,7 +921,16 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
     restoreAnalysisWindows(
       { analysisWindowManager: exactManager },
       {},
+      { windows: [] },
+    ),
+    /payload must be typed JSON bytes/i,
+    'the windows chunk is binary typed JSON, never a decoded object',
+  );
+  await assert.rejects(
+    restoreAnalysisWindows(
+      { analysisWindowManager: exactManager },
       {},
+      encodeTypedJson({}),
     ),
     /payload.*exactly.*windows/i,
   );
@@ -932,7 +950,7 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
         },
       },
       {},
-      { windows: [{}] },
+      encodeTypedJson({ windows: [{}] }),
     ),
     error => error === closeError,
   );
@@ -952,7 +970,7 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
         },
       },
       {},
-      { windows: [{ modeId: 'first' }, { modeId: 'second' }] },
+      encodeTypedJson({ windows: [{ modeId: 'first' }, { modeId: 'second' }] }),
     ),
     error => error === restoreError,
   );
@@ -961,24 +979,16 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
 
 /**
  * The smallest DataState a session fingerprint can be taken from: one
- * in-memory 3D layout (keyed "3d"), shown by the live view, and the export
- * data mapping that names it.
+ * in-memory 3D layout (keyed "3d", named obsm['X_umap']), shown by the live
+ * view, and the data mapping that shows it.
  */
 function createFingerprintState() {
   const positionsArray = new Float32Array(9);
-  const dimensionManager = createInMemoryDimensionManager({
+  const dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: positionsArray,
     dimension: 3,
   });
-  const dataMapping = Object.freeze({
-    kind: 'export',
-    embeddings: {
-    enabled: [{ key: '3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
-  },
-    geneNames: 'index',
-    vectorFields: [],
-  });
+  const dataMapping = Object.freeze(inMemoryAnnDataMapping());
   return {
     getDatasetGeneration: () => 0,
     obsData: { fields: [] },
@@ -988,11 +998,13 @@ function createFingerprintState() {
     getDataMappingOrigin: () => 'default',
     describeEmbeddingRefusal: () => null,
     describeMappingChoiceRefusal: () => null,
+    describeMappingVarCount: describeOwnVarCount,
     applyDataMapping: async () => {
       throw new Error('A session on the same mapping applies no mapping.');
     },
     getViewDimensionLevel: () => 3,
     getViewLayoutKey: () => dimensionManager.getViewLayout('live'),
+    getActiveViewId: () => 'live',
     positionsArray,
     varData: { fields: [] },
   };
@@ -1007,6 +1019,7 @@ function createSessionSerializer(contributors) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -1355,8 +1368,6 @@ test('analysis previews invoke their required full-view modal owner', async () =
 });
 
 test('correlation computation rejects insufficient ready data instead of completing with an error sentinel', async () => {
-  let completeCalls = 0;
-  let failCalls = 0;
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     async getDataForPages({ variableKey }) {
@@ -1366,17 +1377,6 @@ test('correlation computation rejects insufficient ready data instead of complet
         values: variableKey === 'age' ? [1, 2] : [3, 4],
         cellIndices: [0, 1],
       }];
-    },
-  };
-  analysis._notifications = {
-    loading() {
-      return 'correlation-notification';
-    },
-    complete() {
-      completeCalls += 1;
-    },
-    fail() {
-      failCalls += 1;
     },
   };
   analysis._getComputeManager = async () => ({
@@ -1395,8 +1395,6 @@ test('correlation computation rejects insufficient ready data instead of complet
     }),
     /page-a.*at least 3 paired values/i,
   );
-  assert.equal(completeCalls, 0);
-  assert.equal(failCalls, 1);
 });
 
 test('2D correlation and volcano plots preselect the cross-browser SVG scatter renderer', async () => {

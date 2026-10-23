@@ -21,6 +21,31 @@
 const SNAPSHOT_PUBLISHED_COLORS = new WeakSet();
 
 /**
+ * How many times each transparency array and each cell visibility mask was
+ * handed out for writing. A result derived from one array (a visibility pass,
+ * `filter-manager.js`) records its count and stays valid while the count does,
+ * whichever view holds the array by then.
+ */
+const TRANSPARENCY_WRITES = new WeakMap();
+const MASK_WRITES = new WeakMap();
+
+/**
+ * @param {Uint8Array} transparency
+ * @returns {number} How many times `transparency` was handed out for writing.
+ */
+export function transparencyArrayWrites(transparency) {
+  return TRANSPARENCY_WRITES.get(transparency) ?? 0;
+}
+
+/**
+ * @param {Uint8Array} mask
+ * @returns {number} How many times `mask` was handed out for writing.
+ */
+export function cellVisibilityMaskWrites(mask) {
+  return MASK_WRITES.get(mask) ?? 0;
+}
+
+/**
  * Record that `colors` was handed to a snapshot view.
  *
  * @param {Uint8Array} colors
@@ -102,11 +127,13 @@ export function writableTransparency(state) {
   if (isHeldByInactiveView(state, transparency)) {
     state.categoryTransparency = new Uint8Array(transparency);
   }
-  // Every transparency write goes through here, so this counter moves on
-  // every write: results derived from the array (category counts) compare it
-  // instead of rescanning the array.
+  // Every transparency write goes through here, so these counters move on
+  // every write: results derived from the array (category counts, visibility
+  // passes) compare them instead of rescanning the array.
   state._transparencyEpoch = transparencyEpoch(state) + 1;
-  return state.categoryTransparency;
+  const writable = state.categoryTransparency;
+  TRANSPARENCY_WRITES.set(writable, transparencyArrayWrites(writable) + 1);
+  return writable;
 }
 
 /**
@@ -122,6 +149,13 @@ export function transparencyEpoch(state) {
 }
 
 /**
+ * Masks proven to hold only 0 and 1 since their last write. Every write goes
+ * through `writableCellVisibilityMask`, which withdraws the proof, so a mask
+ * is checked once per change instead of on every visibility computation.
+ */
+const PROVEN_BINARY_MASKS = new WeakSet();
+
+/**
  * The active view's cell visibility mask, safe to write in place.
  *
  * @param {object} state
@@ -132,5 +166,25 @@ export function writableCellVisibilityMask(state) {
   if (isHeldByInactiveView(state, mask)) {
     state.cellVisibilityMask = new Uint8Array(mask);
   }
-  return state.cellVisibilityMask;
+  const writable = state.cellVisibilityMask;
+  PROVEN_BINARY_MASKS.delete(writable);
+  MASK_WRITES.set(writable, cellVisibilityMaskWrites(writable) + 1);
+  return writable;
+}
+
+/**
+ * Require every entry of a cell visibility mask to be exactly 0 or 1.
+ *
+ * @param {Uint8Array} mask
+ * @returns {Uint8Array}
+ */
+export function requireBinaryCellVisibilityMask(mask) {
+  if (PROVEN_BINARY_MASKS.has(mask)) return mask;
+  for (let index = 0; index < mask.length; index++) {
+    if (mask[index] > 1) {
+      throw new TypeError(`Cell visibility mask entry ${index} must be exactly 0 or 1.`);
+    }
+  }
+  PROVEN_BINARY_MASKS.add(mask);
+  return mask;
 }

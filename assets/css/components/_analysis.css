@@ -847,17 +847,6 @@
 /* Quick Insights Panel - Compact Editorial Style                            */
 /* ========================================================================= */
 
-.quick-insights-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  margin: 0;
-  padding: var(--control-box-padding-y) var(--control-box-padding-x);
-  color: var(--color-text-secondary);
-  font-size: var(--type-hint);
-}
-
 /* Insights Header - Compact */
 .insights-header {
   padding: var(--space-0-5) 0 var(--space-1);

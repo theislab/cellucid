@@ -12,12 +12,13 @@ export const DATA_LOAD_METHODS = Object.freeze({
   SERVER_AUTO: 'server-auto',
   DATASET_DROPDOWN: 'dataset-dropdown',
   DATASET_URL_PARAM: 'dataset-url-param',
-  LOCAL_PREPARED: 'local-user-prepared',
   LOCAL_H5AD: 'local-user-h5ad',
   LOCAL_ZARR_ZIP: 'local-user-zarr-zip',
+  LOCAL_ZARR_FOLDER: 'local-user-zarr-folder',
   REMOTE_URL_PARAM: 'remote-url-param',
   REMOTE_CONNECT: 'remote-connect',
-  GITHUB_URL_PARAM: 'github-url-param',
-  GITHUB_CONNECT: 'github-connect',
+  DATA_URL_PARAM: 'data-url-param',
+  LINK_CONNECT: 'link-connect',
+  SESSION_SOURCE: 'session-source',
   JUPYTER_AUTO: 'jupyter-auto'
 });

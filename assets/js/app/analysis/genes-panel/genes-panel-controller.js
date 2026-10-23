@@ -103,9 +103,6 @@ export class GenesPanelController {
     /** @type {boolean} */
     this._initialized = false;
 
-    /** @type {Promise<void>|null} Exact shared initialization owner */
-    this._initPromise = null;
-
     /** @type {AbortController|null} Current operation abort controller */
     this._currentAbortController = null;
 
@@ -129,9 +126,7 @@ export class GenesPanelController {
   init() {
     this._assertOpen();
     if (this._initialized) return Promise.resolve();
-    if (this._initPromise !== null) return this._initPromise;
 
-    // Initialize engines
     this._discoveryEngine = new MarkerDiscoveryEngine({
       dataLayer: this.dataLayer,
       config: this._config
@@ -146,45 +141,12 @@ export class GenesPanelController {
       config: this._config
     });
 
-    // Initialize cache
     this._cache = new MarkerCache({
       maxCategories: this._config.cacheMaxCategories,
-      maxAgeDays: this._config.cacheMaxAgeDays,
-      cacheVersion: this._config.cacheVersion,
       identity: this._getCacheIdentity()
     });
-    const ownedCache = this._cache;
-
-    const initTask = (async () => {
-      try {
-        await ownedCache.init();
-        this._assertOpen();
-        this._initialized = true;
-      } catch (error) {
-        if (!this._closed && this._cache === ownedCache) {
-          let closeError;
-          try {
-            ownedCache.close();
-          } catch (candidate) {
-            closeError = candidate;
-          }
-          this._discoveryEngine = null;
-          this._matrixBuilder = null;
-          this._clusteringEngine = null;
-          this._cache = null;
-          this._initPromise = null;
-          if (closeError !== undefined) {
-            throw new AggregateError(
-              [error, closeError],
-              'Genes Panel initialization and cache cleanup both failed'
-            );
-          }
-        }
-        throw error;
-      }
-    })();
-    this._initPromise = initTask;
-    return initTask;
+    this._initialized = true;
+    return Promise.resolve();
   }
 
   /**
@@ -207,6 +169,9 @@ export class GenesPanelController {
    * @param {boolean} [options.useCache=true] - Whether to use cached results
    * @param {Function} [options.onProgress] - Progress callback
    * @param {Function} [options.onPartialResults] - Partial results callback
+   * @param {AbortSignal|null} [options.signal] - The run's job's signal
+   *   (`app/jobs/cancellable-job.js`): aborting it cancels the run
+   * @param {string|null} [options.readOwner] - The job the gene reads are for
    * @returns {Promise<GenesPanelResult>} Complete analysis result
    */
   runAnalysis(options) {
@@ -216,6 +181,16 @@ export class GenesPanelController {
       this.abort();
       const abortController = new AbortController();
       this._currentAbortController = abortController;
+      const external = options?.signal ?? null;
+      if (external !== null) {
+        if (external.aborted) abortController.abort(external.reason);
+        else {
+          external.addEventListener('abort', () => abortController.abort(external.reason), {
+            once: true,
+            signal: abortController.signal
+          });
+        }
+      }
       return this._runAnalysis(options, abortController);
     });
   }
@@ -252,7 +227,8 @@ export class GenesPanelController {
         parallelism = 'auto',
         batchConfig: requestedBatchConfig = {},
         onProgress,
-        onPartialResults
+        onPartialResults,
+        readOwner = null
       } = options;
       for (const [name, callback] of [
         ['onProgress', onProgress],
@@ -330,7 +306,8 @@ export class GenesPanelController {
           clusterCols,
           batchConfig,
           onProgress: reportProgress,
-          signal
+          signal,
+          readOwner
         });
         throwIfAborted();
         return customResult;
@@ -385,9 +362,14 @@ export class GenesPanelController {
           batchConfig,
           onProgress: reportProgress,
           onPartialResults: reportPartialResults,
-          signal
+          signal,
+          readOwner
         });
         throwIfAborted();
+
+        // The grouping the markers were computed over, so a later heatmap
+        // rebuild can tell whether their per-group means still apply.
+        markers.stats.groupingDigest = cacheParams.groupingDigest;
 
         // Cache results
         if (useCache) {
@@ -417,8 +399,10 @@ export class GenesPanelController {
         groups,
         transform,
         batchConfig,
+        knownMeans: markers.stats,
         onProgress: reportProgress,
-        signal
+        signal,
+        readOwner
       });
       throwIfAborted();
 
@@ -526,8 +510,14 @@ export class GenesPanelController {
    * @param {any[]} options.groups
    * @param {'none'|'zscore'|'log1p'} [options.transform]
    * @param {Object} [options.batchConfig]
+   * @param {Object|null} [options.markers] - The marker result the genes come
+   *   from: its per-group means are used when it was computed over the
+   *   grouping `obsCodes` describe now
+   * @param {Uint8Array|Uint16Array|Uint32Array} [options.obsCodes] - The
+   *   current codes of the grouping field (from `getGroupsAndCodes`)
    * @param {Function} [options.onProgress]
    * @param {AbortSignal} [options.signal]
+   * @param {string|null} [options.readOwner] - The job the gene reads are for
    * @returns {Promise<any>}
    */
   buildMatrixForGenes(options) {
@@ -560,8 +550,17 @@ export class GenesPanelController {
           groups: ownedGroups,
           transform: options.transform,
           batchConfig: ownedBatchConfig,
+          knownMeans: (
+            options.markers?.stats?.meanInGroupByGroup !== undefined &&
+            options.obsCodes !== undefined &&
+            options.markers.stats.groupingDigest ===
+              computeCategoryGroupingDigest(options.obsCodes)
+          )
+            ? options.markers.stats
+            : null,
           onProgress: options.onProgress,
-          signal: options.signal
+          signal: options.signal,
+          readOwner: options.readOwner ?? null
         };
       }
 
@@ -719,13 +718,6 @@ export class GenesPanelController {
     this._closed = true;
     this.abort();
     const pending = [...this._activeOperations];
-    if (
-      !this._initialized &&
-      this._initPromise !== null &&
-      !pending.includes(this._initPromise)
-    ) {
-      pending.push(this._initPromise);
-    }
 
     if (pending.length === 0) {
       if (!this._cacheClosed && this._cache !== null) {
@@ -798,17 +790,13 @@ export class GenesPanelController {
    * The data generation marker results belong to.
    *
    * A dataset id names a dataset, not the expression values a load brings: a
-   * re-export under the same id, or a re-saved file opened directly, shares
-   * the id with different data. A published export timestamp
-   * (`dataset_identity.json` `created_at`) identifies the generation across
-   * page loads, so only then may results persist. Without one, results are
-   * keyed to this page's load and kept in memory only.
+   * file written again under the same id shares the id with different data.
+   * Results are therefore keyed to this page's load and kept in memory only.
    * @private
    */
   /**
    * The gene list marker results are computed over: the data mapping's
-   * expression matrix (an AnnData file's; a prepared export has one) and the
-   * gene names, which name every gene in a result. A result from one gene
+   * expression matrix and the gene names, which name every gene in a result. A result from one gene
    * list is never served for another.
    *
    * @returns {[string|null, string]}
@@ -829,26 +817,10 @@ export class GenesPanelController {
     const datasetId = this._getDatasetId();
     const geneAxis = this._getGeneAxisIdentity();
     const manager = getDataSourceManager();
-    if (
-      typeof manager.getCurrentMetadata !== 'function' ||
-      typeof manager.getCurrentSelectionRevision !== 'function'
-    ) {
+    if (typeof manager.getCurrentSelectionRevision !== 'function') {
       throw new TypeError(
-        'The active dataset owner must publish its metadata and selection revision'
+        'The active dataset owner must publish its selection revision'
       );
-    }
-    const metadata = manager.getCurrentMetadata();
-    const createdAt = metadata !== null &&
-      typeof metadata === 'object' &&
-      typeof metadata.created_at === 'string' &&
-      metadata.created_at.length > 0
-      ? metadata.created_at
-      : null;
-    if (createdAt !== null) {
-      return {
-        key: JSON.stringify(['export', datasetId, createdAt, geneAxis]),
-        persistent: true,
-      };
     }
     const revision = manager.getCurrentSelectionRevision();
     if (!Number.isSafeInteger(revision) || revision < 0) {
@@ -856,7 +828,6 @@ export class GenesPanelController {
     }
     return {
       key: JSON.stringify(['load', datasetId, revision, geneAxis]),
-      persistent: false,
     };
   }
 
@@ -1151,7 +1122,8 @@ export class GenesPanelController {
       clusterCols,
       batchConfig,
       onProgress,
-      signal
+      signal,
+      readOwner = null
     } = options;
     const throwIfAborted = () => {
       if (signal?.aborted) {
@@ -1216,7 +1188,8 @@ export class GenesPanelController {
       transform,
       batchConfig,
       onProgress,
-      signal
+      signal,
+      readOwner
     });
     throwIfAborted();
 

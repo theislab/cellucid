@@ -11,16 +11,19 @@
  * frame publishes; and Load quoted "0 cells and 0 genes now" as if an empty
  * runtime were a dataset.
  */
+import { SESSION_BUNDLE_MAGIC_BYTES } from '../../assets/js/app/session/bundle/format.js';
+import { readFile, writeFile } from 'node:fs/promises';
+
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 // No `dataset` parameter: the app opens on the catalog default sample.
 const APP_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&acceptance=empty-dataset-state-ci`;
-const SAMPLE_OPTION = 'dataset:local-demo:current-ui-prepared';
-const SAMPLE_NAME = 'Current UI prepared fixture';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&acceptance=empty-dataset-state-ci`;
+const SAMPLE_OPTION = 'dataset:local-demo:current-ui';
+const SAMPLE_NAME = 'Current UI fixture';
 const NO_CELLS_TO_MEASURE = 'Load a dataset or generate benchmark data first.';
 const GENE_MODES = Object.freeze(['differential', 'signature', 'genesPanel']);
 const OTHER_MODES = Object.freeze(['simple', 'detailed', 'correlation']);
@@ -66,6 +69,28 @@ async function saveSession(page, testInfo) {
   const sessionPath = testInfo.outputPath('sample.cellucid-session');
   await (await download).saveAs(sessionPath);
   return sessionPath;
+}
+
+/**
+ * Make a saved session one that records no source, as a session saved on a
+ * local file does, so loading it cannot open its dataset by itself. The
+ * manifest is re-framed in place: `[magic][u32 length][manifest]…`.
+ */
+async function forgetSessionSource(sessionPath) {
+  const bytes = await readFile(sessionPath);
+  const magicLength = SESSION_BUNDLE_MAGIC_BYTES.byteLength;
+  const length = bytes.readUInt32LE(magicLength);
+  const start = magicLength + 4;
+  const manifest = JSON.parse(bytes.subarray(start, start + length).toString('utf8'));
+  const next = Buffer.from(JSON.stringify({ ...manifest, source: null }), 'utf8');
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(next.byteLength, 0);
+  await writeFile(sessionPath, Buffer.concat([
+    bytes.subarray(0, magicLength),
+    header,
+    next,
+    bytes.subarray(start + length),
+  ]));
 }
 
 async function openMode(page, mode) {
@@ -123,6 +148,10 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   await expect(page.locator('#dataset-name')).toHaveText(SAMPLE_NAME);
   await openSections(page);
   const sessionPath = await saveSession(page, testInfo);
+  // A session that records its sample would open it; one saved on a local
+  // file records nothing, and loading it with no dataset open names the one
+  // it needs.
+  await forgetSessionSource(sessionPath);
 
   await page.locator('#dataset-select').selectOption('__none__');
   await expect(page.locator('#dataset-name')).toHaveText('—');
@@ -153,7 +182,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
     hasText: 'No dataset is open.',
   });
   await expect(refusal).toHaveCount(1);
-  await expect(refusal).toContainText('"current-ui-prepared"');
+  await expect(refusal).toContainText('"current-ui"');
   await expect(refusal).not.toContainText('0 cells');
 
   // The modes built on gene expression say so instead of building a form.

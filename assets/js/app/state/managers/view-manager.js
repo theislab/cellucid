@@ -10,7 +10,6 @@ import { BaseManager } from '../core/base-manager.js';
 import { viewContextCoreMethods } from './view-context-core.js';
 import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { isAnnDataActive } from '../../../data/anndata-provider.js';
 import { MappingLoadError } from '../../../data/data-mapping-candidates.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
@@ -142,9 +141,6 @@ function cloneCentroidState(owner) {
     colors: owner.centroidColors === null
       ? null
       : new Uint8Array(owner.centroidColors),
-    outliers: owner.centroidOutliers === null
-      ? null
-      : new Float32Array(owner.centroidOutliers),
     labels: owner.centroidLabels.map(label => (
       label === null ? null : { ...label }
     )),
@@ -158,8 +154,6 @@ function requireStagedCentroids(owner, label) {
     !(owner.centroidColors instanceof Uint8Array) ||
     owner.centroidColors.length !==
       (owner.centroidPositions.length / 3) * 4 ||
-    !(owner.centroidOutliers instanceof Float32Array) ||
-    owner.centroidOutliers.length !== owner.centroidPositions.length / 3 ||
     !Array.isArray(owner.centroidLabels)
   ) {
     throw new TypeError(`${label} produced incomplete centroid buffers.`);
@@ -379,8 +373,7 @@ export class DataStateViewMethods {
     }
 
     const silent = options.silent;
-    const needsLocalNotif = isAnnDataActive();
-    const notifications = (!silent && needsLocalNotif) ? getNotificationCenter() : null;
+    const notifications = silent ? null : getNotificationCenter();
     const descriptor = vectorFieldManager
       .getAvailableFields()
       .find((field) => field.id === fieldId);
@@ -404,17 +397,17 @@ export class DataStateViewMethods {
       viewer,
       viewContexts: this.viewContexts,
     });
+    let readReported = false;
     try {
-      const fieldData = await vectorFieldManager.loadField(
-        fieldId,
-        layoutKey,
-        { showProgress: !silent && !needsLocalNotif }
-      );
+      const fieldData = await vectorFieldManager.loadField(fieldId, layoutKey);
       assertCurrentVectorLoadOwner(this, loadOwner);
-      viewer.setVectorFieldData(fieldId, layoutKey, fieldData);
+      // The notification reports the read; drawing the field is the overlay's,
+      // which reports its own failure (its caller shows it once).
       if (notifications !== null) {
         notifications.complete(notifId, `Loaded ${level}D ${descriptor.label}`);
+        readReported = true;
       }
+      viewer.setVectorFieldData(fieldId, layoutKey, fieldData);
       return true;
     } catch (error) {
       // A replaced manager aborts its downloads; a load whose owner is gone
@@ -427,7 +420,7 @@ export class DataStateViewMethods {
       if (terminalError instanceof MappingLoadError) {
         this._markMappingChoiceUnusable('vectorFields', terminalError.key, terminalError.reason);
       }
-      if (notifications !== null) {
+      if (notifications !== null && !readReported) {
         if (isDatasetViewLoadSupersededError(terminalError)) {
           notifications.dismiss(notifId);
         } else {
@@ -792,7 +785,6 @@ export class DataStateViewMethods {
         } finally {
           this.centroidPositions = previousGlobalCentroids.positions;
           this.centroidColors = previousGlobalCentroids.colors;
-          this.centroidOutliers = previousGlobalCentroids.outliers;
           this.centroidLabels = previousGlobalCentroids.labels;
         }
       }
@@ -849,12 +841,10 @@ export class DataStateViewMethods {
         if (stagedCentroids !== null) {
           context.centroidPositions = stagedCentroids.positions;
           context.centroidColors = stagedCentroids.colors;
-          context.centroidOutliers = stagedCentroids.outliers;
           context.centroidLabels = stagedCentroids.labels;
           if (isActiveView) {
             this.centroidPositions = stagedCentroids.positions;
             this.centroidColors = stagedCentroids.colors;
-            this.centroidOutliers = stagedCentroids.outliers;
             this.centroidLabels = stagedCentroids.labels;
           }
         }
@@ -866,11 +856,9 @@ export class DataStateViewMethods {
         }
         context.centroidPositions = previousContextCentroids.positions;
         context.centroidColors = previousContextCentroids.colors;
-        context.centroidOutliers = previousContextCentroids.outliers;
         context.centroidLabels = previousContextCentroids.labels;
         this.centroidPositions = previousGlobalCentroids.positions;
         this.centroidColors = previousGlobalCentroids.colors;
-        this.centroidOutliers = previousGlobalCentroids.outliers;
         this.centroidLabels = previousGlobalCentroids.labels;
 
         const publicationErrors = [];

@@ -1,5 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('analysis worker pool initializes and computes the exact result', async ({ page }) => {
@@ -19,12 +19,12 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=analysis-worker-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=analysis-worker-ci`,
     { waitUntil: 'domcontentloaded' }
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const proof = await page.evaluate(async () => {
@@ -70,7 +70,10 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
     busyWorkers: 0,
     idleWorkers: 1,
     pendingRequests: 0,
-    queuedTasks: 0
+    queuedTasks: 0,
+    // No task was cancelled, so no worker was replaced.
+    replacedWorkers: 0,
+    lastReplacementMs: null
   });
   expect(browserErrors).toEqual([]);
 });

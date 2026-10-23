@@ -8,6 +8,7 @@ import {
 } from '../assets/js/app/community-annotations/github-sync.js';
 import {
   ANNOTATION_FILE_MAX_UTF8_BYTES,
+  composeUserFile,
 } from '../assets/js/app/community-annotations/wire-contract.js';
 
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
@@ -56,8 +57,10 @@ function userDocumentAtCanonicalByteLength(targetBytes) {
     votes: {},
   };
   const encoder = new TextEncoder();
-  const canonicalByteLength = () =>
-    encoder.encode(JSON.stringify(document, null, 2) + '\n').byteLength;
+  // The bound is on the published file, which wraps the view's section.
+  const canonicalByteLength = () => encoder.encode(
+    JSON.stringify(composeUserFile(null, 'synthetic', document), null, 2) + '\n'
+  ).byteLength;
   let nextVote = 0;
 
   while (true) {
@@ -72,7 +75,7 @@ function userDocumentAtCanonicalByteLength(targetBytes) {
       1,
       Math.min(
         50_000 - nextVote,
-        Math.floor((remaining - 1_000) / 142)
+        Math.floor((remaining - 1_000) / 146)
       )
     );
     assert.ok(rows >= 1, 'canonical fixture must remain tunable');

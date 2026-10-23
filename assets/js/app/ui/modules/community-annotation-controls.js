@@ -31,7 +31,7 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationFileCache } from '../../community-annotations/file-cache.js';
 import { describeCacheScope, toCacheScopeKey, toSessionStorageKey } from '../../community-annotations/cache-scope.js';
-import { getCommunityAnnotationCacheContext, syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
+import { annotationDatasetIdOf, getCommunityAnnotationCacheContext, syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 import { getUrlAnnotationRepo, setUrlAnnotationRepo } from '../../url-state.js';
 import { getGitHubAuthSession, toGitHubUserKey } from '../../community-annotations/github-auth.js';
 import {
@@ -1269,7 +1269,7 @@ export function initCommunityAnnotationControls({
     }
     const did =
       datasetId === null
-        ? dataSourceManager?.getCurrentDatasetId?.()
+        ? annotationDatasetIdOf(dataSourceManager)
         : datasetId;
     const currentAuthKey = toGitHubUserKey(githubAuth.getUser());
     const key = userKey === null ? currentAuthKey : userKey;
@@ -1631,7 +1631,7 @@ export function initCommunityAnnotationControls({
   });
 
   const setDatasetContextFromManager = () => {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const datasetId = annotationDatasetIdOf(dataSourceManager) || null;
     const owner = applySessionCacheContext({ datasetId });
 
     const paramRepo = getUrlAnnotationRepo();
@@ -1746,7 +1746,7 @@ export function initCommunityAnnotationControls({
     const msg = toCleanString(evt?.message || '') || 'Lost cross-tab lock. Disconnected annotation repo.';
     abortActiveSync(msg);
     disconnectAnnotationRepo({
-      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
       message: msg,
       notify: 'error',
@@ -1758,7 +1758,7 @@ export function initCommunityAnnotationControls({
     const msg = toCleanString(evt?.message || '') || 'Unable to acquire cross-tab lock. Disconnected annotation repo.';
     abortActiveSync(msg);
     disconnectAnnotationRepo({
-      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
       message: msg,
       notify: 'error',
@@ -1770,7 +1770,7 @@ export function initCommunityAnnotationControls({
     const msg = toCleanString(evt?.message || '') || 'Local persistence failed. Disconnected annotation repo.';
     abortActiveSync(msg);
     disconnectAnnotationRepo({
-      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
       message: msg,
       notify: 'error',
@@ -1782,7 +1782,7 @@ export function initCommunityAnnotationControls({
     const msg = toCleanString(evt?.message || '') || 'Annotation data integrity error. Disconnected annotation repo.';
     abortActiveSync(msg);
     disconnectAnnotationRepo({
-      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
       message: msg,
       notify: 'error',
@@ -1960,7 +1960,7 @@ export function initCommunityAnnotationControls({
     { repoOverride = null, quiet = false, confirmDatasetMismatch = false },
     { entryOwner, opAbort },
   ) {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const datasetId = annotationDatasetIdOf(dataSourceManager) || null;
     if (!datasetId) {
       syncError = 'Missing dataset context.';
       return { status: 'failed', error: syncError };
@@ -2759,7 +2759,7 @@ export function initCommunityAnnotationControls({
   }
 
   async function publishExclusive({ opAbort }) {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const datasetId = annotationDatasetIdOf(dataSourceManager) || null;
     if (!datasetId) {
       syncError = 'Missing dataset context.';
       return { status: 'failed', error: syncError };

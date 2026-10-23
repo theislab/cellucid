@@ -13,16 +13,24 @@ import {
   writeBundle,
 } from '../assets/js/app/session/bundle/writer.js';
 import {
-  decodeDeltaUvarint,
-  encodeDeltaUvarint,
-} from '../assets/js/app/session/codecs/delta-varint.js';
+  CELL_SET_BITSET,
+  CELL_SET_REFERENCE_ALL,
+  CELL_SET_REFERENCE_MASK,
+  CELL_SET_RUNS,
+  CELL_SET_SORTED_DELTA,
+  decodeCellSet,
+  digestCellSet,
+  encodeCellSet,
+} from '../assets/js/app/session/codecs/cell-set.js';
 import {
-  decodeTable,
-  encodeTable,
-} from '../assets/js/app/session/codecs/table-codec.js';
+  decodeTypedJson,
+  encodeTypedJson,
+} from '../assets/js/app/session/codecs/typed-json.js';
 import {
   decodeUvarint,
-  pushUvarint,
+  encodeUvarints,
+  uvarintLength,
+  writeUvarint,
 } from '../assets/js/app/session/codecs/varint.js';
 import {
   UserDefinedFieldsRegistry,
@@ -31,14 +39,6 @@ import {
   capture as captureCinematicCamera,
   restore as restoreCinematicCamera,
 } from '../assets/js/app/session/contributors/cinematic-camera.js';
-import {
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
-  capture as captureAnalysisArtifacts,
-  restore as restoreAnalysisArtifact,
-} from '../assets/js/app/session/contributors/analysis-artifacts.js';
-import {
-  DataLayer,
-} from '../assets/js/app/analysis/data/data-layer.js';
 import {
   capture as captureFieldOverlays,
   restore as restoreFieldOverlays,
@@ -70,8 +70,10 @@ import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
-  createInMemoryDimensionManager,
-} from '../assets/js/data/dimension-manager.js';
+  createInMemoryAnnDataDimensionManager,
+  describeOwnVarCount,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 import {
   getNotificationCenter,
 } from '../assets/js/app/notification-center.js';
@@ -97,10 +99,6 @@ import { untilEntered } from './helpers/entered.mjs';
 
 const dockableSource = await readFile(
   new URL('../assets/js/app/session/contributors/dockable-layout.js', import.meta.url),
-  'utf8',
-);
-const analysisArtifactsSource = await readFile(
-  new URL('../assets/js/app/session/contributors/analysis-artifacts.js', import.meta.url),
   'utf8',
 );
 const mainSource = await readFile(
@@ -147,14 +145,19 @@ function installDocumentById(entries = {}) {
   };
 }
 
-test('integer and delta codecs reject coercion, overflow, duplicates, and trailing bytes', async () => {
+test('integer codecs reject coercion, overflow, non-canonical bytes and bad offsets', () => {
   for (const invalid of ['1', -1, 1.5, Number.NaN, 2 ** 53]) {
-    assert.throws(() => pushUvarint(invalid, []), /integer|safe|value/i);
+    assert.throws(() => uvarintLength(invalid), /integer|safe|value/i);
+    assert.throws(() => writeUvarint(new Uint8Array(10), 0, invalid), /integer|safe|value/i);
   }
   for (const invalid of ['1', -1, 1.5, 2 ** 32]) {
     assert.throws(() => u32ToBytesLE(invalid), /u32|integer/i);
   }
-
+  for (const value of [0, 1, 127, 128, 16383, 16384, 2 ** 31, 2 ** 32 + 5, 2 ** 53 - 1]) {
+    const bytes = encodeUvarints([value]);
+    assert.equal(bytes.byteLength, uvarintLength(value));
+    assert.deepEqual(decodeUvarint(bytes), { value, nextOffset: bytes.byteLength });
+  }
   assert.throws(
     () => decodeUvarint(new Uint8Array([0x80, 0x00])),
     /canonical/i,
@@ -163,197 +166,121 @@ test('integer and delta codecs reject coercion, overflow, duplicates, and traili
     () => decodeUvarint(new Uint8Array([0x00]), -1),
     /offset/i,
   );
-  assert.throws(
-    () => encodeDeltaUvarint([3, 3]),
-    /duplicate|strict/i,
-  );
-  assert.throws(
-    () => encodeDeltaUvarint([2 ** 32]),
-    /uint32|index/i,
-  );
+});
 
-  const canonical = encodeDeltaUvarint([1, 4]);
-  const withTrailing = new Uint8Array(canonical.byteLength + 1);
-  withTrailing.set(canonical);
+test('cell sets round-trip in every encoding and the writer keeps the smallest', async () => {
+  const cellCount = 1000;
+  const decode = (bytes, reference = null) => decodeCellSet(bytes, { cellCount, reference, signal: null });
+  // Sparse: sorted deltas. Dense and scattered: a bitset. Contiguous: runs.
+  const sparse = Uint32Array.from([3, 500, 999]);
+  const dense = Uint32Array.from({ length: 600 }, (_value, index) => index + Math.floor(index / 2));
+  const contiguous = Uint32Array.from({ length: 400 }, (_value, index) => 100 + index);
+  for (const [cells, encoding] of [
+    [sparse, CELL_SET_SORTED_DELTA],
+    [dense, CELL_SET_BITSET],
+    [contiguous, CELL_SET_RUNS],
+  ]) {
+    const bytes = encodeCellSet(cells, { cellCount, reference: null });
+    assert.equal(bytes[0], encoding);
+    assert.deepEqual(await decode(bytes), cells);
+  }
+  // Unsorted input is sorted once; duplicates and out-of-range cells are refused.
+  assert.deepEqual(await decode(encodeCellSet([999, 3, 500], { cellCount, reference: null })), sparse);
+  assert.throws(() => encodeCellSet([3, 3], { cellCount, reference: null }), /duplicates/i);
+  assert.throws(() => encodeCellSet([cellCount], { cellCount, reference: null }), /exceeds/i);
+  assert.throws(() => encodeCellSet([2 ** 32], { cellCount, reference: null }), /32-bit/i);
+
+  // Trailing bytes, bits past the cell count, and an unknown encoding.
+  const delta = encodeCellSet(sparse, { cellCount, reference: null });
+  const withTrailing = new Uint8Array(delta.byteLength + 1);
+  withTrailing.set(delta);
+  await assert.rejects(decode(withTrailing), /trailing/i);
+  const bitset = encodeCellSet(dense, { cellCount, reference: null });
+  const pastEnd = bitset.slice();
+  pastEnd[pastEnd.byteLength - 1] |= 0x80;
+  await assert.rejects(decodeCellSet(pastEnd, { cellCount: 999, reference: null, signal: null }), /wrong length|past/i);
+  await assert.rejects(decode(Uint8Array.from([9, 0])), /encoding 9/);
+  // Runs that overlap or touch are not canonical.
+  await assert.rejects(decode(Uint8Array.from([CELL_SET_RUNS, 2, 0, 2, 0, 2])), /separated/i);
+});
+
+test('a category highlight is stored relative to its category and refused when the category moved', async () => {
+  const cellCount = 100_000;
+  const reference = Uint32Array.from({ length: 30_000 }, (_value, index) => index * 3);
+  const all = encodeCellSet(reference, { cellCount, reference });
+  assert.equal(all[0], CELL_SET_REFERENCE_ALL);
+  assert.ok(all.byteLength < 10, 'a whole category costs a few bytes');
+  assert.deepEqual(await decodeCellSet(all, { cellCount, reference, signal: null }), reference);
+
+  const subset = reference.filter((_cell, index) => index % 4 !== 0);
+  const mask = encodeCellSet(subset, { cellCount, reference });
+  assert.equal(mask[0], CELL_SET_REFERENCE_MASK);
+  assert.deepEqual(await decodeCellSet(mask, { cellCount, reference, signal: null }), subset);
+
+  // A selection that is not inside the category is stored on its own.
+  const outside = Uint32Array.from([1, ...subset.subarray(1)]).sort();
+  assert.notEqual(encodeCellSet(outside, { cellCount, reference })[0], CELL_SET_REFERENCE_MASK);
+
+  // The reader derives the category again and checks it is the same cells.
+  const moved = reference.slice();
+  moved[0] = 1;
   await assert.rejects(
-    decodeDeltaUvarint(withTrailing, {
-      maxCount: null,
-      maxIndex: null,
-      signal: null,
-    }),
-    /trailing/i,
+    decodeCellSet(all, { cellCount, reference: moved, signal: null }),
+    /no longer holds the same cells/,
   );
+  await assert.rejects(
+    decodeCellSet(all, { cellCount, reference: null, signal: null }),
+    /relative to a category/,
+  );
+  // The digest is order-independent within a set and sensitive to membership.
+  assert.equal(digestCellSet(reference), digestCellSet(reference.slice()));
+  assert.notEqual(digestCellSet(reference), digestCellSet(moved));
 });
 
-test('table codec accepts only its closed current schema and consumes every byte', () => {
-  assert.throws(
-    () => encodeTable({
-      rowCount: '2',
-      columns: [{ name: 'x', dtype: 'uint8', data: new Uint8Array([1, 2]) }],
-    }),
-    /rowCount.*integer/i,
+test('typed JSON keys named like prototype members decode as own keys', () => {
+  const value = JSON.parse(
+    '{"__proto__": {"polluted": true}, "constructor": [1], "prototype": "x", "nested": {"__proto__": 2}}',
   );
-  assert.throws(
-    () => encodeTable({
-      rowCount: 2,
-      columns: [{ name: 'x', dtype: 'uint8', data: [1, 2] }],
-    }),
-    /Uint8Array|typed array/i,
-  );
-  assert.throws(
-    () => encodeTable({
-      rowCount: 2,
-      columns: [{ name: 'flag', dtype: 'bool', data: [0, 1] }],
-    }),
-    /boolean/i,
-  );
+  assert.ok(Object.hasOwn(value, '__proto__'), 'the fixture itself holds an own "__proto__" key');
+  const decoded = decodeTypedJson(encodeTypedJson(value));
+  for (const key of ['__proto__', 'constructor', 'prototype', 'nested']) {
+    assert.ok(Object.hasOwn(decoded, key), `"${key}" is an own key`);
+  }
+  assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(decoded, '__proto__').value, { polluted: true });
+  assert.deepEqual(decoded.constructor, [1]);
+  assert.equal(decoded.prototype, 'x');
+  assert.ok(Object.hasOwn(decoded.nested, '__proto__'));
+  assert.equal(Object.getPrototypeOf(decoded.nested), Object.prototype);
+  assert.equal(({}).polluted, undefined, 'no prototype was touched');
+});
 
-  const encoded = encodeTable({
-    rowCount: 2,
-    columns: [{ name: 'x', dtype: 'uint8', data: new Uint8Array([1, 2]) }],
-  });
-  const withTrailing = new Uint8Array(encoded.byteLength + 1);
-  withTrailing.set(encoded);
-  assert.throws(() => decodeTable(withTrailing), /trailing/i);
-
-  const meta = {
-    rowCount: 1,
-    columns: [{
-      name: 'x',
-      dtype: 'uint8',
-      byteLength: 1,
-    }],
+test('typed JSON stores numeric columns as their bytes and refuses ambiguous values', () => {
+  const value = {
+    genes: ['CD3E', 'MS4A1'],
+    columns: { log2fc: Float32Array.from([1.5, -2]), padj: Float64Array.from([1e-300, 0.5]) },
+    counts: [Uint32Array.from([7, 8]), Int32Array.from([-1, 2])],
+    note: null,
   };
-  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-  const missingEncoding = new Uint8Array(4 + metaBytes.byteLength + 1);
-  missingEncoding.set(u32ToBytesLE(metaBytes.byteLength), 0);
-  missingEncoding.set(metaBytes, 4);
-  missingEncoding[missingEncoding.length - 1] = 4;
-  assert.throws(
-    () => decodeTable(missingEncoding),
-    /exact keys|encoding/i,
-  );
-});
-
-test('table codec preserves every legal prototype-named column as an ordinary own record', () => {
-  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-  const encoded = encodeTable({
-    rowCount: 1,
-    columns: prototypeNames.map((name, index) => ({
-      name,
-      dtype: 'uint8',
-      data: Uint8Array.of(index),
-    })),
-  });
-
-  const decoded = decodeTable(encoded);
-  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
-  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
-  for (const [index, name] of prototypeNames.entries()) {
-    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
-    assert.deepEqual(Array.from(decoded.columns[name]), [index], name);
-    assert.deepEqual(
-      Object.getOwnPropertyDescriptor(decoded.columns, name),
-      {
-        configurable: true,
-        enumerable: true,
-        value: decoded.columns[name],
-        writable: true,
-      },
-      name,
-    );
-  }
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
-});
-
-test('table codec boolean decode preserves every prototype-named column and exact descriptor', () => {
-  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-  const expectedValues = prototypeNames.map((_, index) => [
-    index % 2 === 0,
-    index % 3 === 0,
-  ]);
-  const decoded = decodeTable(encodeTable({
-    rowCount: 2,
-    columns: prototypeNames.map((name, index) => ({
-      name,
-      dtype: 'bool',
-      data: expectedValues[index],
-    })),
-  }));
-
-  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
-  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
-  for (const [index, name] of prototypeNames.entries()) {
-    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
-    assert.deepEqual(
-      Array.from(decoded.columns[name]),
-      expectedValues[index].map(Number),
-      name,
-    );
-    assert.deepEqual(
-      Object.getOwnPropertyDescriptor(decoded.columns, name),
-      {
-        configurable: true,
-        enumerable: true,
-        value: decoded.columns[name],
-        writable: true,
-      },
-      name,
-    );
-  }
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
-});
-
-test('table codec string decode preserves every prototype-named column and exact descriptor', () => {
-  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-  const expectedValues = prototypeNames.map((name, index) => [
-    `${name}-${index}-first`,
-    `${name}-${index}-second`,
-  ]);
-  const decoded = decodeTable(encodeTable({
-    rowCount: 2,
-    columns: prototypeNames.map((name, index) => ({
-      name,
-      dtype: 'string',
-      data: expectedValues[index],
-    })),
-  }));
-
-  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
-  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
-  for (const [index, name] of prototypeNames.entries()) {
-    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
-    assert.deepEqual(decoded.columns[name], expectedValues[index], name);
-    assert.deepEqual(
-      Object.getOwnPropertyDescriptor(decoded.columns, name),
-      {
-        configurable: true,
-        enumerable: true,
-        value: decoded.columns[name],
-        writable: true,
-      },
-      name,
-    );
-  }
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
+  const bytes = encodeTypedJson(value);
+  const decoded = decodeTypedJson(bytes);
+  assert.deepEqual(decoded, value);
+  assert.ok(decoded.columns.log2fc instanceof Float32Array);
+  assert.ok(decoded.columns.padj instanceof Float64Array);
+  assert.throws(() => encodeTypedJson({ $typed: 0 }), /reserved key/);
+  assert.throws(() => encodeTypedJson({ x: Number.NaN }), /finite/);
+  assert.throws(() => encodeTypedJson({ x: new BigInt64Array(1) }), /unsupported/);
+  // An array the value does not name, or a name with no array, is refused.
+  const withExtra = new Uint8Array(bytes.byteLength + 2);
+  withExtra.set(bytes);
+  withExtra.set([1, 0], bytes.byteLength);
+  assert.throws(() => decodeTypedJson(withExtra), /does not name/);
+  const dangling = encodeTypedJson({ a: [1] });
+  const text = new TextDecoder().decode(dangling.subarray(4)).replace('[1]', '{"$typed":0}');
+  const forged = new Uint8Array(4 + text.length);
+  new DataView(forged.buffer).setUint32(0, text.length, true);
+  forged.set(new TextEncoder().encode(text), 4);
+  assert.throws(() => decodeTypedJson(forged), /does not hold/);
 });
 
 test('bundle framing rejects chunk-count mismatches and trailing bytes', async () => {
@@ -390,18 +317,10 @@ test('bundle framing rejects chunk-count mismatches and trailing bytes', async (
 });
 
 /**
- * The export data mapping of a dataset whose one embedding is an in-memory 3D
+ * The data mapping of a dataset whose one embedding is an in-memory 3D
  * layout (keyed "3d").
  */
-const IN_MEMORY_3D_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: {
-    enabled: [{ key: '3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
-  },
-  geneNames: 'index',
-  vectorFields: [],
-});
+const IN_MEMORY_3D_MAPPING = Object.freeze(inMemoryAnnDataMapping());
 
 /**
  * What a session fingerprint reads from a DataState besides its counts: the
@@ -409,7 +328,7 @@ const IN_MEMORY_3D_MAPPING = Object.freeze({
  * layout, the live layout key and the dataset's data mapping.
  */
 function fingerprintOwners(positionsArray) {
-  const dimensionManager = createInMemoryDimensionManager({
+  const dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: positionsArray,
     dimension: 3,
   });
@@ -417,7 +336,10 @@ function fingerprintOwners(positionsArray) {
     positionsArray,
     dimensionManager,
     getDataMapping: () => IN_MEMORY_3D_MAPPING,
+    describeMappingVarCount: describeOwnVarCount,
     getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
+    // The manifest's `requires` is read from the focused view's state.
+    getActiveViewId: () => 'live',
   };
 }
 
@@ -448,6 +370,7 @@ function makeSessionSerializer(contributors, pointCount = 3) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -578,6 +501,7 @@ function makeHighlightSerializer(state, contributors) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors,
   });
 }
@@ -961,6 +885,8 @@ test('session controls treat exact cancel and supersession as silent no-ops', as
         settled: true,
         whenSettled: async () => {},
       },
+      currentDatasetIdentityId: () => null,
+      openDatasetSource: async () => false,
       sessionSerializer: serializer,
       onAfterLoad() {
         afterLoads += 1;
@@ -1149,7 +1075,9 @@ test('highlight restore commits once after exact lazy cells and preserves old st
           failureState,
           [highlightsMetaContributor, highlightsCellsContributor],
         ).restoreFromBlob(corruptBundle),
-        /trailing bytes/i,
+        // A sorted-delta or runs payload has trailing bytes; a bitset has the
+        // wrong length for the cell count. Both are refused before staging.
+        /trailing bytes|wrong length/i,
       );
       assert.strictEqual(failureState.highlightPages, oldPages);
       assert.equal(failureState.activePageId, 'page_9');
@@ -1257,10 +1185,7 @@ test('highlight restore commits once after exact lazy cells and preserves old st
 
 test('dataset fingerprints are complete exact identities, never partial matches', () => {
   const manager = {
-    getCurrentSourceType() {
-      return 'local-user';
-    },
-    getCurrentDatasetId() {
+    getCurrentIdentityId() {
       return 'dataset-a';
     },
   };
@@ -1279,12 +1204,13 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     },
   });
   assert.deepEqual(fingerprint, {
-    sourceType: 'local-user',
     datasetId: 'dataset-a',
+    // The manager publishes no metadata, so no name.
+    name: null,
     cellCount: 3,
     varCount: 2,
     cellOrder: {
-      embedding: { key: '3d', columns: null },
+      embedding: { key: 'X_umap', columns: [0, 1, 2] },
       dimension: 3,
       digest: fingerprint.cellOrder.digest,
     },
@@ -1294,7 +1220,8 @@ test('dataset fingerprints are complete exact identities, never partial matches'
   assert.equal(datasetFingerprintMatches(fingerprint, { ...fingerprint }), true);
 
   for (const incomplete of [
-    { sourceType: 'local-user', datasetId: 'dataset-a' },
+    { datasetId: 'dataset-a' },
+    { ...fingerprint, sourceType: 'local-user' },
     { ...fingerprint, cellCount: '3' },
     { ...fingerprint, legacyDatasetName: 'A' },
     { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, digest: undefined } },
@@ -1303,9 +1230,14 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     { ...fingerprint, cellOrder: { dimension: 3, digest: fingerprint.cellOrder.digest } },
     {
       ...fingerprint,
-      cellOrder: { ...fingerprint.cellOrder, embedding: { key: '3d', columns: [0, 1, 2] } },
+      cellOrder: { ...fingerprint.cellOrder, embedding: { key: 'X_umap', columns: null } },
     },
-    { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, latent: null } },
+    {
+      ...fingerprint,
+      cellOrder: { ...fingerprint.cellOrder, embedding: { key: 'X_umap', columns: [0, 1] } },
+    },
+    { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, kind: 'export' } },
+    { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, dimension: 3 } },
     { ...fingerprint, dataMapping: null },
   ]) {
     assert.throws(
@@ -1313,16 +1245,20 @@ test('dataset fingerprints are complete exact identities, never partial matches'
       /fingerprint|exact|cellCount|dimension|hexadecimal|embedding|dataMapping/i,
     );
   }
-  // Every one of the six fields is part of the identity, the embedding and
-  // the data mapping included.
+  // The name is for messages only; it is not part of the identity.
+  assert.equal(
+    datasetFingerprintMatches(fingerprint, { ...fingerprint, name: 'Another title' }),
+    true,
+  );
+  // Every other field is part of the identity, the embedding and the data
+  // mapping included.
   for (const different of [
-    { ...fingerprint, sourceType: 'remote' },
     { ...fingerprint, datasetId: 'dataset-b' },
     { ...fingerprint, cellCount: 4 },
     { ...fingerprint, varCount: 3 },
     {
       ...fingerprint,
-      cellOrder: { ...fingerprint.cellOrder, embedding: { key: 'X_umap_3d', columns: null } },
+      cellOrder: { ...fingerprint.cellOrder, embedding: { key: 'X_umap_3d', columns: [0, 1, 2] } },
     },
     { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, digest: '0123456789abcdef' } },
     { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, geneNames: 'column:symbol' } },
@@ -1330,24 +1266,17 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     assert.equal(datasetFingerprintMatches(fingerprint, different), false);
   }
 
-  // A record carrying only the four scalars is a session written before cell
-  // identity existed. It cannot be checked against anything, so it is refused
-  // rather than accepted on the strength of its scalars.
+  // A record carrying only the four scalars is not a format-2 fingerprint.
   assert.throws(
     () => datasetFingerprintMatches(
       {
-        sourceType: 'local-user',
         datasetId: 'dataset-a',
         cellCount: 3,
         varCount: 2,
       },
       fingerprint,
     ),
-    error => {
-      assert.ok(error instanceof RangeError);
-      assert.match(error.message, /which cells a selection contains/);
-      return true;
-    },
+    /exact keys/,
   );
 });
 
@@ -1365,6 +1294,7 @@ test('session context uses only explicitly supplied current owners', () => {
         comparisonModule: null,
         analysisWindowManager: null,
         cinematicCamera: null,
+        figureExport: null,
       }, {
         abortSignal: null,
         restoreTransaction: null,
@@ -1981,6 +1911,7 @@ test('cinematic rollback restores nonzero playing and paused timeline snapshots 
     restoreCinematicCamera(
       {
         cinematicCamera: cameraOwner,
+        figureExport: null,
         restoreTransaction: transaction,
       },
       {},
@@ -2129,6 +2060,7 @@ test('cinematic transaction stops stale RAF and resumes exact old timeline after
     restoreCinematicCamera(
       {
         cinematicCamera: owner,
+        figureExport: null,
         restoreTransaction: transaction,
       },
       {},
@@ -2309,8 +2241,8 @@ test('highlight constructors publish explicit enabled state and metadata uses ex
   }];
   owner.activePageId = 'page_1';
   owner._highlightIdCounter = 0;
-  owner.getCellIndicesForCategory = () => [0, 2];
-  owner.getCellIndicesForRange = () => [1];
+  owner.getCellIndicesForCategory = () => Uint32Array.from([0, 2]);
+  owner.getCellIndicesForRange = () => Uint32Array.from([1]);
   owner._recomputeHighlightArray = () => {};
   owner._notifyHighlightChange = () => {};
 
@@ -2346,12 +2278,11 @@ test('highlight constructors publish explicit enabled state and metadata uses ex
   owner.getHighlightPages = () => owner.highlightPages;
   owner.getActivePageId = () => owner.activePageId;
   const [{ payload }] = captureHighlightMeta({ state: owner });
+  // Field-bound groups are saved by name; positions are resolved on restore.
   assert.deepEqual(Object.keys(payload.pages[0].highlightedGroups[0]).sort(), [
-    'categoryIndex',
     'categoryName',
     'cellCount',
     'enabled',
-    'fieldIndex',
     'fieldKey',
     'fieldSource',
     'id',
@@ -2361,7 +2292,6 @@ test('highlight constructors publish explicit enabled state and metadata uses ex
   assert.deepEqual(Object.keys(payload.pages[0].highlightedGroups[1]).sort(), [
     'cellCount',
     'enabled',
-    'fieldIndex',
     'fieldKey',
     'fieldSource',
     'id',
@@ -2380,7 +2310,7 @@ test('highlight constructors publish explicit enabled state and metadata uses ex
 });
 
 test('highlight cell restore requires staged metadata and rejects count mismatches atomically', async () => {
-  const payload = encodeDeltaUvarint([1]);
+  const payload = encodeCellSet([1], { cellCount: 3, reference: null });
   const stateWithoutGroup = {
     pointCount: 3,
     highlightPages: [],
@@ -2525,6 +2455,88 @@ test('user-defined codes reject trailing bytes and dataset length mismatch befor
   assert.equal(invalidViewIdentity.template.codes, null);
 });
 
+test('user-defined codes decode raw, runs and packed payloads exactly and refuse non-canonical ones', async () => {
+  function restoreInto(pointCount, payload) {
+    const template = {
+      _userDefinedId: 'field-a',
+      _isUserDefined: true,
+      kind: 'category',
+      key: 'restored_groups',
+      codes: null,
+      loaded: false,
+      _codesLengthHint: pointCount,
+      _codesTypeHint: 'Uint8Array',
+      centroidsByLayout: new Map(),
+      categories: ['a', 'b', 'c', 'd', 'e'],
+    };
+    const state = {
+      pointCount,
+      dimensionManager: createInMemoryAnnDataDimensionManager({
+        positions: new Float32Array(pointCount * 3),
+        dimension: 3,
+      }),
+      obsData: { fields: [] },
+      varData: { fields: [] },
+      viewContexts: new Map(),
+      getUserDefinedFieldsRegistry() {
+        return { getField: id => (id === 'field-a' ? template : null) };
+      },
+      getActiveField() {
+        return null;
+      },
+    };
+    return restoreUserDefinedCodes(
+      { state, abortSignal: null },
+      userDefinedCodesChunkMeta(payload),
+      payload,
+    ).then(() => template.codes);
+  }
+  const codes = [0, 1, 2, 3, 3, 1];
+  // 0 raw, 1 runs (value, length), 2 packed (2 bits per code, LSB first).
+  assert.deepEqual([...await restoreInto(6, Uint8Array.from([0, 6, ...codes]))], codes);
+  assert.deepEqual(
+    [...await restoreInto(6, Uint8Array.from([1, 6, 5, 0, 1, 1, 1, 2, 1, 3, 2, 1, 1]))],
+    codes,
+  );
+  const packed = Uint8Array.from([2, 6, 2, 0b11100100, 0b0111]);
+  assert.deepEqual([...await restoreInto(6, packed)], codes);
+
+  // Bits past the last code, an unsupported width, and adjacent equal runs.
+  await assert.rejects(restoreInto(6, Uint8Array.from([2, 6, 2, 0b11100100, 0b10111])), /past their length/);
+  await assert.rejects(restoreInto(6, Uint8Array.from([2, 6, 3, 0, 0, 0])), /1, 2 or 4 bits/);
+  await assert.rejects(restoreInto(2, Uint8Array.from([1, 2, 2, 1, 1, 1, 1])), /distinct/);
+  await assert.rejects(restoreInto(2, Uint8Array.from([7, 2, 0, 0])), /encoding/);
+});
+
+test('user-defined codes are written in their smallest encoding', () => {
+  function captureCodes(codes) {
+    const field = { _userDefinedId: 'field-a', kind: 'category', key: 'groups', codes };
+    const [chunk] = captureUserDefinedCodes({
+      state: {
+        pointCount: codes.length,
+        obsData: { fields: [] },
+        varData: { fields: [] },
+        viewContexts: new Map(),
+        activeFieldSource: null,
+        activeFieldIndex: -1,
+        activeVarFieldIndex: -1,
+        getUserDefinedFieldsRegistry: () => ({ getAllFields: () => [field] }),
+        getActiveField: () => null,
+      },
+    });
+    return chunk.payload;
+  }
+  const n = 4096;
+  // Few long runs: runs. Scattered among 3 codes: 2-bit packed (a quarter of
+  // raw). Scattered among 200 codes: raw.
+  assert.equal(captureCodes(new Uint8Array(n).fill(1, n / 2))[0], 1);
+  const scattered3 = Uint8Array.from({ length: n }, (_v, i) => (i * 7919) % 3);
+  const packed = captureCodes(scattered3);
+  assert.equal(packed[0], 2);
+  assert.equal(packed[packed.length - Math.ceil(n * 2 / 8) - 1], 2, 'two bits per code');
+  assert.equal(captureCodes(Uint8Array.from({ length: n }, (_v, i) => (i * 7919) % 200))[0], 0);
+});
+
 test('dynamic code and highlight chunks reject each dishonest metadata field before mutation', async () => {
   const codePayload = new Uint8Array([0, 3, 0, 1, 0]);
   const codeTemplate = {
@@ -2578,7 +2590,7 @@ test('dynamic code and highlight chunks reject each dishonest metadata field bef
     assert.equal(codeTemplate.codes, null);
   }
 
-  const highlightPayload = encodeDeltaUvarint([1, 2]);
+  const highlightPayload = encodeCellSet([1, 2], { cellCount: 3, reference: null });
   const oldPages = [{
     id: 'page_9',
     name: 'Old',
@@ -3039,6 +3051,7 @@ test('generic restore rejects reordered same-priority user code chunks and rolls
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors: [{
       id: 'field-overlays',
       capture: captureFieldOverlays,
@@ -3072,21 +3085,6 @@ test('generic restore rejects reordered same-priority user code chunks and rolls
   assert.strictEqual(registry.getField('old-field').codes, oldCodes);
 });
 
-function exactAnalysisArtifact() {
-  return {
-    kind: 'bulk-gene',
-    cacheKey: 'bulk_genes:page/α',
-    gene: 'IL/7',
-    pageId: 'page/1',
-    pageName: 'Memory T',
-    cellCount: 2,
-    timestamp: 123456789,
-    geneCount: 4,
-    values: new Float32Array([1.25, -2.5]),
-    cellIndices: new Uint32Array([3, 9]),
-  };
-}
-
 function exactCameraPathState(overrides = {}) {
   return {
     autoplay: false,
@@ -3112,40 +3110,7 @@ function exactCameraPathState(overrides = {}) {
   };
 }
 
-function analysisChunkMeta(chunk, overrides = {}) {
-  const payloadBytes = chunk.kind === 'json'
-    ? new TextEncoder().encode(JSON.stringify(chunk.payload)).byteLength
-    : chunk.payload.byteLength;
-  return {
-    id: chunk.id,
-    contributorId: chunk.contributorId,
-    priority: chunk.priority,
-    kind: chunk.kind,
-    codec: chunk.codec,
-    label: chunk.label,
-    datasetDependent: chunk.datasetDependent,
-    storedBytes: payloadBytes,
-    uncompressedBytes: payloadBytes,
-    ...overrides,
-  };
-}
-
-test('generic restore rolls back cinematic state and analysis cache after a later artifact failure', async () => {
-  const initialArtifact = exactAnalysisArtifact();
-  const firstTargetArtifact = {
-    ...exactAnalysisArtifact(),
-    cacheKey: 'bulk_genes:target-a',
-    gene: 'TARGET_A',
-    pageId: 'target-a',
-    pageName: 'Target A',
-  };
-  const failingTargetArtifact = {
-    ...exactAnalysisArtifact(),
-    cacheKey: 'bulk_genes:target-b',
-    gene: 'TARGET_FAIL',
-    pageId: 'target-b',
-    pageName: 'Target B',
-  };
+test('generic restore rolls back cinematic state after a later lazy chunk fails', async () => {
   const initialCamera = exactCameraPathState({
     defaultSpeed: '20',
     navigationMode: 'planar',
@@ -3154,10 +3119,25 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     defaultSpeed: '80',
     navigationMode: 'free',
   });
-  const analysisContributor = {
-    id: 'analysis-artifacts',
-    capture: captureAnalysisArtifacts,
-    restore: restoreAnalysisArtifact,
+  // A lazy chunk applied after the camera path, whose restore fails.
+  const lateFailure = new Error('late chunk failed');
+  const lateContributor = {
+    id: 'late-content',
+    capture() {
+      return [{
+        id: 'late/one',
+        contributorId: 'late-content',
+        priority: 'lazy',
+        kind: 'binary',
+        codec: 'gzip',
+        label: 'Late content',
+        datasetDependent: true,
+        payload: Uint8Array.from([1, 2, 3]),
+      }];
+    },
+    restore() {
+      throw lateFailure;
+    },
   };
   const sourceSerializer = new SessionSerializer({
     state: {
@@ -3171,15 +3151,10 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [firstTargetArtifact, failingTargetArtifact];
-        },
-      },
-    },
+    comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: {},
+    figureExport: null,
     contributors: [{
       id: 'cinematic-camera',
       capture() {
@@ -3195,7 +3170,7 @@ test('generic restore rolls back cinematic state and analysis cache after a late
         }];
       },
       restore() {},
-    }, analysisContributor],
+    }, lateContributor],
   });
   const bundle = await sourceSerializer.createSessionBundle();
 
@@ -3226,35 +3201,6 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     },
     stopAutoplay() {},
   };
-  const initialCacheArtifact = structuredClone(initialArtifact);
-  let cache = [initialCacheArtifact];
-  let rollbackPreservedBuffers = false;
-  const dataLayer = {
-    beginSessionCacheReplacement() {
-      const previousCache = cache;
-      cache = [];
-      return {
-        commit() {},
-        rollback() {
-          cache = previousCache;
-          rollbackPreservedBuffers =
-            cache[0].values === initialCacheArtifact.values
-            && cache[0].cellIndices === initialCacheArtifact.cellIndices;
-        },
-      };
-    },
-    exportSessionCache() {
-      return cache;
-    },
-    importSessionCache(value) {
-      const artifacts = Array.isArray(value) ? value : [value];
-      if (artifacts.some(artifact => artifact.gene === 'TARGET_FAIL')) {
-        return 0;
-      }
-      cache.push(...structuredClone(artifacts));
-      return artifacts.length;
-    },
-  };
   const destinationSerializer = new SessionSerializer({
     state: {
       getViewDimensionLevel: () => 3,
@@ -3265,14 +3211,15 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
-    comparisonModule: { dataLayer },
+    comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: cameraOwner,
+    figureExport: null,
     contributors: [{
       id: 'cinematic-camera',
       capture: captureCinematicCamera,
       restore: restoreCinematicCamera,
-    }, analysisContributor],
+    }, lateContributor],
   });
 
   const previousAnimationFrame = globalThis.requestAnimationFrame;
@@ -3284,7 +3231,7 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     await withNotificationHarness(async () => {
       await assert.rejects(
         destinationSerializer.restoreFromBlob(bundle),
-        /importSessionCache.*exactly one/i,
+        error => error === lateFailure,
       );
     });
   } finally {
@@ -3296,475 +3243,6 @@ test('generic restore rolls back cinematic state and analysis cache after a late
   }
 
   assert.deepEqual(cameraState, initialCamera);
-  assert.deepEqual(cache, [initialArtifact]);
-  assert.equal(rollbackPreservedBuffers, true);
-});
-
-test('generic empty analysis inventory replaces stale cache and cannot be omitted', async () => {
-  const analysisContributor = {
-    id: 'analysis-artifacts',
-    capture: captureAnalysisArtifacts,
-    restore: restoreAnalysisArtifact,
-  };
-  const source = new SessionSerializer({
-    state: {
-      getDatasetGeneration: () => 0,
-      obsData: { fields: [] },
-      pointCount: 3,
-      getViewDimensionLevel: () => 3,
-      ...fingerprintOwners(new Float32Array(9)),
-      varData: { fields: [] },
-    },
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [];
-        },
-      },
-    },
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    contributors: [analysisContributor],
-  });
-  const bundle = await source.createSessionBundle();
-  const { manifest } = await readBundle(bundle, {
-    signal: null,
-    onProgress: null,
-  });
-  assert.deepEqual(
-    manifest.chunks.map(chunk => chunk.id),
-    ['analysis/cache-inventory'],
-  );
-
-  const oldArtifact = exactAnalysisArtifact();
-  const oldCache = [oldArtifact];
-  let cache = oldCache;
-  let replacements = 0;
-  let imports = 0;
-  const dataLayer = {
-    beginSessionCacheReplacement() {
-      replacements += 1;
-      const previous = cache;
-      cache = [];
-      return {
-        commit() {},
-        rollback() {
-          cache = previous;
-        },
-      };
-    },
-    importSessionCache(value) {
-      imports += 1;
-      cache.push(value);
-      return 1;
-    },
-  };
-  const destination = new SessionSerializer({
-    state: {
-      getViewDimensionLevel: () => 3,
-      pointCount: 3,
-      ...fingerprintOwners(new Float32Array(9)),
-      varData: { fields: [] },
-    },
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: { dataLayer },
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    contributors: [analysisContributor],
-  });
-  await withNotificationHarness(
-    () => destination.restoreFromBlob(bundle),
-  );
-  assert.deepEqual(cache, []);
-  assert.equal(replacements, 1);
-  assert.equal(imports, 0);
-
-  const omitted = await rewriteSessionBundle(
-    bundle,
-    (rewrittenManifest, chunks) => {
-      rewrittenManifest.chunks.length = 0;
-      chunks.length = 0;
-    },
-  );
-  cache = oldCache;
-  replacements = 0;
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      destination.restoreFromBlob(omitted),
-      /require singleton chunk "analysis\/cache-inventory"/i,
-    );
-  });
-  assert.strictEqual(cache, oldCache);
-  assert.equal(replacements, 0);
-});
-
-test('analysis inventory enforces exact artifact order and count transactionally', () => {
-  const first = exactAnalysisArtifact();
-  const second = {
-    ...exactAnalysisArtifact(),
-    cacheKey: 'bulk_genes:second',
-    gene: 'SECOND',
-    pageId: 'page-2',
-    pageName: 'Second',
-  };
-  const chunks = captureAnalysisArtifacts({
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [first, second];
-        },
-      },
-    },
-  });
-
-  function createHarness() {
-    const oldArtifact = exactAnalysisArtifact();
-    const oldCache = [oldArtifact];
-    let cache = oldCache;
-    let importCalls = 0;
-    const dataLayer = {
-      beginSessionCacheReplacement() {
-        const previous = cache;
-        cache = [];
-        return {
-          commit() {},
-          rollback() {
-            cache = previous;
-          },
-        };
-      },
-      importSessionCache(value) {
-        importCalls += 1;
-        cache.push(value);
-        return 1;
-      },
-    };
-    const transaction = createSessionRestoreTransaction();
-    return {
-      context: {
-        comparisonModule: { dataLayer },
-        restoreTransaction: transaction,
-      },
-      getCache() {
-        return cache;
-      },
-      getImportCalls() {
-        return importCalls;
-      },
-      oldCache,
-      transaction,
-    };
-  }
-
-  const reordered = createHarness();
-  restoreAnalysisArtifact(
-    reordered.context,
-    analysisChunkMeta(chunks[0]),
-    chunks[0].payload,
-  );
-  assert.throws(
-    () => restoreAnalysisArtifact(
-      reordered.context,
-      analysisChunkMeta(chunks[2]),
-      chunks[2].payload,
-    ),
-    /does not match advertised cache inventory/i,
-  );
-  assert.equal(reordered.getImportCalls(), 0);
-  reordered.transaction.rollback();
-  assert.strictEqual(reordered.getCache(), reordered.oldCache);
-
-  const incomplete = createHarness();
-  restoreAnalysisArtifact(
-    incomplete.context,
-    analysisChunkMeta(chunks[0]),
-    chunks[0].payload,
-  );
-  restoreAnalysisArtifact(
-    incomplete.context,
-    analysisChunkMeta(chunks[1]),
-    chunks[1].payload,
-  );
-  assert.throws(
-    () => incomplete.transaction.commit(),
-    /advertised 2 artifacts but restored 1/i,
-  );
-  assert.strictEqual(incomplete.getCache(), incomplete.oldCache);
-
-  const exact = createHarness();
-  for (const chunk of chunks) {
-    restoreAnalysisArtifact(
-      exact.context,
-      analysisChunkMeta(chunk),
-      chunk.payload,
-    );
-  }
-  assert.doesNotThrow(() => exact.transaction.commit());
-  assert.deepEqual(
-    exact.getCache().map(artifact => artifact.gene),
-    ['IL/7', 'SECOND'],
-  );
-});
-
-test('analysis cache replacement swaps exact Map and LRU identities without copying', () => {
-  const layer = Object.create(DataLayer.prototype);
-  const values = new Float32Array([1, 2]);
-  const previousCache = new Map([['cache-a', {
-    data: { GENE: { page: { values } } },
-  }]]);
-  const previousOrder = ['cache-a'];
-  layer._bulkGeneCache = previousCache;
-  layer._bulkGeneCacheAccessOrder = previousOrder;
-  layer._bulkGeneCacheGeneration = 0;
-  layer._bulkGeneCacheReplacementOwner = null;
-
-  const replacement = layer.beginSessionCacheReplacement();
-  assert.notStrictEqual(layer._bulkGeneCache, previousCache);
-  assert.notStrictEqual(layer._bulkGeneCacheAccessOrder, previousOrder);
-  layer._bulkGeneCache.set('target', {});
-  layer._bulkGeneCacheAccessOrder.push('target');
-  replacement.commit();
-  replacement.rollback();
-  assert.strictEqual(layer._bulkGeneCache, previousCache);
-  assert.strictEqual(layer._bulkGeneCacheAccessOrder, previousOrder);
-  assert.strictEqual(
-    layer._bulkGeneCache.get('cache-a').data.GENE.page.values,
-    values,
-  );
-});
-
-test('session cache replacement generation-isolates in-flight analysis writes', async () => {
-  function createLayer() {
-    const layer = Object.create(DataLayer.prototype);
-    const oldCache = new Map([['old', {
-      data: {},
-      timestamp: Date.now(),
-      geneCount: 0,
-    }]]);
-    const oldOrder = ['old'];
-    layer._bulkGeneCache = oldCache;
-    layer._bulkGeneCacheAccessOrder = oldOrder;
-    layer._bulkGeneCacheGeneration = 0;
-    layer._bulkGeneCacheReplacementOwner = null;
-    layer._bulkGeneCacheMaxAge = 60_000;
-    layer._bulkGeneCacheMaxSize = 5;
-    layer._notifications = null;
-    layer.refreshPageVersions = () => {};
-    layer.getAvailableVariables = () => [{
-      key: 'GENE',
-    }];
-    let enter;
-    let release;
-    const entered = new Promise(resolve => {
-      enter = resolve;
-    });
-    layer.getDataForPages = () => new Promise(resolve => {
-      release = () => resolve([{
-        pageId: 'page_1',
-        pageName: 'Page 1',
-        values: new Float32Array([1]),
-        cellIndices: new Uint32Array([0]),
-        cellCount: 1,
-      }]);
-      enter();
-    });
-    return {
-      entered,
-      layer,
-      oldCache,
-      oldOrder,
-      release() {
-        release();
-      },
-    };
-  }
-
-  const before = createLayer();
-  const beforeFetch = before.layer.fetchBulkGeneExpression({
-    pageIds: ['page_1'],
-    geneList: ['GENE'],
-  });
-  await before.entered;
-  const beforeReplacement = before.layer.beginSessionCacheReplacement();
-  before.layer._bulkGeneCache.set('session', {
-    data: {},
-    timestamp: 1,
-    geneCount: 0,
-  });
-  before.layer._bulkGeneCacheAccessOrder.push('session');
-  before.release();
-  await beforeFetch;
-  assert.deepEqual([...before.layer._bulkGeneCache.keys()], ['session']);
-  beforeReplacement.rollback();
-  assert.strictEqual(before.layer._bulkGeneCache, before.oldCache);
-  assert.strictEqual(
-    before.layer._bulkGeneCacheAccessOrder,
-    before.oldOrder,
-  );
-
-  const during = createLayer();
-  const duringReplacement = during.layer.beginSessionCacheReplacement();
-  during.layer._bulkGeneCache.set('session', {
-    data: {},
-    timestamp: 1,
-    geneCount: 0,
-  });
-  during.layer._bulkGeneCacheAccessOrder.push('session');
-  const duringFetch = during.layer.fetchBulkGeneExpression({
-    pageIds: ['page_1'],
-    geneList: ['GENE'],
-  });
-  await during.entered;
-  duringReplacement.commit();
-  during.release();
-  await duringFetch;
-  assert.deepEqual([...during.layer._bulkGeneCache.keys()], ['session']);
-});
-
-test('analysis artifacts round-trip every exact cache identity and metadata field', () => {
-  const artifact = exactAnalysisArtifact();
-  const chunks = captureAnalysisArtifacts({
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [artifact];
-        },
-      },
-    },
-  });
-  assert.equal(chunks.length, 2);
-  assert.deepEqual(chunks[0], {
-    ...ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
-    payload: {
-      artifactIds: [
-        'analysis/artifacts/bulk-gene/bulk_genes%3Apage%2F%CE%B1/IL%2F7/page%2F1',
-      ],
-    },
-  });
-  assert.equal(
-    chunks[1].id,
-    'analysis/artifacts/bulk-gene/bulk_genes%3Apage%2F%CE%B1/IL%2F7/page%2F1',
-  );
-
-  const imported = [];
-  restoreAnalysisArtifact({
-    comparisonModule: {
-      dataLayer: {
-        importSessionCache(value) {
-          imported.push(value);
-          return 1;
-        },
-      },
-    },
-  }, analysisChunkMeta(chunks[1]), chunks[1].payload);
-
-  assert.equal(imported.length, 1);
-  assert.deepEqual(imported[0], artifact);
-  assert.notEqual(imported[0].values, artifact.values);
-  assert.notEqual(imported[0].cellIndices, artifact.cellIndices);
-});
-
-test('analysis artifacts reject missing owners, malformed exports, and noncanonical identities', () => {
-  assert.throws(
-    () => captureAnalysisArtifacts({ comparisonModule: null }),
-    /comparisonModule|dataLayer.*exportSessionCache/i,
-  );
-
-  const malformed = exactAnalysisArtifact();
-  malformed.cacheKey = 7;
-  assert.throws(
-    () => captureAnalysisArtifacts({
-      comparisonModule: {
-        dataLayer: {
-          exportSessionCache() {
-            return [malformed];
-          },
-        },
-      },
-    }),
-    /cacheKey.*string/i,
-  );
-
-  const artifact = exactAnalysisArtifact();
-  const chunks = captureAnalysisArtifacts({
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [artifact];
-        },
-      },
-    },
-  });
-  const chunk = chunks[1];
-  let importCalls = 0;
-  const restoreContext = {
-    comparisonModule: {
-      dataLayer: {
-        importSessionCache() {
-          importCalls += 1;
-          return 1;
-        },
-      },
-    },
-  };
-  assert.throws(
-    () => restoreAnalysisArtifact(
-      restoreContext,
-      analysisChunkMeta(chunk, {
-        id: chunk.id.replace('%2F', '%2f'),
-      }),
-      chunk.payload,
-    ),
-    /canonical|chunk id/i,
-  );
-  assert.equal(importCalls, 0);
-  assert.throws(
-    () => restoreAnalysisArtifact(
-      restoreContext,
-      analysisChunkMeta(chunk),
-      new Uint8Array([0]),
-    ),
-    /payload|metadata|table/i,
-  );
-  assert.equal(importCalls, 0);
-});
-
-test('analysis artifact import refusal is a public restore failure', () => {
-  const artifact = exactAnalysisArtifact();
-  const chunks = captureAnalysisArtifacts({
-    comparisonModule: {
-      dataLayer: {
-        exportSessionCache() {
-          return [artifact];
-        },
-      },
-    },
-  });
-  const chunk = chunks[1];
-  assert.throws(
-    () => restoreAnalysisArtifact({
-      comparisonModule: {
-        dataLayer: {
-          importSessionCache() {
-            return 0;
-          },
-        },
-      },
-    }, analysisChunkMeta(chunk), chunk.payload),
-    /importSessionCache.*exactly one/i,
-  );
-});
-
-test('analysis artifact contributor has no optional, coercive, or malformed-skip route', () => {
-  assert.doesNotMatch(
-    analysisArtifactsSource,
-    /\?\.|\bString\(|catch\s*\{[^}]*return|continue;|return\s*\[\s*\]\s*;/s,
-  );
 });
 
 test('multiview validates its closed graph before clearing current views', async () => {
@@ -3779,6 +3257,12 @@ test('multiview validates its closed graph before clearing current views', async
     restoreContext() {},
     getActiveViewId() {
       return 'live';
+    },
+    getFields() {
+      return [];
+    },
+    getVarFields() {
+      return [];
     },
     setActiveView() {},
   };
@@ -3803,7 +3287,6 @@ test('multiview validates its closed graph before clearing current views', async
         return { restored: 0, skippedNoop: 0 };
       },
       async restoreActiveFields() {},
-      pushViewerState() {},
     }, {
       layout: {
         mode: 'single',
@@ -3811,11 +3294,18 @@ test('multiview validates its closed graph before clearing current views', async
         liveViewHidden: false,
       },
       camerasLocked: true,
-      liveCameraState: exactCameraState(),
+      live: {
+        cameraState: exactCameraState(),
+        centroids: { points: false, labels: false },
+      },
       snapshots: [],
-      legacyFocusedView: 'live',
+      focusedView: 'live',
+    }, {
+      embedding: { key: 'X_umap', columns: [0, 1, 2] },
+      filters: {},
+      activeFields: { activeFieldKey: null, activeFieldSource: null },
     }),
-    /exact keys|legacyFocusedView/i,
+    /exact keys/i,
   );
   assert.equal(clearCalls, 0);
 });

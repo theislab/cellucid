@@ -82,7 +82,7 @@ export function initContinuousSelectionPreview(options) {
       hideRangeLabel();
       const standing = selectionState.annotationCandidateSet;
       if (standing !== null && standing.size > 0) {
-        state.setPreviewHighlightFromIndices(standing.toArray());
+        state.setPreviewHighlightFromIndices(standing.toUint32Array());
       } else {
         state.clearPreviewHighlight();
       }
@@ -106,7 +106,9 @@ export function initContinuousSelectionPreview(options) {
       fieldKind: field.kind,
       cellCount: state.pointCount
     });
-    const combinedIndices = candidates === null ? [] : candidates.toArray();
+    const combinedIndices = candidates === null
+      ? new Uint32Array(0)
+      : candidates.toUint32Array();
 
     if (combinedIndices.length > 0) {
       state.setPreviewHighlightFromIndices(combinedIndices);

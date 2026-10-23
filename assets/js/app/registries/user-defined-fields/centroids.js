@@ -141,22 +141,55 @@ export function computeCentroidsForDimension(codes, categories, positions, dim) 
   const sumsZ = new Float64Array(numCategories);
   const counts = new Uint32Array(numCategories);
 
-  for (let i = 0; i < pointCount; i++) {
-    const cat = codes[i];
-    if (cat === missingCode) continue;
-    if (cat >= numCategories) {
-      throw new RangeError(`Centroid category code ${i} is outside the category inventory`);
-    }
-    const base = i * dim;
+  // One loop per dimension, each adding its axes in cell order (so every sum
+  // is the same Float64 sequence of additions). `v - v` is 0 exactly for a
+  // finite `v` and NaN otherwise, which tests finiteness without a call.
+  const rejectPosition = (cell) => {
     for (let axis = 0; axis < dim; axis++) {
-      if (!Number.isFinite(positions[base + axis])) {
-        throw new TypeError(`Centroid position ${i}, axis ${axis} must be finite`);
+      if (!Number.isFinite(positions[cell * dim + axis])) {
+        throw new TypeError(`Centroid position ${cell}, axis ${axis} must be finite`);
       }
     }
-    sumsX[cat] += positions[base];
-    if (dim >= 2) sumsY[cat] += positions[base + 1];
-    if (dim >= 3) sumsZ[cat] += positions[base + 2];
-    counts[cat]++;
+  };
+  const rejectCode = (cell) => {
+    throw new RangeError(`Centroid category code ${cell} is outside the category inventory`);
+  };
+  if (dim === 1) {
+    for (let i = 0; i < pointCount; i++) {
+      const cat = codes[i];
+      if (cat === missingCode) continue;
+      if (cat >= numCategories) rejectCode(i);
+      const x = positions[i];
+      if (x - x !== 0) rejectPosition(i);
+      sumsX[cat] += x;
+      counts[cat]++;
+    }
+  } else if (dim === 2) {
+    for (let i = 0, base = 0; i < pointCount; i++, base += 2) {
+      const cat = codes[i];
+      if (cat === missingCode) continue;
+      if (cat >= numCategories) rejectCode(i);
+      const x = positions[base];
+      const y = positions[base + 1];
+      if (x - x !== 0 || y - y !== 0) rejectPosition(i);
+      sumsX[cat] += x;
+      sumsY[cat] += y;
+      counts[cat]++;
+    }
+  } else {
+    for (let i = 0, base = 0; i < pointCount; i++, base += 3) {
+      const cat = codes[i];
+      if (cat === missingCode) continue;
+      if (cat >= numCategories) rejectCode(i);
+      const x = positions[base];
+      const y = positions[base + 1];
+      const z = positions[base + 2];
+      if (x - x !== 0 || y - y !== 0 || z - z !== 0) rejectPosition(i);
+      sumsX[cat] += x;
+      sumsY[cat] += y;
+      sumsZ[cat] += z;
+      counts[cat]++;
+    }
   }
 
   const out = [];

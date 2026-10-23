@@ -6,7 +6,7 @@
  *
  * A category's original identifier is its **label**, never its position in the
  * inventory. Position is not identity: a session's dataset fingerprint pins the
- * cells and their coordinates, not the obs schema, so the same dataset exported
+ * cells and their coordinates, not the obs schema, so the same dataset written
  * again from the same embedding with one more cell type restores cleanly with
  * every category after the insertion point shifted by one. A registry keyed by
  * position would then move a rename onto its neighbour and colour, label, and
@@ -97,6 +97,7 @@ export class RenameRegistry extends BaseRegistry {
     } else {
       this._fieldRenames.set(mapKey, displayKey);
     }
+    this._recordEdit(source, originalKey);
   }
 
   getDisplayKey(source, originalKey) {
@@ -120,6 +121,7 @@ export class RenameRegistry extends BaseRegistry {
     StateValidator.validateFieldKey(originalKey);
     const mapKey = makeFieldId(source, originalKey);
     this._fieldRenames.delete(mapKey);
+    this._recordEdit(source, originalKey);
   }
 
   // ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ export class RenameRegistry extends BaseRegistry {
     } else {
       this._categoryRenames.set(mapKey, displayLabel);
     }
+    this._recordEdit(source, originalFieldKey);
   }
 
   /**
@@ -173,6 +176,7 @@ export class RenameRegistry extends BaseRegistry {
     this._categoryRenames.delete(
       makeCategoryId(source, originalFieldKey, originalLabel)
     );
+    this._recordEdit(source, originalFieldKey);
   }
 
   // ---------------------------------------------------------------------------
@@ -202,14 +206,29 @@ export class RenameRegistry extends BaseRegistry {
     this._fieldRenames = new Map(Object.entries(data.fields));
     this._categoryRenames = new Map(Object.entries(data.categories));
     this._data = this._fieldRenames;
+    this._recordReplacement();
   }
 
   clear() {
     this._fieldRenames.clear();
     this._categoryRenames.clear();
+    this._recordReplacement();
   }
 
   getCounts() {
     return { fields: this._fieldRenames.size, categories: this._categoryRenames.size };
+  }
+
+  /**
+   * Whether any field or category of `source` is renamed.
+   * @param {string} source - 'obs' | 'var'
+   * @returns {boolean}
+   */
+  hasEntriesFor(source) {
+    requireSource(source);
+    const prefix = `${source}:`;
+    for (const key of this._fieldRenames.keys()) if (key.startsWith(prefix)) return true;
+    for (const key of this._categoryRenames.keys()) if (key.startsWith(prefix)) return true;
+    return false;
   }
 }

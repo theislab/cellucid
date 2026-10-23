@@ -12,7 +12,7 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -23,8 +23,8 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 test.describe.configure({ timeout: 240_000 });
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=presented-layout';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=presented-layout';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -56,7 +56,7 @@ async function openGrid(page, viewCount) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   for (let count = 2; count <= viewCount; count++) {
     await page.locator('#split-keep-view-btn').click();
@@ -689,7 +689,11 @@ async function colourByCellType(page) {
 }
 
 const unifiedState = page => page.evaluate(
-  () => window._cellucidViewer.getUnifiedSelectionState(),
+  () => {
+    // The candidates are a cell list (Uint32Array); hand them over as numbers.
+    const state = window._cellucidViewer.getUnifiedSelectionState();
+    return { ...state, candidates: Array.from(state.candidates) };
+  },
 );
 
 async function armSelection(page, tool, gesture) {
@@ -786,17 +790,26 @@ test('proximity and KNN drags in the left cell grow from the cell under the poin
   await page.keyboard.press('Escape');
   await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
 
-  // A chain graph: each cell's first neighbour is the next index.
-  await page.evaluate(() => {
+  // A chain graph (each cell's neighbours are the previous and next index),
+  // handed over as the reader's edge payload.
+  await page.evaluate(async () => {
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
     const viewer = window._cellucidViewer;
     const count = viewer.getPointCount();
-    const sources = new Uint32Array(count - 1);
-    const destinations = new Uint32Array(count - 1);
-    for (let index = 0; index < count - 1; index++) {
-      sources[index] = index;
-      destinations[index] = index + 1;
+    const indptr = new Int32Array(count + 1);
+    const indices = [];
+    for (let index = 0; index < count; index++) {
+      if (index > 0) indices.push(index - 1);
+      if (index + 1 < count) indices.push(index + 1);
+      indptr[index + 1] = indices.length;
     }
-    viewer.loadKnnEdges(sources, destinations);
+    viewer.loadKnnEdges(extractConnectivityEdges({
+      format: 'csr',
+      shape: [count, count],
+      indptr,
+      indices: Int32Array.from(indices),
+      data: new Float32Array(indices.length).fill(1),
+    }, count));
   });
   await page.locator('.highlight-mode-btn[data-mode="knn"]').click();
   await armSelection(page, 'knn', () => altPath(page, [

@@ -16,37 +16,6 @@ import {
   writableTransparency,
 } from './per-cell-array-ownership.js';
 
-/**
- * Own a manifest field's centroids by layout: `centroidsByEmbedding` is keyed
- * by embedding id, which is the layout key of that embedding. An id the
- * dimension manager has not registered has no reachable centroids. The arrays
- * are copied so lazy in-place normalization owns them; malformed shapes pass
- * through unchanged for buildCentroidsForField to reject.
- */
-function ownCentroidsByLayout(centroidsByEmbedding, dimensionManager) {
-  if (
-    centroidsByEmbedding === null
-    || typeof centroidsByEmbedding !== 'object'
-    || Array.isArray(centroidsByEmbedding)
-  ) {
-    return centroidsByEmbedding;
-  }
-  const owned = new Map();
-  for (const [layoutKey, centroids] of Object.entries(centroidsByEmbedding)) {
-    if (!dimensionManager.hasLayout(layoutKey)) continue;
-    owned.set(layoutKey, Array.isArray(centroids)
-      ? centroids.map((centroid) => (
-          centroid !== null
-          && typeof centroid === 'object'
-          && Array.isArray(centroid.position)
-            ? { ...centroid, position: [...centroid.position] }
-            : centroid
-        ))
-      : centroids);
-  }
-  return owned;
-}
-
 const SYNTHETIC_SCENE_KEYS = Object.freeze([
   'colors',
   'dimensionLevel',
@@ -294,6 +263,16 @@ export const viewContextViewerSyncMethods = {
   },
 
   initScene(positions, obs) {
+    // The active field indexes the inventories this replaces. It is retired
+    // first, before an inventory, the renderer or any listener sees the new
+    // dataset: an index kept any longer points into the new dataset's fields
+    // or genes (outside them, or at another field), and every synchronous
+    // notification below -- the renderer's new points, the centroid reset,
+    // the view contexts -- would read it there.
+    this.activeFieldIndex = -1;
+    this.activeVarFieldIndex = -1;
+    this.activeFieldSource = null;
+    this._activeCategoryCounts = null;
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
     // A new dataset starts with the gene list it was published with.
     this._varAxisGeneration = 0;
@@ -301,37 +280,25 @@ export const viewContextViewerSyncMethods = {
     // are released before we upload new buffers.
     this.viewer.resetVectorFieldOverlay?.();
 
-    const manifestFields = obs?.fields || [];
-    this._obsFieldDescriptors = adoptScientificFieldDescriptors(manifestFields);
-    const normalizedFields = manifestFields.map((field) => {
-      const hasCentroids = field !== null && typeof field === 'object'
-        && Object.hasOwn(field, 'centroidsByEmbedding');
-      const rest = { ...field };
-      delete rest.centroidsByEmbedding;
+    const obsFields = obs?.fields || [];
+    this._obsFieldDescriptors = adoptScientificFieldDescriptors(obsFields);
+    const normalizedFields = obsFields.map((field) => {
       return {
-        ...rest,
+        ...field,
         categories: Array.isArray(field?.categories)
           ? [...field.categories]
           : field?.categories,
         loaded: Boolean(field?.values || field?.codes),
         _loadingPromise: null,
         _loadingSignal: null,
-        // Centroids are normalized lazily and in place, once per layout.
-        // The record of which layouts are done has to have exactly the
-        // lifetime of the arrays it describes: every view context clones this
-        // field shallowly, so the copied centroid arrays and this one Set are
-        // shared by all of them. A per-clone `null` let a view kept before the
-        // field's first colouring normalize the shared arrays a second time.
-        // The arrays themselves are copied so normalization never rewrites the
-        // dataset generation's manifest.
-        ...(hasCentroids
-          ? {
-              centroidsByLayout: ownCentroidsByLayout(
-                field.centroidsByEmbedding,
-                this.dimensionManager
-              )
-            }
-          : {}),
+        // A categorical field's centroids are computed in the browser, once
+        // per layout, from its codes and the layout's positions, and cached
+        // here. The cache and the record of which layouts are done have
+        // exactly the field's lifetime: every view context clones this field
+        // shallowly, so this one Map and this one Set are shared by all of
+        // them. A per-clone `null` let a view kept before the field's first
+        // colouring normalize the shared arrays a second time.
+        ...(field?.kind === 'category' ? { centroidsByLayout: new Map() } : {}),
         _normalizedLayouts: new Set()
       };
     });
@@ -401,15 +368,6 @@ export const viewContextViewerSyncMethods = {
     this._cachedTotalHighlightCount = null;
     this._cachedHighlightLodMembership = null;
 
-    // Publish the new dataset with no active field/filter owner before any
-    // synchronous state notification escapes. A prior categorical selection
-    // can have the same field index in the replacement manifest while its
-    // codes are still intentionally lazy; exposing that stale index lets UI
-    // listeners initialize filter metadata against the wrong generation.
-    this.activeFieldIndex = -1;
-    this.activeVarFieldIndex = -1;
-    this.activeFieldSource = null;
-    this._activeCategoryCounts = null;
     this._batchMode = false;
     this._batchDepth = 0;
     this._batchDirty = {
@@ -537,7 +495,6 @@ export const viewContextViewerSyncMethods = {
     this.centroidCount = 0;
     this.centroidPositions = emptyCentroidPositions;
     this.centroidColors = emptyCentroidColors;
-    this.centroidOutliers = new Float32Array(0);
     this.centroidLabels = [];
 
     this.highlightPages = [{

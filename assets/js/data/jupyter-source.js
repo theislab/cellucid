@@ -11,7 +11,9 @@
  * 4. Source POSTs events to the data server (Frontend → Python)
  *
  * Features:
- * - Data loading from Jupyter server (works everywhere)
+ * - Data loading from the notebook's server (works everywhere): the one
+ *   AnnData store `show_anndata()` serves, read in place by the browser's
+ *   AnnData reader (`served-anndata.js`) and exposed by `getAnnDataSource()`
  * - Live highlighting from Python (works everywhere)
  * - Selection/hover/click notifications to Python (works everywhere via HTTP POST)
  *
@@ -25,7 +27,6 @@
 import {
   DataSourceError,
   DataSourceErrorCode,
-  loadDatasetMetadata,
   readBoundedJson
 } from './data-source.js';
 import {
@@ -35,6 +36,12 @@ import {
 import { getNotificationCenter } from '../app/notification-center.js';
 import { createDeadline } from '../utils/deadline.js';
 import { validateDataMapping } from './data-mapping.js';
+import {
+  describeServedAnnData,
+  openServedAnnData,
+  requireServedAnnData,
+  servedStoreKey,
+} from './served-anndata.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -104,76 +111,6 @@ export function getJupyterConfig() {
     viewerId,
     viewerToken
   };
-}
-
-/**
- * Check if a URL uses the jupyter:// protocol
- * @param {string} url - URL to check
- * @returns {boolean}
- */
-function isJupyterUrl(url) {
-  return url?.startsWith('jupyter://');
-}
-
-/**
- * Parse a jupyter:// URL
- * @param {string} url - URL to parse
- * @returns {{viewerId: string, path: string}|null}
- */
-function parseJupyterUrl(url) {
-  if (!isJupyterUrl(url)) return null;
-
-  const match = url.match(/^jupyter:\/\/([^/]+)(\/.*)?$/);
-  if (!match) return null;
-
-  return {
-    viewerId: match[1],
-    path: (match[2] || '/').substring(1)
-  };
-}
-
-function requireCanonicalJupyterArtifactPath(path) {
-  if (typeof path !== 'string') {
-    throw new TypeError('Jupyter artifact path must be a string');
-  }
-  if (path === '') return path;
-  if (
-    path.startsWith('/') ||
-    path.endsWith('/') ||
-    path.includes('\\') ||
-    path.includes('?') ||
-    path.includes('#')
-  ) {
-    throw new TypeError(
-      'Jupyter artifact path must be one canonical relative file path'
-    );
-  }
-
-  for (const segment of path.split('/')) {
-    let decoded;
-    try {
-      decoded = decodeURIComponent(segment);
-    } catch {
-      throw new TypeError(
-        'Jupyter artifact path contains invalid percent encoding'
-      );
-    }
-    if (
-      segment.length === 0 ||
-      decoded === '.' ||
-      decoded === '..' ||
-      decoded.includes('%') ||
-      decoded.includes('/') ||
-      decoded.includes('\\') ||
-      /[\u0000-\u001f\u007f]/.test(decoded) ||
-      encodeURIComponent(decoded) !== segment
-    ) {
-      throw new TypeError(
-        'Jupyter artifact path contains a noncanonical segment'
-      );
-    }
-  }
-  return path;
 }
 
 function requireJupyterRuntimeConfig(config) {
@@ -346,53 +283,17 @@ function requireNonNegativeInteger(value, label) {
   return value;
 }
 
-function failCellIndex(value, index, label) {
-  if (!Object.hasOwn(value, index)) {
-    throw new TypeError(`${label} must not contain holes`);
-  }
-  throw new TypeError(`${label}[${index}] must be a non-negative integer`);
-}
-
 /**
- * Validate one array of unique non-negative integer cell indices.
- *
- * One pass checks every value and whether the array is already strictly
- * ascending, which proves uniqueness. Only an unordered array pays for a
- * sorted copy. No hash set is built: a JavaScript Set holds at most 2^24
- * entries, and a selection can be larger.
- *
- * @param {unknown} value
- * @param {string} label
- * @returns {number[]} `value`, unchanged.
+ * The cells of a Python command are an array; the state that applies them
+ * checks every index against the dataset and orders them once
+ * (`cellListFrom` for a highlight, `setCellVisibility` for visibility).
  */
-function requireCellIndices(value, label) {
+function requireCellArray(value, label) {
   if (!Array.isArray(value)) {
     throw new TypeError(`${label} must be an array`);
   }
-  const length = value.length;
-  let ascending = true;
-  let previous = -1;
-  for (let index = 0; index < length; index++) {
-    const cellIndex = value[index];
-    if (!Number.isInteger(cellIndex) || cellIndex < 0) {
-      failCellIndex(value, index, label);
-    }
-    if (cellIndex <= previous) ascending = false;
-    previous = cellIndex;
-  }
-  if (!ascending) {
-    const sorted = Float64Array.from(value).sort();
-    for (let index = 1; index < length; index++) {
-      if (sorted[index] === sorted[index - 1]) {
-        throw new TypeError(`${label} must not contain duplicate cell indices`);
-      }
-    }
-  }
   return value;
 }
-
-/** The largest cell index the binary selection wire can carry. */
-const MAX_SELECTION_CELL_INDEX = 0xFFFFFFFF;
 
 const HOST_IS_LITTLE_ENDIAN =
   new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
@@ -403,50 +304,29 @@ const HOST_IS_LITTLE_ENDIAN =
  * The wire is the selected cell indices as little-endian unsigned 32-bit
  * integers, strictly ascending, at least one: four bytes per cell instead of
  * a JSON array, and an order that lets Python prove uniqueness in one pass.
- * Validation is one loop over the input with no per-element strings and no
- * hash set; an unordered selection is sorted once as a typed array.
+ * The selection tools hand over a cell list -- an ascending `Uint32Array`,
+ * the wire's own order -- so encoding is one order check and one copy.
  *
- * @param {unknown} value - Array of unique non-negative integer cell indices
+ * @param {unknown} value - Cell list: ascending Uint32Array of cell indices
  * @param {string} label
  * @returns {Uint8Array} The request body.
  */
 export function encodeJupyterSelectionCells(value, label = 'Jupyter selection cells') {
-  if (!Array.isArray(value)) {
-    throw new TypeError(`${label} must be an array`);
+  if (!(value instanceof Uint32Array)) {
+    throw new TypeError(`${label} must be a cell list (Uint32Array)`);
   }
   const length = value.length;
   if (length === 0) {
     throw new TypeError(`${label} must contain at least one cell`);
   }
-  const cells = new Uint32Array(length);
-  let ascending = true;
-  let previous = -1;
-  for (let index = 0; index < length; index++) {
-    const cellIndex = value[index];
-    if (
-      !Number.isInteger(cellIndex) ||
-      cellIndex < 0 ||
-      cellIndex > MAX_SELECTION_CELL_INDEX
-    ) {
-      if (Number.isInteger(cellIndex) && cellIndex > MAX_SELECTION_CELL_INDEX) {
-        throw new RangeError(
-          `${label}[${index}] exceeds the largest selectable cell index ${MAX_SELECTION_CELL_INDEX}`
-        );
-      }
-      failCellIndex(value, index, label);
-    }
-    if (cellIndex <= previous) ascending = false;
-    cells[index] = cellIndex;
-    previous = cellIndex;
-  }
-  if (!ascending) {
-    cells.sort();
-    for (let index = 1; index < length; index++) {
-      if (cells[index] === cells[index - 1]) {
-        throw new TypeError(`${label} must not contain duplicate cell indices`);
-      }
+  for (let index = 1; index < length; index++) {
+    if (value[index] <= value[index - 1]) {
+      throw new TypeError(
+        `${label} must hold unique cell indices in ascending order`
+      );
     }
   }
+  const cells = value.slice();
   const bytes = new Uint8Array(cells.buffer);
   if (!HOST_IS_LITTLE_ENDIAN) {
     const view = new DataView(cells.buffer);
@@ -458,53 +338,22 @@ export function encodeJupyterSelectionCells(value, label = 'Jupyter selection ce
 }
 
 function requireJupyterHealthPayload(payload) {
-  if (!isPlainRecord(payload)) {
-    throw new TypeError('Jupyter health response must be a JSON object');
-  }
-  if (payload.type === 'exported') {
-    requireExactKeys(
-      payload,
-      ['status', 'type', 'version'],
-      'Jupyter exported health response'
-    );
-  } else if (payload.type === 'anndata') {
-    requireExactKeys(
-      payload,
-      [
-        'status',
-        'type',
-        'version',
-        'format',
-        'is_backed',
-        'n_cells',
-        'n_genes'
-      ],
-      'Jupyter AnnData health response'
-    );
-    requireExactText(
-      payload.format,
-      'Jupyter AnnData health format',
-      { allowWhitespace: true }
-    );
-    if (typeof payload.is_backed !== 'boolean') {
-      throw new TypeError('Jupyter AnnData health is_backed must be a boolean');
-    }
-    requireNonNegativeInteger(
-      payload.n_cells,
-      'Jupyter AnnData health n_cells'
-    );
-    requireNonNegativeInteger(
-      payload.n_genes,
-      'Jupyter AnnData health n_genes'
-    );
-  } else {
-    throw new TypeError(
-      'Jupyter health response type must be exactly exported or anndata'
-    );
-  }
+  requireExactKeys(
+    payload,
+    ['status', 'type', 'version', 'format', 'n_cells', 'n_genes'],
+    'Jupyter health response'
+  );
   if (payload.status !== 'ok') {
     throw new TypeError('Jupyter health response status must be exactly ok');
   }
+  if (payload.type !== 'anndata') {
+    throw new TypeError('Jupyter health response type must be exactly anndata');
+  }
+  if (payload.format !== 'h5ad' && payload.format !== 'zarr') {
+    throw new TypeError('Jupyter health format must be exactly h5ad or zarr');
+  }
+  requireNonNegativeInteger(payload.n_cells, 'Jupyter health n_cells');
+  requireNonNegativeInteger(payload.n_genes, 'Jupyter health n_genes');
   requireExactText(
     payload.version,
     'Jupyter health version',
@@ -672,61 +521,24 @@ const JUPYTER_DATA_MAPPING_ORIGINS = Object.freeze([
   'notebook',
 ]);
 
-function requireDatasetCatalogPath(value, label) {
-  if (
-    typeof value !== 'string' ||
-    !/^\/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,179}\/)?$/.test(value) ||
-    value.includes('/./') ||
-    value.includes('/../')
-  ) {
-    throw new TypeError(
-      `${label} must be "/" or one exact portable dataset directory path`
-    );
-  }
-  const component = value === '/' ? null : value.slice(1, -1);
-  if (
-    component !== null &&
-    (component.endsWith('.') ||
-      /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(component))
-  ) {
-    throw new TypeError(`${label} contains a non-portable dataset directory`);
-  }
-  return value;
-}
-
+/**
+ * The notebook server's catalog: exactly one dataset, the AnnData store it
+ * serves.
+ */
 function requireDatasetCatalogPayload(payload) {
   requireExactKeys(payload, ['datasets'], 'Jupyter dataset listing');
-  if (!Array.isArray(payload.datasets)) {
-    throw new TypeError('Jupyter dataset listing datasets must be an array');
+  if (!Array.isArray(payload.datasets) || payload.datasets.length !== 1) {
+    throw new TypeError(
+      'Jupyter dataset listing must declare exactly one dataset'
+    );
   }
-  const ids = new Set();
-  const paths = new Set();
-  return payload.datasets.map((entry, index) => {
-    const label = `Jupyter dataset listing datasets[${index}]`;
-    requireExactKeys(entry, ['id', 'path', 'name'], label);
-    const id = requireExactText(
-      entry.id,
-      `${label}.id`,
-      { allowWhitespace: true }
-    );
-    const path = requireDatasetCatalogPath(entry.path, `${label}.path`);
-    const name = requireExactText(
-      entry.name,
-      `${label}.name`,
-      { allowWhitespace: true }
-    );
-    if (ids.has(id)) {
-      throw new TypeError(`Jupyter dataset listing contains duplicate id ${id}`);
-    }
-    if (paths.has(path)) {
-      throw new TypeError(
-        `Jupyter dataset listing contains duplicate path ${path}`
-      );
-    }
-    ids.add(id);
-    paths.add(path);
-    return Object.freeze({ id, path, name });
-  });
+  const label = 'Jupyter dataset listing datasets[0]';
+  const entry = requireExactKeys(payload.datasets[0], ['id', 'name', 'anndata'], label);
+  return [Object.freeze({
+    id: requireExactText(entry.id, `${label}.id`, { allowWhitespace: true }),
+    name: requireExactText(entry.name, `${label}.name`, { allowWhitespace: true }),
+    anndata: requireServedAnnData(entry.anndata, `${label}.anndata`),
+  })];
 }
 
 function requireJupyterSessionUploadPayload(payload, expectedBytes) {
@@ -946,9 +758,6 @@ export class JupyterBridgeDataSource {
     /** @type {JupyterConfig|null} */
     this._config = null;
 
-    /** @type {'exported'|'anndata'|null} Server type from the adopted health check */
-    this._serverType = null;
-
     /**
      * What the notebook's `cellucid` accepts on the wire, read at connect.
      * @type {JupyterProtocol}
@@ -969,11 +778,29 @@ export class JupyterBridgeDataSource {
 
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
+    /**
+     * What the dataset list shows of each served store, by store
+     * (`servedStoreKey`): the list is read more than once (startup, then the
+     * data controls), and a store the server declares unchanged is described
+     * once. Cleared with the connection and on refresh.
+     * @type {Map<string, Promise<Object>>}
+     */
+    this._summaries = new Map();
     /** @type {Map<string, Object>} */
     this._metadataInFlight = new Map();
 
-    /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
-    this._datasetPaths = new Map();
+    /** @type {Map<string, Object>} Dataset ID -> catalog entry */
+    this._datasetEntries = new Map();
+
+    /**
+     * The open AnnData store of a `show_anndata()` server, read in place by
+     * the browser's reader.
+     * @type {{key: string, datasetId: string, source: Object, metadata: Object, release: () => void}|null}
+     */
+    this._annData = null;
+
+    /** @type {string|null} Dataset whose base URL was handed out last */
+    this.datasetId = null;
 
     /** @type {Set<Function>} */
     this._messageCallbacks = new Set();
@@ -1142,7 +969,6 @@ export class JupyterBridgeDataSource {
     const controller = new AbortController();
     this._catalogController = controller;
     const revision = ++this._catalogRevision;
-    this._metadataInFlight = new Map();
     previousController?.abort(new Error(reason));
     return { controller, revision };
   }
@@ -1195,11 +1021,12 @@ export class JupyterBridgeDataSource {
     this._removeMessageListener();
     this._connected = false;
     this._config = null;
-    this._serverType = null;
     this._protocol = EMPTY_JUPYTER_PROTOCOL;
     this._parentOrigin = null;
     this._datasetCache.clear();
-    this._datasetPaths.clear();
+    this._summaries.clear();
+    this._datasetEntries.clear();
+    this._releaseAnnData();
     try {
       const health = await requestJupyterHealth(config, controller.signal);
       this._assertLifecycle(revision, 'Jupyter initialization');
@@ -1211,7 +1038,6 @@ export class JupyterBridgeDataSource {
         );
       }
       this._config = config;
-      this._serverType = health.type;
       this._protocol = protocol;
       this._connected = true;
       this._beginCatalogGeneration(
@@ -1232,8 +1058,7 @@ export class JupyterBridgeDataSource {
         this._removeMessageListener();
         this._connected = false;
         this._config = null;
-        this._serverType = null;
-        this._protocol = EMPTY_JUPYTER_PROTOCOL;
+            this._protocol = EMPTY_JUPYTER_PROTOCOL;
         this._parentOrigin = null;
       }
       throw error;
@@ -1245,17 +1070,63 @@ export class JupyterBridgeDataSource {
   }
 
   /**
-   * Whether the notebook's server serves an AnnData object (`show_anndata()`)
-   * rather than a prepared export. Such a server publishes the data mapping it
-   * serves at `_cellucid/mapping/candidates.json` under the dataset base.
+   * Open a served AnnData store (once per connection and store) and return
+   * the metadata the reader reads from it.
    *
-   * @returns {boolean}
+   * @private
    */
-  servesAnnData() {
-    if (!this._connected || this._serverType === null) {
-      throw new Error('Jupyter data source is not connected.');
+  async _openAnnDataMetadata(owner, dataset) {
+    const serverUrl = owner.config.serverUrl;
+    const key = servedStoreKey(serverUrl, dataset);
+    if (this._annData?.key === key) return this._annData.metadata;
+    const opened = await openServedAnnData({
+      serverUrl,
+      dataset,
+      sourceType: this.type,
+    });
+    if (
+      owner.lifecycleRevision !== this._lifecycleRevision ||
+      owner.config !== this._config
+    ) {
+      opened.release();
+      throw createJupyterLifecycleSupersededError('Jupyter AnnData store');
     }
-    return this._serverType === 'anndata';
+    this._releaseAnnData();
+    this._annData = { key, datasetId: dataset.id, ...opened };
+    return opened.metadata;
+  }
+
+  /**
+   * One served store as the dataset list shows it, described once per store.
+   * A failed description is forgotten, so listing again retries it.
+   * @private
+   */
+  _describeStore(serverUrl, dataset, signal) {
+    const key = servedStoreKey(serverUrl, dataset);
+    let summary = this._summaries.get(key);
+    if (summary === undefined) {
+      summary = describeServedAnnData({ serverUrl, dataset, sourceType: this.type, signal });
+      this._summaries.set(key, summary);
+      summary.catch(() => {
+        if (this._summaries.get(key) === summary) this._summaries.delete(key);
+      });
+    }
+    return summary;
+  }
+
+  _releaseAnnData() {
+    const previous = this._annData;
+    this._annData = null;
+    if (this.datasetId === previous?.datasetId) this.datasetId = null;
+    previous?.release();
+  }
+
+  /**
+   * The AnnData data source of the served store, once its metadata is loaded.
+   * @returns {Object|null}
+   */
+  getAnnDataSource() {
+    return this._annData?.source ?? null;
   }
 
   /**
@@ -1433,7 +1304,7 @@ export class JupyterBridgeDataSource {
       'Jupyter highlight message'
     );
     const { cells, color } = data;
-    requireCellIndices(cells, 'Jupyter highlight cells');
+    requireCellArray(cells, 'Jupyter highlight cells');
     if (cells.length === 0) {
       throw new TypeError(
         'Jupyter highlight cells must be a non-empty array'
@@ -1483,7 +1354,7 @@ export class JupyterBridgeDataSource {
     );
     const { cells, visible } = data;
     if (cells !== null) {
-      requireCellIndices(cells, 'Jupyter set-visibility cells');
+      requireCellArray(cells, 'Jupyter set-visibility cells');
     }
     if (typeof visible !== 'boolean') {
       throw new TypeError(
@@ -1864,45 +1735,25 @@ export class JupyterBridgeDataSource {
       });
       this._assertCatalog(owner, 'Jupyter dataset listing');
       const datasetList = requireDatasetCatalogPayload(catalogPayload);
-      const stagedPaths = new Map(
-        datasetList.map(dataset => [dataset.id, dataset.path])
+      // The listing describes each store; it does not open one. Listing is a
+      // startup step that holds the data controls, and opening belongs to
+      // the dataset load (`getMetadata`), which a newer choice replaces.
+      const summaries = await loadMetadataBatchAtomically(
+        datasetList,
+        catalogOwner.controller.signal,
+        (dataset, signal) => this._describeStore(owner.config.serverUrl, dataset, signal),
+        'Jupyter catalog metadata loading'
       );
-      const stagedMetadataEntries =
-        await loadMetadataBatchAtomically(
-          datasetList,
-          catalogOwner.controller.signal,
-          async (dataset, signal) => {
-          const metadata = await loadDatasetMetadata(
-            `${owner.config.serverUrl}${dataset.path}`,
-            dataset.id,
-            this.type,
-            { signal }
-          );
-          if (metadata.name !== dataset.name) {
-            throw new DataSourceError(
-              `Jupyter catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
-              DataSourceErrorCode.VALIDATION_ERROR,
-              this.type,
-              {
-                datasetId: dataset.id,
-                catalogName: dataset.name,
-                identityName: metadata.name,
-              }
-            );
-          }
-          return [dataset.id, metadata];
-          },
-          'Jupyter catalog metadata loading'
-        );
-      const stagedCache = new Map(stagedMetadataEntries);
       this._assertCatalog(owner, 'Jupyter dataset listing');
 
       this._beginCatalogGeneration(
         'Jupyter dataset listing was adopted'
       );
-      this._datasetPaths = stagedPaths;
-      this._datasetCache = stagedCache;
-      return stagedMetadataEntries.map(([, metadata]) => metadata);
+      this._datasetEntries = new Map(
+        datasetList.map(dataset => [dataset.id, dataset])
+      );
+      this._datasetCache = new Map();
+      return summaries;
     } catch (error) {
       if (
         catalogOwner.controller.signal.aborted ||
@@ -1926,9 +1777,9 @@ export class JupyterBridgeDataSource {
     );
   }
 
-  _requireDeclaredDatasetPath(datasetId) {
+  _requireDeclaredDataset(datasetId) {
     const id = this._requireDatasetId(datasetId);
-    if (!this._datasetPaths.has(id)) {
+    if (!this._datasetEntries.has(id)) {
       throw new DataSourceError(
         `Jupyter dataset ${JSON.stringify(id)} is not declared by the current listing`,
         DataSourceErrorCode.NOT_FOUND,
@@ -1936,7 +1787,7 @@ export class JupyterBridgeDataSource {
         { datasetId: id }
       );
     }
-    return this._datasetPaths.get(id);
+    return this._datasetEntries.get(id);
   }
 
   /**
@@ -1954,7 +1805,7 @@ export class JupyterBridgeDataSource {
     }
     const id = this._requireDatasetId(datasetId);
 
-    if (this._datasetPaths.has(id)) {
+    if (this._datasetEntries.has(id)) {
       return true;
     }
 
@@ -1981,84 +1832,59 @@ export class JupyterBridgeDataSource {
       return this._datasetCache.get(id);
     }
 
-    const catalogOwner = this._catalogController === null
-      ? this._beginCatalogGeneration(
-        'Jupyter catalog generation was initialized'
-      )
-      : {
-        controller: this._catalogController,
-        revision: this._catalogRevision
-      };
+    // Opening the store belongs to the connection, not to one listing: the
+    // dataset list is read again while a dataset opens (the controls list
+    // every source when they start), and that must not cancel the open. The
+    // open stands while the connection lasts and the dataset still names
+    // the same store.
     const owner = {
       config: this._config,
       lifecycleRevision: this._lifecycleRevision,
-      catalogRevision: catalogOwner.revision,
-      catalogController: catalogOwner.controller
     };
-    const datasetPath = this._requireDeclaredDatasetPath(id);
-    const existing = this._metadataInFlight.get(id);
+    const dataset = this._requireDeclaredDataset(id);
+    const key = servedStoreKey(owner.config.serverUrl, dataset);
+    const existing = this._metadataInFlight.get(key);
     if (
       existing?.config === owner.config &&
-      existing.lifecycleRevision === owner.lifecycleRevision &&
-      existing.catalogRevision === owner.catalogRevision &&
-      existing.catalogController === owner.catalogController &&
-      existing.datasetPath === datasetPath
+      existing.lifecycleRevision === owner.lifecycleRevision
     ) {
       return existing.promise;
     }
 
-    const loadPromise = (async () => {
-      const metadata = await loadDatasetMetadata(
-        `${owner.config.serverUrl}${datasetPath}`,
-        id,
-        this.type,
-        { signal: catalogOwner.controller.signal }
-      );
-      this._assertCatalog(owner, 'Jupyter dataset metadata');
-      if (this._datasetPaths.get(id) !== datasetPath) {
-        throw createJupyterLifecycleSupersededError(
-          'Jupyter dataset metadata'
-        );
-      }
-      this._datasetCache.set(id, metadata);
-      return metadata;
-    })();
     const inFlight = {
       config: owner.config,
       lifecycleRevision: owner.lifecycleRevision,
-      catalogRevision: owner.catalogRevision,
-      catalogController: owner.catalogController,
-      datasetPath,
       promise: null,
     };
-    const promise = (async () => {
+    inFlight.promise = (async () => {
       try {
-        return await loadPromise;
-      } catch (error) {
+        const metadata = await this._openAnnDataMetadata(owner, dataset);
+        this._assertConnection(owner, 'Jupyter dataset metadata');
+        const declared = this._datasetEntries.get(id);
         if (
-          catalogOwner.controller.signal.aborted ||
-          owner.lifecycleRevision !== this._lifecycleRevision ||
-          owner.catalogRevision !== this._catalogRevision ||
-          owner.catalogController !== this._catalogController
+          declared === undefined ||
+          servedStoreKey(owner.config.serverUrl, declared) !== key
         ) {
           throw createJupyterLifecycleSupersededError(
             'Jupyter dataset metadata'
           );
         }
-        throw error;
+        this._datasetCache.set(id, metadata);
+        return metadata;
       } finally {
-        if (this._metadataInFlight.get(id) === inFlight) {
-          this._metadataInFlight.delete(id);
+        if (this._metadataInFlight.get(key) === inFlight) {
+          this._metadataInFlight.delete(key);
         }
       }
     })();
-    inFlight.promise = promise;
-    this._metadataInFlight.set(id, inFlight);
-    return promise;
+    this._metadataInFlight.set(key, inFlight);
+    return inFlight.promise;
   }
 
   /**
-   * Get base URL for dataset files
+   * The base URL of the dataset: the h5ad:// or zarr:// URL of the store the
+   * browser's reader opened, which its metadata load opens.
+   *
    * @param {string} datasetId
    * @returns {string}
    */
@@ -2070,87 +1896,17 @@ export class JupyterBridgeDataSource {
         this.type
       );
     }
-
-    const datasetPath = this._requireDeclaredDatasetPath(datasetId);
-    if (datasetPath === '/') {
-      return `jupyter://${this._config.viewerId}/`;
-    }
-    return `jupyter://${this._config.viewerId}${datasetPath}`;
-  }
-
-  /**
-   * Resolve a jupyter:// URL to fetchable HTTP URL
-   * @param {string} url
-   * @returns {Promise<string>}
-   */
-  async resolveUrl(url) {
-    if (!isJupyterUrl(url)) {
+    const id = this._requireDeclaredDataset(datasetId).id;
+    if (this._annData?.datasetId !== id) {
       throw new DataSourceError(
-        `Jupyter source cannot resolve a non-Jupyter URL: ${url}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-
-    if (!this._config) {
-      throw new DataSourceError(
-        'Not initialized',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
-    }
-
-    const parsed = parseJupyterUrl(url);
-    if (!parsed) {
-      throw new DataSourceError(
-        `Invalid jupyter URL: ${url}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-    if (parsed.viewerId !== this._config.viewerId) {
-      throw new DataSourceError(
-        'Jupyter URL viewer id does not match the active viewer',
-        DataSourceErrorCode.INVALID_FORMAT,
+        `Jupyter dataset ${JSON.stringify(id)} is not open; load its metadata first`,
+        DataSourceErrorCode.NOT_FOUND,
         this.type,
-        {
-          expectedViewerId: this._config.viewerId,
-          actualViewerId: parsed.viewerId
-        }
+        { datasetId: id }
       );
     }
-
-    let path;
-    try {
-      path = requireCanonicalJupyterArtifactPath(parsed.path);
-    } catch (error) {
-      throw new DataSourceError(
-        `Invalid Jupyter artifact path: ${parsed.path}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type,
-        { cause: error }
-      );
-    }
-
-    const belongsToDeclaredDataset = [
-      ...this._datasetPaths.values(),
-    ].some(datasetPath => {
-      if (datasetPath === '/') return true;
-      return path.startsWith(datasetPath.slice(1));
-    });
-    if (!belongsToDeclaredDataset) {
-      throw new DataSourceError(
-        'Jupyter artifact URL does not belong to a currently declared dataset',
-        DataSourceErrorCode.VALIDATION_ERROR,
-        this.type,
-        { url }
-      );
-    }
-
-    if (path === '') {
-      return `${this._config.serverUrl}/`;
-    }
-    return `${this._config.serverUrl}/${path}`;
+    this.datasetId = id;
+    return this._annData.source.getBaseUrl(id);
   }
 
   /**
@@ -2189,6 +1945,7 @@ export class JupyterBridgeDataSource {
       'Jupyter metadata cache was refreshed'
     );
     this._datasetCache.clear();
+    this._summaries.clear();
   }
 
   /**
@@ -2216,11 +1973,12 @@ export class JupyterBridgeDataSource {
     this._removeMessageListener();
     this._connected = false;
     this._config = null;
-    this._serverType = null;
     this._protocol = EMPTY_JUPYTER_PROTOCOL;
     this._parentOrigin = null;
     this._datasetCache.clear();
-    this._datasetPaths.clear();
+    this._summaries.clear();
+    this._datasetEntries.clear();
+    this._releaseAnnData();
     this._messageCallbacks.clear();
     this._highlightCallbacks.clear();
   }

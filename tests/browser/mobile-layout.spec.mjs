@@ -8,13 +8,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { expectFloatingSettled } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=mobile-layout-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=mobile-layout-ci';
 
 test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
@@ -35,7 +35,7 @@ test('a phone can close the full-screen sidebar and reach the plot', async ({
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const sidebar = page.locator('#sidebar');
@@ -89,7 +89,7 @@ test('a phone gets fingertip-sized icon controls', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   expect(await page.evaluate(() => matchMedia('(pointer: coarse)').matches))
     .toBe(true);
@@ -155,7 +155,7 @@ test('a screen without hover shows the controls that wait for one', async ({
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   expect(await page.evaluate(() => matchMedia('(hover: none)').matches))
     .toBe(true);
@@ -175,7 +175,7 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   const panel = page.locator('.accordion-panel:has(> #shortcuts-section)');
   await panel.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
@@ -219,7 +219,7 @@ test('a swipe that starts on a notification still reaches the sidebar menu', asy
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   // An error stays until dismissed, so it is on screen for the whole check.
   await page.evaluate(async () => {
@@ -268,10 +268,10 @@ test('the full-screen menu closes before the first dataset has loaded', async ({
 }) => {
   // Hold every export request, so the first dataset cannot finish loading
   // while the menu is tried: its ✕ is the only way to the plot on a phone.
-  let releaseExports;
-  const exportsHeld = new Promise(resolve => { releaseExports = resolve; });
-  await page.route('**/tests/browser/fixtures/exports/**', async route => {
-    await exportsHeld;
+  let releaseCatalog;
+  const catalogHeld = new Promise(resolve => { releaseCatalog = resolve; });
+  await page.route('**/tests/browser/fixtures/catalog/**', async route => {
+    await catalogHeld;
     await route.continue().catch(() => {});
   });
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -279,15 +279,15 @@ test('the full-screen menu closes before the first dataset has loaded', async ({
   const sidebar = page.locator('#sidebar');
   await expect(sidebar).not.toHaveClass(/\bhidden\b/);
   await expect(page.locator('#dataset-name')).not.toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.locator('#sidebar-toggle').tap();
   await expect(sidebar).toHaveClass(/\bhidden\b/);
   await page.locator('#sidebar-toggle').tap();
   await expect(sidebar).not.toHaveClass(/\bhidden\b/);
-  releaseExports();
+  releaseCatalog();
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 });
 

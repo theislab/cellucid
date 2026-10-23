@@ -23,13 +23,11 @@ function geneField(key, index) {
   return {
     key,
     kind: 'continuous',
-    valuesPath: `var/${index}.values.f32`,
-    valuesDtype: 'float32',
-    quantized: false,
+    path: `var/${index}`,
   };
 }
 
-function manifest(keys) {
+function geneList(keys) {
   return { n_points: N, fields: keys.map(geneField) };
 }
 
@@ -72,7 +70,7 @@ async function makeState() {
     B: [10, 20, 30, 40],
     C: [5, 6, 7, 8],
   }, reads));
-  state.initVarData(manifest(['A', 'B', 'C']));
+  state.initVarData(geneList(['A', 'B', 'C']));
   state._resetViewContexts();
 
   // The live view is coloured by B with a filter; a kept view by C.
@@ -105,7 +103,7 @@ test('views keep their genes by name on a new gene list, with their filters', as
 
   const nextReads = [];
   const step = await state.stageVarAxisReplacement({
-    varManifest: manifest(['C', 'B', 'D']),
+    geneList: geneList(['C', 'B', 'D']),
     varFieldLoader: loaderFor({ B: [11, 21, 31, 41], C: [50, 60, 70, 80], D: [0, 0, 0, 1] }, nextReads),
     sameAxis: false,
     sameMatrix: false,
@@ -144,7 +142,7 @@ test('views keep their genes by name on a new gene list, with their filters', as
 test('a gene missing from the new list is dropped, and that view loses its gene colouring', async () => {
   const { state } = await makeState();
   const step = await state.stageVarAxisReplacement({
-    varManifest: manifest(['B', 'D']),
+    geneList: geneList(['B', 'D']),
     varFieldLoader: loaderFor({ B: [1, 1, 1, 1], D: [2, 2, 2, 2] }, []),
     sameAxis: false,
     sameMatrix: false,
@@ -163,7 +161,7 @@ test('on the same var axis a gene is its position, whatever it is now called', a
   const before = state.varData.fields[1].values;
   const reads = [];
   const step = await state.stageVarAxisReplacement({
-    varManifest: manifest(['a1', 'b1', 'c1']),
+    geneList: geneList(['a1', 'b1', 'c1']),
     varFieldLoader: loaderFor({}, reads),
     sameAxis: true,
     sameMatrix: true,
@@ -184,7 +182,7 @@ test('the same axis with another matrix keeps positions and reads the new values
   const { state } = await makeState();
   const reads = [];
   const step = await state.stageVarAxisReplacement({
-    varManifest: manifest(['A', 'B', 'C']),
+    geneList: geneList(['A', 'B', 'C']),
     varFieldLoader: loaderFor({ B: [0, 20, 25, 30], C: [1, 2, 3, 4] }, reads),
     sameAxis: true,
     sameMatrix: false,
@@ -195,7 +193,7 @@ test('the same axis with another matrix keeps positions and reads the new values
   assert.deepEqual(activeGene(state, 'live').field._continuousFilter, { min: 15, max: 30 });
   await assert.rejects(
     state.stageVarAxisReplacement({
-      varManifest: manifest(['A']),
+      geneList: geneList(['A']),
       varFieldLoader: loaderFor({}, []),
       sameAxis: false,
       sameMatrix: true,
@@ -209,7 +207,7 @@ test('rollback restores the previous gene list and every view\'s colouring', asy
   const previousFields = state.varData.fields.map(field => field.key);
   const previousLoader = state.varFieldLoader;
   const step = await state.stageVarAxisReplacement({
-    varManifest: manifest(['B', 'D']),
+    geneList: geneList(['B', 'D']),
     varFieldLoader: loaderFor({ B: [9, 9, 9, 9] }, []),
     sameAxis: false,
     sameMatrix: false,
@@ -227,7 +225,7 @@ test('rollback restores the previous gene list and every view\'s colouring', asy
 test('an empty gene list needs no loader', async () => {
   const { state } = await makeState();
   const step = await state.stageVarAxisReplacement({
-    varManifest: { n_points: N, fields: [] },
+    geneList: { n_points: N, fields: [] },
     varFieldLoader: null,
     sameAxis: false,
     sameMatrix: false,
@@ -237,7 +235,7 @@ test('an empty gene list needs no loader', async () => {
   assert.equal(state.getVarAxisGeneCount(), 0);
   assert.equal(state.activeFieldSource, null);
   await assert.rejects(
-    state.stageVarAxisReplacement({ varManifest: manifest(['B']), varFieldLoader: null, sameAxis: false, sameMatrix: false }),
+    state.stageVarAxisReplacement({ geneList: geneList(['B']), varFieldLoader: null, sameAxis: false, sameMatrix: false }),
     /field loader/
   );
 });

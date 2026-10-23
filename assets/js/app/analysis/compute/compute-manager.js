@@ -6,7 +6,11 @@
  * backend does not change the scientific contract. An execution error is
  * returned unchanged to the caller.
  *
- * A terminal worker pool (crash, timeout, or running-task abort) fails the
+ * Every operation takes a `signal`: aborting it rejects the operation with
+ * an `AbortError` at once and stops its work (`worker-pool.js`); it is not
+ * a failure and never retires the pool.
+ *
+ * A terminal worker pool (crash or timeout) fails the
  * operations it owned and is then retired: `getStatus()` keeps reporting the
  * failure, and the next `init()` or `execute()` discovers a fresh pool rather
  * than rejecting every later worker operation until the page reloads.
@@ -19,12 +23,15 @@ import {
 } from './operations.js';
 import { executeOperation } from './operation-handlers.js';
 import { debug } from '../shared/debug-utils.js';
+// A cancelled operation never starts.
+import { throwIfAborted } from '../../jobs/cancellable-job.js';
 
 let workerPoolModule = null;
 let computeManagerInstance = null;
 
 const BACKENDS = new Set(['worker', 'cpu']);
 const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer']);
+const BROADCAST_OPTIONS = new Set([...EXECUTION_OPTIONS, 'retainAs', 'releases']);
 
 function now() {
   if (
@@ -158,11 +165,11 @@ export class ComputeManager {
     this._initialized = false;
   }
 
-  _validateExecutionOptions(options) {
+  _validateExecutionOptions(options, allowed = EXECUTION_OPTIONS) {
     requirePlainRecord(options, 'Execution options');
 
     for (const key of Object.keys(options)) {
-      if (!EXECUTION_OPTIONS.has(key)) {
+      if (!allowed.has(key)) {
         throw new Error(`Unknown execution option: ${key}`);
       }
     }
@@ -277,11 +284,50 @@ export class ComputeManager {
     };
   }
 
+  /**
+   * Run an operation once on every compute thread of the selected backend —
+   * each analysis worker, or this thread for the CPU backend — for state an
+   * operation holds there (a run's groups) before the run's per-gene work.
+   *
+   * @param {string} operation
+   * @param {(threadIndex: number) => Object} payloadFor - A payload per thread
+   *   (each is transferred, so each must own its buffers)
+   * `retainAs` / `releases` name state a worker keeps for later tasks, which
+   * a worker replaced after a cancelled task gets again (`WorkerPool.broadcast`).
+   *
+   * @param {{backend?: 'worker'|'cpu', timeout?: number, signal?: AbortSignal|null, retainAs?: string, releases?: string}} [options]
+   * @returns {Promise<Object[]>} One result per thread
+   */
+  async broadcast(operation, payloadFor, options = {}) {
+    this._validateExecutionOptions(options, BROADCAST_OPTIONS);
+    if (typeof payloadFor !== 'function') {
+      throw new TypeError('Broadcast payloads must come from a function of the thread index');
+    }
+    await this.init();
+    const backend = this.selectBackend(operation, options.backend);
+    if (backend === 'cpu') {
+      throwIfAborted(options.signal);
+      return [executeOperation(operation, payloadFor(0))];
+    }
+    const pool = this._workerBackend;
+    if (!pool) throw new Error('Web Worker backend is unavailable');
+    const { timeout = 30000, signal = null, retainAs, releases } = options;
+    const kept = {};
+    if (retainAs !== undefined) kept.retainAs = retainAs;
+    if (releases !== undefined) kept.releases = releases;
+    try {
+      return await pool.broadcast(operation, payloadFor, { timeout, signal, ...kept });
+    } finally {
+      this._retireTerminalWorker();
+    }
+  }
+
   async _executeOnBackend(backend, operation, payload, options) {
     switch (backend) {
       case 'worker':
         return this._executeWorker(operation, payload, options);
       case 'cpu':
+        throwIfAborted(options.signal);
         return this._executeCPU(operation, payload);
       default:
         throw new Error(`Unknown compute backend: ${backend}`);

@@ -64,7 +64,7 @@ const LOADER_FAILURES = Object.freeze({
   ),
   offlinePayload: new TypeError('Failed to fetch'),
   corruptPayload: new Error(
-    'Payload https://catalog.cellucid.test/exports/a/embeddings/0_2d.bin.gz: '
+    'Payload https://catalog.cellucid.test/a.zarr/obsm/X_umap/0.0: '
     + 'invalid gzip header'
   )
 });
@@ -144,7 +144,7 @@ test('four distinct catalog failures no longer read as one network problem', () 
       'the notice names the cause, never the transport diagnostic'
     );
   }
-  // The wrong address is the one a `?exportsBaseUrl=` typo produces, and it
+  // The wrong address is the one a `?sampleCatalog=` typo produces, and it
   // must not send the user to check their network.
   assert.match(sentences[0], /Check the address for a typo/);
   assert.doesNotMatch(sentences[0], /Check your network/);

@@ -29,6 +29,7 @@ const SERVER = `
 import json
 import anndata as ad, numpy as np, pandas as pd
 import cellucid.jupyter as jupyter
+from cellucid._server_base import CELLUCID_WEB_URL
 from cellucid.anndata_server import AnnDataServer
 
 adata = ad.AnnData(
@@ -37,7 +38,12 @@ adata = ad.AnnData(
     var=pd.DataFrame(index=["g"]),
     obsm={"X_umap_2d": np.array([[0, 0], [1, 1]], np.float32)},
 )
-viewer = jupyter.BaseViewer()
+# The viewer without its own server (which would establish the web build):
+# the data server below is the one the browser reaches.
+viewer = object.__new__(jupyter.AnnDataViewer)
+viewer._init_state(port=None, height=600, client_server_url=None,
+                   web_source_url=CELLUCID_WEB_URL, web_cache_dir=None,
+                   allowed_hosts=None)
 viewer._activate()
 server = AnnDataServer(adata, host="127.0.0.1", port=0, quiet=True, serve_web_ui=False,
                        dataset_name="selection", dataset_id="selection")
@@ -91,14 +97,15 @@ test('a one-million-cell selection reaches the notebook whole, through the brows
         viewerToken: config.viewerToken,
       });
       if (!(await source.initialize())) throw new Error('the bridge did not connect');
-      // Unordered and spread over 4M indices; 7,919 is prime, so every index
-      // is distinct.
-      const cells = new Array(count);
+      // Spread over 4M indices; 7,919 is prime, so every index is distinct.
+      // The selection tools hand over a cell list: ascending.
+      const cells = new Uint32Array(count);
       let sum = 0;
       for (let index = 0; index < count; index++) {
         cells[index] = (index * 7_919) % 4_000_003;
         sum += cells[index];
       }
+      cells.sort();
       const started = performance.now();
       await source.notifySelection(cells, 'lasso');
       const deliveredMs = performance.now() - started;

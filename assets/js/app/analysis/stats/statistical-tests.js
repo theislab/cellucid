@@ -16,6 +16,7 @@ import {
   fDistributionPValue,
   gammaLn,
   computeRanksWithTies,
+  ascendingOrder,
   mannWhitneyU as computeMannWhitneyU,
   welchTTestFromMoments
 } from '../compute/math-utils.js';
@@ -1073,10 +1074,13 @@ export function formatStatisticalResult(result) {
  * Benjamini-Hochberg step-up kernel — the single implementation of the
  * procedure in the analysis module.
  *
- * `entries` must be `{ index, pValue }` records whose p-values are already
- * known to be finite and in [0, 1]. It is sorted in place by ascending p-value
- * and then ascending index, so tied p-values resolve deterministically.
- * `assign(index, adjustedPValue)` is called once per entry.
+ * `family` holds the family's p-values, already known to be finite and in
+ * [0, 1], and `indices` the position each came from, ascending. They are
+ * ranked by ascending p-value and then ascending index, so tied p-values
+ * resolve deterministically; the ranking is the linear-time stable order of
+ * the p-values (`ascendingOrder`), with no record or comparator per p-value —
+ * marker discovery corrects one family of every gene per group.
+ * `assign(index, adjustedPValue)` is called once per member.
  *
  * The running minimum is carried unclamped and only the emitted value is
  * clamped to 1, so a saturated large rank can never drag a smaller rank up.
@@ -1088,23 +1092,23 @@ export function formatStatisticalResult(result) {
  * the wrappers differ only in input validation, in what they do with
  * non-finite p-values, and in the shape they return.
  *
- * @param {{ index: number, pValue: number }[]} entries
+ * @param {{family: Float64Array, indices: Uint32Array}} members
  * @param {(index: number, adjustedPValue: number) => void} assign
  */
-function benjaminiHochbergStepUp(entries, assign) {
-  const m = entries.length;
+function benjaminiHochbergStepUp({ family, indices }, assign) {
+  const m = family.length;
   if (m === 0) return;
 
-  entries.sort((a, b) => a.pValue - b.pValue || a.index - b.index);
+  const order = ascendingOrder(family);
 
   // Start from the largest p-value: its adjusted value is p * m / m = p.
-  let runningMin = entries[m - 1].pValue;
-  assign(entries[m - 1].index, Math.min(runningMin, 1));
+  let runningMin = family[order[m - 1]];
+  assign(indices[order[m - 1]], Math.min(runningMin, 1));
 
   for (let rank = m - 2; rank >= 0; rank--) {
-    const rawAdjusted = entries[rank].pValue * m / (rank + 1);
+    const rawAdjusted = family[order[rank]] * m / (rank + 1);
     if (rawAdjusted < runningMin) runningMin = rawAdjusted;
-    assign(entries[rank].index, Math.min(runningMin, 1));
+    assign(indices[order[rank]], Math.min(runningMin, 1));
   }
 }
 
@@ -1112,23 +1116,33 @@ function benjaminiHochbergStepUp(entries, assign) {
  * Select the members of the correcting family from a batch of p-values.
  *
  * A gene that never reached a test carries `NaN`. It is not a member of the
- * family being corrected, so it is left out of the entry list and therefore out
+ * family being corrected, so it is left out of the family and therefore out
  * of the denominator `m`. A finite p-value outside [0, 1] is a genuinely broken
  * probability and still throws, so a defect can never be quietly reclassified as
  * "untestable".
  *
  * @param {number[]|Float64Array} pValues
- * @returns {{ index: number, pValue: number }[]}
+ * @returns {{family: Float64Array, indices: Uint32Array}}
  */
 function benjaminiHochbergFamily(pValues) {
-  const entries = [];
+  let count = 0;
   for (let index = 0; index < pValues.length; index++) {
     const pValue = pValues[index];
     if (!Number.isFinite(pValue)) continue;
     requireProbability(pValue, `Benjamini-Hochberg p-value ${index + 1}`);
-    entries.push({ index, pValue });
+    count++;
   }
-  return entries;
+  const family = new Float64Array(count);
+  const indices = new Uint32Array(count);
+  let member = 0;
+  for (let index = 0; index < pValues.length; index++) {
+    const pValue = pValues[index];
+    if (!Number.isFinite(pValue)) continue;
+    // +0 for a p-value of -0, so the order sees one zero.
+    family[member] = pValue + 0;
+    indices[member++] = index;
+  }
+  return { family, indices };
 }
 
 /**
@@ -1156,10 +1170,10 @@ export function benjaminiHochbergAdjusted(pValues) {
   const total = pValues.length;
   const adjustedPValues = new Float64Array(total);
   adjustedPValues.fill(NaN);
-  const entries = benjaminiHochbergFamily(pValues);
+  const members = benjaminiHochbergFamily(pValues);
 
-  const testedCount = entries.length;
-  benjaminiHochbergStepUp(entries, (index, adjusted) => {
+  const testedCount = members.family.length;
+  benjaminiHochbergStepUp(members, (index, adjusted) => {
     adjustedPValues[index] = adjusted;
   });
 
@@ -1186,10 +1200,10 @@ export function benjaminiHochbergTestable(pValues) {
 
   const total = pValues.length;
   const adjustedPValues = new Array(total).fill(null);
-  const entries = benjaminiHochbergFamily(pValues);
+  const members = benjaminiHochbergFamily(pValues);
 
-  const testedCount = entries.length;
-  benjaminiHochbergStepUp(entries, (index, adjusted) => {
+  const testedCount = members.family.length;
+  benjaminiHochbergStepUp(members, (index, adjusted) => {
     adjustedPValues[index] = adjusted;
   });
 
