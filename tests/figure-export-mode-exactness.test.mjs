@@ -368,7 +368,7 @@ test('PNG renderer uses one browser backend and metadata failures are terminal',
   // gives a worker. Nothing encodes on the page's main thread.
   const workerSource = await source('utils/figure-export-worker.js');
   assert.doesNotMatch(pngSource, /\.toBlob\(|\.toDataURL\(|\.convertToBlob\(/);
-  assert.match(pngSource, /createImageBitmap\(canvas\)/);
+  assert.match(pngSource, /pagePixels\(canvas\)/);
   assert.match(pngSource, /requestPngEncoding\(/);
   assert.match(workerSource, /convertToBlob\(\{ type: 'image\/png' \}\)/);
   assert.match(workerSource, /embedPngTextChunks\(blob, textMap\)/);

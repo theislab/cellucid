@@ -23,8 +23,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { mappingLatentOutlierPath } from '../assets/js/data/data-mapping-candidates.js';
 import { OutlierQuantileSource } from '../assets/js/data/outlier-quantile-source.js';
 import { categoricalStorageForDtype } from '../assets/js/data/categorical-storage-contract.js';
@@ -52,10 +51,10 @@ async function open(t, name) {
   const warnings = silence(t);
   const bytes = await readFile(new URL(name, FIXTURES));
   const file = new File([bytes], name);
-  const source = name.endsWith('.h5ad') ? new H5adDataSource() : new ZarrDataSource();
+  const source = name.endsWith('.h5ad') ? new AnnDataFileSource() : new AnnDataFileSource();
   t.after(() => source.clear());
-  if (name.endsWith('.h5ad')) await source.loadFromFile(file);
-  else await source.loadFromArchiveFile(file);
+  if (name.endsWith('.h5ad')) await source.loadFile(file);
+  else await source.loadFile(file);
   return { adapter: source.getAdapter(), warnings };
 }
 

@@ -508,25 +508,64 @@ export function pointRasterArgs(session, {
 }
 
 /**
- * Encode a composed frame as PNG in the worker, with its `iTXt` metadata.
- * The frame is handed over, not copied.
+ * The pixels of an image drawn on the page, as the worker's encoders take
+ * them: an ImageData read here, whose buffer is handed over, not copied.
  *
- * @param {ReturnType<typeof openFigureExportWorkerSession>} session
- * @param {ImageBitmap} bitmap
- * @param {Record<string, string>} textMap
- * @returns {Promise<Blob>}
+ * An image crosses to the worker as its pixels, never as an ImageBitmap of
+ * a page canvas. On Linux WebKit (WPE), whose workers have no GL (see
+ * above), an ImageBitmap of a large page canvas encoded in the worker came
+ * out without the canvas's pixels: a PNG figure held a blurred, magnified
+ * patch of the screen's floor grid and none of the figure, and a backdrop
+ * look's raster was entirely transparent (`backdrop-looks.spec.mjs`, "figure
+ * export redraws the look under the points"). `getImageData` reads the
+ * pixels on the thread that drew them, in every engine.
+ *
+ * @param {HTMLCanvasElement|OffscreenCanvas|ImageBitmap} image - a canvas
+ *   with a 2D context, or a frame (an ImageBitmap, closed here)
+ * @returns {ImageData}
  */
-export function requestPngEncoding(session, bitmap, textMap) {
-  return session.request('encodePng', { bitmap, textMap }, [bitmap]);
+export function pagePixels(image) {
+  if (typeof ImageBitmap === 'function' && image instanceof ImageBitmap) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext('2d', { alpha: true, willReadFrequently: true });
+      if (context === null) throw new Error('Figure export requires a Canvas 2D context.');
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, image.width, image.height);
+      canvas.width = 0;
+      canvas.height = 0;
+      return pixels;
+    } finally {
+      image.close();
+    }
+  }
+  const context = image.getContext('2d');
+  if (context === null) throw new Error('Figure export reads pixels from a Canvas 2D context.');
+  return context.getImageData(0, 0, image.width, image.height);
 }
 
 /**
- * Encode a raster as a PNG data URL in the worker. The frame is handed over.
+ * Encode a composed figure's pixels as PNG in the worker, with its `iTXt`
+ * metadata. The pixels are handed over, not copied.
  *
  * @param {ReturnType<typeof openFigureExportWorkerSession>} session
- * @param {ImageBitmap} bitmap
+ * @param {ImageData} pixels - `pagePixels`
+ * @param {Record<string, string>} textMap
+ * @returns {Promise<Blob>}
+ */
+export function requestPngEncoding(session, pixels, textMap) {
+  return session.request('encodePng', { pixels, textMap }, [pixels.data.buffer]);
+}
+
+/**
+ * Encode pixels as a PNG data URL in the worker. The pixels are handed over.
+ *
+ * @param {ReturnType<typeof openFigureExportWorkerSession>} session
+ * @param {ImageData} pixels - `pagePixels`
  * @returns {Promise<string>}
  */
-export function requestPngDataUrl(session, bitmap) {
-  return session.request('encodePngDataUrl', { bitmap }, [bitmap]);
+export function requestPngDataUrl(session, pixels) {
+  return session.request('encodePngDataUrl', { pixels }, [pixels.data.buffer]);
 }

@@ -18,8 +18,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import {
   MappingLoadError,
   mappingGraphPath,
@@ -52,9 +51,9 @@ async function openH5ad(t) {
   const file = new File([await readFile(FIXTURE)], 'data-mapping-full.h5ad', {
     type: 'application/x-hdf5',
   });
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromFile(file);
+  await source.loadFile(file);
   return source.getAdapter();
 }
 
@@ -63,9 +62,9 @@ async function openZarr(t) {
   const file = new File([await readFile(ZARR_FIXTURE)], 'data-mapping-full.zarr.zip', {
     type: 'application/zip',
   });
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromArchiveFile(file);
+  await source.loadFile(file);
   return source.getAdapter();
 }
 

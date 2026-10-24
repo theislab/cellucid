@@ -6,13 +6,16 @@
  * a file.
  *
  * Protocol (every request carries a numeric `id`, echoed in its reply):
- * - `{id, method: 'open', args: [{kind, source}]}` opens a dataset: an
- *   `.h5ad` (`kind: 'h5ad'`, `source` a `File` or a remote file
- *   `{url, size, name, identity}`), or an AnnData Zarr store
- *   (`kind: 'zarr'`, `source` `{files: Map<path, File>, rootName}`,
- *   `{archive}` or `{url}`). The reply is the reader's snapshot (`nObs`,
- *   `nVars`, `obsKeys`, `varNames`, `hasExpressionMatrix`, `isOpen`, `name`).
- * - `{id, method: 'describe', args: [{kind, source}]}` reads what a catalog
+ * - `{id, method: 'open', args: [{source, expect}]}` opens a dataset
+ *   (`openDatasetStore` in `anndata/open.js`): `source` is one file
+ *   `{file}` (a `File` or a remote file `{url, size, name, identity}`), a
+ *   picked folder `{files: Map<path, File>, rootName}` or a store folder on
+ *   a web host `{url, name}`; `expect` (or null) is what the caller was told
+ *   it is (`{format, layout}`). What it is is decided from its content. The
+ *   reply is the reader's snapshot (`nObs`, `nVars`, `obsKeys`, `varNames`,
+ *   `hasExpressionMatrix`, `isOpen`) with `name`, `format` (the input format
+ *   id, `data/input-formats.js`), `layout` and `zarrVersion`.
+ * - `{id, method: 'describe', args: [{source, expect}]}` reads what a catalog
  *   lists about one store (`describeAnnDataStore`) without opening it as the
  *   dataset: `{nObs, nVars, hasExpressionMatrix, title, cellucid}`.
  * - `{id, method: 'latentOutlierQuantiles', args: [key, width, fields,
@@ -71,7 +74,7 @@
  */
 
 import { AnnDataReader, describeAnnDataStore } from './anndata/reader.js';
-import { explainFormatError, openAnnDataStore } from './anndata/open.js';
+import { explainFormatError, openDatasetStore } from './anndata/open.js';
 import { ReadActivity } from '../formats/io/activity.js';
 import { LatentOutlierReader } from './latent-outliers-stream.js';
 import { residencyBudgetBytes } from './memory-budget.js';
@@ -202,14 +205,19 @@ function snapshotOf(reader) {
  * (`formats/io/link.js`).
  */
 function requestConcurrencyOf(source, link) {
-  if (typeof source?.url !== 'string') return Infinity;
+  if (!isRemoteSource(source)) return Infinity;
   const snapshot = link?.snapshot?.() ?? null;
   return snapshot?.backgroundConcurrency ?? snapshot?.concurrency ?? Infinity;
 }
 
+/** Whether a source is read from a host: a remote file, or a folder on a web host. */
+function isRemoteSource(source) {
+  return typeof source?.url === 'string' || typeof source?.file?.url === 'string';
+}
+
 /** The name a source is shown by: its file name, folder or URL. */
 function sourceName(source) {
-  return source?.name ?? source?.rootName ?? source?.archive?.name ?? source?.url ?? 'the file';
+  return source?.file?.name ?? source?.name ?? source?.rootName ?? source?.url ?? 'the file';
 }
 
 /**
@@ -245,8 +253,7 @@ function activityReporter(post, onReport = () => {}) {
  * (`decodePoolStats().decodedBytesPerMs`). Null until measured.
  */
 export function linkMeasurementOf(source, link) {
-  const remote = typeof source?.url === 'string' || typeof source?.archive?.url === 'string';
-  if (!remote) {
+  if (!isRemoteSource(source)) {
     const bytesPerMs = decodePoolStats().decodedBytesPerMs ?? null;
     return bytesPerMs === null ? null : { latencyMs: 0, bytesPerMs, backgroundConcurrency: requestConcurrencyOf(source, link), protocol: null };
   }
@@ -311,12 +318,13 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   };
   let reader = null;
   let latent = null;
-  let kind = null;
+  /** The input format id of the open dataset, for the messages of its later reads. */
+  let format = null;
 
   // Every method takes the request's context (`signal`, aborted by a cancel
   // message) first, then the arguments the client sent.
   const methods = {
-    async open(_context, { kind: nextKind, source }) {
+    async open(_context, { source, expect = null }) {
       // Decode workers start while the structure is read, not on the first chunk.
       warmDecodePool();
       // One activity for the whole opening: the file's structure, then the
@@ -334,7 +342,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         if (!arriving && retrying === null) postLink();
       };
       try {
-        opened = await openAnnDataStore({ kind: nextKind, source }, {
+        opened = await openDatasetStore({ source, expect }, {
           decodedChunkCacheBytes: residencyBudgetBytes('decodedBlocks'),
           onTransfer,
           activity,
@@ -349,7 +357,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         next.createActivity = createActivity;
         try {
           await next.open(opened.root, {
-            format: opened.format,
+            format: opened.readerFormat,
             name: opened.name,
             decodedChunkBytes: residencyBudgetBytes('decodedBlocks'),
             link: opened.link,
@@ -357,7 +365,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
           });
         } catch (error) {
           opened.root.close?.();
-          throw error;
+          throw explainFormatError(error, opened.format);
         }
         activity.finish();
       } catch (error) {
@@ -366,21 +374,27 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       }
       const previous = reader;
       reader = next;
-      kind = nextKind;
+      format = opened.format;
       latent = new LatentOutlierReader(next);
       previous?.close();
-      // The Zarr format version the store was read as (the Dataset box
-      // names it); null for an `.h5ad`.
-      const zarrVersion = opened.root.zarrFormat ?? null;
-      return { ...snapshotOf(reader), name: opened.name, zarrVersion, requestConcurrency: requestConcurrencyOf(source, link) };
+      // What the store was read as (the Dataset box names it): its format,
+      // layout and, for Zarr, the version.
+      return {
+        ...snapshotOf(reader),
+        name: opened.name,
+        format: opened.format,
+        layout: opened.layout,
+        zarrVersion: opened.zarrVersion,
+        requestConcurrency: requestConcurrencyOf(source, link),
+      };
     },
     /**
      * What a catalog lists about one store (`describeAnnDataStore`): its
      * metadata and `uns` only. The store is closed again; the open dataset,
      * if any, is untouched.
      */
-    async describe({ signal }, { kind: describedKind, source }) {
-      const opened = await openAnnDataStore({ kind: describedKind, source }, {
+    async describe({ signal }, { source, expect = null }) {
+      const opened = await openDatasetStore({ source, expect }, {
         decodedChunkCacheBytes: 0,
         sourceAccess,
         onTransfer: ({ url, bytes, requests, ms, arriving = false, retrying = null }) => post(
@@ -390,7 +404,9 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         signal,
       });
       try {
-        return await describeAnnDataStore(opened.root, { format: opened.format }, { signal });
+        return await describeAnnDataStore(opened.root, { format: opened.readerFormat }, { signal });
+      } catch (error) {
+        throw explainFormatError(error, opened.format);
       } finally {
         opened.root.close?.();
       }
@@ -493,9 +509,11 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       const result = ownedBuffers(await method({ signal: controller.signal }, ...(Array.isArray(message.args) ? message.args : [])));
       return { reply: { id, result }, transfer: [...transferables(result)] };
     } catch (error) {
-      const shown = (kind === null && message?.method === 'open') || message?.method === 'describe'
-        ? explainFormatError(error, message.args?.[0]?.kind)
-        : explainFormatError(error, kind ?? 'h5ad');
+      // Opening explains its own failures (`openDatasetStore`); a later
+      // read is explained in the words of the format that is open.
+      const shown = message?.method === 'open' || message?.method === 'describe'
+        ? error
+        : explainFormatError(error, format);
       return { reply: { id, error: serializeReaderError(shown) }, transfer: [] };
     } finally {
       if (running.get(id) === controller) running.delete(id);

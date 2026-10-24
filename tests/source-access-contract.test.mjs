@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { httpByteSource, statedLifetimeMs } from '../assets/js/formats/io/byte-source.js';
+import { REMOTE_POLICY, httpByteSource, statedLifetimeMs } from '../assets/js/formats/io/byte-source.js';
+import { LinkMeter } from '../assets/js/formats/io/link.js';
 import { createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';
 import {
   onSourceAccessRevoked,
@@ -9,6 +10,8 @@ import {
   resolveSourceAccess,
   revokeSourceAccess,
 } from '../assets/js/data/sources/access.js';
+
+import { virtualTime } from './helpers/virtual-time.mjs';
 
 const SIZE = 1 << 20;
 const DISPLAY = 'https://graph.microsoft.com/v1.0/drives/d1/items/i1/content';
@@ -102,18 +105,15 @@ test('a failed connection names the display link, never the target URL', async (
   };
   const access = { target: async () => ({ url: `https://dl.example.org/x?tempauth=${SECRET}` }) };
   const source = httpByteSource({ url: DISPLAY, size: SIZE }, { fetch: fetchImpl, access });
-  const realTimeout = globalThis.setTimeout;
-  // The repeats after a network failure wait; skip the waits.
-  globalThis.setTimeout = (fn, ms, ...rest) => realTimeout(fn, ms > 100 && ms < 10_000 ? 0 : ms, ...rest);
-  try {
-    await assert.rejects(source.read(0, 10), error => {
-      assert.ok(error.message.includes(DISPLAY));
-      assert.ok(!JSON.stringify({ m: error.message, d: error.details }).includes(SECRET));
-      return true;
-    });
-  } finally {
-    globalThis.setTimeout = realTimeout;
-  }
+  // The repeats after a network failure wait, on the link's timers: here a
+  // virtual clock's, which does not wait.
+  const time = virtualTime();
+  const link = new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after });
+  await assert.rejects(source.read(0, 10, { link }), error => {
+    assert.ok(error.message.includes(DISPLAY));
+    assert.ok(!JSON.stringify({ m: error.message, d: error.details }).includes(SECRET));
+    return true;
+  });
 });
 
 test('a target past its expiresAt is replaced before a request is sent', async t => {
@@ -215,15 +215,22 @@ test('the page owns each access; a sign-out reaches every listener by ref', asyn
 
 test('the worker asks the page for targets and drops them on a revoke message', async () => {
   const posted = [];
-  const handle = createAnnDataReaderHandler({ post: message => posted.push(message) });
-  // An open of a remote file that names an access: the worker asks for its target.
+  let asked;
+  const asking = new Promise(resolve => { asked = resolve; });
+  const handle = createAnnDataReaderHandler({
+    post: message => {
+      posted.push(message);
+      if (message.event === 'source-access') asked(message);
+    },
+  });
+  // An open of a remote file that names an access: the worker asks for its
+  // target (the test waits for that message, not for a while).
   const opening = handle({
     id: 1,
     method: 'open',
-    args: [{ kind: 'h5ad', source: { url: DISPLAY, size: SIZE, name: 'a.h5ad', access: { provider: 'onedrive', ref: 'r1', stale: [403] } } }],
+    args: [{ source: { file: { url: DISPLAY, size: SIZE, name: 'a.h5ad', access: { provider: 'onedrive', ref: 'r1', stale: [403] } } } }],
   });
-  await new Promise(resolve => setTimeout(resolve, 20));
-  const ask = posted.find(message => message.event === 'source-access');
+  const ask = await asking;
   assert.deepEqual({ ...ask, request: typeof ask.request }, {
     event: 'source-access', request: 'number', provider: 'onedrive', ref: 'r1', refresh: false,
   });

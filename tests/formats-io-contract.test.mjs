@@ -16,6 +16,8 @@ import {
 import { createByteReader, planMergeGap } from '../assets/js/formats/io/byte-reader.js';
 import { InflateError, inflate } from '../assets/js/formats/io/inflate.js';
 
+import { settle, virtualTime } from './helpers/virtual-time.mjs';
+
 function pattern(size) {
   const bytes = new Uint8Array(size);
   for (let i = 0; i < size; i++) bytes[i] = (i * 31 + (i >> 8)) & 0xff;
@@ -495,7 +497,7 @@ test('an activity knows how much is left: requests count when planned and when t
     reader.read(10_000, 3000, { activity }),
     reader.read(50_000, 3000, { activity }),
   ]);
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   let snapshot = activity.snapshot();
   assert.equal(snapshot.bytesFetched, 0, 'nothing has arrived yet');
   assert.equal(snapshot.bytesPlanned, 6000, 'both requests are planned before any byte arrives');
@@ -532,7 +534,7 @@ test('a planned request cancelled before it is sent no longer counts as left to 
   const first = reader.read(0, 3000, { activity });
   const second = reader.read(60_000, 3000, { activity, signal: controller.signal });
   second.catch(() => {});
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(activity.snapshot().bytesPlanned, 6000);
   controller.abort();
   await assert.rejects(second);
@@ -549,10 +551,10 @@ test('a read a view waits for goes ahead of queued background work, which never 
   const index = new ReadActivity({ kind: 'index', label: 'X, indexed by gene', background: true });
   const release = source.hold();
   const background = [0, 1, 2, 3, 4].map(i => reader.read(i * 100_000, 1000, { activity: index }));
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(source.calls.length, 2, 'background work leaves one slot free');
   const view = reader.read(900_000, 1000, { activity: new ReadActivity({ kind: 'field', label: 'a field' }) });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.deepEqual(source.calls.at(-1), [900_000, 1000], 'the view read starts at once, ahead of queued background reads');
   release();
   await Promise.all([...background, view]);
@@ -562,19 +564,19 @@ test('a read a view waits for goes ahead of queued background work, which never 
 test('a web host starts at its streams; background work keeps under its HTTP/1.1 connections until it is known to multiplex', async () => {
   const { ReadActivity } = await import('../assets/js/formats/io/activity.js');
   const recorded = recordingSource(pattern(16_000_000), { ...POLICY, concurrency: 6, streams: 100, mergeGapBytes: 0 });
-  // A 20 ms round trip, so the link is measured, and forty answers landing
-  // together are told from a queue's waves (within half a round trip) however
-  // a loaded host's timers fire. A request is recorded when the reader sends
-  // it and answered a round trip later: what is in flight is what the reader
-  // sent.
+  // A 20 ms round trip on a virtual clock, so the link is measured, and
+  // forty answers landing together are told from a queue's waves (within
+  // half a round trip). A request is recorded when the reader sends it and
+  // answered a round trip later: what is in flight is what the reader sent.
+  const time = virtualTime();
   const source = { ...recorded, read: async (offset, length, options) => {
     const bytes = await recorded.read(offset, length, options);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await time.sleep(20);
     return bytes;
   } };
   Object.defineProperty(source, 'calls', { get: () => recorded.calls });
   source.hold = () => recorded.hold();
-  const reader = createByteReader(source);
+  const reader = createByteReader(source, { clock: time.now });
   assert.equal(reader.link.concurrency, 100);
   // Measured: one read of half a megabyte.
   await reader.read(15_400_000, 500_000);
@@ -582,7 +584,7 @@ test('a web host starts at its streams; background work keeps under its HTTP/1.1
   const release = source.hold();
   // Forty small scattered reads a view waits for: every one on the wire at once.
   const views = Array.from({ length: 40 }, (_, i) => reader.read(i * 50_000, 100));
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(source.calls.length, 40);
   release();
   await Promise.all(views);
@@ -591,7 +593,7 @@ test('a web host starts at its streams; background work keeps under its HTTP/1.1
   // six wait while those in flight carry two round trips' worth of bytes.
   // Its measuring read is one request: split into a burst, the burst's
   // completions could already show the host multiplexing.
-  const other = createByteReader(source, { policy: { maxRequestBytes: 500_000 } });
+  const other = createByteReader(source, { policy: { maxRequestBytes: 500_000 }, clock: time.now });
   await other.read(15_400_000, 500_000);
   assert.equal(other.link.multiplexed, null, 'one request shows nothing of the protocol');
   source.calls.length = 0;
@@ -599,7 +601,7 @@ test('a web host starts at its streams; background work keeps under its HTTP/1.1
   const size = Math.ceil(other.link.roundTripBytes / 2);
   const step = size + other.link.mergeGapBytes + 1000;
   const large = Array.from({ length: 12 }, (_, i) => other.read(i * step, size));
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.ok(source.calls.length >= 6 && source.calls.length < 12, `${source.calls.length} large requests in flight`);
   big();
   await Promise.all(large);
@@ -611,10 +613,10 @@ test('a web host starts at its streams; background work keeps under its HTTP/1.1
   // Apart by more than the merge gap, so each is its own request.
   const apart = other.link.mergeGapBytes + 1000;
   const background = Array.from({ length: 12 }, (_, i) => other.read(i * apart, 100, { activity: index }));
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(source.calls.length, 5);
   const view = other.read(15_990_000, 100);
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.deepEqual(source.calls.at(-1), [15_990_000, 100], 'the view read starts at once');
   hold();
   await Promise.all([...background, view]);
@@ -638,19 +640,10 @@ test('a Zarr web host that answers a range with the whole object is asked for it
 });
 
 /**
- * Wait until `ms` have passed on the clock the link measures with. A timer
- * may fire up to a millisecond before its delay by `performance.now()` (it
- * counts from the event loop's cached time), which would put a round trip
- * under the latency the source stands for.
+ * A memory source behind a link with a `latency` ms round trip and `rate`
+ * bytes per ms, on a virtual clock (`source.time`) its reader measures with
+ * (`linkReader`): what the link measures is what the source stands for.
  */
-async function elapse(ms) {
-  const until = performance.now() + ms;
-  while (performance.now() < until) {
-    await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(until - performance.now()))));
-  }
-}
-
-/** A memory source behind a link with a `latency` ms round trip and `rate` bytes per ms. */
 function linkSource(bytes, { latency = 20, rate = 1000, concurrency = 2 } = {}) {
   const base = bytesByteSource(bytes, {
     name: 'link',
@@ -658,9 +651,11 @@ function linkSource(bytes, { latency = 20, rate = 1000, concurrency = 2 } = {}) 
   });
   const calls = [];
   let gate = null;
+  const time = virtualTime();
   return {
     ...base,
     calls,
+    time,
     hold() {
       let release;
       gate = new Promise(resolve => { release = resolve; });
@@ -669,11 +664,13 @@ function linkSource(bytes, { latency = 20, rate = 1000, concurrency = 2 } = {}) 
     async read(offset, length, options = {}) {
       calls.push([offset, length]);
       if (gate) await gate;
-      await elapse(latency + length / rate);
+      await time.sleep(latency + length / rate);
       return base.read(offset, length, options);
     },
   };
 }
+
+const linkReader = source => createByteReader(source, { clock: source.time.now });
 
 /** Measure the link: a small read (the round trip), then a large one (the bandwidth). */
 async function measureLink(reader) {
@@ -684,7 +681,7 @@ async function measureLink(reader) {
 test('request shaping follows the measured link: priors until measured, then merge gap and request size from it', async () => {
   const bytes = pattern(200_000);
   const source = linkSource(bytes);
-  const reader = createByteReader(source);
+  const reader = linkReader(source);
   assert.equal(reader.link.measured, false);
   assert.equal(reader.link.mergeGapBytes, 0, 'the prior');
   assert.equal(reader.link.maxRequestBytes, 1 << 20, 'the prior');
@@ -692,8 +689,10 @@ test('request shaping follows the measured link: priors until measured, then mer
   await measureLink(reader);
   const link = reader.link;
   assert.equal(link.measured, true);
-  assert.ok(link.latencyMs >= 20 && link.latencyMs < 40, `round trip ${link.latencyMs}`);
-  assert.ok(link.bytesPerMs > 500 && link.bytesPerMs <= 1100, `bandwidth ${link.bytesPerMs}`);
+  // The round trip is the small read's (20 ms and its 10 bytes); the
+  // bandwidth, the large read's bytes over its time less a round trip.
+  assert.ok(Math.abs(link.latencyMs - 20.01) < 1e-9, `round trip ${link.latencyMs}`);
+  assert.ok(Math.abs(link.bytesPerMs - 1000) < 1, `bandwidth ${link.bytesPerMs}`);
   // A gap is worth what transfers in the share of a round trip one request costs.
   assert.equal(link.mergeGapBytes, Math.floor(link.bytesPerMs * link.latencyMs / 2));
   // A request carries a round trip's worth for every request in flight, and
@@ -770,7 +769,7 @@ test('a fast link reads ahead; a large read over it is split by its bandwidth-de
 test('requests waiting for a slot are merged with their neighbours across plans while round trips cost more than bytes', async () => {
   const bytes = pattern(400_000);
   const source = linkSource(bytes, { latency: 20, rate: 1000, concurrency: 2 });
-  const reader = createByteReader(source);
+  const reader = linkReader(source);
   await measureLink(reader);
   const gap = reader.link.mergeGapBytes;
   assert.ok(gap > 1000, `merge gap ${gap}`);

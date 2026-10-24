@@ -10,15 +10,17 @@
  * `anndata` is
  *
  *     {
- *       file: {url, kind: 'h5ad'|'zarr', layout: 'file'|'zip'|'folder', size?},
+ *       file: {url, kind, layout: 'file'|'zip'|'folder', size?},
  *       defaults: {embedding1d?, embedding2d?, embedding3d?, knn?, expression?,
  *                  geneIdColumn?, latentKey?, vectorFieldDefault?, obsKeys?,
  *                  normalizeEmbeddings?,
  *                  centroidMinPoints?}
  *     }
  *
- * `defaults` are the AnnData launch defaults (`requireAnnDataLaunchDefaults`
- * in `base-anndata-adapter.js`).
+ * `kind` is an input format id and `layout` one of the layouts that format
+ * arrives in (`data/input-formats.js`: `h5ad` as a `file`, `zarr` as a `zip`
+ * or a `folder`). `defaults` are the AnnData launch defaults
+ * (`requireAnnDataLaunchDefaults` in `base-anndata-adapter.js`).
  *
  * `file.url` is the store's route relative to the server's base URL (the
  * server cannot know the address a browser reaches it by: a tunnel, a proxy).
@@ -34,13 +36,12 @@ import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { requireAnnDataLaunchDefaults } from './base-anndata-adapter.js';
 import { AnnDataReaderClient } from './anndata-reader-client.js';
 import { requireCellucidFileMetadata } from './anndata-cellucid-metadata.js';
-import { createH5adDataSource } from './h5ad.js';
-import { createZarrDataSource } from './zarr.js';
+import { createAnnDataFileSource } from './anndata-file-source.js';
+import { isInputFormatId, layoutsOf } from './input-formats.js';
 import { getTransferLog } from './transfer-log.js';
 
 const ROUTE_PREFIX = '_cellucid/anndata/';
 const FILE_KEYS = Object.freeze(['url', 'kind', 'layout', 'size']);
-const LAYOUTS = Object.freeze({ h5ad: ['file'], zarr: ['zip', 'folder'] });
 
 function isPlainRecord(value) {
   return (
@@ -117,9 +118,10 @@ export function requireServedAnnData(value, label) {
   const layout = isPlainRecord(file) ? file.layout : undefined;
   const sized = layout !== 'folder';
   requireKeys(file, sized ? FILE_KEYS : ['url', 'kind', 'layout'], sized ? FILE_KEYS : ['url', 'kind', 'layout'], `${label}.file`);
-  if (!Object.hasOwn(LAYOUTS, kind) || !LAYOUTS[kind].includes(layout)) {
+  if (!isInputFormatId(kind) || !layoutsOf(kind).includes(layout)) {
     throw new TypeError(
-      `${label}.file must be an h5ad file, a zipped Zarr store or a Zarr store folder`
+      `${label}.file must name an input format this viewer reads and one of its layouts ` +
+      '(an h5ad file, a zipped Zarr store or a Zarr store folder)'
     );
   }
   if (sized && (!Number.isSafeInteger(file.size) || file.size < 1)) {
@@ -195,14 +197,10 @@ function servedResource(serverUrl, dataset, sourceType) {
 export async function describeServedAnnData({ serverUrl, dataset, sourceType, signal = null }) {
   const { file } = dataset.anndata;
   const { url, resource } = servedResource(serverUrl, dataset, sourceType);
-  const client = new AnnDataReaderClient({ kind: file.kind });
+  const client = new AnnDataReaderClient();
   try {
-    const source = file.layout === 'file'
-      ? resource
-      : file.layout === 'zip'
-        ? { archive: resource }
-        : { url, name: file.name };
-    const described = await client.describe(source, { signal });
+    const source = file.layout === 'folder' ? { url, name: file.name } : { file: resource };
+    const described = await client.describe(source, { signal, expect: { format: file.kind, layout: file.layout } });
     const own = requireCellucidFileMetadata(described.cellucid, sourceType);
     return Object.freeze({
       id: dataset.id,
@@ -240,21 +238,20 @@ export async function openServedAnnData({ serverUrl, dataset, sourceType }) {
       : 'reading on demand: only what each view needs',
     total: file.size,
   });
-  const source = file.kind === 'h5ad' ? createH5adDataSource() : createZarrDataSource();
+  const source = createAnnDataFileSource();
   const options = {
     datasetId: dataset.id,
     name: dataset.name,
     description: '',
     source: { name: dataset.name, url, filename: file.name },
     defaults,
+    expect: { format: file.kind, layout: file.layout },
   };
   try {
-    if (file.layout === 'file') {
-      await source.loadFromFile(resource, options);
-    } else if (file.layout === 'zip') {
-      await source.loadFromArchiveFile(resource, options);
+    if (file.layout === 'folder') {
+      await source.loadRemoteFolder({ url, name: file.name }, options);
     } else {
-      await source.loadFromRemoteFolder({ url, name: file.name }, options);
+      await source.loadFile(resource, options);
     }
     const metadata = await source.getMetadata(dataset.id);
     if (metadata.id !== dataset.id || metadata.name !== dataset.name) {

@@ -276,7 +276,7 @@ class FakeDatasetManager {
     this.activeDatasetId = datasetId;
     this.activeMetadata = metadata;
     const event = {
-      baseUrl: `zarr://${sourceType}/${datasetId}/`,
+      baseUrl: `anndata://${sourceType}/${datasetId}/`,
       datasetId,
       loadMethod: options.loadMethod,
       metadata,
@@ -771,7 +771,7 @@ test('catalog publication replaces an in-flight exact dataset event atomically',
   harness.manager.activeSourceType = 'local-demo';
   harness.manager.activeMetadata = metadata;
   harness.manager.datasetListeners[0]({
-    baseUrl: 'zarr://local-demo/in-flight/',
+    baseUrl: 'anndata://local-demo/in-flight/',
     datasetId: metadata.id,
     loadMethod: 'dataset-dropdown',
     metadata,

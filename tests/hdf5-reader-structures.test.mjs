@@ -37,6 +37,8 @@ import { lzfDecompress } from '../assets/js/formats/hdf5/lzf.js';
 import { readHeapObjects } from '../assets/js/formats/hdf5/fractal-heap.js';
 import { swapBytes } from '../assets/js/formats/hdf5/decode.js';
 
+import { virtualTime } from './helpers/virtual-time.mjs';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CORPUS = path.join(here, 'fixtures', 'hdf5');
 const fixture = name => new Uint8Array(readFileSync(path.join(CORPUS, name)));
@@ -48,12 +50,22 @@ function open(bytes, options = {}) {
 /**
  * A byte source that answers after `latencyMs` and records the requests. A
  * request's round is one more than the highest round finished before it was
- * made: the length of the chain of round trips it waited for.
+ * made: the length of the chain of round trips it waited for. The latency is
+ * on a virtual clock (`time`, `helpers/virtual-time.mjs`), which moves only
+ * once every request the reader would make at this instant has been made: the
+ * rounds count dependent waves exactly, however long the machine takes
+ * between two sibling requests. `onRead` hears each request as it is made.
  */
 function recordingSource(bytes, { latencyMs = 2, policy = {} } = {}) {
   const base = bytesByteSource(bytes, { name: 'recorded.h5', policy: { concurrency: 10_000, ...policy } });
   const log = [];
+  const time = virtualTime();
   let finishedRound = 0;
+  const recorder = {
+    log,
+    time,
+    onRead: null,
+  };
   const source = {
     size: base.size,
     name: base.name,
@@ -62,19 +74,21 @@ function recordingSource(bytes, { latencyMs = 2, policy = {} } = {}) {
     async read(offset, length, options) {
       const round = finishedRound + 1;
       log.push({ offset, length, round });
-      await new Promise(resolve => setTimeout(resolve, latencyMs));
+      recorder.onRead?.();
+      await time.sleep(latencyMs);
       finishedRound = Math.max(finishedRound, round);
       return base.read(offset, length, options);
     },
   };
-  return {
+  return Object.assign(recorder, {
     source: Object.freeze(source),
-    log,
+    /** A byte reader of the source, measuring its link on the source's clock. */
+    reader: () => createByteReader(recorder.source, { clock: time.now }),
     rounds: () => log.reduce((max, entry) => Math.max(max, entry.round), 0),
     reset() {
       log.length = 0;
     },
-  };
+  });
 }
 
 /* ---------- structures ---------- */
@@ -244,7 +258,7 @@ for (const name of ['default-format.h5', 'latest-format.h5', 'v18-format.h5', 's
     // Small metadata blocks, nothing merged: every structure costs its own
     // request, as metadata scattered through a large remote file would.
     const recorder = recordingSource(fixture(name), { policy: { blockBytes: 512, mergeGapBytes: 0 } });
-    const root = await openHdf5(createByteReader(recorder.source));
+    const root = await openHdf5(recorder.reader());
     const depth = treeDepth(root);
     const objects = root.stats().open.objects;
     const rounds = recorder.rounds();
@@ -260,7 +274,7 @@ for (const name of ['default-format.h5', 'latest-format.h5', 'v18-format.h5', 's
 
 test('a chunk-aligned range of a 5000-chunk dataset fetches only its chunks', async () => {
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 0 });
-  const root = await openHdf5(createByteReader(recorder.source));
+  const root = await openHdf5(recorder.reader());
   const node = root.get('many_chunks/btree_levels');
   // Reading a range first reads the chunk index's leaves holding its chunks.
   await node.read([[400, 440]]);
@@ -282,7 +296,7 @@ test('a chunk-aligned range of a 5000-chunk dataset fetches only its chunks', as
 
 test('the first rows of a many-leaf chunked dataset wait for one leaf of its chunk index, not all of them', async () => {
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 1 });
-  const root = await openHdf5(createByteReader(recorder.source));
+  const root = await openHdf5(recorder.reader());
   const node = root.get('many_chunks/btree_levels');
   recorder.reset();
   const values = await node.read([[0, 40]]);
@@ -303,7 +317,7 @@ test('a column of variable-length strings fetches each byte once', async () => {
   };
   for (const name of ['text/vlen_utf8', 'text/vlen_utf8_chunked_gzip']) {
     const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 0 });
-    const root = await openHdf5(createByteReader(recorder.source));
+    const root = await openHdf5(recorder.reader());
     const node = root.get(name);
     await node.storedBytes();
     // Part of a column first: its heap collection is read in part ...
@@ -329,7 +343,7 @@ test('a column of variable-length strings fetches each byte once', async () => {
 
 test('concurrent reads share each chunk: fetched and decoded once', async () => {
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 1 });
-  const root = await openHdf5(createByteReader(recorder.source));
+  const root = await openHdf5(recorder.reader());
   const node = root.get('shapes/dense_2d_chunked_edges'); // 101 x 23, chunks 10 x 4, gzip
   await node.reader.chunkTable(null);
   const full = await node.storedBytes();
@@ -357,7 +371,7 @@ test('concurrent reads share each chunk: fetched and decoded once', async () => 
 
 test('sequential column reads reuse decoded chunks', async () => {
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 0 });
-  const root = await openHdf5(createByteReader(recorder.source));
+  const root = await openHdf5(recorder.reader());
   const node = root.get('shapes/dense_2d_row_chunks'); // 64 x 9, chunks 16 x 9
   await node.read([[0, 64], [0, 1]]);
   recorder.reset();
@@ -400,15 +414,19 @@ test('results are the caller\'s own: transferring one leaves the next read and t
 
 test('reads can be aborted; other reads of the same chunks still complete', async () => {
   const recorder = recordingSource(fixture('latest-format.h5'), { latencyMs: 5 });
-  const root = await openHdf5(createByteReader(recorder.source));
+  const root = await openHdf5(recorder.reader());
   const node = root.get('chunk_index/extensible_array_gzip');
   const already = new AbortController();
   already.abort();
   await assert.rejects(node.read(undefined, { signal: already.signal }), { name: 'AbortError' });
   const controller = new AbortController();
+  // Cancelled while its first request is in flight.
+  recorder.onRead = () => {
+    recorder.onRead = null;
+    controller.abort();
+  };
   const aborted = node.read([[0, 4000]], { signal: controller.signal });
   const kept = node.read([[0, 4000]]);
-  setTimeout(() => controller.abort(), 1);
   await assert.rejects(aborted, { name: 'AbortError' });
   assert.equal((await kept).length, 4000);
   root.close();

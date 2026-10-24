@@ -40,6 +40,8 @@ import {
 import { benjaminiHochbergAdjusted } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { createFrameThrottle } from '../assets/js/app/analysis/shared/concurrency-utils.js';
 
+import { virtualTime } from './helpers/virtual-time.mjs';
+
 function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -392,8 +394,11 @@ test('Benjamini-Hochberg ranks by p-value then position exactly as the record so
 });
 
 test('a frame throttle delivers the latest update at most once per interval', async () => {
+  // On a virtual clock: a burst of pushes takes no time, however loaded the
+  // machine, and a wait is exactly as long as it says.
+  const time = virtualTime();
   const delivered = [];
-  const throttle = createFrameThrottle(value => delivered.push(value), 20);
+  const throttle = createFrameThrottle(value => delivered.push(value), 20, { clock: time.now, after: time.after });
   let built = 0;
   for (let i = 1; i <= 50; i++) {
     throttle.push(() => {
@@ -402,9 +407,9 @@ test('a frame throttle delivers the latest update at most once per interval', as
     });
   }
   assert.deepEqual(delivered, [1], 'the first update is delivered at once');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await time.sleep(30);
   assert.deepEqual(delivered, [1, 50], 'then only the latest, a frame later');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await time.sleep(30);
   assert.equal(built, 2, 'replaced updates are never built');
   // A frame has passed: the next update goes at once; the ones right after
   // wait, and a flush delivers only the latest of them.
@@ -416,7 +421,7 @@ test('a frame throttle delivers the latest update at most once per interval', as
   // A cancelled update is never delivered.
   throttle.push(() => 54);
   throttle.cancel();
-  await new Promise(resolve => setTimeout(resolve, 40));
+  await time.sleep(40);
   assert.deepEqual(delivered, [1, 50, 51, 53]);
 });
 

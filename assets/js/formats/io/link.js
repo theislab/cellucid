@@ -105,6 +105,19 @@ export const READ_AHEAD_BYTES_PER_MS = 64 * 1000;
 const now = () => performance.now();
 
 /**
+ * Runs `callback` once `ms` milliseconds have passed (`setTimeout`) and
+ * returns what cancels it: the timers a link's waits run on.
+ *
+ * @param {number} ms
+ * @param {() => void} callback
+ * @returns {() => void}
+ */
+export function afterRealTime(ms, callback) {
+  const timer = setTimeout(callback, ms);
+  return () => clearTimeout(timer);
+}
+
+/**
  * How long a request to a web host may stay silent before it is taken for
  * stalled, from the answers measured on the link: TCP's retransmission
  * timeout (RFC 6298), applied to the time a request waits for its answer.
@@ -124,12 +137,15 @@ const now = () => performance.now();
  */
 export class ResponseClock {
   /**
-   * @param {{clock?: () => number, bandwidth?: () => number}} [options] -
-   *   `clock` in milliseconds (tests); `bandwidth`, the link's measured bytes
+   * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void, bandwidth?: () => number}} [options] -
+   *   `clock` in milliseconds and `after`, the timers the link's requests
+   *   and their waits to be asked again run on (`afterRealTime`; tests give
+   *   a virtual clock and its timers); `bandwidth`, the link's measured bytes
    *   per millisecond (0 until measured)
    */
-  constructor({ clock = now, bandwidth = () => 0 } = {}) {
+  constructor({ clock = now, after = afterRealTime, bandwidth = () => 0 } = {}) {
     this.now = clock;
+    this.after = after;
     this._bandwidth = bandwidth;
     this._smoothed = null;
     this._variation = null;
@@ -192,9 +208,11 @@ export class LinkMeter {
    *   connections), its streams (a web host's start before its protocol is
    *   known; none for a local file) and block size always, its merge gap,
    *   request size and bandwidth until the link is measured
-   * @param {{clock?: () => number}} [options] - `clock` in milliseconds (tests)
+   * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void}} [options] -
+   *   `clock` in milliseconds, and `after`, the timers of its requests
+   *   (`ResponseClock`; tests)
    */
-  constructor(prior, { clock = now } = {}) {
+  constructor(prior, { clock = now, after = afterRealTime } = {}) {
     this._prior = prior;
     this._clock = clock;
     /** Requests an HTTP/1.1 host answers at once (the browser's connections). */
@@ -235,7 +253,7 @@ export class LinkMeter {
      */
     this._search = { settled: false, previousRate: null, since: null, completed: 0 };
     /** When a request to this link is stalled (`ResponseClock`). */
-    this.responses = new ResponseClock({ clock, bandwidth: () => this.bytesPerMs });
+    this.responses = new ResponseClock({ clock, after, bandwidth: () => this.bytesPerMs });
   }
 
   /**

@@ -1253,8 +1253,8 @@ export function validateDatasetSummary(summary, sourceType) {
 
 /**
  * The data source interface (duck typed: a source is any object with these
- * methods). Every dataset a source offers is an AnnData file, read by the
- * AnnData reader through an `h5ad.js` or `zarr.js` source.
+ * methods). Every dataset a source offers is read by the AnnData reader
+ * through an `anndata-file-source.js` source, whatever format it arrived in.
  *
  * Required:
  * - `getType(): string` -- the source type ('local-demo', 'local-user',
@@ -1263,13 +1263,13 @@ export function validateDatasetSummary(summary, sourceType) {
  *   shows; an open dataset's identity is a summary too.
  * - `getMetadata(datasetId): Promise<DatasetMetadata>` -- the dataset's
  *   identity, opening its file first when a catalog lists it unopened.
- * - `getBaseUrl(datasetId): string` -- its `h5ad://<id>/` or `zarr://<id>/`
+ * - `getBaseUrl(datasetId): string` -- its `anndata://<id>/`
  *   base, under which the data loaders address its parts.
  *
  * Optional:
  * - `isAvailable(): Promise<boolean>`, `hasDataset(datasetId)`, `refresh()`,
  *   `requiresManualReconnect()`, `onDeactivate()`.
- * - `getAnnDataSource(datasetId)` -- the `h5ad.js`/`zarr.js` source a wrapper
+ * - `getAnnDataSource(datasetId)` -- the `AnnDataFileSource` a wrapper
  *   source reads `datasetId` from (`anndata-provider.js`).
  * - `getStateDescriptor(datasetId)` -- the default view a catalog names for a
  *   dataset (`app/session/catalog-default-session.js`), or null.

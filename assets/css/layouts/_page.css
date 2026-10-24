@@ -1,14 +1,15 @@
 /* layouts/_page.css - Where the brand card (components/_welcome.css) sits
    when it is the whole screen:
 
-   - the standalone pages (404.html, privacy.html, assets/auth/callback.html):
+   - the standalone pages (404.html, privacy.html, terms.html,
+     accessibility.html, assets/auth/callback.html):
      `body.page` > `main.page-screen`, on the viewer's backdrop, scrolling on a
      short screen;
    - the startup failure screen inside the app: `.page-screen.page-screen-fixed`
      over everything, on the same backdrop.
 
-   A reading page (privacy) widens the card with `.welcome-content-wide` and
-   sets its text with `.page-prose`. */
+   A reading page (privacy, terms, accessibility) widens the card with
+   `.welcome-content-wide` and sets its text with `.page-prose`. */
 
 /* The app shell never scrolls; a standalone page must, on a short screen. */
 html:has(> body.page),

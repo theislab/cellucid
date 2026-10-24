@@ -116,11 +116,13 @@ test('runtime cache policy excludes only the deploy-only social preview', async 
       rootDir,
       paths: [
         'assets/img/og-preview.jpg',
+        'accessibility.html',
         'browserconfig.xml',
         'favicon.ico',
         'index.html',
         'privacy.html',
         'site.webmanifest',
+        'terms.html',
       ],
     }),
     /deploy-only social preview/i
@@ -208,6 +210,8 @@ test('web inventory binds exact bytes to the single index build id', async () =>
   await writeFile(join(rootDir, 'browserconfig.xml'), '<browserconfig/>\n');
   await writeFile(join(rootDir, 'favicon.ico'), 'ico\n');
   await writeFile(join(rootDir, 'privacy.html'), '<!doctype html><title>Privacy</title>\n');
+  await writeFile(join(rootDir, 'terms.html'), '<!doctype html><title>Terms</title>\n');
+  await writeFile(join(rootDir, 'accessibility.html'), '<!doctype html><title>Accessibility</title>\n');
   await writeFile(join(rootDir, 'site.webmanifest'), '{}\n');
 
   const inventory = await buildWebAssetInventory({
@@ -216,11 +220,13 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       '404.html',
       'CITATION.cff',
       'assets/js/app.js',
+      'accessibility.html',
       'browserconfig.xml',
       'favicon.ico',
       'index.html',
       'privacy.html',
       'site.webmanifest',
+      'terms.html',
     ],
   });
   assert.deepEqual(
@@ -234,20 +240,22 @@ test('web inventory binds exact bytes to the single index build id', async () =>
     [
       '404.html',
       'CITATION.cff',
+      'accessibility.html',
       'assets/js/app.js',
       'browserconfig.xml',
       'favicon.ico',
       'index.html',
       'privacy.html',
       'site.webmanifest',
+      'terms.html',
     ]
   );
   assert.equal(inventory.assets[0].content_type, 'text/html; charset=utf-8');
   assert.equal(inventory.assets[1].content_type, 'application/octet-stream');
-  assert.equal(inventory.assets[2].bytes, 27);
-  assert.match(inventory.assets[2].sha256, /^[0-9a-f]{64}$/);
+  assert.equal(inventory.assets[3].bytes, 27);
+  assert.match(inventory.assets[3].sha256, /^[0-9a-f]{64}$/);
   assert.equal(
-    inventory.assets[2].content_type,
+    inventory.assets[3].content_type,
     'application/javascript; charset=utf-8'
   );
 
@@ -270,11 +278,13 @@ test('web inventory binds exact bytes to the single index build id', async () =>
         '404.html',
         'CITATION.cff',
         'assets/js/app.js',
+        'accessibility.html',
         'browserconfig.xml',
         'favicon.ico',
         'index.html',
         'privacy.html',
         'site.webmanifest',
+        'terms.html',
       ],
     }),
     /exactly one.*build id/i

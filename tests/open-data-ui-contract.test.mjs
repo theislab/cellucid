@@ -14,9 +14,10 @@ import test from 'node:test';
 import { collectDOMReferences } from '../assets/js/app/ui/core/dom-cache.js';
 import {
   describeHiddenMetadataProblem,
-  localFileKind,
   shortAddress,
 } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { localFileLayout } from '../assets/js/app/ui/modules/dataset-drop.js';
+import { filePickerAccept } from '../assets/js/data/input-formats.js';
 import { routeAddress } from '../assets/js/app/ui/modules/address-routing.js';
 import { infoTipText } from './helpers/info-tip-text.mjs';
 
@@ -47,7 +48,11 @@ test('one Open… button opens a File… / Zarr folder… menu, the same in ever
 
   const fileInput = tag(/<input\b[^>]*id="user-data-file-input"[^>]*>/, 'file input');
   assert.match(fileInput, /\btype="file"/);
-  assert.match(fileInput, /\baccept="\.h5ad,\.zip"/);
+  // File… takes every single-file format of the registry, set when the
+  // control is wired, so the list has one source.
+  assert.doesNotMatch(fileInput, /\baccept=/);
+  assert.match(connectionSource, /userDataFileInput\.accept = filePickerAccept\(\);/);
+  assert.equal(filePickerAccept(), '.h5ad,.zip');
   assert.doesNotMatch(fileInput, /\b(?:webkitdirectory|directory|multiple)\b/);
   const folderInput = tag(/<input\b[^>]*id="user-data-folder-input"[^>]*>/, 'folder input');
   assert.match(folderInput, /\bwebkitdirectory\b/);
@@ -60,11 +65,11 @@ test('one Open… button opens a File… / Zarr folder… menu, the same in ever
 });
 
 test('a picked file is read by what it is', () => {
-  assert.equal(localFileKind({ name: 'cells.h5ad' }), 'h5ad');
-  assert.equal(localFileKind({ name: 'cells.H5AD' }), 'h5ad');
-  assert.equal(localFileKind({ name: 'cells.zarr.zip' }), 'zarr-zip');
-  assert.equal(localFileKind({ name: 'cells.zip' }), 'zarr-zip');
-  assert.equal(localFileKind({ name: 'cells.csv' }), null);
+  assert.equal(localFileLayout({ name: 'cells.h5ad' }), 'file');
+  assert.equal(localFileLayout({ name: 'cells.H5AD' }), 'file');
+  assert.equal(localFileLayout({ name: 'cells.zarr.zip' }), 'zip');
+  assert.equal(localFileLayout({ name: 'cells.zip' }), 'zip');
+  assert.equal(localFileLayout({ name: 'cells.csv' }), null);
 });
 
 test('the File or folder tip names every kind and that nothing is uploaded', () => {

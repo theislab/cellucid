@@ -627,7 +627,8 @@ test('figure-export canvas and PNG preserve translucent color during compositing
       // Read back straight: alpha applied once, not twice.
       const straightPixel = composite(frame, null);
       const immediateComposite = composite(frame, '#ffffff');
-      const dataUrl = await client.requestPngDataUrl(session, frame);
+      // The frame crosses to the encoder as the pixels the page reads.
+      const dataUrl = await client.requestPngDataUrl(session, client.pagePixels(frame));
       const base64 = dataUrl.slice('data:image/png;base64,'.length);
       const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
       const decodedPng = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));

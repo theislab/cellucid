@@ -77,7 +77,7 @@ test('the renderers run no per-cell pass and no encode on the page', async () =>
 test('the PNG figure is composed in one task, after every worker answer', async () => {
   const png = await source('renderers/png-renderer.js');
   const start = png.indexOf('// ── The composition: one synchronous run of canvas commands.');
-  const end = png.indexOf('const frame = await createImageBitmap(canvas);');
+  const end = png.indexOf('const pixels = pagePixels(canvas);');
   assert.ok(start > 0 && end > start);
   // A composition split across tasks is flushed in pieces, and the browser
   // rasterizes antialiased rules differently in pieces (measured on Suo:
@@ -99,6 +99,17 @@ test('the worker module is the one place the rasterizer and encoders run', async
   // The page loads the handler only where a worker cannot draw.
   assert.match(client, /await import\('\.\/figure-export-worker\.js'\)/);
   assert.doesNotMatch(client, /^import [^;]*figure-export-worker\.js'/m);
+  // What the page hands the encoders is pixels it read, never an ImageBitmap
+  // of a page canvas: on Linux WebKit such a bitmap reached the worker's
+  // encoder without the canvas's pixels (`pagePixels`).
+  for (const op of ['encodePng', 'encodePngDataUrl', 'encodeRasterPngDataUrl']) {
+    assert.match(worker, new RegExp(`${op}: async \\(\\{ pixels`), op);
+  }
+  assert.doesNotMatch(worker, /bitmaprenderer|transferFromImageBitmap/);
+  const [png, svg] = await Promise.all([source('renderers/png-renderer.js'), source('renderers/svg-renderer.js')]);
+  for (const [name, text] of [['png-renderer', png], ['svg-renderer', svg]]) {
+    assert.doesNotMatch(text, /createImageBitmap\(/, name);
+  }
 });
 
 /** A worker that answers `webgl2` with `drawing` and records every request. */

@@ -42,8 +42,9 @@
  * @module data/anndata/older-layouts
  */
 
-import { compareNames, isArrayNode, isGroup, pathParts } from '../../formats/store.js';
+import { isArrayNode, isGroup } from '../../formats/store.js';
 import { attributeValue } from './elements.js';
+import { encodingAttrs, joinPath, memberArray, viewArray, viewGroup } from './views/view-nodes.js';
 
 const MAPPING_ROLES = ['obsm', 'varm', 'obsp', 'varp', 'layers'];
 
@@ -51,71 +52,6 @@ const MAPPING_ROLES = ['obsm', 'varm', 'obsp', 'varp', 'layers'];
 export function isOlderAnnDataLayout(root) {
   return isGroup(root) && attributeValue(root, 'encoding-type') === undefined &&
     (root.has('obs') || root.has('var') || root.has('X'));
-}
-
-function encodingAttrs(encoding) {
-  const version = encoding === 'dict' || encoding.endsWith('_matrix') ? '0.1.0' : '0.2.0';
-  return { 'encoding-type': encoding, 'encoding-version': version };
-}
-
-function joinPath(parent, name) {
-  return parent === '/' ? `/${name}` : `${parent}/${name}`;
-}
-
-/**
- * A group presented with other attributes and children. `children` maps each
- * name to a function making the child (made once, on first access).
- */
-function viewGroup({ path, attrs, children, real = null, ownAttributes = [] }) {
-  const made = new Map();
-  const names = [...children.keys()].sort(compareNames);
-  const frozenAttrs = Object.freeze({ ...attrs });
-  const group = {
-    kind: 'group',
-    path,
-    name: path === '/' ? '' : path.slice(path.lastIndexOf('/') + 1),
-    attrs: frozenAttrs,
-    attributeType(name) {
-      return real !== null && !ownAttributes.includes(name) ? real.attributeType(name) : null;
-    },
-    keys: () => [...names],
-    has(name) {
-      const parts = pathParts(name);
-      if (parts.length === 0) return false;
-      if (parts.length === 1) return children.has(parts[0]);
-      const first = group.get(parts[0]);
-      return isGroup(first) && first.has(parts.slice(1).join('/'));
-    },
-    get(name) {
-      const parts = pathParts(name);
-      if (parts.length === 0) return group;
-      const make = children.get(parts[0]);
-      if (make === undefined) return null;
-      if (!made.has(parts[0])) made.set(parts[0], make());
-      const node = made.get(parts[0]);
-      if (parts.length === 1) return node;
-      return isGroup(node) ? node.get(parts.slice(1).join('/')) : null;
-    },
-  };
-  return Object.freeze(group);
-}
-
-/** An array presented with added attributes and, optionally, other values. */
-function viewArray(real, { attrs = {}, dtype = real.dtype, shape = real.shape, read = null, path = real.path }) {
-  const ownAttributes = Object.keys(attrs);
-  return Object.freeze({
-    kind: 'array',
-    path,
-    name: path.slice(path.lastIndexOf('/') + 1),
-    attrs: Object.freeze({ ...real.attrs, ...attrs }),
-    attributeType: name => (ownAttributes.includes(name) ? null : real.attributeType(name)),
-    shape,
-    dtype,
-    chunks: real.chunks,
-    fillValue: real.fillValue,
-    read: read ?? ((selection, options) => real.read(selection, options)),
-    storedBytes: (selection, options) => real.storedBytes(selection, options),
-  });
 }
 
 /** An array, a sparse matrix, or (inside a mapping) a dataframe or nested mapping. */
@@ -241,44 +177,6 @@ function asDataFrame(node, categoriesOf) {
 }
 
 // ------------------------------------------------- anndata 0.6 compounds
-
-/**
- * One member of a compound array as an array of its own, read one member at
- * a time (`readField`). An array member (an embedding of a compound `obsm`)
- * is a two-dimensional array of its element type.
- */
-function memberArray(compound, field) {
-  const rows = compound.shape[0];
-  const width = field.shape.length === 1 ? field.shape[0] : null;
-  const shape = width === null ? [rows] : [rows, width];
-  const path = joinPath(compound.path, field.name);
-  return Object.freeze({
-    kind: 'array',
-    path,
-    name: field.name,
-    attrs: Object.freeze({}),
-    attributeType: () => null,
-    shape,
-    dtype: field.dtype,
-    chunks: compound.chunks === null ? null : (width === null ? [compound.chunks[0]] : [compound.chunks[0], width]),
-    fillValue: null,
-    storedBytes: (selection, options) => compound.storedBytes(selection === undefined ? undefined : [selection[0]], options),
-    async read(selection, options) {
-      const [start, end] = selection?.[0] ?? [0, rows];
-      const values = await compound.readField(field.name, [[start, end]], options);
-      if (width === null) return values;
-      const [first, last] = selection?.[1] ?? [0, width];
-      if (first === 0 && last === width) return values;
-      const selected = new values.constructor((end - start) * (last - first));
-      for (let row = 0; row < end - start; row++) {
-        for (let column = first; column < last; column++) {
-          selected[row * (last - first) + column - first] = values[row * width + column];
-        }
-      }
-      return selected;
-    },
-  });
-}
 
 function compoundDataFrame(compound, categoriesOf) {
   const fields = compound.dtype.fields;

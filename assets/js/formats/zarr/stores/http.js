@@ -148,7 +148,7 @@ export function httpStore(baseUrl, {
       // stays live.
       let arrived = 0;
       const { response, bytes } = await limit(async () => {
-        const started = link?.begin() ?? performance.now();
+        const started = link?.begin() ?? clock.now();
         let answer;
         try {
           answer = await fetchOnce(url, init, {
@@ -171,7 +171,7 @@ export function httpStore(baseUrl, {
         if (method !== 'HEAD') {
           transferred.requests++;
           transferred.bytes += answer.bytes?.length ?? 0;
-          onTransfer?.({ url: base.href, bytes: transferred.bytes, requests: transferred.requests, ms: performance.now() - started });
+          onTransfer?.({ url: base.href, bytes: transferred.bytes, requests: transferred.requests, ms: clock.now() - started });
         }
         return answer;
       }, signal, activity);
@@ -193,6 +193,7 @@ export function httpStore(baseUrl, {
       signal,
       retryable: error => isTransientFailure(error) && (retryNetwork || error.code !== BYTE_SOURCE_FAILURES.NETWORK),
       onRetry: (error, attempts) => clock.onRetry?.(error, attempts),
+      after: clock.after,
     });
   }
 

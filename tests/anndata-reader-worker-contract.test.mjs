@@ -12,8 +12,12 @@ import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 const FIXTURE = new URL('./browser/fixtures/current-ui-smoke.h5ad', import.meta.url);
 const bytes = new Uint8Array(readFileSync(FIXTURE));
 
-function handlerWith(events = []) {
-  const handle = createAnnDataReaderHandler({ post: message => events.push(message) });
+/**
+ * A worker handler whose posted messages go to `events`; `onPost` hears each
+ * one as it is posted.
+ */
+function handlerWith(events = [], onPost = null) {
+  const handle = createAnnDataReaderHandler({ post: message => { events.push(message); onPost?.(message); } });
   return async (method, ...args) => {
     const { reply } = await handle({ id: 1, method, args });
     if (reply.error) {
@@ -56,23 +60,31 @@ test('a cell-major matrix is indexed by gene at open over a link as fast as a di
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
-  const indexStarted = events => events.some(event => event.event === 'activity' && event.kind === 'index');
+  const isIndex = event => event.event === 'activity' && event.kind === 'index';
+  const indexStarted = events => events.some(isIndex);
+  // What is not started by `prepareMatrix` is decided there, before it
+  // returns (`AnnDataReader.prepareMatrix`); a while after, it still is not.
   const settle = () => new Promise(resolve => setTimeout(resolve, 20));
 
-  // A local cell-major (CSR) matrix: its index starts at once.
+  // A local cell-major (CSR) matrix: its index starts at once, on its own,
+  // once the matrix's layout is read (whenever the file's reads answer): the
+  // test waits for the index's activity, not for a while.
   const csr = new Uint8Array(readFileSync(new URL('./browser/fixtures/legacy-twin-current.h5ad', import.meta.url)));
   const local = [];
-  const localCall = handlerWith(local);
-  await localCall('open', { kind: 'h5ad', source: new File([csr], 'csr.h5ad') });
+  let indexPosted;
+  const localIndex = new Promise(resolve => { indexPosted = resolve; });
+  const localCall = handlerWith(local, message => { if (isIndex(message)) indexPosted(message); });
+  await localCall('open', { source: { file: new File([csr], 'csr.h5ad') } });
+  assert.ok(!indexStarted(local), 'nothing is indexed before the matrix is prepared');
   await localCall('prepareMatrix', 'X');
-  await settle();
+  await localIndex;
   assert.ok(indexStarted(local), 'a local CSR file starts its index at once');
 
   // A dense matrix's index holds every value: even local, it is built when
   // its first gene is asked for, never ahead.
   const dense = [];
   const denseCall = handlerWith(dense);
-  await denseCall('open', { kind: 'h5ad', source: new File([bytes], 'x.h5ad') });
+  await denseCall('open', { source: { file: new File([bytes], 'x.h5ad') } });
   await denseCall('prepareMatrix', 'X');
   await settle();
   assert.ok(!indexStarted(dense), 'a dense matrix is not indexed ahead');
@@ -83,7 +95,7 @@ test('a cell-major matrix is indexed by gene at open over a link as fast as a di
   globalThis.fetch = servingOverLink(20, 100);
   const slow = [];
   const slowCall = handlerWith(slow);
-  await slowCall('open', { kind: 'h5ad', source: { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad' } });
+  await slowCall('open', { source: { file: { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad' } } });
   await slowCall('prepareMatrix', 'X');
   await settle();
   assert.ok(!indexStarted(slow), 'a file over a slow link does not');
@@ -101,8 +113,7 @@ test('a remote file reports its transfers, and every read operation reports its 
   const events = [];
   const call = handlerWith(events);
   await call('open', {
-    kind: 'h5ad',
-    source: { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad' },
+    source: { file: { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad' } },
   });
   await call('getObsField', 'cell_type');
   await call('getMatrixColumns', 'X', [0, 5]);
@@ -127,15 +138,15 @@ test('a remote file reports its transfers, and every read operation reports its 
 test('a file that is not HDF5, or is damaged, is explained', async () => {
   const call = handlerWith();
   await assert.rejects(
-    call('open', { kind: 'h5ad', source: new File([new TextEncoder().encode('not an hdf5 file at all')], 'x.h5ad') }),
+    call('open', { source: { file: new File([new TextEncoder().encode('not an hdf5 file at all')], 'x.h5ad') } }),
     error => /not a valid HDF5\/H5AD file/.test(error.message) && error.details?.explained === true
   );
   await assert.rejects(
-    call('open', { kind: 'h5ad', source: new File([bytes.subarray(0, 4000)], 'cut.h5ad') }),
+    call('open', { source: { file: new File([bytes.subarray(0, 4000)], 'cut.h5ad') } }),
     error => /could not be read .*corrupted or truncated/s.test(error.message) && error.details?.explained === true
   );
   await assert.rejects(
-    call('open', { kind: 'h5ad', source: new File([], 'empty.h5ad') }),
+    call('open', { source: { file: new File([], 'empty.h5ad') } }),
     error => /empty/.test(error.message)
   );
 });
@@ -231,12 +242,12 @@ async function openedClient(t) {
     worker = createInProcessAnnDataReaderWorker();
     return worker;
   });
-  const client = new AnnDataReaderClient({ kind: 'h5ad' });
+  const client = new AnnDataReaderClient();
   t.after(() => {
     client.close();
     setAnnDataReaderWorkerFactory(() => createInProcessAnnDataReaderWorker());
   });
-  await client.open(new File([bytes], 'x.h5ad'));
+  await client.open({ file: new File([bytes], 'x.h5ad') });
   const sent = () => worker.messages.filter(message => message.method !== 'open' && message.method !== 'prepareMatrix');
   return { client, sent };
 }
@@ -313,7 +324,7 @@ test('a cancelled read rejects at once and cancels its worker request once no ca
 
 test('the worker cancels a request by id and answers it with an AbortError', async () => {
   const handle = createAnnDataReaderHandler();
-  await handle({ id: 1, method: 'open', args: [{ kind: 'h5ad', source: new File([bytes], 'x.h5ad') }] });
+  await handle({ id: 1, method: 'open', args: [{ source: { file: new File([bytes], 'x.h5ad') } }] });
   const original = AnnDataReader.prototype.getObsField;
   let seen = null;
   AnnDataReader.prototype.getObsField = function (key, { signal }) {

@@ -13,6 +13,7 @@
  * `getAnnDataSource()` exposes it.
  */
 
+import { INPUT_FORMATS, isInputFormatId } from './input-formats.js';
 import {
   DataSourceError,
   DataSourceErrorCode,
@@ -252,8 +253,9 @@ function requireRemoteHealthPayload(payload) {
   if (payload.type !== 'anndata') {
     throw new TypeError('Remote health response type must be exactly anndata');
   }
-  if (!['h5ad', 'zarr'].includes(payload.format)) {
-    throw new TypeError('Remote health format must be exactly h5ad or zarr');
+  if (!isInputFormatId(payload.format)) {
+    throw new TypeError('Remote health format must be an input format id this viewer reads (' +
+      `${INPUT_FORMATS.map(format => format.id).join(', ')})`);
   }
   requireNonNegativeSafeInteger(payload.n_cells, 'Remote health n_cells');
   requireNonNegativeSafeInteger(payload.n_genes, 'Remote health n_genes');
@@ -1070,7 +1072,7 @@ export class RemoteDataSource {
   }
 
   /**
-   * The base URL of the dataset: the h5ad:// or zarr:// URL of the store the
+   * The base URL of the dataset: the anndata:// URL of the store the
    * browser's reader opened, which its metadata load opens.
    *
    * @param {string} datasetId

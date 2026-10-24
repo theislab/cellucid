@@ -27,12 +27,17 @@ const REQUIRED_ROOT_ASSETS = Object.freeze([
   // server that serves a cached build must carry it too.
   'CITATION.cff',
   'browserconfig.xml',
+  // The accessibility statement, linked from the app's footer.
+  'accessibility.html',
   // Browsers ask for /favicon.ico on their own; every page links this one.
   'favicon.ico',
   'index.html',
   // The privacy policy the Google and Microsoft sign-in screens link to.
   'privacy.html',
   'site.webmanifest',
+  // The terms of use, linked from the footer and from Google's and
+  // Microsoft's app branding.
+  'terms.html',
 ]);
 const REQUIRED_ROOT_ASSET_SET = new Set(REQUIRED_ROOT_ASSETS);
 const BUILD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -175,10 +180,40 @@ export async function stampBuildId({ rootDir, paths, today = new Date() }) {
 // date half of the build id: the day the shipped bytes last changed, which is
 // when the page a crawler fetches last changed. The generator writes it beside
 // the inventory, and --check refuses a sitemap that names another day. The
-// privacy policy is reached by the home page's footer link and carries its own
-// canonical; it is not listed, because the build date is not the day it changed.
+// reading pages (privacy, terms, accessibility) are reached by the home page's
+// footer links and carry their own canonicals; they are not listed, because
+// the build date is not the day they changed.
 const SITEMAP_FILENAME = 'sitemap.xml';
 export const SITE_URL = 'https://www.cellucid.com/';
+
+// /.well-known/security.txt (RFC 9116): where to report a vulnerability. Its
+// contact is the one SECURITY.md names, its policy is SECURITY.md as GitHub
+// shows it. RFC 9116 requires an `Expires` less than a year ahead; it is the
+// build date plus 365 days, written by the generator beside the sitemap, so
+// every deploy renews it and --check refuses one that names another day. It is
+// served from the site's origin only, so it is not in the runtime inventory.
+const SECURITY_TXT_PATH = '.well-known/security.txt';
+const SECURITY_CONTACT = 'mailto:k.inecik@gmail.com';
+const SECURITY_POLICY_URL = 'https://github.com/theislab/cellucid/security/policy';
+const SECURITY_TXT_LIFETIME_DAYS = 365;
+
+export function renderSecurityTxt(buildId) {
+  if (!STAMPED_BUILD_ID_PATTERN.test(buildId)) {
+    throw new TypeError(`Cannot date security.txt from build id "${buildId}".`);
+  }
+  const built = new Date(`${buildId.slice(0, 10)}T00:00:00Z`);
+  const expires = new Date(built.getTime() + SECURITY_TXT_LIFETIME_DAYS * 86_400_000);
+  return Buffer.from(
+    '# Report security problems in Cellucid (www.cellucid.com and its\n'
+      + '# packages) privately to the contact below, as the policy describes.\n'
+      + `Contact: ${SECURITY_CONTACT}\n`
+      + `Expires: ${expires.toISOString().replace('.000Z', 'Z')}\n`
+      + `Policy: ${SECURITY_POLICY_URL}\n`
+      + 'Preferred-Languages: en\n'
+      + `Canonical: ${SITE_URL}${SECURITY_TXT_PATH}\n`,
+    'utf8'
+  );
+}
 
 export function renderSitemap(buildId) {
   if (!STAMPED_BUILD_ID_PATTERN.test(buildId)) {
@@ -366,6 +401,8 @@ async function runCli() {
   const outputPath = join(rootDir, INVENTORY_FILENAME);
   const sitemapBytes = renderSitemap(inventory.build_id);
   const sitemapPath = join(rootDir, SITEMAP_FILENAME);
+  const securityTxtBytes = renderSecurityTxt(inventory.build_id);
+  const securityTxtPath = join(rootDir, ...SECURITY_TXT_PATH.split('/'));
 
   if (args.length === 1 && args[0] === '--check') {
     const current = await readFile(outputPath);
@@ -379,6 +416,11 @@ async function runCli() {
         `${SITEMAP_FILENAME} does not carry the current build date.`
       );
     }
+    if (!(await readFile(securityTxtPath)).equals(securityTxtBytes)) {
+      throw new Error(
+        `${SECURITY_TXT_PATH} does not expire a year after the current build date.`
+      );
+    }
     return;
   }
   if (args.length !== 0) {
@@ -388,6 +430,7 @@ async function runCli() {
   }
   await writeInventoryAtomically(outputPath, bytes);
   await writeInventoryAtomically(sitemapPath, sitemapBytes);
+  await writeInventoryAtomically(securityTxtPath, securityTxtBytes);
 }
 
 export async function isDirectModuleInvocation({

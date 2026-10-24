@@ -34,7 +34,7 @@ test('loadPointsBinary requires the layout dimension and never reads it from the
     const options = {};
     if (dimension !== undefined) options.dimension = dimension;
     await assert.rejects(
-      loadPointsBinary('h5ad://dataset/obsm/0/0-1', options),
+      loadPointsBinary('anndata://dataset/obsm/0/0-1', options),
       /payload dimension: exactly 1, 2, or 3/i
     );
   }
@@ -43,10 +43,10 @@ test('loadPointsBinary requires the layout dimension and never reads it from the
 test('loadPointsBinary reads only an AnnData dataset', async () => {
   await assert.rejects(
     loadPointsBinary('https://untrusted.test/data/obsm/0/0-1', { dimension: 2 }),
-    /h5ad:\/\/ or zarr:\/\/ URL/
+    /anndata:\/\/ URL/
   );
   await assert.rejects(
-    loadPointsBinary('h5ad://dataset/obsm/0/0-1', { dimension: 2, expectedBytes: 16 }),
+    loadPointsBinary('anndata://dataset/obsm/0/0-1', { dimension: 2, expectedBytes: 16 }),
     /unexpected key\(s\): expectedBytes/
   );
 });

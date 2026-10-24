@@ -1,0 +1,7 @@
+# Report security problems in Cellucid (www.cellucid.com and its
+# packages) privately to the contact below, as the policy describes.
+Contact: mailto:k.inecik@gmail.com
+Expires: 2027-10-24T00:00:00Z
+Policy: https://github.com/theislab/cellucid/security/policy
+Preferred-Languages: en
+Canonical: https://www.cellucid.com/.well-known/security.txt

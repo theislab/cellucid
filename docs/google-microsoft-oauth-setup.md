@@ -20,8 +20,8 @@ it; public Figshare items need nothing.
 The design, with the facts it rests on, is
 `cellucid-private/plans/drive-onedrive-figshare-2026-10-23.md`. The user-facing
 page is `docs/user_guide/web_app/b_data_loading/16_private_drive_onedrive.md`
-in `cellucid-python`; the privacy policy is `privacy.html`, linked from the
-home page's footer. The same setup, click by click for the site owner, is
+in `cellucid-python`; the privacy policy is `privacy.html` and the terms of use
+`terms.html`, both linked from the home page's footer. The same setup, click by click for the site owner, is
 `cellucid-private/guides/google-drive-and-onedrive-setup.md`.
 
 ## Google (about 40 minutes, plus DNS for brand verification)
@@ -44,8 +44,9 @@ home page's footer. The same setup, click by click for the site owner, is
    email, audience **External**, a contact email.
 5. **Branding**: no logo (a logo forces a brand review), home page
    `https://www.cellucid.com`, privacy policy
-   `https://www.cellucid.com/privacy.html`, no terms of service, authorized
-   domain `cellucid.com`, a developer contact.
+   `https://www.cellucid.com/privacy.html`, terms of service
+   `https://www.cellucid.com/terms.html`, authorized domain `cellucid.com`, a
+   developer contact.
 6. **Data Access**: add the one scope
    `https://www.googleapis.com/auth/drive.file`, listed under non-sensitive
    scopes. Nothing else.
@@ -112,8 +113,9 @@ Google Drive API → Quotas** after launch.
    `Files.ReadWrite…`, no application permissions, and no admin consent for
    your own tenant; `Files.Read.All` is asked for only when a work account
    opens a colleague's file.
-5. **Branding & properties**: home page `https://www.cellucid.com`, privacy
-   statement `https://www.cellucid.com/privacy.html`; a logo is optional.
+5. **Branding & properties**: home page `https://www.cellucid.com`, terms of
+   service `https://www.cellucid.com/terms.html`, privacy statement
+   `https://www.cellucid.com/privacy.html`; a logo is optional.
 6. Copy the **Application (client) ID** into `microsoft.clientId` (not the
    directory or object ID).
 7. **Publisher verification** (optional, for work accounts): verify the custom

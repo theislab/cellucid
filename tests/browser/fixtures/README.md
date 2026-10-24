@@ -33,7 +33,7 @@ python scripts/generate-byte-order-h5ad-fixtures.py
 
 The generator is deterministic and re-verifies the recorded byte order of each
 dataset before finishing. `tests/h5ad-byte-order-contract.test.mjs` loads both
-through the real `H5adDataSource` path and requires identical numbers, which
+through the real `AnnDataFileSource` path and requires identical numbers, which
 pins the guarantee that the HDF5 reader converts stored data to the host byte
 order — the reason the AnnData reader judges an array by its kind alone and
 never by its stored byte order. `dataset-switch-owned-state.spec.mjs` and

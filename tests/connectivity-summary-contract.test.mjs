@@ -14,8 +14,7 @@ import { validateConnectivitySummary } from '../assets/js/data/connectivity-summ
 import {
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesFromPairs, edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
 const DIRECT_SUMMARY = Object.freeze({
@@ -54,7 +53,7 @@ async function withJsonResponse(value, callback, status = 200) {
 
 async function withDirectSource({
   id = 'connectivity-contract',
-  protocol = 'h5ad',
+  protocol = 'anndata',
   summaryMethod = async () => DIRECT_SUMMARY,
   omitSummaryMethod = false,
   adapterMethods = {},
@@ -360,8 +359,8 @@ test('edge dispatch revalidates the summary for the explicit URL protocol', asyn
 
 test('H5AD and Zarr summary access is metadata-only', async t => {
   for (const [label, SourceClass] of [
-    ['H5AD', H5adDataSource],
-    ['Zarr', ZarrDataSource],
+    ['H5AD', AnnDataFileSource],
+    ['Zarr', AnnDataFileSource],
   ]) {
     await t.test(label, async () => {
       const source = new SourceClass();
@@ -428,21 +427,21 @@ test('all four public metadata loaders refuse a pre-aborted owner before reading
   await t.test('a non-AnnData URL is refused', async () => {
     await assert.rejects(
       loadDatasetIdentity('https://cellucid.test/'),
-      /h5ad:\/\/ or zarr:\/\/ URL/
+      /anndata:\/\/ URL/
     );
   });
 
   await t.test('options reject unknown keys and non-signals', async () => {
     await assert.rejects(
       loadDatasetIdentity(
-        'h5ad://dataset/',
+        'anndata://dataset/',
         { legacySignal: null }
       ),
       /unexpected key.*legacySignal/i
     );
     await assert.rejects(
       loadConnectivitySummary(
-        'h5ad://dataset/obsp',
+        'anndata://dataset/obsp',
         { signal: false }
       ),
       /AbortSignal or exact null/i
@@ -479,14 +478,14 @@ test('connectivity edge loading requires and propagates one exact owner signal',
   await t.test('required options contract', async () => {
     await assert.rejects(
       loadEdges(
-        'h5ad://dataset/obsp',
+        'anndata://dataset/obsp',
         DIRECT_SUMMARY
       ),
       /options must be an object/i
     );
     await assert.rejects(
       loadEdges(
-        'h5ad://dataset/obsp',
+        'anndata://dataset/obsp',
         DIRECT_SUMMARY,
         {}
       ),
@@ -494,7 +493,7 @@ test('connectivity edge loading requires and propagates one exact owner signal',
     );
     await assert.rejects(
       loadEdges(
-        'h5ad://dataset/obsp',
+        'anndata://dataset/obsp',
         DIRECT_SUMMARY,
         { signal: EDGE_SIGNAL, legacyAbort: true }
       ),

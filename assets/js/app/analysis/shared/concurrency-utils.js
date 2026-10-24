@@ -86,9 +86,19 @@ export const FRAME_MS = 1000 / 60;
  * @template T
  * @param {(update: T) => void} deliver
  * @param {number} [intervalMs=FRAME_MS]
+ * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void}} [options]
+ *   `clock`, the time in milliseconds (`performance.now`), and `after`, a
+ *   timer that calls back after `ms` and returns what cancels it
+ *   (`setTimeout`); tests give a virtual clock and its timers
  * @returns {{push: (build: () => T) => void, flush: () => void, cancel: () => void}}
  */
-export function createFrameThrottle(deliver, intervalMs = FRAME_MS) {
+export function createFrameThrottle(deliver, intervalMs = FRAME_MS, {
+  clock = () => performance.now(),
+  after = (ms, callback) => {
+    const timer = setTimeout(callback, ms);
+    return () => clearTimeout(timer);
+  },
+} = {}) {
   if (typeof deliver !== 'function') {
     throw new TypeError('deliver must be a function');
   }
@@ -98,32 +108,33 @@ export function createFrameThrottle(deliver, intervalMs = FRAME_MS) {
   let lastDelivery = -Infinity;
   /** @type {(() => T)|null} */
   let pending = null;
-  let timer = null;
+  /** Cancels the timer of the update waiting for its frame (null: none waits). */
+  let cancelTimer = null;
   const flush = () => {
-    if (timer !== null) {
-      clearTimeout(timer);
-      timer = null;
+    if (cancelTimer !== null) {
+      cancelTimer();
+      cancelTimer = null;
     }
     if (pending === null) return;
     const build = pending;
     pending = null;
-    lastDelivery = performance.now();
+    lastDelivery = clock();
     deliver(build());
   };
   return {
     push(build) {
       pending = build;
-      const elapsed = performance.now() - lastDelivery;
+      const elapsed = clock() - lastDelivery;
       if (elapsed >= intervalMs) {
         flush();
-      } else if (timer === null) {
-        timer = setTimeout(flush, intervalMs - elapsed);
+      } else if (cancelTimer === null) {
+        cancelTimer = after(intervalMs - elapsed, flush);
       }
     },
     flush,
     cancel() {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      cancelTimer?.();
+      cancelTimer = null;
       pending = null;
     }
   };

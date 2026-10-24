@@ -14,7 +14,10 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = name => readFile(path.join(ROOT, name), 'utf8');
 
-const PAGES = ['404.html', 'privacy.html', 'assets/auth/callback.html'];
+const PAGES = ['404.html', 'privacy.html', 'terms.html', 'accessibility.html', 'assets/auth/callback.html'];
+// The reading pages: the brand card widened for text, linked from the app's
+// footer and from each other.
+const READING_PAGES = ['privacy.html', 'terms.html', 'accessibility.html'];
 
 test('the design system states the site design principles', async () => {
   const readme = await read('assets/css/README.md');
@@ -50,6 +53,25 @@ test('the standalone pages are the brand card on the shared page stylesheet', as
     assert.ok(policy, `${name} declares a Content-Security-Policy`);
     assert.match(policy, /style-src 'self'/, name);
     assert.doesNotMatch(policy, /unsafe-inline|unsafe-eval/, name);
+  }
+});
+
+test('the reading pages are one set: dated, one contact, linked to each other', async () => {
+  // The contact is the one the security policy names (SECURITY.md).
+  const contact = /`([^`@\s]+@[^`\s]+)`/.exec(await read('SECURITY.md'))?.[1];
+  assert.ok(contact, 'SECURITY.md names a contact address');
+  for (const name of READING_PAGES) {
+    const html = await read(name);
+    assert.match(html, /class="welcome-content welcome-content-wide"/, `${name} is a reading page`);
+    assert.match(html, /<div class="welcome-body page-prose">/, name);
+    assert.match(html, /<p class="page-meta">Last updated \d{1,2} [A-Z][a-z]+ \d{4}<\/p>/, `${name} says when it last changed`);
+    assert.match(html, new RegExp(`<link rel="canonical" href="https://www\\.cellucid\\.com/${name.replace('.', '\\.')}" />`), name);
+    assert.ok(html.includes(`<a href="mailto:${contact}">${contact}</a>`), `${name} names the contact ${contact}`);
+    const footLinks = /<ul class="welcome-links"[^>]*>([\s\S]*?)<\/ul>/.exec(html)?.[1] ?? '';
+    for (const sibling of READING_PAGES.filter(other => other !== name)) {
+      assert.ok(footLinks.includes(`<a href="/${sibling}">`), `${name} links ${sibling} at its foot`);
+    }
+    assert.ok(footLinks.includes('<a href="/">Open Cellucid</a>'), `${name} links back to the app`);
   }
 });
 

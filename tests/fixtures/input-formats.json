@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "signatures": [
+    {
+      "offsets": [
+        0,
+        512,
+        1024,
+        2048
+      ],
+      "hex": "894844460d0a1a0a",
+      "layout": "file",
+      "container": "hdf5"
+    },
+    {
+      "offsets": [
+        0
+      ],
+      "hex": "504b0304",
+      "layout": "zip",
+      "container": "zarr"
+    },
+    {
+      "offsets": [
+        0
+      ],
+      "hex": "504b0506",
+      "layout": "zip",
+      "container": "zarr"
+    }
+  ],
+  "folderMarkers": {
+    "zarr": [
+      ".zarray",
+      ".zattrs",
+      ".zgroup",
+      ".zmetadata",
+      "zarr.json"
+    ]
+  },
+  "formats": [
+    {
+      "id": "h5ad",
+      "label": "AnnData (.h5ad)",
+      "ecosystem": "python",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".h5ad"
+        ]
+      }
+    },
+    {
+      "id": "zarr",
+      "label": "AnnData Zarr",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "zarr",
+      "names": {
+        "zip": [
+          ".zarr.zip",
+          ".zip"
+        ],
+        "folder": [
+          ".zarr"
+        ]
+      }
+    }
+  ]
+}

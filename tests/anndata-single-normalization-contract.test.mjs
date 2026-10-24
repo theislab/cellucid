@@ -28,9 +28,8 @@ import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { resolveVectorBinding } from '../assets/js/data/data-mapping-candidates.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { createDimensionManager } from '../assets/js/data/dimension-manager.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { createVectorFieldManager } from '../assets/js/data/vector-field-manager.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
 import { normalizePositions } from '../assets/js/rendering/gl-utils.js';
 import { storedObsm } from './helpers/stored-obsm.mjs';
 import { loaderMetadata, obsmColumnReader, withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
@@ -63,9 +62,9 @@ function silence(t) {
 
 async function openDirect(t, { file, format }) {
   const bytes = await readFile(new URL(`./browser/fixtures/${file}`, import.meta.url));
-  const source = format === 'H5AD' ? new H5adDataSource() : new ZarrDataSource();
-  if (format === 'H5AD') await source.loadFromFile(new File([bytes], file));
-  else await source.loadFromArchiveFile(new File([bytes], file));
+  const source = format === 'H5AD' ? new AnnDataFileSource() : new AnnDataFileSource();
+  if (format === 'H5AD') await source.loadFile(new File([bytes], file));
+  else await source.loadFile(new File([bytes], file));
 
   const manager = getDataSourceManager();
   const previous = { source: manager.activeSource, datasetId: manager.activeDatasetId };

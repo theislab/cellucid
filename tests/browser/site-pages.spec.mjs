@@ -1,14 +1,19 @@
 /**
- * The standalone pages (404.html, privacy.html, assets/auth/callback.html) are
- * the brand card in the visitor's theme, fit a phone without sideways
- * scrolling, and show keyboard focus (assets/css/README.md, "Site Design
- * Principles"; tests/site-pages-design-contract.test.mjs holds their markup).
+ * The standalone pages (404.html, privacy.html, terms.html,
+ * accessibility.html, assets/auth/callback.html) are the brand card in the
+ * visitor's theme, fit a phone without sideways scrolling, and show keyboard
+ * focus (assets/css/README.md, "Site Design Principles";
+ * tests/site-pages-design-contract.test.mjs holds their markup). The app's
+ * footer reaches the reading pages, each in a new tab so the app keeps its
+ * state.
  */
 import { expect, test } from './helpers/test.mjs';
 
 const PAGES = [
   ['/404.html', 'Page not found'],
   ['/privacy.html', 'Privacy policy'],
+  ['/terms.html', 'Terms of use'],
+  ['/accessibility.html', 'Accessibility'],
   ['/assets/auth/callback.html', 'Sign-in'],
 ];
 
@@ -61,6 +66,34 @@ for (const [address, heading] of PAGES) {
     expect(errors).toEqual([]);
   });
 }
+
+test('the footer keeps its links to one quiet line and opens each page in a new tab', async ({ page }) => {
+  await page.goto('/');
+  const footer = page.locator('#copyright');
+  const links = footer.locator('p').nth(1).locator('a');
+  await expect(links).toHaveText(['Docs', 'Cite', 'GitHub', 'Privacy', 'Terms']);
+  // One line at the sidebar's default width: every link starts on the same row.
+  const rows = await links.evaluateAll(anchors => anchors.map(anchor => {
+    const box = anchor.getBoundingClientRect();
+    return box.width > 0 ? Math.round(box.top) : null;
+  }));
+  expect(rows).not.toContain(null);
+  expect(new Set(rows).size).toBe(1);
+  // The accessibility statement sits beside the licence, on its line.
+  const license = footer.locator('p').nth(2).locator('a');
+  await expect(license).toHaveText(['BSD 3-Clause license', 'Accessibility']);
+  const licenseRows = await license.evaluateAll(anchors => anchors.map(anchor => Math.round(anchor.getBoundingClientRect().top)));
+  expect(new Set(licenseRows).size).toBe(1);
+
+  for (const [name, heading] of [['Privacy', 'Privacy policy'], ['Terms', 'Terms of use'], ['Accessibility', 'Accessibility']]) {
+    const link = footer.getByRole('link', { name, exact: true });
+    await expect(link).toHaveAttribute('target', '_blank');
+    await expect(link).toHaveAttribute('rel', /\bnoopener\b/);
+    const response = await page.request.get(new URL(await link.getAttribute('href'), page.url()).href);
+    expect(response.status()).toBe(200);
+    expect(await response.text()).toContain(`class="welcome-title">${heading}</h1>`);
+  }
+});
 
 test('the sign-in return page with nothing to finish says so', async ({ page }) => {
   await page.goto('/assets/auth/callback.html');

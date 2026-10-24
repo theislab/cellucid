@@ -29,6 +29,7 @@ import {
   formatCountOf,
 } from '../components/display-format.js';
 import { formatTransferBytes, getTransferLog } from '../../../data/transfer-log.js';
+import { inputFormat } from '../../../data/input-formats.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getOpeningProgress } from '../../../data/opening-progress.js';
 
@@ -90,9 +91,9 @@ function hostOf(url) {
  * @returns {string}
  */
 export function describeStorageFormat(storage) {
-  if (storage.format === 'h5ad') return 'h5ad file';
+  if (inputFormat(storage.format).container === 'hdf5') return `${storage.format} file`;
   const version = storage.zarrVersion === null ? '' : ` v${storage.zarrVersion}`;
-  return storage.container === 'zip' ? `Zarr${version} ZIP` : `Zarr${version} folder`;
+  return storage.layout === 'zip' ? `Zarr${version} ZIP` : `Zarr${version} folder`;
 }
 
 /**

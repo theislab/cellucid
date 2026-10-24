@@ -310,9 +310,9 @@ export class VectorFieldManager {
   async _loadExactField(id, entry, layoutKey, dimension) {
     const filename = entry.files[layoutKey];
     if (!isAnnDataUrl(this.baseUrl)) {
-      throw new TypeError('VectorFieldManager reads an AnnData dataset by its h5ad:// or zarr:// base.');
+      throw new TypeError('VectorFieldManager reads an AnnData dataset by its anndata:// base.');
     }
-    // An h5ad:// or zarr:// dataset id is not a URL host, so the payload
+    // An anndata:// dataset id is not a URL host, so the payload
     // path is resolved textually; its adapter answers the mapping route.
     // The positions and the vectors are asked for together: the reader
     // worker reads both at once and scales the vectors by the embedding's

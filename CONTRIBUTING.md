@@ -203,13 +203,16 @@ After changing any shipped file (`index.html`, `assets/`, root assets), run
 `cellucid-web-assets.json` and stamps the build id in `index.html` as
 `<date>.<digest>`, a digest of every shipped file, so the footer, the situation
 report and the Python web cache name the exact build. It also writes
-`sitemap.xml`, whose `<lastmod>` is the date half of that build id. `npm test`
+`sitemap.xml`, whose `<lastmod>` is the date half of that build id, and
+`.well-known/security.txt`, whose `Expires` is a year after it. `npm test`
 fails until it has been run.
 
 What search engines and link previews read — the `<head>` metadata, the JSON-LD
 block and its hash in the Content-Security-Policy, the visually hidden "About
-Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, `llms.txt` and
-`site.webmanifest` — is pinned by `tests/seo-head-contract.test.mjs`.
+Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, the reading pages
+(`privacy.html`, `terms.html`, `accessibility.html`), `.well-known/security.txt`,
+`llms.txt` and `site.webmanifest` — is pinned by
+`tests/seo-head-contract.test.mjs`.
 
 `npm test` runs `scripts/run-web-tests.mjs`, which discovers every
 `tests/*.test.mjs` file and runs them under the Node.js test runner — so a new

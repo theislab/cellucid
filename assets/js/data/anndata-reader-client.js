@@ -220,12 +220,7 @@ export function rebuildReaderError(record) {
  * One reader worker and the dataset open in it.
  */
 export class AnnDataReaderClient {
-  /**
-   * @param {Object} options
-   * @param {'h5ad'|'zarr'} options.kind
-   */
-  constructor({ kind }) {
-    this._kind = kind;
+  constructor() {
     this._worker = null;
     this._nextId = 1;
     this._pending = new Map();
@@ -368,7 +363,7 @@ export class AnnDataReaderClient {
   _callWith({ transfer = [], signal = null }, method, ...args) {
     if (this._worker === null && method !== 'open' && this._source !== null && !this._closed) {
       // The page came back from the back/forward cache: open the file again.
-      this._reopening ??= this._post([], null, 'open', [{ kind: this._kind, source: this._source }]);
+      this._reopening ??= this._post([], null, 'open', [this._source]);
       return this._reopening.then(() => this._post(transfer, signal, method, args));
     }
     return this._post(transfer, signal, method, args);
@@ -409,17 +404,23 @@ export class AnnDataReaderClient {
   }
 
   /**
-   * Open one dataset in the worker: an `.h5ad` File, or for Zarr
-   * `{files: Map<path, File>, rootName}` or `{archive: File}`.
+   * Open one dataset in the worker (`openDatasetStore` in `anndata/open.js`):
+   * one file `{file}` (a `File`, or a remote file read in place), a picked
+   * folder `{files: Map<path, File>, rootName}`, or a store folder on a web
+   * host `{url, name}`. What it is is decided from its content; `expect`
+   * (`{format, layout}`, what a server or a catalog says it is) stands in
+   * for its name.
    *
-   * @param {File|Object} source
-   * @returns {Promise<{name: string}>}
+   * @param {Object} source
+   * @param {{expect?: {format: string, layout: 'file'|'zip'|'folder'}|null}} [options]
+   * @returns {Promise<{name: string, format: string, layout: string, zarrVersion: 2|3|null}>}
    */
-  async open(source) {
+  async open(source, { expect = null } = {}) {
     // The log follows the dataset being opened, from its first read.
     getReadActivityLog().clear();
-    const snapshot = await this._call('open', { kind: this._kind, source });
-    this._source = source;
+    const request = { source, expect };
+    const snapshot = await this._call('open', request);
+    this._source = request;
     // The page's download scheduler runs as many background reads at once
     // as this source answers (`fetch-scheduler.js`).
     if (snapshot.requestConcurrency !== undefined) setSourceRequestConcurrency(snapshot.requestConcurrency);
@@ -429,21 +430,20 @@ export class AnnDataReaderClient {
       obsKeys: Object.freeze([...snapshot.obsKeys]),
       varNames: Object.freeze([...snapshot.varNames]),
     });
-    return { name: snapshot.name };
+    return { name: snapshot.name, format: snapshot.format, layout: snapshot.layout, zarrVersion: snapshot.zarrVersion };
   }
 
   /**
-   * What a catalog lists about one store of this client's kind, read from
-   * its metadata and `uns` alone (`describeAnnDataStore`), without opening
-   * it as the dataset.
+   * What a catalog lists about one store, read from its metadata and `uns`
+   * alone (`describeAnnDataStore`), without opening it as the dataset.
    *
-   * @param {File|Object} source - As `open()`
-   * @param {{signal?: AbortSignal|null}} [options]
+   * @param {Object} source - As `open()`
+   * @param {{signal?: AbortSignal|null, expect?: Object|null}} [options]
    * @returns {Promise<{nObs: number, nVars: number, hasExpressionMatrix: boolean,
    *   title: string|null, cellucid: Object|null}>}
    */
-  describe(source, { signal = null } = {}) {
-    return this._callWith({ signal }, 'describe', { kind: this._kind, source });
+  describe(source, { signal = null, expect = null } = {}) {
+    return this._callWith({ signal }, 'describe', { source, expect });
   }
 
   get nObs() {
@@ -454,7 +454,17 @@ export class AnnDataReaderClient {
     return this._snapshot?.nVars ?? 0;
   }
 
-  /** The Zarr format version (2 or 3) of an open Zarr store; null for an `.h5ad`. */
+  /** The input format id of the open dataset (`data/input-formats.js`), or null. */
+  get format() {
+    return this._snapshot?.format ?? null;
+  }
+
+  /** How the open dataset arrived: `file`, `zip` or `folder`; null before it is open. */
+  get layout() {
+    return this._snapshot?.layout ?? null;
+  }
+
+  /** The Zarr format version (2 or 3) of an open Zarr store; null for any other container. */
   get zarrVersion() {
     return this._snapshot?.zarrVersion ?? null;
   }

@@ -16,6 +16,17 @@ import {
 } from '../assets/js/data/dimension-manager.js';
 
 /**
+ * Schedule a cancellation as the next macrotask, queued behind the decode's
+ * first yield (Node's yield is `setImmediate`, `utils/yield-macrotask.js`):
+ * it runs at the decode's first yield, whatever the speed of the machine, and
+ * only because the decode yields there. (A timer instead raced the decode: a
+ * fast machine finished all of its cells before a millisecond passed.)
+ */
+function scheduleCancel(cancel) {
+  return setImmediate(cancel);
+}
+
+/**
  * A real DimensionManager with two 2D layouts, only the first of them
  * resident. Restored codes get centroids for exactly the resident layout,
  * computed from its positions: cell `i` sits at (i, 2i).
@@ -132,10 +143,10 @@ test('a large sorted-delta cell set yields so a scheduled cancellation wins', as
   const controller = new AbortController();
   const cancellation = new Error('scheduled highlight cancellation');
   let abortFired = false;
-  const timer = setTimeout(() => {
+  const timer = scheduleCancel(() => {
     abortFired = true;
     controller.abort(cancellation);
-  }, 0);
+  });
   try {
     await assert.rejects(
       decodeCellSet(payload, {
@@ -146,7 +157,7 @@ test('a large sorted-delta cell set yields so a scheduled cancellation wins', as
       error => error === cancellation,
     );
   } finally {
-    clearTimeout(timer);
+    clearImmediate(timer);
   }
   assert.equal(abortFired, true);
 });
@@ -157,14 +168,14 @@ test('a large bitset cell set yields so a scheduled cancellation wins', async ()
   payload[0] = 1;
   const controller = new AbortController();
   const cancellation = new Error('scheduled bitset cancellation');
-  const timer = setTimeout(() => controller.abort(cancellation), 0);
+  const timer = scheduleCancel(() => controller.abort(cancellation));
   try {
     await assert.rejects(
       decodeCellSet(payload, { cellCount, reference: null, signal: controller.signal }),
       error => error === cancellation,
     );
   } finally {
-    clearTimeout(timer);
+    clearImmediate(timer);
   }
 });
 
@@ -183,10 +194,10 @@ test('one very large code run yields and never publishes partial codes on cancel
   const unrestoredCentroids = template.centroidsByLayout;
   const unrestoredNormalized = template._normalizedLayouts;
   let abortFired = false;
-  const timer = setTimeout(() => {
+  const timer = scheduleCancel(() => {
     abortFired = true;
     controller.abort(cancellation);
-  }, 0);
+  });
   try {
     await assert.rejects(
       restoreUserDefinedCodes(
@@ -197,7 +208,7 @@ test('one very large code run yields and never publishes partial codes on cancel
       error => error === cancellation,
     );
   } finally {
-    clearTimeout(timer);
+    clearImmediate(timer);
   }
 
   assert.equal(abortFired, true);

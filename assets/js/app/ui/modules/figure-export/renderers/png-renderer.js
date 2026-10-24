@@ -30,8 +30,8 @@
  * MAIN THREAD:
  * Every per-cell pass (bounds, packing, the GL point pass) and the PNG encode
  * run in the worker (`utils/figure-export-worker.js`); the composed canvas
- * crosses as an ImageBitmap and is encoded with `OffscreenCanvas.convertToBlob`,
- * the same encoder `toBlob` uses, so the bytes are the same.
+ * crosses as its pixels (`pagePixels`) and is encoded with
+ * `OffscreenCanvas.convertToBlob`, the same encoder `toBlob` uses.
  *
  * METADATA:
  * PNG files include UTF-8 iTXt chunks with dataset info, export timestamp,
@@ -70,6 +70,7 @@
 	} from '../utils/crop.js';
 import {
   openFigureExportWorkerSession,
+  pagePixels,
   pointRasterArgs,
   requestPngEncoding,
   requestVisibleBounds,
@@ -80,7 +81,6 @@ import { resolveFigureInk } from '../utils/figure-ink.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 import {
   assertFigureExportPayload,
-  isFigureExportSignalAborted,
   throwIfFigureExportAborted,
 } from '../figure-export-contract.js';
 import { clamp } from '../../../../utils/number-utils.js';
@@ -1096,18 +1096,16 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   ctx.restore();
   for (const frame of frames.splice(0)) frame.close();
 
-  // The composed frame crosses to the worker as a snapshot; the canvas's own
-  // buffer is released before the encode, which is the slow part.
-  const frame = await createImageBitmap(canvas);
+  // The composed figure crosses to the worker as its pixels, read in the
+  // task that drew them (`pagePixels`); the canvas's own buffer is released
+  // before the encode, which is the slow part.
+  const pixels = pagePixels(canvas);
   canvas.width = 0;
   canvas.height = 0;
-  if (isFigureExportSignalAborted(signal)) {
-    frame.close();
-    throwIfFigureExportAborted(signal);
-  }
+  throwIfFigureExportAborted(signal);
   const annotatedBlob = await requestPngEncoding(
     session,
-    frame,
+    pixels,
     buildPngTextMetadata(payload.meta, payload)
   );
   throwIfFigureExportAborted(signal);

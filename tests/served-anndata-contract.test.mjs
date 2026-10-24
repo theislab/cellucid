@@ -155,10 +155,11 @@ function assertListedUnopened(source, summary) {
 function assertOpenedWithServerIdentityAndDefaults(source, metadata, type) {
   assert.equal(metadata.id, 'cells');
   assert.equal(metadata.name, 'Served cells');
-  assert.equal(source.getBaseUrl('cells'), `${type}://cells/`);
+  assert.equal(source.getBaseUrl('cells'), 'anndata://cells/');
   assert.equal(source.datasetId, 'cells');
   const annData = source.getAnnDataSource();
-  assert.equal(annData.getType(), type);
+  assert.equal(annData.getType(), 'anndata');
+  assert.equal(annData.format, type);
   const defaults = annData.getAdapter().getMappingCandidates().defaults;
   assert.deepEqual(defaults.embeddings.defaults['2d'], { key: 'X_pca', columns: [3, 1] });
   assert.equal(defaults.knn, 'scvi_connectivities');
@@ -341,7 +342,8 @@ test('reading the dataset list again while a dataset opens does not cancel the o
   const [metadata, [summary]] = await Promise.all([opening, relisted]);
   assert.equal(metadata.id, 'cells');
   assert.equal(summary.id, 'cells');
-  assert.equal(source.getAnnDataSource()?.getType(), 'h5ad');
+  assert.equal(source.getAnnDataSource()?.getType(), 'anndata');
+  assert.equal(source.getAnnDataSource()?.format, 'h5ad');
   assert.equal(await source.getMetadata('cells'), metadata, 'the open stands');
   source.disconnect();
 });

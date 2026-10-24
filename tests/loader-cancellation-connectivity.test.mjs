@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
@@ -343,8 +342,8 @@ test(
 );
 
 for (const [label, SourceClass] of [
-  ['H5AD', H5adDataSource],
-  ['Zarr', ZarrDataSource],
+  ['H5AD', AnnDataFileSource],
+  ['Zarr', AnnDataFileSource],
 ]) {
   test(
     `${label} source connectivity edges forward their cancellation signal`,

@@ -82,6 +82,7 @@ test('calls made before the modules arrive are delivered once, in order', async 
   const loading = analytics.load();
   assert.equal(analytics.load(), loading, 'load is idempotent');
   analytics.init();
+  const beforeBegin = performance.now();
   const load = analytics.beginDataLoad('default-demo', 'local-demo', {
     fromNavigation: true,
   });
@@ -96,8 +97,10 @@ test('calls made before the modules arrive are delivered once, in order', async 
   assert.equal(recording.loads.length, 1, 'a handle settles exactly once');
   assert.equal(recording.loads[0].outcome, 'success');
   assert.equal(recording.loads[0].loadMethod, 'default-demo');
-  // A startup load is timed from navigation start, not from this call.
-  assert.ok(recording.loads[0].durationMs >= performance.now() - 1000);
+  // A startup load is timed from navigation start, not from this call: it
+  // lasted at least as long as the page had been open when the load began.
+  assert.ok(recording.loads[0].durationMs >= beforeBegin,
+    `${recording.loads[0].durationMs} ms, the page open for ${beforeBegin} ms at the load's start`);
 });
 
 test('a dataset activation joins the open request of its load method', async () => {

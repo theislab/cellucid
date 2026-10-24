@@ -54,8 +54,8 @@ import {
   requireCellucidFileMetadata,
 } from '../anndata-cellucid-metadata.js';
 import { describeRemoteFile } from './remote-file.js';
-import { createH5adDataSource } from '../h5ad.js';
-import { createZarrDataSource } from '../zarr.js';
+import { ANNDATA_SOURCE_TYPE, createAnnDataFileSource } from '../anndata-file-source.js';
+import { fileFormatOfName, folderFormatOfName, titleOfName } from '../input-formats.js';
 import { getTransferLog } from '../transfer-log.js';
 
 /** The catalog file of a folder. */
@@ -149,18 +149,19 @@ function requireRelativePath(value, label, baseUrl, sourceType) {
 }
 
 /**
- * The form of one dataset path: a Zarr store folder, an `.h5ad` file or a
- * zipped Zarr store.
+ * The form of one dataset path (`data/input-formats.js`): a store folder (a
+ * path ending in "/"; its format is the one its name names, else the one its
+ * content shows), or a file its name names (an `.h5ad`, a zipped Zarr
+ * store). The reader confirms either from the content.
  *
  * @param {string} path
- * @returns {{kind: 'h5ad'|'zarr', layout: 'file'|'zip'|'folder'}|null}
+ * @returns {Readonly<{format: string|null, layout: 'file'|'zip'|'folder'}>|null}
  */
 export function catalogEntryForm(path) {
-  if (path.endsWith('/')) return Object.freeze({ kind: 'zarr', layout: 'folder' });
-  const lower = path.toLowerCase();
-  if (lower.endsWith('.h5ad')) return Object.freeze({ kind: 'h5ad', layout: 'file' });
-  if (lower.endsWith('.zip')) return Object.freeze({ kind: 'zarr', layout: 'zip' });
-  return null;
+  if (path.endsWith('/')) {
+    return Object.freeze({ format: folderFormatOfName(path)?.format ?? null, layout: 'folder' });
+  }
+  return fileFormatOfName(path);
 }
 
 /** The last part of a path, decoded: a file or folder name. */
@@ -171,7 +172,7 @@ function lastSegment(path) {
 
 /** What a dataset is called when its file does not name itself. */
 function nameOfPath(path) {
-  return lastSegment(path).replace(/(\.zarr\.zip|\.zarr|\.h5ad|\.zip)$/i, '') || lastSegment(path);
+  return titleOfName(lastSegment(path));
 }
 
 /**
@@ -262,14 +263,6 @@ export async function fetchAnnDataCatalog(baseUrl, sourceType, signal, { askOnce
 }
 
 /**
- * The AnnData source of one catalog entry's form.
- * @returns {import('../h5ad.js').H5adDataSource|import('../zarr.js').ZarrDataSource}
- */
-function createEntrySource(entry) {
-  return entry.form.kind === 'h5ad' ? createH5adDataSource() : createZarrDataSource();
-}
-
-/**
  * The datasets of one catalog: listed from their files' metadata, opened one
  * at a time when chosen, and released when another is shown.
  */
@@ -342,7 +335,7 @@ export class AnnDataCatalog {
       described.catch(() => this._resources.delete(entry.id));
     }
     const { resource } = await described;
-    return entry.form.layout === 'zip' ? { archive: resource } : resource;
+    return { file: resource };
   }
 
   /**
@@ -385,11 +378,7 @@ export class AnnDataCatalog {
    * @returns {Promise<Object[]>}
    */
   async describe(signal) {
-    const clients = new Map();
-    const clientFor = kind => {
-      if (!clients.has(kind)) clients.set(kind, new AnnDataReaderClient({ kind }));
-      return clients.get(kind);
-    };
+    const client = new AnnDataReaderClient();
     try {
       return await loadMetadataBatchAtomically(
         this.catalog.datasets,
@@ -399,8 +388,8 @@ export class AnnDataCatalog {
             const listed = await this._listedFromOpen(entry);
             if (listed !== null) return listed;
             const source = await this._readerSource(entry, entrySignal);
-            const described = await clientFor(entry.form.kind).describe(source, { signal: entrySignal });
-            const file = requireCellucidFileMetadata(described.cellucid, entry.form.kind);
+            const described = await client.describe(source, { signal: entrySignal, expect: entry.form });
+            const file = requireCellucidFileMetadata(described.cellucid, ANNDATA_SOURCE_TYPE);
             this._requireAgreeingId(entry, file.id);
             return Object.freeze({
               id: entry.id,
@@ -424,7 +413,7 @@ export class AnnDataCatalog {
         'Catalog listing'
       );
     } finally {
-      for (const client of clients.values()) client.close();
+      client.close();
     }
   }
 
@@ -527,7 +516,7 @@ export class AnnDataCatalog {
         ? 'reading on demand: only the chunks each view needs'
         : 'reading on demand: only what each view needs',
     });
-    const source = createEntrySource(entry);
+    const source = createAnnDataFileSource();
     try {
       try {
         const readerSource = await this._readerSource(entry, signal);
@@ -538,13 +527,12 @@ export class AnnDataCatalog {
           preferFileName: true,
           description: '',
           source: { name: this._sourceName, url: entry.url, filename: entry.name },
+          expect: entry.form,
         };
         if (entry.form.layout === 'folder') {
-          await source.loadFromRemoteFolder(readerSource, options);
-        } else if (entry.form.layout === 'zip') {
-          await source.loadFromArchiveFile(readerSource.archive, options);
+          await source.loadRemoteFolder(readerSource, options);
         } else {
-          await source.loadFromFile(readerSource, options);
+          await source.loadFile(readerSource.file, options);
         }
       } catch (error) {
         throw this._namedOpenFailure(entry, error);

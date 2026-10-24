@@ -11,6 +11,7 @@
 
 import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
+import { folderFormatOfName, titleOfName } from '../../input-formats.js';
 
 function parseHttpUrl(input) {
   if (typeof input !== 'string') return null;
@@ -71,7 +72,7 @@ export default Object.freeze({
     }
     // A Zarr store folder (`…/name.zarr` or `…/name.zarr/`), read in place
     // through its consolidated metadata.
-    if (/\.zarr\/?$/i.test(url.pathname)) {
+    if (folderFormatOfName(url.pathname) !== null) {
       // The folder path ends in "/"; a query string (a signed URL) is kept.
       const path = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
       const folderUrl = `${url.origin}${path}${url.search}`;
@@ -81,7 +82,7 @@ export default Object.freeze({
         store: {
           url: folderUrl,
           name,
-          title: name.replace(/\.zarr$/i, ''),
+          title: titleOfName(name),
           id: `url:${encodeURIComponent(folderUrl)}`,
           attribution: { title: name, url: folderUrl },
         },

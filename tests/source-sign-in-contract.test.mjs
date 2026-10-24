@@ -423,6 +423,27 @@ test('Google: a blocked popup and a refused scope are said, and the step stays t
   assert.equal(steps.list()[0].working, false);
 });
 
+/**
+ * The steps once `holds(steps.list())` is true: at once, or at the change of
+ * the steps that makes it so (`subscribe`). A Microsoft step is ready once
+ * its PKCE challenge is made (`crypto.subtle.digest`, which answers when it
+ * answers): the test waits for that, not for a while.
+ */
+function stepsWhen(steps, holds) {
+  return new Promise(resolve => {
+    let stop = null;
+    const check = list => {
+      if (stop === null || !holds(list)) return;
+      stop();
+      resolve(list);
+    };
+    stop = steps.subscribe(check);
+    check(steps.list());
+  });
+}
+
+const readyStep = list => list.length > 0 && list[0].ready;
+
 /** A fake Microsoft: the popup, the callback's channel and the token endpoint. */
 function fakeMicrosoftWindow(t, { tokenAnswers = [], origin = 'https://www.cellucid.com', top = null, secure = true } = {}) {
   const log = { opened: [], posts: [], received: [], popups: [] };
@@ -474,8 +495,7 @@ test('Microsoft: PKCE in a popup, the code redeemed in the page with the verifie
   let now = 5_000_000;
   const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl, now: () => now });
   const authorized = microsoft.authorize({ kind: 'sign-in' });
-  await new Promise(resolve => setTimeout(resolve, 10));
-  const [step] = steps.list();
+  const [step] = await stepsWhen(steps, readyStep);
   assert.equal(step.ready, true);
   steps.run(step.id);
   const [opened] = fake.log.opened;
@@ -533,7 +553,7 @@ test('Microsoft: an organisation that requires an administrator ends the step wi
   const fake = fakeMicrosoftWindow(t);
   const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl });
   const authorized = microsoft.authorize({ kind: 'more-access', more: true });
-  await new Promise(resolve => setTimeout(resolve, 10));
+  await stepsWhen(steps, readyStep);
   assert.equal(steps.list()[0].action, 'Ask for access');
   steps.run(steps.list()[0].id);
   const query = Object.fromEntries(fake.log.opened[0].searchParams);
@@ -556,7 +576,7 @@ test('Microsoft: not configured says so; a blocked popup is said', async t => {
   fake.win.open = () => null;
   const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl });
   microsoft.authorize();
-  await new Promise(resolve => setTimeout(resolve, 10));
+  await stepsWhen(steps, readyStep);
   steps.run(steps.list()[0].id);
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(steps.list()[0].problem, /blocked Microsoft's sign-in window/);
@@ -595,12 +615,12 @@ test('Microsoft: a sign-in window closed without a sign-in ends the attempt, and
     const fake = fakeMicrosoftWindow(t, { top });
     const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl });
     const waiting = microsoft.authorize();
-    await new Promise(resolve => setTimeout(resolve, 10));
-    const [step] = steps.list();
+    const [step] = await stepsWhen(steps, readyStep);
     steps.run(step.id);
     assert.equal(steps.list()[0].working, true);
     fake.log.popups[0].closed = true;
-    await new Promise(resolve => setTimeout(resolve, 600));
+    // The page finds the window closed when it next looks (every 500 ms).
+    await stepsWhen(steps, list => list.length > 0 && list[0].problem !== null);
     assert.equal(steps.list()[0].problem, text);
     assert.equal(steps.list()[0].working, false);
     assert.equal(fake.log.received.length, 0);

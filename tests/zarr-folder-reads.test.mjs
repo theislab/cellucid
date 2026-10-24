@@ -11,7 +11,7 @@ import test from 'node:test';
 import { directoryStore, memoryStore, openZarr } from '../assets/js/formats/zarr/index.js';
 import { createLimiter } from '../assets/js/formats/zarr/stores/common.js';
 import { copyBox, fillBox, mergeAxes } from '../assets/js/formats/zarr/chunks.js';
-import { openAnnDataStore } from '../assets/js/data/anndata/open.js';
+import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 
 import { corpusFolder } from './helpers/zarr-corpus.mjs';
 
@@ -56,7 +56,7 @@ test('a folder read reads each chunk file it needs once, together, and no other'
 
 test('a picked folder\'s link is the disk: per-file reads never make it look slow, so it reads ahead', async () => {
   const files = await corpusFolder('anndata/v2.zarr');
-  const opened = await openAnnDataStore({ kind: 'zarr', source: { files, rootName: 'v2.zarr' } }, { decodedChunkCacheBytes: 1 << 20 });
+  const opened = await openDatasetStore({ source: { files, rootName: 'v2.zarr' } }, { decodedChunkCacheBytes: 1 << 20 });
   // Every chunk of every array, read file by file.
   const arrays = ['X/data', 'X/indices', 'obs/n_genes', 'obsm/X_umap', 'obsp/connectivities/data'];
   await Promise.all(arrays.map(path => opened.root.get(path).read()));
@@ -280,15 +280,26 @@ test('the limiter serves waiting tasks in order, background work last and never 
 test('the limiter queues tens of thousands of tasks in linear time', async () => {
   // Choosing the next task looks at each waiting activity, not each task: a
   // pass over every waiting task per start made 25,000 background reads
-  // cost 2.4 s of queue work alone, and 100,000 over a minute.
-  const limit = createLimiter(64);
-  const activity = { background: true };
-  let calls = 0;
-  const count = 50_000;
-  const started = performance.now();
-  await Promise.all(Array.from({ length: count }, () => limit(async () => { calls++; }, null, activity)));
-  assert.equal(calls, count);
-  assert.ok(performance.now() - started < 2000, `${count} tasks took ${Math.round(performance.now() - started)} ms`);
+  // cost 2.4 s of queue work alone, and 100,000 over a minute. The queue's
+  // work is counted, not timed: each look at a task's activity (whether it is
+  // background) is one step. Linear time is the same steps per task at every
+  // length of queue (a pass over the waiting tasks adds steps per task as
+  // the queue grows).
+  async function queueSteps(count) {
+    let steps = 0;
+    const activity = { get background() { steps++; return true; } };
+    const limit = createLimiter(64);
+    let calls = 0;
+    await Promise.all(Array.from({ length: count }, () => limit(async () => { calls++; }, null, activity)));
+    assert.equal(calls, count);
+    return steps;
+  }
+  const sizes = [500, 5_000, 50_000];
+  const steps = [];
+  for (const count of sizes) steps.push(await queueSteps(count));
+  const perTask = [1, 2].map(i => (steps[i] - steps[i - 1]) / (sizes[i] - sizes[i - 1]));
+  assert.equal(perTask[1], perTask[0], `steps ${steps.join(', ')} for ${sizes.join(', ')} tasks`);
+  assert.ok(steps[2] <= 8 * sizes[2], `${steps[2]} steps for ${sizes[2]} tasks`);
 });
 
 test('a merged slice is never longer than the store\'s merged-read size', async () => {

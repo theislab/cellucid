@@ -1,16 +1,17 @@
 /**
  * Unified AnnData Provider for Cellucid
  *
- * Every dataset Cellucid shows is an AnnData file, read in the browser by the
- * AnnData reader: an `.h5ad` (`h5ad.js`) or an AnnData Zarr store
- * (`zarr.js`). The data loaders (`data-loaders.js`) address a dataset's parts
- * by h5ad:// and zarr:// URLs under its base (`h5ad://<dataset id>/...`); this
- * module resolves such a URL to the adapter of the dataset that owns it -- the
- * active dataset, or a candidate staged for selection -- and reads the part
- * from it.
+ * Every dataset Cellucid shows is read in the browser by the AnnData reader,
+ * through one data source, whatever format the file arrived in
+ * (`anndata-file-source.js`). The data loaders (`data-loaders.js`) address a
+ * dataset's parts by anndata:// URLs under its base
+ * (`anndata://<dataset id>/...`); this module resolves such a URL to the
+ * adapter of the dataset that owns it -- the active dataset, or a candidate
+ * staged for selection -- and reads the part from it.
  */
 
 import { getDataSourceManager } from './data-source-manager.js';
+import { ANNDATA_SOURCE_TYPE } from './anndata-file-source.js';
 import { parseMappingGraphPath } from './data-mapping-candidates.js';
 import {
   getMetadataLoadSignal,
@@ -20,28 +21,21 @@ import {
 
 const candidateAnnDataBindings = new WeakMap();
 
-/**
- * Supported AnnData format types
- * @typedef {'h5ad' | 'zarr'} AnnDataFormat
- */
+/** The scheme of every direct AnnData URL: `anndata://<dataset id>/<path>`. */
+const SCHEME = `${ANNDATA_SOURCE_TYPE}://`;
 
 /**
- * Check if the current data source is an AnnData file (h5ad or zarr)
- * @returns {AnnDataFormat|null} The format type or null if not AnnData
+ * Whether the active dataset is read by a direct AnnData source.
+ * @returns {boolean}
  */
-function getActiveAnnDataFormat() {
+function isAnnDataActive() {
   const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return null;
-
-  const direct = getAnnDataSource();
-  const format = direct?.getType?.();
-  return format === 'h5ad' || format === 'zarr' ? format : null;
+  if (!manager.activeSource) return false;
+  return getAnnDataSource()?.getType?.() === ANNDATA_SOURCE_TYPE;
 }
 
 /**
- * Get the active AnnData source (works for both h5ad and zarr)
+ * Get the active AnnData source
  * @returns {Object|null}
  */
 function getAnnDataSource() {
@@ -52,8 +46,8 @@ function getAnnDataSource() {
 
   const sourceType = source.getType?.();
 
-  // Direct source types
-  if (sourceType === 'h5ad' || sourceType === 'zarr') {
+  // The direct source
+  if (sourceType === ANNDATA_SOURCE_TYPE) {
     return source;
   }
 
@@ -84,7 +78,7 @@ function requireCandidateAnnDataSource(url, candidateSource) {
     parsed.datasetId.length === 0
   ) {
     throw new TypeError(
-      'Candidate AnnData binding requires an exact h5ad:// or zarr:// dataset URL.'
+      'Candidate AnnData binding requires an exact anndata:// dataset URL.'
     );
   }
   requireMethod(
@@ -114,7 +108,7 @@ function requireCandidateAnnDataSource(url, candidateSource) {
     }
   } else {
     throw new TypeError(
-      `Candidate AnnData source must be an "h5ad" or "zarr" source, or ` +
+      `Candidate AnnData source must be an "${ANNDATA_SOURCE_TYPE}" source, or ` +
       `expose getAnnDataSource(); received "${String(candidateType)}".`
     );
   }
@@ -213,7 +207,7 @@ export function getActiveAnnDataBinding(url) {
   const parsed = parseAnnDataUrl(url);
   if (!parsed) {
     throw new Error(
-      `Direct AnnData access requires an explicit h5ad:// or zarr:// URL: ${String(url)}`
+      `Direct AnnData access requires an explicit anndata:// URL: ${String(url)}`
     );
   }
   if (
@@ -226,11 +220,10 @@ export function getActiveAnnDataBinding(url) {
   }
 
   const manager = getDataSourceManager();
-  const activeFormat = getActiveAnnDataFormat();
-  if (activeFormat !== parsed.protocol) {
+  if (!isAnnDataActive()) {
     throw new Error(
       `Direct AnnData URL uses ${parsed.protocol}://, but the active ` +
-      `dataset protocol is ${activeFormat ? `${activeFormat}://` : 'not AnnData'}`
+      'dataset is not read by a direct AnnData source'
     );
   }
   if (manager.activeDatasetId !== parsed.datasetId) {
@@ -256,7 +249,7 @@ export function getActiveAnnDataBinding(url) {
 }
 
 // =========================================================================
-// Unified data access functions (work for both h5ad and zarr)
+// Unified data access functions
 // =========================================================================
 
 /**
@@ -671,58 +664,30 @@ export function anndataGetDatasetIdentity(
 // =========================================================================
 
 /**
- * Check if a URL is an h5ad:// URL
- * @param {string} url
- * @returns {boolean}
- */
-function isH5adUrl(url) {
-  return url?.startsWith('h5ad://');
-}
-
-/**
- * Check if a URL is a zarr:// URL
- * @param {string} url
- * @returns {boolean}
- */
-function isZarrUrl(url) {
-  return url?.startsWith('zarr://');
-}
-
-/**
- * Check if a URL is an AnnData URL (h5ad:// or zarr://)
+ * Check if a URL is a direct AnnData URL (`anndata://`)
  * @param {string} url
  * @returns {boolean}
  */
 export function isAnnDataUrl(url) {
-  return isH5adUrl(url) || isZarrUrl(url);
+  return typeof url === 'string' && url.startsWith(SCHEME);
 }
 
 /**
- * Parse an AnnData URL (h5ad:// or zarr://)
+ * Parse a direct AnnData URL (`anndata://<dataset id>/<path>`)
  * @param {string} url
  * @returns {{protocol: string, datasetId: string, path: string}|null}
  */
 function parseAnnDataUrl(url) {
-  if (typeof url !== 'string' || url.length === 0) return null;
-
-  let protocol;
-  if (url.startsWith('h5ad://')) {
-    protocol = 'h5ad';
-  } else if (url.startsWith('zarr://')) {
-    protocol = 'zarr';
-  } else {
-    return null;
-  }
-
-  const withoutProtocol = url.substring(protocol.length + 3); // +3 for "://"
+  if (!isAnnDataUrl(url) || url.length === 0) return null;
+  const withoutProtocol = url.substring(SCHEME.length);
   const slashIdx = withoutProtocol.indexOf('/');
 
   if (slashIdx === -1) {
-    return { protocol, datasetId: withoutProtocol, path: '' };
+    return { protocol: ANNDATA_SOURCE_TYPE, datasetId: withoutProtocol, path: '' };
   }
 
   return {
-    protocol,
+    protocol: ANNDATA_SOURCE_TYPE,
     datasetId: withoutProtocol.substring(0, slashIdx),
     path: withoutProtocol.substring(slashIdx + 1)
   };

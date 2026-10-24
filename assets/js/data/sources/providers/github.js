@@ -35,7 +35,8 @@
  */
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
-import { describeRemoteFile, fileFormatOf } from '../remote-file.js';
+import { describeRemoteFile } from '../remote-file.js';
+import { fileFormatOfName, folderFormatOfName, readsFromHead, titleOfName } from '../../input-formats.js';
 import { HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
 
 /**
@@ -344,7 +345,7 @@ async function describeGitHubFile(parsed, { signal }) {
   const url = rawFileUrl(parsed);
   // The head goes out beside the HEAD: an .h5ad's first read, else enough to
   // hold an LFS pointer whole.
-  const headBytes = fileFormatOf(name) === 'h5ad' ? HEAD_BYTES : LFS_POINTER_MAX_BYTES;
+  const headBytes = readsFromHead(fileFormatOfName(name)) ? HEAD_BYTES : LFS_POINTER_MAX_BYTES;
   const headRead = readFileHead(url, headBytes, { signal });
   headRead.catch(() => {});
   const { size, etag } = await headOf(url, name, signal);
@@ -399,7 +400,7 @@ export default Object.freeze({
         { input: value }
       );
     }
-    if (fileFormatOf(parsed.path) !== null) {
+    if (fileFormatOfName(parsed.path) !== null) {
       const file = await describeGitHubFile(parsed, { signal });
       return { title: file.name, file, attribution: file.attribution };
     }
@@ -408,16 +409,16 @@ export default Object.freeze({
       url: `https://github.com/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`,
     };
     // A Zarr store folder, read through its consolidated metadata.
-    if (/\.zarr$/i.test(parsed.path)) {
+    if (folderFormatOfName(parsed.path) !== null) {
       const name = parsed.path.split('/').at(-1);
       return {
         title: `${parsed.owner}/${parsed.repo}/${parsed.path}`,
         store: {
           url: buildRawUrl(parsed),
           name,
-          title: name.replace(/\.zarr$/i, ''),
+          title: titleOfName(name),
           // The dataset id of a store that states none: without "/", as it
-          // becomes `zarr://<id>/`.
+          // becomes `anndata://<id>/`.
           id: `gh:${encodeURIComponent(`${parsed.owner}/${parsed.repo}/${parsed.path}`)}`,
           attribution: repository,
         },

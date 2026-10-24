@@ -17,7 +17,8 @@ import huggingface from '../assets/js/data/sources/providers/huggingface.js';
 import zenodo from '../assets/js/data/sources/providers/zenodo.js';
 import dropbox from '../assets/js/data/sources/providers/dropbox.js';
 import github from '../assets/js/data/sources/providers/github.js';
-import { downloadRemoteFile, fileFormatOf, fileTitleOf } from '../assets/js/data/sources/remote-file.js';
+import { downloadRemoteFile } from '../assets/js/data/sources/remote-file.js';
+import { fileFormatOfName, titleOfName } from '../assets/js/data/input-formats.js';
 import { fetchCatalogFile, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
 
 const ID = '0819e386-e7fd-4212-b732-60e468689f89';
@@ -137,15 +138,15 @@ test('pasted text and ?data= values resolve to one canonical locator', () => {
 test('file names and formats are read from the URL, Zenodo-style /content included', () => {
   assert.equal(fileNameOfUrl(new URL('https://zenodo.org/api/records/1/files/x.h5ad/content')), 'x.h5ad');
   assert.equal(fileNameOfUrl(new URL('https://h.org/a/My%20Atlas.h5ad?dl=1')), 'My Atlas.h5ad');
-  assert.equal(fileFormatOf('a.H5AD'), 'h5ad');
-  assert.equal(fileFormatOf('a.zarr.zip'), 'zip');
-  assert.equal(fileFormatOf('a.rds'), null);
+  assert.deepEqual(fileFormatOfName('a.H5AD'), { format: 'h5ad', layout: 'file' });
+  assert.deepEqual(fileFormatOfName('a.zarr.zip'), { format: 'zarr', layout: 'zip' });
+  assert.equal(fileFormatOfName('a.rds'), null);
   // A file that does not name itself is called by its name without the
   // format's extension, Zarr ZIP included.
-  assert.equal(fileTitleOf('atlas.h5ad'), 'atlas');
-  assert.equal(fileTitleOf('atlas.zarr.zip'), 'atlas');
-  assert.equal(fileTitleOf('atlas.ZIP'), 'atlas');
-  assert.equal(fileTitleOf('atlas.v2.h5ad'), 'atlas.v2');
+  assert.equal(titleOfName('atlas.h5ad'), 'atlas');
+  assert.equal(titleOfName('atlas.zarr.zip'), 'atlas');
+  assert.equal(titleOfName('atlas.ZIP'), 'atlas');
+  assert.equal(titleOfName('atlas.v2.h5ad'), 'atlas.v2');
 });
 
 test('a web address opens a dataset catalog folder or one AnnData file', async t => {
@@ -156,11 +157,11 @@ test('a web address opens a dataset catalog folder or one AnnData file', async t
 
   installFetch(t, fileRoute(4096, { ETag: '"v1"' }));
   const opened = await http.open('https://example.org/data/atlas.h5ad');
-  assert.equal(opened.file.format, 'h5ad');
+  assert.deepEqual(opened.file.format, { format: 'h5ad', layout: 'file' });
   assert.equal(opened.file.title, 'atlas');
   assert.equal(opened.file.resource.size, 4096);
   assert.equal(opened.file.resource.identity.version, '"v1"');
-  assert.ok(!opened.file.id.includes('/'), 'the id becomes h5ad://<id>/');
+  assert.ok(!opened.file.id.includes('/'), 'the id becomes anndata://<id>/');
 
   await assert.rejects(
     http.open('https://example.org/data/atlas.rds'),
@@ -334,12 +335,12 @@ test('GitHub opens a catalog folder, or one file in place, from LFS when it is s
   });
 
   const plain = await github.open('owner/repo/data/plain.h5ad');
-  assert.equal(plain.file.format, 'h5ad');
+  assert.deepEqual(plain.file.format, { format: 'h5ad', layout: 'file' });
   assert.equal(plain.file.title, 'plain');
   assert.equal(plain.file.resource.url, 'https://raw.githubusercontent.com/owner/repo/HEAD/data/plain.h5ad');
   assert.equal(plain.file.resource.size, 4096);
   assert.equal(plain.file.resource.identity.version, '"blob"');
-  assert.ok(!plain.file.id.includes('/'), 'the id becomes h5ad://<id>/');
+  assert.ok(!plain.file.id.includes('/'), 'the id becomes anndata://<id>/');
   // One round trip: a HEAD whose open range asks for the unencoded length
   // (GitHub Pages states a compressed one otherwise) and, beside it, the
   // file's head, its first read, which opening starts from. Nothing probes
@@ -444,7 +445,7 @@ test('a Zarr store folder opens as a store from a web address, GitHub or Hugging
 
   const fromGitHub = await github.open('lab/atlas/files/pbmc.zarr');
   assert.equal(fromGitHub.store.url, 'https://raw.githubusercontent.com/lab/atlas/HEAD/files/pbmc.zarr/');
-  // The id of a store that states none becomes zarr://<id>/: no "/" in it.
+  // The id of a store that states none becomes anndata://<id>/: no "/" in it.
   assert.equal(fromGitHub.store.id, `gh:${encodeURIComponent('lab/atlas/files/pbmc.zarr')}`);
   const onBranch = await github.open('https://github.com/lab/atlas/tree/v2/files/pbmc.zarr');
   assert.equal(onBranch.store.url, 'https://raw.githubusercontent.com/lab/atlas/v2/files/pbmc.zarr/');

@@ -49,7 +49,7 @@ test('a valid catalog resolves every address below its folder', () => {
   ], { default: 'he' }), BASE, 'local-demo');
   assert.equal(checked.default, 'he');
   assert.deepEqual(
-    checked.datasets.map(entry => [entry.id, entry.url, entry.name, entry.form.kind, entry.form.layout]),
+    checked.datasets.map(entry => [entry.id, entry.url, entry.name, entry.form.format, entry.form.layout]),
     [
       ['suo', `${BASE}suo.zarr/`, 'suo.zarr', 'zarr', 'folder'],
       ['he', `${BASE}files/he.h5ad`, 'he.h5ad', 'h5ad', 'file'],
@@ -171,7 +171,7 @@ test('listing reads each file\'s metadata and uns only; choosing one opens it', 
   assert.equal(metadata.name, 'Tiny ready dataset');
   assert.equal(metadata.source.name, 'Example lab');
   assert.equal(single.openedSource('tiny-ready'), source);
-  assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.strictEqual(await single.open('tiny-ready').then(opened => opened.source), source, 'opened once');
   single.releaseExcept(null);
   assert.equal(single.openedSource('tiny-ready'), null);

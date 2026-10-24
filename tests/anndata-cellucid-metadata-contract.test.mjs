@@ -14,8 +14,7 @@ import {
   isPortableDatasetId,
   requireCellucidFileMetadata,
 } from '../assets/js/data/anndata-cellucid-metadata.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 
 const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
 
@@ -109,16 +108,16 @@ test('an opened file is identified, named, described, cited and sourced by uns[\
   quiet(t);
   for (const [label, open] of [
     ['h5ad', async () => {
-      const source = new H5adDataSource();
-      await source.loadFromFile(fixtureFile('ready.h5ad'), {
+      const source = new AnnDataFileSource();
+      await source.loadFile(fixtureFile('ready.h5ad'), {
         preferFileName: true,
         source: { name: 'H5AD file', filename: 'ready.h5ad' },
       });
       return source;
     }],
     ['zarr.zip', async () => {
-      const source = new ZarrDataSource();
-      await source.loadFromArchiveFile(fixtureFile('ready.zarr.zip'), {
+      const source = new AnnDataFileSource();
+      await source.loadFile(fixtureFile('ready.zarr.zip'), {
         preferFileName: true,
         source: { name: 'Zarr ZIP archive', filename: 'ready.zarr.zip' },
       });
@@ -149,9 +148,9 @@ test('an opened file is identified, named, described, cited and sourced by uns[\
 
 test('a caller\'s explicit id, name and defaults stand over the file\'s', async t => {
   quiet(t);
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromFile(fixtureFile('ready.h5ad'), {
+  await source.loadFile(fixtureFile('ready.h5ad'), {
     datasetId: 'served-id',
     name: 'Served name',
     defaults: { obsKeys: ['score', 'cluster'] },
@@ -168,19 +167,19 @@ test('a caller\'s explicit id, name and defaults stand over the file\'s', async 
 
 test('a file without a name of its own is named by uns[\'title\'] only when it may name itself', async t => {
   quiet(t);
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromFile(fixtureFile('ready.h5ad'));
+  await source.loadFile(fixtureFile('ready.h5ad'));
   const metadata = await source.getMetadata('tiny-ready');
   assert.equal(metadata.name, 'ready', 'without preferFileName the caller\'s name (the file name) stands');
 });
 
 test('an unknown key in uns[\'cellucid\'] refuses the file when it opens', async t => {
   quiet(t);
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
   await assert.rejects(
-    source.loadFromFile(fixtureFile('unknown-key.h5ad')),
+    source.loadFile(fixtureFile('unknown-key.h5ad')),
     /uns\['cellucid'\] has unknown key 'colour'/
   );
   assert.equal(source.datasetId, null);

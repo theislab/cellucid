@@ -3,7 +3,9 @@
  * the chunks they need, go out together (merged where neighbours, parallel
  * otherwise), share chunks between concurrent reads, keep partly used
  * decoded chunks for the next read, and read sharded arrays by range.
- * Sources here record every request and add latency, as a web host would.
+ * Sources here record every request and add latency, as a web host would,
+ * on a virtual clock the readers also measure with (`helpers/virtual-time.mjs`):
+ * elapsed times count round trips in a row, whatever the load on the machine.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -14,6 +16,7 @@ import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
 import { crc32, openZipArchive } from '../assets/js/formats/zip/index.js';
 import { httpStore, memoryStore, openZarr, zipStore } from '../assets/js/formats/zarr/index.js';
 
+import { settle, virtualTime } from './helpers/virtual-time.mjs';
 import { corpusEntries } from './helpers/zarr-corpus.mjs';
 const encoder = new TextEncoder();
 const json = value => encoder.encode(JSON.stringify(value));
@@ -73,9 +76,10 @@ function storedZip(entries) {
 }
 
 /**
- * A source with latency that records requests, how many run at once, and
- * whether one ever started beyond the concurrency of the link it is read over
- * (`source.link`, once a reader is made for it).
+ * A source with latency (on the virtual clock `source.time`) that records
+ * requests, how many run at once, and whether one ever started beyond the
+ * concurrency of the link it is read over (`source.link`, once a reader is
+ * made for it).
  */
 function remoteSource(bytes, { latencyMs = 20, policy = {} } = {}) {
   const base = bytesByteSource(bytes, { name: 'remote.zarr.zip', policy: { blockBytes: 64 * 1024, mergeGapBytes: 64 * 1024, maxRequestBytes: 8 * 1024 * 1024, concurrency: 6, cacheBytes: 64 * 1024 * 1024, ...policy } });
@@ -85,13 +89,14 @@ function remoteSource(bytes, { latencyMs = 20, policy = {} } = {}) {
     calls: [],
     maxInFlight: 0,
     link: null,
+    time: virtualTime(),
     beyondLink: 0,
     async read(offset, length, options) {
       source.calls.push([offset, offset + length]);
       inFlight++;
       source.maxInFlight = Math.max(source.maxInFlight, inFlight);
       if (source.link !== null && inFlight > source.link.concurrency) source.beyondLink++;
-      await new Promise(resolve => setTimeout(resolve, latencyMs));
+      await source.time.sleep(latencyMs);
       inFlight--;
       return base.read(offset, length, options);
     },
@@ -125,7 +130,7 @@ const BIG = bigStore();
 
 async function openRemote(options = {}) {
   const source = remoteSource(BIG.bytes, options);
-  const reader = createByteReader(source);
+  const reader = createByteReader(source, { clock: source.time.now });
   source.link = reader.link;
   const archive = await openZipArchive(reader);
   const root = await openZarr(zipStore(archive));
@@ -143,10 +148,10 @@ test('a range read touches only its chunks, in merged parallel requests', async 
   const { source, root } = await openRemote({ policy: { mergeGapBytes: 0 } });
   source.calls.length = 0;
   source.maxInFlight = 0;
-  const started = performance.now();
+  const started = source.time.now();
   // Rows 100..160, columns 300..400: chunk rows 5..7, chunk columns 15..19 (15 chunks).
   const box = await root.get('m').read([[100, 160], [300, 400]]);
-  const elapsed = performance.now() - started;
+  const elapsed = source.time.now() - started;
   assert.equal(box.length, 60 * 100);
   assert.equal(box[0], 100 * BIG.cols + 300);
   assert.equal(box[box.length - 1], 159 * BIG.cols + 399);
@@ -162,16 +167,16 @@ test('a range read touches only its chunks, in merged parallel requests', async 
   // request per chunk row; on this link (round trips, no bandwidth cost) the
   // rows' gaps are worth fetching too, so they may be one request.
   assert.ok(source.calls.length <= 3, `${source.calls.length} requests`);
-  assert.ok(elapsed < 20 * 3, `took ${elapsed.toFixed(0)} ms: not three round trips in a row`);
+  assert.ok(elapsed < 20 * 3, `took ${elapsed} ms: not three round trips in a row`);
 });
 
 test('a column read of a 5000-chunk array goes out at once and decodes only its 100 chunks', async () => {
   const { source, root } = await openRemote({ policy: { mergeGapBytes: 0 } });
   source.calls.length = 0;
   source.maxInFlight = 0;
-  const started = performance.now();
+  const started = source.time.now();
   const column = await root.get('m').read([[0, BIG.rows], [777, 778]]);
-  const elapsed = performance.now() - started;
+  const elapsed = source.time.now() - started;
   assert.equal(column.length, BIG.rows);
   assert.equal(column[1999], 1999 * BIG.cols + 777);
   assert.equal(root.stats().chunksDecoded, 100);
@@ -185,7 +190,7 @@ test('a column read of a 5000-chunk array goes out at once and decodes only its 
   assert.ok(source.calls.length <= 100, `${source.calls.length} requests`);
   assert.equal(source.beyondLink, 0, 'never more requests in flight than the link allows');
   // Not 100 round trips in a row, nor 17 waves of six.
-  assert.ok(elapsed < 100 * 20 / 2, `took ${elapsed.toFixed(0)} ms`);
+  assert.ok(elapsed < 100 * 20 / 2, `took ${elapsed} ms`);
 });
 
 test('reading a dense matrix column by column decodes each chunk once (decoded-chunk cache)', async () => {
@@ -202,7 +207,7 @@ test('reading a dense matrix column by column decodes each chunk once (decoded-c
 
 test('a zero cache budget keeps nothing between reads', async () => {
   const source = remoteSource(BIG.bytes, { latencyMs: 0 });
-  const root = await openZarr(zipStore(await openZipArchive(createByteReader(source))), { decodedChunkCacheBytes: 0 });
+  const root = await openZarr(zipStore(await openZipArchive(createByteReader(source, { clock: source.time.now }))), { decodedChunkCacheBytes: 0 });
   await root.get('m').read([[0, 40], [0, 1]]);
   await root.get('m').read([[0, 40], [1, 2]]);
   assert.equal(root.stats().chunksDecoded, 4);
@@ -293,10 +298,11 @@ test('a web host store never has more requests in flight than its concurrency', 
   files.set('.zmetadata', json({ zarr_consolidated_format: 1, metadata: { '.zgroup': { zarr_format: 2 }, 'a/.zarray': meta } }));
   let inFlight = 0;
   let maxInFlight = 0;
+  const time = virtualTime();
   const fetch = async url => {
     inFlight++;
     maxInFlight = Math.max(maxInFlight, inFlight);
-    await new Promise(resolve => setTimeout(resolve, 2));
+    await time.sleep(2);
     inFlight--;
     const key = new URL(url).pathname.slice('/s/'.length);
     const bytes = files.get(key);
@@ -401,10 +407,10 @@ test('a web host store serves a view\'s reads ahead of queued background work, w
   const store = httpStore('https://example.test/s/', { fetch, concurrency: 3 });
   const index = { background: true, fetched() {} };
   const background = [0, 1, 2, 3, 4].map(i => store.get(`b/${i}`, { activity: index }));
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(started.length, 2, 'background work leaves one slot free');
   const view = store.get('view', { activity: { background: false, fetched() {} } });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(started.at(-1), '/s/view', 'the view read starts at once, ahead of queued background reads');
   release();
   await Promise.all([...background, view]);
@@ -427,7 +433,7 @@ test('a web host store counts a range request as planned before its bytes arrive
     fetched(bytes) { tally.fetched += bytes; },
   };
   const read = store.getRanges('shard', [{ offset: 0, length: 100 }, { offset: 1_000_000, length: 50 }], { activity });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
   assert.equal(tally.planned, 150, 'both ranges are planned before any byte arrives');
   assert.equal(tally.fetched, 0);
   release();

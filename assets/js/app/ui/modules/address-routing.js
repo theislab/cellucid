@@ -15,8 +15,9 @@
  *    Zenodo, Figshare, Google Drive, OneDrive, Dropbox, Hugging Face or
  *    GitHub address, `owner/repo/path`) is
  *    linked data.
- * 4. A web address that names a file or store (`.h5ad`, `.zip`, `.zarr`,
- *    `datasets.json`), carries a query string or a fragment is linked data.
+ * 4. A web address that names a file or store (a name `data/input-formats.js`
+ *    knows: `.h5ad`, `.zip`, `.zarr`; or `datasets.json`), carries a query
+ *    string or a fragment is linked data.
  * 5. A web address of this computer with no path is a server.
  * 6. Any other web address is asked: a Cellucid server answers its health
  *    endpoint, and anything else (a folder of datasets on a web host, a file
@@ -29,6 +30,7 @@
  */
 
 import { getProviderRegistry } from '../../../data/sources/registry.js';
+import { fileFormatOfName, folderFormatOfName } from '../../../data/input-formats.js';
 
 /** A port number, as `cellucid serve --port` takes it. */
 function asPort(text) {
@@ -39,7 +41,11 @@ function asPort(text) {
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 const SCHEMELESS_SERVER = /^(\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?(\/[^?#]*)?$/i;
-const NAMES_DATA = /(\.h5ad|\.zip|\.zarr\/?|\/datasets\.json)$/i;
+/** Whether a path names a dataset file, a store folder or a catalog. */
+function namesData(pathname) {
+  return fileFormatOfName(pathname) !== null || folderFormatOfName(pathname) !== null ||
+    /\/datasets\.json$/i.test(pathname);
+}
 
 /** The one canonical spelling a server address is connected by. */
 function serverBase(url) {
@@ -114,7 +120,7 @@ export function routeAddress(text, { registry = getProviderRegistry() } = {}) {
   }
   if (provider !== null && provider.id !== 'url') return link(value);
   if (
-    NAMES_DATA.test(url.pathname) ||
+    namesData(url.pathname) ||
     url.search !== '' ||
     url.hash !== '' ||
     url.username !== '' ||

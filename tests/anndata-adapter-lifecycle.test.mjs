@@ -11,8 +11,7 @@ import {
 } from '../assets/js/data/data-mapping-candidates.js';
 import { canonicalEmbeddingId } from '../assets/js/data/data-mapping.js';
 import { mappingProbes, selectColumns, withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
@@ -306,7 +305,7 @@ function createColdCoalescingScenario(kind) {
   };
 }
 
-function createScenario(kind, SourceClass = ZarrDataSource) {
+function createScenario(kind, SourceClass = AnnDataFileSource) {
   const pending = deferred();
   let targetedCalls = 0;
 
@@ -436,8 +435,8 @@ async function createWarmCacheScenario(kind) {
   };
 }
 
-test('H5adDataSource.clearCaches evicts the adapter vector-field cache', () => {
-  const source = new H5adDataSource();
+test('AnnDataFileSource.clearCaches evicts the adapter vector-field cache', () => {
+  const source = new AnnDataFileSource();
   const loader = {
     clearCache() {},
     close() {}
@@ -454,8 +453,8 @@ test('H5adDataSource.clearCaches evicts the adapter vector-field cache', () => {
   assert.equal(adapter._vectorFieldCache.size, 0);
 });
 
-test('H5adDataSource.clearCaches invalidates delayed adapter reads', async () => {
-  const scenario = createScenario('embedding', H5adDataSource);
+test('AnnDataFileSource.clearCaches invalidates delayed adapter reads', async () => {
+  const scenario = createScenario('embedding', AnnDataFileSource);
   const staleRequest = scenario.invoke();
   const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);
   await scenario.pending.started;
@@ -516,7 +515,7 @@ async function assertFreshResult(kind, result) {
   }
 }
 
-test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache', async () => {
+test('AnnDataFileSource.clearCaches evicts a populated adapter vector-field cache', async () => {
   let vectorVersion = 1;
   let vectorReads = 0;
   const loader = {
@@ -536,7 +535,7 @@ test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache',
   };
   const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   source._loader = loader;
   source._adapter = adapter;
 
@@ -562,7 +561,7 @@ test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache',
 });
 
 for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
-  test(`ZarrDataSource.clearCaches invalidates a delayed adapter ${kind} read`, async () => {
+  test(`AnnDataFileSource.clearCaches invalidates a delayed adapter ${kind} read`, async () => {
     const scenario = createScenario(kind);
     const staleRequest = scenario.invoke();
     const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);
@@ -589,7 +588,7 @@ for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
 }
 
 for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
-  test(`ZarrDataSource.clear invalidates a delayed adapter ${kind} read`, async () => {
+  test(`AnnDataFileSource.clear invalidates a delayed adapter ${kind} read`, async () => {
     const scenario = createScenario(kind);
     const staleRequest = scenario.invoke();
     const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);

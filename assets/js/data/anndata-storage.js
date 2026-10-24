@@ -4,18 +4,22 @@
  * from this computer or in place from a host, its address, and its size when
  * the host or the file system states one.
  *
- * Every fact is read from the source the reader opened (a `File`, a picked
- * folder, a `.zarr.zip`, a remote file `{url, size}`, a remote Zarr folder
- * `{url}`); nothing is guessed from a dataset's name.
+ * Every fact is read from the source the reader opened (`{file}`: a `File`
+ * or a remote file `{url, size}`; `{files, rootName}`: a picked folder;
+ * `{url}`: a store folder on a web host) and from what the reader found it
+ * to be (its input format, layout and Zarr version); nothing is guessed from
+ * a dataset's name.
  *
  * @module data/anndata-storage
  */
 
+import { isInputFormatId } from './input-formats.js';
+
 /**
  * @typedef {Object} AnnDataStorage
- * @property {'h5ad'|'zarr'} format
- * @property {2|3|null} zarrVersion - The Zarr format version, null for h5ad
- * @property {'file'|'zip'|'folder'} container
+ * @property {string} format - The input format id (`data/input-formats.js`)
+ * @property {2|3|null} zarrVersion - The Zarr format version, null for any other container
+ * @property {'file'|'zip'|'folder'} layout - How the dataset arrived
  * @property {boolean} remote - Read in place from a host, not from this computer
  * @property {string|null} url - The address read from (remote only), without a query string
  * @property {string} name - The file or folder name
@@ -43,62 +47,51 @@ function sizeOf(value) {
 /**
  * Describe the storage of one dataset from the source its reader opened.
  *
- * @param {'h5ad'|'zarr'} format
  * @param {Object} source - What `AnnDataReaderClient.open()` was given
- * @param {{name: string, zarrVersion?: 2|3|null}} opened - The name the reader
- *   gave the store and, for Zarr, the version it read
+ * @param {{format: string, layout: 'file'|'zip'|'folder', name: string, zarrVersion?: 2|3|null}} opened -
+ *   What the reader found the source to be and the name it gave it
  * @returns {Readonly<AnnDataStorage>}
  */
-export function describeAnnDataStorage(format, source, { name, zarrVersion = null }) {
-  if (format === 'h5ad') {
-    const remote = isRemote(source);
+export function describeAnnDataStorage(source, { format, layout, name, zarrVersion = null }) {
+  if (!isInputFormatId(format)) throw new TypeError(`Unknown input format '${String(format)}'.`);
+  const version = zarrVersion === 2 || zarrVersion === 3 ? zarrVersion : null;
+  if (source?.file !== undefined) {
+    if (layout !== 'file' && layout !== 'zip') throw new TypeError(`One file cannot arrive in a ${String(layout)} layout.`);
+    const remote = isRemote(source.file);
     return Object.freeze({
       format,
-      zarrVersion: null,
-      container: 'file',
+      zarrVersion: version,
+      layout,
       remote,
-      url: remote ? withoutQuery(source.url) : null,
+      url: remote ? withoutQuery(source.file.url) : null,
       name,
-      bytes: sizeOf(source),
+      bytes: sizeOf(source.file),
     });
   }
-  if (format !== 'zarr') throw new TypeError(`Unknown AnnData format '${String(format)}'.`);
-  const version = zarrVersion === 2 || zarrVersion === 3 ? zarrVersion : null;
+  if (layout !== 'folder') throw new TypeError(`A folder cannot arrive in a ${String(layout)} layout.`);
   if (source?.files instanceof Map) {
     let bytes = 0;
     for (const file of source.files.values()) bytes += sizeOf(file) ?? 0;
     return Object.freeze({
       format,
       zarrVersion: version,
-      container: 'folder',
+      layout,
       remote: false,
       url: null,
       name,
       bytes,
     });
   }
-  if (source?.archive) {
-    const remote = isRemote(source.archive);
-    return Object.freeze({
-      format,
-      zarrVersion: version,
-      container: 'zip',
-      remote,
-      url: remote ? withoutQuery(source.archive.url) : null,
-      name,
-      bytes: sizeOf(source.archive),
-    });
-  }
   if (typeof source?.url === 'string') {
     return Object.freeze({
       format,
       zarrVersion: version,
-      container: 'folder',
+      layout,
       remote: true,
       url: withoutQuery(source.url),
       name,
       bytes: null,
     });
   }
-  throw new TypeError('A Zarr store source must be a folder, an archive or a URL.');
+  throw new TypeError('A dataset source is a file {file}, a folder {files, rootName} or a folder URL {url}.');
 }

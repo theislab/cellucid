@@ -34,7 +34,7 @@ test('the decode pool measures decoded bytes per millisecond', async () => {
 test('a remote link is reported as measured, and not before', () => {
   let now = 0;
   const link = new LinkMeter(REMOTE_POLICY, { clock: () => now });
-  const source = { url: 'https://host.test/a.h5ad' };
+  const source = { file: { url: 'https://host.test/a.h5ad' } };
   assert.equal(linkMeasurementOf(source, link), null);
   const started = link.begin();
   now = 120;
@@ -50,10 +50,10 @@ test('a remote link is reported as measured, and not before', () => {
 test('the client keeps the latest measurement of a local file: no round trip, its decode rate', async t => {
   const name = 'data-mapping-full.zarr.zip';
   const file = new File([await readFile(new URL(`./browser/fixtures/${name}`, import.meta.url))], name);
-  const client = new AnnDataReaderClient({ kind: 'zarr' });
+  const client = new AnnDataReaderClient();
   t.after(() => client.close());
   assert.equal(client.linkMeasurement(), null);
-  await client.open({ archive: file });
+  await client.open({ file });
   await client.readEmbedding('X_pca', [0, 1], true);
   await new Promise(resolve => setTimeout(resolve, 0));
   const measurement = client.linkMeasurement();
@@ -65,12 +65,12 @@ test('the client keeps the latest measurement of a local file: no round trip, it
 
 test('the var field loader reaches the open dataset\'s measurement through its adapter, else null', async t => {
   const { createVarFieldLoader } = await import('../assets/js/data/data-loaders.js');
-  const { ZarrDataSource } = await import('../assets/js/data/zarr.js');
+  const { AnnDataFileSource } = await import('../assets/js/data/anndata-file-source.js');
   // No dataset is open at that address.
-  assert.equal(createVarFieldLoader('zarr://nothing-open/var').linkMeasurement(), null);
+  assert.equal(createVarFieldLoader('anndata://nothing-open/var').linkMeasurement(), null);
   const name = 'data-mapping-full.zarr.zip';
   const file = new File([await readFile(new URL(`./browser/fixtures/${name}`, import.meta.url))], name);
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
   const { getNotificationCenter } = await import('../assets/js/app/notification-center.js');
   const notifications = getNotificationCenter();
@@ -79,7 +79,7 @@ test('the var field loader reaches the open dataset\'s measurement through its a
   t.after(() => {
     notifications.info = info;
   });
-  await source.loadFromArchiveFile(file, {});
+  await source.loadFile(file, {});
   await new Promise(resolve => setTimeout(resolve, 0));
   const measurement = source.getAdapter().linkMeasurement();
   assert.ok(measurement !== null && measurement.latencyMs === 0 && measurement.bytesPerMs > 0);

@@ -201,6 +201,10 @@ jobs:
         run: |
           mkdir -p test-results
           { free -m; echo; sudo dmesg --ctime | tail -n 400; echo; coredumpctl list 2>&1 | tail -n 20; } > test-results/host-kernel.log 2>&1
+          # A browser process that dumped core (a WebKit web process whose main
+          # thread hung, aborted when its page was closed) says where each of
+          # its threads was: the stacks systemd-coredump recorded.
+          sudo coredumpctl info --no-pager > test-results/host-coredumps.log 2>&1 || true
 
       # A Windows job that fails on a network error (`ERR_NO_BUFFER_SPACE`
       # loading a module from the loopback server) has run out of a host

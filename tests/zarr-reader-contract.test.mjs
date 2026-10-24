@@ -1,7 +1,7 @@
 /**
  * The AnnData Zarr contract: what the app reads from an AnnData Zarr store,
  * and what it refuses, through the Zarr package (`formats/zarr`) and the one
- * AnnData reader (`data/anndata`), and through the public `ZarrDataSource`.
+ * AnnData reader (`data/anndata`), and through the public `AnnDataFileSource`.
  *
  * Stores are real: built in memory as Zarr v2 entries (`.zgroup`, `.zattrs`,
  * `.zarray` and chunk bytes, including canonical frames written by
@@ -26,7 +26,7 @@ import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
 import { readSparseMatrix, sparseContract } from '../assets/js/data/anndata/sparse.js';
 import { nullableContract } from '../assets/js/data/anndata/dataframe.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { asWorkerLoader } from './helpers/worker-loader.mjs';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
@@ -583,10 +583,10 @@ test('rejects directory selections that omit required Zarr v2 metadata', async (
   );
   for (const name of notificationMethods) notifications[name] = () => 'download';
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
     await assert.rejects(
-      source.loadFromFileList(fileList
+      source.loadFolder(fileList
     ),
       error => {
         assert.match(error.message, /zarr\.json, \.zgroup, \.zarray or \.zmetadata/);
@@ -2131,9 +2131,9 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
   const originalWarning = notifications.info;
   notifications.info = () => 'warning';
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    await source.loadFromFileList(
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [0, 0, 1, 1],
@@ -2166,12 +2166,12 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
     missingVar.delete('var/_index/0');
 
     await assert.rejects(
-      source.loadFromFileList(
+      source.loadFolder(
         fileListFromMap(missingVar, 'missing-var.zarr')
     ),
       /var.*(required|must be exactly 'dataframe')/i
     );
-    assert.equal(source.dirname, 'working.zarr');
+    assert.equal(source.filename, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),
@@ -2354,9 +2354,9 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
   try {
     for (const substituteKey of ['X_pca', 'X_tsne', 'X_phate']) {
       await t.test(substituteKey, async () => {
-        const source = new ZarrDataSource();
+        const source = new AnnDataFileSource();
         try {
-          const identity = await source.loadFromFileList(
+          const identity = await source.loadFolder(
             fileListFromMap(
               renamedEmbeddingStore(substituteKey),
               `${substituteKey.slice(2)}-only.zarr`
@@ -2385,9 +2385,9 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
     }
 
     await t.test('a file with nothing plottable is refused and the working source kept', async () => {
-      const source = new ZarrDataSource();
+      const source = new AnnDataFileSource();
       try {
-        await source.loadFromFileList(
+        await source.loadFolder(
           fileListFromMap(
             completeZarrStoreFiles({
               embeddingValues: [0, 0, 1, 1],
@@ -2405,7 +2405,7 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
           constant.set(`obsm/X_spatial/${file}`, constant.get(`obsm/X_umap_2d/${file}`));
           constant.delete(`obsm/X_umap_2d/${file}`);
         }
-        const error = await source.loadFromFileList(
+        const error = await source.loadFolder(
           fileListFromMap(constant, 'constant.zarr')
     ).then(() => null, rejection => rejection);
         assert.equal(error?.code, 'NO_PLOTTABLE_EMBEDDING');
@@ -2416,7 +2416,7 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
           'X_spatial (2 × 2, no coordinate variation).' +
           ' Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again.'
         );
-        assert.equal(source.dirname, 'working.zarr');
+        assert.equal(source.filename, 'working.zarr');
         assert.equal(source.getAdapter(), workingAdapter);
       } finally {
         source.clear();
@@ -3157,7 +3157,7 @@ function slowRootAttributes(markStarted, released) {
   };
 }
 
-test('keeps the latest concurrent ZarrDataSource selection', async () => {
+test('keeps the latest concurrent AnnDataFileSource selection', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
     'info',
@@ -3187,17 +3187,17 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
   // reading it when the second is asked for.
   firstStore.set('.zattrs', slowRootAttributes(started.resolve, released.promise));
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    const firstRequest = source.loadFromFileList(
+    const firstRequest = source.loadFolder(
       fileListFromMap(firstStore, 'first-slow.zarr')
     );
     const firstAssertion = assert.rejects(
       firstRequest,
-      /Zarr.*(load|selection).*superseded|superseded.*Zarr/i
+      /load request was superseded by a newer selection/i
     );
     await started.promise;
-    await source.loadFromFileList(
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [9, 10, 11, 12],
@@ -3209,7 +3209,7 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
     released.resolve();
 
     await firstAssertion;
-    assert.equal(source.dirname, 'second-fast.zarr');
+    assert.equal(source.filename, 'second-fast.zarr');
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),
       [9, 10]
@@ -3239,14 +3239,14 @@ test('a superseded Zarr candidate leaves the opening to the newer one, which end
   // reading it when the second is asked for.
   firstStore.set('.zattrs', slowRootAttributes(started.resolve, released.promise));
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  const older = source.loadFromFileList(
+  const older = source.loadFolder(
     fileListFromMap(firstStore, 'older.zarr')
   );
   const olderAssertion = assert.rejects(older, /superseded/i);
   await started.promise;
-  const newer = await source.loadFromFileList(
+  const newer = await source.loadFolder(
     fileListFromMap(
       completeZarrStoreFiles({
         embeddingValues: [9, 10, 11, 12],
@@ -3267,7 +3267,7 @@ test('a superseded Zarr candidate leaves the opening to the newer one, which end
   assert.match(states.at(-1), /:done$/);
 });
 
-test('ZarrDataSource preserves a working source when required embedding bytes are corrupt', async () => {
+test('AnnDataFileSource preserves a working source when required embedding bytes are corrupt', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
     'info',
@@ -3285,9 +3285,9 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
   notifications.completeDownload = () => {};
   notifications.failDownload = () => {};
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    await source.loadFromFileList(
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [0, 0, 1, 1],
@@ -3304,12 +3304,12 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
     corrupt.set('obsm/X_umap_2d/0.0', Uint8Array.from([0xff]));
 
     await assert.rejects(
-      source.loadFromFileList(
+      source.loadFolder(
         fileListFromMap(corrupt, 'corrupt-embedding.zarr')
       ),
       /embedding|chunk|byte length|payload|decodes to/i
     );
-    assert.equal(source.dirname, 'working.zarr');
+    assert.equal(source.filename, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),

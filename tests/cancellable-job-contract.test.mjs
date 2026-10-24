@@ -430,13 +430,13 @@ test('an analysis read carries its job as owner, reads of two jobs are separate,
     worker = createInProcessAnnDataReaderWorker();
     return worker;
   });
-  const client = new AnnDataReaderClient({ kind: 'h5ad' });
+  const client = new AnnDataReaderClient();
   t.after(() => {
     client.close();
     setAnnDataReaderWorkerFactory(() => createInProcessAnnDataReaderWorker());
   });
   const bytes = new Uint8Array(readFileSync(FIXTURE));
-  await client.open(new File([bytes], 'x.h5ad'));
+  await client.open({ file: new File([bytes], 'x.h5ad') });
   const log = getReadActivityLog();
   const seen = [];
   const unsubscribe = log.subscribe(activity => {

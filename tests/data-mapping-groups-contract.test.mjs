@@ -22,7 +22,7 @@ import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 const N_OBS = 4;
 const DATASET_ID = 'served';
-const BASE = `h5ad://${DATASET_ID}/`;
+const BASE = `anndata://${DATASET_ID}/`;
 
 function obspProbe(key, shape = [N_OBS, N_OBS]) {
   return { key, storage: 'csr', shape, dtype: 'float32', numeric: true, nnz: 6 };
@@ -60,7 +60,7 @@ function installServer(t) {
       throw new Error(`unexpected graph ${obspIndex}`);
     },
   };
-  manager.activeSource = { getType: () => 'h5ad', datasetId: DATASET_ID, getAdapter: () => adapter };
+  manager.activeSource = { getType: () => 'anndata', datasetId: DATASET_ID, getAdapter: () => adapter };
   manager.activeDatasetId = DATASET_ID;
   return requested;
 }

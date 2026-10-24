@@ -116,6 +116,8 @@ const ITEM = {
 };
 
 test('Figshare: the item names size and checksum, then the file\'s first read; nothing is probed', async t => {
+  // The signed link's lifetime is counted on the wall clock: held still here.
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
   const calls = installFetch(t, ({ url }) => (url === 'https://api.figshare.com/v2/articles/16566057'
     ? { status: 200, json: ITEM, headers: { 'Access-Control-Allow-Origin': '*' } }
     : url === 'https://ndownloader.figshare.com/files/30639279'
@@ -138,7 +140,8 @@ test('Figshare: the item names size and checksum, then the file\'s first read; n
   assert.deepEqual([...opened.file.resource.access.stale], [403]);
   const target = await resolveSourceAccess(opened.file.resource.access.ref);
   assert.equal(target.url, 'https://s3.example.org/f?X-Amz-Expires=10&X-Amz-Signature=sig');
-  assert.ok(target.expiresAt > Date.now() && target.expiresAt <= Date.now() + 10_000);
+  // Its 10 s, from when its request was sent, less the time it took to answer.
+  assert.equal(target.expiresAt, 1_000_000 + 10_000);
   const renewed = await resolveSourceAccess(opened.file.resource.access.ref, { refresh: true });
   assert.equal(calls.at(-1).headers.Range, 'bytes=0-0', 'a renewal asks for one byte');
   assert.equal(renewed.url, target.url);

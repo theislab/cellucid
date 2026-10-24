@@ -20,8 +20,7 @@ import {
 import {
   createCandidateAnnDataBinding,
 } from '../assets/js/data/anndata-provider.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
@@ -233,19 +232,13 @@ async function createDirectSource(format, id) {
     'identity construction does not allocate non-default embeddings or vectors'
   );
 
-  const SourceClass = format === 'h5ad'
-    ? H5adDataSource
-    : ZarrDataSource;
-  const source = new SourceClass();
+  const source = new AnnDataFileSource();
   source._loader = loader;
   source._adapter = adapter;
   source._metadata = identity;
   source.datasetId = id;
-  if (format === 'h5ad') {
-    source.filename = filename;
-  } else {
-    source.dirname = filename;
-  }
+  source.format = format;
+  source.filename = filename;
   return { adapter, identity, loader, source };
 }
 
@@ -389,7 +382,7 @@ test('H5AD and Zarr publish one exact identity before direct adoption', async t 
       );
 
       assert.strictEqual(await source.getMetadata(id), identity);
-      assert.equal(source.getBaseUrl(id), `${format}://${id}/`);
+      assert.equal(source.getBaseUrl(id), `anndata://${id}/`);
       for (const wrongId of [undefined, '', `${id}-other`]) {
         await assert.rejects(
           source.getMetadata(wrongId),
@@ -465,13 +458,12 @@ test('direct dispatch requires the exact protocol and adopted dataset id', async
 
     for (const format of ['h5ad', 'zarr']) {
       const fixture = fixtures.get(format);
-      const otherFormat = format === 'h5ad' ? 'zarr' : 'h5ad';
       manager.activeSource = fixture.source;
       manager.activeDatasetId = fixture.id;
       manager.activeIdentityId = fixture.id;
       manager.activeDatasetMetadata = fixture.identity;
 
-      const baseUrl = `${format}://${fixture.id}/`;
+      const baseUrl = `anndata://${fixture.id}/`;
       assert.strictEqual(
         await loadDatasetIdentity(baseUrl),
         fixture.identity
@@ -532,21 +524,22 @@ test('direct dispatch requires the exact protocol and adopted dataset id', async
 
       await assert.rejects(
         loadDatasetIdentity(
-          `${format}://${fixture.id}-other/`
+          `anndata://${fixture.id}-other/`
         ),
         /belongs to dataset|active dataset/
       );
+      // A per-format scheme is no dataset address: every format is one scheme.
       await assert.rejects(
         loadDatasetIdentity(
-          `${otherFormat}://${fixture.id}/`
+          `${format}://${fixture.id}/`
         ),
-        /active dataset protocol/
+        /by its anndata:\/\/ URL/
       );
     }
 
     await assert.rejects(
       loadDatasetIdentity('https://ordinary.example/'),
-      /h5ad:\/\/ or zarr:\/\/ URL/,
+      /anndata:\/\/ URL/,
       'an ordinary URL is no dataset'
     );
     assert.equal(standardFetchCalls, 0);
@@ -602,7 +595,7 @@ test(
       };
       t.after(() => fixture.source.clear());
       const candidate = createLocalAnnDataCandidate(format, fixture);
-      const baseUrl = `${format}://${id}/`;
+      const baseUrl = `anndata://${id}/`;
       const binding = createCandidateAnnDataBinding(
         baseUrl,
         candidate
@@ -648,24 +641,23 @@ test(
         preparedMetadata
       );
 
-      const otherFormat = format === 'h5ad' ? 'zarr' : 'h5ad';
       assert.throws(
         () => createCandidateAnnDataBinding(
-          `${otherFormat}://${id}/`,
+          `${format}://${id}/`,
           candidate
         ),
-        /candidate.*owns|protocol|mode/i
+        /requires an exact anndata:\/\/ dataset URL/
       );
       assert.throws(
         () => createCandidateAnnDataBinding(
-          `${format}://${id}-other/`,
+          `anndata://${id}-other/`,
           candidate
         ),
         /belongs to dataset|candidate source owns/i
       );
       await assert.rejects(
         loadDatasetIdentity(
-          `${format}://${id}-other/`,
+          `anndata://${id}-other/`,
           options
         ),
         /binding does not own.*protocol.*dataset id/i
@@ -715,7 +707,7 @@ test('staged metadata owners reject non-data option shapes before I/O', async ()
   ]) {
     await assert.rejects(
       loadDatasetIdentity(
-        'h5ad://dataset/',
+        'anndata://dataset/',
         options
       ),
       TypeError

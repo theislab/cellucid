@@ -50,12 +50,12 @@ test('only drags that carry files are the drop target\'s', () => {
 
 test('one H5AD file, one Zarr ZIP or one Zarr folder is opened by its own reader', async () => {
   const h5ad = describeDatasetDrop(transfer([fileItem('Cells.H5AD')]));
-  assert.equal(h5ad.kind, 'h5ad');
+  assert.equal(h5ad.kind, 'file');
   assert.equal(h5ad.label, 'Cells.H5AD');
   assert.equal((await h5ad.readFiles())[0].name, 'Cells.H5AD');
 
   const zarr = describeDatasetDrop(transfer([fileItem('cells.zarr.zip')]));
-  assert.equal(zarr.kind, 'zarr-zip');
+  assert.equal(zarr.kind, 'zip');
 
   // A folder is read as an AnnData Zarr store, hidden metadata files and all.
   const folder = describeDatasetDrop(transfer([
@@ -65,7 +65,7 @@ test('one H5AD file, one Zarr ZIP or one Zarr folder is opened by its own reader
       directoryEntry('obs', [fileEntry('.zattrs')]),
     ])),
   ]));
-  assert.equal(folder.kind, 'zarr-folder');
+  assert.equal(folder.kind, 'folder');
   assert.equal(folder.label, 'cells.zarr');
   const files = await folder.readFiles();
   assert.deepEqual(

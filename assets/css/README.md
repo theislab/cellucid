@@ -29,7 +29,8 @@
 ## Site Design Principles
 
 Every screen of www.cellucid.com is one product: the app, its dialogs, the
-standalone pages (`404.html`, `privacy.html`, `assets/auth/callback.html`) and
+standalone pages (`404.html`, the reading pages `privacy.html`, `terms.html`
+and `accessibility.html`, `assets/auth/callback.html`) and
 the screens shown when the app cannot run (startup failure, code-load failure,
 `<noscript>`). Each says its own thing, built from the same principles:
 

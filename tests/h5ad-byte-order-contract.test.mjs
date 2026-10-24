@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { valueKind } from '../assets/js/data/anndata/elements.js';
 import { openHdf5 } from '../assets/js/formats/hdf5/index.js';
 import { storeDtype } from '../assets/js/formats/hdf5/datatype.js';
@@ -146,12 +146,12 @@ async function readEverything(t, fixturePath) {
   const file = new File([bytes], path.basename(fixturePath), {
     type: 'application/x-hdf5',
   });
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => {
     source.clear();
   });
 
-  const descriptor = await source.loadFromFile(file);
+  const descriptor = await source.loadFile(file);
   const loader = source._loader;
 
   const embeddings = {};
@@ -414,8 +414,7 @@ test(
   'no AnnData reader accepts or rejects a value because of stored byte order',
   async () => {
     const files = [
-      '../assets/js/data/h5ad.js',
-      '../assets/js/data/zarr.js',
+      '../assets/js/data/anndata-file-source.js',
       ...(await readdir(fileURLToPath(new URL('../assets/js/data/anndata/', import.meta.url))))
         .filter(name => name.endsWith('.js'))
         .map(name => `../assets/js/data/anndata/${name}`),

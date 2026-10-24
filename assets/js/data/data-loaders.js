@@ -1,6 +1,6 @@
 // The data loaders: read the parts of one AnnData dataset -- the active one,
-// or a candidate staged for selection -- under its base URL (`h5ad://<id>/`
-// or `zarr://<id>/`) from the AnnData adapter that owns it
+// or a candidate staged for selection -- under its base URL (`anndata://<id>/`)
+// from the AnnData adapter that owns it
 // (`anndata-provider.js`), and check them into the runtime shapes DataState
 // uses: the dataset identity, the obs and var field descriptors, field
 // values, cell positions, and the neighbour graph.
@@ -51,14 +51,14 @@ import {
 } from './anndata-provider.js';
 
 /**
- * Require one h5ad:// or zarr:// URL: every dataset is an AnnData file.
+ * Require one anndata:// URL: every dataset is read by the AnnData reader.
  * @param {string} url
  * @param {string} label
  */
 function requireAnnDataUrl(url, label) {
   if (!isAnnDataUrl(url)) {
     throw new TypeError(
-      `${label} reads an AnnData dataset by its h5ad:// or zarr:// URL; got ${String(url)}.`
+      `${label} reads an AnnData dataset by its anndata:// URL; got ${String(url)}.`
     );
   }
 }
@@ -172,7 +172,7 @@ function waitForAbort(promise, signal) {
   });
 }
 
-/** The dataset base of a URL: `h5ad://<id>/` or `zarr://<id>/`. */
+/** The dataset base of a URL: `anndata://<id>/`. */
 function baseOf(url) {
   const start = url.indexOf('://') + 3;
   return url.slice(0, url.indexOf('/', start) + 1);
@@ -714,7 +714,7 @@ export async function loadConnectivitySummary(url, options = {}) {
 /**
  * Load the dataset identity: what the adapter states about the file.
  *
- * @param {string} baseUrl - The dataset base, `h5ad://<id>/` or `zarr://<id>/`
+ * @param {string} baseUrl - The dataset base, `anndata://<id>/`
  * @param {{candidateAnnDataBinding?: Object|null, signal?: AbortSignal|null}} [options]
  * @returns {Promise<Object>}
  */
@@ -760,7 +760,7 @@ export function getEmbeddingsMetadata(identity) {
  * and var field descriptors and graph summary -- and check that they describe
  * the same cells: the generation DataState adopts.
  *
- * @param {string} baseUrl - `h5ad://<id>/` or `zarr://<id>/`
+ * @param {string} baseUrl - `anndata://<id>/`
  * @param {{candidateAnnDataBinding?: Object|null, expectedIdentityId: string, signal: AbortSignal}} options
  * @returns {Promise<{identity: Object, obsFields: Object, geneList: Object|null, connectivitySummary: Object|null}>}
  */

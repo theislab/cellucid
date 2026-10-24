@@ -26,7 +26,7 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
   - **Hybrid** (`hybrid`): points are embedded as a shader-rendered PNG while annotations remain vectors.
 - `renderers/png-renderer.js`: HTML Canvas composer with embedded UTF-8 PNG `iTXt` metadata (`buildPngTextMetadata()` publishes the exact chunk map so it can be compared with the SVG's).
   - Points are rasterized in the worker (on the page where a worker has no WebGL2) via WebGL2 using the same shader variants as the viewer, so 3D “sphere” shading exports correctly (not as flat dots); the frame comes back as an ImageBitmap and is copied one to one onto the plot's device pixels.
-  - The composed canvas crosses to the worker as an ImageBitmap and is encoded there with `OffscreenCanvas.convertToBlob`, the encoder `toBlob` uses: the bytes are those `toBlob` wrote (verified in Chromium, Firefox and WebKit).
+  - The composed canvas crosses to the worker as its pixels (`getImageData`, read in the task that composed it; `pagePixels` in `utils/figure-export-worker-client.js`) and is encoded there with `OffscreenCanvas.convertToBlob`, the encoder `toBlob` uses. Every image the page hands the worker to encode (the composed figure, a backdrop look's raster, a Hybrid point pass) crosses as pixels, never as an ImageBitmap of a page canvas: on Linux WebKit (WPE), whose workers have no GL, such a bitmap reached the encoder without the canvas's pixels.
 - `renderers/svg-point-markup.js`: the `<circle>` markup of Full Vector and Optimized Vector, encoded in the worker straight into a reused 1 MiB buffer whose contents become Blob parts, so memory is the file plus one buffer, and the markup is never a string.
 
 ### Components (shared building blocks)

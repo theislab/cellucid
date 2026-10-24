@@ -18,6 +18,10 @@
  * - `encodePng` / `encodePngDataUrl`: a composed frame encoded with
  *   `OffscreenCanvas.convertToBlob`, the PNG's `iTXt` metadata added here.
  *
+ * The encoders take the pixels the page read (an ImageData, handed over),
+ * never an ImageBitmap of a page canvas (`pagePixels` in
+ * `figure-export-worker-client.js` says why).
+ *
  * Requests belong to a session, one per rendered file. A session's typed
  * arrays are sent once (`uploads`) and referred to by id afterwards
  * (`{ $array: id }`), so a view's positions cross once per file however many
@@ -107,15 +111,17 @@ function reviveRasterOptions(options) {
   };
 }
 
-/** A canvas holding `bitmap` exactly as it is, for encoding. */
-function bitmapCanvas(bitmap) {
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const context = canvas.getContext('bitmaprenderer');
+/**
+ * A canvas holding `pixels` (an ImageData the page read, `pagePixels` in
+ * `figure-export-worker-client.js`) exactly as they are, for encoding.
+ */
+function pixelCanvas(pixels) {
+  const canvas = new OffscreenCanvas(pixels.width, pixels.height);
+  const context = canvas.getContext('2d', { alpha: true });
   if (context === null) {
-    bitmap.close();
-    throw new Error('Figure-export PNG encoding requires an ImageBitmap rendering context.');
+    throw new Error('Figure-export PNG encoding requires a Canvas 2D context.');
   }
-  context.transferFromImageBitmap(bitmap);
+  context.putImageData(pixels, 0, 0);
   return canvas;
 }
 
@@ -135,16 +141,16 @@ function blobToDataUrl(blob) {
  * Place a point raster where the Hybrid crop puts it inside the plot raster,
  * one to one unless it was zoomed past the GPU's sprite range.
  */
-function placeRaster(bitmap, placement) {
+function placeRaster(pixels, placement) {
   const canvas = new OffscreenCanvas(placement.canvasWidth, placement.canvasHeight);
   const context = canvas.getContext('2d', { alpha: true });
   if (context === null) {
     throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
   }
   if (placement.exact) {
-    context.drawImage(bitmap, placement.x, placement.y);
+    context.putImageData(pixels, placement.x, placement.y);
   } else {
-    context.drawImage(bitmap, placement.x, placement.y, placement.width, placement.height);
+    context.drawImage(pixelCanvas(pixels), placement.x, placement.y, placement.width, placement.height);
   }
   return canvas;
 }
@@ -168,13 +174,8 @@ const operations = {
     return { result: frame, transfer: [frame] };
   },
 
-  encodeRasterPngDataUrl: async ({ bitmap, placement }) => {
-    let canvas;
-    try {
-      canvas = placement === null ? bitmapCanvas(bitmap) : placeRaster(bitmap, placement);
-    } finally {
-      if (placement !== null) bitmap.close();
-    }
+  encodeRasterPngDataUrl: async ({ pixels, placement }) => {
+    const canvas = placement === null ? pixelCanvas(pixels) : placeRaster(pixels, placement);
     const blob = await encodeCanvasPng(
       canvas,
       placement === null
@@ -191,13 +192,13 @@ const operations = {
     }),
   }),
 
-  encodePng: async ({ bitmap, textMap }) => {
-    const blob = await encodeCanvasPng(bitmapCanvas(bitmap), 'PNG encoding failed.');
+  encodePng: async ({ pixels, textMap }) => {
+    const blob = await encodeCanvasPng(pixelCanvas(pixels), 'PNG encoding failed.');
     return { result: await embedPngTextChunks(blob, textMap) };
   },
 
-  encodePngDataUrl: async ({ bitmap }) => {
-    const blob = await encodeCanvasPng(bitmapCanvas(bitmap), 'Figure-export PNG encoding failed.');
+  encodePngDataUrl: async ({ pixels }) => {
+    const blob = await encodeCanvasPng(pixelCanvas(pixels), 'Figure-export PNG encoding failed.');
     return { result: blobToDataUrl(blob) };
   },
 };

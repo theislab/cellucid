@@ -16,8 +16,7 @@ import {
 } from '../../../data/data-source.js';
 import { getProviderRegistry } from '../../../data/sources/registry.js';
 import { probeRemoteServer, validateRemoteServerUrl } from '../../../data/remote-source.js';
-import { isH5adFile } from '../../../data/h5ad.js';
-import { isZarrZipArchive } from '../../../data/local-user-source.js';
+import { filePickerAccept, folderMarkersOf, openableNamePhrases } from '../../../data/input-formats.js';
 import { routeAddress } from './address-routing.js';
 import { initOpenDataMenu } from './open-data-menu.js';
 import { getNotificationCenter } from '../../notification-center.js';
@@ -25,7 +24,7 @@ import { beginOpening } from '../../../data/opening-progress.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { analytics } from '../../optional-analytics.js';
 import { debug } from '../../../utils/debug.js';
-import { initDatasetDrop } from './dataset-drop.js';
+import { initDatasetDrop, localFileLayout } from './dataset-drop.js';
 import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
@@ -382,27 +381,45 @@ export function describeDataLinkProblem(value) {
 }
 
 /**
- * The three ways a local dataset is read: an `.h5ad` file, an AnnData Zarr
- * store folder, or a zipped one. The file inputs and a drop onto the viewer
- * share them, so a dropped file is read, validated, reported and superseded
- * exactly as a picked one is.
+ * The three ways a local dataset arrives (`data/input-formats.js` layouts):
+ * one file that is the container itself (an `.h5ad`), a ZIP archive holding a
+ * store (a `.zarr.zip`), or a store folder. The file inputs and a drop onto
+ * the viewer share them, so a dropped file is read, validated, reported and
+ * superseded exactly as a picked one is. What each is is decided by the
+ * reader from its content.
  */
 const LOCAL_LOADERS = Object.freeze({
-  h5ad: Object.freeze({
+  file: Object.freeze({
     loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
     load: (source, files) =>
-      source.loadFromH5adFile(files.length === 1 ? files[0] : null)
+      source.loadFromFile(files.length === 1 ? files[0] : null)
   }),
-  'zarr-zip': Object.freeze({
+  zip: Object.freeze({
     loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
     load: (source, files) =>
-      source.loadFromZarrArchive(files.length === 1 ? files[0] : null)
+      source.loadFromFile(files.length === 1 ? files[0] : null)
   }),
-  'zarr-folder': Object.freeze({
+  folder: Object.freeze({
     loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_FOLDER,
-    load: (source, files) => source.loadFromZarrDirectory(files)
+    load: (source, files) => source.loadFromFolder(files)
   })
 });
+
+/**
+ * What File… opens and what Zarr folder… is for, from the registry: "Choose
+ * an .h5ad file or a .zarr.zip archive, or choose Zarr folder… for a .zarr
+ * folder."
+ *
+ * @returns {string}
+ */
+function describePickableFiles() {
+  const phrases = openableNamePhrases();
+  const folders = phrases.filter(phrase => phrase.endsWith(' folder'));
+  const files = phrases.filter(phrase => !phrase.endsWith(' folder'));
+  const article = phrase => (/^\.[aeiouh]/i.test(phrase) ? 'an' : 'a');
+  return `Choose ${files.map(phrase => `${article(phrase)} ${phrase}`).join(' or ')}, ` +
+    `or choose Zarr folder… for ${folders.map(phrase => `a ${phrase}`).join(' or ')}.`;
+}
 
 /**
  * What a local choice is called while it is being read: the file, or the
@@ -462,24 +479,13 @@ export function describeHiddenMetadataProblem(files) {
       : String(file?.name ?? '')
   ));
   const hasHidden = paths.some(path => path.split('/').some(part => part.startsWith('.')));
-  const hasV3 = paths.some(path => path.split('/').at(-1) === 'zarr.json');
-  if (paths.length === 0 || hasHidden || hasV3) return null;
+  // A Zarr v3 store's metadata (`zarr.json`) is not hidden.
+  const visibleMarkers = folderMarkersOf('zarr').filter(marker => !marker.startsWith('.'));
+  const hasVisibleMarker = paths.some(path => visibleMarkers.includes(path.split('/').at(-1)));
+  if (paths.length === 0 || hasHidden || hasVisibleMarker) return null;
   return 'This browser left out the folder\'s hidden files (names starting with "."), '
     + 'where a Zarr v2 store keeps its metadata. Drag the folder onto the page, '
     + 'or open its .zarr.zip.';
-}
-
-/**
- * How one picked file is read: an `.h5ad`, or a zipped Zarr store; null for
- * anything else.
- *
- * @param {File} file
- * @returns {'h5ad'|'zarr-zip'|null}
- */
-export function localFileKind(file) {
-  if (isH5adFile(file)) return 'h5ad';
-  if (isZarrZipArchive(file)) return 'zarr-zip';
-  return null;
 }
 
 /**
@@ -899,6 +905,8 @@ export function initDatasetConnections(options) {
       userDataFileInput,
       userDataFolderInput
     } = openMenu;
+    // File… offers every single-file format the registry names.
+    userDataFileInput.accept = filePickerAccept();
     initOpenDataMenu({
       button: userDataOpenBtn,
       menu: userDataOpenMenu,
@@ -912,18 +920,17 @@ export function initDatasetConnections(options) {
     listen(userDataFileInput, 'change', event => {
       const files = event.target.files;
       if (!files || files.length === 0) return undefined;
-      const kind = localFileKind(files[0]);
-      if (kind === null) {
+      const layout = localFileLayout(files[0]);
+      if (layout === null) {
         notifications.error(
-          `"${files[0].name}" is not a file Cellucid can open. Choose an .h5ad `
-          + 'file or a .zarr.zip archive, or choose Zarr folder… for a .zarr store.',
+          `"${files[0].name}" is not a file Cellucid can open. ${describePickableFiles()}`,
           { category: 'data', title: 'Cannot open this file' }
         );
         userDataFileInput.value = '';
         return undefined;
       }
       return launchOperation(async () => {
-        await loadLocalUserSelection(pickedSelection(files), LOCAL_LOADERS[kind]);
+        await loadLocalUserSelection(pickedSelection(files), LOCAL_LOADERS[layout]);
         if (!destroyed) userDataFileInput.value = '';
       }, 'File selection failed');
     });
@@ -942,7 +949,7 @@ export function initDatasetConnections(options) {
       return launchOperation(async () => {
         await loadLocalUserSelection(
           pickedSelection(files),
-          LOCAL_LOADERS['zarr-folder']
+          LOCAL_LOADERS.folder
         );
         if (!destroyed) userDataFolderInput.value = '';
       }, 'Zarr folder selection failed');

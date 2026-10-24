@@ -1,9 +1,9 @@
 /**
- * One AnnData file on a web host, described without downloading it: its
- * format from the file name, its exact size and the identity the host
- * reports. Providers that open single files (`.h5ad`, Zarr ZIP) build their
- * entries with this, so every provider names formats and failures the same
- * way.
+ * One dataset file on a web host, described without downloading it: its
+ * format from the file name (`data/input-formats.js`; the reader confirms it
+ * from the content), its exact size and the identity the host reports.
+ * Providers that open single files (`.h5ad`, Zarr ZIP) build their entries
+ * with this, so every provider names formats and failures the same way.
  *
  * A file is read in place with range requests. A host that ignores range
  * requests serves only the whole file: its entry says so (`transport:
@@ -17,40 +17,17 @@
 
 import { DataSourceError, DataSourceErrorCode } from '../data-source.js';
 import { HEAD_BYTES, probeHttpResource } from '../../formats/io/byte-source.js';
-
-/**
- * The file format a name declares, or null. A `.zip` is a zipped Zarr store
- * (`.zarr.zip`).
- *
- * @param {string} name
- * @returns {'h5ad'|'zip'|null}
- */
-export function fileFormatOf(name) {
-  const lower = String(name).toLowerCase();
-  if (lower.endsWith('.h5ad')) return 'h5ad';
-  if (lower.endsWith('.zip')) return 'zip';
-  return null;
-}
-
-/**
- * What a file is called when it does not name itself: its name without the
- * format's extension (`atlas.zarr.zip` is "atlas").
- *
- * @param {string} name
- * @returns {string}
- */
-export function fileTitleOf(name) {
-  return String(name).replace(/\.(h5ad|zarr\.zip|zip)$/i, '');
-}
+import { fileFormatOfName, readsFromHead, titleOfName } from '../input-formats.js';
 
 /**
  * The size and identity a host reports for one file, or the refusal that
- * names why it cannot be read. The head of an `.h5ad` (its first read,
- * `HEAD_BYTES`) is read in the same round trip.
+ * names why it cannot be read. The head of a file whose structure starts at
+ * byte 0 (an `.h5ad`: its first read, `HEAD_BYTES`) is read in the same
+ * round trip (`readsFromHead`).
  */
 async function probeRemoteFile(url, name, format, signal) {
   try {
-    return await probeHttpResource(url, { signal, headBytes: format === 'h5ad' ? HEAD_BYTES : 0 });
+    return await probeHttpResource(url, { signal, headBytes: readsFromHead(format) ? HEAD_BYTES : 0 });
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
     const status = error?.status;
@@ -78,11 +55,12 @@ async function probeRemoteFile(url, name, format, signal) {
  * @param {Object} options
  * @param {string} options.url - Where the bytes are
  * @param {string} options.id - Dataset id; stable for this file wherever it
- *   is opened from, and without '/' (it becomes `h5ad://<id>/`)
+ *   is opened from, and without '/' (it becomes `anndata://<id>/`)
  * @param {string} options.name - File name, which also declares the format
+ *   (`fileFormatOfName`): the entry's `format` is `{format, layout}`
  * @param {string} [options.title] - What the dataset is called when the file
  *   does not name itself (`uns['title']`); its name without the extension
- *   by default
+ *   by default (`titleOfName`)
  * @param {Object} options.attribution - `{title, url, licence?, citation?}`
  * @param {string|null} [options.version] - A provider version; else the
  *   host's ETag or size
@@ -100,7 +78,7 @@ export async function describeRemoteFile({
   url,
   id,
   name,
-  title = fileTitleOf(name),
+  title = titleOfName(name),
   attribution,
   version = null,
   size = null,
@@ -111,7 +89,7 @@ export async function describeRemoteFile({
   if (typeof id !== 'string' || id.length === 0 || id.includes('/')) {
     throw new TypeError('A remote file id must be a non-empty string without "/".');
   }
-  const format = fileFormatOf(name);
+  const format = fileFormatOfName(name);
   if (format === null) {
     throw new DataSourceError(
       `${name} is not a file Cellucid opens from a link. Links open an .h5ad ` +
@@ -152,7 +130,7 @@ export async function describeRemoteFile({
 
 /**
  * The one file a link opens from a listing: the requested one, or the only
- * openable one (`.h5ad`, `.zip`). Several openable files are named back, each
+ * openable one (a name `fileFormatOfName` knows: `.h5ad`, `.zip`). Several openable files are named back, each
  * with the exact locator that opens it, so the person can choose.
  *
  * @param {string[]} names - Every file name the listing holds
@@ -173,7 +151,7 @@ export function chooseOpenableFile(names, requested, where, locatorFor) {
     }
     return requested;
   }
-  const openable = names.filter(name => fileFormatOf(name) !== null);
+  const openable = names.filter(name => fileFormatOfName(name) !== null);
   if (openable.length === 1) return openable[0];
   if (openable.length === 0) {
     throw new DataSourceError(

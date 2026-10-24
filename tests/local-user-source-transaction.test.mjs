@@ -1,7 +1,7 @@
 /**
- * One AnnData dataset chosen on the user's own computer
- * (`LocalUserDirDataSource`): an `.h5ad`, a zipped Zarr store, or a Zarr store
- * folder, read as an isolated candidate and adopted only when it opened
+ * One dataset chosen on the user's own computer (`LocalUserDirDataSource`):
+ * a file (an `.h5ad`, a zipped Zarr store) or a Zarr store folder, what it
+ * is decided from its content, read as an isolated candidate and adopted only when it opened
  * completely; a newer choice supersedes an older one.
  */
 import './helpers/anndata-reader-in-process.mjs';
@@ -10,9 +10,9 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { LocalUserDirDataSource } from '../assets/js/data/local-user-source.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { defaultDatasetIdOf } from '../assets/js/data/input-formats.js';
 import { zippedStoreEntries } from './helpers/zarr-corpus.mjs';
 
 const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
@@ -83,12 +83,12 @@ test('a chosen .h5ad is adopted under the id it states', async t => {
   const source = new LocalUserDirDataSource();
   t.after(() => source.clear());
   const initialAdoption = source.getAdoptionIdentity();
-  const metadata = await source.loadFromH5adFile(fixtureFile('ready.h5ad'));
+  const metadata = await source.loadFromFile(fixtureFile('ready.h5ad'));
   assert.equal(metadata.id, 'tiny-ready');
   assert.equal(metadata.name, 'Tiny ready dataset', 'a file the user chose names itself');
   assert.equal(source.datasetId, 'tiny-ready');
   assert.equal(source.getPath(), 'ready.h5ad');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'h5ad://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.equal(await source.isAvailable(), true);
   assert.deepEqual(await source.listDatasets(), [metadata]);
   assert.ok(source.getAdoptionIdentity() > initialAdoption);
@@ -102,10 +102,10 @@ test('a chosen Zarr store folder is read in the browser, hidden metadata files i
   t.after(() => source.clear());
   const files = await pickedFolder('ready.zarr');
   assert.ok(files.some(file => file.webkitRelativePath === 'ready.zarr/.zmetadata'));
-  const metadata = await source.loadFromZarrDirectory(files);
+  const metadata = await source.loadFromFolder(files);
   assert.equal(metadata.id, 'tiny-ready');
   assert.equal(metadata.source.name, 'Example lab');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.equal(source.getPath(), 'ready.zarr');
 });
 
@@ -113,29 +113,29 @@ test('a folder that is no Zarr store is refused, and the working dataset stays',
   quiet(t);
   const source = new LocalUserDirDataSource();
   t.after(() => source.clear());
-  await source.loadFromH5adFile(fixtureFile('ready.h5ad'));
+  await source.loadFromFile(fixtureFile('ready.h5ad'));
   const adoption = source.getAdoptionIdentity();
   const notAStore = [new File(['x'], 'notes.txt')];
   Object.defineProperty(notAStore[0], 'webkitRelativePath', { value: 'folder/notes.txt' });
   await assert.rejects(
-    source.loadFromZarrDirectory(notAStore),
+    source.loadFromFolder(notAStore),
     error => {
       assert.match(error.message, /not an AnnData Zarr store.*Choose the \.zarr folder itself/);
       assert.equal(error.details.explained, true);
       return true;
     }
   );
-  await assert.rejects(source.loadFromH5adFile(fixtureFile('unknown-key.h5ad')), /unknown key 'colour'/);
+  await assert.rejects(source.loadFromFile(fixtureFile('unknown-key.h5ad')), /unknown key 'colour'/);
   assert.equal(source.getAdoptionIdentity(), adoption, 'a refused candidate changes nothing');
   assert.equal(source.datasetId, 'tiny-ready');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'h5ad://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
 });
 
 test('local selections expose a monotonic identity before asynchronous work', async t => {
   quiet(t);
   const source = new LocalUserDirDataSource();
   const initialIdentity = source.getSelectionIdentity();
-  const loading = source.loadFromH5adFile(fixtureFile('ready.h5ad'));
+  const loading = source.loadFromFile(fixtureFile('ready.h5ad'));
   const loadingIdentity = source.getSelectionIdentity();
   assert.ok(loadingIdentity > initialIdentity);
   source.clear();
@@ -144,79 +144,54 @@ test('local selections expose a monotonic identity before asynchronous work', as
   assert.equal(source.datasetId, null);
 });
 
-test('local Zarr archive selections expose truthful visible folder and ZIP provenance', async t => {
-  const originalArchiveLoad = ZarrDataSource.prototype.loadFromArchiveFile;
-
-  ZarrDataSource.prototype.loadFromArchiveFile = async function (
-    selection,
-    options
-  ) {
-    const root = selection.name.replace(/\.zip$/i, '');
-    this.dirname = root;
-    this.datasetId = options.datasetId ?? options.defaultDatasetId;
-    this._metadata = {
-      id: this.datasetId,
-      name: root.replace(/\.zarr$/i, ''),
-      description: options.description,
-      source: options.source,
-      stats: { n_cells: 2 }
-    };
-    return this._metadata;
-  };
-  t.after(() => {
-    ZarrDataSource.prototype.loadFromArchiveFile = originalArchiveLoad;
-  });
-
+test('a chosen file that states no id is named after its file, and keeps its provenance', async t => {
+  quiet(t);
   const source = new LocalUserDirDataSource();
   t.after(() => source.clear());
+  const bytes = readFileSync(new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url));
+  const metadata = await source.loadFromFile(new File([bytes], 'portable.zarr.zip'));
+  assert.equal(metadata.id, 'zarr_portable', 'a store that states no id is named after its file');
+  assert.equal(metadata.name, 'portable');
+  assert.equal(metadata.source.name, 'AnnData Zarr', 'named by the format its content shows');
+  assert.equal(metadata.source.filename, 'portable.zarr.zip', 'the selected file is part of its provenance');
+  assert.equal(source.getPath(), 'portable.zarr.zip');
+  const inner = source.getAnnDataSource();
+  assert.equal(inner.format, 'zarr');
+  assert.equal(inner.describeStorage().layout, 'zip');
+  assert.equal(inner.describeStorage().zarrVersion, 2);
+  assert.equal((await inner.getMetadata(source.datasetId)).source.name, 'AnnData Zarr',
+    'the adopted inner source and local UI source must expose one identity');
+});
 
-  const archiveMetadata = await source.loadFromZarrArchive(
-    createFile('portable.zarr.zip', 'synthetic ZIP')
-  );
-  assert.equal(
-    archiveMetadata.id,
-    'zarr_portable',
-    'a store that states no id is named after its file'
-  );
-  assert.equal(archiveMetadata.source.name, 'Zarr ZIP archive');
-  assert.equal(
-    archiveMetadata.source.filename,
-    'portable.zarr.zip',
-    'the selected archive filename is part of its provenance'
-  );
-  assert.equal(
-    archiveMetadata.description ?? '',
-    '',
-    'the description is the store\'s own; where it came from is its source'
-  );
-  assert.equal(
-    source.getPath(),
-    'portable.zarr',
-    'the visible folder is the store inside the selected archive'
-  );
-  assert.equal(
-    (await source.getAnnDataSource().getMetadata(source.datasetId)).source.name,
-    'Zarr ZIP archive',
-    'the adopted inner source and local UI source must expose one identity'
-  );
+test('a chosen file is read as what its content is, whatever its name says', async t => {
+  quiet(t);
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+  // An .h5ad's bytes under a .zip name: its HDF5 signature decides.
+  const bytes = readFileSync(new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url));
+  const metadata = await source.loadFromFile(new File([bytes], 'misnamed.zip'));
+  assert.equal(metadata.id, 'h5ad_misnamed');
+  assert.equal(source.getAnnDataSource().format, 'h5ad');
+  assert.equal(source.getAnnDataSource().describeStorage().layout, 'file');
+  await assert.rejects(source.loadFromFile(new File([bytes], 'notes.txt')), /Not a file Cellucid opens/);
 });
 
 for (const flow of [
   {
     name: 'H5AD',
     expectedDatasetId: 'h5ad_newer',
-    prototype: H5adDataSource.prototype,
-    method: 'loadFromFile',
+    prototype: AnnDataFileSource.prototype,
+    method: 'loadFile',
     createSelection(name) {
       return [createFile(`${name}.h5ad`, name)];
     },
     invoke(source, selection) {
-      return source.loadFromH5adFile(selection[0]);
+      return source.loadFromFile(selection[0]);
     },
     async installCandidate(candidate, selection, options) {
       const file = selection;
       candidate.filename = file.name;
-      candidate.datasetId = options.datasetId ?? `h5ad_${file.name.replace(/\.h5ad$/i, '')}`;
+      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('h5ad', file.name);
       candidate._metadata = {
         id: candidate.datasetId,
         name: file.name,
@@ -231,18 +206,18 @@ for (const flow of [
   {
     name: 'Zarr ZIP',
     expectedDatasetId: 'zarr_newer',
-    prototype: ZarrDataSource.prototype,
-    method: 'loadFromArchiveFile',
+    prototype: AnnDataFileSource.prototype,
+    method: 'loadFile',
     createSelection(name) {
       return [createFile(`${name}.zarr.zip`, name)];
     },
     invoke(source, selection) {
-      return source.loadFromZarrArchive(selection[0]);
+      return source.loadFromFile(selection[0]);
     },
     async installCandidate(candidate, selection, options) {
       const root = selection.name.replace(/\.zip$/i, '');
-      candidate.dirname = root;
-      candidate.datasetId = options.datasetId ?? options.defaultDatasetId;
+      candidate.filename = selection.name;
+      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('zarr', selection.name);
       candidate._metadata = {
         id: candidate.datasetId,
         name: root,

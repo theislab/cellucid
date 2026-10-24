@@ -386,6 +386,27 @@ function plotAreaColours({ width, height, channels, pixels }) {
   return values;
 }
 
+/**
+ * The share of the same lattice darker than 192 (mean of R, G and B): on a
+ * white paper the paper and its grid are lighter, the shaded spheres of the
+ * point pass are not. Measured over this fixture's figure: 0.16 (WebKit) and
+ * 0.12 (Chromium). The PNG Linux WebKit wrote while the composed figure
+ * reached the encoder as an ImageBitmap held no point and measured 0, while
+ * its blurred grid passed a count of more than five colours (it had 28).
+ */
+function plotAreaShadedShare({ width, height, channels, pixels }) {
+  let samples = 0;
+  let shaded = 0;
+  for (let y = Math.floor(height * 0.2); y < Math.floor(height * 0.8); y += 7) {
+    for (let x = Math.floor(width * 0.2); x < Math.floor(width * 0.7); x += 7) {
+      const at = (y * width + x) * channels;
+      samples += 1;
+      if (pixels[at] + pixels[at + 1] + pixels[at + 2] < 3 * 192) shaded += 1;
+    }
+  }
+  return shaded / samples;
+}
+
 /** Distinct colours of the look raster an SVG export embeds. */
 function svgLookColours(svg) {
   const match = svg.match(
@@ -416,9 +437,9 @@ test('figure export redraws the look under the points', async ({ page }, testInf
   const plainPngBytes = await exportFigure(page, 'png');
   await keep('plain.png', plainPngBytes, 'image/png');
   expect.soft(
-    plotAreaColours(decodePng(plainPngBytes)).size,
-    'on white paper: the PNG plot area shows the points',
-  ).toBeGreaterThan(5);
+    plotAreaShadedShare(decodePng(plainPngBytes)),
+    'on white paper: the PNG plot area shows the shaded points',
+  ).toBeGreaterThan(0.05);
   await setControl(page, 'figure-export-background', 'viewer');
   for (const [look, dimension] of [['nebula', 3], ['atelier', 2], ['abyss-dark', 3]]) {
     await setDimension(page, 'live', dimension);

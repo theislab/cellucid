@@ -16,7 +16,7 @@
  */
 
 import { onAbort } from './abort.js';
-import { ResponseClock } from './link.js';
+import { ResponseClock, afterRealTime } from './link.js';
 
 /**
  * How reads to a source should be shaped. None of these limits what can be
@@ -226,18 +226,19 @@ export function bytesByteSource(bytes, { name = 'bytes', identity = null, policy
   return Object.freeze(source);
 }
 
-function sleep(milliseconds, signal) {
+/** Waits `milliseconds` on the timers `after` (`ResponseClock`); `signal` ends the wait. */
+function sleep(milliseconds, signal, after) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(abortError(signal));
       return;
     }
-    const timer = setTimeout(() => {
+    const cancel = after(milliseconds, () => {
       stopWaiting();
       resolve();
-    }, milliseconds);
+    });
     const stopWaiting = onAbort(signal, () => {
-      clearTimeout(timer);
+      cancel();
       reject(abortError(signal));
     });
   });
@@ -358,20 +359,20 @@ export async function fetchOnce(url, init, { fetchImpl, signal = null, clock = n
   const started = clock.now();
   let lastAt = started;
   let silentMs = null;
-  let timer = null;
+  let cancelWatch = null;
   const watch = () => {
     const quietSince = Math.max(lastAt, clock.lastActivityAt);
     const left = quietSince + clock.patienceMs(expectedBytes) - clock.now();
     if (left > 0) {
-      timer = setTimeout(watch, left);
+      cancelWatch = clock.after(left, watch);
       return;
     }
-    timer = null;
+    cancelWatch = null;
     silentMs = clock.now() - lastAt;
     clock.stalled();
     controller.abort(new DOMException('The request stalled.', 'TimeoutError'));
   };
-  timer = setTimeout(watch, clock.patienceMs(expectedBytes));
+  cancelWatch = clock.after(clock.patienceMs(expectedBytes), watch);
   let phase = 'answer';
   try {
     const response = await fetchImpl(url, { ...init, signal: controller.signal });
@@ -406,7 +407,7 @@ export async function fetchOnce(url, init, { fetchImpl, signal = null, clock = n
       { cause, url: label, phase }
     );
   } finally {
-    if (timer !== null) clearTimeout(timer);
+    cancelWatch?.();
     stopCaller();
   }
 }
@@ -456,11 +457,14 @@ export function worthAskingAgain(error, before) {
  * @template T
  * @param {(attempt: number) => Promise<T>} attempt
  * @param {{signal?: AbortSignal|null, retryable?: (error: unknown) => boolean,
- *   onRetry?: ((error: ByteSourceError, attempts: number) => void)|null}} [options]
- *   `onRetry` hears each failure that is asked again, with the attempts made so far
+ *   onRetry?: ((error: ByteSourceError, attempts: number) => void)|null,
+ *   after?: (ms: number, callback: () => void) => () => void}} [options]
+ *   `onRetry` hears each failure that is asked again, with the attempts made
+ *   so far; `after`, the timers the waits run on (the link's,
+ *   `ResponseClock.after`; real timers by default)
  * @returns {Promise<T>}
  */
-export async function withRetries(attempt, { signal = null, retryable = isTransientFailure, onRetry = null } = {}) {
+export async function withRetries(attempt, { signal = null, retryable = isTransientFailure, onRetry = null, after = afterRealTime } = {}) {
   const failures = [];
   for (let n = 0; ; n++) {
     try {
@@ -479,7 +483,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
       }
       onRetry?.(error, n + 1);
       if (error.code === BYTE_SOURCE_FAILURES.STALLED) continue;
-      await sleep(retryAfterMilliseconds(error.details?.retryAfter) ?? RETRY_DELAYS_MS[n], signal);
+      await sleep(retryAfterMilliseconds(error.details?.retryAfter) ?? RETRY_DELAYS_MS[n], signal, after);
     }
   }
 }
@@ -729,6 +733,7 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
       }, {
         signal,
         onRetry: (error, attempts) => clock.onRetry?.(error, attempts),
+        after: clock.after,
       });
     },
   };
@@ -798,7 +803,7 @@ export function readFileHead(url, length, { signal = null, fetchImpl = globalThi
 }
 
 async function readHeadOf(url, length, signal, fetchImpl, clock = new ResponseClock()) {
-  const started = performance.now();
+  const started = clock.now();
   // Past the HTTP cache, as every range read of a file (`httpByteSource`).
   const { response, bytes } = await withRetries(async () => {
     const answer = await fetchOnce(url, { headers: { Range: `bytes=0-${length - 1}` }, cache: 'no-store' }, {
@@ -810,8 +815,8 @@ async function readHeadOf(url, length, signal, fetchImpl, clock = new ResponseCl
     });
     if (isTransientStatus(answer.response.status)) throw transientStatusError(answer.response, url);
     return answer;
-  }, { signal });
-  return { response, bytes, ms: performance.now() - started };
+  }, { signal, after: clock.after });
+  return { response, bytes, ms: clock.now() - started };
 }
 
 /**

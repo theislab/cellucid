@@ -1,8 +1,9 @@
 /**
- * LocalUserDirDataSource - one AnnData dataset the user chose on their own
- * computer: an `.h5ad`, an AnnData Zarr store folder (`.zarr`), or a zipped
- * one (`.zarr.zip`), picked or dropped. It is read in the browser by the
- * AnnData reader; nothing is uploaded anywhere.
+ * LocalUserDirDataSource - one dataset the user chose on their own
+ * computer: a file (an `.h5ad`, a `.zarr.zip`) or a store folder (`.zarr`),
+ * picked or dropped. It is read in the browser by the AnnData reader, which
+ * decides what it is from its content (`data/input-formats.js`); nothing is
+ * uploaded anywhere.
  */
 
 import {
@@ -12,19 +13,20 @@ import {
 import {
   createDatasetReloadSupersededError,
 } from './dataset-lifecycle-errors.js';
-import { isH5adFile, createH5adDataSource } from './h5ad.js';
-import { createZarrDataSource, isZarrDirectory } from './zarr.js';
+import { createAnnDataFileSource } from './anndata-file-source.js';
+import { fileFormatOfName, filePickerAccept, folderFormatOfPaths } from './input-formats.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
-export function isZarrZipArchive(file) {
-  return Boolean(
-    file &&
-    typeof file.name === 'string' &&
-    /\.zip$/i.test(file.name)
-  );
+/** Each file's path below the chosen folder's parent, as a folder input lists it. */
+function pathsOf(files) {
+  return Array.from(files, file => (
+    typeof file?.webkitRelativePath === 'string' && file.webkitRelativePath !== ''
+      ? file.webkitRelativePath
+      : String(file?.name ?? '')
+  ));
 }
 
 export class LocalUserDirDataSource {
@@ -38,7 +40,7 @@ export class LocalUserDirDataSource {
     /** @type {DatasetMetadata|null} */
     this._metadata = null;
 
-    /** @type {import('./h5ad.js').H5adDataSource|import('./zarr.js').ZarrDataSource|null} */
+    /** @type {import('./anndata-file-source.js').AnnDataFileSource|null} */
     this._annDataSource = null;
 
     /**
@@ -153,66 +155,40 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * Open one `.h5ad` file. Its dataset id is the one it states
-   * (`uns['cellucid']['id']`), else `h5ad_<file name>`.
+   * Open one file: an `.h5ad` or a `.zarr.zip`, as its name says and its
+   * content confirms. Its dataset id is the one it states
+   * (`uns['cellucid']['id']`), else `<format>_<file name>`.
    * @param {File} file
    * @returns {Promise<DatasetMetadata>}
    */
-  async loadFromH5adFile(file) {
-    if (!file || !isH5adFile(file)) {
+  async loadFromFile(file) {
+    if (!file || typeof file.name !== 'string' || fileFormatOfName(file.name) === null) {
       throw new DataSourceError(
-        'Not an h5ad file. Expected .h5ad extension.',
+        `Not a file Cellucid opens. Expected a name ending in ${filePickerAccept().split(',').join(' or ')}.`,
         DataSourceErrorCode.INVALID_FORMAT,
         this.type
       );
     }
     return this._adopt(
-      createH5adDataSource(),
-      (source, signal) => source.loadFromFile(file, {
+      createAnnDataFileSource(),
+      (source, signal) => source.loadFile(file, {
         signal,
         preferFileName: true,
-        source: { name: 'H5AD file', filename: file.name },
       }),
-      () => file.name
+      source => source.filename
     );
   }
 
   /**
-   * Open one zipped AnnData Zarr store (`.zarr.zip`). Its dataset id is the
-   * one it states (`uns['cellucid']['id']`), else `zarr_<store name>`.
-   * @param {File|Blob} file
-   * @returns {Promise<DatasetMetadata>}
-   */
-  async loadFromZarrArchive(file) {
-    if (!isZarrZipArchive(file)) {
-      throw new DataSourceError(
-        'Not a Zarr ZIP archive. Expected a .zip file.',
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-    return this._adopt(
-      createZarrDataSource(),
-      (source, signal) => source.loadFromArchiveFile(file, {
-        signal,
-        preferFileName: true,
-        defaultDatasetId: `zarr_${file.name.replace(/\.zip$/i, '').replace(/\.zarr$/i, '')}`,
-        source: { name: 'Zarr ZIP archive', filename: file.name },
-      }),
-      source => source.dirname
-    );
-  }
-
-  /**
-   * Open one AnnData Zarr store folder, chosen with a folder picker or
-   * dropped: every file below it, each with its path inside the folder
+   * Open one store folder, chosen with a folder picker or dropped: every
+   * file below it, each with its path inside the folder
    * (`webkitRelativePath`). Its dataset id is the one it states
-   * (`uns['cellucid']['id']`), else `zarr_<folder name>`.
+   * (`uns['cellucid']['id']`), else `<format>_<folder name>`.
    * @param {FileList|File[]} files
    * @returns {Promise<DatasetMetadata>}
    */
-  async loadFromZarrDirectory(files) {
-    if (!isZarrDirectory(files)) {
+  async loadFromFolder(files) {
+    if (!files || files.length === 0 || folderFormatOfPaths(pathsOf(files)) === null) {
       throw new DataSourceError(
         'The chosen folder is not an AnnData Zarr store: it holds no Zarr metadata ' +
         '(.zgroup, .zarray or zarr.json). Choose the .zarr folder itself.',
@@ -222,13 +198,12 @@ export class LocalUserDirDataSource {
       );
     }
     return this._adopt(
-      createZarrDataSource(),
-      (source, signal) => source.loadFromFileList(files, {
+      createAnnDataFileSource(),
+      (source, signal) => source.loadFolder(files, {
         signal,
         preferFileName: true,
-        source: { name: 'Zarr store folder' },
       }),
-      source => source.dirname
+      source => source.filename
     );
   }
 
@@ -269,7 +244,7 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * The h5ad:// or zarr:// base URL of the adopted file.
+   * The anndata:// base URL of the adopted file.
    * @param {string} datasetId
    * @returns {string}
    */
@@ -286,7 +261,7 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * The AnnData source (`h5ad` or `zarr`) the adopted file is read from.
+   * The AnnData file source the adopted file is read from.
    * @returns {Object|null}
    */
   getAnnDataSource() {

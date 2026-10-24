@@ -11,11 +11,10 @@ import {
 import {
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import {
   extractConnectivityEdges,
 } from '../assets/js/data/connectivity-edges.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
@@ -311,18 +310,13 @@ async function finalizeDirect(format, connectivity, id) {
         : `${id}.zarr`,
     },
   });
-  const source = format === 'h5ad'
-    ? new H5adDataSource()
-    : new ZarrDataSource();
+  const source = new AnnDataFileSource();
   source._loader = loader;
   source._adapter = adapter;
   source._metadata = identity;
   source.datasetId = id;
-  if (format === 'h5ad') {
-    source.filename = `${id}.h5ad`;
-  } else {
-    source.dirname = `${id}.zarr`;
-  }
+  source.format = format;
+  source.filename = format === 'h5ad' ? `${id}.h5ad` : `${id}.zarr`;
   return { adapter, identity, loader, source };
 }
 
@@ -444,7 +438,7 @@ test('H5AD and Zarr explicit empty graphs stay present end to end', async t => {
       manager.activeDatasetMetadata = identity;
       try {
         const signal = new AbortController().signal;
-        const graphUrl = `${format}://${id}/obsp`;
+        const graphUrl = `anndata://${id}/obsp`;
         const summary = await loadConnectivitySummary(
           graphUrl,
           { signal }

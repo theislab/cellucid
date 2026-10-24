@@ -166,11 +166,11 @@ test('the gene loader answers log1p from the mapping and reads the highly variab
 
   const loaderMapping = varLoaderMappingOf(candidates.defaults);
   assert.deepEqual(loaderMapping, { expression: 'X', log1p: { X: { base: null } }, highlyVariable: 'highly_variable' });
-  const loader = createVarFieldLoader('h5ad://unused/var', { pointCount: 3, mapping: loaderMapping });
+  const loader = createVarFieldLoader('anndata://unused/var', { pointCount: 3, mapping: loaderMapping });
   assert.deepEqual(loader.log1p(), { base: null });
   assert.deepEqual(loader.log1p({ matrix: 'X' }), { base: null });
   assert.equal(loader.log1p({ matrix: 'raw' }), null);
-  const none = createVarFieldLoader('h5ad://unused/var', {
+  const none = createVarFieldLoader('anndata://unused/var', {
     pointCount: 3,
     mapping: { expression: 'X', log1p: {}, highlyVariable: null },
   });
@@ -178,7 +178,7 @@ test('the gene loader answers log1p from the mapping and reads the highly variab
   assert.equal(await none.highlyVariableGenes(), null);
   assert.equal(varLoaderMappingOf({ expression: null, log1p: {}, highlyVariable: null }), null);
   assert.throws(
-    () => createVarFieldLoader('h5ad://unused/var', { mapping: { expression: 'X', log1p: {} } }),
+    () => createVarFieldLoader('anndata://unused/var', { mapping: { expression: 'X', log1p: {} } }),
     /exactly \{expression, log1p, highlyVariable\}/,
   );
 });

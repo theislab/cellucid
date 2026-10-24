@@ -13,8 +13,7 @@ import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { requireAnnDataLaunchDefaults } from '../assets/js/data/base-anndata-adapter.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
 import { storedObsm } from './helpers/stored-obsm.mjs';
 import { normalizePositions } from '../assets/js/rendering/gl-utils.js';
@@ -37,15 +36,15 @@ async function open(t, format, defaults) {
   silenceNotifications(t);
   if (format === 'H5AD') {
     const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url))], 'data-mapping-full.h5ad');
-    const source = new H5adDataSource();
+    const source = new AnnDataFileSource();
     t.after(() => source.clear());
-    await source.loadFromFile(file, { defaults });
+    await source.loadFile(file, { defaults });
     return source;
   }
   const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url))], 'data-mapping-full.zarr.zip');
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromArchiveFile(file, { defaults });
+  await source.loadFile(file, { defaults });
   return source;
 }
 

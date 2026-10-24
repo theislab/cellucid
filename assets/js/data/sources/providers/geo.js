@@ -11,7 +11,8 @@
  */
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
-import { describeRemoteFile, fileTitleOf } from '../remote-file.js';
+import { describeRemoteFile } from '../remote-file.js';
+import { compressedFormatOfName, fileFormatOfName, namesOfLayout, titleOfName } from '../../input-formats.js';
 
 const GEO_FTP = 'https://ftp.ncbi.nlm.nih.gov/geo/series/';
 const ACCESSION = /^GSE[1-9][0-9]*$/;
@@ -124,37 +125,40 @@ export default Object.freeze({
         );
       }
       const files = parseGeoListing(await response.text());
-      const h5ad = files.filter(name => name.toLowerCase().endsWith('.h5ad'));
-      if (h5ad.length === 0) {
-        const compressed = files.filter(name => name.toLowerCase().endsWith('.h5ad.gz'));
+      // GEO bundles supplementary files in archives (`_RAW.tar`, `.zip`):
+      // only a file that is itself one dataset opens.
+      const endings = namesOfLayout('file').join(' or ');
+      const datasets = files.filter(name => fileFormatOfName(name)?.layout === 'file');
+      if (datasets.length === 0) {
+        const compressed = files.filter(name => compressedFormatOfName(name)?.layout === 'file');
         throw new DataSourceError(
           compressed.length > 0
             ? `GEO series ${accession} ships its AnnData only gzip-compressed ` +
               `(${compressed.join(', ')}), which cannot be read in place. ` +
-              'Download and decompress it, then open the .h5ad file in Cellucid.'
-            : `GEO series ${accession} has no .h5ad supplementary file` +
+              `Download and decompress it, then open the ${endings} file in Cellucid.`
+            : `GEO series ${accession} has no ${endings} supplementary file` +
               (files.length > 0 ? ` (it has: ${files.join(', ')}).` : '.'),
           DataSourceErrorCode.UNSUPPORTED,
           'link',
           { accession, files }
         );
       }
-      if (h5ad.length > 1) {
+      if (datasets.length > 1) {
         throw new DataSourceError(
-          `GEO series ${accession} has ${h5ad.length} .h5ad files. Open one ` +
-          `of them: ${h5ad.map(name => `geo:${accession}/${name}`).join(', ')}.`,
+          `GEO series ${accession} has ${datasets.length} ${endings} files. Open one ` +
+          `of them: ${datasets.map(name => `geo:${accession}/${name}`).join(', ')}.`,
           DataSourceErrorCode.VALIDATION_ERROR,
           'link',
-          { accession, files: h5ad }
+          { accession, files: datasets }
         );
       }
-      fileName = h5ad[0];
+      fileName = datasets[0];
     }
     const file = await describeRemoteFile({
       url: `${folder}${encodeURIComponent(fileName)}`,
       id: `geo:${accession}:${encodeURIComponent(fileName)}`,
       name: fileName,
-      title: `${accession} ${fileTitleOf(fileName)}`,
+      title: `${accession} ${titleOfName(fileName)}`,
       attribution: {
         title: `NCBI GEO ${accession}`,
         url: `https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${accession}`,

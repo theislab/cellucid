@@ -136,7 +136,7 @@ function identity(name, overrides = {}) {
 const ZARR_FOLDER = Object.freeze({
   format: 'zarr',
   zarrVersion: 2,
-  container: 'folder',
+  layout: 'folder',
   remote: true,
   url: 'https://theislab.github.io/cellucid-datasets/anndata/suo.zarr/',
   name: 'suo.zarr',
@@ -145,7 +145,7 @@ const ZARR_FOLDER = Object.freeze({
 const LOCAL_H5AD = Object.freeze({
   format: 'h5ad',
   zarrVersion: null,
-  container: 'file',
+  layout: 'file',
   remote: false,
   url: null,
   name: 'cells.h5ad',
@@ -154,7 +154,7 @@ const LOCAL_H5AD = Object.freeze({
 
 test('where a dataset is read from is one short line', () => {
   assert.equal(describeStorageFormat(ZARR_FOLDER), 'Zarr v2 folder');
-  assert.equal(describeStorageFormat({ ...ZARR_FOLDER, container: 'zip', zarrVersion: 3 }), 'Zarr v3 ZIP');
+  assert.equal(describeStorageFormat({ ...ZARR_FOLDER, layout: 'zip', zarrVersion: 3 }), 'Zarr v3 ZIP');
   assert.equal(describeStorageFormat(LOCAL_H5AD), 'h5ad file');
   assert.equal(describeOrigin(ZARR_FOLDER, 'local-demo'), 'Zarr v2 folder · theislab.github.io');
   assert.equal(describeOrigin(LOCAL_H5AD, 'local-user'), 'h5ad file · this computer');

@@ -426,7 +426,7 @@ test('vector bindings belong to exactly the embeddings their mapping names', asy
     guessed: [],
   });
   const vectors = createVectorFieldManager({
-    baseUrl: 'h5ad://dataset/',
+    baseUrl: 'anndata://dataset/',
     vectorFields: resolveVectorFields({
       // drift_tsne is bound to X_tsne only, velocity_umap to X_umap only.
       mapping: {

@@ -7,6 +7,7 @@ import {
   STARTUP_STEP_DEADLINE_MS,
   createStartupPhaseOwner,
 } from '../assets/js/app/startup-phase.js';
+import { virtualTime } from './helpers/virtual-time.mjs';
 
 function fakeRoot() {
   return { dataset: {} };
@@ -75,7 +76,7 @@ test('an ordinary failure is reported as itself, and retire aborts open steps', 
   );
 
   let stepSignal = null;
-  const pending = startup.step('dataset', 'h5ad://x/', signal => {
+  const pending = startup.step('dataset', 'anndata://x/', signal => {
     stepSignal = signal;
     return new Promise((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -158,13 +159,16 @@ test('every network await of the bootstrap runs through the startup owner', asyn
 test('a step that reports progress stalls only when progress stops, however long it takes', async () => {
   // Opening a linked file reads as much as its first view needs, which grows
   // with the file: steady bytes keep it alive past the deadline.
-  const startup = createStartupPhaseOwner({ root: fakeRoot(), deadlineMs: 40 });
+  // On a virtual clock: the progress ticks and the deadline are timers of
+  // one clock, so a loaded machine cannot put a tick past the deadline.
+  const time = virtualTime();
+  const startup = createStartupPhaseOwner({ root: fakeRoot(), deadlineMs: 40, after: time.after });
   const listeners = new Set();
   const progress = onProgress => {
     listeners.add(onProgress);
     return () => listeners.delete(onProgress);
   };
-  const tick = () => new Promise(resolve => setTimeout(resolve, 15));
+  const tick = () => time.sleep(15);
   const result = await startup.step('catalog', 'zenodo:1', async () => {
     for (let report = 0; report < 8; report += 1) {
       await tick();
@@ -178,8 +182,8 @@ test('a step that reports progress stalls only when progress stops, however long
   await assert.rejects(
     startup.step('catalog', 'zenodo:2', signal => new Promise((_resolve, reject) => {
       // Progress twice, then silence.
-      setTimeout(() => listeners.forEach(listener => listener()), 15);
-      setTimeout(() => listeners.forEach(listener => listener()), 30);
+      time.after(15, () => listeners.forEach(listener => listener()));
+      time.after(30, () => listeners.forEach(listener => listener()));
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     }), { progress }),
     error => error.code === STARTUP_STALL_CODE && error.target === 'zenodo:2'

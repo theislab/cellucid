@@ -20,7 +20,8 @@
  */
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
-import { chooseOpenableFile, describeRemoteFile, fileFormatOf } from '../remote-file.js';
+import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
+import { fileFormatOfName, readsFromHead } from '../../input-formats.js';
 import { HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
 
 const API = 'https://zenodo.org/api/records/';
@@ -86,7 +87,7 @@ export default Object.freeze({
     // The named file's first read goes out with the record request.
     const early = new AbortController();
     const earlySignal = signal === null ? early.signal : AbortSignal.any([signal, early.signal]);
-    const headRead = requested !== null && fileFormatOf(requested) === 'h5ad'
+    const headRead = requested !== null && readsFromHead(fileFormatOfName(requested))
       ? readFileHead(fileUrl(recordId, requested), HEAD_BYTES, { signal: earlySignal })
       : null;
     headRead?.catch(() => {});

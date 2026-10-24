@@ -13,6 +13,7 @@
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
 import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
+import { folderFormatOfName, titleOfName } from '../../input-formats.js';
 
 const HUB = 'https://huggingface.co';
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -128,15 +129,15 @@ export default Object.freeze({
     };
     const prefix = path === '' ? '' : `${path}/`;
     // A Zarr store folder, read through its consolidated metadata.
-    if (/\.zarr$/i.test(path) && (siblings.has(`${prefix}.zmetadata`) || siblings.has(`${prefix}zarr.json`))) {
+    if (folderFormatOfName(path) !== null && (siblings.has(`${prefix}.zmetadata`) || siblings.has(`${prefix}zarr.json`))) {
       const name = path.split('/').at(-1);
       return {
         title: `${repoId}/${path}`,
         store: {
           url: resolve(prefix),
           name,
-          title: name.replace(/\.zarr$/i, ''),
-          // Without "/", as it becomes `zarr://<id>/`.
+          title: titleOfName(name),
+          // Without "/", as it becomes `anndata://<id>/`.
           id: `hf:${encodeURIComponent(`${repoId}/${path}`)}`,
           attribution,
         },

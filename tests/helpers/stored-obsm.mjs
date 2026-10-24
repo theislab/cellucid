@@ -4,7 +4,7 @@
  * what an embedding payload is made from.
  */
 import { AnnDataReader } from '../../assets/js/data/anndata/reader.js';
-import { openAnnDataStore } from '../../assets/js/data/anndata/open.js';
+import { openDatasetStore } from '../../assets/js/data/anndata/open.js';
 
 /**
  * @param {File} file - An `.h5ad`, or a zipped Zarr store (`.zarr.zip`)
@@ -13,14 +13,13 @@ import { openAnnDataStore } from '../../assets/js/data/anndata/open.js';
  * @returns {Promise<Float32Array|Float64Array>}
  */
 export async function storedObsm(file, key, columns) {
-  const h5ad = file.name.endsWith('.h5ad');
-  const opened = await openAnnDataStore(
-    h5ad ? { kind: 'h5ad', source: file } : { kind: 'zarr', source: { archive: file } },
+  const opened = await openDatasetStore(
+    { source: { file } },
     { decodedChunkCacheBytes: 0 }
   );
   const reader = new AnnDataReader();
   try {
-    await reader.open(opened.root, { format: opened.format, name: file.name, link: opened.link });
+    await reader.open(opened.root, { format: opened.readerFormat, name: file.name, link: opened.link });
     return await reader.readObsmColumns(key, columns);
   } finally {
     reader.close();

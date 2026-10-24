@@ -358,14 +358,14 @@ test('keeps adapter uint8 codes in their declared width with the uint8 missing s
   const previous = saveActiveDataset(manager);
   manager.activeSource = {
     datasetId: 'missing-sentinel',
-    getType: () => 'zarr',
+    getType: () => 'anndata',
     getAdapter: () => adapter
   };
   manager.activeDatasetId = 'missing-sentinel';
 
   try {
     const loaded = await loadObsFieldData(
-      'zarr://missing-sentinel/obs',
+      'anndata://missing-sentinel/obs',
       field
     );
     // One byte a cell: the runtime reads the missing code from the array's
@@ -459,7 +459,7 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
   const previous = saveActiveDataset(manager);
   manager.activeSource = {
     datasetId: 'unsupported-dtype',
-    getType: () => 'zarr',
+    getType: () => 'anndata',
     getAdapter: () => ({
       async getObsFieldData() {
         return {
@@ -476,7 +476,7 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
 
   try {
     await assert.rejects(
-      loadObsFieldData('zarr://unsupported-dtype/obs', {
+      loadObsFieldData('anndata://unsupported-dtype/obs', {
         key: 'group',
         kind: 'category',
         fieldIndex: 0,
@@ -693,14 +693,14 @@ async function prepareFalsyCategoryIntegration() {
   const previous = saveActiveDataset(manager);
   manager.activeSource = {
     datasetId: 'categorical-contract',
-    getType: () => 'zarr',
+    getType: () => 'anndata',
     getAdapter: () => adapter
   };
   manager.activeDatasetId = 'categorical-contract';
   manager.activeDatasetMetadata = adapter.getMetadata();
 
   const loaded = await loadObsFieldData(
-    'zarr://categorical-contract/obs',
+    'anndata://categorical-contract/obs',
     field
   );
   assert.deepEqual(Array.from(loaded.codes), [0, 1, 2, 0, 1, 2]);
@@ -905,7 +905,7 @@ test('DataState keeps exact field descriptors separate from mutable load state',
 
     manager.activeSource = {
       datasetId: 'state-descriptor-direct',
-      getType: () => 'zarr',
+      getType: () => 'anndata',
       getAdapter: () => adapter
     };
     manager.activeDatasetId = 'state-descriptor-direct';
@@ -914,10 +914,10 @@ test('DataState keeps exact field descriptors separate from mutable load state',
     const obs = checkObsFields(adapter.getObsFields());
     const state = createStateForFieldLoading();
     state.setFieldLoader(createObsFieldLoader(
-      'zarr://state-descriptor-direct/obs'
+      'anndata://state-descriptor-direct/obs'
     ));
     state.setVarFieldLoader(createVarFieldLoader(
-      'zarr://state-descriptor-direct/var'
+      'anndata://state-descriptor-direct/var'
     ));
     state.initVarData(checkGeneList(await adapter.getGeneList()));
     state.initScene(new Float32Array(6), obs);

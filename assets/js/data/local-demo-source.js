@@ -278,7 +278,7 @@ export class LocalDemoDataSource {
   }
 
   /**
-   * The base URL of one opened dataset: its h5ad:// or zarr:// URL.
+   * The base URL of one opened dataset: its anndata:// URL.
    * @param {string} datasetId
    * @returns {string}
    */

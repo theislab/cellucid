@@ -44,6 +44,7 @@ import { decodeWithCodecs, reviveZarrError } from '../assets/js/formats/zarr/cod
 import { lz4DecodeBlockInto } from '../assets/js/formats/zarr/codecs/lz4.js';
 import { zstdDecompress } from '../assets/js/formats/zarr/codecs/zstd.js';
 import { createNodeDecodeWorker } from './helpers/node-decode-worker.mjs';
+import { settle } from './helpers/virtual-time.mjs';
 import { corpusFolder } from './helpers/zarr-corpus.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -53,9 +54,26 @@ const HDF5_FILES = [
   ...readdirSync(path.join(HERE, 'browser', 'fixtures')).filter(name => name.endsWith('.h5ad')).map(name => path.join(HERE, 'browser', 'fixtures', name)),
 ];
 
-/** A worker factory over worker_threads that counts the workers it made, those alive, and the tasks they were sent. */
-function countingWorkers(options = {}) {
+/**
+ * A worker factory over worker_threads that counts the workers it made, those
+ * alive, and the tasks they were sent. With `holdAnswers`, what the workers
+ * post back reaches the pool only once `answers.release()` is called
+ * (`answers.held` counts what waits): a test can tell what the pool does
+ * before any worker has answered, however fast the worker decodes.
+ */
+function countingWorkers({ holdAnswers = false, ...options } = {}) {
   const counts = { made: 0, alive: 0, mostAlive: 0, tasks: 0 };
+  const waiting = [];
+  let holding = holdAnswers;
+  const answers = {
+    get held() {
+      return waiting.length;
+    },
+    release() {
+      holding = false;
+      for (const deliver of waiting.splice(0)) deliver();
+    },
+  };
   const createWorker = () => {
     counts.made++;
     counts.alive++;
@@ -64,6 +82,13 @@ function countingWorkers(options = {}) {
     let terminated = false;
     return {
       ...worker,
+      addEventListener(type, listener) {
+        if (type !== 'message') return worker.addEventListener(type, listener);
+        return worker.addEventListener(type, event => {
+          if (holding) waiting.push(() => listener(event));
+          else listener(event);
+        });
+      },
       postMessage(message, transfer) {
         counts.tasks++;
         worker.postMessage(message, transfer);
@@ -75,7 +100,7 @@ function countingWorkers(options = {}) {
       },
     };
   };
-  return { counts, createWorker };
+  return { counts, createWorker, answers };
 }
 
 /** Decode in this thread only (the state Node starts in: no global Worker). */
@@ -366,7 +391,9 @@ test('a damaged chunk fails with the same error class and message on a worker as
 // Cancellation and lifetime.
 
 test('a cancelled decode stops waiting at once; a waiting one is never sent; the pool keeps working', async () => {
-  const { counts, createWorker } = countingWorkers();
+  // The worker's answers are held until released: the cancelled read must
+  // have stopped waiting before the worker has answered anything.
+  const { counts, createWorker, answers } = countingWorkers({ holdAnswers: true });
   // One worker, one task at a time in it: the second task waits in the pool.
   configureDecodePool({ createWorker, size: 1, minBytes: 0 });
   const big = floats(4 * 1024 * 1024, 5);
@@ -387,10 +414,17 @@ test('a cancelled decode stops waiting at once; a waiting one is never sent; the
   waiting.abort();
   await assert.rejects(third, { name: 'AbortError' });
   assert.equal(decodePoolStats().queued, 0);
-  const started = performance.now();
+  let firstSettled = false;
+  first.then(() => { firstSettled = true; }, () => { firstSettled = true; });
   running.abort(new DOMException('Gone.', 'AbortError'));
+  await settle();
+  assert.ok(firstSettled, 'the cancelled read did not wait for the worker');
   await assert.rejects(first, { name: 'AbortError', message: 'Gone.' });
-  assert.ok(performance.now() - started < 50, 'the cancelled read did not wait for the worker');
+  let secondSettled = false;
+  second.then(() => { secondSettled = true; }, () => { secondSettled = true; });
+  await settle();
+  assert.equal(secondSettled, false, 'no worker has answered yet: the read still running waits for it');
+  answers.release();
   assert.deepEqual(await second, big);
   assert.equal(counts.tasks, 2, 'the cancelled waiting task was never sent');
   assert.deepEqual(await decodeChunkBytes(zstdTask(smallFrame, small.length)), small);

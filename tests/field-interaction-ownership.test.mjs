@@ -390,7 +390,7 @@ test(
     manager.activeSource = {
       datasetId: 'configured-owner',
       getAdapter: () => adapter,
-      getType: () => 'zarr',
+      getType: () => 'anndata',
     };
     t.after(() => {
       manager.activeSource = previousSource;
@@ -412,11 +412,11 @@ test(
     };
 
     const obsLoader = createObsFieldLoader(
-      'zarr://configured-owner/obs',
+      'anndata://configured-owner/obs',
       options,
     );
     const varLoader = createVarFieldLoader(
-      'zarr://configured-owner/var',
+      'anndata://configured-owner/var',
       options,
     );
     await assert.rejects(obsLoader(obsField), error => error?.name === 'AbortError');

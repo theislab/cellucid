@@ -24,6 +24,7 @@
  *   indices; see `encodeJupyterSelectionCells`)
  */
 
+import { INPUT_FORMATS, isInputFormatId } from './input-formats.js';
 import {
   DataSourceError,
   DataSourceErrorCode,
@@ -349,8 +350,9 @@ function requireJupyterHealthPayload(payload) {
   if (payload.type !== 'anndata') {
     throw new TypeError('Jupyter health response type must be exactly anndata');
   }
-  if (payload.format !== 'h5ad' && payload.format !== 'zarr') {
-    throw new TypeError('Jupyter health format must be exactly h5ad or zarr');
+  if (!isInputFormatId(payload.format)) {
+    throw new TypeError('Jupyter health format must be an input format id this viewer reads (' +
+      `${INPUT_FORMATS.map(format => format.id).join(', ')})`);
   }
   requireNonNegativeInteger(payload.n_cells, 'Jupyter health n_cells');
   requireNonNegativeInteger(payload.n_genes, 'Jupyter health n_genes');
@@ -1882,7 +1884,7 @@ export class JupyterBridgeDataSource {
   }
 
   /**
-   * The base URL of the dataset: the h5ad:// or zarr:// URL of the store the
+   * The base URL of the dataset: the anndata:// URL of the store the
    * browser's reader opened, which its metadata load opens.
    *
    * @param {string} datasetId

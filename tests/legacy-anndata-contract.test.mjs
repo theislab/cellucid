@@ -16,8 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 
 const FIXTURES = new URL('./browser/fixtures/', import.meta.url);
 
@@ -26,14 +25,14 @@ function fixtureFile(name) {
 }
 
 async function openH5ad(name) {
-  const source = new H5adDataSource();
-  await source.loadFromFile(fixtureFile(name), { preferFileName: true });
+  const source = new AnnDataFileSource();
+  await source.loadFile(fixtureFile(name), { preferFileName: true });
   return source;
 }
 
 async function openZarr(name) {
-  const source = new ZarrDataSource();
-  await source.loadFromArchiveFile(fixtureFile(name), { preferFileName: true });
+  const source = new AnnDataFileSource();
+  await source.loadFile(fixtureFile(name), { preferFileName: true });
   return source;
 }
 

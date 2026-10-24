@@ -51,7 +51,7 @@ test('the next client adopts the spare worker, wired as its own, and one spare e
   assert.equal(made.length, 1, 'calling it twice leaves a single spare');
   assert.equal(hasSpareAnnDataReaderWorker(), true);
 
-  const client = new AnnDataReaderClient({ kind: 'zarr' });
+  const client = new AnnDataReaderClient();
   t.after(() => client.close());
   // Any call starts the worker; the reader answers that nothing is open.
   await assert.rejects(client._call('getDatasetMetadata'), /No AnnData file is open/);
@@ -74,7 +74,7 @@ test('a spare nothing adopts ends when the page is left, or when the open it was
   assert.equal(page.count, 0, 'its page-hide listener goes with it');
 
   prewarmAnnDataReaderWorker();
-  const abandoned = new AnnDataReaderClient({ kind: 'h5ad' });
+  const abandoned = new AnnDataReaderClient();
   abandoned.close();
   assert.equal(made[1].terminated, true, 'a client closed before it started a worker releases the spare');
 

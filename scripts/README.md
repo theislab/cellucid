@@ -18,7 +18,7 @@ names a pinned one.
 
 | Script | Purpose |
 | --- | --- |
-| `generate-web-asset-inventory.mjs` | Rewrites `cellucid-web-assets.json` and stamps the build id in `index.html`; `--check` verifies it (see `CONTRIBUTING.md`). |
+| `generate-web-asset-inventory.mjs` | Rewrites `cellucid-web-assets.json`, stamps the build id in `index.html`, and dates `sitemap.xml` and `.well-known/security.txt` from it; `--check` verifies them (see `CONTRIBUTING.md`). |
 | `validate-tokens.js` | Every design-token `var(--...)` resolves to a defined custom property. |
 | `validate-token-types.js` | `types/design-tokens.d.ts` agrees with the token definitions. |
 

@@ -162,7 +162,7 @@ function formatBenchmarkGpuMemory(rendererStats, pointCount) {
     : `~${estimatedGpuMemoryMB.toFixed(1)} MB (estimate)`;
 }
 
-// The base URL of the dataset shown (`h5ad://<id>/` or `zarr://<id>/`):
+// The base URL of the dataset shown (`anndata://<id>/`):
 // the data loaders address its parts under it.
 let DATASET_BASE_URL = '';
 

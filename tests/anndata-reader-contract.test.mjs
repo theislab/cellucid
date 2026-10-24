@@ -22,12 +22,12 @@ import test from 'node:test';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { asWorkerLoader } from './helpers/worker-loader.mjs';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { H5AD_FORMAT, ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
-import { openAnnDataStore } from '../assets/js/data/anndata/open.js';
+import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 import { SLAB_BYTES, readFloat32 } from '../assets/js/data/anndata/values.js';
 import { blobByteSource, httpByteSource } from '../assets/js/formats/io/byte-source.js';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
@@ -77,9 +77,9 @@ function fixtureFile(url, name = url.pathname.slice(url.pathname.lastIndexOf('/'
 /** Open a real `.h5ad` through the app's own path into an AnnData reader. */
 async function openH5adReader(url) {
   const file = fixtureFile(url);
-  const opened = await openAnnDataStore({ kind: 'h5ad', source: file }, { decodedChunkCacheBytes: 64 * MiB });
+  const opened = await openDatasetStore({ source: { file } }, { decodedChunkCacheBytes: 64 * MiB });
   const reader = new AnnDataReader();
-  await reader.open(opened.root, { format: opened.format, name: opened.name });
+  await reader.open(opened.root, { format: opened.readerFormat, name: opened.name });
   return reader;
 }
 
@@ -222,8 +222,8 @@ test('a remote file without an exact size is refused before anything is fetched'
   ]) {
     await t.test(name, async () => {
       await assert.rejects(
-        openAnnDataStore(
-          { kind: 'h5ad', source: { url: `https://example.org/${name}.h5ad`, size, name: `${name}.h5ad` } },
+        openDatasetStore(
+          { source: { file: { url: `https://example.org/${name}.h5ad`, size, name: `${name}.h5ad` } } },
           { decodedChunkCacheBytes: MiB }
         ),
         /needs the exact size of the file/
@@ -233,14 +233,14 @@ test('a remote file without an exact size is refused before anything is fetched'
   }
   await t.test('an empty local file', async () => {
     await assert.rejects(
-      openAnnDataStore({ kind: 'h5ad', source: new File([], 'zero.h5ad') }, { decodedChunkCacheBytes: MiB }),
+      openDatasetStore({ source: { file: new File([], 'zero.h5ad') } }, { decodedChunkCacheBytes: MiB }),
       /The selected H5AD file is empty/
     );
   });
   await t.test('an empty remote file', async () => {
     await assert.rejects(
-      openAnnDataStore(
-        { kind: 'h5ad', source: { url: 'https://example.org/zero.h5ad', size: 0, name: 'zero.h5ad' } },
+      openDatasetStore(
+        { source: { file: { url: 'https://example.org/zero.h5ad', size: 0, name: 'zero.h5ad' } } },
         { decodedChunkCacheBytes: MiB }
       ),
       error => error.details?.explained === true
@@ -253,8 +253,10 @@ test('an HDF5 file is found by its signature at byte zero or after a user block'
   const signature = new Uint8Array([0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]);
 
   await t.test('a signature at byte zero opens', async () => {
-    const opened = await openAnnDataStore({ kind: 'h5ad', source: fixtureFile(SMOKE_H5AD) }, { decodedChunkCacheBytes: MiB });
-    assert.equal(opened.format, H5AD_FORMAT);
+    const opened = await openDatasetStore({ source: { file: fixtureFile(SMOKE_H5AD) } }, { decodedChunkCacheBytes: MiB });
+    assert.equal(opened.readerFormat, H5AD_FORMAT);
+    assert.equal(opened.format, 'h5ad');
+    assert.equal(opened.layout, 'file');
     assert.equal(opened.root.kind, 'group');
   });
 
@@ -262,14 +264,14 @@ test('an HDF5 file is found by its signature at byte zero or after a user block'
     const bytes = readFileSync(USERBLOCK_H5);
     assert.deepEqual([...bytes.subarray(512, 520)], [...signature], 'the fixture keeps a 512-byte user block');
     assert.notDeepEqual([...bytes.subarray(0, 8)], [...signature]);
-    const opened = await openAnnDataStore({ kind: 'h5ad', source: fixtureFile(USERBLOCK_H5) }, { decodedChunkCacheBytes: MiB });
+    const opened = await openDatasetStore({ source: { file: fixtureFile(USERBLOCK_H5) } }, { decodedChunkCacheBytes: MiB });
     assert.equal(opened.root.kind, 'group');
   });
 
   await t.test('unrelated bytes are refused with an actionable format error', async () => {
     await assert.rejects(
-      openAnnDataStore(
-        { kind: 'h5ad', source: new File([new TextEncoder().encode('not-an-hdf5-file')], 'corrupt.h5ad') },
+      openDatasetStore(
+        { source: { file: new File([new TextEncoder().encode('not-an-hdf5-file')], 'corrupt.h5ad') } },
         { decodedChunkCacheBytes: MiB }
       ),
       error => /not a valid HDF5\/H5AD file/i.test(error.message) && error.details?.explained === true
@@ -280,7 +282,7 @@ test('an HDF5 file is found by its signature at byte zero or after a user block'
     const bytes = new Uint8Array(64);
     bytes.set(signature);
     await assert.rejects(
-      openAnnDataStore({ kind: 'h5ad', source: new File([bytes], 'truncated.h5ad') }, { decodedChunkCacheBytes: MiB }),
+      openDatasetStore({ source: { file: new File([bytes], 'truncated.h5ad') } }, { decodedChunkCacheBytes: MiB }),
       error => /H5AD file could not be read.*corrupted or truncated/is.test(error.message) && error.details?.explained === true
     );
   });
@@ -1838,7 +1840,7 @@ async function readerEngine(name) {
  * fails its embedding read, and a pending gate holds the open.
  */
 function fakeClientOpen({ pendingByName = new Map(), records = new Map() } = {}) {
-  return async function fakeOpen(file) {
+  return async function fakeOpen({ file }) {
     const record = { closeCalls: 0, loader: this, name: file.name };
     records.set(file.name, record);
     const close = this.close.bind(this);
@@ -1867,6 +1869,7 @@ function fakeClientOpen({ pendingByName = new Map(), records = new Map() } = {})
     if (file.fail) throw new Error(`invalid ${file.name}`);
     const pending = pendingByName.get(file.name);
     if (pending) await pending.promise;
+    return { name: file.name, format: 'h5ad', layout: 'file', zarrVersion: null };
   };
 }
 
@@ -1882,12 +1885,12 @@ async function withFakeH5adOpen(run) {
   }
 }
 
-test('H5adDataSource keeps a working dataset when a replacement fails', async () => {
+test('AnnDataFileSource keeps a working dataset when a replacement fails', async () => {
   await withFakeH5adOpen(async () => {
-    const source = new H5adDataSource();
-    await source.loadFromFile({ name: 'working.h5ad' });
+    const source = new AnnDataFileSource();
+    await source.loadFile({ name: 'working.h5ad' });
     const originalAdapter = source.getAdapter();
-    await assert.rejects(source.loadFromFile({ fail: true, name: 'broken.h5ad' }), /invalid broken/i);
+    await assert.rejects(source.loadFile({ fail: true, name: 'broken.h5ad' }), /invalid broken/i);
     assert.equal(source.datasetId, 'h5ad_working');
     assert.equal(source.getAdapter(), originalAdapter);
     assert.equal(await source.isAvailable(), true);
@@ -1895,13 +1898,13 @@ test('H5adDataSource keeps a working dataset when a replacement fails', async ()
   });
 });
 
-test('H5adDataSource keeps a working dataset when a replacement\'s embedding bytes are corrupt', async () => {
+test('AnnDataFileSource keeps a working dataset when a replacement\'s embedding bytes are corrupt', async () => {
   await withFakeH5adOpen(async () => {
-    const source = new H5adDataSource();
-    await source.loadFromFile({ name: 'working.h5ad' });
+    const source = new AnnDataFileSource();
+    await source.loadFile({ name: 'working.h5ad' });
     const workingAdapter = source.getAdapter();
     await assert.rejects(
-      source.loadFromFile({ corruptEmbedding: true, name: 'corrupt-embedding.h5ad' }),
+      source.loadFile({ corruptEmbedding: true, name: 'corrupt-embedding.h5ad' }),
       /corrupt embedding payload/i
     );
     assert.equal(source.datasetId, 'h5ad_working');
@@ -1912,14 +1915,14 @@ test('H5adDataSource keeps a working dataset when a replacement\'s embedding byt
   });
 });
 
-test('H5adDataSource makes overlapping selections latest-wins', async () => {
+test('AnnDataFileSource makes overlapping selections latest-wins', async () => {
   await withFakeH5adOpen(async ({ pendingByName, records }) => {
     const oldPending = deferred();
     pendingByName.set('older.h5ad', oldPending);
-    const source = new H5adDataSource();
-    const older = source.loadFromFile({ name: 'older.h5ad' });
+    const source = new AnnDataFileSource();
+    const older = source.loadFile({ name: 'older.h5ad' });
     await Promise.resolve();
-    const newer = await source.loadFromFile({ name: 'newer.h5ad' });
+    const newer = await source.loadFile({ name: 'newer.h5ad' });
     oldPending.resolve();
     await assert.rejects(older, /superseded/i);
     assert.equal(newer.id, 'h5ad_newer');
@@ -1943,11 +1946,11 @@ test('a superseded H5AD candidate leaves the opening to the newer one, which end
   });
   AnnDataReaderClient.prototype.open = fakeClientOpen({ pendingByName: new Map([['older.h5ad', olderGate]]) });
 
-  const source = new H5adDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  const older = source.loadFromFile({ name: 'older.h5ad' });
+  const older = source.loadFile({ name: 'older.h5ad' });
   await Promise.resolve();
-  const newer = await source.loadFromFile({ name: 'newer.h5ad' });
+  const newer = await source.loadFile({ name: 'newer.h5ad' });
   olderGate.resolve();
 
   await assert.rejects(older, /superseded/i);
@@ -1958,10 +1961,10 @@ test('a superseded H5AD candidate leaves the opening to the newer one, which end
   assert.match(states.at(-1), /:done$/);
 });
 
-test('H5adDataSource has one reader owner and closes it once', async () => {
+test('AnnDataFileSource has one reader owner and closes it once', async () => {
   await withFakeH5adOpen(async () => {
-    const source = new H5adDataSource();
-    await source.loadFromFile({ name: 'owned.h5ad' });
+    const source = new AnnDataFileSource();
+    await source.loadFile({ name: 'owned.h5ad' });
     const loader = source._loader;
     const originalClose = loader.close.bind(loader);
     let closeCalls = 0;

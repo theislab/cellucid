@@ -86,6 +86,7 @@ import {
 import { hashStringToSeed } from '../utils/hash.js';
 import {
   openFigureExportWorkerSession,
+  pagePixels,
   pointPassRenderState,
   pointRasterArgs,
   requestPngDataUrl,
@@ -340,7 +341,8 @@ async function rasterizePointsToDataUrl(session, {
     frame.close();
     throw error;
   }
-  return session.request('encodeRasterPngDataUrl', { bitmap: frame, placement }, [frame]);
+  const pixels = pagePixels(frame);
+  return session.request('encodeRasterPngDataUrl', { pixels, placement }, [pixels.data.buffer]);
 }
 
 /**
@@ -385,15 +387,9 @@ function requestSvgPointMarkup(session, {
  * A backdrop-look raster as the PNG data URL of its `<image>`, encoded in the
  * worker.
  */
-async function backdropLookDataUrl(session, lookRaster, signal) {
-  const bitmap = await createImageBitmap(lookRaster);
-  try {
-    throwIfFigureExportAborted(signal);
-  } catch (error) {
-    bitmap.close();
-    throw error;
-  }
-  return requestPngDataUrl(session, bitmap);
+function backdropLookDataUrl(session, lookRaster, signal) {
+  throwIfFigureExportAborted(signal);
+  return requestPngDataUrl(session, pagePixels(lookRaster));
 }
 
 /**

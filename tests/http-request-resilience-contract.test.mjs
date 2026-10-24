@@ -6,6 +6,11 @@
  * a request that is never answered, a connection dropped mid-body, and a body
  * that stops arriving. Cancellation still ends a request at once, and the
  * bytes a range read planned are counted once whatever happened on the way.
+ *
+ * Waits (a stall's silence, a `Retry-After`, a trickling body) run on a
+ * virtual clock and its timers (`helpers/virtual-time.mjs`), given to the
+ * link as its `clock` and `after`: what is asserted on time is what the
+ * requests waited for, never how fast the machine running the test is.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -14,6 +19,7 @@ import {
   BYTE_SOURCE_FAILURES,
   ByteSourceError,
   REMOTE_POLICY,
+  RETRY_DELAYS_MS,
   fetchOnce,
   httpByteSource,
   withRetries,
@@ -23,6 +29,8 @@ import { LinkMeter, ResponseClock } from '../assets/js/formats/io/link.js';
 import { ReadActivity } from '../assets/js/formats/io/activity.js';
 import { httpStore, openZarr } from '../assets/js/formats/zarr/index.js';
 import { fetchWhenNotBusy } from '../assets/js/data/data-source.js';
+
+import { settle, virtualTime } from './helpers/virtual-time.mjs';
 
 const BASE = 'https://host.test/store.zarr/';
 
@@ -67,6 +75,26 @@ function never(signal) {
   return new Promise((_resolve, reject) => {
     signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   });
+}
+
+/** A link measured on a virtual clock, its requests' timers on that clock. */
+function virtualLink() {
+  const time = virtualTime();
+  return { time, link: new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after }) };
+}
+
+/**
+ * Timers that never fire on their own (a clock that stands still), which
+ * record the waits set and cancelled: what ends a wait on them is a cancel.
+ */
+function frozenTimers() {
+  const set = [];
+  const cancelled = [];
+  const after = ms => {
+    set.push(ms);
+    return () => cancelled.push(ms);
+  };
+  return { set, cancelled, after, link: new LinkMeter(REMOTE_POLICY, { clock: () => 0, after }) };
 }
 
 /**
@@ -115,27 +143,29 @@ test('a 503 without CORS headers, a 429 with Retry-After, a hung answer, a dropp
     '.zmetadata': ['cors-503', '429'],
     'a/0': ['hang', 'drop', 'stall-body'],
   });
-  const started = performance.now();
-  const root = await openZarr(httpStore(BASE, { fetch: host.fetch }));
-  const opened = performance.now();
+  const { time, link } = virtualLink();
+  const started = time.now();
+  const root = await openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: link }));
+  const opened = time.now();
   assert.ok(opened - started >= 1000, 'the 429 is waited out as long as its Retry-After asks');
   assert.deepEqual([...await root.get('a').read()], [1, 2, 3, 4]);
   assert.deepEqual(host.log.map(entry => entry.kind), ['cors-503', '429', null, 'hang', 'drop', 'stall-body', null]);
 });
 
 test('a request is not stalled while the link delivers bytes to other requests', async () => {
-  const clock = new ResponseClock();
+  const time = virtualTime();
+  const clock = new ResponseClock({ clock: time.now, after: time.after });
   const slow = new Uint8Array(8);
   const fetch = async (url, init) => {
     if (url.endsWith('/waits')) {
       // Answered only after the other request's body has trickled for 2.4 s.
-      await new Promise(resolve => setTimeout(resolve, 2500));
+      await time.sleep(2500);
       return new Response(Uint8Array.of(7), { status: 200 });
     }
     let sent = 0;
     return new Response(new ReadableStream({
       async pull(controller) {
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await time.sleep(300);
         if (sent === slow.length) controller.close();
         else controller.enqueue(slow.subarray(sent, ++sent));
       },
@@ -147,6 +177,7 @@ test('a request is not stalled while the link delivers bytes to other requests',
   ]);
   assert.deepEqual([...waits.bytes], [7]);
   assert.equal(trickles.bytes.length, slow.length);
+  assert.ok(time.now() >= 2500, 'the waiting request was silent for longer than the stall timeout');
 });
 
 test('the stall timeout follows the measured answers (RFC 6298), doubles on a stall and is computed afresh after an answer', () => {
@@ -179,23 +210,30 @@ test('a host that keeps failing is reported naming the URL and how many times it
 });
 
 test('cancelling ends a hung request and a wait to ask again at once, and nothing is asked after', async () => {
+  // On timers that never fire, only the cancel can end the request or the wait.
+  const hung = frozenTimers();
   const host = faultyHost(storeFiles(), { '.zmetadata': ['hang'] });
   const controller = new AbortController();
-  const opening = openZarr(httpStore(BASE, { fetch: host.fetch }), { signal: controller.signal });
-  setTimeout(() => controller.abort(new DOMException('stop', 'AbortError')), 50);
+  const opening = openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: hung.link }), { signal: controller.signal });
+  await settle();
+  assert.equal(host.log.length, 1, 'the request is out, unanswered');
+  controller.abort(new DOMException('stop', 'AbortError'));
   await assert.rejects(opening, { name: 'AbortError' });
   assert.equal(host.log.length, 1);
+  assert.deepEqual(hung.cancelled, hung.set, 'the stall watch ended with the request');
 
+  const timers = frozenTimers();
   const waiting = new AbortController();
   const asked = [];
   const retrying = withRetries(async attempt => {
     asked.push(attempt);
     throw new ByteSourceError(BYTE_SOURCE_FAILURES.RATE_LIMITED, 'busy', { retryAfter: '60' });
-  }, { signal: waiting.signal });
-  setTimeout(() => waiting.abort(new DOMException('stop', 'AbortError')), 50);
-  const started = performance.now();
+  }, { signal: waiting.signal, after: timers.after });
+  await settle();
+  assert.deepEqual(timers.set, [60_000], 'waiting as long as the Retry-After asks');
+  waiting.abort(new DOMException('stop', 'AbortError'));
   await assert.rejects(retrying, { name: 'AbortError' });
-  assert.ok(performance.now() - started < 1000, 'the 60 s wait ends with the cancel');
+  assert.deepEqual(timers.cancelled, [60_000], 'the 60 s wait ends with the cancel');
   assert.deepEqual(asked, [0]);
 });
 
@@ -208,7 +246,8 @@ test('bytes a range read planned are counted once, however often its request was
     const [, a, b] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
     return new Response(files.get('shard').slice(Number(a), Number(b) + 1), { status: 206 });
   };
-  const store = httpStore('https://host.test/s/', { fetch });
+  const { link } = virtualLink();
+  const store = httpStore('https://host.test/s/', { fetch, concurrency: link });
   const activity = new ReadActivity({ label: 'shard', kind: 'field' });
   const [bytes] = await store.getRanges('shard', [{ offset: 8, length: 16 }], { activity });
   assert.deepEqual([...bytes], Array.from({ length: 16 }, (_, i) => i + 8));
@@ -227,7 +266,7 @@ test('a range read of a file is asked again after a stall, measured on its link'
     return new Response(bytes.slice(Number(a), Number(b) + 1), { status: 206 });
   };
   const source = httpByteSource({ url: 'https://host.test/a.h5ad', size: 100 }, { fetch });
-  const link = new LinkMeter(REMOTE_POLICY);
+  const { link } = virtualLink();
   const retried = [];
   link.responses.onRetry = (error, count) => retried.push([error.code, count]);
   assert.deepEqual([...await source.read(10, 5, { link })], [10, 11, 12, 13, 14]);
@@ -304,13 +343,14 @@ test('a failure that repeats exactly, or a host that never answers this site, is
     failing.log.push({ key });
     return new Response('{"status":500}', { status: 500, headers: { 'Content-Length': '14' } });
   };
-  const started = performance.now();
-  await assert.rejects(openZarr(httpStore(BASE, { fetch: fetch500 })), error => {
+  const { time, link } = virtualLink();
+  const started = time.now();
+  await assert.rejects(openZarr(httpStore(BASE, { fetch: fetch500, concurrency: link })), error => {
     assert.match(error.message, /HTTP 500\)\. Asked 2 times\./);
     return true;
   });
   assert.equal(failing.log.length, 2);
-  assert.ok(performance.now() - started < 2000, 'reported after one short wait');
+  assert.equal(time.now() - started, RETRY_DELAYS_MS[0], 'reported after one short wait');
 
   // No answer at all (CORS refused): asked once more, then reported.
   let corsAsked = 0;

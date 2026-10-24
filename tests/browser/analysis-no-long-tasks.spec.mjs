@@ -14,11 +14,20 @@
  * runners reported no long task for the same flows. The frame gap is still
  * reported with a failure, beside the heartbeat. The dataset is read over
  * HTTP, not through `page.route` (`helpers/served-fixture.mjs` says why).
+ *
+ * The run starts once the scene is quiet (`sceneQuietness`), and draws no
+ * frame of its own. On Linux WebKit a frame holds the main thread about as
+ * long as the frame gap above, so a run started while the viewer still owed
+ * the frames of the dataset's opening (its studio fade and settle frames)
+ * measured one of them: the heartbeat held 459 ms with frames 457 ms apart,
+ * while the run itself draws nothing and changes no DOM (measured in WebKit
+ * and Chromium on macOS: no draw call and no mutation during either run).
  */
 import { expect, test } from './helpers/test.mjs';
 import { anndataZarrZip } from './helpers/anndata-zarr-zip.mjs';
 import { writeServedFixture } from './helpers/served-fixture.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 
 const DATASET = 'analysis-responsive';
 const CELLS = 20_000;
@@ -89,6 +98,17 @@ async function measure(page, flow) {
     }
     let running = true;
     let startedAt = performance.now();
+    // The viewer's draw calls during the run: a run draws no frame.
+    const gl = window._cellucidViewer.getGLContext();
+    let draws = 0;
+    const drawNames = ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced'];
+    for (const name of drawNames) {
+      const original = gl[name];
+      gl[name] = function countedDraw(...args) {
+        draws += 1;
+        return Reflect.apply(original, this, args);
+      };
+    }
     // The main thread: the longest wait of a timer that re-arms itself at
     // once, and when in the run it began.
     let heldMs = 0;
@@ -121,6 +141,7 @@ async function measure(page, flow) {
     lastBeat = startedAt;
     frameGapMs = 0;
     lastFrame = startedAt;
+    draws = 0;
 
     let genes = 0;
     if (flowName === 'markers') {
@@ -148,6 +169,7 @@ async function measure(page, flow) {
     beat();
     running = false;
     observer?.disconnect();
+    for (const name of drawNames) delete gl[name];
     return {
       genes,
       longTasks,
@@ -156,6 +178,7 @@ async function measure(page, flow) {
       heldAtMs: Math.round(heldAt),
       runMs: Math.round(performance.now() - startedAt),
       frameGapMs: Math.round(frameGapMs),
+      draws,
       budget,
     };
   }, { flowName: flow, budget: MAIN_THREAD_BUDGET_MS });
@@ -167,8 +190,11 @@ for (const flow of ['markers', 'differential']) {
     await page.goto(`/?sampleCatalog=${encodeURIComponent(served.root)}&dataset=${DATASET}`, { waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
     await page.waitForFunction(count => window._comparisonModule?.state?.pointCount === count, CELLS, { timeout: 120_000 });
+    // The frames the opening owes are drawn before the run, not during it.
+    await expect.poll(() => sceneQuietness(page), { timeout: 120_000 }).toBe('quiet');
     const result = await measure(page, flow);
     expect(result.genes).toBe(GENES.length);
+    expect(result.draws, `draw calls during the ${flow} run: ${JSON.stringify(result)}`).toBe(0);
     if (result.measuredLongTasks) {
       expect(result.longTasks, `long tasks during the ${flow} run (ms)`).toEqual([]);
     } else {

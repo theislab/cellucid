@@ -1,5 +1,5 @@
 /* page.css - Entry point for the standalone pages (404.html, privacy.html,
-   assets/auth/callback.html).
+   terms.html, accessibility.html, assets/auth/callback.html).
 
    The same layers, tokens, themes and base as main.css, and of the components
    only the brand card these pages are built from. The app's panels, controls

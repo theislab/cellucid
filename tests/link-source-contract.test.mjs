@@ -199,8 +199,9 @@ test('a linked catalog lists its files from their metadata and opens the one cho
   assert.throws(() => source.getBaseUrl('tiny-ready'), /is not open/);
   const metadata = await source.getMetadata('tiny-ready');
   assert.equal(metadata.name, 'Tiny ready dataset');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/');
-  assert.equal(source.getAnnDataSource('tiny-ready').getType(), 'zarr');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
+  assert.equal(source.getAnnDataSource('tiny-ready').getType(), 'anndata');
+  assert.equal(source.getAnnDataSource('tiny-ready').format, 'zarr');
   assert.deepEqual(source.getStateDescriptor('tiny-ready'), {
     sessionUrl: `${GITHUB}tiny-ready.cellucid-session`,
     sessionBytes: 9,
@@ -230,7 +231,7 @@ test('one linked file is its dataset, under the id it states', async t => {
   assert.equal(connection.defaultDatasetId, 'tiny-ready');
   assert.equal(connection.datasets[0].id, 'tiny-ready', 'uns[\'cellucid\'][\'id\'] over the link\'s id');
   assert.equal(connection.datasets[0].name, 'Tiny ready dataset');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'h5ad://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.equal(source.getStateDescriptor('tiny-ready'), null, 'one file names no default view');
   source.disconnect();
 });
@@ -242,7 +243,7 @@ test('a linked Zarr store folder and a zipped one open in place', async t => {
     const source = new LinkDataSource();
     const connection = await source.connect(`${WEB}${path}`);
     assert.equal(connection.datasets[0].id, 'tiny-ready', path);
-    assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/', path);
+    assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/', path);
     source.disconnect();
   }
 });

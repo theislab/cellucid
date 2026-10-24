@@ -6,13 +6,13 @@
  * provider says where the bytes are; this source reads them in one of three
  * forms and knows nothing else about the provider:
  *
- * - one AnnData file (`.h5ad` or a zipped Zarr store), read in place with HTTP
- *   range requests by the AnnData reader worker;
+ * - one file (an `.h5ad` or a zipped Zarr store: `data/input-formats.js`),
+ *   read in place with HTTP range requests by the AnnData reader worker;
  * - one AnnData Zarr store folder on a web host, read key by key;
  * - a dataset catalog: a folder holding `datasets.json` and the AnnData files
  *   it lists (`sources/anndata-catalog.js`), each opened when chosen.
  *
- * Every dataset is served through h5ad:// or zarr:// URLs like a local file,
+ * Every dataset is served through anndata:// URLs like a local file,
  * and `getAnnDataSource(datasetId)` exposes the source it is read from.
  *
  * Connecting builds a complete candidate before anything is replaced, as the
@@ -41,8 +41,7 @@ import {
   fetchAnnDataCatalog,
 } from './sources/anndata-catalog.js';
 import { downloadRemoteFile } from './sources/remote-file.js';
-import { createH5adDataSource } from './h5ad.js';
-import { createZarrDataSource } from './zarr.js';
+import { createAnnDataFileSource } from './anndata-file-source.js';
 import { getTransferLog } from './transfer-log.js';
 import { prewarmAnnDataReaderWorker } from './anndata-reader-client.js';
 import { beginOpening, openingCancelledError } from './opening-progress.js';
@@ -73,9 +72,7 @@ const PROVIDER_OPENINGS = new Map();
  * @returns {Promise<{source: Object, metadata: DatasetMetadata}>}
  */
 async function openAnnDataFile(file, signal) {
-  const source = file.format === 'h5ad'
-    ? createH5adDataSource()
-    : createZarrDataSource();
+  const source = createAnnDataFileSource();
   const identitySource = {
     name: file.attribution.title,
     url: file.attribution.url,
@@ -85,25 +82,15 @@ async function openAnnDataFile(file, signal) {
       : {}),
   };
   try {
-    if (file.format === 'h5ad') {
-      await source.loadFromFile(file.resource, {
-        signal,
-        defaultDatasetId: file.id,
-        name: file.title,
-        preferFileName: true,
-        description: '',
-        source: identitySource,
-      });
-    } else {
-      await source.loadFromArchiveFile(file.resource, {
-        signal,
-        defaultDatasetId: file.id,
-        name: file.title,
-        preferFileName: true,
-        description: '',
-        source: identitySource,
-      });
-    }
+    await source.loadFile(file.resource, {
+      signal,
+      defaultDatasetId: file.id,
+      name: file.title,
+      preferFileName: true,
+      description: '',
+      source: identitySource,
+      expect: file.format,
+    });
     // The id the file states (`uns['cellucid']['id']`), else the link's.
     return { source, metadata: await source.getMetadata(source.datasetId) };
   } catch (error) {
@@ -121,11 +108,11 @@ async function openAnnDataFile(file, signal) {
  */
 async function openZarrFolder(store, signal) {
   if (typeof store.id !== 'string' || store.id.length === 0 || store.id.includes('/')) {
-    throw new TypeError('A Zarr store id must be a non-empty string without "/" (it becomes zarr://<id>/).');
+    throw new TypeError('A Zarr store id must be a non-empty string without "/" (it becomes anndata://<id>/).');
   }
-  const source = createZarrDataSource();
+  const source = createAnnDataFileSource();
   try {
-    await source.loadFromRemoteFolder({ url: store.url, name: store.name }, {
+    await source.loadRemoteFolder({ url: store.url, name: store.name }, {
       signal,
       defaultDatasetId: store.id,
       name: store.title,
@@ -277,7 +264,6 @@ export class LinkDataSource {
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.file) {
-      const format = opening.file.format === 'zip' ? 'zarr-zip' : opening.file.format;
       let resource = opening.file.resource;
       if (opening.file.transport === 'download') {
         // The host serves no part of the file: all of it, once.
@@ -291,7 +277,7 @@ export class LinkDataSource {
           },
         });
       }
-      const annData = await openAnnDataFile({ ...opening.file, format, resource }, signal);
+      const annData = await openAnnDataFile({ ...opening.file, resource }, signal);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     throw new TypeError('A provider opening must hold a catalog, a file or a store.');
@@ -520,7 +506,7 @@ export class LinkDataSource {
   }
 
   /**
-   * The base URL of one open dataset: the h5ad:// or zarr:// URL of its file.
+   * The base URL of one open dataset: the anndata:// URL of its file.
    * @param {string} datasetId
    * @returns {string}
    */

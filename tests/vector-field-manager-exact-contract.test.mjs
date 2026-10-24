@@ -108,7 +108,7 @@ function managerOptions({
   bindings = [['alpha', 'X_umap', [0, 1]], ['beta', 'X_umap', [0, 1]]],
   items = UMAP_ITEMS,
   manager = dimensionManager({ items }),
-  baseUrl = 'h5ad://vector-direct/',
+  baseUrl = 'anndata://vector-direct/',
 } = {}) {
   const candidates = directCandidates(obsm);
   return {
@@ -145,7 +145,7 @@ async function withActiveAdapter(adapter, body, datasetId = 'vector-direct') {
   };
   dataSourceManager.activeSource = {
     datasetId,
-    getType: () => 'h5ad',
+    getType: () => 'anndata',
     getAdapter: () => adapter,
   };
   dataSourceManager.activeDatasetId = datasetId;
@@ -247,7 +247,7 @@ test('vector manager requires the sole exact constructor shape', () => {
   assert.throws(
     () => new VectorFieldManager({
       ...managerOptions(),
-      baseUrl: 'h5ad://vector-direct',
+      baseUrl: 'anndata://vector-direct',
     }),
     /ending in/
   );
@@ -512,7 +512,7 @@ test('direct vector reads are bound to the exact adopted AnnData dataset', async
   const source = {
     datasetId: 'vector-direct',
     getType() {
-      return 'h5ad';
+      return 'anndata';
     },
     getAdapter() {
       return adapter;
@@ -522,7 +522,7 @@ test('direct vector reads are bound to the exact adopted AnnData dataset', async
   dataSourceManager.activeDatasetId = source.datasetId;
 
   try {
-    const manager = new VectorFieldManager(directManagerOptions('h5ad://vector-direct/'));
+    const manager = new VectorFieldManager(directManagerOptions('anndata://vector-direct/'));
     // `velocity_umap` is listed as the field `velocity`, bound to the
     // layout `X_umap`, and is the default as the only field.
     assert.equal(manager.getDefaultFieldId(), 'velocity');
@@ -563,7 +563,7 @@ test('a replaced direct AnnData dataset cannot publish delayed vector data', asy
   const source = {
     datasetId: 'vector-old',
     getType() {
-      return 'h5ad';
+      return 'anndata';
     },
     getAdapter() {
       return adapter;
@@ -573,7 +573,7 @@ test('a replaced direct AnnData dataset cannot publish delayed vector data', asy
   dataSourceManager.activeDatasetId = source.datasetId;
 
   try {
-    const manager = new VectorFieldManager(directManagerOptions('h5ad://vector-old/'));
+    const manager = new VectorFieldManager(directManagerOptions('anndata://vector-old/'));
     const pending = manager.loadField('velocity', 'X_umap');
     await readStarted;
     dataSourceManager.activeSource = null;
@@ -581,7 +581,7 @@ test('a replaced direct AnnData dataset cannot publish delayed vector data', asy
     releaseVector();
     await assert.rejects(
       pending,
-      /active dataset protocol is not AnnData|ownership changed/
+      /not read by a direct AnnData source|ownership changed/
     );
   } finally {
     dataSourceManager.activeSource = previous.activeSource;

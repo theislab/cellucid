@@ -14,6 +14,7 @@ import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { DimensionManager } from '../assets/js/data/dimension-manager.js';
 import { debug } from '../assets/js/utils/debug.js';
 import { loadsAsReader } from './helpers/dimension-loads.mjs';
+import { settle } from './helpers/virtual-time.mjs';
 
 const outcomeModuleUrl = new URL(
   '../assets/js/app/dataset-reload-outcome.js',
@@ -195,7 +196,7 @@ function captureDownloadNotifications(t) {
   return events;
 }
 
-function installActiveAnnDataAdapter(t, adapter, sourceType = 'h5ad') {
+function installActiveAnnDataAdapter(t, adapter, sourceType = 'anndata') {
   const manager = getDataSourceManager();
   const previous = {
     activeDatasetId: manager.activeDatasetId,
@@ -240,7 +241,7 @@ async function runLocalSelection(t, { activateDataset }) {
     getType() {
       return 'local-user';
     },
-    loadFromH5adFile: async () => metadata,
+    loadFromFile: async () => metadata,
   };
   const userSource = {
     candidateCreations: 0,
@@ -525,7 +526,7 @@ test('dataset reload transactions reject stale commits across local selection ep
     await import(outcomeModuleUrl);
   const source = {};
   let identity = {
-    baseUrl: 'zarr://first/',
+    baseUrl: 'anndata://first/',
     datasetId: 'first',
     selectionIdentity: 1,
     source
@@ -544,7 +545,7 @@ test('dataset reload transactions reject stale commits across local selection ep
   })();
 
   identity = {
-    baseUrl: 'zarr://second/',
+    baseUrl: 'anndata://second/',
     datasetId: 'second',
     selectionIdentity: 2,
     source
@@ -686,7 +687,7 @@ test(
     } = await import(outcomeModuleUrl);
     const source = {};
     let identity = {
-      baseUrl: 'zarr://first/',
+      baseUrl: 'anndata://first/',
       datasetId: 'first',
       selectionIdentity: 1,
       source
@@ -706,7 +707,7 @@ test(
 
     identity = {
       ...identity,
-      baseUrl: 'zarr://failed-b/',
+      baseUrl: 'anndata://failed-b/',
       datasetId: 'failed-b',
       selectionIdentity: 2
     };
@@ -747,7 +748,7 @@ for (const runtimeKind of ['dataset', 'synthetic']) {
       } = await import(outcomeModuleUrl);
       const source = {};
       let identity = {
-        baseUrl: 'zarr://live-a/',
+        baseUrl: 'anndata://live-a/',
         datasetId: 'live-a',
         selectionIdentity: 1,
         source
@@ -774,7 +775,7 @@ for (const runtimeKind of ['dataset', 'synthetic']) {
       if (runtimeKind === 'dataset') {
         identity = {
           ...identity,
-          baseUrl: 'zarr://failed-b/',
+          baseUrl: 'anndata://failed-b/',
           datasetId: 'failed-b',
           selectionIdentity: 2
         };
@@ -840,7 +841,7 @@ test('dataset reload identity capture requires one exact explicit shape', async 
     }),
     () => ({
       source: {},
-      baseUrl: 'zarr://selected/',
+      baseUrl: 'anndata://selected/',
       datasetId: 'selected',
       selectionIdentity: '1'
     })
@@ -902,7 +903,7 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
   } = await import(outcomeModuleUrl);
   let identity = {
     source: {},
-    baseUrl: 'zarr://first/',
+    baseUrl: 'anndata://first/',
     datasetId: 'first',
     selectionIdentity: 1
   };
@@ -913,7 +914,7 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
 
   identity = {
     ...identity,
-    baseUrl: 'zarr://second/',
+    baseUrl: 'anndata://second/',
     datasetId: 'second',
     selectionIdentity: 2
   };
@@ -942,7 +943,7 @@ test(
     } = await import(outcomeModuleUrl);
     let identity = {
       source: {},
-      baseUrl: 'zarr://first/',
+      baseUrl: 'anndata://first/',
       datasetId: 'first',
       selectionIdentity: 1
     };
@@ -950,7 +951,7 @@ test(
     const older = coordinator.begin();
     identity = {
       ...identity,
-      baseUrl: 'zarr://second/',
+      baseUrl: 'anndata://second/',
       datasetId: 'second',
       selectionIdentity: 2
     };
@@ -1072,7 +1073,7 @@ test('reload owner adopts one committed identity before published-state success'
   const newSource = {};
   let identity = {
     source: oldSource,
-    baseUrl: 'zarr://old/',
+    baseUrl: 'anndata://old/',
     datasetId: 'old',
     selectionIdentity: null
   };
@@ -1084,7 +1085,7 @@ test('reload owner adopts one committed identity before published-state success'
 
   identity = {
     source: newSource,
-    baseUrl: 'zarr://new/',
+    baseUrl: 'anndata://new/',
     datasetId: 'new',
     selectionIdentity: null
   };
@@ -1121,7 +1122,7 @@ test('reload owner adopts one committed identity before published-state success'
 
   identity = {
     source: {},
-    baseUrl: 'zarr://reentrant-publication/',
+    baseUrl: 'anndata://reentrant-publication/',
     datasetId: 'reentrant-publication',
     selectionIdentity: null
   };
@@ -1485,7 +1486,7 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
 
   const events = captureDownloadNotifications(t);
   const manager = new DimensionManager({
-    baseUrl: 'h5ad://pending-direct-anndata/',
+    baseUrl: 'anndata://pending-direct-anndata/',
     embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
 
@@ -1502,12 +1503,13 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
   assert.equal(decoderCalls, 1, 'direct AnnData embedding decode must be shared');
   manager.clearCache();
 
-  const promptOutcome = await Promise.race([
-    Promise.all([firstObserved, secondObserved]),
-    new Promise(resolve => {
-      setTimeout(() => resolve('still-pending'), 50);
-    })
-  ]);
+  // Still pending once nothing but the held decoder is left to run (an idle
+  // event loop, not a while): the callers waited for it.
+  let promptOutcome = 'still-pending';
+  Promise.all([firstObserved, secondObserved]).then(outcome => {
+    promptOutcome = outcome;
+  });
+  await settle();
   assert.notEqual(
     promptOutcome,
     'still-pending',
@@ -1696,8 +1698,8 @@ test('position normalization evicts stale dimension buffers before exceeding the
 test('position loading takes its dimension from the caller, never from the path', async () => {
   // A route's column count does not state the dimension; only the caller does.
   for (const url of [
-    'h5ad://dataset/obsm/0/0-1',
-    'zarr://dataset/obsm/0/0-1-2',
+    'anndata://dataset/obsm/0/0-1',
+    'anndata://dataset/obsm/0/0-1-2',
   ]) {
     for (const dimension of [undefined, 0, 4, '2', 2.5, null]) {
       const options = {};
@@ -1713,10 +1715,10 @@ test('position loading takes its dimension from the caller, never from the path'
 test('position loading reads only an AnnData dataset, with exactly its own options', async () => {
   await assert.rejects(
     loadPointsBinary('https://cellucid.test/data/obsm/0/0-1', { dimension: 2 }),
-    /reads an AnnData dataset by its h5ad:\/\/ or zarr:\/\/ URL/
+    /reads an AnnData dataset by its anndata:\/\/ URL/
   );
   await assert.rejects(
-    loadPointsBinary('h5ad://dataset/obsm/0/0-1', { dimension: 2, expectedBytes: null }),
+    loadPointsBinary('anndata://dataset/obsm/0/0-1', { dimension: 2, expectedBytes: null }),
     /unexpected key\(s\): expectedBytes/
   );
 });
@@ -2605,7 +2607,7 @@ test('local validation failures publish the validator error message exactly', as
     getType() {
       return 'local-user';
     },
-    async loadFromZarrArchive() {
+    async loadFromFile() {
       throw validationError;
     },
   };
@@ -2816,7 +2818,7 @@ test('File… opens the file input, and a Zarr ZIP picked there is read as an ar
     datasetId: 'portable',
     disconnect() {},
     getType: () => 'local-user',
-    async loadFromZarrArchive(file) {
+    async loadFromFile(file) {
       selectedFiles = [file];
       return metadata;
     }
@@ -2897,13 +2899,10 @@ test('browser local-data wiring invokes only portable current transports', async
       createSelectionCandidate: createUserSource,
       disconnect() {},
       getType: () => 'local-user',
-      async loadFromH5adFile(file) {
-        return loaded('h5ad', file, this);
+      async loadFromFile(file) {
+        return loaded(file.name.endsWith('.h5ad') ? 'h5ad' : 'zarr-archive', file, this);
       },
-      async loadFromZarrArchive(file) {
-        return loaded('zarr-archive', file, this);
-      },
-      async loadFromZarrDirectory(files) {
+      async loadFromFolder(files) {
         return loaded('zarr-folder', files, this);
       },
     };

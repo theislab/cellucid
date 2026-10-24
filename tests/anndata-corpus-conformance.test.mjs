@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { openAnnDataStore } from '../assets/js/data/anndata/open.js';
+import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
 import { blobByteSource, bytesByteSource } from '../assets/js/formats/io/byte-source.js';
@@ -165,22 +165,24 @@ async function sourcesOf(fixture) {
   const file = new File([bytes], name);
   if (fixture.format === 'h5ad') {
     return [
-      { how: 'local', kind: 'h5ad', source: file },
-      { how: 'remote', kind: 'h5ad', source: remoteFile(bytes, fixture.path) },
+      { how: 'local', source: { file } },
+      { how: 'remote', source: { file: remoteFile(bytes, fixture.path) } },
     ];
   }
   return [
-    { how: 'zip', kind: 'zarr', source: { archive: file } },
-    { how: 'folder', kind: 'zarr', source: await folderOf(file) },
+    { how: 'zip', source: { file } },
+    { how: 'folder', source: await folderOf(file) },
   ];
 }
 
-async function openReader({ kind, source }) {
-  const opened = await openAnnDataStore({ kind, source }, { decodedChunkCacheBytes: CACHE_BYTES });
+async function openReader({ source }, format) {
+  const opened = await openDatasetStore({ source }, { decodedChunkCacheBytes: CACHE_BYTES });
+  // The format is told from the content and the name, as the app opens it.
+  assert.equal(opened.format, format, `${opened.name} opens as ${format}`);
   const reader = new AnnDataReader();
   try {
     await reader.open(opened.root, {
-      format: opened.format,
+      format: opened.readerFormat,
       name: opened.name,
       decodedChunkBytes: CACHE_BYTES,
       link: opened.link,
@@ -428,13 +430,13 @@ for (const [writer, fixtures] of byWriter) {
   test(`every ${writer} fixture reads as anndata read it`, async t => {
     for (const fixture of fixtures) {
       const expected = JSON.parse(new TextDecoder().decode(await corpusBytes(fixture.expected)));
-      for (const { how, kind, source } of await sourcesOf(fixture)) {
+      for (const { how, source } of await sourcesOf(fixture)) {
         await t.test(`${fixture.path} (${how})`, async () => {
           const where = `${fixture.path} (${how})`;
           const { expect, refuse_reason: reason } = fixture.reader;
           let reader = null;
           try {
-            reader = await openReader({ kind, source });
+            reader = await openReader({ source }, fixture.format);
             if (expect === 'refuse') {
               // The refused element is named; everything else still reads.
               await assert.rejects(async () => {

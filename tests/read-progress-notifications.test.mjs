@@ -95,7 +95,7 @@ test('a cancelled read is dismissed, a failed one says why, opening is never sho
 });
 
 test('the reader worker posts no progress event of its own: activity is the one channel', () => {
-  for (const file of ['anndata-reader-worker.js', 'anndata-reader-client.js', 'h5ad.js', 'zarr.js', 'anndata/reader.js']) {
+  for (const file of ['anndata-reader-worker.js', 'anndata-reader-client.js', 'anndata-file-source.js', 'anndata/reader.js']) {
     const source = readFileSync(new URL(`../assets/js/data/${file}`, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /event: 'progress'|onProgress|by gene \(once/, file);
   }

@@ -193,20 +193,23 @@ export function planMergeGap(spans, link, maxRequestBytes) {
  * @param {import('./byte-source.js').ByteSource} source
  * @param {{policy?: Partial<import('./byte-source.js').ReadPolicy>,
  *          onTransfer?: (progress: {bytes: number, requests: number, ms: number}) => void,
- *          head?: {bytes: Uint8Array, ms: number}|null}} [options]
+ *          head?: {bytes: Uint8Array, ms: number}|null,
+ *          clock?: () => number}} [options]
  *   `head`: the file's first bytes, read already (beside the probe of its
  *   size, `probeHttpResource`) in `ms`: they fill the cache as a read of its
- *   own would, are counted as one request, and measure the link.
+ *   own would, are counted as one request, and measure the link. `clock`:
+ *   the time in milliseconds that the link is measured with
+ *   (`performance.now`; tests give a virtual one).
  * @returns {ByteReader}
  */
-export function createByteReader(source, { policy: overrides = null, onTransfer = null, head = null } = {}) {
+export function createByteReader(source, { policy: overrides = null, onTransfer = null, head = null, clock = () => performance.now() } = {}) {
   if (!isByteSource(source)) {
     throw new TypeError('createByteReader needs a byte source.');
   }
   const policy = { ...source.policy, ...(overrides ?? {}) };
   const { blockBytes, cacheBytes } = policy;
   const size = source.size;
-  const link = new LinkMeter(policy);
+  const link = new LinkMeter(policy, { clock });
 
   // Metadata blocks: index -> Uint8Array, in least-recently-used order.
   const blocks = new Map();
@@ -376,7 +379,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
           stats.bytes += bytes.length;
           stats.requests++;
           link.end(started, bytes.length);
-          onTransfer?.({ bytes: stats.bytes, requests: stats.requests, ms: performance.now() - started });
+          onTransfer?.({ bytes: stats.bytes, requests: stats.requests, ms: clock() - started });
           let wanted = 0;
           for (const member of members) wanted += member.end - member.start;
           if (wanted < bytes.length) keepSurplus(start, bytes);

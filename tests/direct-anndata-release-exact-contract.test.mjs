@@ -2,10 +2,9 @@ import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
 
 test('the AnnData reader propagates the exact store-release failure', () => {
   const reader = new AnnDataReader();
@@ -64,7 +63,7 @@ test('the AnnData reader reports every required resource-release failure', () =>
 });
 
 test('direct AnnData sources propagate cache-release failures', () => {
-  for (const source of [new H5adDataSource(), new ZarrDataSource()]) {
+  for (const source of [new AnnDataFileSource(), new AnnDataFileSource()]) {
     const releaseFailure = new Error(`${source.getType()} cache release failed`);
     source.clearCaches = () => {
       throw releaseFailure;
@@ -78,17 +77,13 @@ test('direct AnnData sources propagate cache-release failures', () => {
 
 test('direct AnnData connectivity access without an active adapter is terminal', async () => {
   await assert.rejects(
-    new H5adDataSource().getConnectivityEdges(),
-    /No h5ad file loaded/
-  );
-  await assert.rejects(
-    new ZarrDataSource().getConnectivityEdges(),
-    /No zarr directory loaded/
+    new AnnDataFileSource().getConnectivityEdges(),
+    /No dataset loaded/
   );
 });
 
-test('Zarr candidate loading preserves both opening and cleanup failures', async () => {
-  const source = new ZarrDataSource();
+test('candidate loading preserves both opening and cleanup failures', async () => {
+  const source = new AnnDataFileSource();
   const openingFailure = new Error('exact Zarr opening failure');
   const cleanupFailure = new Error('exact Zarr cleanup failure');
   const { open, close } = AnnDataReaderClient.prototype;
@@ -101,14 +96,13 @@ test('Zarr candidate loading preserves both opening and cleanup failures', async
   try {
     await assert.rejects(
       source._loadCandidate(
-        0,
         { files: new Map(), rootName: 'broken.zarr' },
         {
           datasetId: null,
           description: 'broken',
           source: { name: 'test' },
         },
-        { title: 'broken.zarr' }
+        { title: 'broken.zarr', step: 'Reading the folder' }
       ),
       error => {
         assert.ok(error instanceof AggregateError);

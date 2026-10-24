@@ -103,10 +103,11 @@ test('choosing a sample opens its file once; its default view and AnnData source
   const metadata = await source.getMetadata('tiny-ready');
   assert.equal(metadata.id, 'tiny-ready');
   assert.equal(metadata.source.name, 'Example lab', 'the file names its source');
-  assert.equal(source.getBaseUrl('tiny-ready'), 'zarr://tiny-ready/');
+  assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.equal(source.datasetId, 'tiny-ready');
   const annData = source.getAnnDataSource('tiny-ready');
-  assert.equal(annData.getType(), 'zarr');
+  assert.equal(annData.getType(), 'anndata');
+  assert.equal(annData.format, 'zarr');
   assert.strictEqual(await source.getMetadata('tiny-ready'), metadata, 'opened once');
   assert.deepEqual(source.getStateDescriptor('tiny-ready'), {
     sessionUrl: `${BASE}tiny-ready.cellucid-session`,
@@ -464,7 +465,7 @@ test(
         },
         getBaseUrl(datasetId) {
           assert.equal(datasetId, 'local-user');
-          return 'h5ad://local-user/';
+          return 'anndata://local-user/';
         },
         async getMetadata(datasetId) {
           assert.equal(datasetId, 'local-user');
@@ -480,22 +481,17 @@ test(
         async listDatasets() {
           return [];
         },
-        async loadFromH5adFile(file) {
-          assert.equal(file?.name, 'working.h5ad');
-          activeMetadata = localMetadata;
+        async loadFromFile(file) {
+          assert.ok(['working.h5ad', 'working.zarr.zip'].includes(file?.name));
+          activeMetadata = file.name === 'working.h5ad' ? localMetadata : zarrMetadata;
           return activeMetadata;
         },
-        async loadFromZarrDirectory(files) {
+        async loadFromFolder(files) {
           assert.deepEqual(
             Array.from(files, file => file.webkitRelativePath),
             ['working.zarr/.zgroup', 'working.zarr/.zmetadata']
           );
           activeMetadata = folderMetadata;
-          return activeMetadata;
-        },
-        async loadFromZarrArchive(file) {
-          assert.equal(file?.name, 'working.zarr.zip');
-          activeMetadata = zarrMetadata;
           return activeMetadata;
         },
       };
@@ -699,7 +695,7 @@ test(
         },
         getBaseUrl(datasetId) {
           assert.equal(datasetId, 'served');
-          return 'h5ad://served/';
+          return 'anndata://served/';
         },
         getConnectionInfo() {
           return {

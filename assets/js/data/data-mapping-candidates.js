@@ -11,8 +11,7 @@
  *
  * Routes address catalog entries by their position in these lists, never by
  * key, so a path never carries a dataset's vocabulary. Every route names the
- * AnnData element it reads, under the dataset's base (`h5ad://<id>/` or
- * `zarr://<id>/`):
+ * AnnData element it reads, under the dataset's base (`anndata://<id>/`):
  *
  * - `obsm/{i}/{cols}` -- `obsm` entry `i` read at columns `cols` (`0-1`);
  * - `vectors/{v}/{vcols}/{e}/{ecols}` -- `obsm` entry `v` at `vcols`, drawn

@@ -103,7 +103,10 @@ function createStartupStallError(phase, target, deadlineMs, { silence = false, p
 }
 
 /**
- * @param {{ root: { dataset: Record<string, string> }, deadlineMs?: number }} options
+ * @param {{ root: { dataset: Record<string, string> }, deadlineMs?: number,
+ *   after?: (ms: number, callback: () => void) => () => void }} options
+ *   `after`: the timer a step's deadline runs on (`createDeadline`; real
+ *   timers by default, a virtual clock's in tests)
  */
 export function createStartupPhaseOwner(options) {
   if (
@@ -181,7 +184,7 @@ export function createStartupPhaseOwner(options) {
         silence: progress !== null,
         pending: pending?.() ?? null,
       });
-      const deadline = createDeadline(deadlineMs);
+      const deadline = createDeadline(deadlineMs, { after: options.after });
       const stopProgress = progress === null ? null : progress(() => deadline.extend());
       const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
       let onDeadline = null;

@@ -213,12 +213,12 @@ test('field loaders read only an AnnData dataset', async () => {
   const [, cluster] = checkObsFields(currentObsFields()).fields;
   await assert.rejects(
     loadObsFieldData('https://example.test/obs', cluster),
-    /h5ad:\/\/ or zarr:\/\/ URL/
+    /anndata:\/\/ URL/
   );
   const [gene] = checkGeneList(currentGeneList()).fields;
   await assert.rejects(
     loadVarFieldData('https://example.test/var', gene),
-    /h5ad:\/\/ or zarr:\/\/ URL/
+    /anndata:\/\/ URL/
   );
 });
 
@@ -228,7 +228,7 @@ test('categorical field loading rejects codes outside labels or the exact sentin
   const originalActiveDatasetId = manager.activeDatasetId;
   manager.activeSource = {
     datasetId: 'bad-codes',
-    getType: () => 'h5ad',
+    getType: () => 'anndata',
     getAdapter: () => ({
       async getObsFieldData() {
         return {
@@ -251,7 +251,7 @@ test('categorical field loading rejects codes outside labels or the exact sentin
     outlierQuantilesPath: null,
   })).fields;
   await assert.rejects(
-    loadObsFieldData('h5ad://bad-codes/obs', field),
+    loadObsFieldData('anndata://bad-codes/obs', field),
     /code 2.*index 1.*2 declared categories/i
   );
 });
@@ -332,7 +332,7 @@ test('direct AnnData categorical fields do not invent outlier statistics', async
   const originalActiveDatasetId = manager.activeDatasetId;
   manager.activeSource = {
     datasetId: 'strict-current',
-    getType: () => 'h5ad',
+    getType: () => 'anndata',
     getAdapter: () => ({
       async getObsFieldData() {
         return {
@@ -352,7 +352,7 @@ test('direct AnnData categorical fields do not invent outlier statistics', async
   });
 
   const result = await loadObsFieldData(
-    'h5ad://strict-current/obs',
+    'anndata://strict-current/obs',
     checkObsFields(currentObsFields({
       continuous: [],
       outlierQuantilesPath: null,

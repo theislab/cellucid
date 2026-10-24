@@ -544,7 +544,7 @@ export class AnnDataReader {
    * @param {Object} store - An opened store root (`openHdf5` / `openZarr`), with `close()`
    * @param {{format: import('./elements.js').AnnDataFormat, name: string, decodedChunkBytes?: number,
    *   link?: import('../../formats/io/link.js').LinkMeter|null}} options
-   *   `link`: the link to the store, measured as it is read (`openAnnDataStore`).
+   *   `link`: the link to the store, measured as it is read (`openDatasetStore`).
    *   Over a link that delivers bytes as fast as a disk (`link.readsAhead`), a
    *   cell-major matrix is indexed by gene as soon as it is prepared, values
    *   with the structure, as a local file is; over a slower one, the index
