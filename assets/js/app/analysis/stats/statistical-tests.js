@@ -1185,6 +1185,29 @@ export function benjaminiHochbergAdjusted(pValues) {
 }
 
 /**
+ * Bonferroni over the testable subset: `min(1, p × m)`, `m` the number of
+ * finite p-values (an untested gene, NaN, is not in the family and stays
+ * NaN). Same shape as {@link benjaminiHochbergAdjusted}.
+ *
+ * @param {ArrayLike<number>} pValues
+ * @returns {{ adjustedPValues: Float64Array, testedCount: number, untestableCount: number }}
+ */
+export function bonferroniAdjusted(pValues) {
+  requireNumericArrayLike(pValues, 'Bonferroni p-values');
+  const total = pValues.length;
+  let testedCount = 0;
+  for (let i = 0; i < total; i++) {
+    if (Number.isFinite(pValues[i])) testedCount++;
+  }
+  const adjustedPValues = new Float64Array(total);
+  for (let i = 0; i < total; i++) {
+    const p = pValues[i];
+    adjustedPValues[i] = Number.isFinite(p) ? Math.min(1, p * testedCount) : NaN;
+  }
+  return { adjustedPValues, testedCount, untestableCount: total - testedCount };
+}
+
+/**
  * Benjamini-Hochberg over the testable subset of a batch, as a boxed list.
  *
  * Differential expression returns a row object per gene, so the adjusted value

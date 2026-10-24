@@ -8,10 +8,14 @@
  * about 130,000 entries instead of eleven million values.
  *
  * The scores are exactly those of adding every gene's value cell by cell:
- * - sum and mean accumulate each cell's finite values in single precision,
- *   gene by gene in signature order (an absent sparse entry is a zero, and
- *   adding zero leaves a sum unchanged), then the mean divides by the count
- *   of finite values (NaN when there is none);
+ * - mean accumulates each cell's finite values in single precision, gene by
+ *   gene in signature order (an absent sparse entry is a zero, and adding
+ *   zero leaves a sum unchanged), then divides by the count of finite values
+ *   (NaN when there is none);
+ * - mean of transformed values (`addGene(column, {scale, offset})`: each
+ *   value `v` taken as `v × scale + offset`, a zero as `offset`), as the mean
+ *   z-score is (`scale = 1/σ`, `offset = −μ/σ`), accumulated in double
+ *   precision: a sparse gene still costs its entries;
  * - median is the median of a cell's finite values, the absent sparse entries
  *   counted as zeros (`medianInPlace`).
  *
@@ -49,13 +53,13 @@ export function isSparseGeneColumn(column) {
 export class SignaturePageScorer {
   /**
    * @param {Object} options
-   * @param {'mean'|'sum'|'median'} options.method
+   * @param {'mean'|'median'} options.method
    * @param {number} options.geneCount - Genes that will be added
    * @param {ArrayLike<number>} options.cellIndices - The page's distinct cells
    * @param {number} options.pointCount - Cells in the dataset (column length)
    */
   constructor({ method, geneCount, cellIndices, pointCount }) {
-    if (!['mean', 'sum', 'median'].includes(method)) {
+    if (!['mean', 'median'].includes(method)) {
       throw new RangeError(`Unsupported signature scoring method: ${String(method)}`);
     }
     if (!Number.isSafeInteger(geneCount) || geneCount < 1) {
@@ -92,6 +96,11 @@ export class SignaturePageScorer {
     this._entryCells = new Int32Array(0);
     this._entryValues = new Float64Array(0);
     this._entryCount = 0;
+    /** Transformed genes: their values times scale (doubles), offsets summed. */
+    this._scaled = null;
+    this._offsetSum = 0;
+    /** Offsets of transformed genes a cell has no finite value of. */
+    this._missingOffset = null;
   }
 
   _positions() {
@@ -107,19 +116,65 @@ export class SignaturePageScorer {
   /**
    * Add the next gene of the signature.
    * @param {ArrayLike<number>|SparseGeneColumn} column - Over every dataset cell
+   * @param {{scale: number, offset: number}|null} [affine] - Take each value
+   *   as `v × scale + offset` (mean only)
    */
-  addGene(column) {
+  addGene(column, affine = null) {
     if (this._added >= this._geneCount) {
       throw new RangeError('More genes were added than the signature has');
     }
     if (column?.length !== this._pointCount) {
       throw new RangeError('A signature gene column must cover every dataset cell');
     }
+    if (affine !== null) {
+      if (this._method !== 'mean' || !Number.isFinite(affine.scale) || !Number.isFinite(affine.offset)) {
+        throw new RangeError('A transformed gene needs the mean and a finite scale and offset');
+      }
+      this._added++;
+      this._addAffine(column, affine);
+      return;
+    }
     this._added++;
     if (isSparseGeneColumn(column)) {
       this._addSparse(column);
     } else {
       this._addDense(column);
+    }
+  }
+
+  _addAffine(column, { scale, offset }) {
+    const size = this._cells.length;
+    this._scaled ??= new Float64Array(size);
+    this._missingOffset ??= new Float64Array(size);
+    this._offsetSum += offset;
+    const scaled = this._scaled;
+    const missing = this._missing;
+    const missingOffset = this._missingOffset;
+    if (isSparseGeneColumn(column)) {
+      const position = this._positions();
+      const { indices, values } = column;
+      for (let e = 0; e < indices.length; e++) {
+        const p = position[indices[e]];
+        if (p < 0) continue;
+        const value = values[e];
+        if (Number.isFinite(value)) {
+          scaled[p] += value * scale;
+        } else {
+          missing[p]++;
+          missingOffset[p] += offset;
+        }
+      }
+      return;
+    }
+    const cells = this._cells;
+    for (let p = 0; p < cells.length; p++) {
+      const value = column[cells[p]];
+      if (Number.isFinite(value)) {
+        scaled[p] += value * scale;
+      } else {
+        missing[p]++;
+        missingOffset[p] += offset;
+      }
     }
   }
 
@@ -195,11 +250,18 @@ export class SignaturePageScorer {
     const scores = this.scores;
     const missing = this._missing;
     const geneCount = this._geneCount;
-    const mean = this._method === 'mean';
+    const scaled = this._scaled;
+    const missingOffset = this._missingOffset;
+    const offsetSum = this._offsetSum;
     for (let p = from; p < to; p++) {
       const count = geneCount - missing[p];
-      if (count === 0) scores[p] = NaN;
-      else if (mean) scores[p] = scores[p] / count;
+      if (count === 0) {
+        scores[p] = NaN;
+      } else if (scaled !== null) {
+        scores[p] = (scores[p] + scaled[p] + offsetSum - missingOffset[p]) / count;
+      } else {
+        scores[p] = scores[p] / count;
+      }
     }
   }
 

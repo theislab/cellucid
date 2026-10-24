@@ -10,7 +10,7 @@
  * @module data/sources/providers/geo
  */
 
-import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
 import { describeRemoteFile, fileTitleOf } from '../remote-file.js';
 
 const GEO_FTP = 'https://ftp.ncbi.nlm.nih.gov/geo/series/';
@@ -95,7 +95,7 @@ export default Object.freeze({
   match(input) {
     return parseGeo(input);
   },
-  async open(value, { signal = null } = {}) {
+  async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseGeo(value);
     if (parsed === null) {
       throw new DataSourceError(
@@ -109,12 +109,13 @@ export default Object.freeze({
     const folder = geoSupplementaryUrl(accession);
     let fileName = requested;
     if (fileName === null) {
-      const response = await fetch(folder, { signal });
+      onStep?.(`Listing the files of ${accession}`);
+      const response = await fetchWhenNotBusy(folder, { signal });
       if (!response.ok) {
         throw new DataSourceError(
           response.status === 404
-            ? `GEO series ${accession} has no supplementary files.`
-            : `GEO series ${accession} could not be listed (HTTP ${response.status}).`,
+            ? `GEO series ${accession} has no supplementary files. Check the accession on GEO.`
+            : `GEO series ${accession} could not be listed (HTTP ${response.status}). Try again later.`,
           response.status === 404
             ? DataSourceErrorCode.NOT_FOUND
             : DataSourceErrorCode.NETWORK_ERROR,
@@ -159,6 +160,7 @@ export default Object.freeze({
         url: `https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${accession}`,
       },
       signal,
+      onStep,
     });
     return { title: `${accession} / ${fileName}`, file, attribution: file.attribution };
   },

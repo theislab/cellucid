@@ -200,9 +200,11 @@ function storedZip(files) {
  * @param {Object<string, Categorical|Float32Array|string[]>} [dataset.obs]
  * @param {Object<string, {data: Float32Array, columns: number}>} [dataset.obsm]
  * @param {Object} [dataset.uns] - Plain values: text, numbers, lists, mappings
+ * @param {Object<string, Float32Array>} [dataset.layers] - Dense cells x genes, row-major
+ * @param {{genes: string[], X: Float32Array}|null} [dataset.raw] - `raw`: its own genes (`raw.var`) and dense X
  * @returns {Buffer} The `.zarr.zip` bytes
  */
-export function anndataZarrZip({ cells, genes = [], X = null, obs = {}, obsm = {}, uns = {} }) {
+export function anndataZarrZip({ cells, genes = [], X = null, obs = {}, obsm = {}, uns = {}, layers = {}, raw = null }) {
   const store = new StoreWriter();
   store.group('', { 'encoding-type': 'anndata', 'encoding-version': '0.1.0' });
   store.dataframe('obs', Array.from({ length: cells }, (_, index) => `cell-${index}`), obs);
@@ -214,7 +216,14 @@ export function anndataZarrZip({ cells, genes = [], X = null, obs = {}, obsm = {
   for (const [key, { data, columns }] of Object.entries(obsm)) {
     store.typed(`obsm/${key}`, data, [cells, columns]);
   }
-  for (const empty of ['layers', 'obsp', 'varm', 'varp']) store.group(`${empty}/`, DICT_ATTRS);
+  store.group('layers/', DICT_ATTRS);
+  for (const [key, data] of Object.entries(layers)) store.typed(`layers/${key}`, data, [cells, genes.length]);
+  if (raw !== null) {
+    store.group('raw/', { 'encoding-type': 'raw', 'encoding-version': '0.1.0' });
+    store.dataframe('raw/var', raw.genes, {});
+    store.typed('raw/X', raw.X, [cells, raw.genes.length]);
+  }
+  for (const empty of ['obsp', 'varm', 'varp']) store.group(`${empty}/`, DICT_ATTRS);
   store.group('uns/', DICT_ATTRS);
   for (const [key, value] of Object.entries(uns)) store.value(`uns/${key}`, value);
   const sorted = new Map([...store.files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));

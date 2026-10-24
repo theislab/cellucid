@@ -1079,8 +1079,11 @@ test(
       const summary = details.children[0];
       assert.equal(summary.children.length, 1);
       assert.equal(summary.children[0].className, 'disclosure-title');
-      const closeButton = registration.actions[1];
-      assert.equal(closeButton.className, 'accordion-close-btn');
+      assert.deepEqual(
+        registration.actions.map(action => action.className),
+        ['accordion-copy-btn', 'accordion-maximize-btn', 'accordion-close-btn', 'disclosure-chevron']
+      );
+      const closeButton = registration.actions[2];
       manager.closeWindow = receivedId => {
         assert.equal(receivedId, windowId);
         return rejectedClose;
@@ -1669,12 +1672,18 @@ test(
       createFromSessionDescriptor(descriptor) {
         events.push(`create:${descriptor.modeId}`);
       },
+      importViewSizes() {
+        events.push('sizes');
+      },
     };
 
     const result = restoreAnalysisWindows(
       { analysisWindowManager: manager },
       {},
-      encodeTypedJson({ windows: [{ modeId: 'replacement' }] }),
+      encodeTypedJson({
+        windows: [{ modeId: 'replacement' }],
+        sizes: { window: {}, expandedView: {} },
+      }),
     );
     const createdBeforeCloseSettled = events.includes('create:replacement');
 
@@ -1686,6 +1695,7 @@ test(
     assert.deepEqual(events, [
       'close:start',
       'close:done',
+      'sizes',
       'create:replacement',
     ]);
   },
@@ -1813,7 +1823,7 @@ test(
     const memoryMonitor = getMemoryMonitor();
     memoryMonitor.setShowNotifications(false);
     try {
-      comparison = new ComparisonModule({ state, container: {} });
+      comparison = new ComparisonModule({ state, container: {}, colorByGene: async () => null });
       dataLayer = comparison.dataLayer;
 
       await memoryMonitor.performCleanup('critical');

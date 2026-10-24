@@ -34,6 +34,7 @@ import {
   defaultEmbeddingSlots,
   describeObsmEntry,
   dimensionSlot,
+  isBooleanVarDtype,
   makeUniqueNames,
   nothingPlottableMessage,
   obsmEntryDefect,
@@ -64,6 +65,7 @@ import {
   DEFAULT_KNN_KEY,
   obsmIndexOf,
   requireObspKey,
+  openingSlot,
   resolveEmbeddingSlotsAsync,
 } from './data-mapping-candidates.js';
 import { validateConnectivitySummary } from './connectivity-summary-contract.js';
@@ -82,6 +84,7 @@ import {
 } from './categorical-storage-contract.js';
 
 import { residencyBudgetBytes } from './memory-budget.js';
+import { scanpyCategoryPalette } from './palettes.js';
 import { onAbort } from '../formats/io/abort.js';
 import { getReadActivityLog } from './read-activity-log.js';
 
@@ -897,6 +900,15 @@ export class BaseAnnDataAdapter {
    * The title the file gives itself (`uns['title']`), or null.
    * @returns {string|null}
    */
+  /**
+   * The link this file is read over, as its reader last measured it
+   * (`AnnDataReaderClient.linkMeasurement()`), or null.
+   * @returns {Readonly<Object>|null}
+   */
+  linkMeasurement() {
+    return this._loader?.linkMeasurement?.() ?? null;
+  }
+
   getFileTitle() {
     const title = this._metadata?.title;
     return typeof title === 'string' && title.length > 0 ? title : null;
@@ -964,22 +976,23 @@ export class BaseAnnDataAdapter {
       }
       this._metadata = metadata;
       this._describedObsm = described.obsm;
-      await this._computeObsFieldsMetadata(generation);
-      this._assertLifecycleGeneration(generation);
-
       const resolution = await this._resolveEmbeddingSlots(described, generation);
       this._slots = Object.freeze({ ...resolution.slots });
+
+      // The embedding the first view draws is read from here on, beside the
+      // field lists: it is what the view waits for, and the largest read of
+      // opening. Candidate sources are adopted only after initialize()
+      // resolves, so its payload is validated before then: corrupt bytes
+      // cannot replace and close a still-working dataset.
+      const firstView = this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]);
+      firstView.catch(() => {});
+
+      await this._computeObsFieldsMetadata(generation);
+      this._assertLifecycleGeneration(generation);
       this._candidates = this._assembleCandidates(described, resolution);
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
-
-      // Candidate sources are adopted only after initialize() resolves.
-      // Validate the default dimension's embedding payload here so corrupt
-      // bytes cannot replace and close a still-working dataset.
-      const defaultSlot = [...DIMENSION_SLOTS]
-        .reverse()
-        .find(slot => this._slots[slot] !== null);
-      await this.getEmbeddingForRef(this._slots[defaultSlot]);
+      await firstView;
       this._assertLifecycleGeneration(generation);
     } catch (error) {
       if (
@@ -1087,12 +1100,16 @@ export class BaseAnnDataAdapter {
 
   /**
    * The dimension slots a launch named (`embedding1d` ...), checked against
-   * the file: each must exist, be a usable dense array wide enough, and load.
+   * the file's metadata: each must exist and be a usable dense array wide
+   * enough. Nothing is read here: the slot the first view shows is read (and
+   * its values checked) by `initialize()`, each other one when it is first
+   * shown, so opening a file never waits for embeddings its first view does
+   * not draw.
    *
-   * @returns {Promise<Object|null>} The named slots, or null when none is
+   * @returns {Object|null} The named slots, or null when none is
    * @private
    */
-  async _requestedEmbeddingSlots(entries, loadCheck) {
+  _requestedEmbeddingSlots(entries) {
     const named = DIMENSION_SLOTS.filter(slot => Object.hasOwn(this._defaults, `embedding${slot}`));
     if (named.length === 0) return null;
     const requested = {};
@@ -1116,8 +1133,6 @@ export class BaseAnnDataAdapter {
       } catch (error) {
         throw new RangeError(`defaults.${name} obsm['${key}']: ${error.message}`, { cause: error });
       }
-      const defect = await loadCheck(key, resolved);
-      if (defect !== null) throw new EmbeddingLoadError(key, resolved, defect);
       requested[slot] = { key, columns: resolved };
     }
     return requested;
@@ -1168,7 +1183,7 @@ export class BaseAnnDataAdapter {
     const entries = obsmEntries(described.obsm);
     // Slots a launch named are shown as named; the others follow the default
     // rule, and only when neither fills a slot is the best guess made.
-    const requested = await this._requestedEmbeddingSlots(entries, loadCheck);
+    const requested = this._requestedEmbeddingSlots(entries);
     const resolution = requested === null
       ? await resolveEmbeddingSlotsAsync(entries, loadCheck)
       : { slots: this._withDefaultRuleSlots(entries, requested), guessed: [], rejected: [] };
@@ -1281,26 +1296,38 @@ export class BaseAnnDataAdapter {
   ) {
     this._obsFieldsMetadata = null;
 
-    // Opening reads no obs value. Every field is described from its metadata
-    // (a categorical's categories are its stored dictionary), and every field
-    // is asked for at once, so the reader plans those small reads together.
-    // A string or boolean column is categorical too, but its categories are
-    // its distinct values: they are found when it is first loaded
-    // (`_getOrLoadFieldData`), so a column of per-cell unique strings (a
-    // barcode, `observation_joinid`) costs nothing until it is used, and one
-    // that cannot be a categorical is refused then, never at open.
+    // Opening reads no obs value and no category dictionary: every field is
+    // described from its metadata alone, so the first view waits for none of
+    // them. A categorical's stored categories (and Scanpy's palette for them)
+    // are read when the field is first loaded (`_getOrLoadFieldData`): a
+    // dictionary of one category per cell (a barcode stored as a
+    // categorical) is megabytes nobody needs until it is shown. A string or
+    // boolean column is categorical too; its categories are its distinct
+    // values, found when it is first loaded, so one that cannot be a
+    // categorical is refused then, never at open.
     const describe = async key => {
-      const fieldInfo = await this._loader.getObsFieldInfo(key);
+      const fieldInfo = await this._loader.getObsFieldKind(key);
       this._assertLifecycleGeneration(generation);
       if (fieldInfo.dtype === 'categorical') {
-        validateCellucidCategories(fieldInfo.categories, key);
-        return { key, kind: 'category', categories: fieldInfo.categories, ordered: fieldInfo.ordered };
+        return {
+          key,
+          kind: 'category',
+          categories: null,
+          // How many there are is metadata, known without reading them.
+          categoryCount: fieldInfo.categoryCount,
+          ordered: fieldInfo.ordered,
+          // Scanpy's `uns['<key>_colors']`, read with the categories.
+          palette: null,
+          _dictionaryOnLoad: true,
+        };
       }
       if (fieldInfo.dtype === 'float' || fieldInfo.dtype === 'int' || fieldInfo.dtype === 'uint') {
         return { key, kind: 'continuous', min: null, max: null };
       }
       if (fieldInfo.dtype === 'string' || fieldInfo.dtype === 'bool') {
-        return { key, kind: 'category', categories: null, _needsCodeComputation: true };
+        // A text column's categories are found by reading it, in an order a
+        // Scanpy palette was not written in: it opens in Cellucid's colours.
+        return { key, kind: 'category', categories: null, palette: null, _needsCodeComputation: true };
       }
       throw new Error(`Observation field '${key}' has unsupported dtype '${fieldInfo.dtype}'`);
     };
@@ -1313,8 +1340,9 @@ export class BaseAnnDataAdapter {
     this._metadata.obs_fields = obsFieldsMetadata.map(f => ({
       key: f.key,
       kind: f.kind,
-      // Null for a column whose categories are found when it is loaded.
-      n_categories: f.kind === 'category' ? (f.categories?.length ?? null) : undefined,
+      // A stored dictionary's count is metadata; null for a text column,
+      // whose categories are found when it is loaded.
+      n_categories: f.kind === 'category' ? (f.categories?.length ?? f.categoryCount ?? null) : undefined,
       ...(typeof f.ordered === 'boolean'
         ? { ordered: f.ordered }
         : {}),
@@ -1506,6 +1534,20 @@ export class BaseAnnDataAdapter {
     const meta = this._obsFieldsMetadata.find(f => f.key === key);
     if (!meta) {
       throw new Error(`Obs field '${key}' not found`);
+    }
+
+    // A stored category dictionary is read with the field's first load, with
+    // the palette Scanpy wrote for it (`uns['<key>_colors']`), and kept for
+    // the life of the dataset.
+    if (meta._dictionaryOnLoad === true) {
+      const fieldInfo = await this._loader.getObsFieldInfo(key);
+      this._assertLifecycleGeneration(generation);
+      if (meta._dictionaryOnLoad === true) {
+        validateCellucidCategories(fieldInfo.categories, key);
+        meta.categories = fieldInfo.categories;
+        meta.palette = scanpyCategoryPalette(fieldInfo.colors, fieldInfo.categories.length);
+        meta._dictionaryOnLoad = false;
+      }
     }
 
     if (
@@ -1801,9 +1843,11 @@ export class BaseAnnDataAdapter {
         : {
             key: field.key,
             kind: 'category',
-            // Null for a string or boolean column: its categories are found
-            // when it is first loaded.
-            n_categories: field.categories === null ? null : field.categories.length,
+            // A stored dictionary's count is metadata; null for a string or
+            // boolean column, whose categories are found when it is loaded.
+            n_categories: field.categories === null
+              ? (this._obsFieldsMetadata[field.fieldIndex]?.categoryCount ?? null)
+              : field.categories.length,
           }
     ));
 
@@ -1825,7 +1869,7 @@ export class BaseAnnDataAdapter {
         n_edges: null,
       },
       embeddings: {
-        default_dimension: resolved[resolved.length - 1].dimension,
+        default_dimension: slotDimension(openingSlot(this._slots)),
         defaults,
         items,
       },
@@ -2128,6 +2172,7 @@ export class BaseAnnDataAdapter {
         categories: field.categories,
         codesDtype: storage.dtype,
         codesMissingValue: storage.missingValue,
+        palette: field.palette,
         outlierQuantilesPath: latentIndex < 0 ? null : mappingLatentOutlierPath(latentIndex, fieldIndex),
       });
     });
@@ -2181,6 +2226,37 @@ export class BaseAnnDataAdapter {
             renamed: names.renamed.map(pair => [...pair]),
           },
     };
+  }
+
+  /**
+   * The genes of one gene list (`var` or a mapped `var/{axis}/{names}`) that
+   * one boolean column of their axis marks, by their names in that list:
+   * the highly variable genes when the column is `highly_variable`. The
+   * column is read now, when it is asked for; null for a file without an
+   * expression matrix.
+   *
+   * @param {string} path
+   * @param {string} column
+   * @returns {Promise<string[]|null>}
+   */
+  async getMarkedGenes(path, column) {
+    const generation = this._captureLifecycleGeneration();
+    const route = this._resolveGeneRoute(path, 'list');
+    if (route === null) return null;
+    const entry = axisVarColumns(this.getMappingCandidates(), route.axisRoute)
+      .find(item => item.key === column);
+    if (entry === undefined || !isBooleanVarDtype(entry.dtype)) {
+      throw new MappingLoadError(column, 'not a true/false column of these genes');
+    }
+    const [names, flags] = await Promise.all([
+      this._geneNames(route),
+      this._loader.readVarFlags(route.varAxis, column),
+    ]);
+    this._assertLifecycleGeneration(generation);
+    if (flags.length !== names.names.length) {
+      throw new MappingLoadError(column, `has ${flags.length} rows for ${names.names.length} genes`);
+    }
+    return names.names.filter((_, gene) => flags[gene] === 1);
   }
 
   /**
@@ -2320,6 +2396,9 @@ export class BaseAnnDataAdapter {
           data: codes.buffer,
           kind: 'category',
           categories: fieldData.categories,
+          // The file's colours for them, for a field whose categories its
+          // first load found (null for a text column's).
+          palette: this._obsFieldsMetadata?.find(field => field.key === key)?.palette ?? null,
           dtype: dtypeStr,
           missingValue,
           ...(typeof fieldData.ordered === 'boolean'

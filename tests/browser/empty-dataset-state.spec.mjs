@@ -5,8 +5,8 @@
  *
  * These assertions come from defects found by driving the running app after
  * None: Keep view, Figure export and Save session threw on the empty runtime;
- * Differential expression and Marker genes threw "Performance settings require
- * an exact positive dataset pointCount" while building their forms; Analyze
+ * Differential expression and Marker genes threw on the zero point count while
+ * building their forms; Analyze
  * performance raised a page error waiting for renderer statistics no empty
  * frame publishes; and Load quoted "0 cells and 0 genes now" as if an empty
  * runtime were a dataset.
@@ -154,7 +154,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   await forgetSessionSource(sessionPath);
 
   await page.locator('#dataset-select').selectOption('__none__');
-  await expect(page.locator('#dataset-name')).toHaveText('—');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await openSections(page);
 
   // Keep view, Figure export and Save act on cells: unavailable, with a reason.

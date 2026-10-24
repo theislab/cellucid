@@ -15,6 +15,7 @@ import {
   assertExactKeys,
   assertSafeInteger
 } from '../schema-contract.js';
+import { createSlicedInputStream } from '../../../formats/io/inflate.js';
 
 /**
  * @param {AbortSignal | null | undefined} signal
@@ -43,17 +44,6 @@ const GZIP_FIXED_HEADER_BYTES = 10;
 const GZIP_TRAILER_BYTES = 8;
 const UINT32_MODULUS = 0x100000000;
 
-/**
- * Input bytes handed to a native decompressor per pull.
- *
- * Every supported engine's `DecompressionStream` inflates each written chunk
- * to completion before it honours backpressure, so a whole payload written as
- * one chunk lets a DEFLATE bomb expand without bound before any reader limit
- * can cancel it. Feeding the input in slices of this size bounds the output
- * produced past a reader's limit to DEFLATE's maximum expansion of one slice
- * (1032 x 32 KiB, about 33 MiB), at a few percent of inflate throughput.
- */
-export const NATIVE_INFLATE_INPUT_SLICE_BYTES = 32 * 1024;
 
 function readUint32LE(bytes, offset) {
   return (
@@ -103,45 +93,6 @@ function requireSingleMemberEnvelope(compressed, exactOutputBytes) {
       + `the exact ${exactOutputBytes}-byte contract modulo 2^32.`,
     );
   }
-}
-
-/**
- * Stream byte parts to a native decompressor in bounded slices, one slice
- * per pull, so inflation advances only as fast as its reader consumes it.
- *
- * @param {readonly Uint8Array[]} parts
- * @returns {ReadableStream<Uint8Array>}
- */
-export function createSlicedInputStream(parts) {
-  for (const part of parts) {
-    if (!(part instanceof Uint8Array)) {
-      throw new TypeError('Native decompressor input must be Uint8Array parts.');
-    }
-  }
-  let partIndex = 0;
-  let partOffset = 0;
-  return new ReadableStream({
-    pull(controller) {
-      while (
-        partIndex < parts.length
-        && partOffset >= parts[partIndex].byteLength
-      ) {
-        partIndex += 1;
-        partOffset = 0;
-      }
-      if (partIndex === parts.length) {
-        controller.close();
-        return;
-      }
-      const part = parts[partIndex];
-      const end = Math.min(
-        part.byteLength,
-        partOffset + NATIVE_INFLATE_INPUT_SLICE_BYTES,
-      );
-      controller.enqueue(part.subarray(partOffset, end));
-      partOffset = end;
-    },
-  }, { highWaterMark: 0 });
 }
 
 /**

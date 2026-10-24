@@ -557,14 +557,10 @@ function differentialHarness({ execute }) {
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     state: { pointCount: 6 },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));
-    },
-    getPageInfo(pageId) {
-      return { id: pageId, name: `Page ${pageId}` };
-    },
-    getCellIndicesForPage(pageId) {
-      return pageId === 'page-A' ? Uint32Array.of(0, 1, 2) : Uint32Array.of(3, 4, 5);
     },
     async readGeneColumn(gene, options) {
       reads.push({ gene, ...options });
@@ -592,12 +588,10 @@ function differentialHarness({ execute }) {
 
 const deResult = { meanA: 2, meanB: 5, log2FoldChange: -1, pValue: 0.25, statistic: 3, nA: 3, nB: 3, method: 'wilcox' };
 const deOptions = {
-  pageA: 'page-A',
-  pageB: 'page-B',
+  groupA: { name: 'Page page-A', cells: Uint32Array.of(0, 1, 2) },
+  groupB: { name: 'Page page-B', cells: Uint32Array.of(3, 4, 5) },
   geneList: ['Gene A', 'Gene B', 'Gene C'],
   minCells: 2,
-  parallelism: 1,
-  batchConfig: { preloadCount: 1, memoryBudgetMB: 1, networkConcurrency: 1 },
 };
 
 test('differential expression tells its job the cost and every gene, and runs under its signal', async () => {

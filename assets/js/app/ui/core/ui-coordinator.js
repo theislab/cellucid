@@ -28,6 +28,7 @@ import { initViewControls } from '../modules/view-controls.js';
 import { initRepresentationControls } from '../modules/representation-controls.js';
 import { initDataMappingControls } from '../modules/data-mapping-controls.js';
 import { initDatasetControls } from '../modules/dataset-controls.js';
+import { initDatasetCard } from '../modules/dataset-card.js';
 import { initSessionControls } from '../modules/session-controls.js';
 import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
@@ -524,8 +525,45 @@ export function initUI({
   });
   const { showSessionStatus } = sessionControls;
 
+  // The Dataset box describes the open dataset from its identity, where it
+  // is stored, and what its data mapping uses.
+  const datasetCard = initDatasetCard({
+    dom: dom.datasetCard,
+    describeStorage: (sourceType, datasetId) => {
+      const source = dataSourceManager?.getSource(sourceType) ?? null;
+      const annData = typeof source?.getAnnDataSource === 'function'
+        ? source.getAnnDataSource(datasetId)
+        : null;
+      return typeof annData?.describeStorage === 'function'
+        ? annData.describeStorage()
+        : null;
+    },
+    describeMapping: () => {
+      const mapping = state.getDataMapping();
+      if (mapping === null) return null;
+      const candidates = state.getMappingCandidates();
+      const shown = state.getRepresentationChoices()
+        .filter(choice => choice.enabled && choice.usable)
+        .map(choice => `${choice.name} ${choice.dimension}D`);
+      return {
+        genes: state.getVarAxisGeneCount(),
+        graph: state.getConnectivityGraphFact(),
+        embeddings: {
+          shown,
+          arrays: candidates === null
+            ? shown.length
+            : candidates.obsm.filter(item => item.usable).length,
+        },
+        layers: candidates === null ? null : candidates.layers.map(layer => layer.key),
+        raw: candidates === null ? null : (candidates.raw === null ? false : candidates.raw.n_vars),
+        latent: mapping.latent,
+        vectorFields: mapping.vectorFields.map(binding => binding.key),
+      };
+    }
+  });
   const datasetControls = initDatasetControls({
     dom: dom.dataset,
+    datasetCard,
     dataSourceManager,
     clearDataset: clearActiveDataset,
     reloadDataset: reloadActiveDataset,
@@ -626,10 +664,7 @@ export function initUI({
     'mapping:changed',
     () => {
       viewControls?.renderSplitViewBadges?.();
-      datasetControls.updateMappedDatasetFacts({
-        connectivity: state.getConnectivityGraphFact(),
-        genes: state.getVarAxisGeneCount(),
-      });
+      datasetControls.updateMappedDatasetFacts();
     }
   );
   // A new gene list (another expression matrix or other gene names) is
@@ -813,6 +848,7 @@ export function initUI({
       () => representationControls.destroy(),
       () => dataMappingControls.destroy(),
       () => datasetControls.destroy(),
+      () => datasetCard.destroy(),
       () => {
         if (typeof figureExportControls.destroy === 'function') {
           return figureExportControls.destroy();
@@ -872,6 +908,7 @@ export function initUI({
 
   return {
     activateField: fieldSelector.activateField,
+    colorByGene: fieldSelector.colorByGene,
     applyRenderMode: renderControls.applyRenderMode,
     applyDatasetRenderDefaults,
     loadStartupDataset: datasetControls.loadStartupDataset,

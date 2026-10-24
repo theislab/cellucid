@@ -10,7 +10,7 @@
  * @module state-serializer/filters
  */
 
-import { getCategoryColor } from '../../data/palettes.js';
+import { defaultCategoryColor } from '../../data/palettes.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { makeFieldId } from '../utils/field-constants.js';
 import {
@@ -292,10 +292,11 @@ function serializeCategoryFilter(field) {
       const color = field._categoryColors[categoryIndex];
       if (color === undefined || color === null) continue;
       assertRgb(color, `Category color "${field.key}"[${categoryIndex}]`);
-      // The palette default is a function of position, so "changed" is measured
-      // against the position the colour is currently at. Only the change itself
-      // is carried across a rewritten file, and it is carried by name.
-      if (!colorsEqual(color, getCategoryColor(categoryIndex))) {
+      // The default is a function of position (the file's palette, else
+      // Cellucid's), so "changed" is measured against the position the colour
+      // is currently at. Only the change itself is carried across a rewritten
+      // file, and it is carried by name.
+      if (!colorsEqual(color, defaultCategoryColor(field, categoryIndex))) {
         colors.push({
           categoryName: categoryNameAt(
             field,

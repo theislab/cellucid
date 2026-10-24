@@ -58,7 +58,7 @@ async function residue(page) {
 }
 
 async function openFile(page, file, cells) {
-  await page.locator('#user-data-h5ad-input').setInputFiles(file);
+  await page.locator('#user-data-file-input').setInputFiles(file);
   await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount)).toBe(cells);
   await settleFrames(page);
   expect(await residue(page)).toEqual({ glErrors: [], failures: [] });

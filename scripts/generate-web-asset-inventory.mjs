@@ -27,7 +27,11 @@ const REQUIRED_ROOT_ASSETS = Object.freeze([
   // server that serves a cached build must carry it too.
   'CITATION.cff',
   'browserconfig.xml',
+  // Browsers ask for /favicon.ico on their own; every page links this one.
+  'favicon.ico',
   'index.html',
+  // The privacy policy the Google and Microsoft sign-in screens link to.
+  'privacy.html',
   'site.webmanifest',
 ]);
 const REQUIRED_ROOT_ASSET_SET = new Set(REQUIRED_ROOT_ASSETS);

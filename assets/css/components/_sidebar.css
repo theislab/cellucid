@@ -168,9 +168,8 @@
 /* The wordmark is grey-scale ink drawn for a light surface. In the dark theme
    it is inverted (the hue rotation keeps any tint where it was), so the brand
    card follows the theme like every other surface instead of staying a white
-   block. */
-:root[data-theme="dark"] .sidebar-logo,
-:root[data-theme="dark"] .welcome-logo {
+   block. The brand card's wordmark does the same (components/_welcome.css). */
+:root[data-theme="dark"] .sidebar-logo {
   filter: invert(1) hue-rotate(180deg);
 }
 

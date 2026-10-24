@@ -177,6 +177,31 @@ test('listing reads each file\'s metadata and uns only; choosing one opens it', 
   assert.equal(single.openedSource('tiny-ready'), null);
 });
 
+test('a dataset being opened is listed from its opening, not read a second time', async t => {
+  quiet(t);
+  const host = serveFixtureHost(t, { prefix: BASE, root: FIXTURES });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'tiny-ready', path: 'ready.zarr/' }]), BASE, 'local-demo'),
+    sourceType: 'local-demo',
+    sourceName: 'Samples',
+  });
+  t.after(() => owner.close());
+  const opening = owner.open('tiny-ready');
+  const listing = owner.describe(null);
+  const { metadata } = await opening;
+  const metadataReads = host.requests.filter(request => request.url.endsWith('/.zmetadata')).length;
+  const [summary] = await listing;
+  assert.equal(host.requests.filter(request => request.url.endsWith('/.zmetadata')).length, metadataReads);
+  assert.equal(metadataReads, 1, 'the store is opened once');
+  assert.deepEqual(summary, {
+    id: 'tiny-ready',
+    name: metadata.name,
+    description: 'Six cells written for the Cellucid web contract tests.',
+    stats: { n_cells: 6, n_genes: 3 },
+  });
+});
+
 test('an .h5ad listed in a catalog is read in place with range requests', async t => {
   quiet(t);
   serveFixtureHost(t, { prefix: BASE, root: FIXTURES });
@@ -207,4 +232,58 @@ test('a file stating another id than its catalog entry is refused when opened', 
   t.after(() => owner.close());
   await assert.rejects(owner.open('tiny-ready'), /lists other-id\.h5ad as dataset 'tiny-ready', but the file states the id\s+'other-dataset'/);
   assert.equal(owner.openedSource('tiny-ready'), null);
+});
+
+test('the entries are listed from datasets.json itself, before any file is read', async t => {
+  quiet(t);
+  const host = serveFixtureHost(t, { prefix: BASE, root: FIXTURES });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([
+      { id: 'tiny-ready', path: 'ready.zarr/' },
+      { id: 'other', path: 'cell%20atlas.h5ad' },
+    ]), BASE, 'local-demo'),
+    sourceType: 'local-demo',
+    sourceName: 'Samples',
+  });
+  t.after(() => owner.close());
+  assert.deepEqual(owner.entries(), [
+    { id: 'tiny-ready', name: 'ready' },
+    { id: 'other', name: 'cell atlas' },
+  ]);
+  assert.equal(host.requests.length, 0);
+});
+
+test('an opening stops once no caller wants it, and stays once it has opened', async t => {
+  quiet(t);
+  serveFixtureHost(t, { prefix: BASE, root: FIXTURES });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'tiny-ready', path: 'ready.zarr/' }]), BASE, 'local-demo'),
+    sourceType: 'local-demo',
+    sourceName: 'Samples',
+  });
+  t.after(() => owner.close());
+
+  // Two dataset changes want it; the first is replaced, the second is not.
+  const first = new AbortController();
+  const second = new AbortController();
+  const shared = owner.open('tiny-ready', first.signal);
+  assert.equal(owner.open('tiny-ready', second.signal), shared);
+  first.abort();
+  const { metadata } = await shared;
+  assert.equal(metadata.id, 'tiny-ready');
+  // Opened: a later abort of the change that opened it changes nothing.
+  second.abort();
+  assert.equal(await owner.open('tiny-ready', null), await shared);
+  owner.releaseExcept(null);
+
+  // The only caller is replaced while it opens: it stops, and choosing it
+  // again opens it afresh.
+  const replaced = new AbortController();
+  const stopped = owner.open('tiny-ready', replaced.signal);
+  replaced.abort();
+  await assert.rejects(stopped, error => error?.name === 'AbortError');
+  const again = await owner.open('tiny-ready', new AbortController().signal);
+  assert.equal(again.metadata.id, 'tiny-ready');
 });

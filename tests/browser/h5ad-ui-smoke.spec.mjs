@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import {
   readBundle,
 } from '../../assets/js/app/session/bundle/reader.js';
@@ -195,7 +195,7 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(fixturePath);
 
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
@@ -208,7 +208,7 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   expect(browserErrors).toEqual([]);
 });
 
-test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible controls', async ({ page }, testInfo) => {
+test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible controls', async ({ page, browserName }, testInfo) => {
   const browserErrors = [];
   page.on('console', message => {
     if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
@@ -230,19 +230,16 @@ test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible cont
   await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI fixture');
 
-  await expect(page.locator('#user-data-zarr-folder-input')).toHaveAttribute('webkitdirectory', '');
-  await expect(page.locator('#user-data-h5ad-input')).toHaveAttribute('accept', '.h5ad');
-  await expect(page.locator('#user-data-zarr-archive-input')).toHaveAttribute(
-    'accept',
-    '.zarr.zip,.zip,application/zip',
-  );
+  await expect(page.locator('#user-data-folder-input')).toHaveAttribute('webkitdirectory', '');
+  // One file input takes an .h5ad or a Zarr ZIP; what is picked decides.
+  await expect(page.locator('#user-data-file-input')).toHaveAttribute('accept', '.h5ad,.zip');
 
-  await page.locator('#user-data-zarr-archive-input').setInputFiles(zarrFixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(zarrFixturePath);
   // Completion is a four-second production notification. Observe that exact
   // operation boundary before performing independent UI and field work, which
   // can legitimately outlive the notification on a loaded hosted runner.
   await expectUserDataReadyNotification(page);
-  await expectFileInputCleared(page, '#user-data-zarr-archive-input');
+  await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await captureReadableDataset(
@@ -251,9 +248,9 @@ test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible cont
   );
   await dismissAllNotifications(page);
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(fixturePath);
   await expectUserDataReadyNotification(page);
-  await expectFileInputCleared(page, '#user-data-h5ad-input');
+  await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await captureReadableDataset(
@@ -283,12 +280,9 @@ test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible cont
     'true',
   );
 
-  await chooseDirectory(
-    page.locator('#user-data-zarr-folder-input'),
-    zarrFolderFixturePath,
-  );
+  await openZarrFolder(page, browserName, zarrFolderFixturePath);
   await expectUserDataReadyNotification(page);
-  await expectFileInputCleared(page, '#user-data-zarr-folder-input');
+  await expectFileInputCleared(page, '#user-data-folder-input');
   await expect(page.locator('#dataset-name')).toHaveText('Forms — Zarr folder');
   await expect(page.locator('#dataset-cells')).toHaveText('48');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 48 cells');

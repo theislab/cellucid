@@ -18,7 +18,12 @@
 import { getNotificationCenter } from '../../notification-center.js';
 import { debug, debugWarn, debugError } from './debug-utils.js';
 import { getHeapMemoryUsage, measureUserAgentSpecificMemory } from './memory-utils.js';
-import { PerformanceConfig } from './performance-config.js';
+
+/**
+ * Shares of the JavaScript heap limit at which pressure is reported: a
+ * warning, a cleanup, and critical.
+ */
+const HEAP_PRESSURE_PERCENT = Object.freeze({ warning: 75, cleanup: 85, critical: 95 });
 
 // =============================================================================
 // CONSTANTS
@@ -330,9 +335,9 @@ class MemoryMonitor {
     if (!Number.isFinite(limitBytes) || limitBytes <= 0) {
       throw new TypeError('Heap thresholds require a positive finite heap limit');
     }
-    const warningPercent = PerformanceConfig.memory.warningThresholdPercent;
-    const cleanupPercent = PerformanceConfig.memory.cleanupThresholdPercent;
-    const criticalPercent = PerformanceConfig.memory.criticalThresholdPercent;
+    const warningPercent = HEAP_PRESSURE_PERCENT.warning;
+    const cleanupPercent = HEAP_PRESSURE_PERCENT.cleanup;
+    const criticalPercent = HEAP_PRESSURE_PERCENT.critical;
     if (
       !Number.isFinite(warningPercent) ||
       !Number.isFinite(cleanupPercent) ||

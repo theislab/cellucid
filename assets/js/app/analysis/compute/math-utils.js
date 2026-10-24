@@ -1244,6 +1244,20 @@ export function mannWhitneyPValue(n1, n2, statistic, options = {}) {
 }
 
 /**
+ * The two-sided normal probability of a rank-sum z score, `2Φ(−|z|)`, with no
+ * continuity correction: scanpy's `rank_genes_groups` Wilcoxon p-value. Its
+ * z is tie-corrected or not as `tie_correct` was (`compute/gene-statistics.js`
+ * computes both). {@link mannWhitneyPValue} stays the default convention.
+ *
+ * @param {number} z
+ * @returns {number}
+ */
+export function mannWhitneyPValueScanpy(z) {
+  if (Number.isNaN(z)) return NaN;
+  return Math.min(1, 2 * normalSurvival(Math.abs(z)));
+}
+
+/**
  * Running rank sum of the first sample and tie term, fed one tie block at a
  * time in ascending value order.
  *

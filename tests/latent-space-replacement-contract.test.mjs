@@ -25,6 +25,7 @@ function categorical(key, fieldIndex) {
     categories: ['a', 'b'],
     codesDtype: 'uint8',
     codesMissingValue: 255,
+    palette: null,
     outlierQuantilesPath: null,
   };
 }

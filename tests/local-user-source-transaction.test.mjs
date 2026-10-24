@@ -184,7 +184,11 @@ test('local Zarr archive selections expose truthful visible folder and ZIP prove
     'portable.zarr.zip',
     'the selected archive filename is part of its provenance'
   );
-  assert.match(archiveMetadata.description, /Zarr ZIP archive/);
+  assert.equal(
+    archiveMetadata.description ?? '',
+    '',
+    'the description is the store\'s own; where it came from is its source'
+  );
   assert.equal(
     source.getPath(),
     'portable.zarr',
@@ -194,64 +198,6 @@ test('local Zarr archive selections expose truthful visible folder and ZIP prove
     (await source.getAnnDataSource().getMetadata(source.datasetId)).source.name,
     'Zarr ZIP archive',
     'the adopted inner source and local UI source must expose one identity'
-  );
-});
-
-test('local AnnData wrapper keeps nested datasource notifications silent', async t => {
-  const originalH5adLoad = H5adDataSource.prototype.loadFromFile;
-  const originalZarrArchiveLoad =
-    ZarrDataSource.prototype.loadFromArchiveFile;
-  const nestedOptions = [];
-
-  H5adDataSource.prototype.loadFromFile =
-    async function (file, options) {
-      nestedOptions.push(['h5ad', options]);
-      this.filename = file.name;
-      this.datasetId = options.datasetId ?? options.defaultDatasetId ?? `h5ad_${file.name.replace(/\.h5ad$/i, '')}`;
-      this._metadata = {
-        id: this.datasetId,
-        name: 'nested h5ad',
-        stats: { n_cells: 2 },
-      };
-      return this._metadata;
-    };
-  ZarrDataSource.prototype.loadFromArchiveFile =
-    async function (file, options) {
-      nestedOptions.push(['zarr-archive', options]);
-      this.dirname = file.name.replace(/\.zip$/i, '');
-      this.datasetId = options.datasetId ?? options.defaultDatasetId ?? `h5ad_${file.name.replace(/\.h5ad$/i, '')}`;
-      this._metadata = {
-        id: this.datasetId,
-        name: 'nested zarr archive',
-        source: {},
-        stats: { n_cells: 2 },
-      };
-      return this._metadata;
-    };
-  t.after(() => {
-    H5adDataSource.prototype.loadFromFile = originalH5adLoad;
-    ZarrDataSource.prototype.loadFromArchiveFile =
-      originalZarrArchiveLoad;
-  });
-
-  const source = new LocalUserDirDataSource();
-  t.after(() => source.clear());
-  await source.loadFromH5adFile(
-    createFile('nested.h5ad', 'h5ad')
-  );
-  await source.loadFromZarrArchive(
-    createFile('nested.zarr.zip', 'zip')
-  );
-
-  assert.deepEqual(
-    nestedOptions.map(([kind, options]) => [
-      kind,
-      options?.showProgress,
-    ]),
-    [
-      ['h5ad', false],
-      ['zarr-archive', false],
-    ]
   );
 });
 

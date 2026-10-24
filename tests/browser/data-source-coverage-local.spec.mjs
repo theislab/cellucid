@@ -15,7 +15,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import { APP_ORIGIN, appUrl, sampleUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -212,6 +212,7 @@ for (const form of ['forms-h5ad', 'forms-zarr-zip', 'forms-zarr']) {
 
 test('a Zarr store folder chosen in the browser renders without a server', async ({
   page,
+  browserName,
 }) => {
   const errors = observeProductErrors(page);
   await page.goto(localCatalogUrl(), { waitUntil: 'domcontentloaded' });
@@ -221,11 +222,13 @@ test('a Zarr store folder chosen in the browser renders without a server', async
 
   // The folder picker hands over the store's hidden metadata files
   // (`.zgroup`, `.zattrs`, `.zmetadata`) with the rest.
-  await chooseDirectory(page.locator('#user-data-zarr-folder-input'), zarrFolderPath);
+  // WebKit's folder dialog leaves out a v2 store's hidden metadata, so there
+  // the folder is dropped on the page, as a Safari user does.
+  await openZarrFolder(page, browserName, zarrFolderPath);
 
   await expectRenderedDataset(page, { ...DEMO_DATASETS[0], name: 'Forms — Zarr folder' });
   await expect(page.locator('#dataset-select')).toHaveValue(
-    'dataset:local-user:forms-zarr',
+    '__dataset_unlisted__',
   );
   expect(errors).toEqual([]);
 });
@@ -237,7 +240,7 @@ test('a direct .h5ad file chosen in the browser renders', async ({ page }) => {
   await openCollapsedPanels(page);
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(h5adFixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(h5adFixturePath);
 
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
@@ -265,7 +268,7 @@ test('a portable Zarr ZIP archive chosen in the browser renders', async ({
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
   await page
-    .locator('#user-data-zarr-archive-input')
+    .locator('#user-data-file-input')
     .setInputFiles(zarrFixturePath);
 
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');

@@ -5,6 +5,13 @@
  * entries with this, so every provider names formats and failures the same
  * way.
  *
+ * A file is read in place with range requests. A host that ignores range
+ * requests serves only the whole file: its entry says so (`transport:
+ * 'download'`), and the link source downloads it once, showing how much has
+ * arrived, then reads it from memory (`downloadRemoteFile`). A host that does
+ * not let other sites read its files (CORS) cannot be read at all, and the
+ * refusal says so and what to do instead.
+ *
  * @module data/sources/remote-file
  */
 
@@ -47,12 +54,15 @@ async function probeRemoteFile(url, name, format, signal) {
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
     const status = error?.status;
+    const host = new URL(url).host;
     throw new DataSourceError(
       status === 404 || status === 403
-        ? `${name} was not found at ${new URL(url).host} (HTTP ${status}).`
-        : `${name} could not be read from ${new URL(url).host}: ` +
-          `${error?.message ?? error}. The host must allow cross-origin reads ` +
-          'from this site (CORS).',
+        ? `${name} was not found at ${host} (HTTP ${status}). Check the link, or ask its owner whether it moved.`
+        : Number.isInteger(status)
+          ? `${host} answered HTTP ${status} for ${name}. Try again later.`
+          : `${host} did not let this site read ${name}: it does not allow ` +
+            'other websites to read its files (CORS), or it could not be ' +
+            'reached. Download the file and open it from your computer instead.',
       status === 404 || status === 403
         ? DataSourceErrorCode.NOT_FOUND
         : DataSourceErrorCode.NETWORK_ERROR,
@@ -82,6 +92,8 @@ async function probeRemoteFile(url, name, format, signal) {
  *   The file's first bytes, when the provider read them beside its own probe
  *   of the size (`readFileHead`): opening starts from them
  * @param {AbortSignal|null} [options.signal]
+ * @param {((step: string) => void)|null} [options.onStep] - Told what is
+ *   being done, for the opening progress
  * @returns {Promise<Object>}
  */
 export async function describeRemoteFile({
@@ -94,6 +106,7 @@ export async function describeRemoteFile({
   size = null,
   head = null,
   signal = null,
+  onStep = null,
 }) {
   if (typeof id !== 'string' || id.length === 0 || id.includes('/')) {
     throw new TypeError('A remote file id must be a non-empty string without "/".');
@@ -109,23 +122,18 @@ export async function describeRemoteFile({
       { url, name }
     );
   }
-  const probed = Number.isSafeInteger(size) && size >= 0
+  const known = Number.isSafeInteger(size) && size >= 0;
+  if (!known) onStep?.(`Checking ${name} on ${new URL(url).host}`);
+  const probed = known
     ? { size, etag: null, rangeSupported: null, head }
     : await probeRemoteFile(url, name, format, signal);
-  if (probed.rangeSupported === false) {
-    throw new DataSourceError(
-      `${new URL(url).host} ignores range requests, so ${name} cannot be ` +
-      'read in place.',
-      DataSourceErrorCode.UNSUPPORTED,
-      'link',
-      { url }
-    );
-  }
   return Object.freeze({
     id,
     name,
     title,
     format,
+    // A host that ignores range requests serves only the whole file.
+    transport: probed.rangeSupported === false ? 'download' : 'ranges',
     attribution: Object.freeze({ ...attribution }),
     resource: Object.freeze({
       url,
@@ -183,4 +191,58 @@ export function chooseOpenableFile(names, requested, where, locatorFor) {
     'link',
     { where, files: openable }
   );
+}
+
+/**
+ * Download a whole file from a host that serves no part of it (it ignores
+ * range requests), as a `File` the AnnData reader then reads from memory.
+ * `onBytes(received)` hears each piece as it arrives.
+ *
+ * @param {{url: string, name: string, size: number}} resource
+ * @param {{signal?: AbortSignal|null, onBytes?: (received: number) => void}} [options]
+ * @returns {Promise<File>}
+ */
+export async function downloadRemoteFile(resource, { signal = null, onBytes = () => {} } = {}) {
+  const host = new URL(resource.url).host;
+  let response;
+  try {
+    response = await fetch(resource.url, { signal, cache: 'no-store' });
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    throw new DataSourceError(
+      `${resource.name} could not be downloaded from ${host}: ${error?.message ?? error}.`,
+      DataSourceErrorCode.NETWORK_ERROR,
+      'link',
+      { url: resource.url }
+    );
+  }
+  if (!response.ok || response.body === null) {
+    throw new DataSourceError(
+      `${host} answered HTTP ${response.status} for ${resource.name}.`,
+      response.status === 404 || response.status === 403
+        ? DataSourceErrorCode.NOT_FOUND
+        : DataSourceErrorCode.NETWORK_ERROR,
+      'link',
+      { url: resource.url, status: response.status }
+    );
+  }
+  const parts = [];
+  let received = 0;
+  const reader = response.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    received += value.byteLength;
+    onBytes(received);
+  }
+  if (Number.isSafeInteger(resource.size) && received !== resource.size) {
+    throw new DataSourceError(
+      `${host} sent ${received} bytes of ${resource.name}, not the ${resource.size} it reported.`,
+      DataSourceErrorCode.NETWORK_ERROR,
+      'link',
+      { url: resource.url }
+    );
+  }
+  return new File(parts, resource.name, { type: 'application/octet-stream' });
 }

@@ -11,7 +11,12 @@
  * When the decompressed size is known (an HDF5 chunk, a ZIP entry), the output
  * is allocated once and filled in place, and decompression stops as soon as
  * it would exceed that size: a corrupt or hostile stream can never grow
- * memory past what the format declared.
+ * memory past what the format declared. The input is fed to the decompressor
+ * in slices (`createSlicedInputStream`), so that bound holds while it
+ * decodes: WebKit's decompressor inflates everything written to it at once,
+ * and a whole chunk written in one piece expanded a 60 MB bomb past a
+ * 1024-byte declared size before the reader could stop it. The session
+ * codec (`app/session/codecs/gzip.js`) paces its input the same way.
  *
  * @module formats/io/inflate
  */
@@ -35,17 +40,63 @@ function requireDecompressionStream(format, label) {
 }
 
 /**
- * The decompressed stream of `input`, written straight into the decompressor:
- * no copy of the input (a `Blob` would make one) and no extra stream stage.
- * The write is not awaited, so a large output cannot stall it; any error
- * surfaces when the output is read.
+ * Input bytes handed to a native decompressor per pull.
+ *
+ * Every supported engine's `DecompressionStream` inflates each written chunk
+ * to completion before it honours backpressure, so a whole payload written as
+ * one chunk lets a DEFLATE bomb expand without bound before any reader limit
+ * can cancel it. Feeding the input in slices of this size bounds the output
+ * produced past a reader's limit to DEFLATE's maximum expansion of one slice
+ * (1032 x 32 KiB, about 33 MiB), at a few percent of inflate throughput.
+ */
+export const NATIVE_INFLATE_INPUT_SLICE_BYTES = 32 * 1024;
+
+/**
+ * Stream byte parts to a native decompressor in bounded slices, one slice
+ * per pull, so inflation advances only as fast as its reader consumes it.
+ *
+ * @param {readonly Uint8Array[]} parts
+ * @returns {ReadableStream<Uint8Array>}
+ */
+export function createSlicedInputStream(parts) {
+  for (const part of parts) {
+    if (!(part instanceof Uint8Array)) {
+      throw new TypeError('Native decompressor input must be Uint8Array parts.');
+    }
+  }
+  let partIndex = 0;
+  let partOffset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      while (
+        partIndex < parts.length
+        && partOffset >= parts[partIndex].byteLength
+      ) {
+        partIndex += 1;
+        partOffset = 0;
+      }
+      if (partIndex === parts.length) {
+        controller.close();
+        return;
+      }
+      const part = parts[partIndex];
+      const end = Math.min(
+        part.byteLength,
+        partOffset + NATIVE_INFLATE_INPUT_SLICE_BYTES,
+      );
+      controller.enqueue(part.subarray(partOffset, end));
+      partOffset = end;
+    },
+  }, { highWaterMark: 0 });
+}
+
+/**
+ * The decompressed stream of `input`, fed to the decompressor one slice per
+ * pull: inflation advances only as fast as the output is read, so a reader
+ * that stops at a declared size stops the decoding too.
  */
 function decompressed(input, format) {
-  const decompressor = new globalThis.DecompressionStream(format);
-  const writer = decompressor.writable.getWriter();
-  writer.write(input).catch(() => {});
-  writer.close().catch(() => {});
-  return decompressor.readable;
+  return createSlicedInputStream([input]).pipeThrough(new globalThis.DecompressionStream(format));
 }
 
 /**

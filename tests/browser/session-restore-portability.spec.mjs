@@ -408,7 +408,7 @@ test('a session reopens the dataset it records, from a sample or a link', async 
   await forgetNotifications(page);
   await loadSessionFile(page, 'link.cellucid-session', linkSession);
   await expectAnnounced(page, restored, 1, 'the link reopens and restores');
-  await expect(page.locator('#data-link-url')).toHaveValue(link);
+  await expect(page.locator('#data-address')).toHaveValue(link);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   expect(await readLiveOrbit(page)).toEqual(linkOrbit);
   expect(productErrors).toEqual([]);

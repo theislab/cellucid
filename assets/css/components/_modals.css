@@ -1,175 +1,4 @@
 /* =========================================================================
-   Welcome Modal - Newspaper-inspired onboarding
-   ========================================================================= */
-
-.welcome-modal {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-}
-
-.welcome-modal.hidden {
-  display: none;
-}
-
-.welcome-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--color-surface-overlay);
-  backdrop-filter: blur(4px);
-}
-
-.welcome-content {
-  position: relative;
-  background: var(--color-surface-elevated);
-  border: var(--border-default);
-  box-shadow: var(--shadow-lg);
-  max-width: 420px;
-  width: 100%;
-  /* On a short screen (a phone held sideways) the card is taller than the
-     viewport; it scrolls inside the overlay instead of losing its top and
-     bottom past the screen edges. */
-  max-height: 100%;
-  overflow-y: auto;
-}
-
-.welcome-header {
-  margin: var(--space-3) var(--space-3) 0;
-  padding: var(--space-3) var(--space-3) var(--space-2-5);
-  text-align: center;
-  background: var(--color-surface-secondary);
-  border: var(--border-light);
-}
-
-.welcome-logo {
-  width: 240px;
-  max-width: 100%;
-  height: auto;
-  margin-bottom: var(--space-1-5);
-}
-
-.welcome-tagline {
-  font-size: var(--type-label);
-  font-weight: var(--font-weight-regular);
-  color: var(--color-text-secondary);
-  margin: 0;
-}
-
-.welcome-body {
-  padding: var(--space-3);
-}
-
-.welcome-intro {
-  font-size: var(--type-body);
-  line-height: var(--leading-relaxed);
-  color: var(--color-text-secondary);
-  margin: 0 0 var(--space-3);
-  text-align: center;
-}
-
-.welcome-actions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.welcome-btn {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2-5);
-  padding: var(--space-2-5) var(--space-3);
-  background: var(--color-surface-secondary);
-  border: var(--border-default);
-  cursor: pointer;
-  text-decoration: none;
-  color: var(--color-text-primary);
-}
-
-.welcome-btn:hover {
-  background: var(--color-border-light);
-}
-
-.welcome-btn-primary {
-  background: var(--color-text-primary);
-  border-color: var(--color-text-primary);
-  color: var(--color-text-inverse);
-}
-
-.welcome-btn-primary:hover {
-  background: var(--color-interactive-primary-hover);
-}
-
-.welcome-btn-icon {
-  font-size: var(--control-glyph-lg);
-  width: var(--space-6);
-  text-align: center;
-  flex-shrink: 0;
-}
-
-.welcome-btn-text {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-0-5);
-}
-
-.welcome-btn-title {
-  font-size: var(--type-title);
-  font-weight: var(--font-weight-medium);
-}
-
-.welcome-btn-desc {
-  font-size: var(--type-label);
-  color: inherit;
-  opacity: var(--opacity-70);
-}
-
-.welcome-btn-link {
-  background: transparent;
-}
-
-.welcome-quote {
-  margin: var(--space-3) 0 0;
-  padding-top: var(--space-3);
-  border-top: var(--border-width-1) solid var(--color-border-light);
-  font-style: italic;
-  font-size: var(--type-body);
-  color: var(--color-text-secondary);
-  text-align: center;
-}
-
-.welcome-quote-explanation {
-  display: block;
-  font-style: normal;
-  font-size: var(--type-compact);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
-  margin-bottom: var(--space-1);
-  opacity: var(--opacity-60);
-}
-
-.welcome-quote-text {
-  display: block;
-  opacity: var(--opacity-80);
-}
-
-.welcome-quote-attr {
-  display: block;
-  font-style: normal;
-  font-size: var(--type-hint);
-  margin-top: var(--space-1);
-  opacity: var(--opacity-60);
-}
-
-.welcome-quote-book {
-  font-style: italic;
-}
-
-/* =========================================================================
    License Modal
    ========================================================================= */
 
@@ -373,25 +202,6 @@
   color: var(--color-text-primary);
 }
 
-/* Mobile adjustments */
-@media (max-width: 480px) {
-  .welcome-content {
-    margin: var(--space-2-5);
-  }
-
-  .welcome-header {
-    margin: var(--space-2-5) var(--space-2-5) 0;
-  }
-
-  .welcome-logo {
-    width: 160px;
-  }
-
-  .welcome-body {
-    padding: var(--space-2-5);
-  }
-}
-
 /* =========================================================================
    Analysis Modal / Popup
    ========================================================================= */
@@ -424,11 +234,13 @@
   position: relative;
   width: 66vw;
   max-width: 860px;
-  /* The minimums keep the plot usable; they never exceed the viewport, so a
-     short or narrow window still shows the header and its close button. */
-  min-width: min(600px, 95vw);
+  /* The minimums are the content's (set when the view opens: the plot's and
+     the options' least widths, the header's, plot's and footer's least
+     heights); they never exceed the viewport, so a short or narrow window
+     still shows the header and its close button. */
+  min-width: min(var(--modal-min-width, 0px), calc(100vw - 16px));
   height: 66vh;
-  min-height: min(500px, 95vh);
+  min-height: min(var(--modal-min-height, 0px), calc(100dvh - 16px));
   /* Same card as every other dialog. */
   border-radius: var(--radius-none);
   background: var(--color-surface-elevated);
@@ -454,6 +266,13 @@
   align-items: center;
   justify-content: space-between;
   cursor: move;
+  /* A finger on the header moves the view; nothing behind it scrolls. */
+  touch-action: none;
+}
+
+.analysis-modal-content.resizing,
+.analysis-modal-content.resizing * {
+  transition: none;
 }
 
 
@@ -727,6 +546,221 @@
 .analysis-modal-resizer-intersection:hover::before {
   opacity: 1;
   background-image: radial-gradient(circle, var(--color-text-secondary) 1.5px, transparent 1.5px);
+}
+
+/* Resize handles on every edge and corner of the expanded view. The card
+   clips what overhangs it, so they lie just inside its border: 6 px edges and
+   14 px corners, 16 px and 24 px for a finger. A handle shows a 2 px accent
+   line on hover, focus or drag; the bottom-right corner always shows a
+   faint grip. */
+.analysis-modal-edge-resize {
+  --modal-edge: 6px;
+  --modal-corner: 14px;
+  position: absolute;
+  z-index: 10;
+  touch-action: none;
+}
+
+@media (pointer: coarse) {
+  .analysis-modal-edge-resize {
+    --modal-edge: 16px;
+    --modal-corner: 24px;
+  }
+}
+
+.analysis-modal-edge-resize-n,
+.analysis-modal-edge-resize-s {
+  left: var(--modal-corner);
+  right: var(--modal-corner);
+  height: var(--modal-edge);
+  cursor: ns-resize;
+}
+
+.analysis-modal-edge-resize-n { top: 0; }
+.analysis-modal-edge-resize-s { bottom: 0; }
+
+.analysis-modal-edge-resize-e,
+.analysis-modal-edge-resize-w {
+  top: var(--modal-corner);
+  bottom: var(--modal-corner);
+  width: var(--modal-edge);
+  cursor: ew-resize;
+}
+
+.analysis-modal-edge-resize-e { right: 0; }
+.analysis-modal-edge-resize-w { left: 0; }
+
+.analysis-modal-edge-resize-ne,
+.analysis-modal-edge-resize-se,
+.analysis-modal-edge-resize-sw,
+.analysis-modal-edge-resize-nw {
+  width: var(--modal-corner);
+  height: var(--modal-corner);
+}
+
+.analysis-modal-edge-resize-ne { top: 0; right: 0; cursor: nesw-resize; }
+.analysis-modal-edge-resize-se { bottom: 0; right: 0; cursor: nwse-resize; }
+.analysis-modal-edge-resize-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.analysis-modal-edge-resize-nw { top: 0; left: 0; cursor: nwse-resize; }
+
+/* The header's close button stays above the top edge and corners. */
+.analysis-modal-edge-resize-n,
+.analysis-modal-edge-resize-ne,
+.analysis-modal-edge-resize-nw {
+  z-index: 1;
+}
+
+.analysis-modal-close {
+  z-index: 2;
+}
+
+.analysis-modal-edge-resize::after {
+  content: '';
+  position: absolute;
+  border: 0 solid var(--color-border-focus);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--easing-standard);
+}
+
+.analysis-modal-edge-resize-n::after { inset: 0 0 auto; border-top-width: 2px; }
+.analysis-modal-edge-resize-s::after { inset: auto 0 0; border-bottom-width: 2px; }
+.analysis-modal-edge-resize-e::after { inset: 0 0 0 auto; border-right-width: 2px; }
+.analysis-modal-edge-resize-w::after { inset: 0 auto 0 0; border-left-width: 2px; }
+.analysis-modal-edge-resize-ne::after { inset: 0; border-top-width: 2px; border-right-width: 2px; }
+.analysis-modal-edge-resize-se::after { inset: 0; border-bottom-width: 2px; border-right-width: 2px; }
+.analysis-modal-edge-resize-sw::after { inset: 0; border-bottom-width: 2px; border-left-width: 2px; }
+.analysis-modal-edge-resize-nw::after { inset: 0; border-top-width: 2px; border-left-width: 2px; }
+
+@media (hover: hover) {
+  .analysis-modal-edge-resize:hover::after {
+    opacity: 1;
+  }
+}
+
+.analysis-modal-edge-resize:focus-visible::after,
+.analysis-modal-content.resizing > .analysis-modal-edge-resize:active::after {
+  opacity: 1;
+}
+
+.analysis-modal-edge-resize-se::before {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 9px;
+  height: 9px;
+  background: linear-gradient(
+    135deg,
+    transparent 0 45%, var(--color-text-tertiary) 45% 52%,
+    transparent 52% 64%, var(--color-text-tertiary) 64% 71%,
+    transparent 71% 83%, var(--color-text-tertiary) 83% 90%,
+    transparent 90%
+  );
+  opacity: var(--opacity-50);
+  pointer-events: none;
+}
+
+.analysis-modal-resizer:focus-visible,
+.analysis-modal-resizer-intersection:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .analysis-modal-content,
+  .analysis-modal-edge-resize::after {
+    transition: none;
+  }
+}
+
+/* A narrow screen gives the expanded view the whole screen. Plot, options,
+   statistics and analysis stack in one column; the one split left is the
+   plot's against the statistics, on a 24 px grip a finger can hold. The
+   remembered and dragged sizes of a wider screen are overridden, not lost,
+   hence !important over their inline values. */
+@media (max-width: 768px) {
+  .analysis-modal-content {
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-width: 0;
+    min-height: 0;
+    max-width: none;
+    max-height: none;
+    border: none;
+  }
+
+  .analysis-modal-header {
+    cursor: default;
+  }
+
+  .analysis-modal-edge-resize {
+    display: none;
+  }
+
+  .analysis-modal-body {
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .analysis-modal-plot-section {
+    flex: 1;
+    min-width: unset;
+    min-height: 200px;
+    border-bottom: var(--border-width-1) solid var(--color-border-light);
+  }
+
+  .analysis-modal-options {
+    width: 100% !important;
+    min-width: unset;
+    max-width: unset;
+    max-height: 200px;
+    border-left: none;
+    border-top: var(--border-width-1) solid var(--color-border-light);
+  }
+
+  .analysis-modal-footer-area {
+    flex-direction: column;
+    min-height: 0;
+    max-height: 70%;
+    overflow-y: auto;
+  }
+
+  .analysis-modal-stats-panel,
+  .analysis-modal-annotations-panel {
+    width: auto !important;
+    flex: 0 0 auto !important;
+    min-width: unset;
+    min-height: 100px;
+  }
+
+  .analysis-modal-annotations-panel {
+    border-left: none;
+    border-top: var(--border-width-1) solid var(--color-border-light);
+  }
+
+  .analysis-modal-resizer-vertical,
+  .analysis-modal-resizer-intersection {
+    display: none;
+  }
+
+  /* The touch grip on the split. */
+  .analysis-modal-resizer-horizontal {
+    height: 24px;
+    touch-action: none;
+    background: var(--color-surface-secondary);
+    border-top: var(--border-width-1) solid var(--color-border-light);
+  }
+
+  .analysis-modal-resizer-horizontal::before {
+    width: var(--space-9);
+    height: var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--color-border-strong);
+    background-image: none;
+    opacity: var(--opacity-50);
+  }
 }
 
 /* =========================================================================

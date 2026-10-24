@@ -6,7 +6,7 @@ import {
   captureDatasetSourceRecord,
   describeDatasetSourceRecord,
 } from '../assets/js/app/session/dataset-source-record.js';
-import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import { initSessionControls } from '../assets/js/app/ui/modules/session-controls.js';
 
 function manager(sourceType, datasetId, info = null) {
@@ -95,16 +95,13 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
   const button = loadButton();
   const calls = [];
   const file = new Blob(['session']);
-  const notifications = getNotificationCenter();
-  const original = {
-    loading: notifications.loading,
-    dismiss: notifications.dismiss,
-  };
-  notifications.loading = message => {
-    calls.push(['notice', message]);
-    return 'opening';
-  };
-  notifications.dismiss = () => {};
+  // Opening the session's dataset is shown by the opening progress.
+  const shown = new Set();
+  const stopOpenings = getOpeningProgress().subscribe(snapshot => {
+    if (snapshot === null || shown.has(snapshot.id)) return;
+    shown.add(snapshot.id);
+    calls.push(['notice', snapshot.title]);
+  });
   try {
     const controls = initSessionControls({
       dom: { loadBtn: button },
@@ -134,7 +131,7 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
     await button.click();
     await controls.destroy();
   } finally {
-    Object.assign(notifications, original);
+    stopOpenings();
   }
   return calls;
 }
@@ -144,7 +141,7 @@ test('loading a session opens the dataset it records before applying it', async 
   assert.deepEqual(
     await loadSession({ recorded, openIdentity: null }),
     [
-      ['notice', 'Opening the session\'s dataset from the sample dataset "suo"…'],
+      ['notice', 'the session\'s dataset from the sample dataset "suo"'],
       ['open', recorded],
       ['restore', true],
     ],

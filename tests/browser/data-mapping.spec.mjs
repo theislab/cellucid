@@ -26,6 +26,12 @@ const START_URL =
   + '&dataset=current-ui&acceptance=data-mapping-ci';
 
 /** Open one group's disclosure in the Data mapping panel. */
+/** Open "Other arrays", where the off wide arrays and the unusable ones are. */
+async function openOtherArrays(page) {
+  const header = page.locator('#data-mapping-more .disclosure-header');
+  if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+}
+
 async function openGroup(page, section) {
   const header = page.locator(`[data-mapping-section="${section}"] .disclosure-header`);
   if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
@@ -54,8 +60,8 @@ async function openApp(page) {
 async function openFile(page, input, file, name) {
   if (input === 'link') {
     const address = `${SAMPLE_ORIGIN}/tests/browser/fixtures/${path.basename(file)}`;
-    await page.locator('#data-link-url').fill(address);
-    await page.locator('#data-link-connect-btn').click();
+    await page.locator('#data-address').fill(address);
+    await page.locator('#data-address-open-btn').click();
   } else {
     await page.locator(input).setInputFiles(file);
   }
@@ -101,12 +107,12 @@ const guessNotification = page => page
   .filter({ hasText: 'This file has no default UMAP' });
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', GUESS_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', GUESS_ZARR],
+  ['H5AD', '#user-data-file-input', GUESS_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', GUESS_ZARR],
   ['linked H5AD', 'link', GUESS_H5AD],
   ['linked Zarr ZIP', 'link', GUESS_ZARR],
 ]) {
-  test(`a ${format} without a UMAP opens on a best guess, says so, and opens the checklist`, async ({ page }) => {
+  test(`a ${format} without a UMAP opens on a best guess, says so, and Show opens the checklist`, async ({ page }) => {
     const errors = collectBrowserErrors(page);
     await openApp(page);
     await openCollapsedPanels(page);
@@ -119,9 +125,13 @@ for (const [format, input, file] of [
         + "Showing 'X_tsne' as 2D. Change it under Session › Data mapping.",
     );
 
-    const header = page.locator('#data-mapping-disclosure .disclosure-header');
+    // Nothing opens on its own: the notification's Show is the way in.
+    const header = page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header');
+    await expect(header).toHaveAttribute('aria-expanded', 'false');
+    await guessNotification(page).getByRole('button', { name: 'Show' }).click();
     await expect(header).toHaveAttribute('aria-expanded', 'true');
-    await expect(page.locator('#data-mapping-disclosure .disclosure-desc')).toHaveText('2 on · t-SNE 2D · guessed');
+    await expect(guessNotification(page)).toHaveCount(0);
+    await expect(page.locator('#data-mapping-disclosure > .disclosure-header-row .disclosure-desc')).toHaveText('2 on · t-SNE 2D · guessed');
     const tsne = checklistRow(page, 't-SNE');
     await expect(tsne.locator('.data-mapping-tag')).toHaveText('guessed');
     await expect(tsne.locator('.data-mapping-tag')).toBeVisible();
@@ -133,6 +143,13 @@ for (const [format, input, file] of [
     await expect(page.locator('#view-representation-select option')).toHaveText([
       't-SNE · 2D', 'ForceAtlas2 · 2D',
     ]);
+    // Arrays that cannot be drawn, and wide ones that are off, are listed
+    // last under "Other arrays", collapsed.
+    const others = page.locator('#data-mapping-more');
+    await expect(others.locator('.disclosure-title')).toHaveText(/^Other arrays \(\d+\)$/);
+    await expect(others.locator('.disclosure-header')).toHaveAttribute('aria-expanded', 'false');
+    await openOtherArrays(page);
+    await expect(others.locator('.data-mapping-row').filter({ hasText: 'PCA 1,2' })).toBeVisible();
     // Arrays that cannot be drawn are listed, with their reason, and stay off.
     const umapOld = checklistRow(page, 'UMAP old');
     await expect(umapOld.locator('.data-mapping-reason')).toHaveText('NaN at cell 17');
@@ -142,27 +159,23 @@ for (const [format, input, file] of [
       .toHaveText('obsm table, not an array');
     await expect(checklistRow(page, 'sparse').locator('.data-mapping-enable')).toBeDisabled();
     // A wide array is offered at its first columns, off until turned on.
-    await expect(checklistRow(page, 'PCA 1,2,3').locator('.data-mapping-enable')).not.toBeChecked();
+    await expect(checklistRow(page, 'PCA 1,2').locator('.data-mapping-enable')).not.toBeChecked();
+    // A wide array says how wide it is.
+    await expect(checklistRow(page, 'PCA 1,2').locator('.data-mapping-width')).toHaveText(/^\d[\d,]* columns$/);
     await openGroup(page, 'genes');
     await expect(page.locator('#data-mapping-gene-names')).toHaveValue('index');
-
-    // Show reopens the checklist after it was closed.
-    await header.click();
-    await expect(header).toHaveAttribute('aria-expanded', 'false');
-    await guessNotification(page).getByRole('button', { name: 'Show' }).click();
-    await expect(header).toHaveAttribute('aria-expanded', 'true');
-    await expect(guessNotification(page)).toHaveCount(0);
     expect(errors).toEqual([]);
   });
 }
 
-for (const [opened, input] of [['picked', '#user-data-h5ad-input'], ['linked', 'link']]) {
+for (const [opened, input] of [['picked', '#user-data-file-input'], ['linked', 'link']]) {
 test(`a ${opened} wide X_pca is guessed at columns 0 and 1, and a column swap redraws it`, async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await openApp(page);
   await openCollapsedPanels(page);
   await openFile(page, input, WIDE_H5AD, 'data-mapping-wide');
   await expect(guessNotification(page)).toContainText("Showing columns 0 and 1 of 'X_pca' as 2D.");
+  await guessNotification(page).getByRole('button', { name: 'Show' }).click();
   expect(await viewLayout(page, 'live')).toBe('X_pca[0,1]');
   const pca = checklistRow(page, 'PCA 1,2');
   // The only embedding stays on, and says why.
@@ -192,7 +205,7 @@ test(`a ${opened} wide X_pca is guessed at columns 0 and 1, and a column swap re
   await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
   expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_pca', columns: [1, 0] });
   expect(await viewLayout(page, 'live')).toBe('X_pca[1,0]');
-  await expect(page.locator('#data-mapping-disclosure .disclosure-desc')).toHaveText('1 on · PCA 2,1 2D');
+  await expect(page.locator('#data-mapping-disclosure > .disclosure-header-row .disclosure-desc')).toHaveText('1 on · PCA 2,1 2D');
   await expect(page.locator('.data-mapping-row .data-mapping-tag:visible')).toHaveCount(0);
 
   // Swapping the columns swaps every cell's coordinates exactly.
@@ -217,7 +230,7 @@ test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view
   const errors = collectBrowserErrors(page);
   await openApp(page);
   await openCollapsedPanels(page);
-  await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
+  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   // X_umap is the default: nothing is guessed, nothing is announced.
   expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_umap', columns: [0, 1] });
   await expect(guessNotification(page)).toHaveCount(0);
@@ -267,7 +280,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   const errors = collectBrowserErrors(page);
   await openApp(page);
   await openCollapsedPanels(page);
-  await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
+  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   const velocity = page.locator('#velocity-overlay-enabled');
   const field = page.locator('#velocity-field');
 
@@ -297,7 +310,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   // A fresh page on UMAP (one field listed) restores the t-SNE session.
   await openApp(page);
   await openCollapsedPanels(page);
-  await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
+  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   await expect(field).toHaveValue('velocity');
   let chooserPromise = page.waitForEvent('filechooser');
   await page.locator('#load-state-btn').click();
@@ -332,7 +345,7 @@ test('a session restores the data mapping and every view’s embedding', async (
   const errors = collectBrowserErrors(page);
   await openApp(page);
   await openCollapsedPanels(page);
-  await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
+  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
 
   // The kept view is turned to t-SNE; the live view follows the 2D default.
   await page.locator('#split-keep-view-btn').click();
@@ -342,14 +355,15 @@ test('a session restores the data mapping and every view’s embedding', async (
   await expect.poll(() => viewLayout(page, active)).toBe('X_tsne');
 
   // Turn X_pca columns 2 and 3 on as a 2D representation, and make it the default.
-  await page.locator('#data-mapping-disclosure .disclosure-header').click();
-  const pca = checklistRow(page, 'PCA 1,2,3');
+  await page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header').click();
+  await openOtherArrays(page);
+  const pca = checklistRow(page, 'PCA 1,2');
   await pca.locator('.data-mapping-enable').check();
   await pca.locator('.data-mapping-edit').click();
   await pca.locator('.data-mapping-axes').selectOption('2');
   const pca2d = checklistRow(page, 'PCA 1,2');
-  await page.locator('#data-mapping-row-0-x').selectOption({ value: '2' });
-  await page.locator('#data-mapping-row-0-y').selectOption({ value: '3' });
+  await pca2d.locator('.data-mapping-axis-select[data-axis="0"]').selectOption({ value: '2' });
+  await checklistRow(page, 'PCA 3,2').locator('.data-mapping-axis-select[data-axis="1"]').selectOption({ value: '3' });
   const pca34 = checklistRow(page, 'PCA 3,4');
   await expect(pca2d).toHaveCount(0);
   await pca34.locator('.data-mapping-default').click();
@@ -374,7 +388,7 @@ test('a session restores the data mapping and every view’s embedding', async (
   // A fresh page opens the file on its defaults, then restores the session.
   await openApp(page);
   await openCollapsedPanels(page);
-  await openFile(page, '#user-data-h5ad-input', MULTI_H5AD, 'data-mapping-multi');
+  await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_umap', columns: [0, 1] });
   const chooserPromise = page.waitForEvent('filechooser');
   await page.locator('#load-state-btn').click();
@@ -386,7 +400,7 @@ test('a session restores the data mapping and every view’s embedding', async (
       id => [id === 'live' ? 'live' : 'kept', window._cellucidState.getViewLayoutKey(id)]
     )
   ))).toEqual(savedLayouts);
-  await expect(page.locator('#data-mapping-disclosure .disclosure-desc')).toHaveText('3 on · PCA 3,4 2D');
+  await expect(page.locator('#data-mapping-disclosure > .disclosure-header-row .disclosure-desc')).toHaveText('3 on · PCA 3,4 2D');
   expect(errors).toEqual([]);
 });
 
@@ -405,7 +419,7 @@ test('a catalog dataset opens on the embedding its file names, and switches to a
   expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_islands', columns: [0, 1] });
   await expect(guessNotification(page)).toHaveCount(0);
 
-  await page.locator('#data-mapping-disclosure .disclosure-header').click();
+  await page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header').click();
   const markerScores = checklistRow(page, 'marker scores');
   await expect(markerScores).toHaveCount(1);
   await markerScores.locator('.data-mapping-enable').check();
@@ -454,7 +468,7 @@ test.describe('on a phone', () => {
     await openApp(page);
     await page.locator('#sidebar-toggle').click();
     await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
-    await page.locator('#user-data-h5ad-input').setInputFiles(GUESS_H5AD);
+    await page.locator('#user-data-file-input').setInputFiles(GUESS_H5AD);
     await expect(page.locator('#dataset-name')).toHaveText('data-mapping-guess');
     await expect(guessNotification(page)).toBeVisible();
 
@@ -462,13 +476,14 @@ test.describe('on a phone', () => {
     await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
     await guessNotification(page).getByRole('button', { name: 'Show' }).click();
     await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
-    const header = page.locator('#data-mapping-disclosure .disclosure-header');
+    const header = page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header');
     await expect(header).toHaveAttribute('aria-expanded', 'true');
     await expect(checklistRow(page, 't-SNE')).toBeInViewport();
 
     // A wide array's editor sits on its own lines under its name;
     // Revert and Apply share one row, inside the screen.
-    const pca = checklistRow(page, 'PCA 1,2,3');
+    await openOtherArrays(page);
+    const pca = checklistRow(page, 'PCA 1,2');
     await pca.locator('.data-mapping-enable').check();
     await pca.locator('.data-mapping-edit').click();
     const name = await pca.locator('.data-mapping-name').boundingBox();

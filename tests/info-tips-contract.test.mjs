@@ -25,6 +25,7 @@ import {
   DOCS_BASE_URL,
   INFO_TIPS,
   docsUrl,
+  renderInfoTip,
 } from '../assets/js/app/ui/components/info-tips.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -70,12 +71,22 @@ test('every tip the interface names is in the registry, and every entry is used'
 test('every static info button opens a registry tip, with no inline copy', () => {
   const buttons = [...indexHtml.matchAll(/<button\b[^>]*class="info-btn"[^>]*>/g)].map(match => match[0]);
   assert.ok(buttons.length >= 35);
+  const live = [];
   for (const button of buttons) {
     const controls = /aria-controls="([^"]+)"/.exec(button)?.[1];
     assert.ok(controls, `${button} names its popover`);
-    const popover = new RegExp(`<div id="${controls}" class="info-tooltip"[^>]*data-info-tip="[^"]+"[^>]*hidden></div>`).exec(indexHtml);
+    // Empty, but for the live lines its component keeps current (how a
+    // setting was chosen, what a tool needs first).
+    const popover = new RegExp(
+      `<div id="${controls}" class="info-tooltip"[^>]*data-info-tip="[^"]+"[^>]*hidden>`
+      + '((?:<p id="[a-z0-9-]+" class="info-tip-now" data-info-tip-live></p>)*)</div>'
+    ).exec(indexHtml);
     assert.ok(popover, `#${controls} is an empty popover that names its registry tip`);
+    for (const [, liveId] of popover[1].matchAll(/id="([^"]+)"/g)) {
+      live.push(liveId);
+    }
   }
+  assert.deepEqual(live.sort(), ['highlight-tool-hint', 'hp-antialias-status']);
   assert.doesNotMatch(indexHtml, /info-tooltip-content|info-step/, 'tip text lives in the registry only');
 });
 
@@ -109,6 +120,7 @@ const PINNED_LINKS = [
   'b_data_loading/01_loading_options_overview#at-a-glance',
   'b_data_loading/01_loading_options_overview#fast-path-choose-a-workflow-decision-tree',
   'b_data_loading/03_browser_file_picker_tutorial#fast-path-wet-lab-friendly',
+  'b_data_loading/03_browser_file_picker_tutorial#hidden-metadata-files',
   'b_data_loading/04_server_tutorial#fast-path-cli',
   'b_data_loading/04_server_tutorial#launch-choices-what-the-viewer-opens-on',
   'b_data_loading/04_server_tutorial#remote-server-access-ssh-tunnel-workflow',
@@ -120,9 +132,15 @@ const PINNED_LINKS = [
   'b_data_loading/13_data_mapping#dimension-and-columns-of-an-array',
   'b_data_loading/13_data_mapping#files-without-a-umap-the-best-guess',
   'b_data_loading/13_data_mapping#several-embeddings-at-once',
-  'b_data_loading/14_open_from_link#transfers',
+  'b_data_loading/14_open_from_link#the-address-bar',
+  'b_data_loading/01_loading_options_overview#the-dataset-box',
   'b_data_loading/14_open_from_link#what-you-can-paste',
   'b_data_loading/14_open_from_link#why-a-link-can-be-refused',
+  'b_data_loading/16_private_drive_onedrive#google-drive',
+  'b_data_loading/16_private_drive_onedrive#onedrive-and-sharepoint',
+  'b_data_loading/16_private_drive_onedrive#revoke-access',
+  'b_data_loading/16_private_drive_onedrive#what-cellucid-sees-and-keeps',
+  'b_data_loading/16_private_drive_onedrive#work-and-school-accounts-administrator-approval',
   'c_core_interactions/01_navigation_modes_orbit_planar_free_fly#each-view-navigates-on-its-own',
   'c_core_interactions/01_navigation_modes_orbit_planar_free_fly#pick-the-right-mode-fast-guidance',
   'c_core_interactions/02_camera_controls_advanced#camera-path-playback-is-opt-in',
@@ -167,17 +185,35 @@ const PINNED_LINKS = [
   'h_analysis/04_analysis_mode_detailed_analysis#what-detailed-mode-is-for',
   'h_analysis/05_analysis_mode_correlation_analysis#pearson-vs-spearman',
   'h_analysis/05_analysis_mode_correlation_analysis#what-correlation-mode-is-for',
-  'h_analysis/06_analysis_mode_differential_expression_de#performance-settings-when-de-is-slow',
+  'h_analysis/06_analysis_mode_differential_expression_de#filters-and-labels',
+  'h_analysis/06_analysis_mode_differential_expression_de#groups-pages-or-categories',
+  'h_analysis/06_analysis_mode_differential_expression_de#replicates-pseudobulk',
   'h_analysis/06_analysis_mode_differential_expression_de#statistics-exact-implementation',
   'h_analysis/06_analysis_mode_differential_expression_de#what-de-is-for-in-cellucid',
-  'h_analysis/07_analysis_mode_gene_signature#inputs-genes-pages',
-  'h_analysis/07_analysis_mode_gene_signature#normalization-options-what-they-do',
-  'h_analysis/07_analysis_mode_gene_signature#scoring-algorithm-exact',
+  'h_analysis/07_analysis_mode_gene_signature#gene-sets',
+  'h_analysis/07_analysis_mode_gene_signature#genes-not-in-the-dataset',
+  'h_analysis/07_analysis_mode_gene_signature#methods',
   'h_analysis/07_analysis_mode_gene_signature#what-a-gene-signature-is-user-facing',
-  'h_analysis/08_analysis_mode_genes_panel#clustered-mode',
-  'h_analysis/08_analysis_mode_genes_panel#ranked-genes-mode',
-  'h_analysis/08_analysis_mode_genes_panel#statistics-what-is-computed',
+  'h_analysis/08_analysis_mode_genes_panel#excluded-and-selected-genes',
+  'h_analysis/08_analysis_mode_genes_panel#expression-matrix',
+  'h_analysis/08_analysis_mode_genes_panel#filters',
+  'h_analysis/08_analysis_mode_genes_panel#group-by-and-compare-against',
+  'h_analysis/08_analysis_mode_genes_panel#groups-and-cells',
+  'h_analysis/08_analysis_mode_genes_panel#ranking',
+  'h_analysis/08_analysis_mode_genes_panel#small-groups',
+  'h_analysis/08_analysis_mode_genes_panel#test',
   'h_analysis/08_analysis_mode_genes_panel#what-marker-genes-is-for',
+  'h_analysis/12_analysis_mode_composition#cell-types-samples-and-condition',
+  'h_analysis/12_analysis_mode_composition#cells',
+  'h_analysis/12_analysis_mode_composition#display',
+  'h_analysis/12_analysis_mode_composition#tests',
+  'h_analysis/12_analysis_mode_composition#what-composition-answers',
+  'h_analysis/12_analysis_mode_composition#without-samples',
+  'h_analysis/13_analysis_mode_dot_plot#group-by-and-genes',
+  'h_analysis/13_analysis_mode_dot_plot#groups-and-cells',
+  'h_analysis/13_analysis_mode_dot_plot#layout',
+  'h_analysis/13_analysis_mode_dot_plot#values',
+  'h_analysis/13_analysis_mode_dot_plot#what-a-dot-plot-shows',
   'i_vector_field_velocity/02_enabling_overlay_and_selecting_field#availability-states',
   'i_vector_field_velocity/03_core_parameters_document_exact_ui_labels#exact-labels-ranges-and-initial-values',
   'j_community_annotation/01_annotator_guide#connect-to-the-annotation-repo-first-time',
@@ -280,4 +316,58 @@ test('every docs link resolves to a page and heading in the documentation', asyn
     if (!(await headingIds(page)).has(anchor)) missing.push(`${page} has no heading #${anchor}`);
   }
   assert.deepEqual(missing, []);
+});
+
+test('a live line in a tooltip stays, first under the title, when its tip is drawn', () => {
+  const make = (tag, documentRef) => {
+    const node = {
+      tagName: tag,
+      ownerDocument: documentRef,
+      children: [],
+      dataset: {},
+      attributes: new Map(),
+      className: '',
+      textContent: '',
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      appendChild(child) {
+        if (child.parent) child.parent.children.splice(child.parent.children.indexOf(child), 1);
+        child.parent = this;
+        this.children.push(child);
+        return child;
+      },
+      append(...children) { for (const child of children) this.appendChild(child); },
+      replaceChildren(...children) {
+        this.children = [];
+        for (const child of children) this.appendChild(child);
+      },
+      querySelectorAll(selector) {
+        assert.equal(selector, '[data-info-tip-live]');
+        const found = [];
+        const walk = element => {
+          for (const child of element.children ?? []) {
+            if (child.attributes?.has('data-info-tip-live')) found.push(child);
+            walk(child);
+          }
+        };
+        walk(this);
+        return found;
+      },
+    };
+    return node;
+  };
+  const documentRef = {
+    createElement: tag => make(tag, documentRef),
+    createTextNode: text => ({ textContent: text }),
+  };
+  const popover = make('div', documentRef);
+  const line = make('p', documentRef);
+  line.setAttribute('data-info-tip-live', '');
+  line.textContent = 'Chosen automatically: 1,000 cells in 2D.';
+  popover.appendChild(line);
+  renderInfoTip(popover, 'antialiasing');
+  const [content] = popover.children;
+  assert.equal(content.children[0].className, 'info-tip-header');
+  assert.equal(content.children[1], line, 'the live line is the same element, kept');
+  renderInfoTip(popover, 'antialiasing');
+  assert.equal(popover.children[0].children[1], line, 'and survives a second drawing');
 });

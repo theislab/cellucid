@@ -120,6 +120,8 @@ test('CEL-0058: every analysis preview offers the same keyboard-operable Expand 
   await geneSearch.click();
   await geneSearch.fill('GAPDH');
   await page.locator('.dropdown-item', { hasText: 'GAPDH' }).first().click();
+  // Correlation runs on Run, never on a choice.
+  await page.locator(correlation).getByRole('button', { name: 'Run correlation' }).click();
 
   const expand = page.locator(`${correlation} .analysis-expand-btn`);
   await expect(expand, 'Correlation must offer a real Expand button').toHaveCount(1);
@@ -165,11 +167,23 @@ test('CEL-0058: collapsible analysis settings are built as real disclosure contr
   await openDataset(page);
   await openMode(page, 'genesPanel');
 
-  const headers = page.locator(`${panelFor('genesPanel')} .disclosure-inline .disclosure-header`);
-  await expect(headers).toHaveCount(2);
+  // "More options", then the four groups of options inside it.
+  const panel = panelFor('genesPanel');
+  const more = page.locator(`${panel} .analysis-more-options > .disclosure-header`);
+  const groups = page.locator(`${panel} .analysis-options-group > .disclosure-header-row > .disclosure-header`);
+  await expect(more).toHaveCount(1);
+  await expect(groups).toHaveCount(4);
+  const headers = {
+    count: 5,
+    async nth(index) {
+      if (index === 0) return more;
+      if ((await more.getAttribute('aria-expanded')) !== 'true') await more.click();
+      return groups.nth(index - 1);
+    },
+  };
 
-  for (let index = 0; index < 2; index++) {
-    const header = headers.nth(index);
+  for (let index = 0; index < headers.count; index++) {
+    const header = await headers.nth(index);
     await expect(header).toHaveRole('button');
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     const regionId = await header.getAttribute('aria-controls');

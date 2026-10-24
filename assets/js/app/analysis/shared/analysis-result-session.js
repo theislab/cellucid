@@ -18,7 +18,7 @@
 import { decodeAnalysisResult, encodeAnalysisResult } from './analysis-result-codec.js';
 
 /** Layout version of every analysis result payload written today. */
-export const ANALYSIS_RESULT_VERSION = 1;
+export const ANALYSIS_RESULT_VERSION = 2;
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -74,16 +74,21 @@ function missingList(missing) {
 }
 
 /**
- * Throw unless every gene exists in the open dataset.
+ * Throw unless every gene exists in the open dataset: in the expression
+ * matrix the result was read from (`DataLayer.getGeneKeys`), the mapped one
+ * by default.
  *
- * @param {{getVariableInfo: Function}} dataLayer
+ * @param {{getGeneKeys: Function}} dataLayer
  * @param {Iterable<string>} genes
  * @param {string} label
+ * @param {string} [matrix='mapped']
+ * @returns {Promise<void>}
  */
-export function requireDatasetGenes(dataLayer, genes, label) {
+export async function requireDatasetGenes(dataLayer, genes, label, matrix = 'mapped') {
+  const known = new Set(await dataLayer.getGeneKeys(matrix));
   const missing = [];
   for (const gene of new Set(genes)) {
-    if (typeof gene !== 'string' || dataLayer.getVariableInfo('gene_expression', gene) === null) {
+    if (typeof gene !== 'string' || !known.has(gene)) {
       missing.push(String(gene));
     }
   }

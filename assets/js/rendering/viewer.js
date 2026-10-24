@@ -7094,6 +7094,14 @@ export function createViewer({
       viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
       publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
       publishViewDataGeneration(LIVE_VIEW_ID);
+      // A pose belongs to the cells it framed. The outgoing dataset's camera
+      // (its own preset's close-up, say) says nothing about the incoming
+      // cells, and kept as it was it framed a 28,000-cell 2D file from
+      // inside the cloud a 562,000-cell 3D preset had placed it in: a canvas
+      // of giant points. A new scene starts from the default framing of its
+      // dimension, which fits every normalized embedding; a session or a
+      // published preset replayed afterwards still sets its own camera.
+      resetViewCameraForDimension(LIVE_VIEW_ID, dimensionLevel);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
       publishSmokeSourceChange();

@@ -12,8 +12,8 @@
  * would leave the application. `ui/core/file-drop-guard.js`, a classic script
  * that runs before any module, cancels that for the whole document from the
  * first paint; this module adds the opening. Keyboard and screen-reader users
- * keep the H5AD, Zarr ZIP and Zarr folder buttons, which reach the same
- * readers.
+ * keep the Session panel's Open… menu (File… and Zarr folder…), which reaches
+ * the same readers.
  *
  * @module ui/modules/dataset-drop
  */

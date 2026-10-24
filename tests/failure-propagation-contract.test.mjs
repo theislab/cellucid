@@ -122,13 +122,10 @@ test('form-based analysis requires concrete result rendering and propagates exec
   ui._activeAnalysisRequestId = null;
   ui._analysisInvalidationOwner = null;
   ui._getTitle = () => 'Manual';
-  ui._getFormValues = () => ({});
-  ui._validateForm = () => ({ valid: true });
-  ui._formContainer = {
-    querySelector() {
-      return { disabled: false, textContent: 'Run Analysis' };
-    },
-  };
+  ui._options = {};
+  ui._selectedPages = [];
+  ui._runRow = null;
+  ui._highlightRevision = 0;
   ui._notifications = {
     error(message) {
       shown.push(message);

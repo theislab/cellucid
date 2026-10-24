@@ -43,9 +43,13 @@ import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
 import { showReadProgress } from './read-progress-notifications.js';
+import { showOpeningProgress } from './opening-progress-view.js';
+import { showSourceSignIn } from './source-sign-in-view.js';
+import { beginOpening } from '../data/opening-progress.js';
 import {
   createObsFieldLoader,
   createVarFieldLoader,
+  varLoaderMappingOf,
   loadEdges,
   loadDatasetGeneration,
   loadMappingCandidates,
@@ -69,6 +73,8 @@ import {
 } from '../data/dataset-lifecycle-errors.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { getTransferLog } from '../data/transfer-log.js';
+import { getReadActivityLog } from '../data/read-activity-log.js';
+import { sweepAbandonedIndexes } from '../data/column-store-placement.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { createRemoteDataSource } from '../data/remote-source.js';
 import {
@@ -84,14 +90,25 @@ import {
   createJupyterPointerDelivery
 } from './jupyter-pointer-delivery.js';
 // benchmark module is lazy-loaded when needed
-import { DataSourceErrorCode, fetchCatalogFile } from '../data/data-source.js';
+import {
+  DataSourceError,
+  DataSourceErrorCode,
+  fetchCatalogFile,
+  isExplainedFailure
+} from '../data/data-source.js';
 import { formatCompactCount as formatNumber } from './ui/components/display-format.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
 import { getGitHubAuthSession } from './community-annotations/github-auth.js';
-import { initKeyboardShortcuts, initWelcomeModal, showWelcomeModal } from './ui/onboarding/index.js';
+import {
+  hideWelcomeModal,
+  initKeyboardShortcuts,
+  initWelcomeModal,
+  isWelcomeModalVisible,
+  showWelcomeModal
+} from './ui/onboarding/index.js';
 import { publishWebBuildVersion } from './ui/core/build-version.js';
 import { retireDeferredControls } from './ui/core/deferred-control-readiness.js';
 import { DATA_LOAD_METHODS } from './data-load-methods.js';
@@ -158,10 +175,15 @@ function getConnectivityUrl(baseUrl) { return `${baseUrl}obsp`; }
 // never awaited: calls made before it arrives are queued, so it never blocks
 // or breaks startup.
 void analytics.load();
+// A closed or crashed tab's spilled gene-column index (OPFS) is removed now,
+// not only when this tab first spills one of its own.
+void sweepAbandonedIndexes();
 
 (async function bootstrap() {
   let statsEl = null;
   let destroyApplication = null;
+  // The opening of the startup dataset, shown from the first moment.
+  let startupOpening = null;
   // Every startup await on the network runs through this owner: it publishes
   // `data-startup-phase` and bounds request/response steps with a deadline.
   const startup = createStartupPhaseOwner({
@@ -330,6 +352,62 @@ void analytics.load();
     notifications.init();
     // Long reads of an AnnData file say how much is left while they run.
     showReadProgress({ notifications });
+    // Every opening is shown from its first moment: over the empty viewer
+    // while no dataset is shown, as a notification with Cancel otherwise.
+    showOpeningProgress({ hasDataset: () => state.pointCount > 0, notifications });
+    // A Google Drive or OneDrive file waiting on a sign-in says so, with its button.
+    showSourceSignIn({ notifications });
+    // The startup dataset is being opened from now on: the layers that
+    // resolve and read it join this opening, which ends once its first view
+    // is drawn (or startup chose none).
+    startupOpening = beginOpening({
+      title: dataLinkParam
+        ?? (remoteUrlParam !== null ? `the datasets at ${remoteUrlParam}` : null)
+        ?? (inJupyter ? "the notebook's dataset" : null)
+        ?? requestedDataset
+        ?? 'the sample dataset',
+      step: 'Starting Cellucid'
+    });
+    // Data the address names (`?data=`, `?remote=`, `?dataset=`) that does
+    // not open leaves Cellucid running without it: the startup opening fails
+    // over the empty viewer with one plain sentence, the failure's message
+    // under Details, Try again, and Open without this link, which drops those
+    // parameters from the address. Only a failure of the app itself is the
+    // startup failure screen.
+    let startupDataFailed = false;
+    // The address parameters that name a startup dataset of each source.
+    const STARTUP_LAUNCH_PARAMETERS = Object.freeze({
+      link: ['data', 'dataset'],
+      remote: ['remote', 'dataset'],
+      'local-demo': ['sampleCatalog', 'dataset']
+    });
+    function failStartupData(error, summary, launchParameters) {
+      startupDataFailed = true;
+      console.error('[Main] The data the address names did not open:', error);
+      // What the address asked for comes first; onboarding would cover it.
+      if (isWelcomeModalVisible()) hideWelcomeModal();
+      analytics.trackStartupFailure({ phase: startup.phase, error });
+      const actions = [
+        { label: 'Try again', run: () => window.location.reload() }
+      ];
+      const withoutLink = launchParameters.some(name => urlParams.has(name));
+      if (withoutLink) {
+        actions.push({
+          label: 'Open without this link',
+          run: () => {
+            const address = new URL(window.location.href);
+            for (const name of launchParameters) address.searchParams.delete(name);
+            window.history.replaceState(window.history.state, '', address);
+          }
+        });
+      }
+      startupOpening.fail(error, {
+        summary: `${summary} ${withoutLink
+          ? 'Try again, or open Cellucid without it.'
+          : 'Try again, or open other data.'}`,
+        actions
+      });
+    }
 
     // Construct the optional GitHub annotation session inside the startup
     // boundary so storage/configuration failures cannot leave a blank page.
@@ -746,34 +824,43 @@ void analytics.load();
       );
     }
 
-    // An explicit remote URL is a terminal source request.
+    // An explicit remote URL: a server that cannot be reached, or that does
+    // not hold the requested dataset, leaves Cellucid running without it.
     if (remoteUrlParam !== null) {
       debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
-      await startup.step(
-        'health',
-        remoteUrlParam,
-        () => remoteSource.connect({ url: remoteUrlParam })
-      );
-      if (remoteSource.isConnected() !== true) {
-        throw new Error(
-          'The requested remote source did not publish a connected state.'
+      try {
+        await startup.step(
+          'health',
+          remoteUrlParam,
+          () => remoteSource.connect({ url: remoteUrlParam })
+        );
+        if (remoteSource.isConnected() !== true) {
+          throw new Error(
+            'The requested remote source did not publish a connected state.'
+          );
+        }
+        const remoteDatasets = await startup.step(
+          'catalog',
+          remoteUrlParam,
+          () => remoteSource.listDatasets()
+        );
+        const remoteDatasetId = selectIntentDatasetId(
+          remoteDatasets,
+          requestedDataset,
+          'The requested remote source'
+        );
+        selectStartupDataset(
+          'remote',
+          remoteDatasetId,
+          DATA_LOAD_METHODS.REMOTE_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'Cellucid could not open the server this link points to.',
+          ['remote', 'dataset']
         );
       }
-      const remoteDatasets = await startup.step(
-        'catalog',
-        remoteUrlParam,
-        () => remoteSource.listDatasets()
-      );
-      const remoteDatasetId = selectIntentDatasetId(
-        remoteDatasets,
-        requestedDataset,
-        'The requested remote source'
-      );
-      selectStartupDataset(
-        'remote',
-        remoteDatasetId,
-        DATA_LOAD_METHODS.REMOTE_URL_PARAM
-      );
     }
 
     // Auto-connect to a same-origin Cellucid server when the web app is being
@@ -949,6 +1036,7 @@ void analytics.load();
 
     // A data link in the query (?data=): GitHub, CELLxGENE, GEO, any web
     // address. Must be after initialize(), which registers the link source.
+    let linkConnection = null;
     if (dataLinkParam !== null) {
       debug.log(`[Main] Data link from param: ${dataLinkParam}`);
       const linkSource = dataSourceManager.getSource('link');
@@ -960,14 +1048,27 @@ void analytics.load();
       // Opening a linked file reads as much of it as the first view needs,
       // which grows with the file: the step stalls only when no byte arrives
       // for a whole deadline, as the Transfers log records them.
-      const linkConnection = await startup.step(
-        'catalog',
-        dataLinkParam,
-        () => linkSource.connect(dataLinkParam),
-        { progress: onProgress => getTransferLog().subscribe(onProgress) }
-      );
+      try {
+        linkConnection = await startup.step(
+          'catalog',
+          dataLinkParam,
+          () => linkSource.connect(dataLinkParam),
+          { progress: onProgress => getTransferLog().subscribe(onProgress) }
+        );
+      } catch (error) {
+        // Cancelled while it opened: Cellucid starts without a dataset, as it
+        // does when the link did not open.
+        if (!startupOpening.cancelled) {
+          failStartupData(
+            error,
+            'Cellucid could not read the data this link points to.',
+            ['data', 'dataset']
+          );
+        }
+      }
+    }
+    if (linkConnection !== null) {
       if (
-        linkConnection === null ||
         typeof linkConnection !== 'object' ||
         Array.isArray(linkConnection) ||
         !Object.hasOwn(linkConnection, 'datasets')
@@ -978,21 +1079,29 @@ void analytics.load();
       }
       // Without `dataset=`, a link opens on the dataset its catalog names as
       // its default, as the sample catalog does.
-      const linkDatasetId = selectIntentDatasetId(
-        linkConnection.datasets,
-        requestedDataset ?? linkConnection.defaultDatasetId,
-        'The requested data link'
-      );
-      selectStartupDataset(
-        'link',
-        linkDatasetId,
-        DATA_LOAD_METHODS.DATA_URL_PARAM
-      );
+      try {
+        const linkDatasetId = selectIntentDatasetId(
+          linkConnection.datasets,
+          requestedDataset ?? linkConnection.defaultDatasetId,
+          'The requested data link'
+        );
+        selectStartupDataset(
+          'link',
+          linkDatasetId,
+          DATA_LOAD_METHODS.DATA_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'This link does not hold the dataset it names.',
+          ['data', 'dataset']
+        );
+      }
 
-      const dataLinkInput = document.getElementById('data-link-url');
+      const dataLinkInput = document.getElementById('data-address');
       if (!(dataLinkInput instanceof HTMLInputElement)) {
         throw new Error(
-          'Data link startup requires the link input control.'
+          'Data link startup requires the address bar.'
         );
       }
       dataLinkInput.value = linkConnection.locator;
@@ -1004,9 +1113,11 @@ void analytics.load();
       ? 'local-demo'
       : sourceParam;
     const currentSourceType = startupSelection?.sourceType ?? null;
-    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || currentSourceType === 'link';
+    // A link names its own dataset (`dataset=` picks one of its catalog's),
+    // also when its opening was cancelled.
+    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || dataLinkParam !== null;
 
-    if (requestedDataset !== null && !skipUrlDataset) {
+    if (requestedDataset !== null && !skipUrlDataset && !startupDataFailed) {
       const targetSource = dataSourceManager.getSource(requestedSource);
       if (targetSource === null) {
         throw new Error(
@@ -1019,21 +1130,29 @@ void analytics.load();
         );
       }
       const requestedCatalog = `the ${requestedSource} dataset catalog`;
-      const requestedExists = await startup.step(
-        'catalog',
-        requestedCatalog,
-        () => targetSource.hasDataset(requestedDataset)
-      );
-      if (!requestedExists) {
-        throw new Error(
-          `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
+      try {
+        const requestedExists = await startup.step(
+          'catalog',
+          requestedCatalog,
+          () => targetSource.hasDataset(requestedDataset)
+        );
+        if (!requestedExists) {
+          throw new Error(
+            `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
+          );
+        }
+        selectStartupDataset(
+          requestedSource,
+          requestedDataset,
+          DATA_LOAD_METHODS.DATASET_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'The dataset this link names could not be found.',
+          ['dataset']
         );
       }
-      selectStartupDataset(
-        requestedSource,
-        requestedDataset,
-        DATA_LOAD_METHODS.DATASET_URL_PARAM
-      );
     }
 
     // The live manager is replaced only when a complete dataset generation and
@@ -1195,6 +1314,44 @@ void analytics.load();
 
     // A reload is bounded by its own transaction signal and publishes no
     // startup phase; only the startup load runs under the startup owner.
+    /**
+     * Evidence that a dataset's reads are alive (a startup step's
+     * `progress`): bytes or requests counted, or bytes of a request still
+     * under way arriving, as the Transfers log hears them. A request being
+     * made again after a failure is not progress: nothing arrived.
+     */
+    const datasetReadProgress = onProgress => {
+      const arrivals = entries => entries
+        .map(entry => `${entry.key}:${entry.bytes}:${entry.requests}:${entry.lastArrivalAt}`)
+        .join('|');
+      let seen = arrivals(getTransferLog().entries());
+      return getTransferLog().subscribe(entries => {
+        const now = arrivals(entries);
+        if (now === seen) return;
+        seen = now;
+        onProgress();
+      });
+    };
+
+    /**
+     * The reads still open, as the read activity log names them, and the
+     * request being made again after a failure, naming its URL; null when
+     * nothing is open.
+     */
+    function openDatasetReads() {
+      const open = getReadActivityLog().entries()
+        .filter(activity => activity.status === 'running')
+        .map(activity => activity.label);
+      const failing = getTransferLog().entries()
+        .filter(entry => entry.status === 'active' && entry.retrying !== null)
+        .map(entry => entry.retrying);
+      const parts = [
+        ...(open.length === 0 ? [] : [open.join('; ')]),
+        ...(failing.length === 0 ? [] : [`last failure: ${failing.join('; ')}`]),
+      ];
+      return parts.length === 0 ? null : parts.join(' (') + (parts.length > 1 ? ')' : '');
+    }
+
     const RELOAD_STAGE_PHASES = Object.freeze({
       enter() {},
       step: (_phase, _target, operation) => operation(null)
@@ -1333,7 +1490,7 @@ void analytics.load();
 
       try {
         const generation = await phases.step(
-          'identity',
+          'dataset',
           baseUrl,
           stepSignal => loadDatasetGeneration(baseUrl, {
             candidateAnnDataBinding,
@@ -1341,7 +1498,8 @@ void analytics.load();
             signal: stepSignal === null
               ? signal
               : AbortSignal.any([signal, stepSignal])
-          })
+          }),
+          { progress: datasetReadProgress, pending: openDatasetReads }
         );
         const mapping = await resolveStagedDataMapping({
           baseUrl,
@@ -1384,7 +1542,12 @@ void analytics.load();
         const varFieldLoader = generation.geneList
           ? createVarFieldLoader(
               getGeneListUrl(baseUrl),
-              { pointCount: generation.geneList.n_points }
+              {
+                pointCount: generation.geneList.n_points,
+                // How its genes' values are transformed and which are highly
+                // variable, as the mapping it opens with says.
+                mapping: varLoaderMappingOf(mapping.mapping),
+              }
             )
           : null;
         const vectorFieldManager = createVectorFieldManager({
@@ -1795,7 +1958,7 @@ void analytics.load();
     // already owned by it. `startup` marks the one load the bootstrap starts:
     // its network awaits run as deadline-bound startup steps, its progress is
     // shown, it does not rewrite the address the page was opened with, and a
-    // failure that no newer choice superseded is the terminal startup failure.
+    // failure that no newer choice superseded is startup's to explain.
     async function reloadActiveDatasetInPlace(selection) {
       const activationKeys = [
         'datasetId',
@@ -1866,23 +2029,28 @@ void analytics.load();
       let urlPublication = null;
 
       try {
-        // A newer dataset change ends this step at once: the open it waits
-        // on cannot be cancelled (a served or catalog store finishes
-        // opening), and startup must not wait out its deadline behind a
-        // choice the user already replaced. A stage that lands later is
+        // A newer dataset change ends this step at once: a catalog dataset
+        // being opened for it stops (the stage's signal), a served store
+        // finishes opening, and startup must not wait out its deadline behind
+        // a choice the user already replaced. A stage that lands later is
         // discarded.
+        // Opening reads the dataset's metadata, field lists and the embedding
+        // its first view draws; every request of it bounds itself, so the
+        // step stalls only when nothing at all arrives for a whole deadline,
+        // and then names the reads still open.
         selectionStage = await stagePhases.step(
-          'identity',
-          `the ${sourceType} dataset "${datasetId}"`,
+          'dataset',
+          `the host of dataset "${datasetId}"`,
           () => untilSuperseded(
             dataSourceManager.stageDatasetSelection(
               sourceType,
               datasetId,
-              { loadMethod, source }
+              { loadMethod, source, signal: reloadTransaction.signal }
             ),
             reloadTransaction.signal,
             stage => dataSourceManager.discardDatasetSelection(stage)
-          )
+          ),
+          { progress: datasetReadProgress, pending: openDatasetReads }
         );
         reloadTransaction.assertCurrent();
         // The address the page was opened with already names the startup
@@ -1939,8 +2107,8 @@ void analytics.load();
           transaction: reloadTransaction,
           cancel: () => dataLoad.cancel(),
           reportFailure: failure => {
-            // A failed startup load is logged once, by the terminal startup
-            // failure it becomes.
+            // A failed startup load is logged once, by the startup that
+            // explains it (its failed opening, or the startup failure).
             if (!isStartupLoad) {
               console.error(
                 '[Main] Failed to reload dataset in-place:',
@@ -2167,6 +2335,52 @@ void analytics.load();
       );
       return synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
+    }
+
+    /**
+     * A dataset change, shown from its first moment by the opening progress
+     * (`data/opening-progress.js`; the layers that read the dataset join
+     * it): Cancel stops the change, and the dataset on screen stays. A
+     * failure is explained by the dataset controls (or, at startup, by
+     * startup), so the opening only lets go of it.
+     */
+    async function reloadActiveDatasetShown(selection) {
+      const opening = beginOpening({
+        title: selection.datasetId,
+        step: 'Opening the dataset',
+        onCancel: () => selection.transaction.cancel()
+      });
+      // Named as the dataset list names it, once that is read.
+      const source = selection.source ?? dataSourceManager.getSource(selection.sourceType);
+      Promise.resolve(source?.listDatasets?.())
+        .then(datasets => {
+          const name = datasets?.find?.(dataset => dataset.id === selection.datasetId)?.name;
+          if (typeof name === 'string') opening.rename(name);
+        })
+        .catch(() => {});
+      // A newer choice replaces this change at once: the opening is left to
+      // it (and so is the startup opening, when this change was startup's)
+      // even while this change's own reads are still unwinding, which a
+      // read that never answers would otherwise hold on screen.
+      // (A malformed selection is refused by the reload itself.)
+      const signal = selection?.transaction?.signal ?? null;
+      const letGo = () => {
+        opening.dismiss();
+        if (selection.startup === true) startupOpening?.dismiss();
+      };
+      if (signal?.aborted) letGo();
+      else signal?.addEventListener('abort', letGo, { once: true });
+      try {
+        const ready = await reloadActiveDatasetInPlace(selection);
+        if (ready === true) opening.end();
+        else opening.dismiss();
+        return ready;
+      } catch (error) {
+        opening.dismiss();
+        throw error;
+      } finally {
+        signal?.removeEventListener('abort', letGo);
+      }
     }
 
     async function clearActiveDatasetInPlace(reloadTransaction) {
@@ -2478,12 +2692,12 @@ void analytics.load();
             error
           );
           notifications.error(
-            `The dataset is loaded, but its published sample view could not ` +
-            `be applied: ${message}`,
+            'The dataset is open, but its published sample view could not be applied.',
             {
               category: 'data',
               duration: 0,
-              title: 'Sample view unavailable'
+              title: 'Sample view unavailable',
+              details: message
             }
           );
           return {
@@ -2534,7 +2748,7 @@ void analytics.load();
         rebuildSmokeDensity
       },
       clearActiveDataset: clearActiveDatasetInPlace,
-      reloadActiveDataset: reloadActiveDatasetInPlace,
+      reloadActiveDataset: reloadActiveDatasetShown,
       datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
       dataSourceManager,
@@ -2582,7 +2796,8 @@ void analytics.load();
     if (pageAnalysisSection) {
       comparisonModule = createComparisonModule({
         state,
-        container: pageAnalysisSection
+        container: pageAnalysisSection,
+        colorByGene: ui.colorByGene
       });
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
@@ -4897,10 +5112,33 @@ void analytics.load();
     // loads as one ordinary dataset change: its progress is the data
     // controls' own, and any dataset choice the user makes while it loads —
     // a sample, None, a file, a connection, the benchmark — supersedes it.
-    // Only a failure that no newer choice superseded ends startup.
+    // A dataset that does not open leaves Cellucid running without it (its
+    // opening says why); any other failure no newer choice superseded ends
+    // startup.
     let startupOutcome = 'none';
-    if (startupSelection !== null) {
-      startupOutcome = await ui.loadStartupDataset(startupSelection);
+    // Cancelled while startup resolved it: Cellucid starts without it.
+    if (startupSelection !== null && !startupOpening.cancelled) {
+      try {
+        startupOutcome = await ui.loadStartupDataset(startupSelection);
+      } catch (error) {
+        // Data that did not open, or stopped arriving before its first view;
+        // a stall after it (the published default view) is still terminal.
+        const dataFailed = error instanceof DataSourceError
+          || isExplainedFailure(error)
+          || (error?.code === STARTUP_STALL_CODE
+            && (error.phase === 'dataset' || error.phase === 'positions'));
+        if (!dataFailed) throw error;
+        startupOutcome = 'failed';
+        const launchParameters =
+          STARTUP_LAUNCH_PARAMETERS[startupSelection.sourceType] ?? [];
+        failStartupData(
+          error,
+          launchParameters.some(name => urlParams.has(name))
+            ? 'Cellucid could not read the dataset this link opens.'
+            : 'Cellucid could not read the dataset it was opening.',
+          launchParameters
+        );
+      }
       // Jupyter: Python is told the viewer is ready only once its own
       // dataset is on screen. A dataset the user chose instead in this
       // viewer is not the one Python's indices describe.
@@ -4916,6 +5154,9 @@ void analytics.load();
       }
     }
     startup.enter('ready');
+    // Opened, or startup showed none: a failure was said where it happened.
+    if (startupOutcome === 'ready') startupOpening.end();
+    else startupOpening.dismiss();
     analytics.trackAppReady({
       viewer,
       hasDataset: startupOutcome === 'ready'
@@ -4923,6 +5164,7 @@ void analytics.load();
   } catch (thrown) {
     const startupError = normalizeStartupError(thrown);
     startup.retire(startupError);
+    startupOpening?.fail(startupError);
     console.error('[Main] Terminal startup failure:', startupError);
     if (destroyApplication !== null) {
       void destroyApplication().catch(error => {

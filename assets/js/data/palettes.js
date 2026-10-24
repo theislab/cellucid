@@ -836,6 +836,73 @@ function hslToRgb01(h, s, l) {
   return [r1 + m, g1 + m, b1 + m];
 }
 
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+/**
+ * One `#rgb`, `#rrggbb` or `#rrggbbaa` colour as an RGB triplet of 0..1
+ * channels (alpha dropped: a category's opacity is the view's), or null for
+ * any other text.
+ *
+ * @param {unknown} text
+ * @returns {[number, number, number]|null}
+ */
+function hexColorToRgb01(text) {
+  if (typeof text !== 'string' || !HEX_COLOR.test(text)) return null;
+  const digits = text.length === 4
+    ? [...text.slice(1)].map(digit => digit + digit).join('')
+    : text.slice(1, 7);
+  return [0, 2, 4].map(start => parseInt(digits.slice(start, start + 2), 16) / 255);
+}
+
+/**
+ * The colours a Scanpy palette gives the categories of one field.
+ *
+ * `stored` is `uns['<key>_colors']` as the file holds it: one colour per
+ * category, in category order, as `sc.pl.*` writes it. Read as Scanpy reads
+ * it: a palette shorter than the categories is not used (Scanpy draws its own
+ * colours then), and a longer one gives its first colours. Scanpy writes hex
+ * colours; a palette holding anything else among the colours it gives is not
+ * used, rather than mixing its colours with Cellucid's. Null when there is no
+ * palette to use.
+ *
+ * @param {unknown} stored
+ * @param {number} categoryCount
+ * @returns {Array<[number, number, number]>|null}
+ */
+export function scanpyCategoryPalette(stored, categoryCount) {
+  if (!Number.isSafeInteger(categoryCount) || categoryCount < 0) {
+    throw new RangeError('A palette colours a non-negative whole number of categories.');
+  }
+  if (!Array.isArray(stored) || categoryCount === 0 || stored.length < categoryCount) return null;
+  const colors = [];
+  for (let index = 0; index < categoryCount; index++) {
+    const rgb = hexColorToRgb01(stored[index]);
+    if (rgb === null) return null;
+    colors.push(rgb);
+  }
+  return colors;
+}
+
+/**
+ * The colour category `idx` of a categorical field opens with: its file's
+ * palette (`field.palette`, `scanpyCategoryPalette`) while that still has one
+ * colour per category, else Cellucid's own (`getCategoryColor`). Merging
+ * categories changes their count, and a palette written for the file's
+ * categories no longer says which colour each one has. A fresh array the
+ * caller owns.
+ *
+ * @param {{categories: ReadonlyArray<unknown>, palette?: ReadonlyArray<ReadonlyArray<number>>|null}} field
+ * @param {number} idx
+ * @returns {number[]}
+ */
+export function defaultCategoryColor(field, idx) {
+  const palette = field.palette;
+  const color = Array.isArray(palette) && palette.length === field.categories?.length
+    ? palette[idx]
+    : getCategoryColor(idx);
+  return [color[0], color[1], color[2]];
+}
+
 // Returns a distinct-looking color for the provided category index. Uses the base
 // palette first, then fans out around the color wheel using the golden angle to
 // avoid obvious repeats when there are many categories.

@@ -13,6 +13,14 @@ import { compareCodePoints } from './data-mapping.js';
 import { parseMappingEmbeddingPath } from './data-mapping-candidates.js';
 import { StateValidator } from '../app/utils/state-validator.js';
 import { getTransferLog } from './transfer-log.js';
+import {
+  RETRY_DELAYS_MS,
+  fetchOnce,
+  isTransientStatus,
+  transientStatusError,
+  withRetries,
+  worthAskingAgain,
+} from '../formats/io/byte-source.js';
 
 /**
  * @typedef {Object} DatasetStats
@@ -457,60 +465,45 @@ export async function readBoundedJson(response, options) {
 export const CATALOG_FILE_CACHE = 'no-cache';
 
 /**
- * How long to wait before asking a busy host again (HTTP 429 or 503), each
- * try waiting longer, unless the host's `Retry-After` names the wait: the
- * byte reader's schedule for the same answers. A policy for a host that
- * sheds load for a moment (GitHub Pages answers a burst of requests with an
- * occasional 503), not a limit on what is read.
- */
-const BUSY_RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
-
-/** Milliseconds a `Retry-After` value asks for (seconds or an HTTP date), or null. */
-function retryAfterMs(value) {
-  if (typeof value !== 'string' || value.trim() === '') return null;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-  const date = Date.parse(value);
-  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
-}
-
-function waitMs(milliseconds, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal.reason);
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, milliseconds);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-/**
- * `fetch`, asked again while the host answers that it is busy (HTTP 429 or
- * 503), waiting as its `Retry-After` asks (when the host lets this page read
- * it) or longer each time. The last answer is returned as it is, busy or
- * not; the caller reports it.
+ * `fetch` that is never left hanging and rides out a host's transient
+ * failures: a request is made again (`withRetries`, the byte reader's
+ * schedule) while the host answers that it is busy or failing (HTTP 408,
+ * 429, 5xx), while its connection fails (GitHub Pages answers a burst of
+ * requests with an occasional 503 that carries no CORS headers, which a page
+ * sees only as a failed connection), and when it stalls (no answer and no
+ * byte for the link's timeout, `ResponseClock`), unless the failure shows
+ * it will stay (`worthAskingAgain`: the same error status twice, or no
+ * answer twice), which is reported at once. Each wait is as long as the
+ * host's `Retry-After` asks, when the host lets this page read it. The last
+ * answer is returned as it is, busy or not, with its body already read; the
+ * caller reports it. A connection still failing once the repeats are spent
+ * rejects with an error naming the URL.
  *
  * @param {string} url
  * @param {RequestInit} [init]
  * @returns {Promise<Response>}
  */
 export async function fetchWhenNotBusy(url, init = {}) {
-  for (let attempt = 0; ; attempt++) {
-    const response = await fetch(url, init);
-    if ((response.status !== 429 && response.status !== 503) || attempt >= BUSY_RETRY_DELAYS_MS.length) {
-      return response;
+  const { signal = null, ...rest } = init;
+  // Busy answers asked again so far; one that is not worth asking again (it
+  // repeats exactly, `worthAskingAgain`) is returned as it is.
+  const busy = [];
+  const { response, bytes } = await withRetries(async attempt => {
+    const answer = await fetchOnce(url, rest, { fetchImpl: globalThis.fetch, signal, wantsBody: () => rest.method !== 'HEAD' });
+    if (isTransientStatus(answer.response.status) && attempt < RETRY_DELAYS_MS.length) {
+      const failure = transientStatusError(answer.response, url);
+      if (worthAskingAgain(failure, busy)) {
+        busy.push(failure);
+        throw failure;
+      }
     }
-    await response.body?.cancel?.().catch(() => {});
-    await waitMs(retryAfterMs(response.headers?.get?.('Retry-After')) ?? BUSY_RETRY_DELAYS_MS[attempt], init.signal ?? null);
-  }
+    return answer;
+  }, { signal });
+  const bodiless = [101, 103, 204, 205, 304].includes(response.status);
+  const answered = new Response(bodiless ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+  // The final address after redirects, as `fetch` reports it.
+  if (response.url) Object.defineProperty(answered, 'url', { value: response.url });
+  return answered;
 }
 
 /**

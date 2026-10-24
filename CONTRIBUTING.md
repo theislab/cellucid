@@ -186,8 +186,10 @@ node scripts/validate-tokens.js
 
 ## Testing & validation
 
-Node.js 20 or newer is required (`package.json` sets `engines.node`). Install
-the exact dependencies once, then run the suites:
+Node.js 22.15 or newer is required (`package.json` sets `engines.node`): the
+Zstandard contracts compress their inputs with `node:zlib`'s Zstandard encoder,
+which Node.js 20 does not have. Install the exact dependencies once, then run
+the suites:
 
 ```bash
 npm ci
@@ -215,9 +217,9 @@ contract file is picked up by adding it, with nothing to register. These are
 the same commands `.github/workflows/test.yml` runs, so a green local run is the
 same check CI applies:
 
-- `npm test` runs on Ubuntu, macOS, and Windows across Node 20/22/24/26, with
-  `cellucid-demo-custom-datasets` and `cellucid-datasets` checked out beside the
-  repository so the cross-repository fixture and session-preset contracts run.
+- `npm test` runs on Ubuntu, macOS, and Windows across Node 22/24/26, with
+  `cellucid-datasets` (its catalog and session presets) checked out beside the
+  repository so the cross-repository session-preset contracts run.
 - On every push and pull request the browser suite runs chromium, firefox, and
   webkit on Ubuntu, plus webkit on macOS. Every engine on every operating
   system runs nightly and on manual dispatch (**Actions → Web contracts → Run

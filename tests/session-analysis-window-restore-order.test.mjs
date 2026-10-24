@@ -34,8 +34,13 @@ function createState() {
 }
 
 function createManager(state, opened) {
+  let sizes = NO_SIZES;
   return {
     exportSessionWindows: () => opened.map(entry => entry.descriptor),
+    exportViewSizes: () => sizes,
+    importViewSizes(next) {
+      sizes = next;
+    },
     async closeAll() {
       opened.length = 0;
     },
@@ -51,9 +56,13 @@ function createManager(state, opened) {
   };
 }
 
+const NO_SIZES = { window: {}, expandedView: {} };
+
 const WINDOW = {
   modeId: 'differential',
+  open: true,
   rect: { left: 10, top: 10, width: 400, height: 300 },
+  z: 91,
   settings: { selectedPages: ['page_1', 'page_2'] },
   headerTitle: 'Differential expression',
   // A result's numeric columns travel as their bytes (typed JSON).
@@ -78,7 +87,7 @@ test('analysis windows reopen against the restored highlight pages', async () =>
   };
 
   // Chunk order of a saved bundle: analysis/windows precedes highlights/meta.
-  await analysisWindows.restore(ctx, { id: 'analysis/windows' }, encodeTypedJson({ windows: [WINDOW] }));
+  await analysisWindows.restore(ctx, { id: 'analysis/windows' }, encodeTypedJson({ windows: [WINDOW], sizes: NO_SIZES }));
   await highlightsMeta.restore(ctx, { id: 'highlights/meta' }, HIGHLIGHTS);
   await ctx.restoreTransaction.commit();
 
@@ -103,7 +112,7 @@ test('a failed window reopen rolls the restored pages and windows back', async (
   };
 
   const missingPageWindow = { ...WINDOW, settings: { selectedPages: ['page_9'] } };
-  await analysisWindows.restore(ctx, { id: 'analysis/windows' }, encodeTypedJson({ windows: [missingPageWindow] }));
+  await analysisWindows.restore(ctx, { id: 'analysis/windows' }, encodeTypedJson({ windows: [missingPageWindow], sizes: NO_SIZES }));
   await highlightsMeta.restore(ctx, { id: 'highlights/meta' }, HIGHLIGHTS);
   await assert.rejects(ctx.restoreTransaction.commit(), /page "page_9" was not found/);
 

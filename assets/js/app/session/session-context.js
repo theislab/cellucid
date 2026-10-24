@@ -965,7 +965,7 @@ export function describeDataMappingMismatch(saved, current, readers) {
       + ' Open the dataset version the session was saved on, then load the session again.'
     );
   }
-  for (const group of ['knn', 'geneNames', 'expression', 'latent', 'vectorFields']) {
+  for (const group of ['knn', 'geneNames', 'expression', 'log1p', 'highlyVariable', 'latent', 'vectorFields']) {
     if (sameJson(saved[group], current[group])) continue;
     const refusal = describeChoiceRefusal(group, saved[group]);
     if (refusal === null) continue;

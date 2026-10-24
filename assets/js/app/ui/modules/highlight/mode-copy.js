@@ -7,10 +7,11 @@
  */
 
 /**
- * One line per tool under the Tool buttons: the gesture and nothing else. The
- * modifier keys (Shift adds, Ctrl subtracts), Select mode for screens with no
- * Alt key, and each tool's details live in the Selection (i) tip
- * (`ui/components/info-tips.js`), so the sidebar stays short.
+ * One line per tool: the gesture and nothing else, shown first in the
+ * Selection (i) tip (`publishToolHint`), above the modifier keys (Shift adds,
+ * Ctrl subtracts), Select mode for screens with no Alt key and each tool's
+ * details (`ui/components/info-tips.js`). The panel under the Tool buttons
+ * shows only what a gesture did, so the sidebar stays short.
  */
 export const HIGHLIGHT_MODE_COPY = {
   annotation: 'Alt+click a cell to select its group.',
@@ -20,8 +21,8 @@ export const HIGHLIGHT_MODE_COPY = {
 };
 
 /**
- * Replaces the annotation help text while no presented pane is colored by a
- * field.
+ * Replaces the annotation tool's line in the Selection (i) while no presented
+ * pane is colored by a field.
  *
  * An annotation press is read on the field of the pane it lands in, and a
  * pane colored by none selects nothing (the press is answered with
@@ -176,8 +177,7 @@ export function abandonedGestureNotice(reason) {
  * @param {string} notice
  * @returns {string}
  */
-export function selectionNoticeHtml(notice) {
-  if (notice === '') return '';
+function requireSelectionNotice(notice) {
   if (
     typeof notice !== 'string'
     || notice.length === 0
@@ -188,5 +188,22 @@ export function selectionNoticeHtml(notice) {
       'Selection notice must be exactly "" or one SELECTION_NOTICE value.'
     );
   }
-  return `<br><small>${notice}</small>`;
+  return notice;
+}
+
+export function selectionNoticeHtml(notice) {
+  if (notice === '') return '';
+  return `<br><small>${requireSelectionNotice(notice)}</small>`;
+}
+
+/**
+ * The panel line of a tool with nothing in progress: the notice alone, or
+ * nothing (the tool's gesture is in the Selection (i): `publishToolHint`).
+ *
+ * @param {string} notice
+ * @returns {string}
+ */
+export function idleSelectionNoticeHtml(notice) {
+  if (notice === '') return '';
+  return `<small>${requireSelectionNotice(notice)}</small>`;
 }

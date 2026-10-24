@@ -254,6 +254,9 @@ function buildAnnotationTool(field = CATEGORY_FIELD) {
   const selectionState = createHighlightSelectionState();
   const modeDescription = createElementStub('highlight-mode-description');
   modeDescription.parentElement = dom.parent;
+  // The Selection (i)'s first line: the tool's gesture, or what it needs.
+  const toolHint = createElementStub('highlight-tool-hint');
+  dom.elements.set('highlight-tool-hint', toolHint);
   const annotation = withDocument(dom.document, () => initAnnotationSelection({
     state: stateOwner.state,
     viewer: viewerOwner.viewer,
@@ -268,6 +271,7 @@ function buildAnnotationTool(field = CATEGORY_FIELD) {
     annotation,
     dom,
     modeDescription,
+    toolHint,
     presentViews: viewerOwner.presentViews,
     previews: stateOwner.previews,
     restoreCalls: viewerOwner.restoreCalls,
@@ -637,7 +641,7 @@ for (const reason of ANNOTATION_ABANDONED_GESTURE_REASONS) {
 }
 
 test(
-  'an abandoned annotation gesture with nothing selected keeps the idle copy',
+  'an abandoned annotation gesture with nothing selected says only what it did',
   () => {
     const tool = buildAnnotationTool();
     tool.run(() => {
@@ -650,9 +654,13 @@ test(
 
     assert.equal(
       tool.modeDescription.innerHTML,
-      HIGHLIGHT_MODE_COPY.annotation
-      + `<br><small>${SELECTION_NOTICE.noCellUnderPointer}</small>`,
-      'a first click that hit nothing reads under the invitation it failed'
+      `<small>${SELECTION_NOTICE.noCellUnderPointer}</small>`,
+      'a first click that hit nothing says so, on its own line'
+    );
+    assert.equal(
+      tool.toolHint.textContent,
+      HIGHLIGHT_MODE_COPY.annotation,
+      'the gesture it missed stays in the Selection (i)'
     );
     assert.equal(tool.selectionState.annotationCandidateSet, null);
     assert.deepEqual(tool.selectionState.annotationHistory, []);
@@ -854,9 +862,9 @@ test(
       });
     });
 
-    assert.equal(tool.modeDescription.innerHTML, ANNOTATION_NEEDS_FIELD_COPY);
+    assert.equal(tool.toolHint.textContent, ANNOTATION_NEEDS_FIELD_COPY);
     assert.doesNotMatch(
-      tool.modeDescription.innerHTML,
+      tool.toolHint.textContent,
       /Alt\+click a cell to select/,
       'the panel must not promise a gesture the viewer never starts'
     );
@@ -876,19 +884,19 @@ test(
         candidates: new Uint32Array(0)
       });
     });
-    assert.equal(tool.modeDescription.innerHTML, ANNOTATION_NEEDS_FIELD_COPY);
+    assert.equal(tool.toolHint.textContent, ANNOTATION_NEEDS_FIELD_COPY);
 
     tool.stateOwner.setField(CATEGORY_FIELD);
     tool.run(() => tool.stateOwner.emit('visibility:changed'));
     assert.equal(
-      tool.modeDescription.innerHTML,
+      tool.toolHint.textContent,
       HIGHLIGHT_MODE_COPY.annotation,
-      'the panel must follow the field the user just chose'
+      'the hint must follow the field the user just chose'
     );
 
     tool.stateOwner.setField(null);
     tool.run(() => tool.stateOwner.emit('visibility:changed'));
-    assert.equal(tool.modeDescription.innerHTML, ANNOTATION_NEEDS_FIELD_COPY);
+    assert.equal(tool.toolHint.textContent, ANNOTATION_NEEDS_FIELD_COPY);
   }
 );
 
@@ -904,21 +912,21 @@ test(
 
     tool.run(() => tool.presentViews(['live']));
     assert.equal(
-      tool.modeDescription.innerHTML,
+      tool.toolHint.textContent,
       ANNOTATION_NEEDS_FIELD_COPY,
       'with only the field-less view on screen no press can select'
     );
 
     tool.run(() => tool.presentViews(['live', 'kept']));
     assert.equal(
-      tool.modeDescription.innerHTML,
+      tool.toolHint.textContent,
       HIGHLIGHT_MODE_COPY.annotation,
       'a press in the colored pane selects, although focus has no field'
     );
 
     fieldsByView.delete('kept');
     tool.run(() => tool.stateOwner.emit('visibility:changed'));
-    assert.equal(tool.modeDescription.innerHTML, ANNOTATION_NEEDS_FIELD_COPY);
+    assert.equal(tool.toolHint.textContent, ANNOTATION_NEEDS_FIELD_COPY);
   }
 );
 
@@ -927,15 +935,15 @@ test(
   () => {
     const tool = buildAnnotationTool(null);
     tool.selectionState.activeMode = 'lasso';
-    tool.modeDescription.innerHTML = HIGHLIGHT_MODE_COPY.lasso;
+    tool.toolHint.textContent = HIGHLIGHT_MODE_COPY.lasso;
 
     tool.stateOwner.setField(CATEGORY_FIELD);
     tool.run(() => tool.stateOwner.emit('visibility:changed'));
 
     assert.equal(
-      tool.modeDescription.innerHTML,
+      tool.toolHint.textContent,
       HIGHLIGHT_MODE_COPY.lasso,
-      'the annotation tool must not repaint another mode\'s panel'
+      'the annotation tool must not repaint another mode\'s hint'
     );
   }
 );

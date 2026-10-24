@@ -406,7 +406,9 @@ export class DataSourceManager {
    *
    * @param {string} sourceType
    * @param {string} datasetId
-   * @param {{loadMethod?: string|null, source?: Object}} [options]
+   * @param {{loadMethod?: string|null, source?: Object, signal?: AbortSignal}} [options]
+   *   `signal`: the dataset change this stage is for; a catalog dataset still
+   *   being opened for it stops when it aborts (a newer choice replaced it).
    * @returns {Promise<Readonly<{
    *   baseUrl: string,
    *   datasetId: string,
@@ -421,9 +423,15 @@ export class DataSourceManager {
     validateDatasetId(datasetId, 'Dataset selection datasetId');
     const exactOptions = requireExactOptionRecord(
       options,
-      ['loadMethod', 'source'],
+      ['loadMethod', 'source', 'signal'],
       'Dataset selection stage options'
     );
+    const signal = Object.hasOwn(exactOptions, 'signal')
+      ? exactOptions.signal
+      : null;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Dataset selection signal must be an AbortSignal.');
+    }
     const loadMethod = requireLoadMethod(
       Object.hasOwn(exactOptions, 'loadMethod')
         ? exactOptions.loadMethod
@@ -448,7 +456,7 @@ export class DataSourceManager {
       );
     }
 
-    const metadata = await source.getMetadata(datasetId);
+    const metadata = await source.getMetadata(datasetId, { signal });
     validateDatasetIdentity(metadata, datasetId, sourceType);
     const baseUrl = source.getBaseUrl(datasetId);
     if (

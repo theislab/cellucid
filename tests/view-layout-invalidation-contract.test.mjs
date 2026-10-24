@@ -416,6 +416,7 @@ test('vector bindings belong to exactly the embeddings their mapping names', asy
     X: null,
     layers: [],
     raw: null,
+    log1p: null,
   }), {
     slots: {
       '1d': null,

@@ -154,6 +154,19 @@ test('the Content-Security-Policy allows exactly the JSON-LD block', () => {
   assert.deepEqual(hashes, [expected], 'regenerate the script-src hash after editing the JSON-LD');
 });
 
+test('the Content-Security-Policy adds only Google sign-in and its file picker to scripts and frames', () => {
+  const policy = only(/<meta http-equiv="Content-Security-Policy" content="([\s\S]*?)" \/>/g, INDEX, 'CSP');
+  const directive = name => only(new RegExp(`\\b${name} ([^;]+);`, 'g'), policy, name).trim().split(/\s+/);
+  assert.deepEqual(
+    directive('script-src').filter(source => !source.startsWith("'sha256-")),
+    ["'self'", 'https://www.googletagmanager.com', 'https://accounts.google.com', 'https://apis.google.com']
+  );
+  assert.deepEqual(
+    directive('frame-src'),
+    ["'self'", 'https://accounts.google.com', 'https://docs.google.com', 'https://drive.google.com']
+  );
+});
+
 test('crawlable text says what Cellucid is and links out without taking Tab stops', () => {
   const main = only(/<main class="sr-only" aria-label="About Cellucid">([\s\S]*?)<\/main>/g, INDEX, 'about region');
   const title = only(/<title>([^<]+)<\/title>/g, INDEX, 'title');
@@ -177,10 +190,11 @@ test('no link names the retired documentation host', () => {
 
 test('the 404 page is the site design, links home, to the docs, GitHub and citing, and is not indexed', async () => {
   assert.match(NOT_FOUND, /<meta name="robots" content="noindex" \/>/);
-  assert.match(NOT_FOUND, /<h1 id="not-found-title" class="not-found-title">Page not found<\/h1>/);
-  // The app's own stylesheet, theme bootstrap and welcome card, nothing else.
+  assert.match(NOT_FOUND, /<h1 id="not-found-title" class="welcome-title">Page not found<\/h1>/);
+  // The standalone pages' stylesheet, the app's theme bootstrap and the brand
+  // card, nothing else.
   assert.match(NOT_FOUND, /<html lang="en" data-theme="light" data-viewer-background="studio">/);
-  assert.match(NOT_FOUND, /<link rel="stylesheet" href="\/assets\/css\/main\.css" \/>/);
+  assert.match(NOT_FOUND, /<link rel="stylesheet" href="\/assets\/css\/page\.css" \/>/);
   assert.deepEqual(
     [...NOT_FOUND.matchAll(/<script\b([^>]*)>/g)].map(match => match[1]),
     [' src="/assets/js/app/ui/core/theme-init.js"']
@@ -203,7 +217,7 @@ test('the 404 page is the site design, links home, to the docs, GitHub and citin
   // It ships with the build: inventoried, so its bytes are in the build id.
   const inventory = JSON.parse(await read('cellucid-web-assets.json'));
   assert.ok(inventory.assets.some(asset => asset.path === '404.html'));
-  assert.match(await read('assets/css/layouts/_index.css'), /@import '_not-found\.css';/);
+  assert.match(await read('assets/css/page.css'), /@import 'layouts\/_page\.css' layer\(layouts\);/);
 });
 
 test('llms.txt introduces the project and links to the documentation', () => {

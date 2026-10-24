@@ -479,6 +479,13 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
       },
       finish() {
         settle(record);
+      },
+      /**
+       * Stop this change where it is (the person cancelled it): it ends as a
+       * superseded one does, and the dataset on screen stays.
+       */
+      cancel() {
+        controller.abort();
       }
     });
   }

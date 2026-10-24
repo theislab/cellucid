@@ -41,7 +41,7 @@ test('an H5AD file far above the former 512 MiB ceiling opens from the file pick
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
-    await page.locator('#user-data-h5ad-input').setInputFiles(oversizedPath);
+    await page.locator('#user-data-file-input').setInputFiles(oversizedPath);
 
     await expect(page.locator('#dataset-name')).toHaveText('oversized');
     await expect(page.locator('#dataset-cells')).toHaveText('120');

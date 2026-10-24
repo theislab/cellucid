@@ -108,7 +108,7 @@ test('Zarr candidate loading preserves both opening and cleanup failures', async
           description: 'broken',
           source: { name: 'test' },
         },
-        false
+        { title: 'broken.zarr' }
       ),
       error => {
         assert.ok(error instanceof AggregateError);

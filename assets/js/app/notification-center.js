@@ -72,6 +72,7 @@ const DEFAULT_DURATIONS_MS = Object.freeze({
 const NOTIFICATION_OPTION_KEYS = new Set([
   'action',
   'category',
+  'details',
   'dismissible',
   'duration',
   'id',
@@ -140,7 +141,7 @@ function assertNotificationOptions(options, { partial = false } = {}) {
       );
     }
   }
-  for (const key of ['title', 'message']) {
+  for (const key of ['title', 'message', 'details']) {
     if (Object.hasOwn(options, key) && typeof options[key] !== 'string') {
       throw new TypeError(`Notification ${key} must be a string.`);
     }
@@ -225,6 +226,18 @@ function assertNotificationOptions(options, { partial = false } = {}) {
       );
     }
   }
+}
+
+/**
+ * A notification's details: the technical text behind its message (the raw
+ * error of a failure), folded so the message stays one short sentence.
+ *
+ * @param {string} details
+ * @returns {string}
+ */
+function notificationDetailsHtml(details) {
+  return '<details class="notification-details"><summary>Details</summary>'
+    + `<div class="notification-details-text">${escapeHtml(details)}</div></details>`;
 }
 
 function assertMethodOptions(options, methodName, reservedKeys) {
@@ -360,7 +373,8 @@ class NotificationCenter {
       speed = null,
       dismissible = true,
       onCancel = null,
-      action = null
+      action = null,
+      details = ''
     } = options;
 
     const el = document.createElement('div');
@@ -381,6 +395,9 @@ class NotificationCenter {
         ${safeTitle ? `<div class="notification-title">${safeTitle}</div>` : ''}
         ${safeMessage ? `<div class="notification-message">${safeMessage}</div>` : ''}
     `;
+
+    // The technical text behind a short message, folded under it.
+    if (details !== '') html += notificationDetailsHtml(details);
 
     let progressBarWidth = '';
 
@@ -653,6 +670,21 @@ class NotificationCenter {
         content.appendChild(msgEl);
       }
       msgEl.textContent = options.message;
+    }
+
+    if (options.details !== undefined) {
+      element.querySelector('.notification-details')?.remove();
+      if (options.details !== '') {
+        const content = element.querySelector('.notification-content');
+        if (content === null) {
+          throw new Error(`Notification "${id}" has no content element.`);
+        }
+        const holder = document.createElement('div');
+        holder.innerHTML = notificationDetailsHtml(options.details);
+        const message = content.querySelector('.notification-message');
+        if (message === null) content.appendChild(holder.firstElementChild);
+        else message.after(holder.firstElementChild);
+      }
     }
 
     // A title published with active work names that work in progress

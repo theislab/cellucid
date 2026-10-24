@@ -10,11 +10,18 @@
  * anonymous requests per minute, so the record's own listing gives each file's
  * size and checksum and no probe request is made.
  *
+ * A link that names its file opens in one round trip: the file's first bytes
+ * (an `.h5ad`'s first read) are asked for beside the record, which opening
+ * needs anyway, and are used when the record is the version the link names.
+ * Zenodo does not show its `Content-Range` to other sites, so the size always
+ * comes from the record.
+ *
  * @module data/sources/providers/zenodo
  */
 
-import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
-import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
+import { chooseOpenableFile, describeRemoteFile, fileFormatOf } from '../remote-file.js';
+import { HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
 
 const API = 'https://zenodo.org/api/records/';
 const RECORD = /^[1-9][0-9]*$/;
@@ -64,7 +71,7 @@ export default Object.freeze({
   match(input, { explicit = true } = {}) {
     return parseZenodo(input, explicit);
   },
-  async open(value, { signal = null } = {}) {
+  async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseZenodo(value);
     if (parsed === null) {
       throw new DataSourceError(
@@ -75,14 +82,30 @@ export default Object.freeze({
       );
     }
     const [recordId, requested = null] = parsed.split(/\/(.*)/s);
+    const fileUrl = (version, name) => `${API}${version}/files/${encodeURIComponent(name)}/content`;
+    // The named file's first read goes out with the record request.
+    const early = new AbortController();
+    const earlySignal = signal === null ? early.signal : AbortSignal.any([signal, early.signal]);
+    const headRead = requested !== null && fileFormatOf(requested) === 'h5ad'
+      ? readFileHead(fileUrl(recordId, requested), HEAD_BYTES, { signal: earlySignal })
+      : null;
+    headRead?.catch(() => {});
     // A concept record redirects to its latest version, so the record read
     // here names the exact version that opens.
-    const response = await fetch(`${API}${recordId}`, { signal });
+    let response;
+    try {
+      response = await fetchWhenNotBusy(`${API}${recordId}`, { signal });
+    } catch (error) {
+      early.abort(error);
+      throw error;
+    }
     if (!response.ok) {
+      early.abort(new DOMException('The record could not be read.', 'AbortError'));
       throw new DataSourceError(
         response.status === 404 || response.status === 410
           ? `Zenodo record ${recordId} does not exist or is not public.`
-          : `Zenodo record ${recordId} could not be read (HTTP ${response.status}).`,
+          : `Zenodo record ${recordId} could not be read (HTTP ${response.status}). ` +
+            'Check the record number on zenodo.org, or try again later.',
         response.status === 404 || response.status === 410
           ? DataSourceErrorCode.NOT_FOUND
           : DataSourceErrorCode.NETWORK_ERROR,
@@ -108,19 +131,32 @@ export default Object.freeze({
       fileName => `zenodo:${version}/${fileName}`
     );
     const entry = files.get(name);
+    const size = Number.isSafeInteger(entry.size) ? entry.size : null;
+    // The early read is this file's head when the link named this version.
+    let head = null;
+    if (headRead !== null && version === recordId && name === requested && size !== null) {
+      try {
+        head = headOfFile(await headRead, size, HEAD_BYTES);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+      }
+    } else {
+      early.abort(new DOMException('Another version is read instead.', 'AbortError'));
+    }
     const metadata = record.metadata ?? {};
     const title = typeof metadata.title === 'string' && metadata.title.trim()
       ? metadata.title.trim()
       : `Zenodo ${version}`;
     const file = await describeRemoteFile({
-      url: `${API}${version}/files/${encodeURIComponent(name)}/content`,
+      url: fileUrl(version, name),
       // The concept id names the deposit across versions, so sessions and
       // annotations follow a dataset to its next version; the version id and
       // checksum say which one is open.
       id: `zenodo:${record.conceptrecid ?? version}:${encodeURIComponent(name)}`,
       name,
       title,
-      size: Number.isSafeInteger(entry.size) ? entry.size : null,
+      size,
+      head,
       version: `zenodo:${version}:${entry.checksum ?? ''}`,
       attribution: {
         title,
@@ -129,6 +165,7 @@ export default Object.freeze({
         ...(typeof metadata.license?.id === 'string' ? { licence: metadata.license.id } : {}),
       },
       signal,
+      onStep,
     });
     return { title, file, attribution: file.attribution };
   },

@@ -16,6 +16,7 @@
  */
 
 import { onAbort } from './abort.js';
+import { ResponseClock } from './link.js';
 
 /**
  * How reads to a source should be shaped. None of these limits what can be
@@ -40,14 +41,20 @@ import { onAbort } from './abort.js';
  * @property {string} name - File name, for messages
  * @property {Readonly<Object>} identity - What the file is (for sessions and caches)
  * @property {ReadPolicy} policy
- * @property {(offset: number, length: number, options?: {signal?: AbortSignal|null}) => Promise<Uint8Array>} read
+ * @property {(offset: number, length: number, options?: {signal?: AbortSignal|null,
+ *   link?: import('./link.js').LinkMeter|null, onBytes?: ((bytes: number) => void)|null}) => Promise<Uint8Array>} read
+ *   `link`: the link the read is measured on, whose answers time a stalled
+ *   request; `onBytes`: hears bytes as they arrive (negative: an attempt that
+ *   failed, its bytes taken back)
  */
 
 /** Why a read failed, as a code a caller can act on. */
 export const BYTE_SOURCE_FAILURES = Object.freeze({
   NETWORK: 'network',
+  STALLED: 'stalled',
   RANGE_IGNORED: 'range-ignored',
   RATE_LIMITED: 'rate-limited',
+  UNAVAILABLE: 'unavailable',
   HTTP: 'http',
   SHORT_READ: 'short-read',
   CHANGED: 'changed',
@@ -236,8 +243,12 @@ function sleep(milliseconds, signal) {
   });
 }
 
-/** Milliseconds a `Retry-After` header asks for, or null. */
-function retryAfterMilliseconds(value, now = Date.now()) {
+/**
+ * Milliseconds a `Retry-After` header asks for (seconds, or an HTTP date),
+ * or null. A cross-origin page sees the header only where the host exposes
+ * it (`Access-Control-Expose-Headers`); otherwise the waits below apply.
+ */
+export function retryAfterMilliseconds(value, now = Date.now()) {
   if (typeof value !== 'string' || value.trim() === '') return null;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
@@ -246,12 +257,232 @@ function retryAfterMilliseconds(value, now = Date.now()) {
 }
 
 /**
- * How many times a request is repeated after the host says it is busy (HTTP
- * 429 or 503) or the connection drops, waiting longer each time (or as long
- * as the host's `Retry-After` asks). A policy for transient failures, not a
- * limit on what is read.
+ * How many times a request is repeated after a transient failure, waiting
+ * longer each time (or as long as the host's `Retry-After` asks): the host
+ * said it is busy or failing (HTTP 408, 429, 5xx), the connection failed or
+ * dropped (a 503 sent without CORS headers reaches the page as exactly
+ * this), or the request stalled (`ResponseClock`; it is repeated at once:
+ * the silence was the wait). A failure that shows it will stay is reported
+ * sooner (`worthAskingAgain`). A policy for transient failures, not a limit
+ * on what is read: the failure is reported once the repeats are spent.
  */
-const RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
+export const RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
+
+/** Whether an HTTP status says the host may answer if asked again. */
+export function isTransientStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599 && status !== 501 && status !== 505);
+}
+
+/** The error of a transient status (`isTransientStatus`), naming what was asked. */
+export function transientStatusError(response, what) {
+  const status = response.status;
+  return new ByteSourceError(
+    status === 429 ? BYTE_SOURCE_FAILURES.RATE_LIMITED : BYTE_SOURCE_FAILURES.UNAVAILABLE,
+    status === 429
+      ? `${what}: the host is limiting how fast it is read (HTTP 429).`
+      : `${what}: the host could not answer (HTTP ${status}).`,
+    {
+      status,
+      retryAfter: response.headers.get('Retry-After'),
+      // What a repeat of the same failure looks like (`withRetries`).
+      signature: `${status}:${response.headers.get('Content-Length') ?? ''}`,
+    }
+  );
+}
+
+const TRANSIENT_FAILURES = new Set([
+  BYTE_SOURCE_FAILURES.NETWORK,
+  BYTE_SOURCE_FAILURES.STALLED,
+  BYTE_SOURCE_FAILURES.RATE_LIMITED,
+  BYTE_SOURCE_FAILURES.UNAVAILABLE,
+]);
+
+/** Whether a failed request may succeed if made again. */
+export function isTransientFailure(error) {
+  return error instanceof ByteSourceError && TRANSIENT_FAILURES.has(error.code);
+}
+
+/** A response body, read as it arrives; `onBytes` hears of every piece. */
+async function readBody(response, onBytes) {
+  if (response.body === null || typeof response.body?.getReader !== 'function') {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    onBytes(bytes.length);
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const pieces = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pieces.push(value);
+    total += value.length;
+    onBytes(value.length);
+  }
+  if (pieces.length === 1) return pieces[0];
+  const bytes = new Uint8Array(total);
+  let at = 0;
+  for (const piece of pieces) {
+    bytes.set(piece, at);
+    at += piece.length;
+  }
+  return bytes;
+}
+
+/**
+ * One request to a web host, never left hanging: `{response, bytes}`, the
+ * body read when `wantsBody(response)` says so (else cancelled, `bytes`
+ * null). The request is aborted as stalled once neither it nor its link has
+ * received anything for the link's timeout (`ResponseClock`): a host that
+ * never answers, or stops sending a body, fails the request with
+ * `STALLED` instead of holding it forever. A connection that fails (a
+ * network error, a host's answer without CORS headers, a body cut short) is
+ * `NETWORK`. Both name the URL. `signal` cancels.
+ *
+ * @param {string} url
+ * @param {RequestInit} init - Sent as given, with the request's own signal
+ * @param {{fetchImpl: typeof fetch, signal?: AbortSignal|null, clock?: ResponseClock,
+ *   wantsBody?: (response: Response) => boolean, expectedBytes?: number,
+ *   onBytes?: ((bytes: number) => void)|null}} options
+ *   `onBytes` hears each piece of the body as it arrives
+ *   `expectedBytes`: the length of a range asked for, which a host that
+ *   buffers it may take to transfer before answering (`patienceMs`)
+ *   `label`: how failures name the request (the URL by default); a
+ *   pre-authenticated URL is named by its display link instead
+ * @returns {Promise<{response: Response, bytes: Uint8Array|null}>}
+ */
+export async function fetchOnce(url, init, { fetchImpl, signal = null, clock = new ResponseClock(), wantsBody = response => response.ok, expectedBytes = 0, onBytes = null, label = url }) {
+  if (signal?.aborted) throw abortError(signal);
+  const controller = new AbortController();
+  const stopCaller = onAbort(signal, () => controller.abort(abortError(signal)));
+  const started = clock.now();
+  let lastAt = started;
+  let silentMs = null;
+  let timer = null;
+  const watch = () => {
+    const quietSince = Math.max(lastAt, clock.lastActivityAt);
+    const left = quietSince + clock.patienceMs(expectedBytes) - clock.now();
+    if (left > 0) {
+      timer = setTimeout(watch, left);
+      return;
+    }
+    timer = null;
+    silentMs = clock.now() - lastAt;
+    clock.stalled();
+    controller.abort(new DOMException('The request stalled.', 'TimeoutError'));
+  };
+  timer = setTimeout(watch, clock.patienceMs(expectedBytes));
+  let phase = 'answer';
+  try {
+    const response = await fetchImpl(url, { ...init, signal: controller.signal });
+    lastAt = clock.now();
+    clock.answered(lastAt - started);
+    if (!wantsBody(response)) {
+      await response.body?.cancel().catch(() => {});
+      return { response, bytes: null };
+    }
+    phase = 'body';
+    const bytes = await readBody(response, length => {
+      lastAt = clock.now();
+      clock.received();
+      onBytes?.(length);
+    });
+    return { response, bytes };
+  } catch (cause) {
+    if (signal?.aborted) throw abortError(signal);
+    if (silentMs !== null) {
+      throw new ByteSourceError(
+        BYTE_SOURCE_FAILURES.STALLED,
+        `${label}: ${phase === 'answer' ? 'no answer' : 'no more bytes'} for ${(silentMs / 1000).toFixed(1)} s.`,
+        { cause, url: label }
+      );
+    }
+    if (cause instanceof ByteSourceError) throw cause;
+    throw new ByteSourceError(
+      BYTE_SOURCE_FAILURES.NETWORK,
+      phase === 'answer'
+        ? `${label}: the request failed (no connection, or an answer without CORS headers, as a busy or failing host sends).`
+        : `${label}: the connection dropped while reading.`,
+      { cause, url: label, phase }
+    );
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    stopCaller();
+  }
+}
+
+/**
+ * Whether a transient failure is worth asking again, given the failures of
+ * the same request before it. The signs that a host will answer later are
+ * asked again for the whole `RETRY_DELAYS_MS` schedule: a `Retry-After`
+ * (the host names when), a connection dropped in the middle of a body, a
+ * request that stalled. The signs that it will not are reported at once:
+ *
+ * - an error status (5xx, 429) without `Retry-After` that repeats exactly
+ *   (the same status and the same `Content-Length`): a host that answers
+ *   the same failure twice is not busy, it is failing (Zenodo's API answers
+ *   a missing record with the same 500 every time);
+ * - a request that got no answer at all (no connection, or an answer
+ *   without CORS headers) after it was asked once more: a host that does
+ *   not let this site read it never will, while the momentary 503 GitHub
+ *   Pages sends without CORS headers is answered on the next request.
+ *
+ * @param {ByteSourceError} error
+ * @param {ByteSourceError[]} before - The same request's earlier failures
+ * @returns {boolean}
+ */
+export function worthAskingAgain(error, before) {
+  const { code, details = {} } = error;
+  if (code === BYTE_SOURCE_FAILURES.STALLED) return true;
+  if (code === BYTE_SOURCE_FAILURES.NETWORK) {
+    if (details.phase === 'body') return true;
+    return !before.some(earlier => earlier.code === BYTE_SOURCE_FAILURES.NETWORK && earlier.details?.phase !== 'body');
+  }
+  if (code === BYTE_SOURCE_FAILURES.RATE_LIMITED || code === BYTE_SOURCE_FAILURES.UNAVAILABLE) {
+    if (retryAfterMilliseconds(details.retryAfter) !== null) return true;
+    return !before.some(earlier => earlier.details?.signature !== undefined && earlier.details.signature === details.signature);
+  }
+  return true;
+}
+
+/**
+ * `attempt(n)` until it succeeds, repeating it after a transient failure
+ * (`isTransientFailure`, or as `retryable` decides) that is worth asking
+ * again (`worthAskingAgain`), with the waits of `RETRY_DELAYS_MS`, or as
+ * long as a `Retry-After` asks; a stalled request is repeated at once. The
+ * last failure is thrown once the repeats are spent or the failure is
+ * known to stay, saying how many times the request was made.
+ *
+ * @template T
+ * @param {(attempt: number) => Promise<T>} attempt
+ * @param {{signal?: AbortSignal|null, retryable?: (error: unknown) => boolean,
+ *   onRetry?: ((error: ByteSourceError, attempts: number) => void)|null}} [options]
+ *   `onRetry` hears each failure that is asked again, with the attempts made so far
+ * @returns {Promise<T>}
+ */
+export async function withRetries(attempt, { signal = null, retryable = isTransientFailure, onRetry = null } = {}) {
+  const failures = [];
+  for (let n = 0; ; n++) {
+    try {
+      return await attempt(n);
+    } catch (error) {
+      if (signal?.aborted) throw abortError(signal);
+      if (!retryable(error)) throw error;
+      const again = worthAskingAgain(error, failures);
+      failures.push(error);
+      if (!again || n >= RETRY_DELAYS_MS.length) {
+        throw new ByteSourceError(error.code, `${error.message} Asked ${n + 1} time${n === 0 ? '' : 's'}.`, {
+          ...error.details,
+          cause: error.details?.cause ?? error.cause,
+          attempts: n + 1,
+        });
+      }
+      onRetry?.(error, n + 1);
+      if (error.code === BYTE_SOURCE_FAILURES.STALLED) continue;
+      await sleep(retryAfterMilliseconds(error.details?.retryAfter) ?? RETRY_DELAYS_MS[n], signal);
+    }
+  }
+}
 
 /**
  * A file on a web host, read with HTTP `Range` requests.
@@ -267,16 +498,35 @@ const RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
  * (provider metadata or a probe),
  * because many hosts do not expose `Content-Range` to scripts. After a
  * redirect, the final URL is reused until it fails once (signed CDN URLs
- * expire), then the original URL is asked again. When the host exposes an
+ * expire), then the original URL is asked again; a final URL that states its
+ * own lifetime (an AWS SigV4 `X-Amz-Expires`, as Figshare's ten-second S3
+ * links and Hugging Face's CDN links do) is not used past it, counted from
+ * when the redirected request was sent less the time it took to answer, so
+ * its expiry costs no failed request. When the host exposes an
  * `ETag`, a response with a different one means the file changed while it
  * was open, and the read is refused instead of mixing two versions; `etag`
  * is the one bytes already read came with (a head read beside the probe).
  *
+ * A file behind a sign-in or an expiring link is read through `access`:
+ * `target({refresh})` answers the URL and headers the next request goes to
+ * (`{url, headers?, expiresAt?}`, `expiresAt` in epoch milliseconds), and
+ * `url` is then the file's display link only, which messages, identities and
+ * the Transfers log name; the target's URL and headers never appear in them.
+ * One target serves every read: parallel reads wait on one `target()`, a
+ * target past its `expiresAt` is replaced before a request is sent, and an
+ * answer that says the target went stale (HTTP 401, or `isStale(status)`)
+ * replaces it once for every read that used it (`refresh: true`) -- not a
+ * repeat counted by `withRetries`, and its wait is not a silence the stall
+ * clock counts. A second stale answer fails the read with its status. A
+ * change of `access.generation` (a sign-out) drops the target held.
+ *
  * @param {{url: string, size: number, name?: string, identity?: Object, etag?: string|null}} resource
- * @param {{fetch?: typeof fetch, policy?: Partial<ReadPolicy>}} [options]
+ * @param {{fetch?: typeof fetch, policy?: Partial<ReadPolicy>, access?: {
+ *   target: (request: {refresh: boolean}) => Promise<{url: string, headers?: Object<string, string>, expiresAt?: number}>,
+ *   isStale?: (status: number) => boolean, generation?: unknown}|null}} [options]
  * @returns {ByteSource}
  */
-export function httpByteSource({ url, size, name, identity = null, etag: knownTag = null }, { fetch: fetchImpl = globalThis.fetch, policy } = {}) {
+export function httpByteSource({ url, size, name, identity = null, etag: knownTag = null }, { fetch: fetchImpl = globalThis.fetch, policy, access = null } = {}) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -292,67 +542,135 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
   if (typeof fetchImpl !== 'function') {
     throw new TypeError('httpByteSource needs fetch.');
   }
+  if (access !== null && (typeof access !== 'object' || typeof access.target !== 'function')) {
+    throw new TypeError('httpByteSource access needs target({refresh}).');
+  }
   const originalUrl = parsed.href;
   const fileName = name ?? (decodeURIComponent(parsed.pathname.split('/').pop() || '') || parsed.host);
   let finalUrl = null;
+  /** When the final URL stops working, by its own stated lifetime; null: unknown. */
+  let finalUrlExpiresAt = null;
   let etag = typeof knownTag === 'string' ? knownTag : null;
 
-  async function request(target, offset, length, signal) {
-    let response;
-    try {
-      response = await fetchImpl(target, {
-        headers: { Range: `bytes=${offset}-${offset + length - 1}` },
-        cache: 'no-store',
-        signal,
-      });
-    } catch (cause) {
-      if (signal?.aborted) throw abortError(signal);
-      throw new ByteSourceError(
-        BYTE_SOURCE_FAILURES.NETWORK,
-        `${fileName}: the host did not answer, or does not allow other sites to read it (CORS).`,
-        { cause }
-      );
-    }
-    return response;
+  /** One request of `[offset, offset + length)` from `target`, with `headers`. */
+  function request(target, headers, offset, length, signal, clock, onBytes) {
+    return fetchOnce(target, {
+      headers: { ...headers, Range: `bytes=${offset}-${offset + length - 1}` },
+      cache: 'no-store',
+    }, {
+      fetchImpl,
+      signal,
+      clock,
+      wantsBody: response => response.status === 206 || (response.status === 200 && offset === 0 && length === size),
+      expectedBytes: length,
+      onBytes,
+      // A target URL may be pre-authenticated: failures name the display link.
+      label: access === null ? target : originalUrl,
+    });
   }
 
-  async function readOnce(offset, length, signal) {
-    let response = null;
+  // The target `access` answers, shared by every read.
+  let held = null;
+  let heldGeneration;
+  let pending = null;
+  const usable = target => target !== null && target === held && heldGeneration === access.generation &&
+    !(Number.isFinite(target.expiresAt) && Date.now() >= target.expiresAt);
+
+  /** The target to read from; `stale`: the one a read found stale, replaced unless another read already did. */
+  function targetOf(stale) {
+    if (usable(held) && held !== stale) return Promise.resolve(held);
+    pending ??= (async () => {
+      const generation = access.generation;
+      const next = requireTarget(await access.target({ refresh: stale !== null || held !== null }));
+      held = next;
+      heldGeneration = generation;
+      // A new target redirects anew.
+      finalUrl = null;
+      finalUrlExpiresAt = null;
+      return next;
+    })().finally(() => {
+      pending = null;
+    });
+    return pending;
+  }
+
+  function waitFor(promise, signal) {
+    if (signal === null) return promise;
+    if (signal.aborted) return Promise.reject(abortError(signal));
+    return new Promise((resolve, reject) => {
+      const stopWaiting = onAbort(signal, () => reject(abortError(signal)));
+      promise.then(
+        value => {
+          stopWaiting();
+          resolve(value);
+        },
+        error => {
+          stopWaiting();
+          reject(error);
+        }
+      );
+    });
+  }
+
+  /** The answer of one request from `base` (or the final URL it redirected to). */
+  async function answerFrom(base, headers, offset, length, signal, clock, onBytes) {
+    if (finalUrl !== null && finalUrlExpiresAt !== null && Date.now() >= finalUrlExpiresAt) {
+      finalUrl = null;
+      finalUrlExpiresAt = null;
+    }
+    let answer = null;
     if (finalUrl !== null) {
       try {
-        response = await request(finalUrl, offset, length, signal);
-        if (response.status !== 206) {
-          await response.body?.cancel().catch(() => {});
-          response = null;
-        }
+        answer = await request(finalUrl, headers, offset, length, signal, clock, onBytes);
+        if (answer.response.status !== 206) answer = null;
       } catch (error) {
         if (signal?.aborted) throw error;
-        response = null;
+        answer = null;
       }
-      if (response === null) finalUrl = null;
+      if (answer === null) {
+        finalUrl = null;
+        finalUrlExpiresAt = null;
+      }
     }
-    response ??= await request(originalUrl, offset, length, signal);
+    if (answer !== null) return { ...answer, base, sentAt: null };
+    const sentAt = Date.now();
+    answer = await request(base, headers, offset, length, signal, clock, onBytes);
+    return { ...answer, base, sentAt };
+  }
+
+  async function readOnce(offset, length, signal, clock, onBytes) {
+    let answer;
+    if (access === null) {
+      answer = await answerFrom(originalUrl, {}, offset, length, signal, clock, onBytes);
+    } else {
+      let target = await waitFor(targetOf(null), signal);
+      for (let renewed = false; ; renewed = true) {
+        answer = await answerFrom(target.url, target.headers ?? {}, offset, length, signal, clock, onBytes);
+        const answered = answer.response.status;
+        if (answered !== 401 && access.isStale?.(answered) !== true) break;
+        if (renewed) {
+          throw new ByteSourceError(
+            BYTE_SOURCE_FAILURES.HTTP,
+            `${originalUrl}: the host refused the read (HTTP ${answered}) after its access was renewed.`,
+            { status: answered }
+          );
+        }
+        target = await waitFor(targetOf(target), signal);
+      }
+    }
+    const { response, bytes } = answer;
     const status = response.status;
     if (status === 200 && !(offset === 0 && length === size)) {
-      await response.body?.cancel().catch(() => {});
       throw new ByteSourceError(
         BYTE_SOURCE_FAILURES.RANGE_IGNORED,
         `${fileName}: the host ignores range requests, so the file cannot be read in place.`
       );
     }
-    if (status === 429 || status === 503) {
-      await response.body?.cancel().catch(() => {});
-      throw new ByteSourceError(
-        BYTE_SOURCE_FAILURES.RATE_LIMITED,
-        `${fileName}: the host is limiting how fast it is read (HTTP ${status}).`,
-        { status, retryAfter: response.headers.get('Retry-After') }
-      );
-    }
+    if (isTransientStatus(status)) throw transientStatusError(response, originalUrl);
     if (status !== 206 && status !== 200) {
-      await response.body?.cancel().catch(() => {});
       throw new ByteSourceError(
         BYTE_SOURCE_FAILURES.HTTP,
-        `${fileName}: the host answered HTTP ${status}.`,
+        `${originalUrl}: the host answered HTTP ${status}.`,
         { status }
       );
     }
@@ -360,58 +678,101 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
     if (responseTag !== null) {
       if (etag === null) etag = responseTag;
       else if (responseTag !== etag) {
-        await response.body?.cancel().catch(() => {});
         throw new ByteSourceError(
           BYTE_SOURCE_FAILURES.CHANGED,
           `${fileName} changed on the host while it was open; open it again to read the new version.`
         );
       }
     }
-    let buffer;
-    try {
-      buffer = await response.arrayBuffer();
-    } catch (cause) {
-      if (signal?.aborted) throw abortError(signal);
-      throw new ByteSourceError(
-        BYTE_SOURCE_FAILURES.NETWORK,
-        `${fileName}: the connection dropped while reading.`,
-        { cause }
-      );
-    }
-    if (buffer.byteLength !== length) {
+    if (bytes.length !== length) {
       throw new ByteSourceError(
         BYTE_SOURCE_FAILURES.SHORT_READ,
-        `${fileName}: asked for ${length} bytes at ${offset}, received ${buffer.byteLength}; the file may have changed.`
+        `${fileName}: asked for ${length} bytes at ${offset}, received ${bytes.length}; the file may have changed.`
       );
     }
-    if (response.url && response.url !== originalUrl) finalUrl = response.url;
-    return new Uint8Array(buffer);
+    if (response.url && response.url !== answer.base) {
+      finalUrl = response.url;
+      // Answered from the base URL: the final URL's stated lifetime starts now.
+      if (answer.sentAt !== null) {
+        const lifetime = statedLifetimeMs(finalUrl);
+        finalUrlExpiresAt = lifetime === null ? null : answer.sentAt + lifetime - (Date.now() - answer.sentAt);
+      }
+    }
+    return bytes;
   }
 
+  /** Requests made without a measured link (tests, a lone source) share one clock. */
+  const ownClock = new ResponseClock();
   const source = {
     size,
     name: fileName,
     url: originalUrl,
     identity: Object.freeze(identity ?? { kind: 'url', url: originalUrl, size }),
     policy: withPolicy(REMOTE_POLICY, policy),
-    async read(offset, length, { signal = null } = {}) {
+    async read(offset, length, { signal = null, link = null, onBytes = null } = {}) {
       requireRange(source, offset, length);
       if (signal?.aborted) throw abortError(signal);
       if (length === 0) return new Uint8Array(0);
-      for (let attempt = 0; ; attempt++) {
+      const clock = link?.responses ?? ownClock;
+      return withRetries(async () => {
+        // Bytes of an attempt that fails are taken back: they did not arrive.
+        let arrived = 0;
         try {
-          return await readOnce(offset, length, signal);
+          return await readOnce(offset, length, signal, clock, onBytes === null ? null : bytes => {
+            arrived += bytes;
+            onBytes(bytes);
+          });
         } catch (error) {
-          const transient = error instanceof ByteSourceError &&
-            (error.code === BYTE_SOURCE_FAILURES.RATE_LIMITED || error.code === BYTE_SOURCE_FAILURES.NETWORK);
-          if (!transient || attempt >= RETRY_DELAYS_MS.length || signal?.aborted) throw error;
-          const asked = retryAfterMilliseconds(error.details?.retryAfter);
-          await sleep(asked ?? RETRY_DELAYS_MS[attempt], signal);
+          if (arrived > 0) onBytes(-arrived);
+          throw error;
         }
-      }
+      }, {
+        signal,
+        onRetry: (error, attempts) => clock.onRetry?.(error, attempts),
+      });
     },
   };
   return Object.freeze(source);
+}
+
+/** A target `access` answered, checked: `{url, headers?, expiresAt?}`. */
+function requireTarget(target) {
+  let parsed = null;
+  try {
+    parsed = new URL(target?.url);
+  } catch {
+    // refused below
+  }
+  if (parsed === null || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
+    throw new TypeError('A byte source access target needs an absolute http(s) URL.');
+  }
+  const headers = target.headers ?? {};
+  if (headers === null || typeof headers !== 'object' ||
+      Object.values(headers).some(value => typeof value !== 'string')) {
+    throw new TypeError('A byte source access target\'s headers must be strings.');
+  }
+  if (target.expiresAt !== undefined && target.expiresAt !== null && !Number.isFinite(target.expiresAt)) {
+    throw new TypeError('A byte source access target\'s expiresAt must be a time in milliseconds.');
+  }
+  return Object.freeze({ url: parsed.href, headers: Object.freeze({ ...headers }), expiresAt: target.expiresAt ?? null });
+}
+
+/**
+ * How long a signed URL says it works, in milliseconds (AWS SigV4
+ * `X-Amz-Expires`, in seconds), or null when it does not say.
+ *
+ * @param {string} href
+ * @returns {number|null}
+ */
+export function statedLifetimeMs(href) {
+  let value;
+  try {
+    value = new URL(href).searchParams.get('X-Amz-Expires');
+  } catch {
+    return null;
+  }
+  if (value === null || !/^\d+$/.test(value)) return null;
+  return Number(value) * 1000;
 }
 
 /** Whether `value` is a byte source (has a size, a name and `read`). */
@@ -436,15 +797,20 @@ export function readFileHead(url, length, { signal = null, fetchImpl = globalThi
   return readHeadOf(url, length, signal, fetchImpl);
 }
 
-async function readHeadOf(url, length, signal, fetchImpl) {
+async function readHeadOf(url, length, signal, fetchImpl, clock = new ResponseClock()) {
   const started = performance.now();
   // Past the HTTP cache, as every range read of a file (`httpByteSource`).
-  const response = await fetchImpl(url, { headers: { Range: `bytes=0-${length - 1}` }, cache: 'no-store', signal });
-  if (response.status !== 206) {
-    await response.body?.cancel().catch(() => {});
-    return { response, bytes: null, ms: performance.now() - started };
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  const { response, bytes } = await withRetries(async () => {
+    const answer = await fetchOnce(url, { headers: { Range: `bytes=0-${length - 1}` }, cache: 'no-store' }, {
+      fetchImpl,
+      signal,
+      clock,
+      wantsBody: reply => reply.status === 206,
+      expectedBytes: length,
+    });
+    if (isTransientStatus(answer.response.status)) throw transientStatusError(answer.response, url);
+    return answer;
+  }, { signal });
   return { response, bytes, ms: performance.now() - started };
 }
 
@@ -480,10 +846,17 @@ export async function probeHttpResource(url, { signal = null, fetchImpl = global
   let rangeSupported = null;
   let finalUrl = url;
   // The head goes out with the HEAD, not after it: both take one round trip.
-  const headRead = headBytes > 0 ? readHeadOf(url, headBytes, signal, fetchImpl) : null;
+  // One clock for the probe's requests: a silent host stalls them, never holds them.
+  const clock = new ResponseClock();
+  const headRead = headBytes > 0 ? readHeadOf(url, headBytes, signal, fetchImpl, clock) : null;
   headRead?.catch(() => {});
   try {
-    const head = await fetchImpl(url, { method: 'HEAD', headers: { Range: 'bytes=0-' }, signal });
+    const { response: head } = await fetchOnce(url, { method: 'HEAD', headers: { Range: 'bytes=0-' } }, {
+      fetchImpl,
+      signal,
+      clock,
+      wantsBody: () => false,
+    });
     if (head.ok) {
       const length = Number(head.headers.get('Content-Length'));
       const total = /\/(\d+)\s*$/.exec(head.headers.get('Content-Range') ?? '');
@@ -513,7 +886,7 @@ export async function probeHttpResource(url, { signal = null, fetchImpl = global
     }
     return { url: finalUrl, size, etag, lastModified, rangeSupported, head: headOfFile(headOf, size, headBytes) };
   }
-  const read = await (headRead ?? readHeadOf(url, 1, signal, fetchImpl));
+  const read = await (headRead ?? readHeadOf(url, 1, signal, fetchImpl, clock));
   const { response } = read;
   if (response.status === 206) {
     const total = /\/(\d+)\s*$/.exec(response.headers.get('Content-Range') ?? '');

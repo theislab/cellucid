@@ -24,11 +24,13 @@ function joinedPageData(pageData, variableName) {
 }
 
 function joinedScores(pageData) {
-  const rows = ['page,score'];
+  const rows = ['page,set,cell_index,score'];
   for (const pd of pageData) {
-    for (const value of pd.values) {
-      if (Number.isFinite(value)) rows.push([toCSVCell(pd.pageName), toCSVCell(value)].join(','));
-    }
+    pd.values.forEach((value, i) => {
+      if (Number.isFinite(value)) {
+        rows.push([toCSVCell(pd.pageName), toCSVCell(pd.setName), toCSVCell(pd.cellIndices?.[i] ?? i), toCSVCell(value)].join(','));
+      }
+    });
   }
   return rows.join('\n');
 }
@@ -63,7 +65,11 @@ test('per-cell CSV bytes equal the joined rows however the rows are split', asyn
   }
 
   // Signature scores skip non-finite scores; a range may hold none.
-  const scores = [{ pageName: 'A', values }, { pageName: 'B', values: Float32Array.of(NaN, 1.5) }, { pageName: 'C', values: Float32Array.of(NaN) }];
+  const scores = [
+    { pageName: 'A', setName: 'T cells', values, cellIndices },
+    { pageName: 'B', setName: 'T cells', values: Float32Array.of(NaN, 1.5), cellIndices: Uint32Array.of(3, 9) },
+    { pageName: 'C', setName: 'B, cells', values: Float32Array.of(NaN), cellIndices: Uint32Array.of(1) },
+  ];
   for (const parts of [1, 3, 8]) {
     assert.equal(await written('signature-scores', scores, undefined, parts), joinedScores(scores), `${parts} parts`);
   }
@@ -74,8 +80,11 @@ test('the CSV export operation writes the lines of its rows, and refuses unknown
   const pages = [{ pageName: 'P', values: Float32Array.of(1, 2), cellIndices: Uint32Array.of(4, 9) }];
   const { rows } = executeOperation(OperationType.COMPUTE_CSV_EXPORT, { layout: 'page-data', pages });
   assert.equal(await rows.text(), 'P,4,1\nP,9,2');
-  const scores = executeOperation(OperationType.COMPUTE_CSV_EXPORT, { layout: 'signature-scores', pages });
-  assert.equal(await scores.rows.text(), 'P,1\nP,2');
+  const scores = executeOperation(OperationType.COMPUTE_CSV_EXPORT, {
+    layout: 'signature-scores',
+    pages: pages.map(page => ({ ...page, setName: 'S' })),
+  });
+  assert.equal(await scores.rows.text(), 'P,S,4,1\nP,S,9,2');
   assert.throws(
     () => executeOperation(OperationType.COMPUTE_CSV_EXPORT, { layout: 'other', pages }),
     /Unknown CSV export layout/

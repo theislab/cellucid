@@ -222,10 +222,9 @@ test('analysis rows keep one rhythm and the page chips stay legible', async ({
   // same distance any two rows are apart.
   const gaps = await panel.evaluate(element => {
     const actions = element.querySelector('.analysis-page-actions');
-    const next = element.querySelector(
-      '.analysis-page-selector + .control-block',
-    );
-    const rows = [...element.querySelectorAll('.analysis-page-selector ~ .control-block')];
+    // The options follow the page selector: their first row, then the next.
+    const rows = [...element.querySelectorAll('.analysis-options-essentials > .control-block')];
+    const next = rows[0];
     return {
       afterSelector: next.getBoundingClientRect().top
         - actions.getBoundingClientRect().bottom,
@@ -263,18 +262,28 @@ test('marker genes names its method and its disclosures draw one chevron', async
 }) => {
   await openDataset(page);
   const panel = await openAnalysisMode(page, 'genesPanel');
-  await expect(panel.getByLabel('Statistical method', { exact: true })).toBeVisible();
-  await expect(panel.getByLabel('Mode', { exact: true })).toBeVisible();
-
-  const headers = panel.locator('.disclosure-inline .disclosure-header');
-  await expect(headers).toHaveCount(2);
+  // "More options", then the groups inside it: each draws one chevron and,
+  // closed inside an open item, does not inherit the item's turn.
+  const more = panel.locator('.analysis-more-options > .disclosure-header');
+  await expect(more.locator('> .disclosure-chevron')).toHaveText('');
+  await expect(more).toHaveAttribute('aria-expanded', 'false');
+  await expect(more.locator('> .disclosure-chevron')).toHaveCSS('transform', 'none');
+  await more.click();
+  await expect(more.locator('> .disclosure-chevron')).not.toHaveCSS('transform', 'none');
+  const headers = panel.locator('.analysis-options-group .disclosure-header');
+  await expect(headers).toHaveCount(4);
   for (const header of await headers.all()) {
     const chevron = header.locator('> .disclosure-chevron');
+    await expect(chevron).toHaveCount(1);
     await expect(chevron).toHaveText('');
-    // Closed inside an open item, so it must not inherit the item's turn.
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     await expect(chevron).toHaveCSS('transform', 'none');
   }
+
+  // The test is named where it is chosen.
+  await panel.getByRole('button', { name: 'Test', exact: true }).click();
+  await expect(panel.getByLabel('Method', { exact: true })).toBeVisible();
+  await expect(panel.getByLabel('Method', { exact: true })).toHaveValue('wilcox');
 });
 
 test('shortcut descriptions share one left edge and keys sit flush right', async ({
@@ -331,7 +340,16 @@ test.describe('short screen', () => {
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI fixture',
     );
-    await expect(page.locator('.notification').first()).toBeVisible();
+    // Startup's own progress is the opening overlay; a notification published
+    // while the dialog is open (an outcome, a refusal) must still stay behind
+    // it.
+    await page.evaluate(async () => {
+      const { getNotificationCenter } = await import(
+        '/assets/js/app/notification-center.js'
+      );
+      getNotificationCenter().info('A notice during the welcome dialog', { duration: 0 });
+    });
+    await expect(page.locator('.notification').first()).toBeAttached();
     const covering = await page.evaluate(() => {
       const dialog = document.querySelector('#welcome-modal .welcome-content');
       // Touch layouts let taps through notifications; hit-test what is drawn.

@@ -154,14 +154,13 @@ export function servedStoreKey(serverUrl, dataset) {
 
 /**
  * Where one served store's bytes are, as this browser reaches the server:
- * its URL and host, and the remote file the reader reads in place.
+ * its URL and the remote file the reader reads in place.
  */
 function servedResource(serverUrl, dataset, sourceType) {
   const { file } = dataset.anndata;
   const url = new URL(file.route, `${serverUrl}/`).href;
   return {
     url,
-    host: new URL(url).host,
     resource: {
       url,
       size: file.size,
@@ -195,7 +194,7 @@ function servedResource(serverUrl, dataset, sourceType) {
  */
 export async function describeServedAnnData({ serverUrl, dataset, sourceType, signal = null }) {
   const { file } = dataset.anndata;
-  const { url, host, resource } = servedResource(serverUrl, dataset, sourceType);
+  const { url, resource } = servedResource(serverUrl, dataset, sourceType);
   const client = new AnnDataReaderClient({ kind: file.kind });
   try {
     const source = file.layout === 'file'
@@ -208,7 +207,7 @@ export async function describeServedAnnData({ serverUrl, dataset, sourceType, si
     return Object.freeze({
       id: dataset.id,
       name: dataset.name,
-      description: own.description ?? `Read in place from ${host}`,
+      description: own.description ?? '',
       stats: Object.freeze({
         n_cells: described.nObs,
         n_genes: described.hasExpressionMatrix ? described.nVars : 0,
@@ -232,7 +231,7 @@ export async function describeServedAnnData({ serverUrl, dataset, sourceType, si
  */
 export async function openServedAnnData({ serverUrl, dataset, sourceType }) {
   const { file, defaults } = dataset.anndata;
-  const { url, host, resource } = servedResource(serverUrl, dataset, sourceType);
+  const { url, resource } = servedResource(serverUrl, dataset, sourceType);
   const transfer = getTransferLog().begin({
     key: url,
     label: dataset.name,
@@ -243,10 +242,9 @@ export async function openServedAnnData({ serverUrl, dataset, sourceType }) {
   });
   const source = file.kind === 'h5ad' ? createH5adDataSource() : createZarrDataSource();
   const options = {
-    showProgress: false,
     datasetId: dataset.id,
     name: dataset.name,
-    description: `Read in place from ${host}`,
+    description: '',
     source: { name: dataset.name, url, filename: file.name },
     defaults,
   };

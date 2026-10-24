@@ -5,7 +5,9 @@
  * (`data/read-activity-log.js`) that runs longer than a moment gets one
  * notification saying what is read, how much of how much, how fast and how
  * long is left, updated as it goes, and closed with what it read and how
- * long it took. Opening a file is shown by the startup view instead, and a
+ * long it took. The reads of an opening (the file's structure, the embedding
+ * and field its first view draws) are shown by the opening progress instead
+ * (`data/opening-progress.js`, `app/opening-progress-view.js`), and a
  * job's reads (an analysis's, outlier quantiles': `JOB_READ_KINDS`, and a
  * read a job joined after something else started it: `adopt`) by the job's
  * own notification, which can cancel it (`jobs/cancellable-job.js`): a run
@@ -18,6 +20,7 @@ import { getNotificationCenter } from './notification-center.js';
 import { isJobRead } from './jobs/cancellable-job.js';
 import { formatTransferBytes } from '../data/transfer-log.js';
 import { describeReadProgress, formatDuration, getReadActivityLog } from '../data/read-activity-log.js';
+import { getOpeningProgress } from '../data/opening-progress.js';
 
 /** A read is shown once it has run this long; shorter ones would only flicker. */
 const SHOW_AFTER_MS = 700;
@@ -44,12 +47,16 @@ function finishedMessage(activity) {
  * @param {{log?: Object, notifications?: Object}} [options]
  * @returns {() => void} Stop showing them
  */
-export function showReadProgress({ log = getReadActivityLog(), notifications = getNotificationCenter() } = {}) {
+export function showReadProgress({
+  log = getReadActivityLog(),
+  notifications = getNotificationCenter(),
+  opening = getOpeningProgress(),
+} = {}) {
   /** @type {Map<number, string>} Notification id by activity id */
   const shown = new Map();
   return log.subscribe(activity => {
     const id = shown.get(activity.id) ?? null;
-    if (activity.kind === 'open' || isJobRead(activity)) {
+    if (activity.kind === 'open' || opening.shows(activity) || isJobRead(activity)) {
       // A read a job joined after it was shown is the job's now: its
       // notification goes, the job's shows it.
       if (id !== null) {

@@ -40,6 +40,8 @@ import {
   anndataLoadGeneValues,
   anndataLoadGeneSparse,
   anndataLoadGeneCellSubset,
+  anndataLinkMeasurement,
+  anndataLoadMarkedGenes,
   anndataDescribeOutlierQuantiles,
   anndataLoadOutlierQuantiles,
   anndataLoadConnectivity,
@@ -505,14 +507,38 @@ export function checkGeneList(list) {
 }
 
 /**
+ * A categorical field's palette is null, or one RGB triplet of 0..1 channels
+ * per category; a field whose categories are found on load has none.
+ */
+function requireCategoryPalette(palette, categories, key) {
+  if (palette === null) return;
+  if (
+    !Array.isArray(categories) ||
+    !Array.isArray(palette) ||
+    palette.length !== categories.length ||
+    palette.some(color => (
+      !Array.isArray(color) ||
+      color.length !== 3 ||
+      color.some(channel => !(Number.isFinite(channel) && channel >= 0 && channel <= 1))
+    ))
+  ) {
+    throw new Error(
+      `Invalid obs field "${key}": palette must be null or one RGB colour (0 to 1) per category`
+    );
+  }
+}
+
+/**
  * Check the obs field list the adapter answers
  * (`BaseAnnDataAdapter.getObsFields`). A continuous field is `{key, kind:
  * 'continuous', fieldIndex, outlierQuantilesPath: null}`; a categorical
  * field is `{key, kind: 'category', fieldIndex, categories, codesDtype,
- * codesMissingValue, outlierQuantilesPath}`, its categories (and code width)
- * null when they are found on first load, and its outlier route null when
- * the dataset opens with no latent space. Centroids are computed in the
- * browser, never listed.
+ * codesMissingValue, palette, outlierQuantilesPath}`, its categories (and code
+ * width) null when they are found on first load, its palette the RGB colour
+ * (0..1 channels) of each category the file stores one for (Scanpy's
+ * `uns['<key>_colors']`) or null, and its outlier route null when the dataset
+ * opens with no latent space. Centroids are computed in the browser, never
+ * listed.
  *
  * @param {Object} list
  * @returns {Object}
@@ -560,6 +586,7 @@ export function checkObsFields(list) {
       'categories',
       'codesDtype',
       'codesMissingValue',
+      'palette',
       'outlierQuantilesPath',
     ], 'categorical obs field');
     if (field.kind !== 'category') {
@@ -567,9 +594,10 @@ export function checkObsFields(list) {
     }
     const key = validateFieldName(field.key, { names, label: 'obs field list' });
     const fieldIndex = requireFieldIndex(field.fieldIndex, `obs field "${key}"`);
-    const { categories, codesDtype, codesMissingValue, outlierQuantilesPath } = field;
+    const { categories, codesDtype, codesMissingValue, palette, outlierQuantilesPath } = field;
     const storage = { categories, dtype: codesDtype, missingValue: codesMissingValue, fieldKey: key };
     if (!categoriesFoundOnLoad(storage)) validateCategoricalStorage(storage);
+    requireCategoryPalette(palette, categories, key);
     // Outlier quantiles (float32) are computed in the dataset's latent
     // space, when it has one: their route names it and this field.
     if (
@@ -586,6 +614,7 @@ export function checkObsFields(list) {
       categories,
       codesDtype,
       codesMissingValue,
+      palette,
       outlierQuantilesPath,
     });
   }
@@ -869,9 +898,12 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
       missingValue: field.codesMissingValue,
     });
     if (foundOnLoad) {
-      // The categories this column has, found by reading it: the field
-      // adopts them (field/loading.js).
+      // The categories this column has, found by reading it, and the colours
+      // its file stores for them: the field adopts both (field/loading.js).
+      const palette = data.palette ?? null;
+      requireCategoryPalette(palette, data.categories, field.key);
       outputs.categories = data.categories;
+      outputs.palette = palette;
     } else if (
       codesDtype !== field.codesDtype ||
       data.missingValue !== field.codesMissingValue ||
@@ -1005,23 +1037,96 @@ export function createObsFieldLoader(obsUrl, options = {}) {
 }
 
 /**
+ * The part of a data mapping a gene loader answers for: the expression
+ * matrix its genes come from, each matrix's `log1p` and the highly variable
+ * genes' column. Null for a loader of genes no mapping names.
+ *
+ * @typedef {{expression: string, log1p: Record<string, {base: number|null}>, highlyVariable: string|null}} VarLoaderMapping
+ */
+
+/**
+ * What a gene loader answers for from one data mapping, or null when the
+ * mapping names no expression matrix.
+ *
+ * @param {{expression: string|null, log1p: Object, highlyVariable: string|null}} mapping
+ * @returns {VarLoaderMapping|null}
+ */
+export function varLoaderMappingOf(mapping) {
+  if (mapping.expression === null) return null;
+  return {
+    expression: mapping.expression,
+    log1p: mapping.log1p,
+    highlyVariable: mapping.highlyVariable,
+  };
+}
+
+function requireVarLoaderMapping(mapping) {
+  if (mapping === null) return null;
+  if (
+    mapping === undefined ||
+    typeof mapping !== 'object' ||
+    Object.keys(mapping).sort().join(',') !== 'expression,highlyVariable,log1p' ||
+    typeof mapping.expression !== 'string' ||
+    mapping.log1p === null ||
+    typeof mapping.log1p !== 'object' ||
+    (mapping.highlyVariable !== null && typeof mapping.highlyVariable !== 'string')
+  ) {
+    throw new TypeError('A gene loader mapping is exactly {expression, log1p, highlyVariable}, or null.');
+  }
+  return Object.freeze({
+    expression: mapping.expression,
+    log1p: Object.freeze(Object.fromEntries(Object.entries(mapping.log1p).map(
+      ([matrix, entry]) => [matrix, Object.freeze({ base: entry.base })]
+    ))),
+    highlyVariable: mapping.highlyVariable,
+  });
+}
+
+/**
  * A gene loader with shared options. It also has
  * `readSparseColumn(field, {signal})`: one gene's non-zero entries
- * (`{length, indices, values}`), owned by the caller; and
+ * (`{length, indices, values}`), owned by the caller;
  * `readCellSubset(fields, cells, {signal})`: some genes in some cells, read
- * by cell or by gene, whichever costs less.
+ * by cell or by gene, whichever costs less; and, as the data mapping says
+ * (`options.mapping`):
+ *
+ * - `log1p({matrix})`: `{base}` (null for e) when the data mapping says the
+ *   expression matrix `matrix` (`X`, `raw`, `layer:<name>`; this loader's own
+ *   when omitted) holds `log1p` values, else null;
+ * - `highlyVariableGenes()`: the names, in this gene list, of the genes the
+ *   mapped highly-variable column marks, or null when the mapping names
+ *   none. The column is read on the first call and kept with the loader: a
+ *   changed mapping makes a new loader.
  *
  * @param {string} geneListUrl - `<base>var` or `<base>var/{axis}/{names}`
- * @param {FieldLoaderOptions} [options]
+ * @param {FieldLoaderOptions & {mapping?: VarLoaderMapping|null}} [options]
  * @returns {(field: any, runtimeOptions?: Object) => Promise<any>}
  */
 export function createVarFieldLoader(geneListUrl, options = {}) {
   requireAnnDataUrl(geneListUrl, 'Var field loader');
+  const { mapping: rawMapping = null, ...loadOptions } = options;
+  const mapping = requireVarLoaderMapping(rawMapping);
   const loader = (field, runtimeOptions = {}) => loadVarFieldData(
     geneListUrl,
     field,
-    mergeFieldLoaderOptions(options, runtimeOptions)
+    mergeFieldLoaderOptions(loadOptions, runtimeOptions)
   );
+  loader.log1p = ({ matrix = mapping?.expression ?? null } = {}) => {
+    if (mapping === null || matrix === null) return null;
+    const entry = mapping.log1p[matrix];
+    return entry === undefined ? null : { base: entry.base };
+  };
+  let highlyVariable = null;
+  loader.highlyVariableGenes = () => {
+    if (mapping === null || mapping.highlyVariable === null) return Promise.resolve(null);
+    highlyVariable ??= anndataLoadMarkedGenes(geneListUrl, mapping.highlyVariable).then(
+      names => (names === null ? null : Object.freeze(names))
+    ).catch(error => {
+      highlyVariable = null;
+      throw error;
+    });
+    return highlyVariable;
+  };
   const base = baseOf(geneListUrl);
   // An analysis's reads: `owner` is the job they are for.
   loader.readSparseColumn = (field, { signal = null, owner = null } = {}) => {
@@ -1032,6 +1137,9 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
     for (const field of fields) requireGeneDescriptor(field, `var field "${field.key}"`);
     return anndataLoadGeneCellSubset(fields.map(field => `${base}${field.path}`), cells, { signal, owner });
   };
+  // The link the genes are read over, as last measured, or null (work that
+  // tunes itself to the link reads it here).
+  loader.linkMeasurement = () => anndataLinkMeasurement(geneListUrl);
   return loader;
 }
 

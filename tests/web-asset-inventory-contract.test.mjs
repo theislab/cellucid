@@ -79,7 +79,7 @@ test('web inventory MIME types are explicit and never guessed', () => {
     'font/woff2'
   );
   assert.equal(
-    contentTypeForAssetPath('assets/img/favicon.ico'),
+    contentTypeForAssetPath('favicon.ico'),
     'image/vnd.microsoft.icon'
   );
   assert.equal(
@@ -117,7 +117,9 @@ test('runtime cache policy excludes only the deploy-only social preview', async 
       paths: [
         'assets/img/og-preview.jpg',
         'browserconfig.xml',
+        'favicon.ico',
         'index.html',
+        'privacy.html',
         'site.webmanifest',
       ],
     }),
@@ -204,6 +206,8 @@ test('web inventory binds exact bytes to the single index build id', async () =>
   await writeFile(join(rootDir, '404.html'), '<!doctype html><title>Not found</title>\n');
   await writeFile(join(rootDir, 'CITATION.cff'), 'cff-version: 1.2.0\n');
   await writeFile(join(rootDir, 'browserconfig.xml'), '<browserconfig/>\n');
+  await writeFile(join(rootDir, 'favicon.ico'), 'ico\n');
+  await writeFile(join(rootDir, 'privacy.html'), '<!doctype html><title>Privacy</title>\n');
   await writeFile(join(rootDir, 'site.webmanifest'), '{}\n');
 
   const inventory = await buildWebAssetInventory({
@@ -213,7 +217,9 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       'CITATION.cff',
       'assets/js/app.js',
       'browserconfig.xml',
+      'favicon.ico',
       'index.html',
+      'privacy.html',
       'site.webmanifest',
     ],
   });
@@ -230,7 +236,9 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       'CITATION.cff',
       'assets/js/app.js',
       'browserconfig.xml',
+      'favicon.ico',
       'index.html',
+      'privacy.html',
       'site.webmanifest',
     ]
   );
@@ -263,7 +271,9 @@ test('web inventory binds exact bytes to the single index build id', async () =>
         'CITATION.cff',
         'assets/js/app.js',
         'browserconfig.xml',
+        'favicon.ico',
         'index.html',
+        'privacy.html',
         'site.webmanifest',
       ],
     }),

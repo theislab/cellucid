@@ -87,63 +87,8 @@
 }
 
 /* ========================================================================
-   Dataset & Session Styles
+   Data mapping (Session; the rest of the Session panel is _session.css)
    ===================================================================== */
-
-/* The dataset facts and the data-source status: a dashed `.control-box` in
-   the mono instrument type. */
-.dataset-info {
-  font-size: var(--type-readout);
-  color: var(--color-text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-
-.dataset-info.loading {
-  color: var(--color-text-secondary);
-  font-style: italic;
-}
-
-.dataset-info.error {
-  color: var(--color-danger-text);
-  background: var(--color-danger-soft);
-  border-color: var(--color-danger);
-}
-
-.dataset-info-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  padding: calc(var(--space-0-5) + var(--space-px)) 0;
-  border-bottom: var(--border-width-1) solid var(--color-border-faint);
-}
-
-.dataset-info-row:last-child {
-  border-bottom: none;
-}
-
-.dataset-info-label {
-  flex: 0 0 82px;
-  font-size: var(--type-readout);
-  color: var(--color-text-secondary);
-  letter-spacing: var(--tracking-normal);
-  white-space: nowrap;
-}
-
-.dataset-info-value {
-  flex: 1 1 auto;
-  text-align: right;
-  color: var(--color-text-primary);
-  font-size: var(--type-readout);
-  letter-spacing: var(--tracking-tight);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dataset-info-ellipsis {
-  max-width: 180px;
-}
 
 /* Data mapping (Session, last group): a disclosure list -- the Embeddings
    checklist first, then the groups read from the file -- one status line,
@@ -179,6 +124,52 @@
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
+}
+
+/* The checklist is one list: rows sit flush, divided by a hairline, with no
+   box of their own. The dimension chips line up at the right edge. */
+.data-mapping-list {
+  gap: 0;
+  padding-block: var(--space-0-5);
+}
+
+.data-mapping-list .data-mapping-row,
+.data-mapping-list .data-mapping-row:hover,
+.data-mapping-list .data-mapping-row[data-disabled="true"] {
+  padding-inline: 0;
+  border: 0;
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  background: transparent;
+}
+
+.data-mapping-list .data-mapping-row:last-child,
+.data-mapping-more .data-mapping-row:last-child {
+  border-bottom: 0;
+}
+
+.data-mapping-row-main > .data-mapping-dim {
+  margin-left: auto;
+  min-width: var(--space-10);
+  justify-content: space-between;
+}
+
+/* How wide a wide array is, quietly, under its name. */
+.data-mapping-width {
+  white-space: nowrap;
+  font-size: var(--type-compact);
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Other arrays": arrays wider than a 3D layout, or that cannot be drawn, collapsed at the end. */
+.data-mapping-more > .disclosure-header {
+  padding-block: var(--space-1);
+}
+
+.data-mapping-more > .disclosure-header > .disclosure-title {
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
 }
 
 /* A long name ("PCA scale0 latents 1,2,3") takes a second line rather than
@@ -406,62 +397,9 @@
   gap: var(--space-1-5);
 }
 
-.user-data-row {
-  display: flex;
-  gap: var(--space-1-5);
-  /* Field and button keep their own drawn heights side by side. */
-  align-items: center;
-  margin-top: var(--space-1-5);
-}
-
-.user-data-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-1-5);
-  margin-top: var(--space-1-5);
-}
-
-.user-data-grid .data-btn {
-  min-width: 0;
-  width: 100%;
-  white-space: nowrap;
-}
-
-.user-data-grid .data-btn-wide {
-  grid-column: 1 / -1;
-}
-
 /* Hidden inputs (triggered programmatically). */
 .file-input-hidden {
   display: none;
-}
-
-/* Equal-width data buttons that scale with sidebar */
-.user-data-row .data-btn {
-  flex: 1 1 0;
-  min-width: 0;
-}
-
-.user-data-row > .obs-select {
-  flex: 1;
-  min-width: 0;
-}
-
-#user-data-browse-btn,
-#user-data-h5ad-btn {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-/* Style user data block if File System Access API is not supported */
-#user-data-block.unsupported {
-  opacity: var(--opacity-50);
-}
-
-#user-data-block.unsupported #user-data-browse-btn,
-#user-data-block.unsupported #user-data-h5ad-btn {
-  cursor: not-allowed;
-  opacity: var(--opacity-60);
 }
 
 /* Dataset select dropdown enhancements */
@@ -471,7 +409,6 @@
 
 #dataset-select option:disabled {
   color: var(--color-text-tertiary);
-  font-style: italic;
 }
 
 /* ========================================================================

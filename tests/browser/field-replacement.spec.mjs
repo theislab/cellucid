@@ -106,7 +106,7 @@ test('dataset replacement cancels stale field editors before same-index reuse', 
   expect(staleEditor).not.toBeNull();
 
   await page.locator('#dataset-select').selectOption('__none__');
-  await expect(page.locator('#dataset-name')).toHaveText('—');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('.inline-rename-input')).toHaveCount(0);
 
   await page.locator('#dataset-select').selectOption(

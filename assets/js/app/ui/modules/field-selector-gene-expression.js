@@ -51,6 +51,7 @@ const CALLBACK_KEYS = new Set([
 ]);
 const RETURN_KEYS = new Set([
   'clearGeneSelection',
+  'colorByGene',
   'clearLocalSelectionUI',
   'destroy',
   'initGeneExpressionDropdown',
@@ -765,6 +766,26 @@ export function initGeneExpressionSelector(options) {
     });
   }
 
+  /**
+   * Colour the cells by the gene named `geneKey`, exactly as choosing it in
+   * this list does: how a gene picked elsewhere (an analysis result) is
+   * shown, so the search box always names the gene the cells show.
+   *
+   * @param {string} geneKey
+   * @returns {Promise<Object|null>} As `selectGene`
+   */
+  function colorByGene(geneKey) {
+    assertAlive();
+    if (typeof geneKey !== 'string' || geneKey.length === 0) {
+      throw new TypeError('Gene to colour by must be its exact key');
+    }
+    const entry = geneFieldList.find(candidate => candidate.field.key === geneKey);
+    if (entry === undefined) {
+      throw new RangeError(`"${geneKey}" is not a gene of the expression matrix shown`);
+    }
+    return selectGene(entry.originalIdx);
+  }
+
   async function clearGeneSelection() {
     assertAlive();
     selectedGeneOriginalIdx = -1;
@@ -946,6 +967,7 @@ export function initGeneExpressionSelector(options) {
   const api = {
     initGeneExpressionDropdown,
     selectGene,
+    colorByGene,
     clearGeneSelection,
     clearLocalSelectionUI,
     syncFromState,

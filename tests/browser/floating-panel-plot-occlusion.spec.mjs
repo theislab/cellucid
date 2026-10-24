@@ -47,7 +47,7 @@ async function openDataset(page) {
   });
 }
 
-async function undock(page, panelId) {
+async function undock(page, panelId, edge = 's') {
   const frame = frameOf(page, panelId);
   await page.evaluate(id => { document.getElementById(id).open = true; }, panelId);
   await frame.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
@@ -58,11 +58,29 @@ async function undock(page, panelId) {
   // "covers" it) or under the tail of its final shadow (Firefox, Chromium:
   // the region's top device rows three levels dark).
   await expectFloatingSettled(frame);
-  // The panel only had a scroller of its own, and so only ever lost the plot,
-  // when its content overflows the window.
-  expect(await frame.locator('.accordion-content').evaluate(
-    content => content.scrollHeight > content.clientHeight,
-  )).toBe(true);
+  // The panel only has a scroller of its own, and so only ever lost the plot,
+  // when its content overflows the window. A panel opens as tall as its
+  // content, so it is made shorter from one edge, 16 px a key, until it
+  // overflows and lies within its half of the plot (where its mirror image
+  // is): the bottom edge for a panel in the top half, the top edge for one
+  // in the lower half.
+  const content = frame.locator('.accordion-content');
+  const ready = () => frame.evaluate((element, fromBottom) => {
+    const inner = element.querySelector('.accordion-content');
+    const box = element.getBoundingClientRect();
+    const middle = window.innerHeight / 2;
+    const inHalf = fromBottom ? box.bottom < middle : box.top > middle;
+    return inner.scrollHeight > inner.clientHeight && inHalf;
+  }, edge === 's');
+  const handle = frame.locator(`> .accordion-resize-handle[data-edge="${edge}"]`);
+  await handle.focus();
+  for (let press = 0; press < 80 && !(await ready()); press++) {
+    await page.keyboard.press(edge === 's' ? 'ArrowUp' : 'ArrowDown');
+  }
+  expect(await ready()).toBe(true);
+  expect(await content.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
+  // Away from the handle, so its focus ring is not in the comparison.
+  await page.evaluate(() => document.activeElement?.blur());
 }
 
 /**
@@ -253,7 +271,7 @@ test('the plot shows above an undocked panel in the lower half', async ({
   page,
 }) => {
   await openDataset(page);
-  await undock(page, 'visualization-section');
+  await undock(page, 'visualization-section', 'n');
   const frame = frameOf(page, 'visualization-section');
   const box = await frame.boundingBox();
   expect(box.y + box.height / 2).toBeGreaterThan(450);

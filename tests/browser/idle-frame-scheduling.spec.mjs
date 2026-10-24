@@ -286,7 +286,7 @@ test('pointer movement and typing that change nothing do not redraw the scene', 
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
   const canvas = await page.locator('#glcanvas').boundingBox();
-  const field = page.locator('#remote-server-url');
+  const field = page.locator('#data-address');
   const fieldBox = await field.boundingBox();
   expect(canvas).not.toBeNull();
   expect(fieldBox).not.toBeNull();

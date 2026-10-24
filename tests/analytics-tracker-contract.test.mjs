@@ -139,6 +139,9 @@ test('a production page sends environment classes, then only declared events', (
     isTrusted: true,
     target: element({ parent: element({ id: 'analysis-header-genesPanel' }) }),
   });
+  // The two analyses added beside it are counted by their own variants.
+  click({ isTrusted: true, target: element({ id: 'analysis-header-dotplot' }) });
+  click({ isTrusted: true, target: element({ id: 'analysis-header-composition' }) });
   // A field select names dataset fields; only the fact of the change counts.
   change({
     isTrusted: true,
@@ -150,6 +153,8 @@ test('a production page sends environment classes, then only declared events', (
   assert.deepEqual(events(calls), [
     { name: 'feature_used', params: { feature: 'legend_highlight' } },
     { name: 'feature_used', params: { feature: 'analysis', variant: 'genes_panel' } },
+    { name: 'feature_used', params: { feature: 'analysis', variant: 'dotplot' } },
+    { name: 'feature_used', params: { feature: 'analysis', variant: 'composition' } },
     { name: 'feature_used', params: { feature: 'color_by_category' } },
     { name: 'feature_used', params: { feature: 'render_mode', variant: 'smoke' } },
   ]);

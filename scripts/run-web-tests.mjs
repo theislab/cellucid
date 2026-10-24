@@ -5,9 +5,13 @@ import path from 'node:path';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testsDirectory = path.join(repositoryRoot, 'tests');
+// Every file goes on one command line, and Windows caps a command line at
+// 32,767 characters. Paths relative to the repository root (the child's
+// working directory) keep each entry to its name, so the checkout's location
+// does not count once per file.
 const testFiles = readdirSync(testsDirectory, { withFileTypes: true })
   .filter(entry => entry.isFile() && entry.name.endsWith('.test.mjs'))
-  .map(entry => path.join(testsDirectory, entry.name))
+  .map(entry => path.join('tests', entry.name))
   .sort();
 
 if (testFiles.length === 0) {

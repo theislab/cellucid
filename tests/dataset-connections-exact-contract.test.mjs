@@ -7,6 +7,7 @@ import {
   createDatasetReloadSupersededError
 } from '../assets/js/app/dataset-reload-outcome.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { recordOpenings } from './helpers/opening-events.mjs';
 import { prepareUrlForDataSource } from '../assets/js/app/url-state.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
@@ -44,6 +45,25 @@ function createInput(value = '') {
     },
   };
 }
+
+function createConnectionLine() {
+  return { hidden: true };
+}
+
+function createConnectionTarget() {
+  return { textContent: '', title: '' };
+}
+
+/** The Session panel's address bar, holding `value`. */
+function createAddressBar(value) {
+  return {
+    dataAddressInput: createInput(value),
+    dataAddressOpenBtn: createButton(),
+  };
+}
+
+const REMOTE_ADDRESS = 'http://localhost:8765';
+const LINK_ADDRESS = 'owner/repo/exports';
 
 function createSelect() {
   return {
@@ -139,6 +159,8 @@ function captureNotifications(t) {
   notifications.success = message => {
     events.push({ kind: 'success', message });
   };
+  // A connection or a file is shown by the opening progress.
+  recordOpenings(t, events);
   t.after(() => Object.assign(notifications, originals));
   return events;
 }
@@ -259,6 +281,23 @@ function createDeferred() {
     resolve = resolvePromise;
   });
   return { promise, reject, resolve };
+}
+
+/**
+ * A connection whose recovery could not finish is not opened again: the
+ * address bar's Open says to reload instead of starting a connection.
+ */
+async function assertReopenRefused(harness) {
+  const created = harness.factory.creationCount;
+  harness.dom.dataAddressInput.value = harness.type === 'remote'
+    ? 'http://localhost:9999'
+    : 'owner/repo/other';
+  await harness.connectButton.activate();
+  assert.equal(harness.factory.creationCount, created);
+  assert.match(
+    harness.notifications.at(-1).message,
+    /cannot be opened again until the page is reloaded/
+  );
 }
 
 async function waitFor(predicate, label) {
@@ -430,9 +469,7 @@ function makeLifecycleHarness(
   const datasets = Array.from({ length: count }, (_, index) =>
     dataset(index + 1)
   );
-  const connectionValue = type === 'remote'
-    ? 'https://remote.test'
-    : 'owner/repo/exports';
+  const connectionValue = type === 'remote' ? REMOTE_ADDRESS : LINK_ADDRESS;
   const factory = createLifecycleSourceFactory(
     type,
     datasets,
@@ -477,20 +514,18 @@ function makeLifecycleHarness(
     },
   };
   const select = createSelect();
-  const dom = { select };
+  const dom = { select, ...createAddressBar(connectionValue) };
   if (type === 'remote') {
     Object.assign(dom, {
-      remoteConnectBtn: createButton(),
       remoteDisconnectBtn: createButton(),
-      remoteDisconnectContainer: { style: {} },
-      remoteServerUrl: createInput('https://remote.test'),
+      remoteDisconnectContainer: createConnectionLine(),
+      remoteConnectionTarget: createConnectionTarget(),
     });
   } else {
     Object.assign(dom, {
-      dataLinkConnectBtn: createButton(),
       dataLinkDisconnectBtn: createButton(),
-      dataLinkDisconnectContainer: { style: {} },
-      dataLinkUrl: createInput('owner/repo/exports'),
+      dataLinkDisconnectContainer: createConnectionLine(),
+      dataLinkConnectionTarget: createConnectionTarget(),
     });
   }
   const activations = [];
@@ -563,8 +598,11 @@ function makeLifecycleHarness(
   return {
     activations,
     clearCalls,
-    connectButton:
-      type === 'remote' ? dom.remoteConnectBtn : dom.dataLinkConnectBtn,
+    connectButton: dom.dataAddressOpenBtn,
+    connectionLine:
+      type === 'remote'
+        ? dom.remoteDisconnectContainer
+        : dom.dataLinkDisconnectContainer,
     datasetIntents,
     disconnectButton:
       type === 'remote'
@@ -593,8 +631,8 @@ function makeHarness(t, type, count) {
   const datasets = Array.from({ length: count }, (_, index) =>
     dataset(index + 1)
   );
-  const remoteValue = 'https://remote.test';
-  const githubValue = 'owner/repo/exports';
+  const remoteValue = REMOTE_ADDRESS;
+  const githubValue = LINK_ADDRESS;
   const remote = createConnectionSource('remote', datasets, remoteValue);
   const github = createConnectionSource(
     'link',
@@ -629,20 +667,13 @@ function makeHarness(t, type, count) {
   const select = createSelect();
   const dom = {
     select,
-    userDataBrowseBtn: createButton(),
-    userDataFileInput: createInput(),
-    userDataH5adBtn: createButton(),
-    userDataH5adInput: createInput(),
-    userDataZarrArchiveBtn: createButton(),
-    userDataZarrArchiveInput: createInput(),
-    remoteConnectBtn: createButton(),
+    ...createAddressBar(type === 'remote' ? remoteValue : githubValue),
     remoteDisconnectBtn: createButton(),
-    remoteDisconnectContainer: { style: {} },
-    remoteServerUrl: createInput(remoteValue),
-    dataLinkConnectBtn: createButton(),
+    remoteDisconnectContainer: createConnectionLine(),
+    remoteConnectionTarget: createConnectionTarget(),
     dataLinkDisconnectBtn: createButton(),
-    dataLinkDisconnectContainer: { style: {} },
-    dataLinkUrl: createInput(githubValue),
+    dataLinkDisconnectContainer: createConnectionLine(),
+    dataLinkConnectionTarget: createConnectionTarget(),
   };
   const activations = [];
   const populationCalls = [];
@@ -690,8 +721,11 @@ function makeHarness(t, type, count) {
     activations,
     browser,
     candidate: type === 'remote' ? remote.candidate : github.candidate,
-    connectButton:
-      type === 'remote' ? dom.remoteConnectBtn : dom.dataLinkConnectBtn,
+    connectButton: dom.dataAddressOpenBtn,
+    connectionLine:
+      type === 'remote'
+        ? dom.remoteDisconnectContainer
+        : dom.dataLinkDisconnectContainer,
     datasets,
     dom,
     infoUpdates,
@@ -737,13 +771,8 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
           );
           assert.equal(harness.registeredSource.disconnectCalls, 0);
           assert.equal(harness.populationCalls.length, 0);
-          assert.equal(harness.connectButton.textContent, 'Connect');
-          assert.equal(
-            harness.dom[
-              type === 'remote' ? 'remoteServerUrl' : 'dataLinkUrl'
-            ].disabled,
-            false
-          );
+          assert.equal(harness.connectionLine.hidden, true);
+          assert.equal(harness.dom.dataAddressInput.disabled, false);
           assert.deepEqual(harness.activations, []);
           assert.equal(harness.browser.href, priorHref);
           assert.equal(harness.browser.historyCalls.length, 0);
@@ -759,14 +788,12 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
           [type]
         );
         assert.equal(harness.populationCalls.length, 1);
-        assert.equal(harness.connectButton.textContent, 'Reconnect');
+        // One line under the bar names the connection, with Disconnect; the
+        // bar itself stays free for the next address.
+        assert.equal(harness.connectionLine.hidden, false);
+        assert.equal(harness.dom.dataAddressInput.disabled, false);
         assert.equal(harness.manager.getSource(type), harness.candidate);
         assert.equal(harness.registeredSource.disconnectCalls, 1);
-        const displaced =
-          type === 'remote'
-            ? harness.dom.remoteServerUrl
-            : harness.dom.dataLinkUrl;
-        assert.equal(displaced.disabled, true);
 
         if (count === 1) {
           assert.deepEqual(harness.activations, [{
@@ -781,9 +808,7 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
           assert.equal(url.searchParams.get('dataset'), 'dataset-1');
           assert.equal(
             url.searchParams.get(type === 'remote' ? 'remote' : 'data'),
-            type === 'remote'
-              ? 'https://remote.test'
-              : 'owner/repo/exports'
+            type === 'remote' ? REMOTE_ADDRESS : LINK_ADDRESS
           );
           assert.equal(url.searchParams.get('annotations'), 'team/labels');
           assert.equal(url.hash, '#view');
@@ -799,13 +824,17 @@ test('manual Remote and GitHub connections own exact zero/one/many behavior', as
         assert.equal(harness.select.disabled, false);
         assert.equal(harness.select.focusCalls, 1);
         assert.equal(terminal[0].kind, 'complete');
-        assert.match(terminal[0].message, /choose.*sample datasets/i);
+        assert.match(terminal[0].message, /choose.*dataset list/i);
       });
     }
   }
 });
 
-test('active Remote and GitHub reconnects are rejected before candidate mutation', async t => {
+test('a new address of the open connection\'s kind replaces it only once its dataset is ready', async t => {
+  // The address bar opens what is typed: when a server (or a link) is the
+  // open dataset's source, another one is connected beside it and its
+  // dataset replaces the one on screen only when it is ready; nothing is
+  // cleared first, so a failure or Cancel leaves the dataset on screen.
   for (const type of ['remote', 'link']) {
     await t.test(type, async t => {
       const harness = makeLifecycleHarness(t, type, 1, {
@@ -813,26 +842,30 @@ test('active Remote and GitHub reconnects are rejected before candidate mutation
       });
       await harness.connectButton.activate();
 
-      assert.equal(harness.factory.creationCount, 0);
-      assert.equal(harness.factory.registered.createCandidateCalls, 0);
-      assert.deepEqual(harness.activations, []);
-      assert.equal(
-        harness.manager.getSource(type),
-        harness.factory.registered
-      );
+      assert.deepEqual(harness.clearCalls, []);
+      assert.deepEqual(harness.unregistrations, []);
+      assert.equal(harness.activations.length, 1);
+      assert.equal(harness.activations[0].sourceType, type);
+      assert.equal(harness.manager.getSource(type), harness.factory.candidates[0]);
       assert.equal(harness.connectButton.disabled, false);
-      assert.equal(
-        harness.notifications.filter(event => event.kind === 'loading')
-          .length,
-        0
+      assert.deepEqual(
+        harness.notifications.filter(event => event.kind === 'error'),
+        []
       );
-      const errors = harness.notifications.filter(
-        event => event.kind === 'error'
-      );
-      assert.equal(errors.length, 1);
-      assert.match(errors[0].message, /active.*disconnect.*reconnect/i);
     });
   }
+
+  await t.test('a failed replacement leaves the dataset on screen', async t => {
+    const harness = makeLifecycleHarness(t, 'link', 1, {
+      activeSourceType: 'link',
+      candidateBehaviors: [{ connectError: new Error('connect rejected') }],
+    });
+    await harness.connectButton.activate();
+    assert.deepEqual(harness.clearCalls, []);
+    assert.deepEqual(harness.activations, []);
+    assert.equal(harness.manager.getSource('link'), harness.factory.registered);
+    assert.equal(harness.manager.getCurrentSourceType(), 'link');
+  });
 });
 
 test('a typed address the source cannot read is refused before any connection starts', async t => {
@@ -843,19 +876,15 @@ test('a typed address the source cannot read is refused before any connection st
   // "Enter one remote server". Both are now refused with one sentence about
   // the input itself, and no candidate is created.
   const cases = [
-    ['remote', '', /^Enter a remote server address, such as http:\/\/localhost:8765, before connecting\.$/],
-    ['remote', 'https://remote.test/', /^The remote server address was not tried: remote server URL .*trailing slash\. Use the bare address the server prints as Local URL\.$/],
-    ['remote', 'localhost:8765', /^The remote server address was not tried: .*HTTP\(S\).*\. Use the bare address the server prints as Local URL\.$/],
-    ['link', '   ', /^Paste a link or an id, such as a CELLxGENE dataset link, GSE123456, or owner\/repo\/folder, before connecting\.$/],
+    ['remote', '', /^Type an address first: /],
+    ['remote', 'localhost:99999', /^99999 is not a port: a port is a number from 1 to 65535, as in localhost:8765\.$/],
+    ['link', '   ', /^Type an address first: /],
     ['link', 'not a repo', /^Cellucid does not recognise "not a repo"\./],
   ];
   for (const [type, value, expected] of cases) {
     await t.test(`${type} ${JSON.stringify(value)}`, async t => {
       const harness = makeLifecycleHarness(t, type, 1);
-      const input = type === 'remote'
-        ? harness.dom.remoteServerUrl
-        : harness.dom.dataLinkUrl;
-      input.value = value;
+      harness.dom.dataAddressInput.value = value;
       await harness.connectButton.activate();
 
       assert.equal(harness.factory.creationCount, 0);
@@ -909,14 +938,16 @@ test('failed connection candidates retire exactly once and preserve prior state'
         assert.equal(terminal[0].kind, 'fail');
         // The loader published no cause on these errors, so the notification
         // must say what happened without naming a cause it does not have, and
-        // must still carry the raw text as the only evidence there is.
+        // must still carry the raw text, under its Details, as the only
+        // evidence there is.
         // A server is reached; a link is opened.
         assert.match(
           terminal[0].message,
           type === 'remote' ? /could not be reached/i : /could not be opened/i
         );
         assert.doesNotMatch(terminal[0].message, /the server|the connection may/i);
-        assert.match(terminal[0].message, /Details: .+ rejected/);
+        assert.doesNotMatch(terminal[0].message, /Details:|rejected/);
+        assert.match(terminal[0].details, /rejected/);
       });
     }
   }
@@ -941,7 +972,8 @@ test('failed connection candidates retire exactly once and preserve prior state'
     );
     assert.equal(terminal.length, 1);
     assert.equal(terminal[0].kind, 'fail');
-    assert.match(terminal[0].message, /could not be reached.*catalog rejected/i);
+    assert.match(terminal[0].message, /could not be reached/i);
+    assert.match(terminal[0].details, /catalog rejected/i);
   });
 
   await t.test('candidate factory failure is terminal and contained', async t => {
@@ -961,7 +993,7 @@ test('failed connection candidates retire exactly once and preserve prior state'
     );
     assert.equal(terminal.length, 1);
     assert.equal(terminal[0].kind, 'fail');
-    assert.match(terminal[0].message, /candidate factory rejected/i);
+    assert.match(terminal[0].details, /candidate factory rejected/i);
     assert.equal(harness.connectButton.disabled, false);
   });
 
@@ -992,7 +1024,7 @@ test('failed connection candidates retire exactly once and preserve prior state'
         );
         assert.equal(terminal.length, 1);
         assert.equal(terminal[0].kind, 'fail');
-        assert.match(terminal[0].message, /cleanup.*failed|cleanup rejected/i);
+        assert.match(terminal[0].details, /cleanup.*failed|cleanup rejected/i);
       }
     );
   }
@@ -1106,7 +1138,7 @@ test('Remote connection loss clears only active science and retires transport on
         () => harness.notifications.some(
           event =>
             event.kind === 'error' &&
-            /connection was lost.*reconnect/i.test(event.message)
+            /connection was lost.*open its address again/i.test(event.message)
         ),
         'connection-loss completion'
       );
@@ -1124,7 +1156,7 @@ test('Remote connection loss clears only active science and retires transport on
         harness.notifications.some(
           event =>
             event.kind === 'error' &&
-            /connection was lost.*reconnect/i.test(event.message)
+            /connection was lost.*open its address again/i.test(event.message)
         ),
         true
       );
@@ -1164,14 +1196,14 @@ test('Remote connection loss clears only active science and retires transport on
             () => harness.notifications.some(
               event =>
                 event.kind === 'error' &&
-                /connection was lost.*reconnect/i.test(event.message)
+                /connection was lost.*open its address again/i.test(event.message)
             ),
             'connection-loss completion'
           );
           // Recovery completes that same notice.
           assert.equal(
             harness.notifications.find(
-              event => event.kind === 'error' && /connection was lost.*reconnect/i.test(event.message)
+              event => event.kind === 'error' && /connection was lost.*open its address again/i.test(event.message)
             ).id,
             lossNotices[0].id
           );
@@ -1198,15 +1230,17 @@ test('Remote connection loss clears only active science and retires transport on
     const lost = harness.factory.candidates[0];
     lost.loseConnection();
     await waitFor(
-      () => harness.connectButton.disabled === true,
-      'blocked connection-loss controls'
+      () => harness.notifications.some(
+        event => event.kind === 'error' && /could not be cleared safely/i.test(event.message)
+      ),
+      'blocked connection-loss notice'
     );
 
     assert.equal(lost.disconnectCalls, 0);
     assert.equal(harness.manager.getSource('remote'), lost);
     assert.deepEqual(harness.clearCalls, ['remote']);
     assert.deepEqual(harness.unregistrations, []);
-    assert.equal(harness.dom.remoteServerUrl.disabled, true);
+    assert.equal(harness.disconnectButton.disabled, true);
     assert.equal(
       harness.notifications.some(
         event =>
@@ -1215,6 +1249,7 @@ test('Remote connection loss clears only active science and retires transport on
       ),
       true
     );
+    await assertReopenRefused(harness);
   });
 });
 
@@ -1259,10 +1294,12 @@ test('superseded one-dataset connections cannot revoke the newer candidate', asy
       assert.equal(newer.connected, true);
       assert.equal(harness.manager.getSource(type), newer);
       assert.equal(harness.factory.registered.disconnectCalls, 1);
+      // One opening on screen: the newer connection joined it, and the
+      // older one only let go of it, so it ends once, opened.
       assert.equal(
         harness.notifications.filter(event => event.kind === 'dismiss')
           .length,
-        1
+        0
       );
       assert.equal(
         harness.notifications.filter(event => event.kind === 'complete')
@@ -1310,10 +1347,12 @@ test('an older multi-dataset inventory cannot publish after a newer connection',
       assert.equal(newer.disconnectCalls, 0);
       assert.equal(harness.manager.getSource(type), newer);
       assert.equal(harness.select.focusCalls, 1);
+      // One opening on screen: the newer connection joined it, and the
+      // older one only let go of it, so it ends once, opened.
       assert.equal(
         harness.notifications.filter(event => event.kind === 'dismiss')
           .length,
-        1
+        0
       );
       assert.equal(
         harness.notifications.filter(event => event.kind === 'complete')
@@ -1340,9 +1379,8 @@ test('disconnect failures are contained in a deterministic blocked state', async
     assert.equal(connected.connected, true);
     assert.equal(harness.manager.getSource('remote'), connected);
     assert.deepEqual(harness.unregistrations, []);
-    assert.equal(harness.connectButton.disabled, true);
     assert.equal(harness.disconnectButton.disabled, true);
-    assert.equal(harness.dom.remoteServerUrl.disabled, true);
+    await assertReopenRefused(harness);
     assert.equal(
       harness.notifications.some(
         event =>
@@ -1370,8 +1408,8 @@ test('disconnect failures are contained in a deterministic blocked state', async
     assert.notEqual(harness.manager.getSource('remote'), connected);
     assert.equal(harness.manager.getSource('remote').connected, false);
     assert.deepEqual(harness.unregistrations, ['remote']);
-    assert.equal(harness.connectButton.disabled, true);
     assert.equal(harness.disconnectButton.disabled, true);
+    await assertReopenRefused(harness);
     assert.equal(
       harness.notifications.some(
         event =>
@@ -1408,53 +1446,21 @@ test('connection teardown unregisters transport listeners and disables DOM owner
   assert.deepEqual(harness.populationCalls, []);
 });
 
-test('every connect button ships the label its wiring writes', async () => {
-  // `index.html` paints these buttons long before `initUI` runs — the sidebar
-  // ships them disabled precisely because their listeners arrive tens of
-  // seconds later on a slow link. Whatever the markup says is therefore on
-  // screen for the whole of startup, and it is what a screenshot taken during
-  // startup records. The GitHub button shipped "Load" and was relabelled
-  // "Connect" the moment the wiring ran (CEL-0170), so the app documented
-  // itself with a word it never shows once it is working.
-  const [indexHtml, connectionsSource, domCacheSource] = await Promise.all([
+test('the address bar ships the label it keeps', async () => {
+  // `index.html` paints the bar long before `initUI` runs, so whatever the
+  // markup says is on screen for the whole of startup. Its Open button is
+  // never relabelled: a connection is shown on its own line under the bar.
+  const [indexHtml, connectionsSource] = await Promise.all([
     readFile(new URL('../index.html', import.meta.url), 'utf8'),
     readFile(
       new URL('../assets/js/app/ui/modules/dataset-connections.js', import.meta.url),
       'utf8'
     ),
-    readFile(
-      new URL('../assets/js/app/ui/core/dom-cache.js', import.meta.url),
-      'utf8'
-    ),
   ]);
-
-  const label = /connectButton\.textContent =\s*connected \? '([^']+)' : '([^']+)';/
-    .exec(connectionsSource);
-  assert.ok(label !== null, 'the connect label must still be written in one place');
-  const [, connectedLabel, disconnectedLabel] = label;
-
-  // The buttons are whichever DOM keys the wiring is handed, resolved to their
-  // element ids by the DOM cache, so a third connection source is covered the
-  // day it is added rather than the day someone remembers this test.
-  const wiredKeys = [
-    ...connectionsSource.matchAll(/^\s+connectButton: \w+\.(\w+),$/gm),
-  ].map(match => match[1]);
-  assert.ok(wiredKeys.length >= 2, 'both connection sources must still be wired');
-
-  for (const key of wiredKeys) {
-    const idMatch = new RegExp(`${key}: byId\\('([^']+)'\\)`).exec(domCacheSource);
-    assert.ok(idMatch !== null, `dom-cache must resolve ${key} to an element id`);
-    const id = idMatch[1];
-    const shipped = new RegExp(
-      `<button[^>]*id="${id}"[^>]*>([^<]*)</button>`
-    ).exec(indexHtml);
-    assert.ok(shipped !== null, `index.html must carry a #${id} button`);
-    assert.equal(
-      shipped[1],
-      disconnectedLabel,
-      `#${id} must ship the label its wiring writes when nothing is connected, `
-        + 'so startup never shows a word the app then replaces'
-    );
-    assert.notEqual(shipped[1], connectedLabel);
-  }
+  assert.match(
+    indexHtml,
+    /<button[^>]*id="data-address-open-btn"[^>]*>Open<\/button>/
+  );
+  assert.doesNotMatch(connectionsSource, /(addressOpenButton|dataAddressOpenBtn)\.textContent\s*=/);
+  assert.doesNotMatch(connectionsSource, /Reconnect/);
 });

@@ -200,6 +200,7 @@
 @media (hover: none) {
   .disclosure-header-row > .accordion-copy-btn,
   .analysis-window-frame > .accordion-panel-actions > .accordion-copy-btn,
+  .analysis-window-frame > .accordion-panel-actions > .accordion-maximize-btn,
   .analysis-window-frame > .accordion-panel-actions > .accordion-close-btn {
     opacity: var(--opacity-90);
   }

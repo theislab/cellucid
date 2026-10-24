@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   openFigureExportWorkerSession,
   setFigureExportWorkerFactory,
+  setFigureExportWorkerWebgl2,
 } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
 import {
   OBJECT_URL_RELEASE_DELAY_MS,
@@ -28,6 +29,8 @@ test('a worker request aborts promptly and closes its late frame', async () => {
   }
   globalThis.ImageBitmap = FakeImageBitmap;
   setFigureExportWorkerFactory(() => fakeWorker);
+  // A worker that draws: the point pass is its request.
+  setFigureExportWorkerWebgl2(true);
   try {
     const controller = new AbortController();
     const session = openFigureExportWorkerSession({ signal: controller.signal });

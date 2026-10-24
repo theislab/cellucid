@@ -55,10 +55,13 @@ export const DEVELOPMENT = Object.freeze({
   genes: 10,
   select: 'dataset:local-demo:synthetic-development-3d',
 });
+// A file, folder or single-dataset link is not a choice of the sample list:
+// while one is open the list shows "—" (`UNLISTED_OPTION`).
+export const UNLISTED_OPTION = '__dataset_unlisted__';
 export const H5AD = Object.freeze({
   name: 'current-ui-smoke',
   cells: 120,
-  select: /^dataset:local-user:/,
+  select: UNLISTED_OPTION,
 });
 // The one Zarr store folder of the browser tests, for the folder picker and
 // folder drops.
@@ -66,10 +69,10 @@ export const ZARR_FOLDER = Object.freeze({
   path: path.join(fixturesDirectory, 'forms-catalog', 'forms-zarr.zarr'),
   name: 'Forms — Zarr folder',
   cells: 48,
-  select: /^dataset:local-user:/,
+  select: UNLISTED_OPTION,
 });
 export const NONE = Object.freeze({
-  name: '—',
+  name: 'No dataset open',
   cells: 0,
   select: '__none__',
 });
@@ -151,12 +154,25 @@ export async function readRecord(page) {
 }
 
 /**
+ * Run `closed` when the worker that is making a request now closes: the
+ * newest running worker whose script address `worker` matches. A request of
+ * a worker the page ended (a superseded read closes its reader) is never
+ * answered, so a test that waits for its requests to settle counts it then.
+ */
+export function onWorkerClose(page, worker, closed) {
+  const owner = page.workers().filter(candidate => worker.test(candidate.url())).at(-1);
+  owner?.once('close', closed);
+}
+
+/**
  * Hold requests matching `pattern` (a URL prefix or a regular expression)
  * until `release()`: every one, or with `when`, those the request predicate
  * accepts, and with `first`, only that many. The page may abort a held
- * request at any time; once released, nothing it aborted is answered.
+ * request at any time; once released, nothing it aborted is answered. With
+ * `worker` (the script address of the worker that makes them), a held
+ * request also settles when its worker closes.
  */
-export async function holdRequests(page, pattern, { when = () => true, first = Infinity } = {}) {
+export async function holdRequests(page, pattern, { when = () => true, first = Infinity, worker = null } = {}) {
   let release = () => {};
   const gate = new Promise(resolve => {
     release = resolve;
@@ -179,7 +195,13 @@ export async function holdRequests(page, pattern, { when = () => true, first = I
         return;
       }
       held.started += 1;
-      holding.add(route.request());
+      const request = route.request();
+      holding.add(request);
+      // A request of a worker the page ended (a superseded read closes its
+      // reader, which ends its worker) is never answered: it settles when
+      // that worker closes. `worker` names the script of the worker that
+      // makes the held requests; the newest one running made this one.
+      if (worker !== null) onWorkerClose(page, worker, () => settle(request));
       await gate;
       await route.fallback().catch(() => {});
     },
@@ -277,8 +299,12 @@ export async function openWithHeldStart(page) {
   // The startup dataset is in flight and every data control is live.
   await expect.poll(() => held.started).toBeGreaterThan(0);
   await expect(page.locator('#dataset-select')).toHaveValue(START.select);
+  // The catalog is listed from datasets.json at once, the entry being opened
+  // marked so.
+  await expect(page.locator('#dataset-select option:checked')).toHaveText(/ · opening…$/);
+  await expect(page.locator(`#dataset-select option[value="${TRAJECTORY.select}"]`)).toHaveCount(1);
   await expect(page.locator('#dataset-select')).toBeEnabled();
-  await expect(page.locator('#user-data-h5ad-input')).toBeEnabled();
+  await expect(page.locator('#user-data-file-input')).toBeEnabled();
   await expect(page.locator('html')).not.toHaveAttribute(
     'data-startup-phase',
     'ready',
@@ -304,14 +330,16 @@ export async function expectSettledOn(page, target) {
   await expect
     .poll(() => page.evaluate(() => window._cellucidViewer.getPointCount()))
     .toBe(target.cells);
-  await expect(page.locator('#dataset-cells')).toHaveText(
-    target.cells === 0 ? '–' : String(target.cells),
-  );
+  if (target.cells === 0) {
+    await expect(page.locator('#dataset-summary')).toBeHidden();
+  } else {
+    await expect(page.locator('#dataset-cells')).toHaveText(String(target.cells));
+  }
   await expect(page.locator('html')).toHaveAttribute(
     'data-startup-phase',
     'ready',
   );
-  await expect(page.locator('#dataset-info')).not.toHaveClass(/\bloading\b/);
+  await expect(page.locator('#dataset-info')).not.toHaveAttribute('data-state', 'loading');
   await expect(
     page.locator(`#dataset-select option[value="${PENDING_OPTION}"]`),
   ).toHaveCount(0);

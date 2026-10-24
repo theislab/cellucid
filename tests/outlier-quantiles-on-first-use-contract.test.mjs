@@ -27,6 +27,7 @@ function categorical(key, fieldIndex, path) {
     categories: ['a', 'b'],
     codesDtype: 'uint8',
     codesMissingValue: 255,
+    palette: null,
     outlierQuantilesPath: path,
   };
 }
@@ -89,11 +90,13 @@ test('picking a field reads nothing; the status says what the filter costs', asy
   await settle();
   const status = state.getOutlierFilterStatus(0);
   assert.equal(status.plan.source, 'read');
-  assert.match(describeOutlierStatus(status).text, /first use reads the latent space X_scVI \(\d[^)]*\) once/);
+  // One short line names what the first use reads and how much.
+  assert.match(describeOutlierStatus(status).text, /^First use reads X_scVI \(\d[^)]*\)\.$/);
+  assert.equal(describeOutlierStatus(status).slider, true);
   assert.equal(reads.length, 0);
 });
 
-test('without a latent space the filter says how to get one, suggesting what the file has', () => {
+test('without a latent space the filter is one button, whose title names what the file has', () => {
   const { state } = makeState({ path: null });
   state.getMappingCandidates = () => ({
     obsm: [
@@ -113,15 +116,17 @@ test('without a latent space the filter says how to get one, suggesting what the
   assert.deepEqual(status.suggestions.map(item => item.key), ['X_scVI', 'X_pca']);
   const described = describeOutlierStatus(status);
   assert.equal(described.action, 'latent');
-  assert.match(described.text, /not in the 2D\/3D layout/);
-  assert.match(described.text, /X_scVI or X_pca/);
+  assert.equal(described.slider, false);
+  assert.equal(described.text, null, 'no paragraph: what it measures is in the (i)');
+  assert.match(described.detail, /X_scVI or X_pca/);
 });
 
 test('a field with no category large enough says so', () => {
   const { state } = makeState({ minPoints: 4 });
   const status = state.getOutlierFilterStatus(0);
   assert.deepEqual({ ...status }, { state: 'too-small', fieldKey: 'leiden', latentKey: 'X_scVI', minPoints: 4, largest: 3 });
-  assert.match(describeOutlierStatus(status).text, /No category of “leiden” has 4 cells/);
+  assert.equal(describeOutlierStatus(status).text, 'No category has 4 cells.');
+  assert.match(describeOutlierStatus(status).detail, /No category of “leiden” has 4 cells/);
 });
 
 test('the first threshold below 1 gets the quantiles once, for every view, and then filters', async () => {
@@ -179,7 +184,8 @@ test('a failure says why, leaves the threshold at 100%, and the next move tries 
   await moving;
   const status = state.getOutlierFilterStatus(0);
   assert.equal(status.state, 'failed');
-  assert.match(describeOutlierStatus(status).text, /NaN at cell 3/);
+  assert.match(describeOutlierStatus(status).text, /Move the slider to try again/);
+  assert.match(describeOutlierStatus(status).detail, /NaN at cell 3/);
   assert.equal(fieldOf(state, 'live')._outlierThreshold, 1);
   void state.setOutlierThresholdForActive(0.9);
   await settle();
@@ -209,6 +215,7 @@ test('a latent space that cannot be read asks for another one', async () => {
   assert.equal(status.latentUnusable, true);
   const described = describeOutlierStatus(status);
   assert.equal(described.action, 'latent');
-  assert.match(described.text, /Choose another latent space/);
+  assert.equal(described.text, 'This latent space cannot be used.');
+  assert.match(described.detail, /NaN at cell 3/);
   assert.equal(state.getMappingChoiceUnusableReason('latent', 'X_scVI'), 'NaN at cell 3');
 });

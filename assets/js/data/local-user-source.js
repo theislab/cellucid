@@ -55,6 +55,12 @@ export class LocalUserDirDataSource {
      */
     this._adoptionEpoch = 0;
 
+    /**
+     * Stops the file still being read for the newest selection.
+     * @type {AbortController|null}
+     */
+    this._reading = null;
+
     this.type = 'local-user';
   }
 
@@ -116,9 +122,12 @@ export class LocalUserDirDataSource {
    */
   async _adopt(candidateSource, load, describe) {
     const selectionEpoch = ++this._selectionEpoch;
+    this._reading?.abort();
+    const reading = new AbortController();
+    this._reading = reading;
     let adopted = false;
     try {
-      await load(candidateSource);
+      await load(candidateSource, reading.signal);
       if (selectionEpoch !== this._selectionEpoch) throw this._createSupersededSelectionError();
       const metadata = await candidateSource.getMetadata(candidateSource.datasetId);
       if (selectionEpoch !== this._selectionEpoch) throw this._createSupersededSelectionError();
@@ -138,6 +147,7 @@ export class LocalUserDirDataSource {
       }
       throw error;
     } finally {
+      if (this._reading === reading) this._reading = null;
       if (!adopted) candidateSource.clear();
     }
   }
@@ -158,10 +168,9 @@ export class LocalUserDirDataSource {
     }
     return this._adopt(
       createH5adDataSource(),
-      source => source.loadFromFile(file, {
-        showProgress: false,
+      (source, signal) => source.loadFromFile(file, {
+        signal,
         preferFileName: true,
-        description: 'Loaded directly from H5AD file',
         source: { name: 'H5AD file', filename: file.name },
       }),
       () => file.name
@@ -184,11 +193,10 @@ export class LocalUserDirDataSource {
     }
     return this._adopt(
       createZarrDataSource(),
-      source => source.loadFromArchiveFile(file, {
-        showProgress: false,
+      (source, signal) => source.loadFromArchiveFile(file, {
+        signal,
         preferFileName: true,
         defaultDatasetId: `zarr_${file.name.replace(/\.zip$/i, '').replace(/\.zarr$/i, '')}`,
-        description: 'Loaded directly from Zarr ZIP archive',
         source: { name: 'Zarr ZIP archive', filename: file.name },
       }),
       source => source.dirname
@@ -215,10 +223,9 @@ export class LocalUserDirDataSource {
     }
     return this._adopt(
       createZarrDataSource(),
-      source => source.loadFromFileList(files, {
-        showProgress: false,
+      (source, signal) => source.loadFromFileList(files, {
+        signal,
         preferFileName: true,
-        description: 'Loaded directly from a Zarr store folder',
         source: { name: 'Zarr store folder' },
       }),
       source => source.dirname
@@ -295,9 +302,14 @@ export class LocalUserDirDataSource {
     this._metadata = null;
   }
 
-  /** Clear the current selection, superseding any candidate still loading. */
+  /**
+   * Clear the current selection, superseding any candidate still loading:
+   * its read stops where it is.
+   */
   clear() {
     this._selectionEpoch += 1;
+    this._reading?.abort();
+    this._reading = null;
     this._cleanup();
     this._adoptionEpoch += 1;
   }

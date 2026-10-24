@@ -53,7 +53,7 @@ async function openFixture(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(fixturePath);
   await expect(page.locator('#dataset-name')).toHaveText('uint32 categories');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
 }

@@ -31,7 +31,7 @@ const TITLES = {
 };
 
 function opened(file) {
-  return { name: TITLES[file], cells: 120, select: /^dataset:local-user:/ };
+  return { name: TITLES[file], cells: 120, select: '__dataset_unlisted__' };
 }
 
 async function expectEveryCellField(page) {
@@ -46,10 +46,10 @@ async function expectEveryCellField(page) {
 }
 
 for (const [file, input] of [
-  ['legacy-0.7-csr.h5ad', '#user-data-h5ad-input'],
-  ['legacy-seuratdisk.h5ad', '#user-data-h5ad-input'],
-  ['legacy-0.6-compound-obsm.h5ad', '#user-data-h5ad-input'],
-  ['legacy-0.7.zarr.zip', '#user-data-zarr-archive-input'],
+  ['legacy-0.7-csr.h5ad', '#user-data-file-input'],
+  ['legacy-seuratdisk.h5ad', '#user-data-file-input'],
+  ['legacy-0.6-compound-obsm.h5ad', '#user-data-file-input'],
+  ['legacy-0.7.zarr.zip', '#user-data-file-input'],
 ]) {
   test(`${file} opens from its file picker with every cell field`, async ({ page }) => {
     const productErrors = await openStarted(page);

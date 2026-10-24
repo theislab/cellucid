@@ -221,6 +221,8 @@ const NOTEBOOK_MAPPING = Object.freeze({
   knn: null,
   geneNames: 'index',
   expression: 'X',
+  log1p: {},
+  highlyVariable: null,
   latent: null,
   vectorFields: [],
 });

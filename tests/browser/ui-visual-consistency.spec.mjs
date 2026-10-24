@@ -19,6 +19,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { settleStyleTransitions } from './helpers/style-transitions.mjs';
+import { H5AD_PATH } from './helpers/dataset-loading.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -195,16 +196,21 @@ test('an open section points its chevron up, the way nested disclosures do', asy
   expect(productErrors).toEqual([]);
 });
 
-test('a finished load is announced as loaded', async ({ page }) => {
+test('a finished load is announced in the notification center', async ({ page }) => {
+  // Opening a dataset is shown by the opening progress
+  // (`app/opening-progress-view.js`): over the empty viewer the dataset
+  // appearing says it opened; while another dataset stays on screen its
+  // progress is a notification that ends as a success. The sidebar carries
+  // no prose about it.
   const productErrors = observeProductErrors(page);
   await openDataset(page);
-  const positions = page.locator('.notification', {
-    hasText: '2D cell positions',
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
+  await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+  const finished = page.locator('#notification-center .notification[data-type="success"]', {
+    hasText: /Opened current-ui-smoke|User data ready/,
   });
-  await expect(positions).toHaveAttribute('data-type', 'success');
-  await expect(positions.locator('.notification-title')).toHaveText(
-    'Loaded',
-  );
+  await expect(finished).toHaveCount(1);
+  await expect(page.locator('#session-section')).not.toContainText(/Why:|Kept in memory|reading in place/);
   expect(productErrors).toEqual([]);
 });
 

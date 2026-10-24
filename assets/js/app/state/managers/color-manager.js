@@ -13,7 +13,7 @@ import {
   COLOR_PICKER_PALETTE,
   CONTINUOUS_COLORMAPS,
   DEFAULT_COLORMAP_ID,
-  getCategoryColor,
+  defaultCategoryColor,
   getCssStopsForColormap
 } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
@@ -460,7 +460,7 @@ export class DataStateColorMethods {
     if (field._categoryColors === undefined) {
       categoryColors = new Array(numCats);
       for (let i = 0; i < numCats; i++) {
-        categoryColors[i] = getCategoryColor(i);
+        categoryColors[i] = defaultCategoryColor(field, i);
       }
     } else {
       if (

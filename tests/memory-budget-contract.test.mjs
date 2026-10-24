@@ -14,7 +14,6 @@ import {
   residencyBudgetBytes,
 } from '../assets/js/data/memory-budget.js';
 import { DECODE_WORKER_BYTES, decodeWorkerCount } from '../assets/js/formats/io/decode-pool.js';
-import { analysisMemoryBudgetMB } from '../assets/js/app/analysis/shared/performance-config.js';
 
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
@@ -69,9 +68,11 @@ test('a refused allocation smaller than the allowance halves it; a larger one sa
   assert.equal(memoryAllowanceBytes(environment), 4 * GiB);
 });
 
-test('the analysis default and the decode pool read their own shares', () => {
-  assert.equal(analysisMemoryBudgetMB({ navigator: { deviceMemory: 8 } }), 512);
-  assert.equal(analysisMemoryBudgetMB({}), 512);
+test('the analysis budget and the decode pool read their own shares', () => {
+  // An analysis run's tuner reads its budget here at every run and pressure
+  // event (analysis/shared/run-tuner.js).
+  assert.equal(residencyBudgetBytes('analysis', { navigator: { deviceMemory: 8 } }), 512 * MiB);
+  assert.equal(residencyBudgetBytes('analysis', {}), 512 * MiB);
   const cores = cores => ({ navigator: { hardwareConcurrency: cores } });
   // Cores less the page and the reader thread, as many as the memory holds.
   assert.equal(decodeWorkerCount(Infinity, cores(10)), 8);

@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["20", "22", "24", "26"]
+        node: ["22", "24", "26"]
     # The repository is checked out beside the sibling repository its
     # cross-repository contracts read (`../cellucid-datasets`), so those
     # contracts run here instead of skipping.

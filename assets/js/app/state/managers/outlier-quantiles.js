@@ -56,6 +56,14 @@ const LATENT_NAME_HINTS = Object.freeze([
   /scanvi/i, /scvi/i, /totalvi/i, /multivi/i, /harmony/i, /scanorama/i, /mofa/i, /pca/i, /lsi/i, /latent/i, /emb/i,
 ]);
 
+/**
+ * Names that mark an `obsm` array as positions, not a latent space: a
+ * segmentation export's 4-column `coordinates` (pixel boxes) is wider than an
+ * embedding, but no distance in it says how unlike its category a cell is.
+ * Such an array is still in the Latent space menu; it is only not suggested.
+ */
+const POSITION_NAME_HINTS = Object.freeze([/spatial/i, /coord/i]);
+
 function hintRank(key) {
   const rank = LATENT_NAME_HINTS.findIndex(pattern => pattern.test(key));
   return rank < 0 ? LATENT_NAME_HINTS.length : rank;
@@ -116,7 +124,10 @@ export class DataStateOutlierQuantileMethods {
     return this.getMappingCandidates?.()?.obsm?.[route.obsmIndex]?.key ?? null;
   }
 
-  /** The `obsm` arrays that look like a latent space, likeliest first. @private */
+  /**
+   * The `obsm` arrays that look like a latent space, likeliest first: wider
+   * than an embedding, not a vector field, not named as positions. @private
+   */
   _latentSuggestions() {
     const candidates = this.getMappingCandidates?.() ?? null;
     if (candidates === null) return [];
@@ -127,7 +138,12 @@ export class DataStateOutlierQuantileMethods {
     );
     const vectors = vectorFieldKeys(candidates.obsm.map(item => item.key));
     return candidates.obsm
-      .filter(item => usable.has(item.key) && !vectors.has(item.key) && (obsmWidth(item) ?? 0) > 3)
+      .filter(item => (
+        usable.has(item.key)
+        && !vectors.has(item.key)
+        && (obsmWidth(item) ?? 0) > 3
+        && !POSITION_NAME_HINTS.some(pattern => pattern.test(item.key))
+      ))
       .map(item => ({ key: item.key, width: obsmWidth(item) }))
       .sort((a, b) => hintRank(a.key) - hintRank(b.key) || a.key.localeCompare(b.key));
   }

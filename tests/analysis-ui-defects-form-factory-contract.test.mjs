@@ -8,20 +8,14 @@
  *   unique per call: ids derived from the control's name alone repeated
  *   whenever an analysis mode was copied into a floating window, and the
  *   copy's label then operated the sidebar's control.
- * - A labelled select whose options carry descriptions shows the chosen
- *   option's description as its help line and announces it with the select.
  * - Labels never end in a colon.
- * - The performance settings are a keyboard-operable disclosure (a real
- *   `<button>` with `aria-expanded`/`aria-controls`, the region `hidden`) and
- *   every control inside it is named by its label.
+ * - A field that needs explaining carries an (i) beside its label, never a
+ *   help line under it.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  createPerformanceSettings,
-  createSelectField
-} from '../assets/js/app/analysis/shared/dom-utils.js';
+import { createSelectField } from '../assets/js/app/analysis/shared/dom-utils.js';
 
 // =============================================================================
 // Minimal DOM
@@ -184,13 +178,6 @@ function withFakeDOM(run) {
   }
 }
 
-function performanceDataLayer() {
-  return {
-    state: { pointCount: 1200 },
-    getAvailableVariables: () => [{ key: 'GAPDH' }, { key: 'ACTB' }]
-  };
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -233,7 +220,7 @@ test('a field that needs explaining carries an (i) beside its label, never a hel
     const { root, select } = createSelectField({
       label: 'Statistical method',
       name: 'method',
-      tip: 'analysis-test-method',
+      tip: 'analysis-test-options',
       options: [
         { value: 'wilcox', label: 'Wilcoxon', selected: true },
         { value: 'ttest', label: 't-test' }
@@ -246,7 +233,7 @@ test('a field that needs explaining carries an (i) beside its label, never a hel
     assert.equal(info.className, 'info-btn');
     assert.equal(info.getAttribute('aria-controls'), popover.id);
     assert.equal(popover.className, 'info-tooltip');
-    assert.equal(popover.dataset.infoTip, 'analysis-test-method');
+    assert.equal(popover.dataset.infoTip, 'analysis-test-options');
     assert.equal(control, select);
     assert.equal(select.getAttribute('aria-describedby'), null);
     assert.equal(
@@ -272,53 +259,3 @@ test('form control ids are unique per call, not per control name', () => {
   });
 });
 
-test('createPerformanceSettings emits a keyboard-operable disclosure and named rows', () => {
-  withFakeDOM(() => {
-    const settings = createPerformanceSettings({
-      dataLayer: performanceDataLayer()
-    });
-
-    // The header row pairs the toggle with its (i); the popover follows it.
-    const [headerRow, popover, content] = settings.children;
-    const [header, info] = headerRow.children;
-    assert.equal(headerRow.className, 'disclosure-header-row');
-    assert.equal(info.getAttribute('aria-controls'), popover.id);
-    assert.equal(popover.dataset.infoTip, 'analysis-performance');
-    assert.ok(settings.classList.contains('disclosure'));
-    assert.equal(header.tagName, 'BUTTON', 'the header is a native button');
-    assert.equal(header.getAttribute('aria-expanded'), 'false');
-    assert.equal(header.getAttribute('aria-controls'), content.id);
-    assert.equal(content.hidden, true);
-
-    header.click();
-    assert.equal(header.getAttribute('aria-expanded'), 'true');
-    assert.equal(content.hidden, false);
-
-    // Every control the section hides is named by its label.
-    const rows = content.children;
-    assert.equal(rows.length, 4);
-    const names = [];
-    for (const row of rows) {
-      const label = row.querySelector('label');
-      const select = row.querySelector('select');
-      assert.ok(select, 'each performance row holds a select');
-      assert.ok(select.id.length > 0, 'each performance select has an id');
-      assert.equal(label.htmlFor, select.id, label.textContent);
-      assert.doesNotMatch(label.textContent, /:$/);
-      names.push(select.name);
-    }
-    assert.deepEqual(
-      names,
-      ['batchSize', 'memoryBudget', 'networkConcurrency', 'parallelism'],
-    );
-
-    // Two sections in one document never share ids.
-    const other = createPerformanceSettings({ dataLayer: performanceDataLayer() });
-    const idsOf = section => [
-      section.children[2].id,
-      ...section.children[2].querySelectorAll('select').map(s => s.id)
-    ];
-    const overlap = idsOf(settings).filter(id => idsOf(other).includes(id));
-    assert.deepEqual(overlap, []);
-  });
-});

@@ -9,14 +9,24 @@
  * Accepts a dataset id (a UUID), a Discover Explorer link
  * (`cellxgene.cziscience.com/e/<dataset_id>.cxg/`), or `cellxgene:<id>`.
  *
+ * Opening costs two dependent round trips, the release list and then the
+ * file's probe, and usually one: the release this browser read last is
+ * remembered (`localStorage`), and the file is probed in it at the same time
+ * as the release list is read. When the list names the same release, the
+ * probe already answered; when a newer release came out, the file is probed
+ * again in it, so a link always opens the release the list names.
+ *
  * @module data/sources/providers/cellxgene
  */
 
-import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
 
 export const CENSUS_BUCKET_URL =
   'https://cellxgene-census-public-us-west-2.s3.us-west-2.amazonaws.com';
+
+/** Where the release this browser read last is remembered. */
+const RELEASE_MEMORY_KEY = 'cellucid:cellxgene-census-release';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -62,7 +72,7 @@ function parseCellxgene(input) {
  * through aliases to the build whose `h5ads` folder holds the copies.
  */
 async function latestCensusRelease(signal) {
-  const response = await fetch(`${CENSUS_BUCKET_URL}/cell-census/release.json`, {
+  const response = await fetchWhenNotBusy(`${CENSUS_BUCKET_URL}/cell-census/release.json`, {
     signal,
     cache: 'no-cache',
   });
@@ -90,6 +100,29 @@ async function latestCensusRelease(signal) {
   return { build, h5adsUrl: `${CENSUS_BUCKET_URL}${relative.endsWith('/') ? relative : `${relative}/`}` };
 }
 
+/** The release this browser read last, or null. */
+function rememberedRelease() {
+  try {
+    const release = JSON.parse(globalThis.localStorage?.getItem(RELEASE_MEMORY_KEY) ?? 'null');
+    return typeof release?.build === 'string' &&
+      typeof release?.h5adsUrl === 'string' &&
+      release.h5adsUrl.startsWith(`${CENSUS_BUCKET_URL}/`)
+      ? { build: release.build, h5adsUrl: release.h5adsUrl }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberRelease(release) {
+  try {
+    globalThis.localStorage?.setItem(RELEASE_MEMORY_KEY, JSON.stringify(release));
+  } catch {
+    // Storage may be unavailable (a private window): the next link reads
+    // the release list first.
+  }
+}
+
 export default Object.freeze({
   id: 'cellxgene',
   label: 'CELLxGENE',
@@ -102,7 +135,7 @@ export default Object.freeze({
   match(input) {
     return parseCellxgene(input);
   },
-  async open(value, { signal = null } = {}) {
+  async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseCellxgene(value);
     if (parsed === null) {
       throw new DataSourceError(
@@ -129,23 +162,47 @@ export default Object.freeze({
         { version: id }
       );
     }
-    const release = await latestCensusRelease(signal);
     const explorerUrl = `https://cellxgene.cziscience.com/e/${id}.cxg/`;
+    const describeIn = (release, probeSignal) => describeRemoteFile({
+      url: `${release.h5adsUrl}${id}.h5ad`,
+      id: `cellxgene:${id}`,
+      name: `${id}.h5ad`,
+      title: `CELLxGENE ${id}`,
+      version: `census:${release.build}`,
+      attribution: {
+        title: `CELLxGENE Discover dataset ${id}`,
+        url: explorerUrl,
+        licence: 'CC BY 4.0',
+        via: `CZ CELLxGENE Census ${release.build}`,
+      },
+      signal: probeSignal,
+    });
+    onStep?.('Finding the dataset in the CELLxGENE Census');
+    // The file in the release read last is probed beside the release list.
+    const remembered = rememberedRelease();
+    const early = new AbortController();
+    const earlySignal = signal === null ? early.signal : AbortSignal.any([signal, early.signal]);
+    const speculative = remembered === null ? null : describeIn(remembered, earlySignal);
+    speculative?.catch(() => {});
+    let release;
     try {
-      const file = await describeRemoteFile({
-        url: `${release.h5adsUrl}${id}.h5ad`,
-        id: `cellxgene:${id}`,
-        name: `${id}.h5ad`,
-        title: `CELLxGENE ${id}`,
-        version: `census:${release.build}`,
-        attribution: {
-          title: `CELLxGENE Discover dataset ${id}`,
-          url: explorerUrl,
-          licence: 'CC BY 4.0',
-          via: `CZ CELLxGENE Census ${release.build}`,
-        },
-        signal,
-      });
+      release = await latestCensusRelease(signal);
+    } catch (error) {
+      early.abort(error);
+      throw error;
+    }
+    rememberRelease(release);
+    const same = remembered !== null &&
+      remembered.build === release.build &&
+      remembered.h5adsUrl === release.h5adsUrl;
+    let probe = speculative;
+    if (!same) {
+      early.abort(new DOMException('A newer Census release is read instead.', 'AbortError'));
+      onStep?.(`Checking the dataset in Census ${release.build}`);
+      probe = describeIn(release, signal);
+    }
+    try {
+      const file = await probe;
       return { title: `CELLxGENE ${id}`, file, attribution: file.attribution };
     } catch (error) {
       if (error?.code === DataSourceErrorCode.NOT_FOUND) {

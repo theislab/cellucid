@@ -73,9 +73,10 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     const { mannWhitneyU } = await import(
       '/assets/js/app/analysis/compute/math-utils.js'
     );
-    const { GenesPanelController } = await import(
+    const { GenesPanelController, GROUP_ID_PREFIX } = await import(
       '/assets/js/app/analysis/genes-panel/genes-panel-controller.js'
     );
+    const { MARKER_OPTIONS } = await import('/assets/js/app/analysis/options/marker-options.js');
     const cm = window._comparisonModule;
     const state = cm.state;
     const dataLayer = cm.dataLayer;
@@ -86,14 +87,14 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     };
 
     // Reference: each gene's column of the expression the file was written with.
-    const reference = new Map();
+    const referenceColumns = new Map();
     const decodeMismatches = [];
     for (const [gene, key] of geneNames.entries()) {
       const expected = Float32Array.from(
         { length: expression.length / geneNames.length },
         (_, cell) => expression[cell * geneNames.length + gene],
       );
-      reference.set(key, expected);
+      referenceColumns.set(key, expected);
       const loaded = await dataLayer.ensureGeneExpressionLoaded(key);
       if (!sameBits(loaded.values, expected)) decodeMismatches.push(key);
     }
@@ -115,13 +116,13 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     let deChecks = 0;
     for (const method of ['wilcox', 'ttest']) {
       const run = await cm.multiVariableAnalysis.differentialExpression({
-        pageA,
-        pageB,
+        groupA: cm.multiVariableAnalysis.pageGroup(pageA),
+        groupB: cm.multiVariableAnalysis.pageGroup(pageB),
         method,
         minCells: 10,
       });
       for (const row of run.results) {
-        const values = reference.get(row.gene);
+        const values = referenceColumns.get(row.gene);
         deChecks++;
         const expected = computeDifferential({
           groupAValues: Float32Array.from(cellsA, i => values[i]),
@@ -136,41 +137,49 @@ test('streamed DE and marker statistics equal on-page references exactly', async
       }
     }
 
+    // Markers against the rest, and against one reference group: every
+    // tested group's p-value equals the rank-sum test of its cells against
+    // the reference's cells.
     const controller = new GenesPanelController({ dataLayer });
     const markerMismatches = [];
     let markerChecks = 0;
+    const codes = (await dataLayer.ensureObsFieldLoaded('cell_type')).codes;
     try {
-      const { groups, obsCodes } = await controller.getGroupsAndCodes('cell_type');
-      const run = await controller.runAnalysis({
-        obsCategory: 'cell_type',
-        method: 'wilcox',
-        useCache: false,
-        topNPerGroup: 'all',
-        pValueThreshold: 1,
-        foldChangeThreshold: 0,
-      });
-      const { genes, groupIds, pValuesByGroup } = run.markers.stats;
-      for (let g = 0; g < groupIds.length; g++) {
-        const group = groups.find(candidate => candidate.groupId === groupIds[g]);
-        for (let geneIndex = 0; geneIndex < genes.length; geneIndex++) {
-          const values = reference.get(genes[geneIndex]);
-          const inGroup = [];
-          const rest = [];
-          for (let cell = 0; cell < obsCodes.length; cell++) {
-            if (obsCodes[cell] === 65535 || !Number.isFinite(values[cell])) continue;
-            (obsCodes[cell] === group.groupCode ? inGroup : rest).push(values[cell]);
+      for (const choice of [{ compareAgainst: 'rest' }, { compareAgainst: 'group', referenceGroup: 'beta' }]) {
+        const options = MARKER_OPTIONS.withDefaults(
+          { groupBy: 'cell_type', minCells: 2, ...choice },
+          {
+            categoricalFields: [{ key: 'cell_type' }],
+            groupsFor: () => ['alpha', 'beta', 'gamma'].map(name => ({ id: name, name, count: 24 })),
+          },
+        );
+        controller.clearCache();
+        const { stats } = await controller.runAnalysis({ options });
+        const codeOf = group => Number(group.groupId.slice(GROUP_ID_PREFIX.length));
+        const reference = stats.groups.find(group => group.reference) ?? null;
+        stats.groups.forEach((group, g) => {
+          if (!group.tested) return;
+          for (let geneIndex = 0; geneIndex < stats.genes.length; geneIndex++) {
+            const values = referenceColumns.get(stats.genes[geneIndex]);
+            const inGroup = [];
+            const rest = [];
+            for (let cell = 0; cell < codes.length; cell++) {
+              if (!Number.isFinite(values[cell])) continue;
+              if (codes[cell] === codeOf(group)) inGroup.push(values[cell]);
+              else if (reference === null || codes[cell] === codeOf(reference)) rest.push(values[cell]);
+            }
+            const expected = mannWhitneyU(inGroup, rest).pValue;
+            markerChecks++;
+            if (!Object.is(stats.pValuesByGroup[g][geneIndex], expected)) {
+              markerMismatches.push(
+                `${choice.compareAgainst} ${group.groupName} ${stats.genes[geneIndex]}: ${stats.pValuesByGroup[g][geneIndex]} != ${expected}`,
+              );
+            }
           }
-          const expected = mannWhitneyU(inGroup, rest).pValue;
-          markerChecks++;
-          if (!Object.is(pValuesByGroup[g][geneIndex], expected)) {
-            markerMismatches.push(
-              `${groupIds[g]} ${genes[geneIndex]}: ${pValuesByGroup[g][geneIndex]} != ${expected}`,
-            );
-          }
-        }
+        });
       }
     } finally {
-      await controller.close();
+      controller.close();
     }
 
     return {
@@ -187,7 +196,8 @@ test('streamed DE and marker statistics equal on-page references exactly', async
   expect(proof.decodeMismatches).toEqual([]);
   expect(proof.deChecks).toBe(16);
   expect(proof.deMismatches).toEqual([]);
-  expect(proof.markerChecks).toBe(24);
+  // 3 groups x 8 genes against the rest, 2 groups x 8 genes against beta.
+  expect(proof.markerChecks).toBe(40);
   expect(proof.markerMismatches).toEqual([]);
   expect(errors).toEqual([]);
 });

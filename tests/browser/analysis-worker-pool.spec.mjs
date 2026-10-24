@@ -63,7 +63,13 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
     slope: 2,
     intercept: 0
   });
-  expect(proof.stats).toEqual({
+  // Each task type's measured queue and run times (the run tuner reads them).
+  const { taskTiming, ...stats } = proof.stats;
+  expect(Object.keys(taskTiming)).toEqual(['COMPUTE_CORRELATION']);
+  expect(taskTiming.COMPUTE_CORRELATION.count).toBe(1);
+  expect(taskTiming.COMPUTE_CORRELATION.queueMs).toBeGreaterThanOrEqual(0);
+  expect(taskTiming.COMPUTE_CORRELATION.runMs).toBeGreaterThanOrEqual(0);
+  expect(stats).toEqual({
     poolSize: 1,
     state: 'ready',
     failure: null,

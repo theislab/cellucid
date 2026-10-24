@@ -1,6 +1,7 @@
 /**
  * Figure export keeps every per-cell pass and every encode off the page's
- * main thread (`utils/figure-export-worker.js`), writes vector markup as Blob
+ * main thread (`utils/figure-export-worker.js`) -- the point passes too,
+ * wherever a worker can create a WebGL2 context -- writes vector markup as Blob
  * parts rather than one string, checksums with the shared slicing CRC, and
  * honours a requested depth sort at every point count.
  */
@@ -14,6 +15,7 @@ import { forEachProjectedPoint } from '../assets/js/app/ui/modules/figure-export
 import { computeVisibleCameraBounds } from '../assets/js/app/ui/modules/figure-export/utils/coordinate-mapper.js';
 import { writeSvgPointMarkup } from '../assets/js/app/ui/modules/figure-export/renderers/svg-point-markup.js';
 import {
+  figureExportRasterizesOnPage,
   openFigureExportWorkerSession,
   requestVisibleBounds,
 } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
@@ -94,6 +96,91 @@ test('the worker module is the one place the rasterizer and encoders run', async
   const client = await source('utils/figure-export-worker-client.js');
   assert.match(client, /new URL\('\.\/figure-export-worker\.js', import\.meta\.url\)/);
   assert.match(client, /\{ type: 'module' \}/);
+  // The page loads the handler only where a worker cannot draw.
+  assert.match(client, /await import\('\.\/figure-export-worker\.js'\)/);
+  assert.doesNotMatch(client, /^import [^;]*figure-export-worker\.js'/m);
+});
+
+/** A worker that answers `webgl2` with `drawing` and records every request. */
+function answeringWorker(drawing) {
+  const worker = {
+    onmessage: null,
+    requests: [],
+    postMessage(message) {
+      worker.requests.push(message);
+      if (message.op === 'close') return;
+      const result = message.op === 'webgl2' ? drawing : 4;
+      queueMicrotask(() => worker.onmessage?.({ data: { id: message.id, result } }));
+    },
+    terminate() {},
+  };
+  return worker;
+}
+
+test('the worker is asked once whether it can draw, and a worker that can draws every point pass', async () => {
+  const worker = answeringWorker(true);
+  setFigureExportWorkerFactory(() => worker);
+  try {
+    assert.equal(figureExportRasterizesOnPage(), null, 'nothing is assumed before the worker answers');
+    const first = openFigureExportWorkerSession();
+    assert.equal(await first.request('spriteZoomLimit', {}), 4);
+    first.close();
+    const second = openFigureExportWorkerSession();
+    assert.equal(await second.request('spriteZoomLimit', {}), 4);
+    second.close();
+    assert.deepEqual(
+      worker.requests.filter(message => message.op !== 'close').map(message => message.op),
+      ['webgl2', 'spriteZoomLimit', 'spriteZoomLimit'],
+    );
+    assert.equal(figureExportRasterizesOnPage(), false);
+  } finally {
+    setFigureExportWorkerFactory(null);
+  }
+});
+
+test('where the worker cannot draw, the point passes run on the page and everything else stays in the worker', async () => {
+  // Node has no OffscreenCanvas: the in-process worker answers `webgl2` with
+  // false, as a WebKitGTK or WPE worker does.
+  const worker = createInProcessFigureExportWorker();
+  setFigureExportWorkerFactory(() => worker);
+  try {
+    const positions = Float32Array.from([0, 0, 0, 0.5, 0.5, 0.5]);
+    const session = openFigureExportWorkerSession();
+    await requestVisibleBounds(session, {
+      camera: true,
+      positions,
+      dimension: 3,
+      transparency: null,
+      lodMembership: null,
+      renderState: { mvpMatrix: IDENTITY, viewMatrix: IDENTITY, viewportWidth: 10, viewportHeight: 10 },
+      crop: null,
+      normTransform: null,
+    });
+    // The page's pass reports the page's own validation, as the worker would.
+    await assert.rejects(
+      session.request('rasterizePoints', {
+        positions: session.share(positions),
+        dimension: 4,
+        colors: Uint8Array.from([255, 255, 255, 255]),
+        renderState: {},
+        outputWidthPx: 4,
+        outputHeightPx: 4,
+        pointSizePx: 1,
+        lodMembership: null,
+      }),
+      error => error instanceof RangeError && /dimension must be exactly 1, 2, or 3/.test(error.message)
+    );
+    session.close();
+    assert.equal(figureExportRasterizesOnPage(), true);
+    assert.deepEqual(
+      worker.requests.map(message => message.op ?? null),
+      ['visibleBounds', 'webgl2', 'close'],
+      'the worker never receives a point pass',
+    );
+    assert.equal(worker.requests[0].uploads.length, 1, 'the positions travel to the worker once');
+  } finally {
+    setFigureExportWorkerFactory(null);
+  }
 });
 
 test('PNG chunks and ZIP entries use the shared slicing CRC', async () => {

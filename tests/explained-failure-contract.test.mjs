@@ -10,10 +10,7 @@ import {
 } from '../assets/js/data/data-source.js';
 import { serializeReaderError } from '../assets/js/data/anndata-reader-worker.js';
 import { rebuildReaderError } from '../assets/js/data/anndata-reader-client.js';
-import {
-  describeDataSourceFailure,
-  reportDataSourceFailure,
-} from '../assets/js/app/ui/modules/dataset-connections.js';
+import { describeDataSourceFailure } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { explainFormatError } from '../assets/js/data/anndata/open.js';
 import { Hdf5UnsupportedError, openHdf5 } from '../assets/js/formats/hdf5/index.js';
 import { filterName, unsupportedFilters } from '../assets/js/formats/hdf5/filters.js';
@@ -29,7 +26,7 @@ test('a failure written for the person is shown as it is, never replaced by a ge
   );
   assert.equal(isExplainedFailure(explained), true);
   assert.equal(
-    reportDataSourceFailure('The linked data', 'could not be opened', explained),
+    describeDataSourceFailure('The linked data', 'could not be opened', explained),
     'The linked data could not be opened: Zenodo record 1 has 2 files Cellucid opens. ' +
       'Open one of them: zenodo:1/a.h5ad, zenodo:1/b.h5ad.'
   );

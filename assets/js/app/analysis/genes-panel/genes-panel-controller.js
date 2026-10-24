@@ -1,27 +1,17 @@
 /**
  * Genes Panel Controller
  *
- * Main orchestrator for the Marker Genes Panel feature.
- * Coordinates marker discovery, matrix building, clustering, and caching.
- *
- * Features:
- * - Unified API for complete marker gene analysis workflow
- * - Automatic cache management
- * - Progressive results streaming
- * - Configuration management
- * - Memory-aware operation
- *
- * Usage Patterns:
- * 1. Full analysis: discoverAndBuildMatrix()
- * 2. Cached results: getCachedOrCompute()
- * 3. Custom genes: buildCustomMatrix()
- * 4. Re-clustering: recluster()
+ * Turns the marker options (`options/marker-options.js`) into a run: the
+ * groups of the field in the cell scope, which are tested and against what
+ * (the small-group policy decides, never an error), the genes tested, the
+ * fold-change mode; then runs marker discovery, or answers from the cache.
+ * Filters, ranking and the number shown are the UI's, applied to the full
+ * statistics a run returns (`marker-selection.js`).
  *
  * @module genes-panel/genes-panel-controller
  */
 
-import { MarkerDiscoveryEngine } from './marker-discovery-engine.js';
-import { ExpressionMatrixBuilder } from './expression-matrix-builder.js';
+import { MarkerDiscoveryEngine, describeMarkerRun } from './marker-discovery-engine.js';
 import { ClusteringEngine } from './clustering-engine.js';
 import { MarkerCache } from './marker-cache.js';
 import { computeCategoryGroupingDigest } from '../data/data-layer.js';
@@ -29,1215 +19,454 @@ import {
   isCategoricalCodes,
   missingCategoryCode
 } from '../../../data/categorical-storage-contract.js';
-import { DEFAULTS, ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
+import { ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
+import { residencyBudgetBytes } from '../../../data/memory-budget.js';
+import { getMemoryMonitor } from '../shared/memory-monitor.js';
+import { filterGenes, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
+import { geneMomentsFor } from '../shared/gene-moments-cache.js';
+import { formatCount } from '../../ui/components/display-format.js';
 
-/**
- * The memory clustering may use: the run's analysis memory budget, the one
- * marker discovery is bounded by (Performance settings), or its default.
- *
- * @param {{ memoryBudgetMB?: number }|undefined|null} batchConfig
- * @returns {number} Bytes
- */
-function clusteringBudgetBytes(batchConfig) {
-  const megabytes = batchConfig?.memoryBudgetMB ?? DEFAULTS.memoryBudgetMB;
-  if (!Number.isFinite(megabytes) || megabytes <= 0) {
-    throw new RangeError('The analysis memory budget must be a positive number of MB');
+/** Synthetic id of a category's group. */
+export const GROUP_ID_PREFIX = 'category-code:';
+/** Synthetic id of the pooled small groups. */
+export const POOLED_GROUP_ID = 'pooled:small';
+
+const DEFAULT_GROUP_PALETTE = [
+  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+];
+
+/** A short digest of a cell scope (null: every cell). */
+function scopeDigest(scope) {
+  if (scope === null) return 'all';
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  let count = 0;
+  for (let i = 0; i < scope.length; i++) {
+    if (scope[i] === 0) continue;
+    count++;
+    h1 = Math.imul(h1 ^ i, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (i >>> 3), 0x5bd1e995) >>> 0;
   }
-  return Math.floor(megabytes * 2 ** 20);
+  return `${count}:${h1.toString(16)}:${h2.toString(16)}`;
 }
 
-// =============================================================================
-// GENES PANEL CONTROLLER
-// =============================================================================
+/** The label a category is chosen by in the options (`testGroups`, `referenceGroup`). */
+export function categoryOptionId(label) {
+  return String(label);
+}
 
-/**
- * Genes Panel Controller
- *
- * High-level orchestrator for marker genes analysis.
- *
- * @example
- * const controller = new GenesPanelController({ dataLayer });
- * await controller.init();
- *
- * const result = await controller.runAnalysis({
- *   obsCategory: 'cell_type',
- *   mode: 'clustered',
- *   topNPerGroup: 10,
- *   onProgress: updateUI
- * });
- */
 export class GenesPanelController {
   /**
-   * Create a GenesPanelController
-   *
    * @param {Object} options
    * @param {Object} options.dataLayer - DataLayer instance
-   * @param {Object} [options.config] - Configuration overrides
    */
-  constructor(options) {
-    const { dataLayer, config = {} } = options;
-
-    if (!dataLayer) {
-      throw new Error('[GenesPanelController] dataLayer is required');
-    }
-
-    /** @type {Object} DataLayer instance */
+  constructor({ dataLayer }) {
+    if (!dataLayer) throw new Error('[GenesPanelController] dataLayer is required');
     this.dataLayer = dataLayer;
-
-    /** @type {Object} Configuration */
-    this._config = { ...DEFAULTS, ...config };
-
-    /** @type {MarkerDiscoveryEngine|null} */
-    this._discoveryEngine = null;
-
-    /** @type {ExpressionMatrixBuilder|null} */
-    this._matrixBuilder = null;
-
-    /** @type {ClusteringEngine|null} */
-    this._clusteringEngine = null;
-
-    /** @type {MarkerCache|null} */
-    this._cache = null;
-
-    /** @type {boolean} */
-    this._initialized = false;
-
-    /** @type {AbortController|null} Current operation abort controller */
-    this._currentAbortController = null;
-
-    /** @type {Set<Promise<unknown>>} Public operations that still own cache state */
-    this._activeOperations = new Set();
-
-    /** @type {boolean} */
+    this._engine = new MarkerDiscoveryEngine({ dataLayer });
+    this._clusteringEngine = new ClusteringEngine();
+    this._cache = new MarkerCache({ identity: this._getCacheIdentity() });
     this._closed = false;
-
-    /** @type {boolean} */
-    this._cacheClosed = false;
-
-    /** @type {Promise<void>|null} */
-    this._closePromise = null;
-  }
-
-  /**
-   * Initialize the controller and all engines
-   * @returns {Promise<void>}
-   */
-  init() {
-    this._assertOpen();
-    if (this._initialized) return Promise.resolve();
-
-    this._discoveryEngine = new MarkerDiscoveryEngine({
-      dataLayer: this.dataLayer,
-      config: this._config
-    });
-
-    this._matrixBuilder = new ExpressionMatrixBuilder({
-      dataLayer: this.dataLayer,
-      config: this._config
-    });
-
-    this._clusteringEngine = new ClusteringEngine({
-      config: this._config
-    });
-
-    this._cache = new MarkerCache({
-      maxCategories: this._config.cacheMaxCategories,
-      identity: this._getCacheIdentity()
-    });
-    this._initialized = true;
-    return Promise.resolve();
-  }
-
-  /**
-   * Run full marker genes analysis
-   *
-   * @param {Object} options
-   * @param {string} options.obsCategory - Observation category to analyze (e.g., 'cell_type')
-   * @param {'ranked'|'clustered'|'custom'} [options.mode='clustered'] - Display mode
-   * @param {string[]} [options.customGenes] - For custom mode: genes to display
-   * @param {number} [options.topNPerGroup] - Top markers per group
-   * @param {'wilcox'|'ttest'} [options.method] - Statistical method
-   * @param {'none'|'zscore'|'log1p'} [options.transform] - Heatmap transform
-   * @param {'correlation'|'euclidean'|'cosine'} [options.distance] - Clustering distance
-   * @param {'average'|'complete'|'single'} [options.linkage] - Clustering linkage
-   * @param {boolean} [options.clusterRows] - Whether to cluster genes
-   * @param {boolean} [options.clusterCols] - Whether to cluster groups
-   * @param {number} [options.pValueThreshold] - P-value cutoff
-   * @param {number} [options.foldChangeThreshold] - Fold change cutoff
-   * @param {boolean} [options.useAdjustedPValue] - Use FDR-corrected p-values
-   * @param {boolean} [options.useCache=true] - Whether to use cached results
-   * @param {Function} [options.onProgress] - Progress callback
-   * @param {Function} [options.onPartialResults] - Partial results callback
-   * @param {AbortSignal|null} [options.signal] - The run's job's signal
-   *   (`app/jobs/cancellable-job.js`): aborting it cancels the run
-   * @param {string|null} [options.readOwner] - The job the gene reads are for
-   * @returns {Promise<GenesPanelResult>} Complete analysis result
-   */
-  runAnalysis(options) {
-    return this._trackPublicOperation(() => {
-      // Supersession ownership must be installed before the first await so an
-      // immediate abort/close can cancel the operation in the same turn.
-      this.abort();
-      const abortController = new AbortController();
-      this._currentAbortController = abortController;
-      const external = options?.signal ?? null;
-      if (external !== null) {
-        if (external.aborted) abortController.abort(external.reason);
-        else {
-          external.addEventListener('abort', () => abortController.abort(external.reason), {
-            once: true,
-            signal: abortController.signal
-          });
-        }
+    this._pressureUnsubscribe = getMemoryMonitor().onMemoryPressure(event => {
+      if (event?.level === 'warning' || event?.level === 'cleanup' || event?.level === 'critical') {
+        this._cache.trim();
       }
-      return this._runAnalysis(options, abortController);
     });
   }
-
-  async _runAnalysis(options, abortController) {
-    const signal = abortController.signal;
-    const throwIfAborted = () => {
-      if (signal.aborted) {
-        throw signal.reason ??
-          new DOMException('Request aborted', 'AbortError');
-      }
-      this._assertOpen();
-    };
-
-    try {
-      if (!options || typeof options !== 'object' || Array.isArray(options)) {
-        throw new TypeError('[GenesPanelController] analysis options must be an object');
-      }
-      const {
-        obsCategory,
-        mode = 'clustered',
-        customGenes: requestedCustomGenes = null,
-        topNPerGroup = this._config.topNPerGroup,
-        method = this._config.method,
-        transform = this._config.transform,
-        distance = this._config.distance,
-        linkage = this._config.linkage,
-        clusterRows = this._config.clusterRows,
-        clusterCols = this._config.clusterCols,
-        pValueThreshold = this._config.pValueThreshold,
-        foldChangeThreshold = this._config.foldChangeThreshold,
-        useAdjustedPValue = this._config.useAdjustedPValue,
-        useCache = true,
-        parallelism = 'auto',
-        batchConfig: requestedBatchConfig = {},
-        onProgress,
-        onPartialResults,
-        readOwner = null
-      } = options;
-      for (const [name, callback] of [
-        ['onProgress', onProgress],
-        ['onPartialResults', onPartialResults]
-      ]) {
-        if (callback !== undefined && typeof callback !== 'function') {
-          throw new TypeError(
-            `[GenesPanelController] ${name} must be a function when provided`
-          );
-        }
-      }
-      if (
-        requestedBatchConfig === null ||
-        typeof requestedBatchConfig !== 'object' ||
-        Array.isArray(requestedBatchConfig)
-      ) {
-        throw new TypeError(
-          '[GenesPanelController] batchConfig must be an object'
-        );
-      }
-      const customGenes = Array.isArray(requestedCustomGenes)
-        ? [...requestedCustomGenes]
-        : requestedCustomGenes;
-      const batchConfig = structuredClone(requestedBatchConfig);
-
-      await this.init();
-      throwIfAborted();
-      this._syncCacheIdentity();
-
-      const reportProgress = onProgress === undefined
-        ? undefined
-        : update => {
-          if (!signal.aborted) onProgress(update);
-        };
-      const reportPartialResults = onPartialResults === undefined
-        ? undefined
-        : update => {
-          if (!signal.aborted) onPartialResults(update);
-        };
-
-      const startTime = performance.now();
-
-      // Report init phase
-      if (reportProgress) {
-        reportProgress({
-          phase: ANALYSIS_PHASES.INIT,
-          progress: 0,
-          message: 'Initializing analysis...'
-        });
-      }
-
-      // Get groups from observation category
-      if (reportProgress) {
-        reportProgress({
-          phase: ANALYSIS_PHASES.INIT,
-          progress: 5,
-          message: `Loading groups for "${obsCategory}"...`
-        });
-      }
-      const { groups, obsCodes } = await this._getGroupsFromCategory(
-        obsCategory,
-        { onProgress: reportProgress, signal }
-      );
-      throwIfAborted();
-
-      // Handle custom mode
-      if (mode === 'custom' && customGenes) {
-        const customResult = await this._runCustomAnalysis({
-          groups,
-          genes: customGenes,
-          transform,
-          distance,
-          linkage,
-          clusterRows,
-          clusterCols,
-          batchConfig,
-          onProgress: reportProgress,
-          signal,
-          readOwner
-        });
-        throwIfAborted();
-        return customResult;
-      }
-
-      // Check cache for markers.
-      //
-      // `groupingDigest` is the cache's identity for *which cells were compared*.
-      // The observation-field key alone is not: an in-place category merge or a
-      // move to "unassigned" rewrites a field's codes while its key is unchanged,
-      // and without the digest the panel would answer the new grouping with the
-      // markers computed for the old one.
-      const cacheParams = {
-        method,
-        topNPerGroup,
-        pValueThreshold,
-        foldChangeThreshold,
-        useAdjustedPValue,
-        minCells: this._config.minCells,
-        groupingDigest: computeCategoryGroupingDigest(obsCodes)
-      };
-      let markers = null;
-      let cacheHit = false;
-
-      if (useCache) {
-        markers = await this._cache.get(obsCategory, cacheParams);
-        if (markers) {
-          cacheHit = true;
-          if (reportProgress) {
-            reportProgress({
-              phase: ANALYSIS_PHASES.DISCOVERY,
-              progress: 100,
-              message: 'Using cached markers'
-            });
-          }
-        }
-      }
-      throwIfAborted();
-
-      // Discover markers if not cached
-      if (!markers) {
-        markers = await this._discoveryEngine.discoverMarkers({
-          obsCategory,
-          groups,
-          obsCodes,
-          method,
-          topNPerGroup,
-          pValueThreshold,
-          foldChangeThreshold,
-          useAdjustedPValue,
-          parallelism,
-          batchConfig,
-          onProgress: reportProgress,
-          onPartialResults: reportPartialResults,
-          signal,
-          readOwner
-        });
-        throwIfAborted();
-
-        // The grouping the markers were computed over, so a later heatmap
-        // rebuild can tell whether their per-group means still apply.
-        markers.stats.groupingDigest = cacheParams.groupingDigest;
-
-        // Cache results
-        if (useCache) {
-          await this._cache.set(obsCategory, markers, cacheParams);
-          throwIfAborted();
-        }
-      }
-
-      // Extract unique genes from all groups
-      const allGenes = this._extractUniqueGenes(markers);
-
-      if (allGenes.length === 0) {
-        throw new Error(formatError(ERROR_MESSAGES.EMPTY_RESULTS, {
-          pValue: pValueThreshold,
-          fc: foldChangeThreshold
-        }));
-      }
-
-      // Build expression matrix.
-      // For interactive thresholding + browsing, we only need a small panel by default.
-      // The figure modal can request larger sets (Top 10/20/100/All) and rebuild the matrix.
-      const DEFAULT_HEATMAP_TOP_N = 5;
-      const genesForMatrix = this._extractTopNGenes(markers, DEFAULT_HEATMAP_TOP_N);
-
-      const matrix = await this._matrixBuilder.buildMatrix({
-        genes: genesForMatrix,
-        groups,
-        transform,
-        batchConfig,
-        knownMeans: markers.stats,
-        onProgress: reportProgress,
-        signal,
-        readOwner
-      });
-      throwIfAborted();
-
-      // Cluster if requested
-      let clustering = null;
-      let orderedMatrix = matrix;
-
-      if (mode === 'clustered' && (clusterRows || clusterCols)) {
-        clustering = await this._clusteringEngine.clusterMatrix({
-          matrix,
-          clusterRows,
-          clusterCols,
-          distance,
-          linkage,
-          memoryBudgetBytes: clusteringBudgetBytes(batchConfig),
-          onProgress: reportProgress,
-          signal
-        });
-        throwIfAborted();
-        orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
-      }
-
-      // Report render phase
-      if (reportProgress) {
-        reportProgress({
-          phase: ANALYSIS_PHASES.RENDER,
-          progress: 100,
-          message: 'Analysis complete'
-        });
-      }
-      throwIfAborted();
-
-      const duration = performance.now() - startTime;
-
-      return {
-        markers,
-        matrix: orderedMatrix,
-        clustering,
-        metadata: {
-          obsCategory,
-          mode,
-          method,
-          transform,
-          distance,
-          linkage,
-          topNPerGroup,
-          pValueThreshold,
-          foldChangeThreshold,
-          useAdjustedPValue,
-          parallelism,
-          batchConfig,
-          geneCount: allGenes.length,
-          matrixGeneCount: genesForMatrix.length,
-          groupCount: groups.length,
-          duration,
-          cached: useCache && cacheHit
-        }
-      };
-
-    } catch (error) {
-      if (error.name === 'AbortError' || signal.aborted) {
-        throw error;
-      }
-      throw error;
-    } finally {
-      // Ensure repeated runs don't keep stale controllers alive.
-      if (this._currentAbortController === abortController) {
-        this._currentAbortController = null;
-      }
-    }
-  }
-
-  /**
-   * Public helper: get groups + obsCodes for a category (for post-run re-filtering).
-   *
-   * @param {string} obsCategory
-   * @param {{ onProgress?: Function, signal?: AbortSignal }} [options]
-   * @returns {Promise<{ groups: any[], obsCodes: Uint8Array|Uint16Array|Uint32Array }>}
-   */
-  getGroupsAndCodes(obsCategory, options = {}) {
-    return this._trackPublicOperation(() => {
-      const ownedOptions =
-        options !== null &&
-        typeof options === 'object' &&
-        !Array.isArray(options)
-          ? {
-              onProgress: options.onProgress,
-              signal: options.signal
-            }
-          : options;
-      return (async () => {
-        await this.init();
-        return this._getGroupsFromCategory(obsCategory, ownedOptions);
-      })();
-    });
-  }
-
-  /**
-   * Public helper: build an expression matrix for a given gene list.
-   * This lets the UI rebuild the heatmap after post-run threshold changes
-   * without re-running marker discovery.
-   *
-   * @param {Object} options
-   * @param {string[]} options.genes
-   * @param {any[]} options.groups
-   * @param {'none'|'zscore'|'log1p'} [options.transform]
-   * @param {Object} [options.batchConfig]
-   * @param {Object|null} [options.markers] - The marker result the genes come
-   *   from: its per-group means are used when it was computed over the
-   *   grouping `obsCodes` describe now
-   * @param {Uint8Array|Uint16Array|Uint32Array} [options.obsCodes] - The
-   *   current codes of the grouping field (from `getGroupsAndCodes`)
-   * @param {Function} [options.onProgress]
-   * @param {AbortSignal} [options.signal]
-   * @param {string|null} [options.readOwner] - The job the gene reads are for
-   * @returns {Promise<any>}
-   */
-  buildMatrixForGenes(options) {
-    return this._trackPublicOperation(() => {
-      let ownedOptions = options;
-      if (
-        options !== null &&
-        typeof options === 'object' &&
-        !Array.isArray(options)
-      ) {
-        const ownedGroups = Array.isArray(options.groups)
-          ? options.groups.map(group => (
-              group !== null &&
-              typeof group === 'object' &&
-              !Array.isArray(group)
-                ? { ...group }
-                : group
-            ))
-          : options.groups;
-        const ownedBatchConfig =
-          options.batchConfig !== null &&
-          typeof options.batchConfig === 'object' &&
-          !Array.isArray(options.batchConfig)
-            ? { ...options.batchConfig }
-            : options.batchConfig;
-        ownedOptions = {
-          genes: Array.isArray(options.genes)
-            ? [...options.genes]
-            : options.genes,
-          groups: ownedGroups,
-          transform: options.transform,
-          batchConfig: ownedBatchConfig,
-          knownMeans: (
-            options.markers?.stats?.meanInGroupByGroup !== undefined &&
-            options.obsCodes !== undefined &&
-            options.markers.stats.groupingDigest ===
-              computeCategoryGroupingDigest(options.obsCodes)
-          )
-            ? options.markers.stats
-            : null,
-          onProgress: options.onProgress,
-          signal: options.signal,
-          readOwner: options.readOwner ?? null
-        };
-      }
-
-      return (async () => {
-        await this.init();
-        if (!this._matrixBuilder) {
-          throw new Error('[GenesPanelController] Matrix builder not initialized');
-        }
-        return this._matrixBuilder.buildMatrix(ownedOptions);
-      })();
-    });
-  }
-
-  /**
-   * Recluster an existing result with different parameters
-   *
-   * @param {GenesPanelResult} result - Previous result
-   * @param {Object} options
-   * @param {'correlation'|'euclidean'|'cosine'} [options.distance]
-   * @param {'average'|'complete'|'single'} [options.linkage]
-   * @param {boolean} [options.clusterRows]
-   * @param {boolean} [options.clusterCols]
-   * @returns {Promise<GenesPanelResult>} Updated result
-   */
-  recluster(result, options) {
-    return this._trackPublicOperation(() => {
-      const {
-        distance = result.metadata?.distance || this._config.distance,
-        linkage = result.metadata?.linkage || this._config.linkage,
-        clusterRows = result.metadata?.clusterRows ?? this._config.clusterRows,
-        clusterCols = result.metadata?.clusterCols ?? this._config.clusterCols
-      } = options;
-
-      // Get original (unordered) matrix
-      const requestedMatrix = result.matrix;
-      const matrix =
-        requestedMatrix !== null &&
-        typeof requestedMatrix === 'object' &&
-        !Array.isArray(requestedMatrix)
-          ? {
-              ...requestedMatrix,
-              genes: Array.isArray(requestedMatrix.genes)
-                ? [...requestedMatrix.genes]
-                : requestedMatrix.genes,
-              groupIds: Array.isArray(requestedMatrix.groupIds)
-                ? [...requestedMatrix.groupIds]
-                : requestedMatrix.groupIds,
-              groupNames: Array.isArray(requestedMatrix.groupNames)
-                ? [...requestedMatrix.groupNames]
-                : requestedMatrix.groupNames,
-              groupColors: Array.isArray(requestedMatrix.groupColors)
-                ? [...requestedMatrix.groupColors]
-                : requestedMatrix.groupColors
-            }
-          : requestedMatrix;
-      const metadata =
-        result.metadata !== null &&
-        typeof result.metadata === 'object' &&
-        !Array.isArray(result.metadata)
-          ? { ...result.metadata }
-          : result.metadata;
-      const ownedResult = {
-        ...result,
-        matrix,
-        metadata
-      };
-
-      return (async () => {
-        await this.init();
-
-        // Recluster
-        const clustering = await this._clusteringEngine.clusterMatrix({
-          matrix,
-          clusterRows,
-          clusterCols,
-          distance,
-          linkage,
-          memoryBudgetBytes: clusteringBudgetBytes(metadata?.batchConfig)
-        });
-
-        // Apply ordering
-        const orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
-
-        return {
-          ...ownedResult,
-          matrix: orderedMatrix,
-          clustering,
-          metadata: {
-            ...metadata,
-            distance,
-            linkage
-          }
-        };
-      })();
-    });
-  }
-
-  /**
-   * Re-transform an existing result with different transformation
-   *
-   * @param {GenesPanelResult} result - Previous result
-   * @param {'none'|'zscore'|'log1p'} transform - New transform
-   * @returns {GenesPanelResult} Updated result
-   */
-  retransform(result, transform) {
-    this._assertOpen();
-    const newMatrix = this._matrixBuilder.retransform(result.matrix, transform);
-
-    return {
-      ...result,
-      matrix: newMatrix,
-      metadata: {
-        ...result.metadata,
-        transform
-      }
-    };
-  }
-
-  /**
-   * Get available observation categories for analysis
-   * @returns {string[]}
-   */
-  getAvailableCategories() {
-    this._assertOpen();
-    return this.dataLayer.getAvailableVariables('categorical_obs').map(v => v.key);
-  }
-
-  /**
-   * Abort current operation
-   */
-  abort() {
-    if (this._currentAbortController) {
-      this._currentAbortController.abort();
-      this._currentAbortController = null;
-    }
-  }
-
-  /**
-   * Clear all caches
-   * @returns {Promise<void>}
-   */
-  clearCache() {
-    return this._trackPublicOperation(async () => {
-      await this.init();
-      await this._cache.clear();
-    });
-  }
-
-  /**
-   * Close and cleanup
-   */
-  close() {
-    if (this._closePromise !== null) return this._closePromise;
-
-    this._closed = true;
-    this.abort();
-    const pending = [...this._activeOperations];
-
-    if (pending.length === 0) {
-      if (!this._cacheClosed && this._cache !== null) {
-        this._cache.close();
-        this._cacheClosed = true;
-      }
-      this._closePromise = Promise.resolve();
-      return this._closePromise;
-    }
-
-    this._closePromise = Promise.allSettled(pending).then(() => {
-      if (this._cacheClosed || this._cache === null) return;
-      this._cache.close();
-      this._cacheClosed = true;
-    });
-    return this._closePromise;
-  }
-
-  // ===========================================================================
-  // PRIVATE METHODS
-  // ===========================================================================
 
   _assertOpen() {
-    if (this._closed) {
-      throw new Error('[GenesPanelController] controller is closed');
-    }
+    if (this._closed) throw new Error('[GenesPanelController] controller is closed');
   }
 
-  _trackPublicOperation(operation) {
+  // ===========================================================================
+  // Groups
+  // ===========================================================================
+
+  /**
+   * The cells a "Cells" choice scopes a run to: null for every cell, else one
+   * byte a cell.
+   * @param {string} cells - 'all', 'visible' or 'page:<id>'
+   * @returns {Uint8Array|null}
+   */
+  scopeOf(cells) {
+    if (cells === 'all') return null;
+    if (cells === 'visible') return this.dataLayer.getVisibleCellMask();
+    if (typeof cells === 'string' && cells.startsWith('page:')) {
+      const [{ cellIndices }] = this.dataLayer.getPageCells([cells.slice('page:'.length)]);
+      const scope = new Uint8Array(this.dataLayer.state.pointCount);
+      for (let i = 0; i < cellIndices.length; i++) scope[cellIndices[i]] = 1;
+      return scope;
+    }
+    throw new RangeError(`Unknown cell scope ${String(cells)}`);
+  }
+
+  /**
+   * The categories of a field with their cells in a scope, largest first.
+   *
+   * @param {string} field
+   * @param {Uint8Array|null} scope
+   * @returns {Promise<{codes: Uint8Array|Uint16Array|Uint32Array, categories: Array, groups: Array<{groupId: string, optionId: string, groupName: unknown, code: number, count: number, color: string}>}>}
+   */
+  async describeGroups(field, scope = null) {
     this._assertOpen();
-    if (typeof operation !== 'function') {
-      throw new TypeError('Tracked Genes Panel operation must be a function');
+    const fieldData = await this.dataLayer.ensureObsFieldLoaded(field, { silent: true });
+    if (fieldData === null || typeof fieldData !== 'object' || fieldData.kind !== 'category') {
+      throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
     }
-
-    let task;
-    try {
-      task = Promise.resolve(operation());
-    } catch (error) {
-      task = Promise.reject(error);
+    const { codes, categories, colors = {} } = fieldData;
+    if (!isCategoricalCodes(codes) || codes.length === 0 || !Array.isArray(categories)) {
+      throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
     }
-    this._activeOperations.add(task);
-    const release = () => {
-      this._activeOperations.delete(task);
-    };
-    task.then(release, release);
-    return task;
-  }
-
-  /**
-   * Get dataset identifier for cache keys
-   * @private
-   */
-  _getDatasetId() {
-    const manager = getDataSourceManager();
-    if (!manager || typeof manager.getCurrentDatasetId !== 'function') {
-      throw new TypeError('The active dataset owner getCurrentDatasetId is required');
-    }
-    const datasetId = manager.getCurrentDatasetId();
-    if (
-      typeof datasetId !== 'string' ||
-      datasetId.length === 0 ||
-      datasetId.trim().length === 0
-    ) {
-      throw new TypeError('An exact active datasetId is required for marker analysis');
-    }
-    return datasetId;
-  }
-
-  /**
-   * The data generation marker results belong to.
-   *
-   * A dataset id names a dataset, not the expression values a load brings: a
-   * file written again under the same id shares the id with different data.
-   * Results are therefore keyed to this page's load and kept in memory only.
-   * @private
-   */
-  /**
-   * The gene list marker results are computed over: the data mapping's
-   * expression matrix and the gene names, which name every gene in a result. A result from one gene
-   * list is never served for another.
-   *
-   * @returns {[string|null, string]}
-   */
-  _getGeneAxisIdentity() {
-    const state = this.dataLayer?.state;
-    if (typeof state?.getDataMapping !== 'function') {
-      throw new TypeError('Marker analysis requires the data mapping of the open dataset');
-    }
-    const mapping = state.getDataMapping();
-    if (mapping === null || typeof mapping !== 'object' || typeof mapping.geneNames !== 'string') {
-      throw new TypeError('Marker analysis requires the data mapping of the open dataset');
-    }
-    return [mapping.expression ?? null, mapping.geneNames];
-  }
-
-  _getCacheIdentity() {
-    const datasetId = this._getDatasetId();
-    const geneAxis = this._getGeneAxisIdentity();
-    const manager = getDataSourceManager();
-    if (typeof manager.getCurrentSelectionRevision !== 'function') {
-      throw new TypeError(
-        'The active dataset owner must publish its selection revision'
-      );
-    }
-    const revision = manager.getCurrentSelectionRevision();
-    if (!Number.isSafeInteger(revision) || revision < 0) {
-      throw new TypeError('The dataset selection revision must be a non-negative integer');
-    }
-    return {
-      key: JSON.stringify(['load', datasetId, revision, geneAxis]),
-    };
-  }
-
-  _syncCacheIdentity() {
-    if (!this._cache || typeof this._cache.setIdentity !== 'function') {
-      throw new TypeError('Marker cache setIdentity is required');
-    }
-    this._cache.setIdentity(this._getCacheIdentity());
-  }
-
-  _extractTopNGenes(markers, topNPerGroup) {
-    if (!markers || !markers.groups || typeof markers.groups !== 'object') {
-      throw new TypeError('Marker groups are required');
-    }
-    if (!Number.isSafeInteger(topNPerGroup) || topNPerGroup < 1) {
-      throw new RangeError('topNPerGroup must be a positive integer');
-    }
-    const groups = markers.groups;
-    const wanted = new Set();
-
-    for (const group of Object.values(groups)) {
-      if (!group || !Array.isArray(group.markers)) {
-        throw new TypeError('Every marker group must own a markers array');
+    const missing = missingCategoryCode(codes);
+    const counts = new Uint32Array(categories.length);
+    if (scope === null) {
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i];
+        if (code !== missing && code < counts.length) counts[code]++;
       }
-      const list = group.markers;
-      const limit = Math.min(list.length, topNPerGroup);
-      for (let i = 0; i < limit; i++) {
-        const gene = list[i]?.gene;
-        if (typeof gene !== 'string' || gene.length === 0) {
-          throw new TypeError('Every selected marker must own a non-empty gene name');
-        }
-        wanted.add(gene);
+    } else {
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i];
+        if (scope[i] !== 0 && code !== missing && code < counts.length) counts[code]++;
       }
     }
-
-    const genes = Array.from(wanted);
-    if (genes.length === 0) {
-      throw new Error('Marker groups did not provide any genes for the expression matrix');
-    }
-    return genes;
-  }
-
-  /**
-   * Get group specifications from an observation category
-   *
-   * Uses dataLayer.ensureObsFieldLoaded() to get the categorical observation
-   * field data (codes and categories), then builds group specifications.
-   *
-   * @private
-   * @param {string} obsCategory - The observation category key (e.g., 'cell_type')
-   * @returns {Promise<GroupSpec[]>} Array of group specifications
-   */
-  async _getGroupsFromCategory(obsCategory, options = {}) {
-    if (
-      typeof obsCategory !== 'string' ||
-      obsCategory.length === 0 ||
-      obsCategory !== obsCategory.trim()
-    ) {
-      throw new TypeError('obsCategory must be a non-empty string');
-    }
-    if (
-      options === null ||
-      typeof options !== 'object' ||
-      Array.isArray(options)
-    ) {
-      throw new TypeError('Group-loading options must be an object');
-    }
-    const { onProgress, signal } = options;
-    if (onProgress !== undefined && typeof onProgress !== 'function') {
-      throw new TypeError('Group-loading onProgress must be a function');
-    }
-    if (
-      signal !== undefined &&
-      (
-        signal === null ||
-        typeof signal.aborted !== 'boolean' ||
-        typeof signal.addEventListener !== 'function'
-      )
-    ) {
-      throw new TypeError('Group-loading signal must implement AbortSignal');
-    }
-    if (signal?.aborted) {
-      throw signal.reason;
-    }
-
-    // If the field is not yet loaded, allow DataLayer/state to show a notification.
-    // This prevents "stuck at initialization" perception on first load for large datasets.
-    let silent = true;
-    const obsFields = this.dataLayer?.state?.obsData?.fields;
-    if (Array.isArray(obsFields)) {
-      const field = obsFields.find(f => f?.key === obsCategory);
-      if (field !== undefined) {
-        if (typeof field.loaded !== 'boolean') {
-          throw new TypeError(
-            `Observation field "${obsCategory}" loaded state must be boolean`
-          );
-        }
-        silent = field.loaded;
-      }
-    }
-
-    if (onProgress) {
-      onProgress({
-        phase: ANALYSIS_PHASES.INIT,
-        progress: 10,
-        message: silent ? 'Preparing groups...' : 'Loading observation field...'
+    const groups = [];
+    for (let code = 0; code < categories.length; code++) {
+      if (counts[code] === 0) continue;
+      const label = categories[code];
+      const declared = typeof label === 'string' && Object.hasOwn(colors, label) ? colors[label] : undefined;
+      groups.push({
+        groupId: `${GROUP_ID_PREFIX}${code}`,
+        optionId: categoryOptionId(label),
+        groupName: label,
+        code,
+        count: counts[code],
+        color: typeof declared === 'string' && declared.length > 0 ? declared : DEFAULT_GROUP_PALETTE[code % DEFAULT_GROUP_PALETTE.length]
       });
     }
+    groups.sort((a, b) => b.count - a.count || a.code - b.code);
+    return { codes, categories, groups };
+  }
 
-    // Load the observation field data
-    const fieldData = await this.dataLayer.ensureObsFieldLoaded(obsCategory, { silent });
-    if (signal?.aborted) {
-      throw signal.reason;
-    }
+  /**
+   * Who is tested against what, by the options: never an error. A small
+   * group is skipped (it stays in the rest), pooled, or tested and flagged;
+   * `blocker` says why nothing can run.
+   *
+   * @param {Object} options - The marker options record
+   * @param {{codes: ArrayLike<number>, groups: Object[]}} described - `describeGroups`
+   */
+  plan(options, described) {
+    const { groups: present } = described;
+    const minCells = options.minCells;
+    const selected = options.testGroups.mode === 'all'
+      ? null
+      : new Set(options.testGroups.ids);
+    const isSelected = group => selected === null || selected.has(group.optionId);
+    const restMode = options.compareAgainst === 'rest';
+    // No reference group chosen ('') is the largest group (`present` is
+    // sorted largest first).
+    const referenceGroup = restMode
+      ? null
+      : (options.referenceGroup === ''
+        ? present[0] ?? null
+        : present.find(group => group.optionId === options.referenceGroup) ?? null);
+    const restOnlySelected = restMode && selected !== null && options.restIncludes === 'selected';
+    const policy = options.smallGroups;
 
-    if (
-      fieldData === null ||
-      typeof fieldData !== 'object' ||
-      fieldData.kind !== 'category'
-    ) {
-      throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
-    }
-
-    const { codes, categories, colors = {} } = fieldData;
-
-    if (!isCategoricalCodes(codes) || codes.length === 0) {
-      throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
-    }
-
-    if (!Array.isArray(categories)) {
-      throw new TypeError(
-        `Observation field "${obsCategory}" categories must be an array`
-      );
-    }
-    const catCount = categories.length;
-    if (catCount <= 0) {
-      throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
-    }
-    const categorySet = new Set();
-    for (let code = 0; code < categories.length; code++) {
-      const category = categories[code];
-      if (
-        (
-          typeof category !== 'string' &&
-          typeof category !== 'number' &&
-          typeof category !== 'boolean'
-        ) ||
-        (typeof category === 'number' && !Number.isFinite(category))
-      ) {
-        throw new TypeError(
-          `Observation category ${code} must be an exact primitive label`
-        );
+    const columns = [];
+    const pooledMembers = [];
+    const skipped = [];
+    const lowN = [];
+    for (const group of present) {
+      // With the reference a group, only it and the tested groups are compared.
+      if (!restMode && group !== referenceGroup && !isSelected(group)) continue;
+      if (restOnlySelected && !isSelected(group)) continue;
+      const small = group.count < minCells;
+      const candidate = isSelected(group) && group !== referenceGroup;
+      let tested = candidate;
+      let smallFate = null;
+      if (candidate && small) {
+        if (policy === 'skip') {
+          tested = false;
+          smallFate = 'skipped';
+          skipped.push(group);
+        } else if (policy === 'pool') {
+          pooledMembers.push(group);
+          continue;
+        } else if (group.count < 2) {
+          tested = false;
+          smallFate = 'skipped';
+          skipped.push(group);
+        } else {
+          lowN.push(group);
+        }
       }
-      if (categorySet.has(category)) {
-        throw new Error(
-          `Observation category label at code ${code} is duplicated`
-        );
-      }
-      categorySet.add(category);
+      columns.push({ ...group, tested, small, smallFate, members: [group.code] });
     }
-    if (
-      colors === null ||
-      typeof colors !== 'object' ||
-      Array.isArray(colors)
-    ) {
-      throw new TypeError(
-        `Observation field "${obsCategory}" colors must be an object`
-      );
-    }
-
-    // Two-pass, typed-array group index construction:
-    // 1) count cells per category code
-    // 2) allocate fixed-size Uint32Array per group
-    // 3) fill indices without per-cell push overhead
-    const countsByCode = new Uint32Array(catCount);
-    // Codes are read at the field's own width, and so is its missing code.
-    const missingCode = missingCategoryCode(codes);
-
-    for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      if (code === missingCode) continue;
-      if (code >= catCount) {
-        throw new RangeError(
-          `Observation code ${code} at cell ${i} exceeds the category inventory`
-        );
-      }
-      countsByCode[code]++;
-    }
-
-    /** @type {{ code: number, name: string|number|boolean, count: number }[]} */
-    const present = [];
-    for (let code = 0; code < catCount; code++) {
-      const count = countsByCode[code];
-      if (count > 0) {
-        present.push({ code, name: categories[code], count });
-      }
-    }
-
-    if (present.length < 2) {
-      throw new Error(formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: present.length }));
-    }
-
-    // Sort groups by size (descending) for a stable and intuitive UI.
-    present.sort((a, b) => b.count - a.count || a.code - b.code);
-
-    // Map code -> group index (in `present` order)
-    const codeToGroupIdx = new Int32Array(catCount);
-    codeToGroupIdx.fill(-1);
-    for (let i = 0; i < present.length; i++) {
-      codeToGroupIdx[present[i].code] = i;
-    }
-
-    /** @type {Uint32Array[]} */
-    const indicesByGroup = present.map((p) => new Uint32Array(p.count));
-    const writePtr = new Uint32Array(present.length);
-
-    for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      if (code === missingCode) continue;
-      if (code >= catCount) {
-        throw new RangeError(
-          `Observation code ${code} at cell ${i} exceeds the category inventory`
-        );
-      }
-      const gi = codeToGroupIdx[code];
-      if (gi < 0) {
-        throw new Error(
-          `Observation code ${code} has no present marker group`
-        );
-      }
-      const w = writePtr[gi]++;
-      indicesByGroup[gi][w] = i;
-    }
-
-    // Build groups array
-    const groups = present.map((p, idx) => {
-      const declaredColor =
-        typeof p.name === 'string' && Object.hasOwn(colors, p.name)
-          ? colors[p.name]
-          : undefined;
-      if (
-        declaredColor !== undefined &&
-        (typeof declaredColor !== 'string' || declaredColor.length === 0)
-      ) {
-        throw new TypeError(
-          `Category "${p.name}" color must be a non-empty string`
-        );
-      }
-      return {
-        groupId: `category-code:${p.code}`,
-        groupName: p.name,
-        groupCode: p.code,
-        cellIndices: indicesByGroup[idx],
-        cellCount: p.count,
-        color: declaredColor === undefined
-          ? this._generateColor(idx)
-          : declaredColor
+    let pooled = null;
+    if (pooledMembers.length > 0) {
+      const count = pooledMembers.reduce((sum, group) => sum + group.count, 0);
+      const tested = count >= minCells;
+      pooled = {
+        groupId: POOLED_GROUP_ID,
+        optionId: POOLED_GROUP_ID,
+        groupName: `Other small groups (${pooledMembers.length})`,
+        code: -1,
+        count,
+        color: '#9e9e9e',
+        tested,
+        small: !tested,
+        smallFate: tested ? 'pooled' : 'skipped',
+        members: pooledMembers.map(group => group.code)
       };
-    });
-
-    return { groups, obsCodes: codes, categories };
-  }
-
-  /**
-   * Extract unique genes from marker results
-   * @private
-   */
-  _extractUniqueGenes(markers) {
-    const geneSet = new Set();
-
-    for (const groupData of Object.values(markers.groups)) {
-      for (const marker of groupData.markers) {
-        geneSet.add(marker.gene);
-      }
+      if (!tested) skipped.push(pooled);
+      columns.push(pooled);
     }
 
-    return Array.from(geneSet);
+    const testedCount = columns.filter(group => group.tested).length;
+    let blocker = null;
+    if (present.length < 2 && restMode) {
+      blocker = formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: present.length });
+    } else if (!restMode && referenceGroup === null) {
+      blocker = 'Choose the reference group';
+    } else if (!restMode && referenceGroup.count < Math.max(2, policy === 'test' ? 2 : minCells)) {
+      blocker = `The reference group has fewer than ${formatCount(policy === 'test' ? 2 : minCells)} cells`;
+    } else if (selected !== null && selected.size === 0) {
+      blocker = 'Choose groups to test';
+    } else if (testedCount === 0) {
+      blocker = `No group to test has ${formatCount(minCells)} cells or more`;
+    } else if (columns.length < 2) {
+      blocker = formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: columns.length });
+    }
+
+    return {
+      columns,
+      skipped,
+      pooled: pooled === null ? [] : pooledMembers,
+      lowN,
+      referenceIndex: referenceGroup === null ? -1 : columns.findIndex(group => group.groupId === referenceGroup.groupId),
+      minCellsPerSide: policy === 'test' ? 2 : Math.max(2, minCells),
+      testedCount,
+      blocker
+    };
+  }
+
+  // ===========================================================================
+  // Genes
+  // ===========================================================================
+
+  /**
+   * The genes a run tests, by the gene filters: those of its expression
+   * matrix, named on that matrix's axis (`options.matrix`).
+   * @param {Object} options
+   * @returns {Promise<string[]>}
+   */
+  async genesToTest(options) {
+    const all = await this.dataLayer.getGeneKeys(options.matrix);
+    if (all.length === 0) throw new Error(formatError(ERROR_MESSAGES.NO_GENES_AVAILABLE));
+    let only = null;
+    if (options.onlyGenes === 'hvg') {
+      const hvg = await this.dataLayer.state.varFieldLoader.highlyVariableGenes();
+      only = new Set(Array.isArray(hvg) ? hvg : []);
+    } else if (options.onlyGenes === 'list') {
+      only = new Set(resolveGenes(parseGeneText(options.onlyGenesList), all).resolved);
+    }
+    return filterGenes(all, { exclude: options.excludeGenes, pattern: options.excludePattern, only });
   }
 
   /**
-   * Run analysis with custom gene list
-   * @private
+   * The fold change a run reports: undoing log1p when asked, or when the
+   * file says its matrix is log1p'd (`uns['log1p']`) and "Automatic" is
+   * chosen; as stored otherwise.
+   * @param {'auto'|'log1p'|'stored'} choice
+   * @param {string} [matrix='mapped'] - The expression matrix read: its own
+   *   log1p record is the one that counts
+   * @returns {{mode: 'stored'|'log1p', base: number|null}}
    */
-  async _runCustomAnalysis(options) {
-    const {
-      groups,
-      genes,
-      transform,
+  foldChangeOf(choice, matrix = 'mapped') {
+    const loader = this.dataLayer.state?.varFieldLoader ?? null;
+    const read = matrix === 'mapped' ? null : this.dataLayer.resolveExpressionMatrix(matrix).matrix;
+    const log1p = loader === null ? null : loader.log1p(read === null ? {} : { matrix: read });
+    if (choice === 'log1p') return { mode: 'log1p', base: log1p?.base ?? null };
+    if (choice === 'auto' && log1p !== null) return { mode: 'log1p', base: log1p.base ?? null };
+    return { mode: 'stored', base: null };
+  }
+
+  // ===========================================================================
+  // Run
+  // ===========================================================================
+
+  /**
+   * Run marker discovery for an options record.
+   *
+   * @param {Object} params
+   * @param {Object} params.options - The marker options record
+   * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [params.job]
+   * @param {AbortSignal|null} [params.signal]
+   * @returns {Promise<{stats: Object, plan: Object, metadata: Object}>}
+   */
+  async runAnalysis({ options, job = null, signal = job?.signal ?? null }) {
+    this._assertOpen();
+    this._cache.setIdentity(this._getCacheIdentity());
+    const startTime = performance.now();
+    job?.step(ANALYSIS_PHASES.INIT);
+    const scope = this.scopeOf(options.cells);
+    const described = await this.describeGroups(options.groupBy, scope);
+    if (signal?.aborted) throw signal.reason;
+    const plan = this.plan(options, described);
+    if (plan.blocker !== null) throw new Error(plan.blocker);
+    const genes = await this.genesToTest(options);
+    if (genes.length === 0) throw new Error(formatError(ERROR_MESSAGES.NO_GENES_TO_TEST));
+    const foldChange = this.foldChangeOf(options.foldChange, options.matrix);
+    const matrix = this.dataLayer.resolveExpressionMatrix(options.matrix);
+    const allGenes = await this.dataLayer.getGeneKeys(options.matrix);
+
+    const { columns } = plan;
+    const codeToGroupIndex = new Int32Array(described.categories.length).fill(-1);
+    columns.forEach((group, index) => {
+      for (const code of group.members) codeToGroupIndex[code] = index;
+    });
+    const tested = Uint8Array.from(columns, group => (group.tested ? 1 : 0));
+    const method = options.method;
+    const pConvention = method === 'wilcox' ? options.pConvention : 'exact';
+
+    const cacheParams = {
+      field: options.groupBy,
+      grouping: computeCategoryGroupingDigest(described.codes),
+      scope: scopeDigest(scope),
+      columns: columns.map(group => [group.groupId, group.tested, group.members]),
+      reference: plan.referenceIndex,
+      minCellsPerSide: plan.minCellsPerSide,
+      method,
+      pConvention,
+      correction: options.correction,
+      foldChange,
+      matrix: matrix.read ?? 'mapped',
+      genes: genes.length === allGenes.length ? 'all' : genes
+    };
+    job?.setPlan(describeMarkerRun({ geneCount: genes.length, testedCount: plan.testedCount, groupCount: columns.length }));
+
+    let stats = this._cache.get(cacheParams);
+    const cached = stats !== null;
+    if (!cached) {
+      // Gene moments of the mapped matrix serve the module score later.
+      const moments = matrix.read === null ? geneMomentsFor(this.dataLayer.getDatasetGeneration()) : null;
+      stats = await this._engine.discoverMarkers({
+        grouping: {
+          codes: described.codes,
+          codeToGroupIndex,
+          groupCount: columns.length,
+          tested,
+          reference: plan.referenceIndex,
+          scope
+        },
+        genes,
+        method,
+        pConvention,
+        correction: options.correction,
+        foldChange,
+        minCellsPerSide: plan.minCellsPerSide,
+        job,
+        signal,
+        readOwner: job?.id ?? null,
+        matrix: options.matrix,
+        onGeneMoments: moments === null ? null : (gene, value) => moments.set(gene, value)
+      });
+      stats.groups = columns.map(group => ({
+        groupId: group.groupId,
+        groupName: group.groupName,
+        cellCount: group.count,
+        color: group.color,
+        tested: group.tested,
+        small: group.small,
+        smallFate: group.smallFate,
+        reference: plan.referenceIndex >= 0 && columns[plan.referenceIndex] === group
+      }));
+      this._cache.set(cacheParams, stats);
+    }
+    if (signal?.aborted) throw signal.reason;
+
+    return {
+      stats,
+      plan,
+      metadata: {
+        groupBy: options.groupBy,
+        matrix: options.matrix,
+        matrixLabel: matrix.label,
+        method,
+        pConvention,
+        correction: options.correction,
+        foldChange,
+        minCellsPerSide: plan.minCellsPerSide,
+        geneCount: genes.length,
+        groupCount: columns.length,
+        testedCount: plan.testedCount,
+        skippedGroups: plan.skipped.map(group => ({ name: String(group.groupName), cells: group.count })),
+        pooledGroups: plan.pooled.map(group => ({ name: String(group.groupName), cells: group.count })),
+        lowNGroups: plan.lowN.map(group => ({ name: String(group.groupName), cells: group.count })),
+        cached,
+        durationMs: Math.round(performance.now() - startTime),
+        tuning: cached ? null : stats.tuning
+      }
+    };
+  }
+
+  /**
+   * Cluster a heatmap matrix.
+   * @param {Object} matrix
+   * @param {{distance: string, linkage: string, clusterRows: boolean, clusterCols: boolean}} options
+   */
+  cluster(matrix, { distance, linkage, clusterRows, clusterCols }) {
+    this._assertOpen();
+    return this._clusteringEngine.clusterMatrix({
+      matrix,
       distance,
       linkage,
       clusterRows,
       clusterCols,
-      batchConfig,
-      onProgress,
-      signal,
-      readOwner = null
-    } = options;
-    const throwIfAborted = () => {
-      if (signal?.aborted) {
-        throw signal.reason ??
-          new DOMException('Request aborted', 'AbortError');
-      }
-      this._assertOpen();
-    };
-    throwIfAborted();
-
-    if (
-      !Array.isArray(genes) ||
-      genes.length === 0 ||
-      genes.some(
-        gene =>
-          typeof gene !== 'string' ||
-          gene.length === 0 ||
-          gene !== gene.trim()
-      ) ||
-      new Set(genes).size !== genes.length
-    ) {
-      throw new TypeError(
-        'Custom marker genes must be unique non-empty strings'
-      );
-    }
-    const availableVariables =
-      this.dataLayer.getAvailableVariables('gene_expression');
-    if (!Array.isArray(availableVariables) || availableVariables.length === 0) {
-      throw new Error(formatError(ERROR_MESSAGES.NO_GENES_AVAILABLE));
-    }
-    const availableGenes = new Set();
-    for (const [index, variable] of availableVariables.entries()) {
-      if (
-        variable === null ||
-        typeof variable !== 'object' ||
-        typeof variable.key !== 'string' ||
-        variable.key.length === 0
-      ) {
-        throw new TypeError(
-          `Available gene entry ${index} must own a non-empty key`
-        );
-      }
-      if (availableGenes.has(variable.key)) {
-        throw new Error(
-          `Available gene inventory contains duplicate key "${variable.key}"`
-        );
-      }
-      availableGenes.add(variable.key);
-    }
-    for (const gene of genes) {
-      if (!availableGenes.has(gene)) {
-        throw new Error(
-          formatError(ERROR_MESSAGES.GENE_NOT_FOUND, { symbol: gene })
-        );
-      }
-    }
-
-    // Build expression matrix
-    const matrix = await this._matrixBuilder.buildMatrix({
-      genes: [...genes],
-      groups,
-      transform,
-      batchConfig,
-      onProgress,
-      signal,
-      readOwner
+      memoryBudgetBytes: Math.max(1, Math.floor(residencyBudgetBytes('analysis')))
     });
-    throwIfAborted();
-
-    // Cluster if requested
-    let clustering = null;
-    let orderedMatrix = matrix;
-
-    if (clusterRows || clusterCols) {
-      clustering = await this._clusteringEngine.clusterMatrix({
-        matrix,
-        clusterRows,
-        clusterCols,
-        distance,
-        linkage,
-        memoryBudgetBytes: clusteringBudgetBytes(batchConfig),
-        onProgress,
-        signal
-      });
-      throwIfAborted();
-
-      orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
-    }
-    throwIfAborted();
-
-    return {
-      markers: null, // No marker discovery for custom genes
-      matrix: orderedMatrix,
-      clustering,
-      metadata: {
-        mode: 'custom',
-        transform,
-        distance,
-        linkage,
-        geneCount: genes.length,
-        groupCount: groups.length
-      }
-    };
   }
 
-  /**
-   * Generate a color for a group
-   * @private
-   */
-  _generateColor(index) {
-    const palette = [
-      '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-      '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
-    ];
-    return palette[index % palette.length];
+  /** Apply a clustering's order to its matrix. */
+  applyOrdering(matrix, clustering) {
+    return this._clusteringEngine.applyOrdering(matrix, clustering);
+  }
+
+  /** Forget cached runs. */
+  clearCache() {
+    this._cache.clear();
+  }
+
+  close() {
+    if (this._closed) return Promise.resolve();
+    this._closed = true;
+    this._cache.close();
+    this._pressureUnsubscribe?.();
+    this._pressureUnsubscribe = null;
+    return Promise.resolve();
+  }
+
+  // ===========================================================================
+  // Identity
+  // ===========================================================================
+
+  _getCacheIdentity() {
+    const manager = getDataSourceManager();
+    const datasetId = manager.getCurrentDatasetId();
+    if (typeof datasetId !== 'string' || datasetId.trim().length === 0) {
+      throw new TypeError('An exact active datasetId is required for marker analysis');
+    }
+    const revision = manager.getCurrentSelectionRevision();
+    const mapping = this.dataLayer.state?.getDataMapping?.();
+    if (mapping === null || typeof mapping !== 'object' || typeof mapping.geneNames !== 'string') {
+      throw new TypeError('Marker analysis requires the data mapping of the open dataset');
+    }
+    return {
+      key: JSON.stringify(['load', datasetId, revision, mapping.expression ?? null, mapping.geneNames])
+    };
   }
 }

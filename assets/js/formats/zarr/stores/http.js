@@ -13,8 +13,15 @@
  * slot, as in the byte reader. An object the host answers 404 (or 410) for is absent, so
  * it reads as the fill value. Some buckets answer 403 for a missing object
  * when they do not allow listing; pass `absentStatuses: [403, 404, 410]` for
- * those. A request the host says is busy (429, 503) or that drops is retried
- * with growing waits.
+ * those. Every request goes past the browser's HTTP cache (`cache:
+ * 'no-store'`): WebKit never finished reading the bodies of chunks it served
+ * from its cache to the reader worker (measured: a page reloaded with a warm
+ * cache waited for them forever, every time), and nothing then mixes chunks
+ * cached from an earlier version of a store with its current metadata. A
+ * request the host says is busy or failing (408, 429, 5xx), whose connection
+ * fails (a 503 sent without CORS headers arrives as exactly that) or that
+ * stalls (`formats/io/link.js`, `ResponseClock`) is made again with growing
+ * waits (`byte-source.js`, `withRetries`); a request is never left hanging.
  *
  * A sharded array reads byte ranges of its shards: the index with one
  * request (`Range: bytes=-N`, the last N bytes), then the inner chunks it
@@ -36,40 +43,28 @@
  * @module formats/zarr/stores/http
  */
 
-import { ByteSourceError, BYTE_SOURCE_FAILURES, REMOTE_POLICY } from '../../io/byte-source.js';
+import {
+  ByteSourceError,
+  BYTE_SOURCE_FAILURES,
+  REMOTE_POLICY,
+  fetchOnce,
+  isTransientFailure,
+  isTransientStatus,
+  transientStatusError,
+  withRetries,
+} from '../../io/byte-source.js';
+import { ResponseClock } from '../../io/link.js';
 import { createLimiter, mergeRanges, nextTask, normalizeKey } from './common.js';
-import { onAbort } from '../../io/abort.js';
-
-/** Waits before repeating a request the host was too busy for (milliseconds). */
-const RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 2000, 4000, 8000]);
-
-function abortError(signal) {
-  return signal?.reason ?? new DOMException('The read was aborted.', 'AbortError');
-}
-
-function sleep(milliseconds, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError(signal));
-      return;
-    }
-    const timer = setTimeout(() => {
-      stopWaiting();
-      resolve();
-    }, milliseconds);
-    const stopWaiting = onAbort(signal, () => {
-      clearTimeout(timer);
-      reject(abortError(signal));
-    });
-  });
-}
 
 /**
  * @param {string} baseUrl - URL of the store folder (a query string, as on a signed URL, is kept on every request)
  * @param {{fetch?: typeof fetch, concurrency?: number|import('../../io/link.js').LinkMeter, mergeGapBytes?: number,
- *          maxRequestBytes?: number, cacheBytes?: number, absentStatuses?: number[], name?: string}} [options]
+ *          maxRequestBytes?: number, cacheBytes?: number, absentStatuses?: number[], name?: string,
+ *          onTransfer?: (progress: {url: string, bytes: number, requests: number, ms: number}) => void}} [options]
  *   `mergeGapBytes` and `maxRequestBytes` hold until a link given as
- *   `concurrency` is measured; `cacheBytes` bounds the whole objects kept.
+ *   `concurrency` is measured, which every request also measures;
+ *   `cacheBytes` bounds the whole objects kept; `onTransfer` hears the
+ *   running totals after every answered request (the Transfers log).
  */
 export function httpStore(baseUrl, {
   fetch: fetchImpl = globalThis.fetch,
@@ -79,6 +74,7 @@ export function httpStore(baseUrl, {
   cacheBytes = REMOTE_POLICY.cacheBytes,
   absentStatuses = [404, 410],
   name,
+  onTransfer = null,
 } = {}) {
   let base;
   try {
@@ -93,6 +89,7 @@ export function httpStore(baseUrl, {
   const absent = new Set(absentStatuses);
   const limit = createLimiter(concurrency);
   const link = typeof concurrency === 'number' ? null : concurrency;
+  const clock = link?.responses ?? new ResponseClock();
   const mergeGap = () => (link?.measured ? link.mergeGapBytes : mergeGapBytes);
   const requestBytes = () => (link?.measured ? link.maxRequestBytes : maxRequestBytes);
   /** Objects a host sent whole for a range, by key, least recently used first. */
@@ -120,7 +117,10 @@ export function httpStore(baseUrl, {
     whole.set(key, bytes);
     return bytes;
   }
+  /** What was read (answers with a body: `stats()`). */
   const stats = { requests: 0, bytes: 0 };
+  /** Every request answered (the Transfers log). */
+  const transferred = { requests: 0, bytes: 0 };
   const sizes = new Map();
   let suffixRanges = true;
 
@@ -131,65 +131,69 @@ export function httpStore(baseUrl, {
   }
 
   /**
-   * One request, retried while the host is busy or the connection drops. A
-   * request holds its concurrency slot until its body has arrived.
+   * One request, made again after a transient failure (`withRetries`). A
+   * request holds its concurrency slot until its body has arrived, and never
+   * while it waits to be made again.
    */
   async function request(key, { method = 'GET', range = null, signal = null, activity = null, retryNetwork = true } = {}) {
     const url = urlOf(key);
-    for (let attempt = 0; ; attempt++) {
-      let answer;
-      try {
-        answer = await limit(async () => {
-          const response = await fetchImpl(url, {
-            method,
-            headers: range === null ? undefined : { Range: range },
+    const init = { method, cache: 'no-store' };
+    if (range !== null) init.headers = { Range: range };
+    // A range's length is known (a whole object's is not until it arrives).
+    const bounds = /^bytes=(\d+)-(\d+)$/.exec(range ?? '');
+    const expectedBytes = bounds === null ? 0 : Number(bounds[2]) - Number(bounds[1]) + 1;
+    return withRetries(async () => {
+      // Bytes of the body are counted to the read's activity as they arrive
+      // (taken back if this attempt fails), so a long request's progress
+      // stays live.
+      let arrived = 0;
+      const { response, bytes } = await limit(async () => {
+        const started = link?.begin() ?? performance.now();
+        let answer;
+        try {
+          answer = await fetchOnce(url, init, {
+            fetchImpl,
             signal,
+            clock,
+            wantsBody: reply => method !== 'HEAD' && (reply.status === 200 || reply.status === 206),
+            expectedBytes,
+            onBytes: activity?.fetched === undefined ? null : length => {
+              arrived += length;
+              activity.fetched(length, 0);
+            },
           });
-          const status = response.status;
-          if (method === 'HEAD' || (status !== 200 && status !== 206)) {
-            await response.body?.cancel().catch(() => {});
-            return { response, bytes: null };
-          }
-          try {
-            return { response, bytes: new Uint8Array(await response.arrayBuffer()) };
-          } catch (cause) {
-            if (signal?.aborted) throw abortError(signal);
-            throw new ByteSourceError(BYTE_SOURCE_FAILURES.NETWORK, `${storeName}: the connection dropped while reading '${key}'.`, { cause });
-          }
-        }, signal, activity);
-      } catch (cause) {
-        if (signal?.aborted) throw abortError(signal);
-        if (!retryNetwork || attempt >= RETRY_DELAYS_MS.length) {
-          if (cause instanceof ByteSourceError) throw cause;
-          throw new ByteSourceError(
-            BYTE_SOURCE_FAILURES.NETWORK,
-            `${storeName}: the host did not answer for '${key}', or does not allow other sites to read it (CORS).`,
-            { cause }
-          );
+        } catch (error) {
+          link?.end(started, null);
+          if (arrived > 0) activity.fetched(-arrived, 0);
+          throw error;
         }
-        await sleep(RETRY_DELAYS_MS[attempt], signal);
-        continue;
-      }
-      const { response, bytes } = answer;
+        link?.end(started, method === 'HEAD' ? null : answer.bytes?.length ?? 0);
+        if (method !== 'HEAD') {
+          transferred.requests++;
+          transferred.bytes += answer.bytes?.length ?? 0;
+          onTransfer?.({ url: base.href, bytes: transferred.bytes, requests: transferred.requests, ms: performance.now() - started });
+        }
+        return answer;
+      }, signal, activity);
       const status = response.status;
-      if ((status === 429 || status === 503) && attempt < RETRY_DELAYS_MS.length) {
-        const retryAfter = Number(response.headers.get('Retry-After'));
-        await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : RETRY_DELAYS_MS[attempt], signal);
-        continue;
+      if (isTransientStatus(status) || absent.has(status) || (status !== 200 && status !== 206)) {
+        // Whatever arrived is not what was read.
+        if (arrived > 0) activity.fetched(-arrived, 0);
       }
+      if (isTransientStatus(status)) throw transientStatusError(response, url);
       if (absent.has(status)) return null;
       if (status !== 200 && status !== 206) {
-        throw new ByteSourceError(
-          status === 429 || status === 503 ? BYTE_SOURCE_FAILURES.RATE_LIMITED : BYTE_SOURCE_FAILURES.HTTP,
-          `${storeName}: the host answered HTTP ${status} for '${key}'.`,
-          { status }
-        );
+        throw new ByteSourceError(BYTE_SOURCE_FAILURES.HTTP, `${url}: the host answered HTTP ${status}.`, { status, url });
       }
       stats.requests++;
       stats.bytes += bytes?.length ?? 0;
-      activity?.fetched?.(bytes?.length ?? 0, 1);
+      activity?.fetched?.((bytes?.length ?? 0) - arrived, 1);
       return { response, bytes };
-    }
+    }, {
+      signal,
+      retryable: error => isTransientFailure(error) && (retryNetwork || error.code !== BYTE_SOURCE_FAILURES.NETWORK),
+      onRetry: (error, attempts) => clock.onRetry?.(error, attempts),
+    });
   }
 
   async function get(key, { signal = null, activity = null } = {}) {
@@ -206,7 +210,7 @@ export function httpStore(baseUrl, {
     if (result === null) return null;
     const size = Number(result.response.headers.get('Content-Length'));
     if (!Number.isSafeInteger(size) || size < 0) {
-      throw new ByteSourceError(BYTE_SOURCE_FAILURES.HTTP, `${storeName}: the host does not say how large '${key}' is.`);
+      throw new ByteSourceError(BYTE_SOURCE_FAILURES.HTTP, `${urlOf(key)}: the host does not say how large it is.`);
     }
     sizes.set(key, size);
     return size;
@@ -241,7 +245,7 @@ export function httpStore(baseUrl, {
       return result.bytes.subarray(start, end);
     }
     if (result.bytes.length !== end - start) {
-      throw new ByteSourceError(BYTE_SOURCE_FAILURES.SHORT_READ, `${storeName}: asked for ${end - start} bytes of '${key}', received ${result.bytes.length}.`);
+      throw new ByteSourceError(BYTE_SOURCE_FAILURES.SHORT_READ, `${urlOf(key)}: asked for ${end - start} bytes, received ${result.bytes.length}.`);
     }
     return result.bytes;
   }

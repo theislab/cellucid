@@ -389,10 +389,24 @@
   display: none;
 }
 
+/* One short line and its action side by side; either may be absent. */
+.outlier-filter-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.outlier-filter-status:not(:has(> :not([hidden]))) {
+  display: none;
+}
+
 .outlier-filter-note {
+  flex: 1;
+  min-width: 0;
   margin: 0;
   font-size: var(--type-hint);
-  line-height: 1.4;
+  line-height: var(--leading-normal);
   color: var(--color-text-secondary);
 }
 
@@ -403,5 +417,5 @@
 /* The bar under the slider while the outlier distances are got is the job
    progress bar every cancellable job shows (components/_jobs.css). */
 .outlier-filter-action {
-  align-self: flex-start;
+  flex: none;
 }

@@ -358,7 +358,19 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
     runningBytes += end - start;
     if (background) runningBackground++;
     const started = link.begin();
-    source.read(start, end - start, { signal: carrier.controller.signal })
+    // Bytes arriving are counted to the first read's activity as they come,
+    // up to that read's length, so a long request's progress stays live;
+    // its completion counts the rest.
+    const lead = members[0];
+    let arrived = 0;
+    const onBytes = bytes => {
+      if (lead.activity === null) return;
+      const counted = Math.max(-arrived, Math.min(bytes, lead.end - lead.start - arrived));
+      if (counted === 0) return;
+      arrived += counted;
+      lead.activity.fetched(counted, 0);
+    };
+    source.read(start, end - start, { signal: carrier.controller.signal, link, onBytes })
       .then(
         bytes => {
           stats.bytes += bytes.length;
@@ -369,14 +381,19 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
           for (const member of members) wanted += member.end - member.start;
           if (wanted < bytes.length) keepSurplus(start, bytes);
           members.forEach((member, index) => {
-            if (member.cancelled) return;
+            const counted = index === 0 ? arrived : 0;
+            if (member.cancelled) {
+              if (counted > 0) member.activity?.fetched(-counted, 0);
+              return;
+            }
             member.fetched = true;
-            member.activity?.fetched(member.end - member.start, index === 0 ? 1 : 0);
+            member.activity?.fetched(member.end - member.start - counted, index === 0 ? 1 : 0);
             member.resolve(bytes.subarray(member.start - start, member.end - start));
           });
         },
         error => {
           link.end(started, null);
+          if (arrived > 0) lead.activity?.fetched(-arrived, 0);
           for (const member of members) member.reject(error);
         }
       )

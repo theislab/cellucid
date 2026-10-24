@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-viewer-background="studio">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <!--
+    The page Microsoft's sign-in returns to (callback-page.js says what it
+    does). It shows for a moment before it closes, so it is the brand card on
+    the viewer's backdrop like every other page of the site (page.css), in the
+    theme the visitor chose in the app (theme-init.js).
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Cellucid sign-in</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
+  <script src="/assets/js/app/ui/core/theme-init.js"></script>
+  <link rel="stylesheet" href="/assets/css/page.css" />
+</head>
+<body class="page">
+  <main class="page-screen" aria-labelledby="sign-in-title">
+    <div class="welcome-content">
+      <div class="welcome-header">
+        <img src="/assets/img/cellucid-logo.svg" alt="Cellucid" class="welcome-logo" width="260" height="80" />
+      </div>
+      <div class="welcome-body">
+        <h1 id="sign-in-title" class="welcome-title">Sign-in</h1>
+        <p id="status" class="welcome-intro" role="status" aria-live="polite">Finishing sign-in…</p>
+        <ul class="welcome-links" aria-label="More about Cellucid">
+          <li><a href="/">Open Cellucid</a></li>
+          <li><a href="/privacy.html">Privacy policy</a></li>
+        </ul>
+      </div>
+    </div>
+  </main>
+  <script type="module" src="/assets/js/data/sources/auth/callback-page.js"></script>
+</body>
+</html>

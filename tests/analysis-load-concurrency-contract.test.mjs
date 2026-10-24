@@ -13,7 +13,8 @@
  *    2.07 s with never more than one request in flight.
  *  - gene loading for a signature ran fixed batches of ten with a macrotask
  *    barrier between them, so a 60-gene signature cost six sequential waves
- *    however fast the link was; `readGeneColumns` keeps a sliding window.
+ *    however fast the link was. `readGeneColumns` asks for every gene at
+ *    once; the reader's fetch scheduler paces the requests.
  *
  * These tests pin the shape rather than the clock: they count how many loads
  * are open at once, which is load-invariant and reproduces identically on a
@@ -23,7 +24,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
-import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 
 /** A load gate that records peak concurrency and completion order. */
 function concurrencyRecorder() {
@@ -119,50 +119,11 @@ test('observation fields are requested together, not one after another', async (
   assert.equal(result.stats.fieldsLoaded, fieldKeys.length);
 });
 
-test('observation field loading never exceeds the configured concurrency', async () => {
+test('every gene column is asked for at once and published in requested order', async () => {
   const gate = concurrencyRecorder();
   const layer = pageOnlyLayer();
-  const window = PerformanceConfig.batch.networkConcurrency;
-  const fieldKeys = Array.from(
-    { length: window * 2 + 3 },
-    (_unused, index) => `field-${index}`,
-  );
-  layer.getAvailableVariables = type => (
-    type === 'continuous_obs' ? fieldKeys.map(key => ({ key })) : []
-  );
-  layer.ensureObsFieldLoaded = async fieldKey => {
-    await gate.enter(fieldKey);
-    return { fieldIndex: 0, kind: 'continuous', values: Float32Array.of(1) };
-  };
-
-  const run = layer.fetchBulkObsFields({
-    pageIds: ['page-1'],
-    obsFields: fieldKeys,
-    subsetPages: false,
-  });
-
-  await settle();
-  assert.equal(
-    gate.record.peak,
-    window,
-    'the loader must fill its window and then stop',
-  );
-
-  // Draining the window must let the rest through without a barrier.
-  while (gate.waiting > 0) {
-    gate.releaseAll();
-    await settle();
-  }
-  const result = await run;
-  assert.deepEqual(Object.keys(result.fields), fieldKeys);
-});
-
-test('gene columns keep a full window in flight instead of fixed batches', async () => {
-  const gate = concurrencyRecorder();
-  const layer = pageOnlyLayer();
-  const window = PerformanceConfig.batch.networkConcurrency;
   const geneKeys = Array.from(
-    { length: window + 3 },
+    { length: 23 },
     (_unused, index) => `Gene ${String(index).padStart(3, '0')}`,
   );
   layer.readGeneColumn = async geneKey => {
@@ -175,22 +136,11 @@ test('gene columns keep a full window in flight instead of fixed batches', async
   await settle();
   assert.equal(
     gate.record.peak,
-    window,
-    'the gene loader must fill its concurrency window',
+    geneKeys.length,
+    'no gene waits on another gene; the reader paces the requests',
   );
 
-  // A batch loader cannot start gene 11 until the whole batch of ten has
-  // finished, whereas a sliding window admits one more as soon as one
-  // finishes. Releasing exactly one load must admit exactly one further gene.
-  gate.release(1);
-  await settle();
-  assert.equal(
-    gate.record.started.length,
-    window + 1,
-    'one completed load must admit exactly one more, with no batch barrier',
-  );
-
-  for (let attempt = 0; attempt < 20 && gate.waiting > 0; attempt++) {
+  while (gate.waiting > 0) {
     gate.releaseAll();
     await settle(2);
   }

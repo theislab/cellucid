@@ -30,6 +30,7 @@ import { ZarrDataSource } from '../assets/js/data/zarr.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { asWorkerLoader } from './helpers/worker-loader.mjs';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import {
   connectivityEdgesOf,
   extractConnectivityEdges,
@@ -585,7 +586,8 @@ test('rejects directory selections that omit required Zarr v2 metadata', async (
   const source = new ZarrDataSource();
   try {
     await assert.rejects(
-      source.loadFromFileList(fileList, { showProgress: false }),
+      source.loadFromFileList(fileList
+    ),
       error => {
         assert.match(error.message, /zarr\.json, \.zgroup, \.zarray or \.zmetadata/);
         // A browser folder picker may leave out the metadata files; the
@@ -902,16 +904,63 @@ test('Zarr dataset metadata counts categorical fields without label payloads', a
   assert.deepEqual(readsOf(reads, 'obs/label/codes'), []);
 });
 
+test('opening reads no category dictionary: a 21,751-category column is read with its first load', async () => {
+  // A barcode stored as a categorical, one category per cell, as GEO files
+  // often hold: its dictionary is megabytes the first view never needs.
+  const nObs = 21_751;
+  const barcodes = Array.from({ length: nObs }, (_, index) => `BARCODE-${index}`);
+  const { reader, reads } = await openAnnData(storeWith({
+    nObs,
+    genes: ['A'],
+    obs: {
+      BARCODE: categorical(Int32Array.from({ length: nObs }, (_, index) => index), barcodes, { codesDtype: '<i4' }),
+      group: categorical(Int8Array.from({ length: nObs }, (_, index) => index % 2), ['a', 'b']),
+    },
+  }), { name: 'barcodes.zarr' });
+  const adapter = new BaseAnnDataAdapter(asWorkerLoader(reader));
+  // Everything the first view waits for: the file's structure, its field
+  // lists, the embedding it draws, and the dataset's identity.
+  await adapter.initialize();
+  const identity = await adapter.finalizeDirectIdentity({
+    id: 'barcodes',
+    name: 'barcodes',
+    preferFileName: false,
+    description: '',
+    source: { name: 'Zarr store' },
+  });
+  assert.deepEqual(readsOf(reads, 'obs/BARCODE/categories'), []);
+  assert.deepEqual(readsOf(reads, 'obs/group/categories'), []);
+  assert.ok(readsOf(reads, 'obsm/X_umap_2d').length > 0, 'the first view\'s embedding was read');
+  // How many categories each has is metadata, known without reading them.
+  assert.deepEqual(
+    identity.obs_fields.filter(field => field.kind === 'category'),
+    [
+      { key: 'BARCODE', kind: 'category', n_categories: nObs },
+      { key: 'group', kind: 'category', n_categories: 2 },
+    ]
+  );
+
+  const field = await adapter.getObsFieldData('BARCODE');
+  assert.ok(readsOf(reads, 'obs/BARCODE/categories').length > 0);
+  assert.equal(field.categories.length, nObs);
+  assert.equal(field.categories[21_750], 'BARCODE-21750');
+  assert.equal(field.dtype, 'uint16');
+  assert.deepEqual(readsOf(reads, 'obs/group/categories'), [], 'only the field loaded');
+});
+
 test('Zarr adapter reuses retained categories after loader cache clearing', async () => {
   const { reader, reads } = await openAnnData(storeWith({
     obs: { label: categorical([0, 0], ['A'], { ordered: true }) },
   }), { name: 'retained-categories.zarr' });
   const adapter = new BaseAnnDataAdapter(asWorkerLoader(reader));
   await adapter.initialize();
+  // Opening reads no category dictionary; the field's first load does.
+  assert.equal(readsOf(reads, 'obs/label/categories').length, 0);
+  assert.equal(adapter._obsFieldsMetadata[0].ordered, true);
+  await adapter.getObsFieldData('label');
   const canonicalCategories =
     adapter._obsFieldsMetadata[0].categories;
   assert.equal(readsOf(reads, 'obs/label/categories').length, 1);
-  assert.equal(adapter._obsFieldsMetadata[0].ordered, true);
 
   adapter.clearCaches();
   reader.clearCache();
@@ -2091,8 +2140,7 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
           geneValues: [1, 0, 2, 0]
         }),
         'working.zarr'
-      ),
-      { showProgress: false }
+      )
     );
     const workingAdapter = source.getAdapter();
 
@@ -2119,9 +2167,8 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
 
     await assert.rejects(
       source.loadFromFileList(
-        fileListFromMap(missingVar, 'missing-var.zarr'),
-        { showProgress: false }
-      ),
+        fileListFromMap(missingVar, 'missing-var.zarr')
+    ),
       /var.*(required|must be exactly 'dataframe')/i
     );
     assert.equal(source.dirname, 'working.zarr');
@@ -2313,9 +2360,8 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
             fileListFromMap(
               renamedEmbeddingStore(substituteKey),
               `${substituteKey.slice(2)}-only.zarr`
-            ),
-            { showProgress: false }
-          );
+            )
+    );
           const candidates = source.getAdapter().getMappingCandidates();
           assert.deepEqual(candidates.guessed, ['embeddings.2d']);
           assert.deepEqual(candidates.defaults.embeddings.defaults['2d'], {
@@ -2348,9 +2394,8 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
               geneValues: [1, 0, 2, 0]
             }),
             'working.zarr'
-          ),
-          { showProgress: false }
-        );
+          )
+    );
         const workingAdapter = source.getAdapter();
         const constant = completeZarrStoreFiles({
           embeddingValues: [3, 3, 3, 3],
@@ -2361,9 +2406,8 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
           constant.delete(`obsm/X_umap_2d/${file}`);
         }
         const error = await source.loadFromFileList(
-          fileListFromMap(constant, 'constant.zarr'),
-          { showProgress: false }
-        ).then(() => null, rejection => rejection);
+          fileListFromMap(constant, 'constant.zarr')
+    ).then(() => null, rejection => rejection);
         assert.equal(error?.code, 'NO_PLOTTABLE_EMBEDDING');
         assert.equal(
           error.message,
@@ -2925,7 +2969,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     hold.release();
 
     await staleAssertion;
-    assert.deepEqual(await reader.getObsFieldInfo('label'), { dtype: 'categorical', categories: ['A'], ordered: false });
+    assert.deepEqual(await reader.getObsFieldInfo('label'), { dtype: 'categorical', categories: ['A'], ordered: false, colors: null });
   });
 
   await t.test('observation value cache', async () => {
@@ -2974,7 +3018,8 @@ test('reads official categorical v0.2 layouts with nullable-string categories', 
   const categoricalField = adapter.getObsFields().fields.filter(field => field.kind === 'category')[0];
   assert.equal(categoricalField.fieldIndex, 0);
   assert.equal(categoricalField.key, 'label');
-  assert.deepEqual(categoricalField.categories, ['A', 'C']);
+  // Its categories are read with the field, not when the store opens.
+  assert.equal(categoricalField.categories, null);
   const field = await adapter.getObsFieldData('label');
   assert.equal(field.kind, 'category');
   assert.deepEqual(field.categories, ['A', 'C']);
@@ -3178,68 +3223,12 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
   }
 });
 
-test('Zarr direct-load warning is published only after successful adoption', async t => {
-  captureDownloadNotifications(t);
-  const notifications = getNotificationCenter();
-  const originalWarning = notifications.info;
-  const warnings = [];
-  notifications.info = (...args) => {
-    warnings.push(args);
-    return `warning-${warnings.length}`;
-  };
-  t.after(() => {
-    notifications.info = originalWarning;
-  });
-
-  const source = new ZarrDataSource();
-  t.after(() => source.clear());
-  await assert.rejects(
-    source.loadFromFileList(
-      fileListFromMap(
-        new Map([
-          ['.zgroup', json({ zarr_format: 2 })],
-        ]),
-        'broken.zarr'
-      ),
-      { showProgress: false }
-    ),
-    /root.*(zattrs|required|encoding-type must be exactly 'anndata')/i
-  );
-  assert.equal(warnings.length, 0);
-
-  await source.loadFromFileList(
-    fileListFromMap(
-      completeZarrStoreFiles({
-        embeddingValues: [0, 0, 1, 1],
-        geneValues: [1, 0, 2, 0],
-      }),
-      'working.zarr'
-    ),
-    { showProgress: false }
-  );
-  assert.equal(warnings.length, 0);
-
-  await source.loadFromFileList(
-    fileListFromMap(
-      completeZarrStoreFiles({
-        embeddingValues: [2, 2, 3, 3],
-        geneValues: [3, 0, 4, 0],
-      }),
-      'visible-warning.zarr'
-    ),
-    { showProgress: true }
-  );
-  assert.equal(warnings.length, 1);
-});
-
-test('ZarrDataSource owns one terminal event across overlapping candidates', async t => {
-  const notifications = getNotificationCenter();
-  const originalWarning = notifications.info;
-  notifications.info = () => {};
-  t.after(() => {
-    notifications.info = originalWarning;
-  });
-  const events = captureDownloadNotifications(t);
+test('a superseded Zarr candidate leaves the opening to the newer one, which ends it opened', async t => {
+  const progress = getOpeningProgress();
+  const states = [];
+  t.after(progress.subscribe(snapshot => {
+    if (snapshot !== null) states.push(`${snapshot.id}:${snapshot.state}`);
+  }));
   const firstStore = completeZarrStoreFiles({
     embeddingValues: [1, 2, 3, 4],
     geneValues: [1, 0, 2, 0]
@@ -3270,17 +3259,12 @@ test('ZarrDataSource owns one terminal event across overlapping candidates', asy
   await olderAssertion;
 
   assert.equal(newer.id, 'zarr_newer');
-  assert.deepEqual(
-    events
-      .filter(event => event.kind !== 'update')
-      .map(event => event.kind),
-    ['start', 'start', 'complete', 'dismiss']
-  );
-  const completedId = events.find(event => event.kind === 'complete').id;
-  const newerStart = events.find(
-    event => event.kind === 'start' && /newer\.zarr/.test(event.name)
-  );
-  assert.equal(completedId, newerStart.id);
+  // One opening on screen for both: the newer joined it, and the older's
+  // supersession neither failed nor ended it.
+  const ids = new Set(states.map(state => state.split(':')[0]));
+  assert.equal(ids.size, 1);
+  assert.equal(states.filter(state => !state.endsWith(':running')).length, 1);
+  assert.match(states.at(-1), /:done$/);
 });
 
 test('ZarrDataSource preserves a working source when required embedding bytes are corrupt', async () => {

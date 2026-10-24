@@ -6,7 +6,8 @@ import {
   hideWelcomeModal,
   isWelcomeModalVisible
 } from './ui/onboarding/welcome-modal.js';
-import { isExplainedFailure } from '../data/data-source.js';
+import { DataSourceError, isExplainedFailure } from '../data/data-source.js';
+import { STARTUP_STALL_CODE } from './startup-phase.js';
 
 /**
  * Convert JavaScript's unrestricted thrown-value channel into the sole
@@ -32,8 +33,113 @@ export function normalizeStartupError(thrown) {
   return error;
 }
 
+const DOCS = 'https://docs.cellucid.com/en/latest/user_guide/web_app/';
+
+/** The guide for a link, server or file that would not open. */
 export const STARTUP_TROUBLESHOOTING_URL =
-  'https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/08_troubleshooting_data_loading.html';
+  `${DOCS}b_data_loading/08_troubleshooting_data_loading.html`;
+
+/** What a browser needs to run Cellucid (WebGL2). */
+export const STARTUP_REQUIREMENTS_URL =
+  `${DOCS}a_orientation/02_system_requirements.html`;
+
+/** Where every troubleshooting path starts. */
+export const STARTUP_TROUBLESHOOTING_INDEX_URL =
+  `${DOCS}q_troubleshooting_index/index.html`;
+
+/** Where a failure nobody explained can be reported. */
+export const STARTUP_ISSUES_URL = 'https://github.com/theislab/cellucid/issues';
+
+/**
+ * What the person is told about a failed start, chosen by what failed and
+ * never by its technical message: the message (a host, a status, an address)
+ * goes under Details, to the console and to the notification log.
+ *
+ * Data the address names (`?data=`, `?remote=`, `?dataset=`, a catalog's
+ * default) that does not open never reaches this screen: Cellucid starts
+ * without it and its failed opening says why (main.js, failStartupData).
+ * What remains:
+ *
+ * - `browser`: no WebGL2, so Cellucid cannot run in this browser at all;
+ * - `data`: the server the page itself is served from could not be read;
+ * - `stall`: a server startup waited on never answered (the page's own
+ *   server, the sample catalog, a published default view);
+ * - `app`: anything else.
+ *
+ * @param {Error} error
+ * @param {{ webgl2Available: boolean, hasLaunchSettings: boolean }} context
+ * @returns {{
+ *   kind: 'browser'|'data'|'stall'|'app',
+ *   title: string,
+ *   sentence: string,
+ *   offerWithoutSettings: boolean,
+ *   links: Array<[string, string]>
+ * }}
+ */
+export function describeStartupFailure(error, { webgl2Available, hasLaunchSettings }) {
+  if (!webgl2Available) {
+    return {
+      kind: 'browser',
+      title: 'This browser cannot run Cellucid',
+      sentence:
+        'Cellucid draws with WebGL2, which this browser has turned off or does not have. ' +
+        'Update the browser or turn on hardware acceleration, then try again.',
+      offerWithoutSettings: false,
+      links: [[STARTUP_REQUIREMENTS_URL, 'System requirements']]
+    };
+  }
+  if (error instanceof DataSourceError || isExplainedFailure(error)) {
+    return {
+      kind: 'data',
+      title: 'The data could not be opened',
+      sentence: hasLaunchSettings
+        ? 'Cellucid could not read the data this link points to. Try again, or open Cellucid without it.'
+        : 'Cellucid could not read the data it was opening. Try again in a moment.',
+      offerWithoutSettings: hasLaunchSettings,
+      links: [[STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']]
+    };
+  }
+  if (error.code === STARTUP_STALL_CODE) {
+    return {
+      kind: 'stall',
+      title: 'A server did not answer',
+      sentence:
+        'Cellucid stopped waiting for a server that did not respond. ' +
+        'Check your connection, then try again.',
+      offerWithoutSettings: hasLaunchSettings,
+      links: [[STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']]
+    };
+  }
+  return {
+    kind: 'app',
+    title: 'Cellucid could not start',
+    sentence: hasLaunchSettings
+      ? 'Something went wrong while starting. Try again, or open Cellucid without this link\u2019s settings.'
+      : 'Something went wrong while starting. Try again in a moment.',
+    offerWithoutSettings: hasLaunchSettings,
+    links: [
+      [STARTUP_TROUBLESHOOTING_INDEX_URL, 'Troubleshooting'],
+      [STARTUP_ISSUES_URL, 'Report a problem']
+    ]
+  };
+}
+
+/**
+ * Whether this browser can create a WebGL2 context. The probe's context is
+ * released at once, so it never counts against the browser's context limit.
+ *
+ * @param {Document} documentOwner
+ * @returns {boolean}
+ */
+function probeWebGL2(documentOwner) {
+  const canvas = documentOwner.createElement('canvas');
+  // A document without a drawing surface (a test double) cannot say no.
+  if (typeof canvas.getContext !== 'function') return true;
+  const context = canvas.getContext('webgl2');
+  if (context === null) return false;
+  context.getExtension('WEBGL_lose_context')?.loseContext();
+  return true;
+}
 
 function requireStartupFailureOptions(options) {
   if (
@@ -93,14 +199,33 @@ function requireStartupFailureOptions(options) {
   return options;
 }
 
-function applyStyles(element, styles) {
-  for (const [property, value] of Object.entries(styles)) {
-    element.style[property] = value;
-  }
+function element(documentOwner, tagName, className, text) {
+  const node = documentOwner.createElement(tagName);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function actionRow(documentOwner, href, title, primary) {
+  const row = element(
+    documentOwner,
+    'a',
+    primary ? 'welcome-btn welcome-btn-primary' : 'welcome-btn welcome-btn-link'
+  );
+  row.setAttribute('href', href);
+  const icon = element(documentOwner, 'span', 'welcome-btn-icon', primary ? '\u21bb' : '\u2192');
+  icon.setAttribute('aria-hidden', 'true');
+  const text = element(documentOwner, 'span', 'welcome-btn-text');
+  text.append(element(documentOwner, 'span', 'welcome-btn-title', title));
+  row.append(icon, text);
+  return row;
 }
 
 /**
- * Publish one persistent, accessible terminal startup surface.
+ * Publish one persistent, accessible terminal startup surface: the brand card
+ * (components/_welcome.css) over everything (layouts/_page.css), saying what
+ * happened in one sentence and what to do, with the technical message folded
+ * under Details.
  *
  * @param {{
  *   documentOwner: Document,
@@ -127,98 +252,67 @@ export function publishStartupFailure(options) {
   // `aria-modal` region really does close and its Tab trap really is released.
   if (isWelcomeModalVisible()) hideWelcomeModal();
 
-  const surface = documentOwner.createElement('section');
+  const { location } = documentOwner;
+  const hasLaunchSettings = location.search !== '';
+  const said = describeStartupFailure(error, {
+    webgl2Available: probeWebGL2(documentOwner),
+    hasLaunchSettings
+  });
+
+  const surface = element(documentOwner, 'section', 'page-screen page-screen-fixed');
   surface.id = 'cellucid-startup-failure';
+  surface.setAttribute('data-failure', said.kind);
   surface.setAttribute('role', 'alert');
   surface.setAttribute('aria-live', 'assertive');
   surface.setAttribute('aria-atomic', 'true');
-  applyStyles(surface, {
-    position: 'fixed',
-    inset: '0',
-    zIndex: '2147483647',
-    display: 'grid',
-    placeItems: 'center',
-    padding: '24px',
-    background: '#f4f6f8',
-    color: '#18212b',
-    fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, sans-serif'
-  });
+  surface.setAttribute('aria-labelledby', 'cellucid-startup-failure-title');
 
-  const card = documentOwner.createElement('div');
-  applyStyles(card, {
-    width: 'min(680px, 100%)',
-    padding: '28px',
-    border: '2px solid #18212b',
-    borderRadius: '14px',
-    background: '#ffffff',
-    boxShadow: '10px 10px 0 #18212b'
-  });
+  const card = element(documentOwner, 'div', 'welcome-content');
+  const header = element(documentOwner, 'div', 'welcome-header');
+  const logo = element(documentOwner, 'img', 'welcome-logo');
+  logo.setAttribute('src', 'assets/img/cellucid-logo.svg');
+  logo.setAttribute('alt', 'Cellucid');
+  logo.setAttribute('width', '260');
+  logo.setAttribute('height', '80');
+  header.append(logo);
 
-  const title = documentOwner.createElement('h1');
-  title.textContent = 'Cellucid could not start';
-  applyStyles(title, {
-    margin: '0 0 12px',
-    fontSize: '28px',
-    lineHeight: '1.15'
-  });
+  const body = element(documentOwner, 'div', 'welcome-body');
+  const title = element(documentOwner, 'h1', 'welcome-title', said.title);
+  title.id = 'cellucid-startup-failure-title';
+  const sentence = element(documentOwner, 'p', 'welcome-intro', said.sentence);
 
-  const message = documentOwner.createElement('p');
-  message.textContent = error.message;
-  applyStyles(message, {
-    margin: '0',
-    fontSize: '16px',
-    lineHeight: '1.55',
-    overflowWrap: 'anywhere'
-  });
-
-  const action = documentOwner.createElement('p');
-  action.textContent =
-    'Correct the launch configuration or server response, then reload this page.';
-  applyStyles(action, {
-    margin: '16px 0 0',
-    fontSize: '14px',
-    lineHeight: '1.45',
-    color: '#4b5968'
-  });
-
-  // A failure is never a dead end. A link that carried launch settings (a
-  // dataset, a repository, a server) can be dropped to open the app as it
-  // starts by default, and the troubleshooting guide covers each failure.
-  const links = documentOwner.createElement('p');
-  applyStyles(links, {
-    margin: '16px 0 0',
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: '8px 20px',
-    fontSize: '14px',
-    lineHeight: '1.45'
-  });
-  const exits = [];
-  if (documentOwner.location.search !== '') {
-    exits.push([documentOwner.location.pathname, 'Open Cellucid without this link\u2019s settings']);
-  }
-  exits.push([STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']);
-  for (const [href, label] of exits) {
-    const link = documentOwner.createElement('a');
-    link.setAttribute('href', href);
-    link.textContent = label;
-    applyStyles(link, {
-      color: '#18212b',
-      textDecoration: 'underline',
-      textUnderlineOffset: '2px'
-    });
-    links.append(link);
+  // A failure is never a dead end: the same address again, and, when the
+  // link carried launch settings (a dataset, a repository, a server), the app
+  // as it starts by default.
+  const actions = element(documentOwner, 'div', 'welcome-actions');
+  actions.append(actionRow(documentOwner, `${location.pathname}${location.search}`, 'Try again', true));
+  if (said.offerWithoutSettings) {
+    actions.append(actionRow(documentOwner, location.pathname, 'Open Cellucid without this link', false));
   }
 
-  // A refusal written for the person already says what to do; the generic
-  // advice would only repeat it less precisely.
-  card.append(
-    title,
-    message,
-    ...(isExplainedFailure(error) ? [] : [action]),
-    links
+  const details = element(documentOwner, 'details', 'welcome-details');
+  details.append(
+    element(documentOwner, 'summary', '', 'Details'),
+    element(documentOwner, 'p', 'welcome-details-text', error.message)
   );
+
+  const links = element(documentOwner, 'ul', 'welcome-links');
+  links.setAttribute('aria-label', 'Help');
+  for (const [href, label] of said.links) {
+    const item = element(documentOwner, 'li', '');
+    const link = element(documentOwner, 'a', '', label);
+    link.setAttribute('href', href);
+    item.append(link);
+    links.append(item);
+  }
+
+  body.append(title, sentence, actions, details, links);
+  card.append(header, body);
   surface.appendChild(card);
+  // The application behind it is gone: nothing there takes focus or is read.
+  for (const sibling of Array.from(documentOwner.body.children)) {
+    sibling.inert = true;
+  }
   documentOwner.body.appendChild(surface);
   // Retracting onboarding takes focus off a control that no longer exists, so
   // the alert takes it: leaving focus on `<body>` would strand a keyboard user

@@ -23,7 +23,7 @@ const fixturesDirectory = path.join(
 );
 const GOOD_CATALOG = `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
 const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-catalogs/`;
-const NOTICE = '.dataset-info[role="status"]';
+const NOTICE = '#dataset-notice';
 const NOTICE_BUTTON = `${NOTICE} button`;
 
 const GOOD_DATASET = Object.freeze({
@@ -49,7 +49,7 @@ function optionValue(datasetId) {
 }
 
 async function noticeText(page) {
-  return page.locator(`${NOTICE} > div`).first().innerText();
+  return page.locator(`${NOTICE} .dataset-notice-message`).first().innerText();
 }
 
 /* ------------------------------------------------------------------ *
@@ -259,7 +259,7 @@ test('a damaged dataset leads with the dataset, not the file', async ({
 
   // The session survives, and other data still loads from the same controls.
   await expect(page.locator('#dataset-name')).toHaveText(OTHER_DATASET.name);
-  await page.locator('#user-data-h5ad-input').setInputFiles(
+  await page.locator('#user-data-file-input').setInputFiles(
     path.join(fixturesDirectory, 'current-ui-smoke.h5ad'),
   );
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');

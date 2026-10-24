@@ -52,20 +52,39 @@ import {
   createSlicedYield,
   waitForAvailableSlot
 } from '../shared/concurrency-utils.js';
-import { getPerformanceConfig } from '../shared/performance-config.js';
 
 // =============================================================================
-// BOUNDED PARALLEL LOADING
+// PARALLEL LOADING
 // =============================================================================
 //
 // The fields a single analysis needs are independent of one another, and the
 // AnnData reader reads those asked for together as one batch. Awaiting each
 // one before asking for the next makes the wall clock the *sum* of the round
-// trips on a remote file instead of the deepest one. `networkConcurrency` is
-// the one place that number is owned and justified
-// (`shared/performance-config.js`), so every loader here asks it rather than
-// carrying a literal of its own.
+// trips on a remote file instead of the deepest one. Every field a request
+// needs is asked for at once: the reader's fetch scheduler holds the reads to
+// what the link carries (`backgroundConcurrency`, measured), which no number
+// here could know.
 
+
+/** An expression matrix (`X`, `raw`, `layer:<key>`) as results name it. */
+function matrixName(matrix) {
+  return matrix.startsWith('layer:') ? `layers['${matrix.slice('layer:'.length)}']` : matrix;
+}
+
+/**
+ * A gene an expression matrix does not have, refused by name: `code`
+ * `GENE_NOT_IN_MATRIX`, `gene` the key.
+ *
+ * @param {string} gene
+ * @param {string} label - The matrix as its choice names it
+ * @returns {RangeError}
+ */
+function geneNotInMatrixError(gene, label) {
+  const error = new RangeError(`${gene} is not a gene of ${label}`);
+  error.code = 'GENE_NOT_IN_MATRIX';
+  error.gene = gene;
+  return error;
+}
 
 /**
  * The categorical codes of an observation field, exactly as the field holds
@@ -197,17 +216,6 @@ function pageDataValueBytes(pageData) {
  */
 function arrayLikeBytes(values) {
   return ArrayBuffer.isView(values) ? values.byteLength : values.length * 8;
-}
-
-/** @returns {number} The configured ceiling on concurrent field requests. */
-function networkConcurrency() {
-  const configured = getPerformanceConfig().batch.networkConcurrency;
-  if (!Number.isSafeInteger(configured) || configured <= 0) {
-    throw new RangeError(
-      'PerformanceConfig networkConcurrency must be a positive integer'
-    );
-  }
-  return configured;
 }
 
 /**
@@ -697,6 +705,12 @@ export class DataLayer {
     this._datasetGeneration = 0;
     this._cacheGeneration = 0;
     this._fieldLoadLifecycle = new AbortController();
+    /**
+     * The expression matrices other than the mapped one an analysis has read
+     * this generation (`_openMatrix`), by matrix and gene-name source.
+     * @type {Map<string, Promise<{handle: Object, indexOf: Map<string, number>, keys: string[]}>>}
+     */
+    this._matrixHandles = new Map();
     this._destroyed = false;
     this._destroyPromise = null;
 
@@ -1360,17 +1374,38 @@ export class DataLayer {
    *
    * `owner` is the job the read is for (`app/jobs/cancellable-job.js`).
    *
+   * `matrix` is an analysis's "Expression matrix" (`getExpressionMatrices`):
+   * `mapped` (the one shown), or another matrix of the file, whose genes are
+   * named on its own axis (`getGeneKeys`) and always read from the source; a
+   * gene that matrix lacks is refused by name (`GENE_NOT_IN_MATRIX`).
+   *
    * @param {string} geneKey
-   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null, matrix?: string}} [options]
    * @returns {Promise<{fieldIndex: number, values: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, owned: boolean}>}
    */
   async readGeneColumn(geneKey, options = {}) {
-    const { signal = null, priority = 'normal', owner = null } = options;
+    const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene read signal must be an AbortSignal or null');
     }
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    if (expression !== null) {
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const gene = opened.indexOf.get(geneKey);
+      if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+      const sample = await this.state.readMatrixSparseColumn(opened.handle, gene, {
+        priority,
+        owner,
+        signal: signal === null
+          ? this._fieldLoadLifecycle.signal
+          : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      return { fieldIndex: gene, values: sample, owned: true };
+    }
     const fields = this.state.varData?.fields;
     if (!fields) {
       throw new Error('[DataLayer] No var fields available (gene expression disabled)');
@@ -1407,17 +1442,161 @@ export class DataLayer {
   }
 
   /**
+   * The expression matrices an analysis can read its genes from (its
+   * "Expression matrix" option): `mapped`, the matrix the Data mapping shows
+   * (named in its label), then every other usable matrix of the file (`X`,
+   * each layer, `raw`). `reason` says why only the mapped one is listed: the
+   * dataset cannot change its expression matrix, or has no expression matrix.
+   *
+   * @returns {{choices: Array<{value: string, label: string}>, reason: string|null}}
+   */
+  getExpressionMatrices() {
+    const mapping = this.state.getDataMapping?.() ?? null;
+    const mapped = mapping?.expression ?? null;
+    const menu = mapped === null ? null : (this.state.getMappingGroupChoices?.('expression') ?? null);
+    const choices = [{ value: 'mapped', label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped)})` }];
+    if (menu === null) {
+      return {
+        choices,
+        reason: mapped === null ? 'This dataset has no expression matrix.' : 'This dataset reads only its mapped expression matrix.'
+      };
+    }
+    for (const choice of menu) {
+      if (choice.value !== null && choice.value !== mapped && choice.usable) {
+        choices.push({ value: choice.value, label: choice.label });
+      }
+    }
+    return { choices, reason: null };
+  }
+
+  /**
+   * What one "Expression matrix" value reads: `matrix` the matrix it names
+   * (`X`, `raw`, `layer:<key>`; the mapping's for `mapped`), `read` null when
+   * that is the mapped matrix (read through the shown gene list) else the
+   * matrix, and its short `label` (`Mapped (X)`, `raw`, `layers['counts']`).
+   *
+   * @param {string} matrix
+   * @returns {{matrix: string|null, read: string|null, label: string}}
+   */
+  resolveExpressionMatrix(matrix) {
+    const mapped = this.state.getDataMapping?.()?.expression ?? null;
+    const { choices } = this.getExpressionMatrices();
+    if (matrix === 'mapped' || matrix === mapped) {
+      return { matrix: mapped, read: null, label: choices[0].label };
+    }
+    const choice = choices.find(entry => entry.value === matrix);
+    if (choice === undefined) {
+      throw new RangeError(`This dataset has no expression matrix ${String(matrix)} to read`);
+    }
+    return { matrix, read: matrix, label: matrixName(matrix) };
+  }
+
+  /**
+   * The gene keys of one "Expression matrix", in its order: the shown genes
+   * for the mapped one, else that matrix's genes on its own axis.
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {Promise<string[]>}
+   */
+  async getGeneKeys(matrix = 'mapped') {
+    const expression = this.resolveExpressionMatrix(matrix).read;
+    if (expression === null) return this.getAvailableVariables('gene_expression').map(gene => gene.key);
+    return (await this._openMatrix(expression)).keys;
+  }
+
+  /**
+   * A matrix other than the mapped one, opened once per generation and gene
+   * name source (`DataState.openExpressionMatrix`).
+   * @private
+   */
+  _openMatrix(expression) {
+    const geneNames = this.state.getDataMapping?.()?.geneNames ?? 'index';
+    const key = JSON.stringify([this._datasetGeneration, expression, geneNames]);
+    let opened = this._matrixHandles.get(key);
+    if (opened === undefined) {
+      const label = this.resolveExpressionMatrix(expression).label;
+      opened = this.state.openExpressionMatrix(expression).then(handle => {
+        const keys = handle.fields.map(field => field.key);
+        return { handle, label, keys, indexOf: new Map(keys.map((gene, index) => [gene, index])) };
+      });
+      opened.catch(() => this._matrixHandles.delete(key));
+      this._matrixHandles.set(key, opened);
+    }
+    return opened;
+  }
+
+  /**
+   * The load the data layer reads from: it changes whenever the dataset (or
+   * its expression mapping) is replaced, so what was computed from one load
+   * is never served for another (`shared/gene-moments-cache.js`).
+   * @returns {number}
+   */
+  getDatasetGeneration() {
+    return this._datasetGeneration;
+  }
+
+  /**
+   * The cells the active view shows (its filters applied), one byte a cell:
+   * 1 shown, 0 hidden. A copy: an analysis scoped to the visible cells keeps
+   * the cells it started with whatever the filters do next.
+   *
+   * @returns {Uint8Array}
+   */
+  getVisibleCellMask() {
+    const pointCount = this.state?.pointCount;
+    const visibility = this.state?.categoryTransparency;
+    if (!(visibility instanceof Uint8Array) || visibility.length !== pointCount) {
+      throw new Error('The view has no visibility of every cell to scope an analysis by');
+    }
+    return visibility.slice();
+  }
+
+  /**
+   * The open dataset's link as the reader measured it
+   * (`{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`), or null
+   * before a measurement or when the source reports none. A run's tuner
+   * sizes its read-ahead by it (`shared/run-tuner.js`).
+   *
+   * @returns {{latencyMs: number, bytesPerMs: number, backgroundConcurrency: number, protocol: string|null}|null}
+   */
+  linkMeasurement() {
+    const measure = this.state?.varFieldLoader?.linkMeasurement;
+    return typeof measure === 'function' ? (measure() ?? null) : null;
+  }
+
+  /**
    * Some genes' values in some cells, read by cell or by gene, whichever
    * costs less (see DataState.readVarCellSubset); null when the source
    * cannot.
    *
-   * @param {string[]} geneKeys - Distinct gene keys
+   * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
    * @param {ArrayLike<number>} cellIndices - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
-   *   `owner`: the job the read is for
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options] -
+   *   `owner`: the job the read is for; `matrix` as `readGeneColumn`
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
   async readGeneCellSubset(geneKeys, cellIndices, options = {}) {
+    const matrix = options.matrix ?? 'mapped';
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    if (expression !== null) {
+      const datasetGeneration = this._datasetGeneration;
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const genes = geneKeys.map(geneKey => {
+        const gene = opened.indexOf.get(geneKey);
+        if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+        return gene;
+      });
+      const signal = options.signal ?? null;
+      const block = await this.state.readMatrixCellSubset(opened.handle, genes, cellIndices, {
+        owner: options.owner ?? null,
+        signal: signal === null
+          ? this._fieldLoadLifecycle.signal
+          : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      return block;
+    }
     if (typeof this.state.readVarCellSubset !== 'function') return null;
     const indexOf = this._getGeneFieldIndexMap();
     const fieldIndices = geneKeys.map(geneKey => {
@@ -1439,15 +1618,15 @@ export class DataLayer {
   /**
    * Whole gene columns for a computation, in gene order: each the cheaper form
    * `readGeneColumn` gives (a loaded field's shared dense array -- read it
-   * only -- or the gene's sparse entries). Up to `networkConcurrency` genes are
-   * read at once. `signal` stops the reads in flight and rejects with its
+   * only -- or the gene's sparse entries). Every gene is asked for at once;
+   * the reader's fetch scheduler paces them. `signal` stops the reads in flight and rejects with its
    * `AbortError`; `owner` is the job they are for. A request that stops
    * being current is refused at its next step; one that registers an
    * invalidation cleanup also aborts the reads in flight the moment it is
    * invalidated.
    *
    * @param {string[]} geneKeys
-   * @param {{isCurrent?: () => boolean, registerInvalidationCleanup?: (cleanup: () => void) => void, priority?: 'high'|'normal'|'bulk'|'low', signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @param {{isCurrent?: () => boolean, registerInvalidationCleanup?: (cleanup: () => void) => void, priority?: 'high'|'normal'|'bulk'|'low', signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options]
    * @returns {Promise<Array<ArrayLike<number>|{length: number, indices: Uint32Array, values: Float32Array}>>}
    */
   async readGeneColumns(geneKeys, options = {}) {
@@ -1459,7 +1638,8 @@ export class DataLayer {
       registerInvalidationCleanup,
       priority = 'normal',
       signal = null,
-      owner: readOwner = null
+      owner: readOwner = null,
+      matrix = 'mapped'
     } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene column signal must be an AbortSignal or null');
@@ -1489,11 +1669,11 @@ export class DataLayer {
     const columns = new Array(geneKeys.length);
     const inFlight = new Set();
     const tasks = [];
-    const maxInFlight = Math.max(1, Math.min(geneKeys.length, networkConcurrency()));
+    const maxInFlight = Math.max(1, geneKeys.length);
     for (let index = 0; index < geneKeys.length; index++) {
       await waitForAvailableSlot(inFlight, maxInFlight);
       requireCurrent();
-      const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner })
+      const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix })
         .then(({ values }) => {
           columns[index] = values;
         });
@@ -1503,9 +1683,17 @@ export class DataLayer {
     try {
       await Promise.all(tasks);
     } catch (error) {
+      // Whether the request still owned its reads is decided before this
+      // catch stops the others: aborting `owner` here is the read failure's
+      // own cleanup, not an ownership change, and must not hide the failure.
+      const lostOwnership = owner.signal.aborted || (isCurrent !== undefined && !isCurrent());
       owner.abort();
       await Promise.allSettled(tasks);
-      requireCurrent();
+      throwIfAborted(signal);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (lostOwnership) {
+        throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+      }
       throw error;
     } finally {
       signal?.removeEventListener('abort', stopReads);
@@ -2397,6 +2585,7 @@ export class DataLayer {
     );
     this._fieldLoadLifecycle = new AbortController();
     this._datasetGeneration += 1;
+    this._matrixHandles.clear();
     this.clearAllCaches();
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
@@ -2691,13 +2880,12 @@ export class DataLayer {
   }
 
   /**
-   * Load the requested observation fields with bounded concurrency.
+   * Load the requested observation fields together.
    *
    * Awaiting each field before asking for the next would make a run's wall
    * clock the *sum* of its reads on a remote file. The fields are
-   * independent, so they are asked for together under the same
-   * `networkConcurrency` ceiling every other analysis loader uses, and the
-   * reader batches them.
+   * independent, so they are asked for together, and the reader batches and
+   * paces them.
    *
    * Fields are still *published* in request order, because `result.fields` is
    * an ordered record the callers read positionally.
@@ -2716,10 +2904,7 @@ export class DataLayer {
     const inFlight = new Set();
     let completed = 0;
 
-    const maxInFlight = Math.max(
-      1,
-      Math.min(totalFields, networkConcurrency())
-    );
+    const maxInFlight = Math.max(1, totalFields);
 
     for (let index = 0; index < totalFields; index++) {
       const fieldKey = obsFields[index];

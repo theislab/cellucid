@@ -22,7 +22,6 @@ import {
   benjaminiHochbergTestable,
 } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
-import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
 
 // =============================================================================
 // NUMERIC HELPERS
@@ -253,12 +252,12 @@ test('the surviving Benjamini-Hochberg reproduces the replaced DE implementation
     }));
     legacyMvaBenjaminiHochberg(legacyRows);
 
-    const analysis = Object.create(MultiVariableAnalysis.prototype);
     const rows = pValues.map((pValue, index) => ({
       gene: `G${index}`,
       pValue,
     }));
-    const counts = analysis._applyBenjaminiHochberg(rows);
+    const counts = benjaminiHochbergTestable(rows.map(row => row.pValue));
+    rows.forEach((row, index) => { row.adjustedPValue = counts.adjustedPValues[index]; });
 
     for (let index = 0; index < rows.length; index++) {
       const expected = legacyRows[index].adjustedPValue;
@@ -299,8 +298,8 @@ test('the DE correction uses the testable subset, not the panel size, as m', () 
     { gene: 'MIDDLE', pValue: 0.03 },
     { gene: 'UNTESTABLE_3', pValue: NaN },
   ];
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  const counts = analysis._applyBenjaminiHochberg(rows);
+  const counts = benjaminiHochbergTestable(rows.map(row => row.pValue));
+  rows.forEach((row, index) => { row.adjustedPValue = counts.adjustedPValues[index]; });
 
   assert.equal(counts.testedCount, 3);
   assert.equal(counts.untestableCount, 3);
@@ -325,228 +324,48 @@ test('the testable correction rejects a finite p-value outside [0, 1]', () => {
 });
 
 // =============================================================================
-// FINDING 1 — THE REPORTED COUNTS ARE THE CORRECTION'S OWN NUMBERS
+// THE REPORTED COUNTS ARE THE CORRECTION'S OWN NUMBERS
 // =============================================================================
 
-/**
- * Twenty panel genes; eight fail the min-cell check and carry no p-value, so
- * Benjamini-Hochberg ran at m = 12. This is the audited scenario in miniature.
- */
-function untestableGeneFixture() {
-  const results = [];
-  for (let index = 0; index < 12; index++) {
-    const pValue = (index + 1) / 1000;
-    results.push({
-      gene: `TESTED_${index}`,
-      pValue,
-      adjustedPValue: pValue * 12 / (index + 1),
-      log2FoldChange: index % 2 === 0 ? 2 : -2,
-      nA: 12,
-      nB: 12,
-    });
-  }
-  for (let index = 0; index < 8; index++) {
-    results.push({
-      gene: `UNTESTABLE_${index}`,
-      error: 'Insufficient valid cells (A: 3, B: 4)',
-      pValue: NaN,
-      adjustedPValue: null,
-      log2FoldChange: NaN,
-      nA: 3,
-      nB: 4,
-    });
-  }
-  const upregulated = results.filter(
-    row => Number.isFinite(row.adjustedPValue)
-      && row.adjustedPValue < 0.05
-      && row.log2FoldChange > 0,
-  ).length;
-  const downregulated = results.filter(
-    row => Number.isFinite(row.adjustedPValue)
-      && row.adjustedPValue < 0.05
-      && row.log2FoldChange < 0,
-  ).length;
-
-  return {
-    results,
-    summary: {
-      genesTested: 12,
-      genesUntestable: 8,
-      minCells: 10,
-      significantGenes: upregulated + downregulated,
-      upregulated,
-      downregulated,
-      method: 'wilcox',
-      pageA: 'page-A',
-      pageB: 'page-B',
-      duration: 1234,
-      throughput: 10,
-      batchConfig: {
-        preloadCount: 4,
-        memoryBudgetMB: 8,
-        networkConcurrency: 2,
-      },
-    },
-    metadata: {
-      pageAName: 'Treated',
-      pageBName: 'Control',
-      recommendedSettings: {},
-    },
+test('a DE run reports the family it corrected over: untested genes are not in it', async () => {
+  // Gene U is measured in one cell of group A only (the rest of its values
+  // are NaN), so it cannot be tested; genes T1 and T2 can.
+  const columns = {
+    T1: Float32Array.of(1, 2, 3, 7, 8, 9),
+    T2: Float32Array.of(4, 4, 5, 1, 1, 2),
+    U: Float32Array.of(1, NaN, NaN, 2, 3, 4),
   };
-}
-
-test('the DE modal reports the FDR denominator, not the panel size', () => {
-  const data = untestableGeneFixture();
-  const ui = Object.create(DEAnalysisUI.prototype);
-  ui._lastResult = {
-    type: 'differential',
-    plotType: 'volcanoplot',
-    data,
-    options: {
-      pValueThreshold: 0.05,
-      foldChangeThreshold: 1.0,
-      useAdjustedPValue: true,
-      labelTopN: 15,
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = {
+    state: { pointCount: 6 },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
+    getAvailableVariables: () => Object.keys(columns).map(key => ({ key })),
+    async readGeneColumn(gene) {
+      return { fieldIndex: 0, values: columns[gene], owned: false };
     },
-    title: 'Differential Expression',
-    subtitle: 'Treated vs Control',
+    performCacheCleanup() {},
   };
-
-  const container = { innerHTML: '' };
-  ui._renderModalStats(container);
-  const html = container.innerHTML;
-
-  assert.equal(
-    data.results.length,
-    20,
-    'fixture must carry more panel genes than tested genes',
-  );
-  assert.match(
-    html,
-    /Genes tested \(FDR denominator\)<\/td>\s*<td><strong>12<\/strong>/,
-    'the modal must report the 12 genes the correction actually used',
-  );
-  assert.doesNotMatch(
-    html,
-    /Genes tested \(FDR denominator\)<\/td>\s*<td><strong>20<\/strong>/,
-    'the panel size must never be labelled as the tested-gene count',
-  );
-  assert.match(
-    html,
-    /Not tested \(&lt; 10 cells with a value\)<\/td>\s*<td><strong>8<\/strong>/,
-    'the untestable remainder must be reported distinctly',
-  );
-  // The significance threshold is inclusive everywhere in the analysis module,
-  // so the label must read the comparison the count actually used.
-  assert.match(
-    html,
-    /Significant \(FDR \u2264 0\.05, \|log\u2082FC\| \u2265 1\)/,
-    'the significance row must state the inclusive comparison it used',
-  );
-  assert.doesNotMatch(
-    html,
-    /Significant \(FDR (&lt;|<) 0\.05/,
-    'a strict comparison must never be shown for an inclusive rule',
-  );
-});
-
-test('the DE modal refuses to render counts the correction did not supply', () => {
-  const data = untestableGeneFixture();
-  delete data.summary.genesTested;
-  const ui = Object.create(DEAnalysisUI.prototype);
-  ui._lastResult = {
-    data,
-    options: { pValueThreshold: 0.05, foldChangeThreshold: 1.0, useAdjustedPValue: true },
-  };
-
-  assert.throws(
-    () => ui._renderModalStats({ innerHTML: '' }),
-    /genesTested, genesUntestable and minCells/,
-  );
-});
-
-/**
- * Pull the modal statistics table apart into [label, count] pairs, in the order
- * the rows are emitted. The label cell is matched non-greedily so the raw "<" in
- * "Significant (FDR <= 0.05, ...)" does not truncate it.
- */
-function modalStatRows(html) {
-  return [
-    ...html.matchAll(
-      /<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*><strong>([\d,]+)<\/strong>/g,
-    ),
-  ].map(([, label, value]) => [
-    label.trim(),
-    Number(value.replaceAll(',', '')),
-  ]);
-}
-
-test('the DE modal reports every count row and never counts an untestable gene', () => {
-  // The summary grid this replaced guarded the "significant cannot exceed
-  // tested" invariant with an explicit throw. On the live path the guarantee is
-  // structural rather than asserted: the modal tallies significance from the
-  // result rows, and a gene with no p-value is skipped. To prove the skip is
-  // real, the eight untestable genes here carry a large *finite* fold change —
-  // only the missing p-value keeps them out. A renderer that treated a missing
-  // p-value as passing would report 20 significant genes in a 12-gene corrected
-  // family, which is exactly the impossible state the old throw existed to stop.
-  const data = untestableGeneFixture();
-  for (const row of data.results) {
-    if (row.gene.startsWith('UNTESTABLE_')) row.log2FoldChange = 5;
-  }
-  const ui = Object.create(DEAnalysisUI.prototype);
-  ui._lastResult = {
-    type: 'differential',
-    plotType: 'volcanoplot',
-    data,
-    options: {
-      pValueThreshold: 0.05,
-      foldChangeThreshold: 1.0,
-      useAdjustedPValue: true,
-      labelTopN: 15,
+  const { computeDifferentialOfColumn, setTwoGroupContext } = await import('../assets/js/app/analysis/compute/operation-handlers.js');
+  analysis._getComputeManager = async () => ({
+    selectBackend: () => 'cpu',
+    async broadcast(operation, payloadFor) {
+      if (operation === 'SET_TWO_GROUP_CONTEXT') return [setTwoGroupContext(payloadFor(0))];
+      return [{ released: true }];
     },
-    title: 'Differential Expression',
-    subtitle: 'Treated vs Control',
-  };
-
-  const container = { innerHTML: '' };
-  ui._renderModalStats(container);
-  const rows = modalStatRows(container.innerHTML);
-
-  assert.deepEqual(
-    rows.map(([label]) => label),
-    [
-      'Genes tested (FDR denominator)',
-      'Not tested (&lt; 10 cells with a value)',
-      'Significant (FDR ≤ 0.05, |log₂FC| ≥ 1)',
-      'Upregulated',
-      'Downregulated',
-    ],
-    'every count row must be present, in order, with its denominator labelled',
-  );
-
-  const counts = Object.fromEntries(
-    rows.map(([, value], index) => [
-      ['genesTested', 'genesUntestable', 'significant', 'up', 'down'][index],
-      value,
-    ]),
-  );
-
-  assert.equal(counts.genesTested, 12, 'the denominator must be the tested-gene count');
-  assert.equal(counts.genesUntestable, 8, 'the untestable remainder must be reported');
-  assert.equal(
-    counts.significant,
-    counts.up + counts.down,
-    'the significant total must be the sum of the two directions shown beside it',
-  );
-  assert.ok(
-    counts.significant <= counts.genesTested,
-    `significant (${counts.significant}) exceeded the FDR denominator (${counts.genesTested}): `
-      + 'a gene with no p-value was counted as significant',
-  );
-  assert.equal(
-    counts.significant,
-    12,
-    'all twelve tested genes are significant here and none of the eight untestable ones are',
-  );
+    async execute(operation, payload) {
+      return computeDifferentialOfColumn(payload);
+    },
+  });
+  const result = await analysis.differentialExpression({
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
+    minCells: 10,
+  });
+  assert.equal(result.summary.genesTested, 2);
+  assert.equal(result.summary.genesUntestable, 1);
+  const untested = result.results.find(row => row.gene === 'U');
+  assert.ok(Number.isNaN(untested.pValue));
+  assert.equal(untested.adjustedPValue, null);
+  assert.deepEqual(result.summary.lowN, ['A', 'B'], 'groups under the minimum of 10 are flagged, not refused');
 });

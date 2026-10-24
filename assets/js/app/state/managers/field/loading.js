@@ -66,6 +66,18 @@ function fetchSchedulerOf(state) {
   return entry.scheduler;
 }
 
+/** An `openExpressionMatrix` handle of the state's current dataset generation. */
+function requireOpenMatrix(state, matrix) {
+  if (
+    matrix === null || typeof matrix !== 'object' ||
+    !Array.isArray(matrix.fields) || typeof matrix.loader?.readSparseColumn !== 'function'
+  ) {
+    throw new TypeError('An expression matrix is read through its openExpressionMatrix() handle.');
+  }
+  if (matrix.generation !== readDatasetGeneration(state)) throw createDatasetFieldLoadSupersededError();
+  return matrix;
+}
+
 function readDatasetGeneration(state) {
   const generation = state._datasetGeneration ?? 0;
   if (!Number.isSafeInteger(generation) || generation < 0) {
@@ -224,16 +236,19 @@ function validateLoadedLength(values, pointCount, message) {
 }
 
 /**
- * Give a categorical field the categories its first load found (a direct
- * AnnData string or boolean column publishes none until it is read), shown
- * under their display names. A field whose categories are known keeps them:
- * the dataset codes a column one way for its whole life.
+ * Give a categorical field the categories its first load found (an AnnData
+ * column publishes none until it is read: a string or boolean column's are
+ * its distinct values, a categorical's its stored dictionary), with the
+ * colours its file stores for them, shown under their display names. A field
+ * whose categories are known keeps them: the dataset codes a column one way
+ * for its whole life.
  */
-function adoptFoundCategories(state, field, categories) {
+function adoptFoundCategories(state, field, categories, palette = null) {
   if (categories === undefined || field.categories !== null) return;
   if (!Array.isArray(categories)) {
     throw new TypeError(`Field "${field.key}" found categories must be an array.`);
   }
+  if (Array.isArray(palette) && palette.length === categories.length) field.palette = palette;
   field.categories = [...categories];
   state._applyCategoryOverlay(
     field,
@@ -362,7 +377,7 @@ export class FieldLoadingMethods {
       if (cached.values) field.values = cached.values;
       if (cached.codes) field.codes = cached.codes;
       if (cached.outlierQuantiles) field.outlierQuantiles = cached.outlierQuantiles;
-      adoptFoundCategories(this, field, cached.categories);
+      adoptFoundCategories(this, field, cached.categories, cached.palette);
       field.loaded = true;
       touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
@@ -436,7 +451,7 @@ export class FieldLoadingMethods {
         // The categories a column has are found by its first load when its
         // field list could not state them (data-loaders.js).
         const foundCategories = loadedData?.categories;
-        adoptFoundCategories(this, field, foundCategories);
+        adoptFoundCategories(this, field, foundCategories, loadedData?.palette ?? null);
         if (nextValues !== undefined) field.values = nextValues;
         if (nextCodes !== undefined) field.codes = nextCodes;
         if (nextOutlierQuantiles !== undefined) {
@@ -451,7 +466,9 @@ export class FieldLoadingMethods {
           values: field.values,
           codes: field.codes,
           outlierQuantiles: field.outlierQuantiles,
-          ...(foundCategories === undefined ? {} : { categories: foundCategories })
+          ...(foundCategories === undefined
+            ? {}
+            : { categories: foundCategories, palette: loadedData?.palette ?? null })
         });
         touchFieldResidency(this, FieldSource.OBS, cacheKey);
         if (notifId) notifications.complete(notifId, `Loaded field: ${field.key}`);
@@ -718,6 +735,62 @@ export class FieldLoadingMethods {
       priority: options.priority ?? 'normal',
       signal,
       start: downloadSignal => loader.readSparseColumn(descriptor, {
+        signal: downloadSignal,
+        owner: options.owner ?? null
+      })
+    });
+  }
+
+  /**
+   * One gene's non-zero entries from an expression matrix other than the
+   * mapped one (`openExpressionMatrix`), scheduled as `readVarSparseColumn`.
+   * The caller owns the arrays.
+   *
+   * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
+   * @param {number} gene - The gene's position in `matrix.fields`
+   * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
+   * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}>}
+   */
+  async readMatrixSparseColumn(matrix, gene, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const descriptor = requireOpenMatrix(this, matrix).fields[gene];
+    if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: options.priority ?? 'normal',
+      signal,
+      start: downloadSignal => matrix.loader.readSparseColumn(descriptor, {
+        signal: downloadSignal,
+        owner: options.owner ?? null
+      })
+    });
+  }
+
+  /**
+   * Some genes of an expression matrix other than the mapped one
+   * (`openExpressionMatrix`) in some cells, as `readVarCellSubset` reads them.
+   *
+   * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
+   * @param {number[]} genes - Distinct positions in `matrix.fields`
+   * @param {ArrayLike<number>} cells - Distinct cell positions
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
+   */
+  async readMatrixCellSubset(matrix, genes, cells, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const { fields } = requireOpenMatrix(this, matrix);
+    const descriptors = genes.map(gene => {
+      const descriptor = fields[gene];
+      if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
+      return descriptor;
+    });
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: 'bulk',
+      signal,
+      start: downloadSignal => matrix.loader.readCellSubset(descriptors, cells, {
         signal: downloadSignal,
         owner: options.owner ?? null
       })

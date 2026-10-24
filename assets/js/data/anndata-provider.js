@@ -383,6 +383,19 @@ export async function anndataGetGeneList(
 }
 
 /**
+ * The genes of one gene list that one boolean var column of their axis marks
+ * (`BaseAnnDataAdapter.getMarkedGenes`), by their names in that list.
+ *
+ * @param {string} url - The gene list's URL (`<base>var` or a mapped route)
+ * @param {string} column
+ * @returns {Promise<string[]|null>}
+ */
+export async function anndataLoadMarkedGenes(url, column, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getMarkedGenes(parsed.path, column);
+}
+
+/**
  * Load obs field data from AnnData source
  * @param {string} url - Explicit direct AnnData URL
  * @param {string} fieldKey - Field name
@@ -417,6 +430,25 @@ export async function anndataLoadGeneValues(
     owner: options.owner ?? null,
     key: options.key ?? null,
   });
+}
+
+/**
+ * The link the AnnData file behind `url` is read over, as its reader last
+ * measured it (`AnnDataReaderClient.linkMeasurement()`:
+ * `{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`), or null when
+ * no dataset is open there or nothing has been measured yet.
+ *
+ * @param {string} url
+ * @returns {Readonly<Object>|null}
+ */
+export function anndataLinkMeasurement(url) {
+  let binding;
+  try {
+    binding = getAnnDataBinding(url, null);
+  } catch {
+    return null;
+  }
+  return binding.adapter.linkMeasurement?.() ?? null;
 }
 
 /**

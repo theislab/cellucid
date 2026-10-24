@@ -3,7 +3,8 @@
  *
  * - Starts OAuth via full-page redirect to `${WORKER_ORIGIN}/auth/login`
  * - Worker redirects back to the app with token in URL fragment
- * - Stores token in `sessionStorage` (never `localStorage`)
+ * - Stores token in the tab's `sessionStorage` through the shared sign-in
+ *   store (`data/sources/auth/token-store.js`; never `localStorage`)
  * - Fetches user identity from `${WORKER_ORIGIN}/auth/user`
  *
  * This module is UI-agnostic (no DOM writes).
@@ -12,6 +13,7 @@
 import { EventEmitter } from '../utils/event-emitter.js';
 import { isLocalDevHost } from '../utils/local-dev.js';
 import { parseExactJson } from './wire-contract.js';
+import { readSignIn, removeSignIn, writeSignIn } from '../../data/sources/auth/token-store.js';
 import {
   isCanonicalGitHubAccount,
   isCanonicalGitHubRepositoryFullName,
@@ -19,7 +21,8 @@ import {
 
 const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.dev';
 
-const SESSION_KEY = 'cellucid:github-app-auth:session';
+/** The sign-in's name in the shared store: `cellucid:github-app-auth:session`. */
+const SIGN_IN_NAME = 'github-app';
 
 const AUTH_FLAG_PARAM = 'cellucid_github_auth';
 const AUTH_TOKEN_PARAM = 'cellucid_github_token';
@@ -328,35 +331,26 @@ export function getGitHubWorkerOrigin() {
   return overrideOrigin;
 }
 
-function readSessionItem(key) {
+function readSessionItem() {
   try {
-    if (typeof sessionStorage === 'undefined') {
-      throw new Error('sessionStorage is unavailable');
-    }
-    return sessionStorage.getItem(key);
+    return readSignIn(SIGN_IN_NAME);
   } catch (cause) {
     throw storageFailure('sessionStorage', 'read', cause);
   }
 }
 
-function writeSessionItem(key, value) {
+function writeSessionItem(value) {
   try {
-    if (typeof sessionStorage === 'undefined') {
-      throw new Error('sessionStorage is unavailable');
-    }
-    sessionStorage.setItem(key, value);
+    writeSignIn(SIGN_IN_NAME, value);
     return true;
   } catch (cause) {
     throw storageFailure('sessionStorage', 'write', cause);
   }
 }
 
-function removeSessionItem(key) {
+function removeSessionItem() {
   try {
-    if (typeof sessionStorage === 'undefined') {
-      throw new Error('sessionStorage is unavailable');
-    }
-    sessionStorage.removeItem(key);
+    removeSignIn(SIGN_IN_NAME);
     return true;
   } catch (cause) {
     throw storageFailure('sessionStorage', 'remove', cause);
@@ -985,7 +979,7 @@ export class GitHubAuthSession extends EventEmitter {
     this._user = null;
     let rawSession;
     try {
-      rawSession = readSessionItem(SESSION_KEY);
+      rawSession = readSessionItem();
     } catch {
       // A browser that refuses session storage has no persisted identity to
       // adopt. Sign-in reports its own storage failure when it cannot persist.
@@ -1015,7 +1009,7 @@ export class GitHubAuthSession extends EventEmitter {
       user = Object.freeze({ ...assertStoredGitHubUser(session.user) });
     } catch {
       try {
-        removeSessionItem(SESSION_KEY);
+        removeSessionItem();
       } catch {
         // Storage that refuses removal also refused to hand back a usable
         // identity, so there is nothing left to adopt in either outcome.
@@ -1037,7 +1031,6 @@ export class GitHubAuthSession extends EventEmitter {
       );
     }
     writeSessionItem(
-      SESSION_KEY,
       JSON.stringify({
         token,
         user: assertStoredGitHubUser(user),
@@ -1265,7 +1258,7 @@ export class GitHubAuthSession extends EventEmitter {
     // Storage removal comes first on purpose: a sign-out that cannot be made
     // durable is refused rather than reported, so the in-memory session can
     // never claim to be signed out while a reload would restore the token.
-    removeSessionItem(SESSION_KEY);
+    removeSessionItem();
     if (signOutGeneration !== this._requestGeneration) return;
     if (!hadAuthenticatedState) return;
     this._token = null;

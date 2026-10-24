@@ -60,8 +60,7 @@ const DOMAIN_OWNED_IDS = new Set([
   'view-representation-select',
   'dataset-select',
   'pointer-lock',
-  'remote-server-url',
-  'data-link-url',
+  'data-address',
 ]);
 
 function assertPlainRecord(value, context) {

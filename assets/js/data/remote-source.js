@@ -321,6 +321,38 @@ function requireDatasetCatalogPayload(payload) {
   })]);
 }
 
+/**
+ * Whether a Cellucid server answers at one base address: its health endpoint
+ * replies with a valid health document within the connection deadline. The
+ * address bar asks this of a web address that names no file, so a server and
+ * a dataset folder on a web host are told apart by what answers, not by how
+ * the address looks. Any failure (nothing there, not a server, no reply in
+ * time) is a plain no.
+ *
+ * @param {string} url - A base URL `validateRemoteServerUrl` accepts
+ * @param {{signal?: AbortSignal|null}} [options]
+ * @returns {Promise<boolean>}
+ */
+export async function probeRemoteServer(url, { signal = null } = {}) {
+  validateRemoteServerUrl(url);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_CONNECTION_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    requireRemoteHealthPayload(
+      await requestJson(`${url}/_cellucid/health`, controller.signal, 'Remote health')
+    );
+    return true;
+  } catch {
+    if (signal?.aborted) throw signal.reason;
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
 async function requestJson(url, signal, label) {
   let response;
   try {

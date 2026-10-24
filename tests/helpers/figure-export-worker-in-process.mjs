@@ -6,8 +6,9 @@
  * cloned (its typed arrays copied, its transfer list detached on the sending
  * side), handled by `createFigureExportWorkerHandler`, and answered on a
  * later microtask. Node has no OffscreenCanvas, so only the CPU operations
- * (bounds, vector point markup) can succeed here; a raster request fails as
- * it would in a browser without one.
+ * (bounds, vector point markup) can succeed here: the worker answers `webgl2`
+ * with false, the client runs the point passes on its page host (the same
+ * handler), and they fail there as they would in a browser without one.
  */
 
 import { setFigureExportWorkerFactory } from '../../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';

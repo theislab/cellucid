@@ -293,6 +293,8 @@ export class AnnDataCatalog {
     this._opened = new Map();
     /** @type {Map<string, Object>} The AnnData source of each dataset whose opening finished */
     this._settled = new Map();
+    /** @type {WeakMap<Promise<Object>, Object>} Who still wants each opening (`open`) */
+    this._wanted = new WeakMap();
     this._closed = false;
   }
 
@@ -360,6 +362,20 @@ export class AnnDataCatalog {
   }
 
   /**
+   * The datasets as `datasets.json` itself lists them, in catalog order:
+   * `{id, name}`, the name taken from each path. Nothing is read, so the
+   * picker can list them while their files are still being described.
+   *
+   * @returns {ReadonlyArray<Readonly<{id: string, name: string}>>}
+   */
+  entries() {
+    return Object.freeze(this.catalog.datasets.map(entry => Object.freeze({
+      id: entry.id,
+      name: nameOfPath(entry.path),
+    })));
+  }
+
+  /**
    * What the dataset picker lists about every dataset, in catalog order:
    * `{id, name, description, stats: {n_cells, n_genes}}`, read from each
    * file's metadata and `uns`. One file that cannot be described fails the
@@ -380,6 +396,8 @@ export class AnnDataCatalog {
         signal,
         async (entry, entrySignal) => {
           try {
+            const listed = await this._listedFromOpen(entry);
+            if (listed !== null) return listed;
             const source = await this._readerSource(entry, entrySignal);
             const described = await clientFor(entry.form.kind).describe(source, { signal: entrySignal });
             const file = requireCellucidFileMetadata(described.cellucid, entry.form.kind);
@@ -411,8 +429,46 @@ export class AnnDataCatalog {
   }
 
   /**
+   * What the listing says about one entry, taken from its opening when the
+   * entry is open or being opened (its file is not read a second time), else
+   * null once every opening under way has settled: the other files are read
+   * for the listing only after the dataset being opened has what it shows
+   * first, so their reads never compete with it.
+   * @private
+   */
+  async _listedFromOpen(entry) {
+    for (let pending = [...this._opened.values()]; pending.length > 0; ) {
+      await Promise.allSettled(pending);
+      const next = [...this._opened.values()];
+      pending = next.filter(opening => !pending.includes(opening));
+    }
+    const opening = this._opened.get(entry.id);
+    if (opening === undefined) return null;
+    let opened;
+    try {
+      opened = await opening;
+    } catch {
+      // Its failure is the open's to report; the listing reads the file itself.
+      return null;
+    }
+    const { source, metadata } = opened;
+    return Object.freeze({
+      id: entry.id,
+      name: metadata.name,
+      description: source.getAdapter().getFileMetadata().description ?? '',
+      stats: Object.freeze({ n_cells: metadata.stats.n_cells, n_genes: metadata.stats.n_genes }),
+    });
+  }
+
+  /**
    * Open one dataset completely, once: its AnnData source and identity. A
    * failed open is forgotten, so choosing it again retries.
+   *
+   * Every caller passes the signal of its own reason to want the dataset (a
+   * dataset change, which a newer choice replaces), or null to want it until
+   * it is released. An opening still under way stops as soon as no caller
+   * wants it any more, so a superseded choice neither keeps reading nor keeps
+   * its opening on screen; once it has opened, it stays until released.
    *
    * @param {string} datasetId
    * @param {AbortSignal|null} [signal]
@@ -420,21 +476,50 @@ export class AnnDataCatalog {
    */
   open(datasetId, signal = null) {
     if (this._closed) throw new Error('The catalog was closed.');
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('A catalog open signal must be an AbortSignal or null.');
+    }
     const entry = this._entry(datasetId);
     let opening = this._opened.get(datasetId);
-    if (opening === undefined) {
-      opening = this._open(entry, signal);
-      this._opened.set(datasetId, opening);
-      opening.catch(() => {
-        if (this._opened.get(datasetId) === opening) this._opened.delete(datasetId);
+    let wanted = opening === undefined ? undefined : this._wanted.get(opening);
+    if (opening === undefined || wanted.controller.signal.aborted) {
+      const controller = new AbortController();
+      wanted = { controller, always: false, callers: new Map(), settled: false };
+      const current = this._open(entry, controller.signal);
+      opening = current;
+      this._opened.set(datasetId, current);
+      this._wanted.set(current, wanted);
+      const settle = () => {
+        wanted.settled = true;
+        for (const [callerSignal, onAbort] of wanted.callers) {
+          callerSignal.removeEventListener('abort', onAbort);
+        }
+        wanted.callers.clear();
+      };
+      current.then(settle, () => {
+        settle();
+        if (this._opened.get(datasetId) === current) this._opened.delete(datasetId);
       });
+    }
+    if (signal === null) {
+      wanted.always = true;
+    } else if (!wanted.settled) {
+      const state = wanted;
+      const onAbort = () => {
+        state.callers.delete(signal);
+        if (!state.settled && !state.always && state.callers.size === 0) {
+          state.controller.abort(signal.reason);
+        }
+      };
+      state.callers.set(signal, onAbort);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
     }
     return opening;
   }
 
   /** @private */
   async _open(entry, signal) {
-    const host = new URL(entry.url).host;
     const transfer = getTransferLog().begin({
       key: entry.url,
       label: nameOfPath(entry.path),
@@ -447,11 +532,11 @@ export class AnnDataCatalog {
       try {
         const readerSource = await this._readerSource(entry, signal);
         const options = {
-          showProgress: false,
+          signal,
           datasetId: entry.id,
           name: nameOfPath(entry.path),
           preferFileName: true,
-          description: `Read in place from ${host}`,
+          description: '',
           source: { name: this._sourceName, url: entry.url, filename: entry.name },
         };
         if (entry.form.layout === 'folder') {
@@ -528,6 +613,9 @@ export class AnnDataCatalog {
       if (datasetId === keepId) continue;
       this._opened.delete(datasetId);
       this._settled.delete(datasetId);
+      // Released while still opening: it stops where it is.
+      const wanted = this._wanted.get(opening);
+      if (wanted !== undefined && !wanted.settled) wanted.controller.abort();
       opening.then(
         ({ source, transfer }) => {
           // An opening still under way when it was released settles here.

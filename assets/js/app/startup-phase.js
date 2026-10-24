@@ -2,8 +2,9 @@
  * @fileoverview One owner for the network awaits of application startup.
  *
  * Startup is a chain of awaits on servers the application does not control: a
- * health endpoint, a dataset catalog, a dataset's identity and field lists, its
- * default embedding, and the published default session a sample advertises.
+ * health endpoint, a dataset catalog, opening the startup dataset (its
+ * metadata, field lists and the embedding its first view draws), and the
+ * published default session a sample advertises.
  * The interface is built after the catalog is read and before the startup
  * dataset loads, so the data controls are live — and can replace that load —
  * for the whole of it.
@@ -18,6 +19,13 @@
  *   hands the operation a signal that the deadline aborts, so a request that
  *   never answers ends startup through the terminal failure surface with an
  *   error naming the phase and the URL.
+ *
+ * Every request of a dataset's files bounds itself (`formats/io/byte-source.js`:
+ * a request that stalls is made again, then fails naming its URL), so a step
+ * that reads a dataset passes `progress` and its deadline measures silence,
+ * not duration: it fires only when nothing at all has arrived for a whole
+ * deadline, which no working read does, and says which reads were open
+ * (`pending`).
  *
  * The positions and interface phases are published but not deadline-bound:
  * their duration scales with the dataset (a large embedding over a slow link
@@ -38,7 +46,7 @@ const STARTUP_PHASES = Object.freeze([
   'health',
   'catalog',
   'ui',
-  'identity',
+  'dataset',
   'positions',
   'session',
   'ready'
@@ -54,7 +62,7 @@ const PHASE_DESCRIPTIONS = Object.freeze({
   'sign-in': 'completing GitHub sign-in',
   health: 'checking the data server',
   catalog: 'reading the dataset catalog',
-  identity: 'reading the dataset identity and field lists',
+  dataset: 'opening the dataset (its metadata, field lists and the embedding its first view draws)',
   positions: 'loading cell positions',
   ui: 'building the interface',
   session: 'reading the published default session',
@@ -72,17 +80,25 @@ function requirePhase(phase) {
  * @param {string} phase
  * @param {string} target - URL (or named endpoint) the step was waiting on
  * @param {number} deadlineMs
+ * @param {{silence?: boolean, pending?: string|null}} [details] - `silence`:
+ *   the deadline measured time without progress; `pending`: what was being
+ *   read when it elapsed
  * @returns {Error}
  */
-function createStartupStallError(phase, target, deadlineMs) {
+function createStartupStallError(phase, target, deadlineMs, { silence = false, pending = null } = {}) {
+  const seconds = deadlineMs / 1000;
   const error = new Error(
     `Startup stalled while ${PHASE_DESCRIPTIONS[requirePhase(phase)]}: ` +
-    `${target} did not answer within ${deadlineMs / 1000} s.`
+    (silence
+      ? `nothing arrived from ${target} for ${seconds} s`
+      : `${target} did not answer within ${seconds} s`) +
+    (pending === null || pending === '' ? '.' : `, while reading ${pending}.`)
   );
   error.name = 'TimeoutError';
   error.code = STARTUP_STALL_CODE;
   error.phase = phase;
   error.target = target;
+  error.pending = pending;
   return error;
 }
 
@@ -141,10 +157,13 @@ export function createStartupPhaseOwner(options) {
      * @param {string} phase
      * @param {string} target - URL or named endpoint, used in the stall error
      * @param {(signal: AbortSignal) => Promise<T>|T} operation
-     * @param {{progress?: (onProgress: () => void) => () => void}} [options]
+     * A step's `pending` names what it is waiting for when its deadline
+     * elapses (the reads still open), for the stall error.
+     *
+     * @param {{progress?: (onProgress: () => void) => () => void, pending?: () => string|null}} [options]
      * @returns {Promise<T>}
      */
-    async step(phase, target, operation, { progress = null } = {}) {
+    async step(phase, target, operation, { progress = null, pending = null } = {}) {
       enter(phase);
       if (typeof target !== 'string' || target.length === 0) {
         throw new TypeError('A startup step must name what it waits on.');
@@ -155,14 +174,19 @@ export function createStartupPhaseOwner(options) {
       if (progress !== null && typeof progress !== 'function') {
         throw new TypeError('A startup step progress source must be a subscription.');
       }
+      if (pending !== null && typeof pending !== 'function') {
+        throw new TypeError('A startup step pending description must be a function.');
+      }
+      const stallError = () => createStartupStallError(phase, target, deadlineMs, {
+        silence: progress !== null,
+        pending: pending?.() ?? null,
+      });
       const deadline = createDeadline(deadlineMs);
       const stopProgress = progress === null ? null : progress(() => deadline.extend());
       const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
       let onDeadline = null;
       const stalled = new Promise((_resolve, reject) => {
-        onDeadline = () => reject(
-          createStartupStallError(phase, target, deadlineMs)
-        );
+        onDeadline = () => reject(stallError());
         deadline.signal.addEventListener('abort', onDeadline, { once: true });
       });
       const work = Promise.resolve().then(() => operation(signal));
@@ -175,7 +199,7 @@ export function createStartupPhaseOwner(options) {
         // A fetch the deadline aborted rejects with its own abort error; the
         // stall is the cause worth reporting.
         if (deadline.signal.aborted && !lifetime.signal.aborted) {
-          throw createStartupStallError(phase, target, deadlineMs);
+          throw stallError();
         }
         throw error;
       } finally {

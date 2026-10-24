@@ -2,9 +2,8 @@
  * An analysis mode built on gene expression has no form to offer while no
  * genes are published: after choosing None, or on a dataset exported without
  * them. Its requirements say so, and the one requirement validator every form
- * renders through refuses before any form control reads the dataset — which is
- * where "Performance settings require an exact positive dataset pointCount"
- * used to escape as a page error.
+ * renders through refuses before any form control reads the dataset, so no
+ * control fails on a dataset without genes as a page error.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

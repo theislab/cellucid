@@ -13,10 +13,11 @@
  * in `anndata-provider.js`, which serves h5ad:// and zarr:// alike.
  */
 
-import { getNotificationCenter } from '../app/notification-center.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { BaseAnnDataAdapter, requireAnnDataLaunchDefaults } from './base-anndata-adapter.js';
 import { AnnDataReaderClient } from './anndata-reader-client.js';
+import { stoppableOpening } from './opening-progress.js';
+import { describeAnnDataStorage } from './anndata-storage.js';
 import {
   getMetadataLoadSignal,
   throwIfMetadataAborted,
@@ -71,6 +72,9 @@ export class H5adDataSource {
     /** @type {Object|null} */
     this._metadata = null;
 
+    /** @type {Readonly<import('./anndata-storage.js').AnnDataStorage>|null} */
+    this._storage = null;
+
     /** @type {number} Latest file-selection request identity */
     this._loadRequestId = 0;
 
@@ -106,7 +110,9 @@ export class H5adDataSource {
    * @param {File|{url: string, size: number, name: string}} file - A file
    *   from a file input, or a remote file read in place with range requests
    * @param {Object} [options]
-   * @param {boolean} [options.showProgress=true]
+   * @param {AbortSignal|null} [options.signal] - Stops the opening where it
+   *   is (its reader worker and every request it made end); Cancel on the
+   *   opening progress does the same (`data/opening-progress.js`)
    * @param {string} [options.datasetId] - The id the caller serves the
    *   dataset under (a catalog's, a server's); without one, the id the file
    *   states (`uns['cellucid']['id']`), else `defaultDatasetId`
@@ -134,13 +140,13 @@ export class H5adDataSource {
     const requestId = ++this._loadRequestId;
     const remoteHost = typeof file.url === 'string' ? new URL(file.url).host : null;
     const {
-      showProgress = true,
+      signal = null,
       defaults = {},
       datasetId = null,
       defaultDatasetId = `h5ad_${file.name.replace(/\.h5ad$/i, '')}`,
       name = file.name.replace(/\.h5ad$/i, ''),
       preferFileName = false,
-      description = 'Loaded directly from H5AD file',
+      description = '',
       source = {
         name: 'H5AD file',
         filename: file.name,
@@ -148,20 +154,26 @@ export class H5adDataSource {
     } = options;
     // Launch defaults are checked before anything is read.
     requireAnnDataLaunchDefaults(defaults);
-    const notifications = showProgress ? getNotificationCenter() : null;
-    const trackerId = notifications
-      ? notifications.startDownload(file.name || 'H5AD file')
-      : null;
 
     // Validate a candidate completely before releasing the working dataset.
     const candidateReader = new AnnDataReaderClient({ kind: 'h5ad' });
+    // Shown from its first moment; Cancel or `signal` close the candidate's
+    // reader, which ends its worker and every request it made.
+    const opening = stoppableOpening({
+      title: file.name,
+      step: remoteHost === null ? 'Reading the file' : `Connecting to ${remoteHost}`,
+      signal,
+      stop: () => candidateReader.close(),
+    });
     let candidateAdapter = null;
     let adopted = false;
     try {
       await candidateReader.open(file);
+      opening.throwIfStopped();
       this._assertLoadRequest(requestId);
       candidateAdapter = new H5adDataAdapter(candidateReader, { defaults });
       await candidateAdapter.initialize();
+      opening.throwIfStopped();
       this._assertLoadRequest(requestId);
 
       const candidateFilename = file.name;
@@ -179,29 +191,24 @@ export class H5adDataSource {
         });
       this._assertLoadRequest(requestId);
 
+      const candidateStorage = describeAnnDataStorage('h5ad', file, { name: candidateFilename });
       this._releaseCurrentSource();
       this._loader = candidateReader;
       this._adapter = candidateAdapter;
+      this._storage = candidateStorage;
       this.filename = candidateFilename;
       this.datasetId = candidateDatasetId;
       this._metadata = candidateMetadata;
       adopted = true;
 
       console.log(`[H5adDataSource] Loaded ${file.name}: ${this._loader.nObs} cells, ${this._loader.nVars} genes`);
-      if (notifications !== null) {
-        notifications.completeDownload(trackerId);
-        notifications.info(
-          'Opened H5AD directly in the browser. It is read ' +
-          (remoteHost === null ? 'from disk' : `in place from ${remoteHost}`) +
-          ' as each view needs it; a row-major ' +
-          '(CSR) matrix is indexed by gene the first time a gene is shown.',
-          { duration: 15000 }
-        );
-      }
-
+      opening.release();
+      opening.handle.end();
       return this._metadata;
-    } catch (error) {
-      let terminalError = error instanceof Error
+    } catch (thrown) {
+      opening.release();
+      const error = opening.outcome(thrown);
+      let terminalError = error instanceof Error || error?.name === 'AbortError'
         ? error
         : new TypeError(
             'H5AD source loading must reject with an Error.',
@@ -222,21 +229,7 @@ export class H5adDataSource {
           );
         }
       }
-      if (!adopted && notifications !== null) {
-        try {
-          if (requestId !== this._loadRequestId) {
-            notifications.dismissDownload(trackerId);
-          } else {
-            notifications.failDownload(trackerId, terminalError.message);
-          }
-        } catch (reportingFailure) {
-          terminalError = combineDatasetLifecycleFailures(
-            terminalError,
-            reportingFailure,
-            'H5AD source loading and failure reporting both failed.'
-          );
-        }
-      }
+      opening.handle.fail(terminalError);
       throw terminalError;
     }
   }
@@ -442,6 +435,15 @@ export class H5adDataSource {
     this.datasetId = null;
     this.filename = null;
     this._metadata = null;
+    this._storage = null;
+  }
+
+  /**
+   * Where the open file is kept (`data/anndata-storage.js`), or null.
+   * @returns {Readonly<import('./anndata-storage.js').AnnDataStorage>|null}
+   */
+  describeStorage() {
+    return this._storage;
   }
 
   /**

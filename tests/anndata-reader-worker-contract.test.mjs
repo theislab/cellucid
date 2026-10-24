@@ -47,7 +47,7 @@ function servingOverLink(latency, rate) {
   };
 }
 
-test('a matrix is indexed by gene at open over a link as fast as a disk, at the first gene over a slower one', async t => {
+test('a cell-major matrix is indexed by gene at open over a link as fast as a disk, a dense one and any over a slower link at the first gene', async t => {
   // The index of a cell-major matrix reads its whole index array: over a
   // slow link that waits until a gene is shown, so opening downloads only
   // what its first view draws. The decision follows the link the reader
@@ -59,12 +59,25 @@ test('a matrix is indexed by gene at open over a link as fast as a disk, at the 
   const indexStarted = events => events.some(event => event.event === 'activity' && event.kind === 'index');
   const settle = () => new Promise(resolve => setTimeout(resolve, 20));
 
+  // A local cell-major (CSR) matrix: its index starts at once.
+  const csr = new Uint8Array(readFileSync(new URL('./browser/fixtures/legacy-twin-current.h5ad', import.meta.url)));
   const local = [];
   const localCall = handlerWith(local);
-  await localCall('open', { kind: 'h5ad', source: new File([bytes], 'x.h5ad') });
+  await localCall('open', { kind: 'h5ad', source: new File([csr], 'csr.h5ad') });
   await localCall('prepareMatrix', 'X');
   await settle();
-  assert.ok(indexStarted(local), 'a local file starts its index at once');
+  assert.ok(indexStarted(local), 'a local CSR file starts its index at once');
+
+  // A dense matrix's index holds every value: even local, it is built when
+  // its first gene is asked for, never ahead.
+  const dense = [];
+  const denseCall = handlerWith(dense);
+  await denseCall('open', { kind: 'h5ad', source: new File([bytes], 'x.h5ad') });
+  await denseCall('prepareMatrix', 'X');
+  await settle();
+  assert.ok(!indexStarted(dense), 'a dense matrix is not indexed ahead');
+  await denseCall('getMatrixColumn', 'X', 0);
+  assert.ok(indexStarted(dense), 'its first gene starts its index');
 
   // A slow link: a 20 ms round trip, 100 kB/s.
   globalThis.fetch = servingOverLink(20, 100);

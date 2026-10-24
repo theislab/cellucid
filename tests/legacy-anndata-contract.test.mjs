@@ -27,13 +27,13 @@ function fixtureFile(name) {
 
 async function openH5ad(name) {
   const source = new H5adDataSource();
-  await source.loadFromFile(fixtureFile(name), { showProgress: false, preferFileName: true });
+  await source.loadFromFile(fixtureFile(name), { preferFileName: true });
   return source;
 }
 
 async function openZarr(name) {
   const source = new ZarrDataSource();
-  await source.loadFromArchiveFile(fixtureFile(name), { showProgress: false, preferFileName: true });
+  await source.loadFromArchiveFile(fixtureFile(name), { preferFileName: true });
   return source;
 }
 

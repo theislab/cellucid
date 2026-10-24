@@ -30,7 +30,7 @@ let workerPoolModule = null;
 let computeManagerInstance = null;
 
 const BACKENDS = new Set(['worker', 'cpu']);
-const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer']);
+const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer', 'onTiming']);
 const BROADCAST_OPTIONS = new Set([...EXECUTION_OPTIONS, 'retainAs', 'releases']);
 
 function now() {
@@ -195,6 +195,12 @@ export class ComputeManager {
     ) {
       throw new TypeError('Compute transfer must be exactly boolean');
     }
+    if (
+      Object.hasOwn(options, 'onTiming')
+      && typeof options.onTiming !== 'function'
+    ) {
+      throw new TypeError('Compute onTiming must be a function');
+    }
   }
 
   _assertBackendSupported(backend, operation) {
@@ -326,9 +332,13 @@ export class ComputeManager {
     switch (backend) {
       case 'worker':
         return this._executeWorker(operation, payload, options);
-      case 'cpu':
+      case 'cpu': {
         throwIfAborted(options.signal);
-        return this._executeCPU(operation, payload);
+        const startedAt = now();
+        const result = await this._executeCPU(operation, payload);
+        options.onTiming?.({ queueMs: 0, runMs: now() - startedAt });
+        return result;
+      }
       default:
         throw new Error(`Unknown compute backend: ${backend}`);
     }
@@ -340,9 +350,10 @@ export class ComputeManager {
       throw new Error('Web Worker backend is unavailable');
     }
 
-    const { timeout = 30000, signal = null, transfer } = options;
+    const { timeout = 30000, signal = null, transfer, onTiming } = options;
     const workerOptions = { timeout, signal };
     if (transfer !== undefined) workerOptions.transfer = transfer;
+    if (onTiming !== undefined) workerOptions.onTiming = onTiming;
     try {
       return await backend.execute(operation, payload, workerOptions);
     } finally {

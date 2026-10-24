@@ -1,0 +1,302 @@
+/* components/_welcome.css - The brand card.
+
+   One card for every surface that speaks for Cellucid as a whole rather than
+   for one panel: the welcome dialog, the standalone pages (404.html,
+   privacy.html, assets/auth/callback.html) and the startup failure screen
+   (app/startup-failure.js, ui/core/code-load-watch.js). Each one fills it with
+   its own content in the same order: the wordmark, a calm heading, one short
+   sentence, clear actions, quiet links, and technical detail folded away.
+
+   The main app imports it through components/_index.css; the standalone pages
+   through page.css. Page placement lives in layouts/_page.css. */
+
+/* =========================================================================
+   Welcome dialog: the card over the viewer
+   ========================================================================= */
+
+.welcome-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.welcome-modal.hidden {
+  display: none;
+}
+
+.welcome-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+  backdrop-filter: blur(4px);
+}
+
+/* =========================================================================
+   The card
+   ========================================================================= */
+
+.welcome-content {
+  position: relative;
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
+  max-width: 420px;
+  width: 100%;
+  /* On a short screen (a phone held sideways) the card is taller than the
+     viewport; it scrolls inside the overlay instead of losing its top and
+     bottom past the screen edges. */
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+.welcome-header {
+  margin: var(--space-3) var(--space-3) 0;
+  padding: var(--space-3) var(--space-3) var(--space-2-5);
+  text-align: center;
+  background: var(--color-surface-secondary);
+  border: var(--border-light);
+}
+
+.welcome-header > a {
+  display: inline-block;
+}
+
+.welcome-logo {
+  display: block;
+  width: 240px;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto var(--space-1-5);
+}
+
+/* A header that carries only the wordmark has no line below it to space. */
+.welcome-header > .welcome-logo:last-child,
+.welcome-header > a:last-child > .welcome-logo {
+  margin-bottom: 0;
+}
+
+/* The wordmark is grey-scale ink drawn for a light surface. In the dark theme
+   it is inverted (the hue rotation keeps any tint where it was), so the card
+   follows the theme like every other surface. */
+:root[data-theme="dark"] .welcome-logo {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+.welcome-tagline {
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+.welcome-body {
+  padding: var(--space-3);
+}
+
+/* The calm heading: the card's one title, the size of a dialog title. */
+.welcome-title {
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  margin: 0 0 var(--space-2);
+  text-align: center;
+}
+
+.welcome-intro {
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
+  color: var(--color-text-secondary);
+  margin: 0 0 var(--space-3);
+  text-align: center;
+}
+
+/* =========================================================================
+   Actions: one row per choice, the first one filled
+   ========================================================================= */
+
+.welcome-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.welcome-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  width: 100%;
+  padding: var(--space-2-5) var(--space-3);
+  background: var(--color-surface-secondary);
+  border: var(--border-default);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  text-decoration: none;
+  color: var(--color-text-primary);
+  transition: var(--transition-colors);
+}
+
+.welcome-btn:hover {
+  background: var(--color-border-light);
+}
+
+.welcome-btn-primary {
+  background: var(--color-text-primary);
+  border-color: var(--color-text-primary);
+  color: var(--color-text-inverse);
+}
+
+.welcome-btn-primary:hover {
+  background: var(--color-interactive-primary-hover);
+}
+
+.welcome-btn-icon {
+  font-size: var(--control-glyph-lg);
+  width: var(--space-6);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.welcome-btn-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-0-5);
+}
+
+.welcome-btn-title {
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-medium);
+}
+
+.welcome-btn-desc {
+  font-size: var(--type-label);
+  color: inherit;
+  opacity: var(--opacity-70);
+}
+
+.welcome-btn-link {
+  background: transparent;
+}
+
+/* =========================================================================
+   Quiet links and folded detail at the foot of the card
+   ========================================================================= */
+
+.welcome-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2-5) 0 0;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  list-style: none;
+  font-size: var(--type-label);
+}
+
+.welcome-links li {
+  margin: 0;
+}
+
+.welcome-links a {
+  color: var(--color-text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.welcome-links a:hover {
+  color: var(--color-text-primary);
+}
+
+/* What went wrong, for whoever asks: the exact message, folded by default. */
+.welcome-details {
+  margin: var(--space-3) 0 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.welcome-details > summary {
+  width: fit-content;
+  margin: 0 auto;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
+.welcome-details > summary:hover {
+  color: var(--color-text-primary);
+}
+
+.welcome-details-text {
+  margin: var(--space-2) 0 0;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-light);
+  line-height: var(--leading-relaxed);
+  overflow-wrap: anywhere;
+}
+
+/* =========================================================================
+   The welcome dialog's closing quote
+   ========================================================================= */
+
+.welcome-quote {
+  margin: var(--space-3) 0 0;
+  padding-top: var(--space-3);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  font-style: italic;
+  font-size: var(--type-body);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.welcome-quote-explanation {
+  display: block;
+  font-style: normal;
+  font-size: var(--type-compact);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-1);
+  opacity: var(--opacity-60);
+}
+
+.welcome-quote-text {
+  display: block;
+  opacity: var(--opacity-80);
+}
+
+.welcome-quote-attr {
+  display: block;
+  font-style: normal;
+  font-size: var(--type-hint);
+  margin-top: var(--space-1);
+  opacity: var(--opacity-60);
+}
+
+.welcome-quote-book {
+  font-style: italic;
+}
+
+/* A phone: the card keeps a gutter and a smaller wordmark. */
+@media (max-width: 480px) {
+  .welcome-modal .welcome-content {
+    margin: var(--space-2-5);
+  }
+
+  .welcome-header {
+    margin: var(--space-2-5) var(--space-2-5) 0;
+  }
+
+  .welcome-logo {
+    width: 160px;
+  }
+
+  .welcome-body {
+    padding: var(--space-2-5);
+  }
+}

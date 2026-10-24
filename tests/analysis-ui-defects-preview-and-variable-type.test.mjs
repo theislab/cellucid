@@ -77,6 +77,7 @@ class FakeElement {
     this.style = new FakeStyle();
     this.attributes = new Map();
     this.listeners = new Map();
+    this.dataset = {};
     this.id = '';
     this.title = '';
     this.textContent = '';
@@ -93,6 +94,17 @@ class FakeElement {
 
   get innerHTML() {
     return '';
+  }
+
+  prepend(...nodes) {
+    for (const node of nodes.reverse()) {
+      node.parentNode = this;
+      this.children.unshift(node);
+    }
+  }
+
+  get childElementCount() {
+    return this.children.length;
   }
 
   appendChild(child) {
@@ -179,6 +191,9 @@ const PREVIEW_MODES = [
     label: 'Differential Expression',
     prototype: DEAnalysisUI.prototype,
     plotType: '__defects-de-preview__',
+    result: {
+      full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10 } },
+    },
     configure(ui) {
       ui._plotContainerIdBase = 'de-preview';
     }
@@ -187,6 +202,7 @@ const PREVIEW_MODES = [
     label: 'Gene Signature',
     prototype: GeneSignatureUI.prototype,
     plotType: '__defects-signature-preview__',
+    result: { raw: { sets: [], unscored: [] } },
     configure(ui) {
       ui._instanceId = 'signature-preview';
     }
@@ -195,9 +211,19 @@ const PREVIEW_MODES = [
     label: 'Marker Genes',
     prototype: GenesPanelUI.prototype,
     plotType: '__defects-genes-panel-preview__',
+    result: {
+      data: { matrix: { nRows: 1, nCols: 2, genes: ['G'], groupIds: ['a', 'b'], groupNames: ['a', 'b'], values: Float32Array.of(0, 1) }, clustering: null },
+      stats: { groups: [] },
+      selection: { groups: [], shownGenes: ['G'] },
+      metadata: {
+        method: 'wilcox', correction: 'bh', geneCount: 1, testedCount: 2, groupBy: 'g',
+        skippedGroups: [], pooledGroups: [], lowNGroups: [], cached: false,
+      },
+    },
     configure(ui) {
-      ui._plotContainerId = 'genes-panel-preview';
-      ui._currentMode = 'clustered';
+      ui._instanceId = 'genes-panel-preview';
+      ui._show = 'heatmap';
+      ui._hoverOwners = new Map();
       ui._setupHoverContext = () => {};
     }
   }
@@ -239,7 +265,7 @@ test('CEL-0058: every analysis preview renders one real Expand button', async ()
       for (const modeCase of PREVIEW_MODES) {
         const { ui, modalOpens } = previewHarness(modeCase);
         const requestId = ui._startAnalysisRequest();
-        await ui._showResult({ plotType: modeCase.plotType }, requestId);
+        await ui._showResult({ plotType: modeCase.plotType, ...(modeCase.result ?? {}) }, requestId);
         ui._finishAnalysisRequest(requestId);
 
         const buttons = ui._resultContainer.querySelectorAll('.analysis-expand-btn');

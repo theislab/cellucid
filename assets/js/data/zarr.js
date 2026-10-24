@@ -13,10 +13,11 @@
  * in `anndata-provider.js`, which serves zarr:// and h5ad:// alike.
  */
 
-import { getNotificationCenter } from '../app/notification-center.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { BaseAnnDataAdapter, requireAnnDataLaunchDefaults } from './base-anndata-adapter.js';
 import { AnnDataReaderClient } from './anndata-reader-client.js';
+import { stoppableOpening } from './opening-progress.js';
+import { describeAnnDataStorage } from './anndata-storage.js';
 import {
   combineDatasetLifecycleFailures,
   createDatasetReloadSupersededError,
@@ -111,6 +112,9 @@ export class ZarrDataSource {
     /** @type {Object|null} */
     this._metadata = null;
 
+    /** @type {Readonly<import('./anndata-storage.js').AnnDataStorage>|null} */
+    this._storage = null;
+
     /** @type {number} Latest directory-selection request identity */
     this._loadRequestId = 0;
 
@@ -141,72 +145,27 @@ export class ZarrDataSource {
     return this._loader !== null && this._loader.isOpen;
   }
 
-  _showDirectLoadWarning(kind) {
-    const notifications = getNotificationCenter();
-    notifications.info(
-      `Opened a Zarr ${kind} directly in the browser. Its chunks are read as each ` +
-      'view needs them; a row-major (CSR) ' +
-      'matrix is indexed by gene the first time a gene is shown.',
-      { duration: 15000 }
-    );
-  }
-
-  async _runLoadTransaction(
-    requestId,
-    progressName,
-    showProgress,
-    operation
-  ) {
-    const notifications = showProgress ? getNotificationCenter() : null;
-    const trackerId = notifications
-      ? notifications.startDownload(progressName)
-      : null;
-    let adopted = false;
-    try {
-      const result = await operation();
-      this._assertLoadRequest(requestId);
-      adopted = true;
-      if (notifications !== null) {
-        notifications.completeDownload(trackerId);
-      }
-      return result;
-    } catch (error) {
-      let terminalError = error instanceof Error
-        ? error
-        : new TypeError(
-            'Zarr source loading must reject with an Error.',
-            { cause: error }
-          );
-      if (!adopted && notifications !== null) {
-        try {
-          if (requestId !== this._loadRequestId) {
-            notifications.dismissDownload(trackerId);
-          } else {
-            notifications.failDownload(trackerId, terminalError.message);
-          }
-        } catch (reportingFailure) {
-          terminalError = combineDatasetLifecycleFailures(
-            terminalError,
-            reportingFailure,
-            'Zarr source loading and failure reporting both failed.'
-          );
-        }
-      }
-      throw terminalError;
-    }
-  }
-
-  async _loadCandidate(requestId, source, identityOptions) {
+  /**
+   * Open one store as a candidate and adopt it once it is complete. The
+   * opening is shown from its first moment (`data/opening-progress.js`);
+   * Cancel or `signal` close the candidate's reader, which ends its worker
+   * and every request it made.
+   * @private
+   */
+  async _loadCandidate(requestId, source, identityOptions, { title, step, signal = null }) {
     // Launch defaults are checked before anything is read.
     const defaults = requireAnnDataLaunchDefaults(identityOptions.defaults ?? {});
     const candidateReader = new AnnDataReaderClient({ kind: 'zarr' });
+    const opening = stoppableOpening({ title, step, signal, stop: () => candidateReader.close() });
     let candidateAdapter = null;
     let adopted = false;
     try {
       const { name: candidateDirname } = await candidateReader.open(source);
+      opening.throwIfStopped();
       this._assertLoadRequest(requestId);
       candidateAdapter = new ZarrDataAdapter(candidateReader, { defaults });
       await candidateAdapter.initialize();
+      opening.throwIfStopped();
       this._assertLoadRequest(requestId);
 
       // A store is named by its folder or archive, without `.zarr`/`.zip`.
@@ -226,9 +185,14 @@ export class ZarrDataSource {
         });
       this._assertLoadRequest(requestId);
 
+      const candidateStorage = describeAnnDataStorage('zarr', source, {
+        name: candidateDirname,
+        zarrVersion: candidateReader.zarrVersion,
+      });
       this._releaseCurrentSource();
       this._loader = candidateReader;
       this._adapter = candidateAdapter;
+      this._storage = candidateStorage;
       this.dirname = candidateDirname;
       this.datasetId = candidateDatasetId;
       this._metadata = candidateMetadata;
@@ -238,8 +202,12 @@ export class ZarrDataSource {
         `[ZarrDataSource] Loaded ${this.dirname}: ` +
         `${this._loader.nObs} cells, ${this._loader.nVars} genes`
       );
+      opening.release();
+      opening.handle.end();
       return this._metadata;
-    } catch (error) {
+    } catch (thrown) {
+      opening.release();
+      const error = opening.outcome(thrown);
       let terminalError = error instanceof Error
         ? error
         : new TypeError(
@@ -261,6 +229,7 @@ export class ZarrDataSource {
           );
         }
       }
+      opening.handle.fail(terminalError);
       throw terminalError;
     }
   }
@@ -269,7 +238,8 @@ export class ZarrDataSource {
    * Load a zarr directory from FileList
    * @param {FileList} fileList - FileList from <input type="file" webkitdirectory>
    * @param {Object} [options]
-   * @param {boolean} [options.showProgress=true]
+   * @param {AbortSignal|null} [options.signal] - Stops the opening where it
+   *   is; Cancel on the opening progress does the same
    * @param {string} [options.datasetId] - The id the caller serves the
    *   dataset under; without one, the id the store states
    *   (`uns['cellucid']['id']`), else `defaultDatasetId`
@@ -292,12 +262,12 @@ export class ZarrDataSource {
 
     const requestId = ++this._loadRequestId;
     const {
-      showProgress = true,
+      signal = null,
       defaults = {},
       datasetId = null,
       defaultDatasetId = null,
       preferFileName = false,
-      description = 'Loaded directly from Zarr directory',
+      description = '',
       source = {
         name: 'Zarr directory',
       },
@@ -306,18 +276,12 @@ export class ZarrDataSource {
       fileList[0].webkitRelativePath || fileList[0].name
     ).replace(/\\/g, '/');
     const candidateDirname = firstPath.split('/')[0];
-    const result = await this._runLoadTransaction(
+    return this._loadCandidate(
       requestId,
-      candidateDirname || 'Zarr directory',
-      showProgress,
-      () => this._loadCandidate(
-        requestId,
-        zarrStoreFromFileList(fileList),
-        { datasetId, defaultDatasetId, preferFileName, description, source, defaults },
-      )
+      zarrStoreFromFileList(fileList),
+      { datasetId, defaultDatasetId, preferFileName, description, source, defaults },
+      { title: candidateDirname || 'Zarr directory', step: 'Reading the folder', signal },
     );
-    if (showProgress) this._showDirectLoadWarning('directory');
-    return result;
   }
 
   /**
@@ -327,7 +291,8 @@ export class ZarrDataSource {
    * @param {File|Blob|{url: string, size: number, name: string}} file - A
    *   local file, or a remote file read in place with range requests
    * @param {Object} [options]
-   * @param {boolean} [options.showProgress=true]
+   * @param {AbortSignal|null} [options.signal] - Stops the opening where it
+   *   is; Cancel on the opening progress does the same
    * @param {string} [options.datasetId] - The id the caller serves the
    *   dataset under; without one, the id the store states
    *   (`uns['cellucid']['id']`), else `defaultDatasetId`
@@ -356,13 +321,13 @@ export class ZarrDataSource {
 
     const requestId = ++this._loadRequestId;
     const {
-      showProgress = true,
+      signal = null,
       defaults = {},
       datasetId = null,
       defaultDatasetId = null,
       name = null,
       preferFileName = false,
-      description = 'Loaded directly from Zarr ZIP archive',
+      description = '',
       source = {
         name: 'Zarr ZIP archive',
         ...(typeof file.name === 'string'
@@ -370,18 +335,16 @@ export class ZarrDataSource {
           : {}),
       },
     } = options;
-    const result = await this._runLoadTransaction(
+    return this._loadCandidate(
       requestId,
-      file.name || 'Zarr ZIP archive',
-      showProgress,
-      () => this._loadCandidate(
-        requestId,
-        { archive: file },
-        { datasetId, defaultDatasetId, name, preferFileName, description, source, defaults },
-      )
+      { archive: file },
+      { datasetId, defaultDatasetId, name, preferFileName, description, source, defaults },
+      {
+        title: file.name || 'Zarr ZIP archive',
+        step: remote ? `Connecting to ${new URL(file.url).host}` : 'Reading the archive',
+        signal,
+      },
     );
-    if (showProgress) this._showDirectLoadWarning('ZIP archive');
-    return result;
   }
 
   /**
@@ -410,71 +373,21 @@ export class ZarrDataSource {
     }
     const requestId = ++this._loadRequestId;
     const {
-      showProgress = true,
+      signal = null,
       defaults = {},
       datasetId = null,
       defaultDatasetId = null,
       name = null,
       preferFileName = false,
-      description = 'Read in place from a Zarr store on a web host',
+      description = '',
       source = { name: 'Zarr store', filename: folder.name },
     } = options;
-    return this._runLoadTransaction(
+    return this._loadCandidate(
       requestId,
-      folder.name || 'Zarr store',
-      showProgress,
-      () => this._loadCandidate(
-        requestId,
-        { url: folder.url, name: folder.name },
-        { datasetId, defaultDatasetId, name, preferFileName, description, source, defaults },
-      )
+      { url: folder.url, name: folder.name },
+      { datasetId, defaultDatasetId, name, preferFileName, description, source, defaults },
+      { title: folder.name || 'Zarr store', step: `Connecting to ${new URL(folder.url).host}`, signal },
     );
-  }
-
-  /**
-   * Load an already indexed Zarr v2 store transactionally.
-   * Primarily used by archive/container adapters.
-   *
-   * @param {Map<string, File|Object>} files
-   * @param {string} rootName
-   * @param {Object} [options]
-   * @param {boolean} [options.showProgress=true]
-   * @param {string} [options.datasetId] - The id the caller serves the
-   *   dataset under; without one, the id the store states
-   *   (`uns['cellucid']['id']`), else `defaultDatasetId`
-   * @param {string} [options.defaultDatasetId] - The id of a store that states
-   *   none; `zarr_<folder name>` by default
-   * @param {string} [options.description]
-   * @param {Object} [options.source]
-   * @param {Object} [options.defaults] - Launch defaults: the choices the
-   *   dataset opens with (`requireAnnDataLaunchDefaults`)
-   * @returns {Promise<Object>}
-   */
-  async loadFromFileMap(files, rootName, options = {}) {
-    const requestId = ++this._loadRequestId;
-    const {
-      showProgress = true,
-      defaults = {},
-      datasetId = null,
-      defaultDatasetId = null,
-      preferFileName = false,
-      description = 'Loaded directly from Zarr store',
-      source = {
-        name: 'Zarr store',
-      },
-    } = options;
-    const result = await this._runLoadTransaction(
-      requestId,
-      rootName || 'Zarr store',
-      showProgress,
-      () => this._loadCandidate(
-        requestId,
-        { files, rootName },
-        { datasetId, defaultDatasetId, preferFileName, description, source, defaults },
-      )
-    );
-    if (showProgress) this._showDirectLoadWarning('store');
-    return result;
   }
 
   /**
@@ -677,6 +590,15 @@ export class ZarrDataSource {
     this.datasetId = null;
     this.dirname = null;
     this._metadata = null;
+    this._storage = null;
+  }
+
+  /**
+   * Where the open store is kept (`data/anndata-storage.js`), or null.
+   * @returns {Readonly<import('./anndata-storage.js').AnnDataStorage>|null}
+   */
+  describeStorage() {
+    return this._storage;
   }
 
   /**

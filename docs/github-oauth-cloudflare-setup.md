@@ -272,8 +272,9 @@ Official GitHub reference:
 
 ## 4. Run the local contract gates
 
-Use Node.js 20 or newer for the source contracts. The pinned Wrangler bundle
-gate requires Node.js 22 or newer and runs under Node.js 24 in CI. The tests
+Use Node.js 22.15 or newer (`package.json` `engines.node`) for the source
+contracts and the pinned Wrangler bundle gate, which runs under Node.js 24 in
+CI. The tests
 execute the Worker directly with mocked GitHub responses and do not modify
 Cloudflare or GitHub:
 

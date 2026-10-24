@@ -104,6 +104,87 @@ export const READ_AHEAD_BYTES_PER_MS = 64 * 1000;
 
 const now = () => performance.now();
 
+/**
+ * How long a request to a web host may stay silent before it is taken for
+ * stalled, from the answers measured on the link: TCP's retransmission
+ * timeout (RFC 6298), applied to the time a request waits for its answer.
+ *
+ * - Each answer's wait `R` updates the smoothed wait and its variation
+ *   (`SRTT`, `RTTVAR`; alpha 1/8, beta 1/4); the timeout is
+ *   `SRTT + 4 * RTTVAR`, never under one second (RFC 6298 2.4), and one
+ *   second until the first answer (2.1).
+ * - Each stall doubles it (5.5), and the next answer computes it afresh
+ *   (5.7): a host that has slowed down is given longer, at once.
+ *
+ * A request is stalled only when neither it nor any other request of the
+ * link has received anything for a whole timeout (`lastActivityAt`): while
+ * the link delivers bytes, a request waiting behind them (in a browser's
+ * HTTP/1.1 queue, or behind an HTTP/2 host's other streams) is waiting, not
+ * stalled; once the link falls silent, every request still open is.
+ */
+export class ResponseClock {
+  /**
+   * @param {{clock?: () => number, bandwidth?: () => number}} [options] -
+   *   `clock` in milliseconds (tests); `bandwidth`, the link's measured bytes
+   *   per millisecond (0 until measured)
+   */
+  constructor({ clock = now, bandwidth = () => 0 } = {}) {
+    this.now = clock;
+    this._bandwidth = bandwidth;
+    this._smoothed = null;
+    this._variation = null;
+    this._backoff = 1;
+    /** When the link last received anything: an answer, or bytes of a body. */
+    this.lastActivityAt = -Infinity;
+    /** Told each time the link receives something (progress for a reader that watches it). */
+    this.onReceived = null;
+    /** Told of each request made again after a transient failure: `(error, attempts)`. */
+    this.onRetry = null;
+  }
+
+  /** A request was answered `waitedMs` after it was sent. */
+  answered(waitedMs) {
+    if (this._smoothed === null) {
+      this._smoothed = waitedMs;
+      this._variation = waitedMs / 2;
+    } else {
+      this._variation = 0.75 * this._variation + 0.25 * Math.abs(this._smoothed - waitedMs);
+      this._smoothed = 0.875 * this._smoothed + 0.125 * waitedMs;
+    }
+    this._backoff = 1;
+    this.received();
+  }
+
+  /** Something arrived on the link (an answer, or bytes of a body). */
+  received() {
+    this.lastActivityAt = this.now();
+    this.onReceived?.();
+  }
+
+  /** A request was taken for stalled: the next ones are given twice as long. */
+  stalled() {
+    this._backoff *= 2;
+  }
+
+  /**
+   * How long a request of `expectedBytes` (0 when its size is not known) and
+   * its link may stay silent before the request is stalled: the timeout, and
+   * the time those bytes take at the link's measured bandwidth, as a host
+   * that answers only once it holds the whole range (a proxy that buffers, a
+   * CDN fetching the object from its origin) is silent for that long.
+   */
+  patienceMs(expectedBytes = 0) {
+    const bandwidth = this._bandwidth();
+    return this.timeoutMs + (expectedBytes > 0 && bandwidth > 0 ? expectedBytes / bandwidth : 0);
+  }
+
+  /** How long a request and its link may stay silent before the request is stalled. */
+  get timeoutMs() {
+    const base = this._smoothed === null ? 1000 : this._smoothed + 4 * this._variation;
+    return Math.max(1000, base) * this._backoff;
+  }
+}
+
 export class LinkMeter {
   /**
    * @param {{concurrency: number, streams?: number, blockBytes: number, mergeGapBytes: number, maxRequestBytes: number, bytesPerMs?: number}} prior
@@ -153,6 +234,8 @@ export class LinkMeter {
      * search has ended.
      */
     this._search = { settled: false, previousRate: null, since: null, completed: 0 };
+    /** When a request to this link is stalled (`ResponseClock`). */
+    this.responses = new ResponseClock({ clock, bandwidth: () => this.bytesPerMs });
   }
 
   /**

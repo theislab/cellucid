@@ -11,7 +11,7 @@
  * @module data/sources/providers/huggingface
  */
 
-import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
 import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
 
 const HUB = 'https://huggingface.co';
@@ -81,7 +81,7 @@ export default Object.freeze({
     const parsed = parseHf(input, explicit);
     return parsed === null ? null : canonical(parsed);
   },
-  async open(value, { signal = null } = {}) {
+  async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseHf(value);
     if (parsed === null) {
       throw new DataSourceError(
@@ -93,7 +93,7 @@ export default Object.freeze({
     }
     const { user, repo, revision, path } = parsed;
     const repoId = `${user}/${repo}`;
-    const response = await fetch(
+    const response = await fetchWhenNotBusy(
       `${HUB}/api/datasets/${repoId}/revision/${encodeURIComponent(revision)}?blobs=true`,
       { signal }
     );
@@ -173,6 +173,7 @@ export default Object.freeze({
       version: `hf:${commit}:${sibling?.lfs?.sha256 ?? sibling?.blobId ?? ''}`,
       attribution,
       signal,
+      onStep,
     });
     return { title: `${repoId}/${filePath}`, file, attribution: file.attribution };
   },

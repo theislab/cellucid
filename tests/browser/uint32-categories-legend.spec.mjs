@@ -31,7 +31,7 @@ test('a field with more categories than uint16 carries loads, and its legend bui
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(fixturePath);
   await expect(page.locator('#dataset-name')).toHaveText('uint32 categories');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });

@@ -34,7 +34,13 @@ export const OperationType = {
   COMPUTE_DENSITY_PLAN: 'COMPUTE_DENSITY_PLAN',
   COMPUTE_PAIRWISE_DISTANCES: 'COMPUTE_PAIRWISE_DISTANCES',
   COMPUTE_AGGLOMERATION: 'COMPUTE_AGGLOMERATION',
-  COMPUTE_CSV_EXPORT: 'COMPUTE_CSV_EXPORT'
+  COMPUTE_CSV_EXPORT: 'COMPUTE_CSV_EXPORT',
+  COMPUTE_GENE_MOMENTS: 'COMPUTE_GENE_MOMENTS',
+  // --- composition and dot plot ---
+  COMPOSITION_COUNTS: 'COMPOSITION_COUNTS',
+  GROUP_SUMMARY_SET_CONTEXT: 'GROUP_SUMMARY_SET_CONTEXT',
+  GROUP_SUMMARY_COMPUTE_GENES: 'GROUP_SUMMARY_COMPUTE_GENES',
+  GROUP_SUMMARY_CLEAR_CONTEXT: 'GROUP_SUMMARY_CLEAR_CONTEXT'
 };
 
 // ============================================================================
@@ -184,6 +190,44 @@ const Operations = {
     id: OperationType.COMPUTE_CSV_EXPORT,
     name: 'Compute CSV Export',
     description: 'The lines of a range of rows of a per-cell CSV file, as a Blob',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_GENE_MOMENTS]: {
+    id: OperationType.COMPUTE_GENE_MOMENTS,
+    name: 'Compute Gene Moments',
+    description: 'Sum, sum of squares and non-zero count of one gene column over every cell',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  // --- composition and dot plot ---
+  [OperationType.COMPOSITION_COUNTS]: {
+    id: OperationType.COMPOSITION_COUNTS,
+    name: 'Composition Counts',
+    description: 'Cells of each cell type in each sample or condition, in one pass over the cells',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_SET_CONTEXT]: {
+    id: OperationType.GROUP_SUMMARY_SET_CONTEXT,
+    name: 'Set Group Summary Context',
+    description: 'Hold the group of every cell for a dot plot run',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_COMPUTE_GENES]: {
+    id: OperationType.GROUP_SUMMARY_COMPUTE_GENES,
+    name: 'Group Summary of Genes',
+    description: 'Per-group sum, cells above the expression cutoff and their sum, for a run of genes',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_CLEAR_CONTEXT]: {
+    id: OperationType.GROUP_SUMMARY_CLEAR_CONTEXT,
+    name: 'Clear Group Summary Context',
+    description: 'Release the groups of a dot plot run',
     workerCapable: true,
     cpuCapable: true
   }

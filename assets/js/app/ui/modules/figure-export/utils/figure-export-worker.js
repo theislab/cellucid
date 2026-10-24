@@ -6,10 +6,13 @@
  * canvas and writes the SVG's annotations; this worker does the rest:
  *
  * - `visibleBounds`: the axis bounds of the drawn points (one pass over N);
+ * - `webgl2`: whether this thread can draw a point pass (an OffscreenCanvas
+ *   WebGL2 context);
  * - `rasterizePoints`: the shader-accurate point pass, on an OffscreenCanvas
- *   WebGL2 context the worker owns, returned as an ImageBitmap the page
+ *   WebGL2 context this thread owns, returned as an ImageBitmap the page
  *   composites (`webgl-point-rasterizer.js`);
- * - `rasterizePointsPngDataUrl`: the Hybrid SVG's point pass, encoded here;
+ * - `encodeRasterPngDataUrl`: the Hybrid SVG's point pass, placed and
+ *   encoded as a PNG data URL;
  * - `svgPointMarkup`: the circles of a Full or Optimized Vector SVG, as one
  *   Blob (`svg-point-markup.js`);
  * - `encodePng` / `encodePngDataUrl`: a composed frame encoded with
@@ -23,6 +26,10 @@
  * Messages: `{ id, op, session, uploads, args }` is answered with
  * `{ id, result }` or `{ id, error }`; `{ op: 'close', session }` has no reply.
  *
+ * Where a worker cannot create a WebGL2 context (WebKitGTK, WPE; `webgl2`
+ * answers false), the page runs this same handler for the point passes
+ * (`spriteZoomLimit`, `rasterizePoints`): `figure-export-worker-client.js`.
+ *
  * @module ui/modules/figure-export/utils/figure-export-worker
  */
 
@@ -33,6 +40,7 @@ import {
 import {
   exportSpriteZoomLimit,
   rasterizePointsWebgl,
+  webgl2RasterAvailable,
 } from './webgl-point-rasterizer.js';
 import { embedPngTextChunks } from './png-metadata.js';
 import { writeSvgPointMarkup } from '../renderers/svg-point-markup.js';
@@ -142,6 +150,8 @@ function placeRaster(bitmap, placement) {
 }
 
 const operations = {
+  webgl2: () => ({ result: webgl2RasterAvailable() }),
+
   spriteZoomLimit: () => ({ result: exportSpriteZoomLimit() }),
 
   visibleBounds: (args) => {
@@ -158,13 +168,12 @@ const operations = {
     return { result: frame, transfer: [frame] };
   },
 
-  rasterizePointsPngDataUrl: async ({ raster, placement }) => {
-    const frame = rasterizePointsWebgl(reviveRasterOptions(raster));
+  encodeRasterPngDataUrl: async ({ bitmap, placement }) => {
     let canvas;
     try {
-      canvas = placement === null ? bitmapCanvas(frame) : placeRaster(frame, placement);
+      canvas = placement === null ? bitmapCanvas(bitmap) : placeRaster(bitmap, placement);
     } finally {
-      if (placement !== null) frame.close();
+      if (placement !== null) bitmap.close();
     }
     const blob = await encodeCanvasPng(
       canvas,
@@ -194,8 +203,9 @@ const operations = {
 };
 
 /**
- * The worker's message handler, also run in-process by the Node contract
- * tests. It answers `{ reply, transfer }`, or null for a message without a
+ * The worker's message handler, also run on the page for the point passes
+ * where a worker cannot draw, and in-process by the Node contract tests. It
+ * answers `{ reply, transfer }`, or null for a message without a
  * reply.
  *
  * @returns {(message: object) => Promise<{reply: object, transfer: Transferable[]}|null>}

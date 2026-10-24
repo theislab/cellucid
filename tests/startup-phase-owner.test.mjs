@@ -75,7 +75,7 @@ test('an ordinary failure is reported as itself, and retire aborts open steps', 
   );
 
   let stepSignal = null;
-  const pending = startup.step('identity', 'h5ad://x/', signal => {
+  const pending = startup.step('dataset', 'h5ad://x/', signal => {
     stepSignal = signal;
     return new Promise((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -113,7 +113,7 @@ test('every network await of the bootstrap runs through the startup owner', asyn
   }
   // After the interface exists, the startup selection loads through the
   // reload, whose network awaits run as deadline-bound startup steps: the
-  // dataset's own metadata and generation as `identity`, the published
+  // dataset's own metadata and generation as `dataset`, the published
   // default session a sample advertises as `session`. Their stall is rethrown
   // to the startup failure surface instead of becoming a sample-view
   // notification.
@@ -132,7 +132,7 @@ test('every network await of the bootstrap runs through the startup owner', asyn
   );
   assert.match(
     reload,
-    /selectionStage = await stagePhases\.step\(\s*'identity',/
+    /selectionStage = await stagePhases\.step\(\s*'dataset',/
   );
   assert.match(
     reload,

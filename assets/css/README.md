@@ -1,6 +1,6 @@
 # Cellucid CSS Design System
 
-`assets/css/main.css` is the single entry point. Styles are organized into CSS Layers so the cascade stays predictable:
+`assets/css/main.css` is the app's entry point, and `assets/css/page.css` the standalone pages' (a subset of the same modules; see Site Design Principles). Styles are organized into CSS Layers so the cascade stays predictable:
 
 - `tokens` → primitive design values (the only place raw hex lives)
 - `themes` → semantic token mapping per theme (`[data-theme="..."]`, currently `light`/`dark`)
@@ -25,6 +25,42 @@
 - Components must use semantic tokens (e.g. `var(--color-text-primary)`), not primitives.
 - Font families come only from `var(--font-sans)` (Inter, all interface text) and `var(--font-mono)` (inline `code` and preformatted output only); only `@font-face` in `base/_fonts.css` names a family directly.
 - Prefer utilities for spacing/typography before adding new bespoke rules.
+
+## Site Design Principles
+
+Every screen of www.cellucid.com is one product: the app, its dialogs, the
+standalone pages (`404.html`, `privacy.html`, `assets/auth/callback.html`) and
+the screens shown when the app cannot run (startup failure, code-load failure,
+`<noscript>`). Each says its own thing, built from the same principles:
+
+1. **Tokens only.** Colour, type, spacing, borders, shadows and motion come
+   from `tokens/` and `themes/`; nothing is styled inline or with a raw value.
+2. **Light and dark.** A page follows the theme the visitor chose in the app
+   (`theme-init.js`) on the viewer's backdrop, and reads in both.
+3. **Composition.** The brand card (`components/_welcome.css`): the wordmark,
+   one calm heading, one short sentence, then clear actions (the first one
+   filled), quiet links at the foot. A reading page widens the card; it does
+   not add a second look.
+4. **Tone.** Tidy, informative, never verbose. Say what happened and what to
+   do, in plain words for the person. Technical detail (a host, a status, an
+   address, an exception) is folded under **Details** and goes to the console
+   and the notification log. Explanations live behind (i) tips and in the
+   documentation; logs live in the notification center.
+5. **Never a dead end.** Every failure offers a way on: try again, continue
+   without what failed, or read the guide.
+6. **Terminal only when the app cannot run** (no WebGL2, its code did not
+   load, no JavaScript). A dataset or link that failed is a failure of that
+   opening, not of the app.
+7. **Flat type scale, square shapes, quiet edges** — the rules below apply to
+   every page, not only the sidebar.
+8. **Everyone can use it.** Phone widths without horizontal scroll, a visible
+   keyboard focus ring, theme contrast held by `theme-contrast-contract`, and
+   `prefers-reduced-motion` stopping motion.
+
+Standalone pages load `assets/css/page.css`: the same layers, tokens, themes
+and base as `main.css`, plus the brand card and `layouts/_page.css`, without
+the app's panels. A rule a page needs goes in the shared module, which the
+app's own copy of that surface (the startup failure screen) uses too.
 
 ## Sidebar Control Standard
 

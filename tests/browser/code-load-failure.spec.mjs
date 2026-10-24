@@ -24,6 +24,14 @@ test('a module that fails to download says so instead of starting forever', asyn
     'data-code-load-failed',
     'true',
   );
+  // The app cannot run, so the startup failure screen says so over it, with
+  // the file that failed folded under Details.
+  const failure = page.locator('#cellucid-startup-failure');
+  await expect(failure).toBeVisible();
+  await expect(failure).toHaveAttribute('data-failure', 'code');
+  await expect(failure.locator('.welcome-title')).toHaveText('Cellucid could not load');
+  await expect(failure.locator('.welcome-details-text')).toContainText('did not download');
+  await expect(failure.getByRole('link', { name: 'Try again' })).toBeVisible();
 });
 
 test('a page whose code loads never reports a code-load failure', async ({

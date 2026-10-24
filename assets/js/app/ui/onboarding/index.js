@@ -4,4 +4,9 @@
  */
 
 export { initKeyboardShortcuts } from './keyboard-shortcuts.js';
-export { initWelcomeModal, showWelcomeModal } from './welcome-modal.js';
+export {
+  hideWelcomeModal,
+  initWelcomeModal,
+  isWelcomeModalVisible,
+  showWelcomeModal
+} from './welcome-modal.js';

@@ -194,7 +194,7 @@ test(
     expect(await publishedWarnings(page)).toEqual([MISSING_GRAPH_MESSAGE]);
 
     // A new dataset is a new generation, even when it also lacks the graph.
-    await page.locator('#user-data-h5ad-input').setInputFiles(h5adFixturePath);
+    await page.locator('#user-data-file-input').setInputFiles(h5adFixturePath);
     await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
     await expect(page.locator('#connectivity-controls')).toBeHidden();
     // Clear the board so the toast counted below can only be a new one.

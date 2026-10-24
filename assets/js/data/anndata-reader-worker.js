@@ -43,10 +43,26 @@
  *   network has not sent is never sent), it stops waiting for shared work (a
  *   gene index other reads still need goes on), and it replies with an
  *   `AbortError`. Nothing replies to the cancel itself.
+ * - `{event: 'link', latencyMs, bytesPerMs, backgroundConcurrency, protocol}`
+ *   whenever the measured link of the open dataset changes
+ *   (`linkMeasurementOf`: a local source reports latency 0 and its decode
+ *   rate); the client keeps the latest (`linkMeasurement()`).
  * - Events: `{event: 'transfer', url, bytes, reads, ms}` with a remote file's running
- *   totals; `{event: 'activity', ...}` for every read operation (what it
+ *   totals, `{event: 'transfer', url, arriving: true}` while bytes of a
+ *   request still under way arrive (at most every 250 ms), and
+ *   `{event: 'transfer', url, retrying}` when a request is made again after
+ *   a transient failure (`retrying` says why, naming the request's URL); `{event: 'activity', ...}` for every read operation (what it
  *   reads, requests, bytes fetched, chunks decoded, progress, outcome), live
  *   while it runs (at most every `ACTIVITY_INTERVAL_MS`) and once when it ends.
+ *
+ * - A remote file behind a sign-in or an expiring link (Google Drive,
+ *   OneDrive) names its access, `{provider, ref, stale?}`; the page owns it.
+ *   The worker asks the page for the URL and headers to read from with
+ *   `{event: 'source-access', request, provider, ref, refresh}` and is
+ *   answered `{sourceAccess: request, target}` (`{url, headers?, expiresAt?}`)
+ *   or `{sourceAccess: request, error}`. `{sourceAccessRevoked: ref}` (a
+ *   sign-out) drops the target it holds. Targets live in this worker's memory
+ *   only and are never posted back, logged or put in an error.
  *
  * Errors cross as plain records (`serializeReaderError`) and are rebuilt
  * with their original class, code and cause on the main thread.
@@ -59,7 +75,7 @@ import { explainFormatError, openAnnDataStore } from './anndata/open.js';
 import { ReadActivity } from '../formats/io/activity.js';
 import { LatentOutlierReader } from './latent-outliers-stream.js';
 import { residencyBudgetBytes } from './memory-budget.js';
-import { configureDecodePool, warmDecodePool } from '../formats/io/decode-pool.js';
+import { configureDecodePool, decodePoolStats, warmDecodePool } from '../formats/io/decode-pool.js';
 import { narrowCategoricalCodes } from './categorical-storage-contract.js';
 
 /** How often a running activity is reported, at most. */
@@ -97,6 +113,16 @@ export function serializeReaderError(error, depth = 0) {
     record.errors = error.errors.map(item => serializeReaderError(item, depth + 1));
   }
   return record;
+}
+
+/** The error the page answered a source access request with, as a plain record. */
+function accessError(record) {
+  const error = new Error(typeof record?.message === 'string' ? record.message : 'The file could not be accessed.');
+  if (typeof record?.name === 'string') error.name = record.name;
+  if (record?.code !== undefined) error.code = record.code;
+  if (typeof record?.sourceType === 'string') error.source = record.sourceType;
+  if (record?.details !== undefined) error.details = record.details;
+  return error;
 }
 
 /**
@@ -190,7 +216,7 @@ function sourceName(source) {
  * Activities whose updates are posted: live, at most every
  * `ACTIVITY_INTERVAL_MS` while running, and always when they end.
  */
-function activityReporter(post) {
+function activityReporter(post, onReport = () => {}) {
   const lastPosted = new Map();
   return ({ kind, label, owner = null, keys = null, background = false }) => new ReadActivity({
     kind,
@@ -205,8 +231,33 @@ function activityReporter(post) {
       if (running) lastPosted.set(activity.id, now);
       else lastPosted.delete(activity.id);
       post({ event: 'activity', ...activity.snapshot() });
+      onReport();
     },
   });
+}
+
+/**
+ * The link the open dataset is read over, as plain data:
+ * `{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`. A remote
+ * source reports its measured link (`formats/io/link.js`); a local one (a
+ * `File`, a picked folder, a local `.zarr.zip`) has no round trip, so its
+ * latency is 0 and its rate is how fast its chunks decode
+ * (`decodePoolStats().decodedBytesPerMs`). Null until measured.
+ */
+export function linkMeasurementOf(source, link) {
+  const remote = typeof source?.url === 'string' || typeof source?.archive?.url === 'string';
+  if (!remote) {
+    const bytesPerMs = decodePoolStats().decodedBytesPerMs ?? null;
+    return bytesPerMs === null ? null : { latencyMs: 0, bytesPerMs, backgroundConcurrency: requestConcurrencyOf(source, link), protocol: null };
+  }
+  const snapshot = link?.snapshot?.() ?? null;
+  if (snapshot === null || (snapshot.latencyMs === null && snapshot.bytesPerMs === null)) return null;
+  return {
+    latencyMs: snapshot.latencyMs,
+    bytesPerMs: snapshot.bytesPerMs,
+    backgroundConcurrency: snapshot.backgroundConcurrency,
+    protocol: snapshot.protocol,
+  };
 }
 
 /**
@@ -218,7 +269,46 @@ function activityReporter(post) {
  *   The reply to post, or null for a cancel message
  */
 export function createAnnDataReaderHandler({ post = () => {} } = {}) {
-  const createActivity = activityReporter(post);
+  /** The open dataset's source and link, whose measurement is posted as it changes. */
+  let measured = null;
+  let lastMeasurement = null;
+  /** Post `{event: 'link', ...}` when the open dataset's link measurement changed. */
+  const postLink = () => {
+    if (measured === null) return;
+    const measurement = linkMeasurementOf(measured.source, measured.link);
+    if (measurement === null) return;
+    if (lastMeasurement !== null &&
+        Object.keys(measurement).every(key => Object.is(measurement[key], lastMeasurement[key]))) return;
+    lastMeasurement = measurement;
+    post({ event: 'link', ...measurement });
+  };
+  const createActivity = activityReporter(post, postLink);
+
+  // The access of each remote file that names one, by its page-side `ref`.
+  const accesses = new Map();
+  const accessRequests = new Map();
+  let nextAccessRequest = 1;
+  const sourceAccess = descriptor => {
+    const ref = descriptor?.ref;
+    if (typeof ref !== 'string' || ref === '' || typeof descriptor.provider !== 'string') {
+      throw new TypeError('A remote file access names its provider and ref.');
+    }
+    const stale = new Set(Array.isArray(descriptor.stale) ? descriptor.stale : []);
+    let access = accesses.get(ref);
+    if (access === undefined) {
+      access = {
+        generation: 0,
+        isStale: status => stale.has(status),
+        target: ({ refresh }) => new Promise((resolve, reject) => {
+          const request = nextAccessRequest++;
+          accessRequests.set(request, { resolve, reject });
+          post({ event: 'source-access', request, provider: descriptor.provider, ref, refresh });
+        }),
+      };
+      accesses.set(ref, access);
+    }
+    return access;
+  };
   let reader = null;
   let latent = null;
   let kind = null;
@@ -237,16 +327,25 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       // A remote source's running totals carry how many requests its link
       // answers at once now, which the page's download scheduler follows.
       let link = null;
-      const onTransfer = ({ url, bytes, requests, ms }) => post({
-        event: 'transfer', url, bytes, reads: requests, ms, requestConcurrency: requestConcurrencyOf(source, link),
-      });
+      const onTransfer = ({ url, bytes, requests, ms, arriving = false, retrying = null }) => {
+        post(arriving || retrying !== null
+          ? { event: 'transfer', url, arriving, retrying }
+          : { event: 'transfer', url, bytes, reads: requests, ms, requestConcurrency: requestConcurrencyOf(source, link) });
+        if (!arriving && retrying === null) postLink();
+      };
       try {
         opened = await openAnnDataStore({ kind: nextKind, source }, {
           decodedChunkCacheBytes: residencyBudgetBytes('decodedBlocks'),
           onTransfer,
           activity,
+          sourceAccess,
         });
         link = opened.link ?? null;
+        // From here on, the link this dataset is read over is reported as it
+        // is measured (`{event: 'link'}`).
+        measured = { source, link };
+        lastMeasurement = null;
+        postLink();
         next.createActivity = createActivity;
         try {
           await next.open(opened.root, {
@@ -270,7 +369,10 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       kind = nextKind;
       latent = new LatentOutlierReader(next);
       previous?.close();
-      return { ...snapshotOf(reader), name: opened.name, requestConcurrency: requestConcurrencyOf(source, link) };
+      // The Zarr format version the store was read as (the Dataset box
+      // names it); null for an `.h5ad`.
+      const zarrVersion = opened.root.zarrFormat ?? null;
+      return { ...snapshotOf(reader), name: opened.name, zarrVersion, requestConcurrency: requestConcurrencyOf(source, link) };
     },
     /**
      * What a catalog lists about one store (`describeAnnDataStore`): its
@@ -280,7 +382,11 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     async describe({ signal }, { kind: describedKind, source }) {
       const opened = await openAnnDataStore({ kind: describedKind, source }, {
         decodedChunkCacheBytes: 0,
-        onTransfer: ({ url, bytes, requests, ms }) => post({ event: 'transfer', url, bytes, reads: requests, ms }),
+        sourceAccess,
+        onTransfer: ({ url, bytes, requests, ms, arriving = false, retrying = null }) => post(
+          arriving || retrying !== null
+            ? { event: 'transfer', url, arriving, retrying }
+            : { event: 'transfer', url, bytes, reads: requests, ms }),
         signal,
       });
       try {
@@ -305,6 +411,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       return { held, kept: held || latent.wouldHold(width), ...cost };
     },
     readVarNames: (_context, axis, column) => reader.readVarNames(axis, column),
+    readVarFlags: (_context, axis, column) => reader.readVarFlags(axis, column),
     getMatrixColumn: ({ signal }, element, index, owner = null, keys = null) =>
       reader.getMatrixColumn(element, index, { signal, owner, keys }),
     getMatrixColumns: ({ signal }, element, genes, owner = null, keys = null) =>
@@ -316,6 +423,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       reader.getMatrixCellSubset(element, cells, genes, { signal, owner }),
     prepareMatrix: (_context, element) => reader.prepareMatrix(element),
     getObsFieldInfo: (_context, key) => reader.getObsFieldInfo(key),
+    getObsFieldKind: (_context, key) => reader.getObsFieldKind(key),
     async getObsField({ signal }, key) {
       const field = await reader.getObsField(key, { signal });
       // The payload is transferred to the caller, which owns it from now on;
@@ -352,6 +460,20 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   const running = new Map();
 
   return async function handle(message) {
+    if (message?.sourceAccess !== undefined) {
+      const waiting = accessRequests.get(message.sourceAccess);
+      accessRequests.delete(message.sourceAccess);
+      if (waiting !== undefined) {
+        if (message.error === undefined) waiting.resolve(message.target);
+        else waiting.reject(accessError(message.error));
+      }
+      return null;
+    }
+    if (message?.sourceAccessRevoked !== undefined) {
+      const access = accesses.get(message.sourceAccessRevoked);
+      if (access !== undefined) access.generation += 1;
+      return null;
+    }
     if (message?.cancel !== undefined) {
       running.get(message.cancel)?.abort(new DOMException('The request was cancelled.', 'AbortError'));
       return null;

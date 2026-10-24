@@ -3,7 +3,9 @@
  * round trips as the store allows, so navigation afterwards is synchronous.
  *
  * - The format version is found from the root: `zarr.json` is Zarr v3;
- *   `.zgroup`, `.zarray`, `.zattrs` or `.zmetadata` is Zarr v2.
+ *   `.zgroup`, `.zarray`, `.zattrs` or `.zmetadata` is Zarr v2. A store that
+ *   cannot be listed is asked for `.zmetadata` first, then `zarr.json` only
+ *   when that is absent: a consolidated Zarr v2 store opens in one request.
  * - Consolidated metadata (Zarr v2 `.zmetadata`, the `consolidated_metadata`
  *   of a Zarr v3 root `zarr.json`) describes the whole tree in one read. A
  *   store that can be listed (a folder, a ZIP) also has every metadata file
@@ -239,16 +241,23 @@ export async function openZarr(store, {
       if (keys.has('zarr.json')) format = 3;
       else if (['.zgroup', '.zarray', '.zattrs', '.zmetadata'].some(key => keys.has(key))) format = 2;
     } else {
-      const [zarrJson, zmetadata] = await store.getMany(['zarr.json', '.zmetadata'], options);
-      if (zarrJson !== null) {
-        format = 3;
-        rootFetched.set('zarr.json', zarrJson);
-      } else if (zmetadata !== null) {
+      // A store that cannot be listed opens from its consolidated metadata,
+      // asked for first as Zarr v2 writes it (`.zmetadata`, what anndata,
+      // cellucid.prepare() and cellucid_prepare() write by default): such a
+      // store opens in one request and no request is answered 404. Only
+      // without it is the store asked for a Zarr v3 root (`zarr.json`).
+      const zmetadata = await store.get('.zmetadata', options);
+      rootFetched.set('.zmetadata', zmetadata);
+      if (zmetadata !== null) {
         format = 2;
-        rootFetched.set('.zmetadata', zmetadata);
       } else {
-        format = 2;
-        rootFetched.set('.zmetadata', null);
+        const zarrJson = await store.get('zarr.json', options);
+        if (zarrJson !== null) {
+          format = 3;
+          rootFetched.set('zarr.json', zarrJson);
+        } else {
+          format = 2;
+        }
       }
     }
     if (format === null) {

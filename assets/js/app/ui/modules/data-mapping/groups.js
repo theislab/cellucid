@@ -33,6 +33,9 @@ export const GROUP_SECTIONS = Object.freeze([
     fields: Object.freeze([
       Object.freeze({ group: 'expression', id: 'data-mapping-expression', label: 'Expression', analyticsId: 'data-mapping:expression' }),
       Object.freeze({ group: 'geneNames', id: 'data-mapping-gene-names', label: 'Gene names', analyticsId: 'data-mapping:gene-names' }),
+      // The transform of the expression matrix chosen above; each matrix keeps its own.
+      Object.freeze({ group: 'log1p', id: 'data-mapping-log1p', label: 'Values', analyticsId: 'data-mapping:log1p' }),
+      Object.freeze({ group: 'highlyVariable', id: 'data-mapping-highly-variable', label: 'Highly variable genes', analyticsId: 'data-mapping:highly-variable' }),
     ]),
   }),
   Object.freeze({

@@ -53,8 +53,8 @@ function clusteringRefusal(axis, count, requiredBytes, budgetBytes) {
   return (
     `Clustering ${count.toLocaleString('en-US')} ${items} needs about ` +
     `${megabytes(requiredBytes)} MB of memory, more than the ` +
-    `${megabytes(budgetBytes)} MB analysis memory budget. Raise the budget in ` +
-    `Performance settings, use fewer ${items}, or turn clustering of ${items} off.`
+    `${megabytes(budgetBytes)} MB this device gives an analysis. Show fewer ` +
+    `${items}, or turn clustering of ${items} off.`
   );
 }
 

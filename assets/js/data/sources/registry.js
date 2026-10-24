@@ -16,12 +16,19 @@
  *                   //   `explicit` is true after the provider's own scheme
  *                   //   (`hf:…`), so ambiguous short forms (a bare number,
  *                   //   `user/repo`) are claimed only then
- *   async open(value, {signal}),
+ *   async open(value, {signal, onStep}),
  *                   // → {title, attribution, catalog: {baseUrl}} for a dataset
  *                   //   catalog folder, or {title, attribution, file} for
- *                   //   one AnnData file (see `remote-file.js`)
+ *                   //   one AnnData file (see `remote-file.js`), and
+ *                   //   `locator` when what opened has a canonical value
+ *                   //   of its own (a OneDrive share link opens as its
+ *                   //   drive and item); `onStep(text)`
+ *                   //   says what it is doing (`Listing the files of GSE…`),
+ *                   //   shown by the opening progress; it makes as few
+ *                   //   dependent round trips as the host allows
  *   auth?,          // {signIn, signOut, authorize(request)} for a provider
  *                   //   that reads behind a sign-in; tokens never leave it
+ *                   //   but through `sources/access.js` to the reader
  * }
  * ```
  *
@@ -34,10 +41,13 @@
 import { DataSourceError, DataSourceErrorCode } from '../data-source.js';
 import cellxgene from './providers/cellxgene.js';
 import dropbox from './providers/dropbox.js';
+import figshare from './providers/figshare.js';
+import gdrive from './providers/gdrive.js';
 import geo from './providers/geo.js';
 import github from './providers/github.js';
 import http from './providers/http.js';
 import huggingface from './providers/huggingface.js';
+import onedrive from './providers/onedrive.js';
 import zenodo from './providers/zenodo.js';
 
 const PROVIDER_ID = /^[a-z][a-z0-9-]*$/;
@@ -96,7 +106,10 @@ export const DEFAULT_PROVIDERS = Object.freeze([
   cellxgene,
   geo,
   zenodo,
+  figshare,
   huggingface,
+  gdrive,
+  onedrive,
   dropbox,
   github,
   http,
@@ -174,8 +187,8 @@ export class ProviderRegistry {
       `Cellucid does not recognise "${text}". Paste a web address (an .h5ad ` +
       'file, a zipped Zarr store, a Zarr store folder, or a folder holding ' +
       'datasets.json ending in "/"), a GitHub repository (owner/repo/path), a Hugging Face dataset ' +
-      '(hf:user/repo), a Zenodo record or DOI, a Dropbox file link, a ' +
-      'CELLxGENE dataset link or id, or a GEO series (GSE…).',
+      '(hf:user/repo), a Zenodo record or DOI, a Figshare item or DOI, a Google Drive, OneDrive or ' +
+      'Dropbox file link, a CELLxGENE dataset link or id, or a GEO series (GSE…).',
       DataSourceErrorCode.INVALID_FORMAT,
       'link',
       { input: text }

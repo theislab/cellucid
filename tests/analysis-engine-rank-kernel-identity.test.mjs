@@ -636,8 +636,8 @@ test('signature median scores and their statistics equal the sort-based definiti
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  const [result] = await analysis.computeSignatureScore({
-    genes,
+  const { sets: [{ pages: [result] }] } = await analysis.computeSignatureScore({
+    geneSets: [{ name: 'S', genes }],
     pageIds: ['page-A'],
     method: 'median',
   });

@@ -79,7 +79,7 @@ function clonedPayloadBytes(value) {
   scan(value);
   return bytes;
 }
-const EXECUTION_OPTION_KEYS = new Set(['timeout', 'signal', 'transfer']);
+const EXECUTION_OPTION_KEYS = new Set(['timeout', 'signal', 'transfer', 'onTiming']);
 const BROADCAST_OPTION_KEYS = new Set([...EXECUTION_OPTION_KEYS, 'retainAs', 'releases']);
 
 let poolInstance = null;
@@ -133,7 +133,11 @@ function validateExecutionOptions(options, defaultTimeout, allowedKeys = EXECUTI
   if (typeof transfer !== 'boolean') {
     throw new TypeError('Worker execution transfer must be exactly boolean');
   }
-  return { timeout, signal, transfer };
+  const onTiming = options.onTiming === undefined ? null : options.onTiming;
+  if (onTiming !== null && typeof onTiming !== 'function') {
+    throw new TypeError('Worker execution onTiming must be a function');
+  }
+  return { timeout, signal, transfer, onTiming };
 }
 
 function toWorkerFailure(workerIndex, error) {
@@ -210,6 +214,13 @@ export class WorkerPool {
     // Workers replaced after a cancelled task outlived its grace, and what
     // replacing cost (terminate to ready, kept state restored).
     this._replacements = { count: 0, lastMs: null, totalMs: 0 };
+    /**
+     * Per operation type: tasks answered, and moving averages of the time a
+     * task waited for a worker and the time it ran (ms). A run's tuner reads
+     * a task's own times through `onTiming` (shared/run-tuner.js).
+     * @type {Map<string, {count: number, queueMs: number, runMs: number}>}
+     */
+    this._taskTiming = new Map();
 
     this._handleMessage = this._handleMessage.bind(this);
     this._handleError = this._handleError.bind(this);
@@ -291,6 +302,11 @@ export class WorkerPool {
     const acknowledgements = [];
     try {
       for (let index = 0; index < this.poolSize; index++) {
+        // One worker per task: each module worker's construction runs on
+        // the page's thread, so a pool built in one loop holds it for the
+        // sum of them.
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 0));
+        if (this._lifecycle !== 'initializing') throw this._terminalError;
         acknowledgements.push(this._spawnWorker(index));
       }
 
@@ -424,6 +440,7 @@ export class WorkerPool {
     this.pendingRequests.delete(data.requestId);
     this.workerStates[workerIndex] = 'idle';
 
+    this._recordTiming(pending.task);
     // A cancelled task's caller was answered at the cancel: its result is
     // dropped, and the worker takes the next task.
     if (!pending.abandoned) {
@@ -434,6 +451,29 @@ export class WorkerPool {
       }
     }
     this._processQueue(workerIndex);
+  }
+
+  /** Record how long an answered task waited and ran. @private */
+  _recordTiming(task) {
+    if (!(task.startedAt > 0)) return;
+    const done = performance.now();
+    const queueMs = task.startedAt - task.createdAt;
+    const runMs = done - task.startedAt;
+    const timing = this._taskTiming.get(task.type);
+    if (timing === undefined) {
+      this._taskTiming.set(task.type, { count: 1, queueMs, runMs });
+    } else {
+      timing.count++;
+      timing.queueMs = timing.queueMs * 0.8 + queueMs * 0.2;
+      timing.runMs = timing.runMs * 0.8 + runMs * 0.2;
+    }
+    if (typeof task.onTiming === 'function') {
+      try {
+        task.onTiming({ queueMs, runMs });
+      } catch (error) {
+        queueMicrotask(() => { throw error; });
+      }
+    }
   }
 
   _handleError(workerIndex, error) {
@@ -613,6 +653,7 @@ export class WorkerPool {
     }
 
     task.state = 'running';
+    task.startedAt = performance.now();
     this.workerStates[workerIndex] = 'busy';
     const timeoutId = setTimeout(() => {
       this._fail(
@@ -713,6 +754,9 @@ export class WorkerPool {
       timeout: execution.timeout,
       signal: execution.signal,
       transfer: execution.transfer,
+      onTiming: execution.onTiming ?? null,
+      createdAt: performance.now(),
+      startedAt: 0,
       state: 'queued',
       stopWaiting: () => {},
       resolve: null,
@@ -968,7 +1012,14 @@ export class WorkerPool {
         0
       ),
       replacedWorkers: this._replacements.count,
-      lastReplacementMs: this._replacements.lastMs
+      lastReplacementMs: this._replacements.lastMs,
+      taskTiming: Object.fromEntries(
+        [...this._taskTiming].map(([type, timing]) => [type, {
+          count: timing.count,
+          queueMs: +timing.queueMs.toFixed(2),
+          runMs: +timing.runMs.toFixed(2)
+        }])
+      )
     };
   }
 

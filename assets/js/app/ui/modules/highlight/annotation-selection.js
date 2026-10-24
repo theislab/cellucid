@@ -22,12 +22,14 @@ import {
   SELECT_BAR_ANNOTATION_NEEDS_FIELD_HINT,
   SELECT_BAR_HINT,
   SELECTION_NOTICE,
+  idleSelectionNoticeHtml,
   selectionNoticeHtml
 } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import {
   publishSelectBarHint,
+  publishToolHint,
   removeStepControls,
   showStepControls
 } from './step-controls.js';
@@ -472,7 +474,8 @@ export function initAnnotationSelection(options) {
       const idleCopy = canSelect
         ? HIGHLIGHT_MODE_COPY.annotation
         : ANNOTATION_NEEDS_FIELD_COPY;
-      highlightModeDescriptionEl.innerHTML = `${idleCopy}${noticeHtml}`;
+      publishToolHint(documentOwner, idleCopy);
+      highlightModeDescriptionEl.innerHTML = idleSelectionNoticeHtml(notice);
       publishSelectBarHint(
         documentOwner,
         canSelect

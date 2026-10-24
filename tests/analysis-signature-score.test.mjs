@@ -14,7 +14,7 @@ function lcg(seed) {
 
 /**
  * The scores from dense page values, gene by gene into a Float32 sum per cell
- * (sum, mean) or the median of each cell's finite values: the definition the
+ * (mean) or the median of each cell's finite values: the definition the
  * sparse path must equal bit for bit.
  */
 function denseReference(denseGenes, cells, method) {
@@ -84,7 +84,7 @@ test('signature scores from sparse, dense and mixed columns equal the dense defi
   genes[9].fill(0);
   const cells = Uint32Array.from({ length: pointCount }, (_, i) => i).filter(i => i % 3 !== 1);
   const rest = Array.from({ length: pointCount }, (_, i) => i).filter(i => i % 3 === 1);
-  for (const method of ['mean', 'sum', 'median']) {
+  for (const method of ['mean', 'median']) {
     for (const page of [cells, rest]) {
       const expected = denseReference(genes, page, method);
       const variants = {
@@ -108,7 +108,6 @@ test('a cell with no finite value scores NaN; absent sparse entries are zeros', 
   const b = Float32Array.of(NaN, 0, 0, 5);
   const cells = Uint32Array.of(0, 1, 2, 3);
   assert.deepEqual(Array.from(score([a, b], cells, 'mean', pointCount, 4)), [NaN, 1, 0, 2.5]);
-  assert.deepEqual(Array.from(score([a, b], cells, 'sum', pointCount, 4)), [NaN, 2, 0, 5]);
   assert.deepEqual(Array.from(score([a, b], cells, 'median', pointCount, 4)), [NaN, 1, 0, 2.5]);
 });
 
@@ -141,10 +140,44 @@ test('signature scoring without a caller ownership predicate reads its columns',
     const analysis = Object.create(MultiVariableAnalysis.prototype);
     analysis.dataLayer = layer;
     analysis._computeManager = null;
-    const [page] = await analysis.computeSignatureScore({ genes: ['A'], pageIds: ['p'], method: 'mean' });
+    const { sets: [{ pages: [page] }] } = await analysis.computeSignatureScore({
+      geneSets: [{ name: 'S', genes: ['A'] }],
+      pageIds: ['p'],
+      method: 'mean'
+    });
     assert.deepEqual(Array.from(page.scores), [1, 3]);
     assert.deepEqual(Array.from(page.cellIndices), [0, 2]);
   } finally {
     layer.destroy();
   }
+});
+
+test('a transformed gene (the mean z-score) costs its entries and equals the dense definition', () => {
+  const pointCount = 6;
+  const a = Float32Array.of(0, 2, 0, 4, NaN, 1);
+  const b = Float32Array.of(3, 0, 0, 1, 2, 0);
+  const affine = gene => {
+    const finite = Array.from(gene).filter(Number.isFinite);
+    const mean = finite.reduce((x, y) => x + y, 0) / finite.length;
+    const sd = Math.sqrt(finite.reduce((x, y) => x + (y - mean) ** 2, 0) / (finite.length - 1));
+    return { scale: 1 / sd, offset: -mean / sd };
+  };
+  const cells = Uint32Array.of(0, 1, 2, 3, 4, 5);
+  const expected = Array.from(cells, cell => {
+    const zs = [a, b].filter(gene => Number.isFinite(gene[cell])).map(gene => gene[cell] * affine(gene).scale + affine(gene).offset);
+    return Math.fround(zs.reduce((x, y) => x + y, 0) / zs.length);
+  });
+  for (const columns of [[a, b], [sparseOf(a), sparseOf(b)]]) {
+    const scorer = new SignaturePageScorer({ method: 'mean', geneCount: 2, cellIndices: cells, pointCount });
+    scorer.addGene(columns[0], affine(a));
+    scorer.addGene(columns[1], affine(b));
+    scorer.scoreCells(0, cells.length);
+    Array.from(scorer.scores).forEach((value, p) => {
+      assert.ok(Math.abs(value - expected[p]) < 1e-6, `cell ${p}: ${value} vs ${expected[p]}`);
+    });
+  }
+  assert.throws(
+    () => new SignaturePageScorer({ method: 'median', geneCount: 1, cellIndices: cells, pointCount }).addGene(a, affine(a)),
+    /transformed gene needs the mean/
+  );
 });

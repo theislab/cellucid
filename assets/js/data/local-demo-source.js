@@ -225,6 +225,18 @@ export class LocalDemoDataSource {
   }
 
   /**
+   * The datasets `datasets.json` lists, before their files are read:
+   * `{id, name}` in catalog order (`AnnDataCatalog.entries`).
+   * @returns {Promise<ReadonlyArray<Readonly<{id: string, name: string}>>>}
+   */
+  async listCatalogEntries() {
+    // A catalog that did not load is not asked for again here: its failure
+    // is the listing's to report, and only a retry asks again.
+    if (this._availabilityError !== null) throw this._availabilityError;
+    return (await this._loadCatalog()).entries();
+  }
+
+  /**
    * The catalog's default dataset id.
    * @returns {Promise<string>}
    */
@@ -235,9 +247,11 @@ export class LocalDemoDataSource {
   /**
    * One dataset's identity: its file is opened (once) to build it.
    * @param {string} datasetId
+   * @param {{signal?: AbortSignal|null}} [options] - `signal`: the caller's
+   *   reason to want it (`AnnDataCatalog.open`)
    * @returns {Promise<DatasetMetadata>}
    */
-  async getMetadata(datasetId) {
+  async getMetadata(datasetId, { signal = null } = {}) {
     const catalog = await this._loadCatalog();
     if (!catalog.has(datasetId)) {
       throw new DataSourceError(
@@ -247,7 +261,7 @@ export class LocalDemoDataSource {
         { datasetId }
       );
     }
-    return (await catalog.open(datasetId)).metadata;
+    return (await catalog.open(datasetId, signal)).metadata;
   }
 
   /**

@@ -7,6 +7,7 @@
 import { HIGHLIGHT_MODE_COPY, SELECT_BAR_HINT } from './mode-copy.js';
 import {
   publishSelectBarHint,
+  publishToolHint,
   removeStepControls,
   STEP_CONTROL_TOOLS
 } from './step-controls.js';
@@ -297,7 +298,8 @@ export function initHighlightModeUI(options) {
     }
 
     removeAllStepControls();
-    highlightModeDescriptionEl.textContent = HIGHLIGHT_MODE_COPY[exactMode];
+    highlightModeDescriptionEl.textContent = '';
+    publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY[exactMode]);
     publishSelectBarHint(documentOwner, SELECT_BAR_HINT[exactMode]);
     restoreModeSelection(exactMode, unifiedState);
   }

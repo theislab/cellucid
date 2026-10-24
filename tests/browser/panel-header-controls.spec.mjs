@@ -159,8 +159,9 @@ test('no summary in the app contains an interactive element, in any panel state'
     '#floating-panels-root > .accordion-panel.analysis-window-frame',
   );
   await expect(analysisWindow).toHaveCount(1);
+  // Copy, maximize and close.
   await expect(analysisWindow.locator('> .accordion-panel-actions > button'))
-    .toHaveCount(2);
+    .toHaveCount(3);
 
   // A sidebar panel floating, then collapsed while floating.
   await control(page, PANEL, 'accordion-undock-btn').click();

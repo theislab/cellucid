@@ -15,6 +15,7 @@ import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { requireAnnDataLaunchDefaults } from '../assets/js/data/base-anndata-adapter.js';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
 import { storedObsm } from './helpers/stored-obsm.mjs';
 import { normalizePositions } from '../assets/js/rendering/gl-utils.js';
 
@@ -154,6 +155,28 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
     const { knn: automaticKnn, ...automaticRest } = automatic.getMappingCandidates().defaults;
     assert.equal(automaticKnn, 'connectivities');
     assert.deepEqual(rest, automaticRest);
+  });
+
+  test(`${format}: opening reads only the embedding its first view draws; the others when first shown`, async t => {
+    const read = [];
+    const original = AnnDataReaderClient.prototype.readEmbedding;
+    AnnDataReaderClient.prototype.readEmbedding = function (key, columns, ...rest) {
+      read.push(`${key}[${columns.join(',')}]`);
+      return original.call(this, key, columns, ...rest);
+    };
+    t.after(() => {
+      AnnDataReaderClient.prototype.readEmbedding = original;
+    });
+    const source = await open(t, format, {
+      embedding1d: { key: 'X_pca', columns: [2] },
+      embedding2d: { key: 'X_pca', columns: [3, 1] },
+      embedding3d: { key: 'X_pca', columns: [0, 1, 2] },
+    });
+    assert.deepEqual(read, ['X_pca[0,1,2]'], 'only the 3D slot the first view shows is read at open');
+    const identity = source._metadata;
+    const shown = identity.embeddings.items[identity.embeddings.defaults['2d']];
+    await source.getAdapter().getEmbeddingPayload(shown.path, 2);
+    assert.deepEqual(read, ['X_pca[0,1,2]', 'X_pca[3,1]'], 'the 2D slot is read when it is first shown');
   });
 
   test(`${format}: a launch default the file cannot honour is refused at open, naming what it has`, async t => {

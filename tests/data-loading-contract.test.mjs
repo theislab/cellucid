@@ -137,6 +137,7 @@ function currentObsFields({
       ...categorical.map((field, position) => ({
         kind: 'category',
         fieldIndex: continuous.length + position,
+        palette: null,
         outlierQuantilesPath,
         ...field,
       })),
@@ -169,6 +170,7 @@ test('the adapter\'s field lists check into one descriptor per field', () => {
       categories: ['A', 'B'],
       codesDtype: 'uint8',
       codesMissingValue: 255,
+      palette: null,
       outlierQuantilesPath: 'outliers/0/1',
     },
   ]);
@@ -275,7 +277,7 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
   };
   adapter._obsFieldsMetadata = [
     { key: 'score', kind: 'continuous' },
-    { key: 'cluster', kind: 'category', categories: ['A', 'B'] },
+    { key: 'cluster', kind: 'category', categories: ['A', 'B'], palette: null },
   ];
 
   const rawObs = adapter.getObsFields();
@@ -293,6 +295,7 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
         categories: ['A', 'B'],
         codesDtype: 'uint8',
         codesMissingValue: 255,
+        palette: null,
         outlierQuantilesPath: null,
       },
     ],

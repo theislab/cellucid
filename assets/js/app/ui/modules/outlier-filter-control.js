@@ -1,24 +1,23 @@
 /**
- * @fileoverview The legend's outlier filter: its slider, and a line that
- * always says what the filter can do for the active field and why.
+ * @fileoverview The legend's outlier filter: a label with its (i), then the
+ * one control the active field's state calls for, and at most one short line.
  *
  * It shows the active field's outlier status (`state/managers/outlier-quantiles.js`):
  *
- * - a categorical field with no latent space chosen: the slider is shown
- *   disabled, with what the filter measures, the file's arrays that look
- *   like a latent space (suggested, never chosen for the person) and a button
- *   that opens the Data mapping setting where one is chosen;
- * - no category large enough: the slider is disabled and the line says the
- *   fewest cells a category needs;
+ * - no latent space chosen: only a "Choose latent space" button, which opens
+ *   the Data mapping setting where one is chosen (it lists the file's
+ *   candidate arrays; the button's title names them). What the filter
+ *   measures is in the (i);
+ * - no category large enough: one line saying the fewest cells a category
+ *   needs;
  * - quantiles stored in the file, or already got: the slider alone, instant;
- * - quantiles to compute: the line says, before anything is read, that the
- *   first use reads the latent space once and how many bytes that is;
- * - while they are got: a progress bar with how much of how much is read,
- *   how fast, how long is left, and Cancel (which puts the slider back at
- *   100%);
- * - when getting them failed: why, and that moving the slider tries again,
- *   or, when the latent space itself cannot be read, a button to choose
- *   another.
+ * - quantiles to compute: the slider and one line naming what the first use
+ *   reads and how large it is;
+ * - while they are got: a progress bar, one line, and Cancel (which puts the
+ *   slider back at 100%); the job's notification carries the details;
+ * - when getting them failed: one line (the reason is its title, and the
+ *   job's notification), and moving the slider tries again, or, when the
+ *   latent space itself cannot be read, the button to choose another.
  *
  * The slider recomputes visibility at most once per frame while the thumb
  * moves, with the readout painted in the same frame; releasing the thumb
@@ -31,7 +30,6 @@
 
 import { coalesceToFrame } from '../components/controls.js';
 import { formatPercent } from '../components/display-format.js';
-import { describeReadProgress } from '../../../data/read-activity-log.js';
 import { describePlanBytes } from '../../state/managers/outlier-quantiles.js';
 
 /** Join names as people list them: `a`, `a or b`, `a, b or c`. */
@@ -41,69 +39,80 @@ function listOr(names) {
 }
 
 /**
- * What the line under the slider says for one status, and which action it
- * offers: `{text, tone, action}` (`tone` `info` or `error`; `action` `latent`
- * or `cancel`), or null when the slider needs no words.
+ * What the filter shows for one status: its one line (`text`, with
+ * `detail` as the line's title), which action it offers (`latent` or
+ * `cancel`) and whether the slider is shown; null when the slider needs no
+ * words.
  *
  * @param {Object} status - `getOutlierFilterStatus()`
- * @returns {{text: string, tone: 'info'|'error', action: 'latent'|'cancel'|null}|null}
+ * @returns {{text: string|null, detail: string|null, tone: 'info'|'error',
+ *   action: 'latent'|'cancel'|null, slider: boolean}|null}
  */
 export function describeOutlierStatus(status) {
   switch (status.state) {
     case 'no-latent': {
       const names = status.suggestions.map(item => item.key);
-      const found = names.length === 0
-        ? 'This file has no obsm array that looks like one (more than three columns).'
-        : `This file has ${listOr(names)}.`;
       return {
-        text: 'Measures each cell’s distance to its category’s centre in a latent space (scVI, PCA), ' +
-          `not in the 2D/3D layout. Choose the latent space in Data mapping. ${found}`,
+        text: null,
+        detail: names.length === 0
+          ? 'This file has no obsm array that looks like a latent space (more than three columns).'
+          : `Candidates in this file: ${listOr(names)}.`,
         tone: 'info',
         action: 'latent',
+        slider: false,
       };
     }
     case 'too-small':
       return {
-        text: `No category of “${status.fieldKey}” has ${status.minPoints} cells, the fewest the filter measures ` +
-          `(the largest has ${status.largest}), so it has nothing to hide.`,
+        text: `No category has ${status.minPoints} cells.`,
+        detail: `No category of “${status.fieldKey}” has ${status.minPoints} cells, the fewest the filter ` +
+          `measures (the largest has ${status.largest}), so it has nothing to hide.`,
         tone: 'info',
         action: null,
+        slider: false,
       };
     case 'available': {
       const plan = status.plan;
       if (plan?.source !== 'read') return null;
       const bytes = describePlanBytes(plan);
       const size = bytes === null ? '' : ` (${bytes})`;
-      const elsewhere = plan.storedLatentKey !== null && plan.storedLatentKey !== plan.latentKey
-        ? ` This file stores them for ${plan.storedLatentKey} only.`
-        : ' This file does not store them.';
-      const reads = plan.kept
-        ? `The first use reads the latent space ${plan.latentKey}${size} once to compute the outlier distances; ` +
-          'every other field then filters at once.'
-        : `Each field’s first use reads the latent space ${plan.latentKey}${size} to compute its outlier distances: ` +
-          'it is larger than the memory Cellucid keeps for it.';
-      return { text: `${reads}${elsewhere}`, tone: 'info', action: null };
+      return {
+        text: plan.kept
+          ? `First use reads ${plan.latentKey}${size}.`
+          : `Each field’s first use reads ${plan.latentKey}${size}.`,
+        detail: plan.kept
+          ? 'The outlier distances are computed once from the latent space; every other field then filters at once.'
+          : 'The latent space is larger than the memory Cellucid keeps for it, so each field reads it again.',
+        tone: 'info',
+        action: null,
+        slider: true,
+      };
     }
-    case 'running': {
-      const reading = status.progress?.status === 'running' ? describeReadProgress(status.progress) : null;
-      const what = status.plan?.source === 'stored'
-        ? 'Reading the stored outlier distances'
-        : status.plan?.source === 'held' || (status.progress === null && status.plan?.source !== 'read')
-          ? 'Computing the outlier distances'
-          : `Reading ${status.latentKey} to compute the outlier distances`;
-      return { text: reading === null ? `${what}…` : `${what}: ${reading}`, tone: 'info', action: 'cancel' };
-    }
+    case 'running':
+      return {
+        text: status.plan?.source === 'stored'
+          ? 'Reading the stored distances…'
+          : 'Computing outlier distances…',
+        detail: null,
+        tone: 'info',
+        action: 'cancel',
+        slider: true,
+      };
     case 'failed':
       return status.latentUnusable
         ? {
-          text: `The outlier distances could not be computed: ${status.message} Choose another latent space in Data mapping.`,
+          text: 'This latent space cannot be used.',
+          detail: status.message,
           tone: 'error',
           action: 'latent',
+          slider: false,
         }
         : {
-          text: `The outlier distances could not be computed: ${status.message} Move the slider to try again.`,
+          text: 'Could not compute. Move the slider to try again.',
+          detail: status.message,
           tone: 'error',
           action: null,
+          slider: true,
         };
     default:
       return null;
@@ -152,6 +161,9 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
     if (status.state === 'none') return;
 
     const usable = status.state !== 'no-latent' && status.state !== 'too-small';
+    const described = describeOutlierStatus(status);
+    const sliderRow = input?.closest?.('.slider-row') ?? null;
+    if (sliderRow) sliderRow.hidden = described !== null && !described.slider;
     if (input) {
       input.disabled = !usable;
       // The thumb is left alone while it is being dragged.
@@ -162,11 +174,13 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
       }
     }
 
-    const described = describeOutlierStatus(status);
     if (note) {
-      note.hidden = described === null;
-      note.textContent = described?.text ?? '';
+      const text = described?.text ?? null;
+      note.hidden = text === null;
+      note.textContent = text ?? '';
       note.dataset.tone = described?.tone ?? 'info';
+      if (described?.detail) note.title = described.detail;
+      else note.removeAttribute?.('title');
     }
     if (progress) {
       const running = status.state === 'running';
@@ -181,6 +195,8 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
       shownAction = described?.action ?? null;
       action.hidden = shownAction === null;
       action.textContent = shownAction === 'latent' ? 'Choose latent space' : 'Cancel';
+      if (shownAction === 'latent' && described?.detail) action.title = described.detail;
+      else action.removeAttribute?.('title');
     }
   }
 

@@ -23,15 +23,18 @@
 import { executeOperation } from './operation-handlers.js';
 import { LOG2_FOLD_CHANGE_PSEUDOCOUNT } from './math-utils.js';
 import {
+  P_CONVENTIONS,
+  TEST_METHODS,
   createGroupingContext,
   geneSampleOf,
-  isGeneSample,
-  oneVsRestMarkers
+  groupMarkers,
+  isGeneSample
 } from './gene-statistics.js';
 import {
   isCategoricalCodes,
   missingCategoryCode
 } from '../../../data/categorical-storage-contract.js';
+import { createUcellContext, ucellAddGenes, ucellFinish } from './ucell.js';
 
 // ============================================================================
 // Worker Pool State
@@ -45,7 +48,8 @@ let workerId = null;
 
 /**
  * Marker computation context stored per worker: each cell's group, every
- * group's size, and the reusable tables of the one-vs-rest kernel
+ * group's size, which groups are tested, the reference (the rest or one
+ * group), and the reusable tables of the marker kernel
  * (compute/gene-statistics.js). It avoids re-sending the per-cell categorical
  * codes for every gene.
  *
@@ -61,7 +65,13 @@ function setMarkerContext(payload) {
   ) {
     throw new TypeError('MARKERS_SET_CONTEXT: payload must be an object');
   }
-  const { codes, codeToGroupIndex, groupCount } = payload;
+  const { codes, codeToGroupIndex, groupCount, tested, reference } = payload;
+  if (!(tested instanceof Uint8Array) || tested.length !== groupCount) {
+    throw new TypeError('MARKERS_SET_CONTEXT: tested must be a Uint8Array of one flag per group');
+  }
+  if (!Number.isSafeInteger(reference) || reference < -1 || reference >= groupCount) {
+    throw new RangeError('MARKERS_SET_CONTEXT: reference must be -1 or a group index');
+  }
 
   if (!isCategoricalCodes(codes) || codes.length === 0) {
     throw new TypeError(
@@ -108,23 +118,23 @@ function setMarkerContext(payload) {
     }
   }
 
-  markerContext = createGroupingContext(cellGroupIndex, groupCount);
+  markerContext = createGroupingContext(cellGroupIndex, groupCount, { tested, reference });
 
   return { ok: true, cells: nCells, groups: groupCount };
 }
 
 /**
- * One-vs-rest statistics of one gene for every group of the marker context.
+ * Statistics of one gene for every tested group of the marker context
+ * against its reference (`groupMarkers`).
  *
  * `values` is the gene in every cell: a dense Float32Array, or the sample of
  * its non-zero entries `{length, indices, values}`. Either way the kernel
  * walks the non-zero entries only.
  *
- * The test statistic itself is deliberately not among the results. Marker
- * discovery reports probabilities, fold changes and expression fractions;
- * nothing on the way to the panel, the heatmap, the volcano or the cache ever
- * read a U or a t, and Mann-Whitney U reaches n1*n2 (20,250,000 for two sides
- * of 4,500 cells), past what Float32 holds exactly.
+ * Results carry the score (rank-sum z or Welch t, scanpy's `scores`) and
+ * AUROC rather than U itself: Mann-Whitney U reaches n1*n2 (20,250,000 for
+ * two sides of 4,500 cells), past what Float32 holds exactly, and no reader
+ * needs it.
  */
 function computeGeneMarkers(payload) {
   if (!markerContext?.cellGroupIndex) {
@@ -142,7 +152,8 @@ function computeGeneMarkers(payload) {
     values,
     method,
     minCells,
-    pseudocount = LOG2_FOLD_CHANGE_PSEUDOCOUNT
+    pConvention,
+    foldChange
   } = payload;
 
   if (!(values instanceof Float32Array) && !isGeneSample(values)) {
@@ -155,27 +166,51 @@ function computeGeneMarkers(payload) {
       'MARKERS_COMPUTE_GENE: values length must exactly match marker context'
     );
   }
-  if (method !== 'wilcox' && method !== 'ttest') {
+  if (!TEST_METHODS.includes(method)) {
     throw new RangeError(
-      'MARKERS_COMPUTE_GENE: method must be wilcox or ttest'
+      `MARKERS_COMPUTE_GENE: method must be one of ${TEST_METHODS.join(', ')}`
     );
+  }
+  if (!P_CONVENTIONS.includes(pConvention)) {
+    throw new RangeError(
+      `MARKERS_COMPUTE_GENE: pConvention must be one of ${P_CONVENTIONS.join(', ')}`
+    );
+  }
+  if (
+    foldChange === null ||
+    typeof foldChange !== 'object' ||
+    (foldChange.mode !== 'stored' && foldChange.mode !== 'log1p')
+  ) {
+    throw new TypeError('MARKERS_COMPUTE_GENE: foldChange must name a mode, stored or log1p');
   }
   if (!Number.isSafeInteger(minCells) || minCells <= 0) {
     throw new RangeError(
       'MARKERS_COMPUTE_GENE: minCells must be a positive integer'
     );
   }
-  if (!Number.isFinite(pseudocount) || pseudocount <= 0) {
-    throw new RangeError(
-      'MARKERS_COMPUTE_GENE: pseudocount must be a positive finite number'
-    );
-  }
 
-  return oneVsRestMarkers(geneSampleOf(values, 0), markerContext, {
+  return groupMarkers(geneSampleOf(values, 0), markerContext, {
     method,
     minCells,
-    pseudocount
+    pConvention,
+    foldChange: { pseudocount: LOG2_FOLD_CHANGE_PSEUDOCOUNT, ...foldChange }
   });
+}
+
+// ============================================================================
+// UCell (gene signature) Worker State
+// ============================================================================
+
+/**
+ * The range of cells this worker scores for a UCell run (compute/ucell.js):
+ * set by UCELL_SET_CONTEXT, fed by UCELL_ADD_GENES, released by UCELL_FINISH.
+ * @type {ReturnType<typeof createUcellContext>|null}
+ */
+let ucellContext = null;
+
+function requireUcellContext(type) {
+  if (ucellContext === null) throw new Error(`${type}: no UCell context is held`);
+  return ucellContext;
 }
 
 // ============================================================================
@@ -236,6 +271,26 @@ self.onmessage = function(e) {
 
     if (type === 'MARKERS_COMPUTE_GENE') {
       const result = computeGeneMarkers(payload);
+      self.postMessage({ requestId, success: true, result }, resultBuffers(result));
+      return;
+    }
+
+    if (type === 'UCELL_SET_CONTEXT') {
+      ucellContext = createUcellContext(payload);
+      self.postMessage({ requestId, success: true, result: { cells: ucellContext.cellCount } });
+      return;
+    }
+
+    if (type === 'UCELL_ADD_GENES') {
+      ucellAddGenes(requireUcellContext(type), payload);
+      self.postMessage({ requestId, success: true, result: { added: payload.pointers.length - 1 } });
+      return;
+    }
+
+    if (type === 'UCELL_FINISH') {
+      const scores = ucellFinish(requireUcellContext(type));
+      ucellContext = null;
+      const result = { scores };
       self.postMessage({ requestId, success: true, result }, resultBuffers(result));
       return;
     }

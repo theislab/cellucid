@@ -1,12 +1,16 @@
 /**
  * @fileoverview Session contributor: floating analysis windows.
  *
- * EAGER chunk (dataset-dependent):
- * - Reopen floating analysis windows with their modeId + geometry + settings.
+ * EAGER chunk (dataset-dependent), payload
+ * `{windows: [{headerTitle, modeId, open, rect, z, result, settings}], sizes}`:
+ * - reopen floating analysis windows, back to front, with their box, open
+ *   state, layer, settings and result;
+ * - restore the sizes remembered per analysis for new windows and expanded
+ *   views (`sizes: {window, expandedView}`, shared/analysis-view-sizes.js).
  *
- * Uses AnalysisWindowManager public APIs added for session restore:
- * - exportSessionWindows()
- * - createFromSessionDescriptor()
+ * Uses the AnalysisWindowManager session API: exportSessionWindows(),
+ * exportViewSizes(), importViewSizes(), closeAll() and
+ * createFromSessionDescriptor().
  *
  * @module session/contributors/analysis-windows
  */
@@ -44,17 +48,21 @@ function requireManager(ctx, methods) {
 function requireRestorePayload(payload) {
   if (
     !isPlainObject(payload) ||
-    Object.keys(payload).length !== 1 ||
-    !Object.hasOwn(payload, 'windows')
+    Object.keys(payload).length !== 2 ||
+    !Object.hasOwn(payload, 'windows') ||
+    !Object.hasOwn(payload, 'sizes')
   ) {
     throw new TypeError(
-      'Analysis-window restore payload must contain exactly: windows'
+      'Analysis-window restore payload must contain exactly: sizes, windows'
     );
   }
   if (!Array.isArray(payload.windows)) {
     throw new TypeError('Analysis-window restore payload windows must be an array');
   }
-  return structuredClone(payload.windows);
+  if (!isPlainObject(payload.sizes)) {
+    throw new TypeError('Analysis-window restore payload sizes must be an object');
+  }
+  return structuredClone({ windows: payload.windows, sizes: payload.sizes });
 }
 
 /**
@@ -63,13 +71,14 @@ function requireRestorePayload(payload) {
  * @returns {import('../session-serializer.js').SessionChunk[]}
  */
 export function capture(ctx) {
-  const mgr = requireManager(ctx, ['exportSessionWindows']);
+  const mgr = requireManager(ctx, ['exportSessionWindows', 'exportViewSizes']);
   const exportedWindows = mgr.exportSessionWindows();
   if (!Array.isArray(exportedWindows)) {
     throw new TypeError(
       'analysisWindowManager.exportSessionWindows() must return an array'
     );
   }
+  const sizes = mgr.exportViewSizes();
   // Settings are JSON; a window's result columns are typed arrays, stored
   // as their bytes (codecs/typed-json.js).
   return [
@@ -81,19 +90,20 @@ export function capture(ctx) {
       codec: 'gzip',
       label: 'Analysis windows',
       datasetDependent: true,
-      payload: encodeTypedJson({ windows: exportedWindows })
+      payload: encodeTypedJson({ windows: exportedWindows, sizes })
     }
   ];
 }
 
 /**
- * Restore floating analysis windows from descriptors.
- * @param {object} ctx
- * @param {any} _chunkMeta
- * @param {{ windows: any[] }} payload
+ * Close the open windows, then restore the remembered sizes and reopen the
+ * saved windows.
+ * @param {object} manager
+ * @param {{ windows: any[], sizes: Object }} state
  */
-async function applyWindows(manager, windows) {
+async function applyWindows(manager, { windows, sizes }) {
   await manager.closeAll();
+  manager.importViewSizes(sizes);
   for (const descriptor of windows) {
     await manager.createFromSessionDescriptor(descriptor);
   }
@@ -102,18 +112,18 @@ async function applyWindows(manager, windows) {
 export async function restore(ctx, _chunkMeta, payload) {
   const mgr = requireManager(
     ctx,
-    ['closeAll', 'createFromSessionDescriptor']
+    ['closeAll', 'createFromSessionDescriptor', 'importViewSizes']
   );
   if (!(payload instanceof Uint8Array)) {
     throw new TypeError('Analysis-window payload must be typed JSON bytes.');
   }
-  const windows = requireRestorePayload(decodeTypedJson(payload));
+  const restored = requireRestorePayload(decodeTypedJson(payload));
   const restoreTransaction = ctx?.restoreTransaction;
   if (
     restoreTransaction === null
     || typeof restoreTransaction !== 'object'
   ) {
-    await applyWindows(mgr, windows);
+    await applyWindows(mgr, restored);
     return;
   }
   if (typeof restoreTransaction.register !== 'function') {
@@ -125,7 +135,7 @@ export async function restore(ctx, _chunkMeta, payload) {
     ctx,
     'analysis/windows'
   );
-  const previousWindows = requireRestorePayload(decodeTypedJson(
+  const previous = requireRestorePayload(decodeTypedJson(
     sharedSnapshot === undefined ? capture(ctx)[0].payload : sharedSnapshot
   ));
   // Window settings name highlight pages and analysis caches that later
@@ -135,15 +145,15 @@ export async function restore(ctx, _chunkMeta, payload) {
   // the restore half-applied.
   let applied = false;
   restoreTransaction.register('analysis-windows/state', {
-    value: windows,
+    value: restored,
     stage: 'presentation',
     prepare() {},
     async commit() {
-      await applyWindows(mgr, windows);
+      await applyWindows(mgr, restored);
     },
     async rollback() {
       if (!applied) return;
-      await applyWindows(mgr, previousWindows);
+      await applyWindows(mgr, previous);
       applied = false;
     }
   });

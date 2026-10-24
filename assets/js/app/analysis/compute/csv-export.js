@@ -119,7 +119,7 @@ export function perCellCSVHeader(layout, variableName) {
     }
     return `page,cell_index,${toCSVCell(variableName)}`;
   }
-  if (layout === 'signature-scores') return 'page,score';
+  if (layout === 'signature-scores') return 'page,set,cell_index,score';
   throw new RangeError(`Unknown CSV export layout: ${String(layout)}`);
 }
 
@@ -128,7 +128,8 @@ export function perCellCSVHeader(layout, variableName) {
  * and without a trailing break (an empty Blob when there is no line):
  * - 'page-data': `page,cell_index,value`, one line per value; a page without
  *   cell indices numbers its rows from `firstRow` (0 by default);
- * - 'signature-scores': `page,score`, one line per finite score.
+ * - 'signature-scores': `page,set,cell_index,score`, one line per finite
+ *   score (`setName` names the gene set).
  * A file split into row ranges is these Blobs joined by line breaks.
  *
  * @param {'page-data'|'signature-scores'} layout
@@ -151,11 +152,15 @@ export function perCellCSVRows(layout, pages) {
     }
   } else if (layout === 'signature-scores') {
     for (const page of pages) {
-      const pageName = toCSVCell(page.pageName);
+      const prefix = `${toCSVCell(page.pageName)},${toCSVCell(page.setName ?? '')}`;
       const { values } = page;
+      const cells = page.cellIndices ?? null;
+      const firstRow = page.firstRow ?? 0;
       for (let i = 0; i < values.length; i++) {
         const value = values[i];
-        if (Number.isFinite(value)) writer.line(`${pageName},${String(value)}`);
+        if (!Number.isFinite(value)) continue;
+        const cell = cells?.[i] ?? firstRow + i;
+        writer.line(`${prefix},${toCSVCell(cell)},${String(value)}`);
       }
     }
   } else {
@@ -208,6 +213,7 @@ export function splitPerCellRows(pages, parts) {
         pageName: page.pageName,
         values: page.values.slice(from, to),
         cellIndices: page.cellIndices ? page.cellIndices.slice(from, to) : null,
+        setName: page.setName ?? null,
         categories: page.categories ?? null,
         missingCode: page.missingCode ?? null,
         firstRow: from
@@ -223,4 +229,43 @@ export function splitPerCellRows(pages, parts) {
   }
   if (current.length > 0) ranges.push(current);
   return ranges;
+}
+
+/**
+ * Every gene of every group of a marker run, one line each (long format),
+ * with scanpy's `rank_genes_groups_df` column names plus `auroc`,
+ * `small_group` and `tested`; fractions are 0–1 as scanpy writes them. Each
+ * group's genes are in the run's gene order.
+ *
+ * @param {{genes: string[], groups: Array<{name: string, tested: boolean, small: boolean}>,
+ *   scores: Float32Array[], logfoldchanges: Float32Array[], pvals: Float64Array[],
+ *   pvalsAdj: Float64Array[], pctIn: Float32Array[], pctRef: Float32Array[], auroc: Float32Array[]}} markers
+ * @returns {Blob} With its header line
+ */
+export function markerStatisticsCSV(markers) {
+  const { genes, groups, scores, logfoldchanges, pvals, pvalsAdj, pctIn, pctRef, auroc } = markers;
+  const writer = new CsvBlobWriter();
+  writer.line('group,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');
+  const names = genes.map(gene => toCSVCell(gene));
+  groups.forEach((group, g) => {
+    const groupCell = toCSVCell(group.name);
+    const small = group.small ? 'true' : 'false';
+    const tested = group.tested ? 'true' : 'false';
+    for (let i = 0; i < genes.length; i++) {
+      writer.line([
+        groupCell,
+        names[i],
+        toCSVCell(scores[g][i]),
+        toCSVCell(logfoldchanges[g][i]),
+        toCSVCell(pvals[g][i]),
+        toCSVCell(pvalsAdj[g][i]),
+        toCSVCell(pctIn[g][i] / 100),
+        toCSVCell(pctRef[g][i] / 100),
+        toCSVCell(auroc[g][i]),
+        small,
+        tested
+      ].join(','));
+    }
+  });
+  return writer.blob();
 }

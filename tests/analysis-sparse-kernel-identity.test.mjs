@@ -26,7 +26,7 @@ import {
   createGroupingContext,
   createTwoGroupContext,
   geneSampleOf,
-  oneVsRestMarkers,
+  groupMarkers,
   splitTwoGroups,
   twoSampleDifferential
 } from '../assets/js/app/analysis/compute/gene-statistics.js';
@@ -279,13 +279,13 @@ function denseMarkers(values, cellGroupIndex, groupCount, method, minCells) {
       nOut: rest.length,
       meanIn: inGroup.length > 0 ? Math.fround(sum / inGroup.length) : NaN,
       pValue: tested ? (method === 'wilcox' ? mannWhitneyU(inGroup, rest) : welchTTest(inGroup, rest)).pValue : NaN,
-      percentIn: inGroup.length > 0 ? Math.fround((inGroup.filter(v => v > 0).length / inGroup.length) * 100) : 0
+      percentIn: inGroup.length > 0 ? Math.fround((inGroup.filter(v => v !== 0).length / inGroup.length) * 100) : 0
     });
   }
   return out;
 }
 
-test('one-vs-rest markers over non-zero entries keep every group\'s exact statistics', () => {
+test('markers against the rest over non-zero entries keep every group\'s exact statistics', () => {
   const cells = 12_000;
   const groupCount = 6;
   const random = mulberry32(3);
@@ -299,12 +299,17 @@ test('one-vs-rest markers over non-zero entries keep every group\'s exact statis
   for (const [shape, options] of SHAPES) {
     const values = expressionGene(cells, shape.length * 13, options);
     for (const method of ['wilcox', 'ttest']) {
-      const options = { method, minCells: 3, pseudocount: LOG2_FOLD_CHANGE_PSEUDOCOUNT };
-      const dense = oneVsRestMarkers(geneSampleOf(values, 0), context, options);
-      const sparse = oneVsRestMarkers(sparseOf(values), context, options);
+      const options = {
+        method,
+        minCells: 3,
+        pConvention: 'exact',
+        foldChange: { mode: 'stored', pseudocount: LOG2_FOLD_CHANGE_PSEUDOCOUNT }
+      };
+      const dense = groupMarkers(geneSampleOf(values, 0), context, options);
+      const sparse = groupMarkers(sparseOf(values), context, options);
       for (const key of Object.keys(dense)) {
-        if (key === 'nAll') {
-          assert.equal(sparse.nAll, dense.nAll);
+        if (key === 'nAll' || key === 'column') {
+          assert.deepEqual(sparse[key], dense[key]);
           continue;
         }
         for (let g = 0; g < groupCount; g++) {
@@ -344,8 +349,11 @@ test('marker moments are centred: a tiny spread around a large offset keeps its 
     values[i] = 100 + ((i % 3) - 1) * 1e-5;
     values[size + i] = 100.0001 + ((i % 3) - 1) * 1e-5;
   }
-  const result = oneVsRestMarkers(geneSampleOf(values, 0), createGroupingContext(cellGroupIndex, 2), {
-    method: 'ttest', minCells: 2, pseudocount: LOG2_FOLD_CHANGE_PSEUDOCOUNT
+  const result = groupMarkers(geneSampleOf(values, 0), createGroupingContext(cellGroupIndex, 2), {
+    method: 'ttest',
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored', pseudocount: LOG2_FOLD_CHANGE_PSEUDOCOUNT }
   });
   assert.deepEqual([...result.pValues], [0, 0]);
   // The rest of group 0 is exactly group 1: its mean is exact, not a residue.

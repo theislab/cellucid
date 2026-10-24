@@ -1124,6 +1124,7 @@ export function initFieldSelector(options) {
     new Set([
       'clearGeneSelection',
       'clearLocalSelectionUI',
+      'colorByGene',
       'destroy',
       'initGeneExpressionDropdown',
       'selectGene',
@@ -1492,9 +1493,9 @@ export function initFieldSelector(options) {
     geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
   }
 
-  async function selectGene(originalIdx) {
+  async function colorByGene(geneKey) {
     assertAlive();
-    return geneSelector.selectGene(originalIdx);
+    return geneSelector.colorByGene(geneKey);
   }
 
   function clearGeneSelection() {
@@ -1508,7 +1509,7 @@ export function initFieldSelector(options) {
     destroy,
     activateField,
     prepareDatasetReplacement,
-    selectGene,
+    colorByGene,
     settleAllInteractions,
     settleCurrentInteraction,
     syncFromState,

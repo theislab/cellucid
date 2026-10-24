@@ -172,17 +172,14 @@ test('analysis modal owns focus and releases every active pointer interaction on
     const scenarios = [
       {
         expectedCursor: 'ew-resize',
-        eventType: 'mouse',
-        selector: '.analysis-modal-edge-resize-right'
+        selector: '.analysis-modal-edge-resize-e'
       },
       {
         expectedCursor: 'col-resize',
-        eventType: 'pointer',
         selector: '.analysis-modal-resizer-vertical'
       },
       {
         expectedCursor: 'move',
-        eventType: 'mouse',
         selector: '.analysis-modal-header'
       }
     ];
@@ -218,43 +215,34 @@ test('analysis modal owns focus and releases every active pointer interaction on
       const target = modal.querySelector(scenario.selector);
       let capturedPointer = null;
       let releasedPointer = null;
-      if (scenario.eventType === 'pointer') {
-        Object.defineProperties(target, {
-          hasPointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              return capturedPointer === pointerId;
-            }
-          },
-          releasePointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              releasedPointer = pointerId;
-              capturedPointer = null;
-            }
-          },
-          setPointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              capturedPointer = pointerId;
-            }
+      Object.defineProperties(target, {
+        hasPointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            return capturedPointer === pointerId;
           }
-        });
-        target.dispatchEvent(new PointerEvent('pointerdown', {
-          bubbles: true,
-          cancelable: true,
-          clientX: 400,
-          clientY: 240,
-          pointerId: 31
-        }));
-      } else {
-        target.dispatchEvent(new MouseEvent('mousedown', {
-          bubbles: true,
-          cancelable: true,
-          clientX: 400,
-          clientY: 240
-        }));
-      }
+        },
+        releasePointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            releasedPointer = pointerId;
+            capturedPointer = null;
+          }
+        },
+        setPointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            capturedPointer = pointerId;
+          }
+        }
+      });
+      target.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 400,
+        clientY: 240,
+        pointerId: 31
+      }));
       const during = {
         cursor: document.body.style.cursor,
         userSelect: readEffectiveInlineUserSelect()
@@ -271,8 +259,7 @@ test('analysis modal owns focus and releases every active pointer interaction on
       await modal._closePromise;
       outcomes.push({
         captureReleased:
-          scenario.eventType !== 'pointer' ||
-          (capturedPointer === null && releasedPointer === 31),
+          capturedPointer === null && releasedPointer === 31,
         classesCleared:
           !target.classList.contains('resizing'),
         detached: !modal.isConnected,

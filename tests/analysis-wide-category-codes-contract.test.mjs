@@ -98,15 +98,15 @@ test('marker groups from a uint32 field carry the exact codes and cell counts', 
     state: { obsData: { fields: [{ key: 'wide', loaded: true }] } },
     ensureObsFieldLoaded: async () => ({ kind: 'category', codes, categories, colors: {} }),
   };
-  const { groups, obsCodes } = await controller._getGroupsFromCategory('wide', {});
-  assert.strictEqual(obsCodes, codes);
+  const { groups, codes: groupCodes } = await controller.describeGroups('wide', null);
+  assert.strictEqual(groupCodes, codes);
   assert.deepEqual(
-    new Map(groups.map(group => [group.groupName, group.cellCount])),
+    new Map(groups.map(group => [group.groupName, group.count])),
     EXPECTED,
   );
   const beyond = groups.find(group => group.groupName === 'c69999');
-  assert.equal(beyond.groupCode, 69_999);
-  assert.deepEqual([...beyond.cellIndices], [7, 8, 9, 10, 11]);
+  assert.equal(beyond.code, 69_999);
+  assert.equal(beyond.groupId, 'category-code:69999');
 });
 
 test('the marker worker counts each cell in its group past 32,767 groups', async () => {
@@ -126,9 +126,17 @@ test('the marker worker counts each cell in its group past 32,767 groups', async
       codes: codes.slice(),
       codeToGroupIndex: Int32Array.from({ length: CATEGORY_COUNT }, (_, code) => code),
       groupCount: CATEGORY_COUNT,
+      tested: new Uint8Array(CATEGORY_COUNT).fill(1),
+      reference: -1,
     });
     const values = Float32Array.from(CELL_CODES, (_, cell) => cell + 1);
-    const result = run('MARKERS_COMPUTE_GENE', { values, method: 'ttest', minCells: 1 });
+    const result = run('MARKERS_COMPUTE_GENE', {
+      values,
+      method: 'ttest',
+      minCells: 1,
+      pConvention: 'exact',
+      foldChange: { mode: 'stored' },
+    });
     assert.equal(result.nAll, CELL_CODES.length - 2);
     for (const [label, count] of EXPECTED) {
       assert.equal(result.nIn[Number(label.slice(1))], count, label);

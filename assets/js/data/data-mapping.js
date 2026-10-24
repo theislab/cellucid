@@ -5,7 +5,9 @@
  * (any number, of any mix of 1D, 2D and 3D: the *enabled* representations),
  * the default representation of each dimension, the vector fields bound to
  * those embeddings, the neighbour graph, the gene-name set, the expression
- * matrix and the latent space, each named by its key in one AnnData object.
+ * matrix, how each expression matrix is transformed (log1p), the highly
+ * variable genes and the latent space, each named by its key in one AnnData
+ * object.
  * The same JSON shape is written into session fingerprints and sent over the
  * Jupyter wire.
  *
@@ -49,9 +51,12 @@ const ANNDATA_MAPPING_KEYS = Object.freeze([
   'knn',
   'geneNames',
   'expression',
+  'log1p',
+  'highlyVariable',
   'latent',
   'vectorFields',
 ]);
+const LOG1P_ENTRY_KEYS = Object.freeze(['base']);
 const EMBEDDING_REF_KEYS = Object.freeze(['key', 'columns']);
 const EMBEDDINGS_GROUP_KEYS = Object.freeze(['enabled', 'defaults']);
 const VECTOR_BINDING_KEYS = Object.freeze(['key', 'embedding']);
@@ -76,6 +81,12 @@ export const EMBEDDING_KEY_PREFIX = 'X_';
 
 const GENE_NAMES_COLUMN_PREFIX = 'column:';
 const LAYER_PREFIX = 'layer:';
+
+/**
+ * The `var` column `sc.pp.highly_variable_genes` writes, the one Scanpy reads
+ * as its `mask_var` when it is not told another.
+ */
+export const HIGHLY_VARIABLE_COLUMN = 'highly_variable';
 
 /**
  * Best-guess tiers, in the order a name is tested against them. A name is
@@ -674,20 +685,55 @@ function validateGeneNames(value, label) {
   );
 }
 
+function isExpressionMatrix(value) {
+  return typeof value === 'string' && (
+    value === 'X' ||
+    value === 'raw' ||
+    (value.startsWith(LAYER_PREFIX) && value.length > LAYER_PREFIX.length)
+  );
+}
+
 function validateExpression(value, label) {
   if (value === null) return null;
-  if (
-    typeof value === 'string' &&
-    (value === 'X' ||
-      value === 'raw' ||
-      (value.startsWith(LAYER_PREFIX) && value.length > LAYER_PREFIX.length))
-  ) {
+  if (isExpressionMatrix(value)) {
     return value;
   }
   throw new DataMappingError(
     'expression',
     `${label} must be "X", "raw", "layer:<name>" or null.`
   );
+}
+
+/**
+ * Validate the `log1p` group: for each expression matrix whose values are
+ * `log1p` of counts (`X`, `raw`, `layer:<name>`), its `{base}` -- null for
+ * the natural logarithm (`sc.pp.log1p`'s default), else the base, a positive
+ * number other than 1. A matrix not listed holds its values as stored. The
+ * result lists the matrices in code-point order.
+ */
+function validateLog1p(value, label) {
+  if (!isPlainObject(value)) {
+    throw new DataMappingError('log1p', `${label} must be an object of expression matrices.`);
+  }
+  const result = {};
+  for (const matrix of Object.keys(value).sort(compareCodePoints)) {
+    if (!isExpressionMatrix(matrix)) {
+      throw new DataMappingError(
+        'log1p',
+        `${label} keys must be expression matrices: "X", "raw" or "layer:<name>".`
+      );
+    }
+    const entry = requireExactKeys(value[matrix], LOG1P_ENTRY_KEYS, `${label}.${matrix}`);
+    const base = entry.base;
+    if (base !== null && !(typeof base === 'number' && Number.isFinite(base) && base > 0 && base !== 1)) {
+      throw new DataMappingError(
+        'log1p_base',
+        `${label}.${matrix}.base must be null (base e) or a positive number other than 1.`
+      );
+    }
+    result[matrix] = { base };
+  }
+  return result;
 }
 
 /**
@@ -811,9 +857,13 @@ export function sortVectorBindings(bindings) {
  * embedding's `key`, then its `columns`, then the vector's `obsm` key -- and
  * must not repeat a binding.
  *
+ * `log1p` names, per expression matrix that holds `log1p` values, its base
+ * (`validateLog1p`); `highlyVariable` the boolean `var` column of the mapped
+ * expression matrix's genes that marks the highly variable ones, or null.
+ *
  * The result is a fresh, plain, JSON-serializable object whose keys are in
  * canonical order: `kind`, `embeddings`, `knn`, `geneNames`, `expression`,
- * `latent`, `vectorFields`.
+ * `log1p`, `highlyVariable`, `latent`, `vectorFields`.
  *
  * @param {unknown} value
  * @param {{label?: string}} [options]
@@ -875,6 +925,8 @@ export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
     knn: optionalMappingString(mapping.knn, `${label}.knn`),
     geneNames: validateGeneNames(mapping.geneNames, `${label}.geneNames`),
     expression: validateExpression(mapping.expression, `${label}.expression`),
+    log1p: validateLog1p(mapping.log1p, `${label}.log1p`),
+    highlyVariable: optionalMappingString(mapping.highlyVariable, `${label}.highlyVariable`),
     latent: optionalMappingString(mapping.latent, `${label}.latent`),
     vectorFields: bindings,
   };
@@ -1187,6 +1239,100 @@ export function defaultExpression({ hasX, hasRaw, layers }) {
     }
   }
   return { expression: `${LAYER_PREFIX}${best}`, guessed: true };
+}
+
+/**
+ * Whether one stored dtype holds integers: values a `log1p` never writes.
+ *
+ * @param {string|null|undefined} dtype
+ * @returns {boolean}
+ */
+function isIntegerDtype(dtype) {
+  return typeof dtype === 'string' && /^u?int(8|16|32|64)$/.test(dtype);
+}
+
+/**
+ * Return the default `log1p` group and whether it was guessed, by Scanpy's
+ * convention.
+ *
+ * `sc.pp.log1p` records itself in `uns['log1p']` (with `base`, None for e),
+ * and Scanpy reads that record as saying the data it works on is `log1p`:
+ * `rank_genes_groups` undoes it with that base for `X` or any layer it is
+ * given. So when the file has `uns['log1p']`, `X` and every layer are `log1p`
+ * with its base. `raw` is what `adata.raw = adata` saved, conventionally the
+ * log-normalised matrix: it is `log1p` too, unless it is stored as integers
+ * (counts). Without `uns['log1p']` every matrix is as stored, as the file
+ * states by not recording a transform. The choice is recorded as guessed when
+ * the record was read as applying to matrices: it names none of them.
+ *
+ * @param {{
+ *   log1p: {base: number|null}|null,
+ *   hasX: boolean,
+ *   raw: {dtype: string}|null,
+ *   layers: ReadonlyArray<string>
+ * }} options - `log1p` is `uns['log1p']` as probed; `layers` the usable
+ *   layers' names; `raw` raw.X's dtype, or null without raw.
+ * @returns {{log1p: Record<string, {base: number|null}>, guessed: boolean}}
+ */
+export function defaultLog1p({ log1p, hasX, raw, layers }) {
+  const matrices = [
+    ...(hasX ? ['X'] : []),
+    ...layers.map(name => `${LAYER_PREFIX}${name}`),
+    ...(raw !== null && !isIntegerDtype(raw.dtype) ? ['raw'] : []),
+  ];
+  if (log1p === null) return { log1p: {}, guessed: false };
+  const result = {};
+  for (const matrix of matrices.sort(compareCodePoints)) result[matrix] = { base: log1p.base };
+  return { log1p: result, guessed: matrices.length > 0 };
+}
+
+/**
+ * Whether one `var` column dtype is boolean (numpy `bool`, or anndata's
+ * nullable `boolean`).
+ *
+ * @param {string} dtype
+ * @returns {boolean}
+ */
+export function isBooleanVarDtype(dtype) {
+  return dtype === 'bool' || dtype === 'boolean';
+}
+
+/**
+ * Order the boolean `var` columns that can mark highly variable genes:
+ * `highly_variable` (what `sc.pp.highly_variable_genes` writes) first, then
+ * names that say so (`highly_variable_*`, `hvg`, `*_hvg`), then every other
+ * boolean column, each in code-point order.
+ *
+ * @param {ReadonlyArray<{key: string, dtype: string}>} columns
+ * @returns {string[]}
+ */
+export function highlyVariableCandidates(columns) {
+  const rank = key => {
+    if (key === HIGHLY_VARIABLE_COLUMN) return 0;
+    return /highly_variable|(^|_)hvgs?($|_)/i.test(key) ? 1 : 2;
+  };
+  return columns
+    .filter(column => isBooleanVarDtype(column.dtype))
+    .map(column => column.key)
+    .sort((left, right) => rank(left) - rank(right) || compareCodePoints(left, right));
+}
+
+/**
+ * Return the default highly-variable-genes column and whether it was guessed:
+ * Scanpy's `highly_variable` on the mapped expression matrix's genes when it
+ * is a boolean column there, else null.
+ *
+ * @param {ReadonlyArray<{key: string, dtype: string}>} columns - The var
+ *   columns of the mapped expression matrix's axis (`raw.var` for `raw`).
+ * @returns {{highlyVariable: string|null, guessed: boolean}}
+ */
+export function defaultHighlyVariable(columns) {
+  const found = columns.some(
+    column => column.key === HIGHLY_VARIABLE_COLUMN && isBooleanVarDtype(column.dtype)
+  );
+  return found
+    ? { highlyVariable: HIGHLY_VARIABLE_COLUMN, guessed: true }
+    : { highlyVariable: null, guessed: false };
 }
 
 // =============================================================================

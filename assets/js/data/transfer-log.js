@@ -28,6 +28,8 @@
  * @property {number|null} total - Size of the file, when known
  * @property {'active'|'closed'|'failed'} status
  * @property {string|null} detail - The failure, for a failed entry
+ * @property {number|null} lastArrivalAt - When bytes last arrived (`performance.now()`), null before any
+ * @property {string|null} retrying - Why a request is being made again, naming it, until bytes arrive again
  */
 
 /** Where the bytes go, as the panel and the console say it. */
@@ -89,6 +91,8 @@ export class TransferLog {
       total,
       status: 'active',
       detail: null,
+      lastArrivalAt: null,
+      retrying: null,
     };
     this._entries.delete(key);
     this._entries.set(key, entry);
@@ -137,6 +141,38 @@ export class TransferLog {
       entry.bytes += bytes;
       entry.requests += requests;
     }
+    entry.lastArrivalAt = performance.now();
+    entry.retrying = null;
+    this._publish();
+  }
+
+  /**
+   * A request for a URL failed for a moment and is made again: why, naming
+   * the request (`retrying`), until bytes arrive again.
+   *
+   * @param {string} url
+   * @param {string} message
+   */
+  retrying(url, message) {
+    const entry = this.entryFor(url);
+    if (entry === null) return;
+    entry.retrying = String(message);
+    this._console?.warn?.(`[cellucid:transfer] ${entry.label}: ${entry.retrying}`);
+    this._publish();
+  }
+
+  /**
+   * Bytes of a request still under way arrive for a URL: its entry is
+   * receiving (`lastArrivalAt`), and listeners hear of it (a read of one large
+   * request shows that it is alive before it completes).
+   *
+   * @param {string} url
+   */
+  arriving(url) {
+    const entry = this.entryFor(url);
+    if (entry === null) return;
+    entry.lastArrivalAt = performance.now();
+    entry.retrying = null;
     this._publish();
   }
 

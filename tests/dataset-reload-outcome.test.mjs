@@ -5,6 +5,8 @@ import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { createOpenMenuDom } from './helpers/open-menu-dom.mjs';
+import { recordOpenings } from './helpers/opening-events.mjs';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
 import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
 import { loadPointsBinary } from '../assets/js/data/data-loaders.js';
@@ -150,6 +152,8 @@ function captureNotifications(t) {
   notifications.success = message => {
     events.push({ kind: 'success', message });
   };
+  // A file is shown by the opening progress.
+  recordOpenings(t, events);
   t.after(() => Object.assign(notifications, originals));
   return events;
 }
@@ -271,8 +275,7 @@ async function runLocalSelection(t, { activateDataset }) {
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataH5adBtn: createButton(),
-      userDataH5adInput: input,
+      ...createOpenMenuDom({ fileInput: input }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -2621,8 +2624,7 @@ test('local validation failures publish the validator error message exactly', as
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataZarrArchiveBtn: createButton(),
-      userDataZarrArchiveInput: input,
+      ...createOpenMenuDom({ fileInput: input }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -2640,9 +2642,10 @@ test('local validation failures publish the validator error message exactly', as
   ]);
 
   assert.deepEqual(
-    notificationEvents.filter(event => event.kind === 'fail'),
+    notificationEvents
+      .filter(event => event.kind === 'fail')
+      .map(({ kind, message }) => ({ kind, message })),
     [{
-      id: 'local-load',
       kind: 'fail',
       message: validationError.message,
     }]
@@ -2676,19 +2679,17 @@ test('connection analytics expose only exact current load methods', () => {
 test('disconnect controls clear only their connection and never choose science', async t => {
   for (const connection of [
     {
-      connectButtonKey: 'remoteConnectBtn',
       disconnectButtonKey: 'remoteDisconnectBtn',
       disconnectContainerKey: 'remoteDisconnectContainer',
-      fieldKey: 'remoteServerUrl',
+      targetKey: 'remoteConnectionTarget',
       initialHref:
         'https://cellucid.test/?remote=https%3A%2F%2Fserver.test%2F',
       sourceType: 'remote',
     },
     {
-      connectButtonKey: 'dataLinkConnectBtn',
       disconnectButtonKey: 'dataLinkDisconnectBtn',
       disconnectContainerKey: 'dataLinkDisconnectContainer',
-      fieldKey: 'dataLinkUrl',
+      targetKey: 'dataLinkConnectionTarget',
       initialHref: 'https://cellucid.test/?data=gh%3Aowner%2Frepository',
       sourceType: 'link',
     },
@@ -2696,19 +2697,14 @@ test('disconnect controls clear only their connection and never choose science',
     await t.test(connection.sourceType, async t => {
       const browserState = installBrowserStubs(t, connection.initialHref);
       const notificationEvents = captureNotifications(t);
-      const connectButton = Object.assign(createButton(), {
-        disabled: false,
-        textContent: '',
-      });
       const disconnectButton = createButton();
       const disconnectContainer = { hidden: false };
-      const field = { disabled: false, value: '' };
+      const target = { textContent: '', title: '' };
       const dom = {
         select: { focus() {} },
-        [connection.connectButtonKey]: connectButton,
         [connection.disconnectButtonKey]: disconnectButton,
         [connection.disconnectContainerKey]: disconnectContainer,
-        [connection.fieldKey]: field,
+        [connection.targetKey]: target,
       };
       let disconnectCalls = 0;
       let populateCalls = 0;
@@ -2780,9 +2776,8 @@ test('disconnect controls clear only their connection and never choose science',
       await disconnectButton.activate();
 
       assert.equal(disconnectCalls, 1);
-      assert.equal(connectButton.textContent, 'Connect');
       assert.equal(disconnectContainer.hidden, true);
-      assert.equal(field.disabled, false);
+      assert.equal(target.textContent, '');
       assert.deepEqual(sourceLookups, [connection.sourceType]);
       assert.equal(clearCalls, 1);
       assert.equal(populateCalls, 1);
@@ -2804,11 +2799,11 @@ test('disconnect controls clear only their connection and never choose science',
   }
 });
 
-test('dedicated Zarr ZIP control opens and activates the portable archive input', async t => {
+test('File… opens the file input, and a Zarr ZIP picked there is read as an archive', async t => {
   installBrowserStubs(t);
   const notificationEvents = captureNotifications(t);
   const input = createFileInput();
-  const button = createButton();
+  const openMenu = createOpenMenuDom({ fileInput: input });
   const archive = { name: 'portable.zarr.zip' };
   let selectedFiles = null;
   let activation = null;
@@ -2847,8 +2842,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataZarrArchiveBtn: button,
-      userDataZarrArchiveInput: input
+      ...openMenu
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -2865,7 +2859,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
       Object.freeze({ status: 'ready' }),
   });
 
-  button.activate();
+  openMenu.userDataFileItem.activate();
   assert.equal(input.pickerClicks, 1);
   await input.select([archive]);
 
@@ -2888,9 +2882,8 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
 test('browser local-data wiring invokes only portable current transports', async t => {
   installBrowserStubs(t);
   captureNotifications(t);
-  const h5adInput = createFileInput();
+  const fileInput = createFileInput();
   const folderInput = createFileInput();
-  const archiveInput = createFileInput();
   const calls = [];
   const activations = [];
   function createUserSource() {
@@ -2936,12 +2929,7 @@ test('browser local-data wiring invokes only portable current transports', async
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataH5adBtn: createButton(),
-      userDataH5adInput: h5adInput,
-      userDataZarrArchiveBtn: createButton(),
-      userDataZarrArchiveInput: archiveInput,
-      userDataZarrFolderBtn: createButton(),
-      userDataZarrFolderInput: folderInput,
+      ...createOpenMenuDom({ fileInput, folderInput }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -2965,9 +2953,11 @@ test('browser local-data wiring invokes only portable current transports', async
   ];
   const archiveFile = { name: 'direct.zarr.zip' };
 
-  await h5adInput.select([h5adFile]);
+  // One file input takes both kinds of file; what was picked decides how it
+  // is read.
+  await fileInput.select([h5adFile]);
   await folderInput.select(folderFiles);
-  await archiveInput.select([archiveFile]);
+  await fileInput.select([archiveFile]);
 
   assert.deepEqual(
     calls.map(([kind]) => kind),

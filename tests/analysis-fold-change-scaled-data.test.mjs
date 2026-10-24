@@ -73,11 +73,15 @@ test('marker worker fold change on scaled data matches DE and keeps its sign', a
       codes: Uint16Array.from(values, (_, index) => Math.floor(index / 10)),
       codeToGroupIndex: Int32Array.from([0, 1, 2]),
       groupCount: 3,
+      tested: Uint8Array.of(1, 1, 1),
+      reference: -1,
     }, 'scaled-context');
     const result = runWorker('MARKERS_COMPUTE_GENE', {
       values,
       method: 'wilcox',
       minCells: 2,
+      pConvention: 'exact',
+      foldChange: { mode: 'stored' },
     }, 'scaled-gene');
 
     const groups = [groupA, groupB, groupC];

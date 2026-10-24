@@ -204,8 +204,10 @@ export class DataStateMappingMethods {
 
   /**
    * The groups the current mapping took from the best guess and still shows:
-   * embedding slots (`'embeddings.2d'`) and, for a file without `X`, the
-   * `'expression'` matrix chosen in its place.
+   * embedding slots (`'embeddings.2d'`), for a file without `X` the
+   * `'expression'` matrix chosen in its place, the matrices' `'log1p'` (read
+   * from Scanpy's `uns['log1p']`) and the `'highlyVariable'` column, each until
+   * it is changed.
    *
    * @returns {string[]}
    */
@@ -213,8 +215,8 @@ export class DataStateMappingMethods {
     const candidates = this.getMappingCandidates();
     if (candidates === null || this.dataMapping === null) return [];
     return candidates.guessed.filter(group => {
-      if (group === 'expression') {
-        return this.dataMapping.expression === candidates.defaults.expression;
+      if (group === 'expression' || group === 'log1p' || group === 'highlyVariable') {
+        return sameJson(this.dataMapping[group], candidates.defaults[group]);
       }
       const slot = group.replace(/^embeddings\./, '');
       return (
@@ -291,8 +293,14 @@ export class DataStateMappingMethods {
   /**
    * Every embedding the mapper can enable, enabled or not: every `obsm` array
    * (unusable ones with their reason) with every column selection that is
-   * enabled now, or its first columns when none is. A wide array can be
-   * enabled at any further selection of 1 to 3 columns.
+   * enabled now. An array with none enabled is offered at all of its columns
+   * when it is 1 to 3 wide (an embedding), and at its first two, in 2D, when
+   * it is wider: a matrix of components or latent dimensions (`X_pca`, a
+   * 3,136-column latent space) is not an embedding, and its first two columns
+   * are how it is conventionally plotted (PC1 against PC2). Offered as 3D at
+   * its first three, every such matrix read as a 3D embedding beside the
+   * file's real 2D UMAP. Embeddings are listed before wider arrays. A wide
+   * array can be enabled at any further selection of 1 to 3 columns.
    *
    * @returns {Array<{
    *   ref: {key: string, columns: number[]|null},
@@ -336,6 +344,7 @@ export class DataStateMappingMethods {
       });
     }
     const choices = [];
+    const wideChoices = [];
     const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
     for (const item of candidates.obsm) {
       if (vectorKeys.has(item.key)) continue;
@@ -353,9 +362,9 @@ export class DataStateMappingMethods {
       const selections = enabledRefs.filter(ref => ref.key === item.key);
       const shown = selections.length > 0
         ? selections
-        : [{ key: item.key, columns: Array.from({ length: Math.min(width, 3) }, (_, index) => index) }];
+        : [{ key: item.key, columns: Array.from({ length: width > 3 ? 2 : width }, (_, index) => index) }];
       for (const ref of shown) {
-        choices.push(choice(ref, {
+        (width > 3 ? wideChoices : choices).push(choice(ref, {
           name: representationName({
             layoutKey: item.key,
             label: item.key,
@@ -369,7 +378,7 @@ export class DataStateMappingMethods {
         }));
       }
     }
-    return choices;
+    return [...choices, ...wideChoices];
   }
 
   /**

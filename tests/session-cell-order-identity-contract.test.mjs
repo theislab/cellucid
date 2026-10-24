@@ -112,6 +112,8 @@ function keyedMapping(overrides = {}) {
     knn: null,
     geneNames: 'index',
     expression: 'X',
+    log1p: {},
+    highlyVariable: null,
     latent: null,
     vectorFields: [],
     ...overrides,
@@ -144,6 +146,8 @@ function anndataMapping(overrides = {}) {
     knn: 'connectivities',
     geneNames: 'index',
     expression: 'X',
+    log1p: {},
+    highlyVariable: null,
     latent: null,
     vectorFields: [],
     ...overrides,
@@ -1053,6 +1057,8 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
     'knn',
     'geneNames',
     'expression',
+    'log1p',
+    'highlyVariable',
     'latent',
     'vectorFields',
   ]);
@@ -1124,6 +1130,8 @@ test('cellOrder.embedding names the live layout by obsm key and columns, whateve
     'knn',
     'geneNames',
     'expression',
+    'log1p',
+    'highlyVariable',
     'latent',
     'vectorFields',
   ]);
@@ -1244,8 +1252,8 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
   rejects(record => { record.dataMapping.kind = 'h5ad'; }, /kind/);
   rejects(
     record => {
-      const { kind, embeddings, knn, geneNames, expression, latent, vectorFields } = record.dataMapping;
-      record.dataMapping = { kind, geneNames, embeddings, knn, expression, latent, vectorFields };
+      const { kind, embeddings, knn, geneNames, expression, log1p, highlyVariable, latent, vectorFields } = record.dataMapping;
+      record.dataMapping = { kind, geneNames, embeddings, knn, expression, log1p, highlyVariable, latent, vectorFields };
     },
     /canonical form/,
   );

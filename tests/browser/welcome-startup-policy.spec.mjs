@@ -170,7 +170,7 @@ test('an exact authenticated Jupyter URL startup never shows or paints onboardin
   expect(errors).toEqual([]);
 });
 
-test('a failed exact remote-server intent keeps onboarding hidden and owns the failure', async ({
+test('a failed exact remote-server intent keeps onboarding hidden and says why', async ({
   page,
 }) => {
   await installWelcomePaintProbe(page);
@@ -185,18 +185,18 @@ test('a failed exact remote-server intent keeps onboarding hidden and owns the f
   remoteUrl.searchParams.set('remote', APP_ORIGIN);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  const failure = page.locator('#cellucid-startup-failure');
-  await expect(failure).toBeVisible();
-  await expect(failure).toHaveAttribute('role', 'alert');
-  await expect(failure).toContainText('Cellucid could not start');
-  await expect(failure).toContainText(
+  // A server that does not answer is data that did not open: Cellucid
+  // starts without it, and the failed opening says why with the ways on.
+  const failed = page.locator('.opening-overlay[data-state="failed"]');
+  await expect(failed).toBeVisible();
+  await expect(failed.locator('.opening-title')).toHaveText('The data could not be opened');
+  await expect(failed.locator('.welcome-details-text')).toContainText(
     'Remote health request failed with HTTP 503',
   );
-  await expect(failure).toContainText(
-    'Correct the launch configuration or server response, then reload this page.',
-  );
-  await expect(failure).toHaveCount(1);
-  await expect(page.locator('#dataset-name')).toHaveText('–');
+  await expect(failed.getByRole('button', { name: 'Try again' })).toBeVisible();
+  await expect(failed.getByRole('button', { name: 'Open without this link' })).toBeVisible();
+  await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expectWelcomeNeverPainted(page);
 });
 
@@ -221,6 +221,6 @@ test('a failed exact same-origin AnnData intent keeps onboarding hidden', async 
     'Same-origin Cellucid health request failed with HTTP 503.',
   );
   await expect(failure).toHaveCount(1);
-  await expect(page.locator('#dataset-name')).toHaveText('–');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expectWelcomeNeverPainted(page);
 });

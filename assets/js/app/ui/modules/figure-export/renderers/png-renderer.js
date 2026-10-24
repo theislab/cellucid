@@ -8,8 +8,9 @@
  * ARCHITECTURE:
  * - Uses Canvas2D surface for layout, background, frame, title, axes, legend
  * - The figure-export worker draws the points with the WebGL2 rasterizer
- *   (preserves 3D sphere shading with lighting/fog), computes the axis bounds,
- *   and encodes the composed frame; the page only composes
+ *   (preserves 3D sphere shading with lighting/fog; on the page where a
+ *   worker has no WebGL2), computes the axis bounds, and encodes the composed
+ *   frame; the page composes
  * - Fails visibly if the exact WebGL2 point pass cannot be produced
  *
  * LAYOUT SYSTEM (IMPORTANT):
@@ -435,7 +436,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   /** @type {ImageBitmap[]} */
   const frames = [];
   try {
-  // Read once from the worker's GL context: a crop's raster plan needs it.
+  // Read once from the export's GL context: a crop's raster plan needs it.
   const zoomLimit = crop01 === null
     ? null
     : await session.request('spriteZoomLimit', {});

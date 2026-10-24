@@ -34,7 +34,7 @@ import {
 import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 import {
   classifyDataSourceFailure,
-  dataSourceFailureDetail,
+  dataSourceFailureDetails,
   describeDataSourceFailure,
 } from '../assets/js/app/ui/modules/dataset-connections.js';
 
@@ -190,9 +190,9 @@ test('a size refusal is never given the write-it-again advice', () => {
     'the notice names the cause, never the transport diagnostic'
   );
   assert.equal(
-    dataSourceFailureDetail(tooLarge),
-    '',
-    'a named cause makes the raw byte count redundant'
+    dataSourceFailureDetails(tooLarge),
+    tooLarge.message,
+    'the raw byte count is kept for the notification\'s Details only'
   );
 });
 
@@ -270,7 +270,7 @@ test('every failure row is reachable, distinct, and shaped alike', () => {
     // unclassified fallback uses, and none of them carries a raw detail.
     assert.match(sentence, /^Sample datasets could not be loaded: /);
     assert.match(sentence, /try again/i);
-    assert.equal(dataSourceFailureDetail(error), '');
+    assert.doesNotMatch(sentence, /Details:/);
     sentences.add(sentence);
   }
   assert.equal(
@@ -295,6 +295,6 @@ test('the unclassified shape keeps exactly the cases it had', () => {
       describeDataSourceFailure('Sample datasets', 'could not be loaded', error),
       /^Sample datasets could not be loaded\. Try again;/
     );
-    assert.match(dataSourceFailureDetail(error), /^ Details: /);
+    assert.equal(dataSourceFailureDetails(error), error.message);
   }
 });

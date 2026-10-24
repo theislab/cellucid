@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { defineOptions } from '../assets/js/app/analysis/options/option-schema.js';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
@@ -34,7 +35,6 @@ import {
 } from './helpers/in-memory-anndata.mjs';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
-import { createPageComparisonSelector } from '../assets/js/app/analysis/ui/components/selectors.js';
 import {
   deResultsToCSV,
   toCSV,
@@ -126,42 +126,36 @@ test('BaseAnalysisUI settings are exact, cloneable, and internally consistent', 
 
 test('FormBasedAnalysisUI imports one complete exact settings schema', () => {
   const ui = Object.create(FormBasedAnalysisUI.prototype);
+  ui._getTitle = () => 'Form';
+  ui._getOptionsSchema = () => defineOptions({
+    id: 'exact',
+    groups: [],
+    options: [{ key: 'size', kind: 'number', label: 'Size', tip: 'analysis-signature', group: 'essentials', default: 1 }],
+  });
+  ui._getOptionsContext = () => ({});
+  ui.dataLayer = { getPages: () => [{ id: 'page-a' }], getCellCountForPageId: () => 3 };
   ui.onPageSelectionChange = () => {
     throw new Error('invalid settings must be rejected before mutation');
   };
-  ui._applyNamedFormControls = () => {
-    throw new Error('invalid settings must be rejected before mutation');
-  };
+  const view = { disclosures: { more: false, groups: [] } };
 
+  assert.throws(() => ui.importSettings(null), /settings must be an object/i);
   assert.throws(
-    () => ui.importSettings(null),
-    /form-based analysis settings must be an object/i,
+    () => ui.importSettings({ selectedPages: ['page-a'], options: { size: 1 }, view, formControls: {} }),
+    /exactly: options, selectedPages, view/i,
   );
   assert.throws(
-    () => ui.importSettings({
-      selectedPages: ['page-a'],
-      formControls: {},
-      legacyMode: true,
-    }),
-    /exactly.*formControls.*selectedPages/i,
+    () => ui.importSettings({ selectedPages: ['page-a'], options: { size: 1 } }),
+    /exactly: options, selectedPages, view/i,
   );
   assert.throws(
-    () => ui.importSettings({
-      selectedPages: ['page-a'],
-    }),
-    /exactly.*formControls.*selectedPages/i,
+    () => ui.importSettings({ selectedPages: ['page-a'], options: { size: 1, batchSize: 100 }, view }),
+    /no option "batchSize"/i,
+    'an option this version does not have is refused, never ignored',
   );
   assert.throws(
-    () => ui.importSettings({
-      selectedPages: ['page-a'],
-      formControls: {
-        method: {
-          type: 'checkbox',
-          value: 'true',
-        },
-      },
-    }),
-    /checkbox.*boolean/i,
+    () => ui.importSettings({ selectedPages: ['page-a'], options: { size: 'big' }, view }),
+    /Size must be a number/,
   );
 });
 
@@ -315,41 +309,14 @@ test('AnalysisUIManager rejects an explicit zero-cell page selection', () => {
   assert.deepEqual(manager.getCurrentPages(), []);
 });
 
-test('DE page comparison never constructs a pair from a zero-cell page', async () => {
-  await withFakeDOM(() => {
-    const changes = [];
-    const selector = createPageComparisonSelector({
-      pages: [{ id: 'page_1', name: 'Page 1' }],
-      selectedIds: [],
-      includeDerivedPages: true,
-      getCellCountForPageId(pageId) {
-        return pageId === 'page_1' ? 0 : 561_947;
-      },
-      onChange(pageIds) {
-        changes.push([...pageIds]);
-      },
-    });
-
-    assert.deepEqual(
-      selector._getSelection(),
-      [],
-      'DE requires two non-empty groups and must not pair Page 1 (0) with Rest',
-    );
-    assert.deepEqual(changes, []);
-
-    assert.throws(
-      () => createPageComparisonSelector({
-        pages: [{ id: 'page_1', name: 'Page 1' }],
-        selectedIds: ['page_1', 'restof__page_1'],
-        includeDerivedPages: true,
-        getCellCountForPageId(pageId) {
-          return pageId === 'page_1' ? 0 : 561_947;
-        },
-        onChange() {},
-      }),
-      /page_1.*zero cells.*cannot be selected/i,
-    );
-  });
+test('DE never offers a zero-cell page as a group', () => {
+  const ui = Object.create(DEAnalysisUI.prototype);
+  ui.dataLayer = {
+    getPages: () => [{ id: 'page_1', name: 'Page 1' }],
+    getCellCountForPageId: pageId => (pageId === 'page_1' ? 0 : 561_947),
+  };
+  // Page 1 holds no cell: only the rest of it can be compared.
+  assert.deepEqual(ui._pageChoices().map(page => page.id), ['restof__page_1']);
 });
 
 test('AnalysisUIManager accepts only factories that return a fully initialized UI', () => {
@@ -447,6 +414,13 @@ class FakeElement {
     for (const node of nodes) this.appendChild(node);
   }
 
+  prepend(...nodes) {
+    for (const node of nodes.reverse()) {
+      node.parentNode = this;
+      this.children.unshift(node);
+    }
+  }
+
   replaceChildren(...nodes) {
     this.children = [];
     this.append(...nodes);
@@ -454,6 +428,10 @@ class FakeElement {
 
   get ownerDocument() {
     return globalThis.document;
+  }
+
+  get childElementCount() {
+    return this.children.length;
   }
 
   setAttribute(name, value) {
@@ -483,6 +461,10 @@ class FakeElement {
 
   querySelector() {
     return null;
+  }
+
+  querySelectorAll() {
+    return [];
   }
 
   getBoundingClientRect() {
@@ -902,6 +884,9 @@ test('analysis-window session capture requires the exact manager API', () => {
         exportSessionWindows() {
           return {};
         },
+        exportViewSizes() {
+          return { window: {}, expandedView: {} };
+        },
       },
     }),
     /exportSessionWindows.*array/i,
@@ -911,12 +896,14 @@ test('analysis-window session capture requires the exact manager API', () => {
 test('analysis-window session restore is terminal on invalid boundaries and manager failures', async () => {
   await assert.rejects(
     restoreAnalysisWindows({}, {}, { windows: [] }),
-    /analysisWindowManager.*closeAll.*createFromSessionDescriptor/i,
+    /analysisWindowManager.*closeAll.*createFromSessionDescriptor.*importViewSizes/i,
   );
   const exactManager = {
     closeAll() {},
     createFromSessionDescriptor() {},
+    importViewSizes() {},
   };
+  const NO_SIZES = { window: {}, expandedView: {} };
   await assert.rejects(
     restoreAnalysisWindows(
       { analysisWindowManager: exactManager },
@@ -932,7 +919,16 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
       {},
       encodeTypedJson({}),
     ),
-    /payload.*exactly.*windows/i,
+    /payload.*exactly.*sizes, windows/i,
+  );
+  await assert.rejects(
+    restoreAnalysisWindows(
+      { analysisWindowManager: exactManager },
+      {},
+      encodeTypedJson({ windows: [] }),
+    ),
+    /payload.*exactly.*sizes, windows/i,
+    'a payload without remembered sizes is refused, not migrated',
   );
 
   const closeError = new Error('close failed');
@@ -947,10 +943,11 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
           createFromSessionDescriptor() {
             restoreCalls += 1;
           },
+          importViewSizes() {},
         },
       },
       {},
-      encodeTypedJson({ windows: [{}] }),
+      encodeTypedJson({ windows: [{}], sizes: NO_SIZES }),
     ),
     error => error === closeError,
   );
@@ -967,10 +964,11 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
             restoreCalls += 1;
             throw restoreError;
           },
+          importViewSizes() {},
         },
       },
       {},
-      encodeTypedJson({ windows: [{ modeId: 'first' }, { modeId: 'second' }] }),
+      encodeTypedJson({ windows: [{ modeId: 'first' }, { modeId: 'second' }], sizes: NO_SIZES }),
     ),
     error => error === restoreError,
   );
@@ -1211,6 +1209,8 @@ test('correlation UI awaits each selected variable readiness before one compute 
   let computeRequestOrder = null;
   const ui = Object.create(CorrelationAnalysisUI.prototype);
   ui._selectedPages = ['page-a'];
+  ui._isCurrentAnalysisRequest = () => true;
+  ui._registerAnalysisInvalidationCleanup = () => {};
   ui._pageSelector = {
     getCustomColors() {
       return new Map();
@@ -1245,8 +1245,8 @@ test('correlation UI awaits each selected variable readiness before one compute 
     variableX: { type: 'continuous_obs', key: 'age' },
     variableY: { type: 'continuous_obs', key: 'n_genes' },
     method: 'pearson',
-    colorBy: null,
-  });
+    colorBy: '',
+  }, 1, null);
   try {
     await Promise.resolve();
     assert.deepEqual(requestOrder, ['age']);
@@ -1293,7 +1293,7 @@ test('analysis previews invoke their required full-view modal owner', async () =
       {
         label: 'Gene Signature',
         prototype: GeneSignatureUI.prototype,
-        result: { plotType: '__missing-signature-preview-plot__' },
+        result: { plotType: '__missing-signature-preview-plot__', raw: { sets: [], unscored: [] } },
         clickClass: 'analysis-expand-btn',
         configure(ui) {
           ui._instanceId = 'signature-preview';
@@ -1302,7 +1302,10 @@ test('analysis previews invoke their required full-view modal owner', async () =
       {
         label: 'Differential Expression',
         prototype: DEAnalysisUI.prototype,
-        result: { plotType: '__missing-de-preview-plot__' },
+        result: {
+          plotType: '__missing-de-preview-plot__',
+          full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10 } },
+        },
         clickClass: 'analysis-expand-btn',
         configure(ui) {
           ui._plotContainerIdBase = 'de-preview';

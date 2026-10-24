@@ -134,13 +134,18 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
     page.locator('.accordion-panel:has(> #visualization-section)')
   ).not.toHaveClass(/floating-enter/);
 
-  /* The floating panel's only size control was pointer-only and
-     `aria-hidden`. It is a focusable window splitter now. */
+  /* The floating panel's size controls were pointer-only and `aria-hidden`.
+     Its edges are focusable window splitters now: the right edge widens it
+     by arrow key. */
   const widthHandle = page.locator(
-    '#visualization-section .accordion-width-handle'
+    '.accordion-panel:has(> #visualization-section)'
+    + ' > .accordion-resize-handle[data-edge="e"]'
   );
   await expect(widthHandle).toHaveAttribute('role', 'separator');
-  await expect(widthHandle).toHaveAttribute('aria-label', 'Panel width');
+  await expect(widthHandle).toHaveAttribute(
+    'aria-label',
+    'Resize window from its right edge'
+  );
   await expect(widthHandle).not.toHaveAttribute('aria-hidden', 'true');
   await widthHandle.focus();
   await expect(widthHandle).toBeFocused();
@@ -159,7 +164,7 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   expect(Math.abs(reportedWide - widthAfter)).toBeLessThanOrEqual(2);
   await expect(widthHandle).toHaveAttribute(
     'aria-valuetext',
-    `${reportedWide} pixels wide`
+    new RegExp(`^${reportedWide} × \\d+ pixels$`)
   );
 
   await page.keyboard.press('ArrowLeft');

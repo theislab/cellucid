@@ -562,10 +562,15 @@ test('a read a view waits for goes ahead of queued background work, which never 
 test('a web host starts at its streams; background work keeps under its HTTP/1.1 connections until it is known to multiplex', async () => {
   const { ReadActivity } = await import('../assets/js/formats/io/activity.js');
   const recorded = recordingSource(pattern(16_000_000), { ...POLICY, concurrency: 6, streams: 100, mergeGapBytes: 0 });
-  // A round trip of a few milliseconds, so the link is measured.
+  // A 20 ms round trip, so the link is measured, and forty answers landing
+  // together are told from a queue's waves (within half a round trip) however
+  // a loaded host's timers fire. A request is recorded when the reader sends
+  // it and answered a round trip later: what is in flight is what the reader
+  // sent.
   const source = { ...recorded, read: async (offset, length, options) => {
-    await new Promise(resolve => setTimeout(resolve, 2));
-    return recorded.read(offset, length, options);
+    const bytes = await recorded.read(offset, length, options);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    return bytes;
   } };
   Object.defineProperty(source, 'calls', { get: () => recorded.calls });
   source.hold = () => recorded.hold();
@@ -584,8 +589,11 @@ test('a web host starts at its streams; background work keeps under its HTTP/1.1
   assert.equal(reader.link.multiplexed, true, 'forty answered within a round trip: the host multiplexes');
   // On another link to a host not yet known to multiplex, large reads beyond
   // six wait while those in flight carry two round trips' worth of bytes.
-  const other = createByteReader(source);
+  // Its measuring read is one request: split into a burst, the burst's
+  // completions could already show the host multiplexing.
+  const other = createByteReader(source, { policy: { maxRequestBytes: 500_000 } });
   await other.read(15_400_000, 500_000);
+  assert.equal(other.link.multiplexed, null, 'one request shows nothing of the protocol');
   source.calls.length = 0;
   const big = source.hold();
   const size = Math.ceil(other.link.roundTripBytes / 2);
@@ -629,6 +637,19 @@ test('a Zarr web host that answers a range with the whole object is asked for it
   assert.equal(requests.length, 1, 'the whole shard was kept, not fetched again');
 });
 
+/**
+ * Wait until `ms` have passed on the clock the link measures with. A timer
+ * may fire up to a millisecond before its delay by `performance.now()` (it
+ * counts from the event loop's cached time), which would put a round trip
+ * under the latency the source stands for.
+ */
+async function elapse(ms) {
+  const until = performance.now() + ms;
+  while (performance.now() < until) {
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(until - performance.now()))));
+  }
+}
+
 /** A memory source behind a link with a `latency` ms round trip and `rate` bytes per ms. */
 function linkSource(bytes, { latency = 20, rate = 1000, concurrency = 2 } = {}) {
   const base = bytesByteSource(bytes, {
@@ -648,7 +669,7 @@ function linkSource(bytes, { latency = 20, rate = 1000, concurrency = 2 } = {}) 
     async read(offset, length, options = {}) {
       calls.push([offset, length]);
       if (gate) await gate;
-      await new Promise(resolve => setTimeout(resolve, latency + length / rate));
+      await elapse(latency + length / rate);
       return base.read(offset, length, options);
     },
   };

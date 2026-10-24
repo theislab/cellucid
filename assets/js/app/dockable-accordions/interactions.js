@@ -1,4 +1,14 @@
-import { clampFloatingPosition } from './geometry.js';
+import {
+  FLOATING_MARGIN,
+  RESIZE_EDGES,
+  clampFloatingPosition,
+  floatingSnapTargets,
+  keyboardResizeTravel,
+  maximizedFloatingRect,
+  resizeFloatingRect
+} from './geometry.js';
+import { announceKeyboardMove } from '../ui/keyboard-move.js';
+import { capturePointer, releasePointer } from '../ui/pointer-capture.js';
 /**
  * @fileoverview Interaction helpers for dockable accordions.
  *
@@ -56,11 +66,13 @@ function setGlobalDragState(isDragging) {
   }
 }
 
-function setGlobalResizeState(isResizing) {
+function setGlobalResizeState(isResizing, cursor = 'ew-resize') {
   document.body.classList.toggle('dock-resizing', isResizing);
   if (isResizing) {
+    document.body.style.setProperty('--dock-resize-cursor', cursor);
     document.addEventListener('selectstart', preventSelect, { capture: true });
   } else {
+    document.body.style.removeProperty('--dock-resize-cursor');
     document.removeEventListener('selectstart', preventSelect, { capture: true });
   }
 }
@@ -68,7 +80,6 @@ function setGlobalResizeState(isResizing) {
 export function createAccordionInteractions({
   sidebar,
   StyleManager,
-  isFiniteNumber,
   getState,
   panelFrame,
   isFloating,
@@ -81,8 +92,7 @@ export function createAccordionInteractions({
     DRAG_THRESHOLD_PX,
     DETACH_DISTANCE_PX,
     DOCK_HIT_PADDING_PX,
-    FLOAT_MIN_WIDTH_PX,
-    FLOAT_MAX_SCALE
+    FLOAT_MIN_WIDTH_PX
   } = constants || {};
 
   function isInSidebarZone(clientX, clientY, sidebarRect) {
@@ -102,171 +112,527 @@ export function createAccordionInteractions({
     sidebar.classList.toggle('dock-drop-hover', isActive && isHover);
   }
 
-  // Width bounds shared by the pointer drag and the keyboard resize, so both
-  // inputs clamp against exactly the same numbers.
-  function widthBounds(details, state, rect) {
-    const startWidth = rect.width;
-    const minWidth = state.widthConstraints?.min ?? FLOAT_MIN_WIDTH_PX;
-    const maxWidthConstraint = state.widthConstraints?.max;
-    const baseWidth = state.baseFloatSize?.width ?? startWidth;
-    const maxWidthByScale = Math.max(minWidth, baseWidth * FLOAT_MAX_SCALE);
-    const maxWidthByConstraint = isFiniteNumber(maxWidthConstraint)
-      ? Math.max(minWidth, maxWidthConstraint)
-      : maxWidthByScale;
-    const maxWidthByViewport = Math.max(
-      minWidth,
-      window.innerWidth - rect.left - 8
-    );
+  // ═════════════════════════════════════════════════════════════════════════
+  // Resizing a floating panel: eight handles (four edges, four corners), by
+  // pointer — mouse, pen or finger — and by keyboard.
+  //
+  // The handles are children of the frame, not of the `<details>`: a closed
+  // `<details>` renders only its summary, and the card clips what overhangs
+  // it, so handles inside it could neither straddle the border nor exist
+  // while the panel is collapsed.
+  // ═════════════════════════════════════════════════════════════════════════
+
+  const HANDLE_NAMES = {
+    n: 'top edge',
+    ne: 'top-right corner',
+    e: 'right edge',
+    se: 'bottom-right corner',
+    s: 'bottom edge',
+    sw: 'bottom-left corner',
+    w: 'left edge',
+    nw: 'top-left corner'
+  };
+  const HANDLE_CURSORS = {
+    n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+    ne: 'nesw-resize', sw: 'nesw-resize', nw: 'nwse-resize', se: 'nwse-resize'
+  };
+  const KEY_STEP_PX = 16;
+  const KEY_STEP_LARGE_PX = 64;
+  const SNAP_DISTANCE_PX = 12;
+  const SNAP_DISTANCE_COARSE_PX = 20;
+  const READOUT_LINGER_MS = 900;
+  const FIRST_CONTROL_SELECTOR = 'select, input:not([type="hidden"]), textarea, button';
+
+  /**
+   * How much of a panel's content shows its first control: from the top of
+   * the content to the bottom of its first select, field or button (its
+   * label and the padding above included).
+   */
+  function firstControlHeight(details) {
+    const content = details.querySelector(':scope > .accordion-content');
+    const first = content?.querySelector(FIRST_CONTROL_SELECTOR) ?? null;
+    if (first === null) return 0;
+    const top = content.getBoundingClientRect().top - content.scrollTop;
+    return Math.max(0, Math.ceil(first.getBoundingClientRect().bottom - top));
+  }
+
+  function handlesOf(frame) {
+    return frame.querySelectorAll(':scope > .accordion-resize-handle');
+  }
+
+  function isSheet(frame) {
+    return frame.classList.contains('floating-sheet');
+  }
+
+  /**
+   * The panel's box as the dockable owner wrote it (`--pos-*`): not a
+   * measurement, which would be scaled while the panel lifts in and clipped
+   * on a viewport smaller than the panel.
+   */
+  function frameRect(frame) {
+    const read = name => Number.parseFloat(frame.style.getPropertyValue(name));
+    return { left: read('--pos-x'), top: read('--pos-y'), width: read('--pos-width'), height: read('--pos-height') };
+  }
+
+  /**
+   * The height that shows all of the panel's content: its header plus the
+   * content's own extent (its scroll height while it overflows, else the
+   * bottom of its last child).
+   */
+  function contentHeight(details) {
+    const summary = details.querySelector(':scope > summary');
+    const content = details.querySelector(':scope > .accordion-content');
+    const header = summary?.offsetHeight ?? 0;
+    if (content === null || !details.open) return header;
+    let extent = content.scrollHeight;
+    if (!(content.scrollHeight > content.clientHeight + 1)) {
+      const box = content.getBoundingClientRect();
+      let bottom = box.top;
+      for (const child of content.children) {
+        bottom = Math.max(bottom, child.getBoundingClientRect().bottom);
+      }
+      const padding = Number.parseFloat(getComputedStyle(content).paddingBottom) || 0;
+      extent = bottom - box.top + padding;
+    }
+    // The card's top and bottom border.
+    return Math.ceil(header + extent + 2);
+  }
+
+  /**
+   * The smallest box that still works: as narrow as the panel's minimum
+   * width, as short as its header and the first control of its content (the
+   * rest scrolls).
+   */
+  function sizeLimits(details, state) {
+    const summary = details.querySelector(':scope > summary');
+    const header = summary?.offsetHeight ?? 0;
+    // The header can change height (a pointer of another kind, a longer
+    // title); the content's height follows it (`_accordion.css`).
+    StyleManager.setVariable(panelFrame(details), '--floating-header-height', `${header}px`);
+    const firstRow = details.open ? firstControlHeight(details) : 0;
+    const contentMin = header + firstRow + 2;
     return {
-      minWidth,
-      maxWidth: Math.min(maxWidthByConstraint, maxWidthByViewport),
+      minWidth: state.widthConstraints?.min ?? FLOAT_MIN_WIDTH_PX,
+      minHeight: Math.max(state.minHeight ?? 0, contentMin)
     };
   }
 
-  // A focusable `separator` is the window-splitter role: assistive technology
-  // reads the current width off `aria-valuenow` on every arrow key, so the
-  // keyboard resize needs no announcement of its own.
-  //
-  // `knownRect` is the geometry a caller has just written. Measuring
-  // immediately after a style write forces a synchronous layout, and the one
-  // caller that does both — laying a panel out as it starts floating — already
-  // holds the numbers it wrote.
-  function syncWidthHandleValue(details, widthHandle, knownRect = null) {
-    if (!isFloating(details)) return;
-    const state = getState(details);
-    const rect = knownRect ?? panelFrame(details).getBoundingClientRect();
-    const { minWidth, maxWidth } = widthBounds(details, state, rect);
-    widthHandle.setAttribute('aria-valuemin', String(Math.round(minWidth)));
-    widthHandle.setAttribute('aria-valuemax', String(Math.round(maxWidth)));
-    widthHandle.setAttribute('aria-valuenow', String(Math.round(rect.width)));
-    widthHandle.setAttribute(
-      'aria-valuetext',
-      `${Math.round(rect.width)} pixels wide`
-    );
+  function viewport() {
+    return { viewportWidth: window.innerWidth, viewportHeight: window.innerHeight };
   }
 
-  // Resize handles (for floating panels)
-  function ensureResizeHandles(details, signal) {
-    if (details.querySelector('.accordion-width-handle')) return;
+  function sidebarBox() {
+    if (sidebar.classList.contains('hidden')) return { right: 0, width: 0 };
+    const rect = sidebar.getBoundingClientRect();
+    return { right: rect.right, width: rect.width };
+  }
 
-    const widthHandle = document.createElement('div');
-    widthHandle.className = 'accordion-width-handle';
-    // The handle used to be `aria-hidden` and pointer-only, which made the
-    // floating panel's only size control unreachable without a mouse.
-    widthHandle.setAttribute('role', 'separator');
-    widthHandle.setAttribute('aria-orientation', 'vertical');
-    widthHandle.setAttribute('aria-label', 'Panel width');
-    widthHandle.setAttribute('aria-keyshortcuts', 'ArrowLeft ArrowRight Home End');
-    widthHandle.tabIndex = 0;
-    details.appendChild(widthHandle);
+  function snapTargetsFor(details, frame, distance) {
+    const others = [];
+    for (const sibling of frame.parentElement?.children ?? []) {
+      if (sibling === frame || !sibling.classList.contains('accordion-floating')) continue;
+      others.push(sibling.getBoundingClientRect());
+    }
+    const side = sidebarBox();
+    return floatingSnapTargets({
+      ...viewport(),
+      sidebarRight: side.right,
+      sidebarWidth: side.width,
+      others,
+      contentHeight: contentHeight(details),
+      distance
+    });
+  }
 
-    widthHandle.addEventListener('focus', () => {
-      syncWidthHandleValue(details, widthHandle);
-    }, { signal });
+  /**
+   * Write a box and keep the drag origin in step. It reads no layout, so a
+   * drag can write once a frame without forcing one; the handles' values are
+   * brought up to date when the gesture or key is done.
+   */
+  function applyRect(details, rect) {
+    const state = getState(details);
+    const frame = panelFrame(details);
+    StyleManager.setPosition(frame, { x: rect.left, y: rect.top, width: rect.width, height: rect.height });
+    state.floatLeft = rect.left;
+    state.floatTop = rect.top;
+  }
 
-    widthHandle.addEventListener('keydown', (e) => {
-      if (e.altKey || e.ctrlKey || e.metaKey) return;
+  function notifyGeometry(details) {
+    const state = getState(details);
+    if (typeof state.onGeometryChange !== 'function') return;
+    const frame = panelFrame(details);
+    const width = Number.parseFloat(frame.style.getPropertyValue('--pos-width'));
+    const height = Number.parseFloat(frame.style.getPropertyValue('--pos-height'));
+    if (!(width > 0) || !(height > 0)) return;
+    state.onGeometryChange({ width, height });
+  }
 
-      if (!isFloating(details)) return;
-      const state = getState(details);
-      const frame = panelFrame(details);
+  function readoutOf(frame) {
+    return frame.querySelector(':scope > .floating-size-readout');
+  }
 
-      const rect = frame.getBoundingClientRect();
-      const { minWidth, maxWidth } = widthBounds(details, state, rect);
-      const step = e.shiftKey ? 64 : 16;
-      let nextWidth = null;
-      if (e.key === 'ArrowLeft') nextWidth = rect.width - step;
-      else if (e.key === 'ArrowRight') nextWidth = rect.width + step;
-      else if (e.key === 'Home') nextWidth = minWidth;
-      else if (e.key === 'End') nextWidth = maxWidth;
-      if (nextWidth === null) return;
+  function showReadout(details, rect, linger) {
+    const frame = panelFrame(details);
+    const readout = readoutOf(frame);
+    if (readout === null) return;
+    readout.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)}`;
+    frame.classList.add('size-readout-visible');
+    const state = getState(details);
+    clearTimeout(state.readoutTimer);
+    state.readoutTimer = linger
+      ? setTimeout(() => frame.classList.remove('size-readout-visible'), READOUT_LINGER_MS)
+      : null;
+  }
 
-      e.preventDefault();
-      e.stopPropagation();
-      StyleManager.setPosition(frame, {
-        width: Math.round(Math.min(Math.max(nextWidth, minWidth), maxWidth)),
+  function hideReadout(details) {
+    const frame = panelFrame(details);
+    const state = getState(details);
+    clearTimeout(state.readoutTimer);
+    state.readoutTimer = null;
+    frame.classList.remove('size-readout-visible');
+  }
+
+  /** The 1 px guides shown while an edge sits on a snap line. */
+  function showGuides(frame, guides) {
+    const root = frame.parentElement;
+    if (root === null) return;
+    for (const axis of ['x', 'y']) {
+      let guide = root.querySelector(`:scope > .floating-snap-guide[data-axis="${axis}"]`);
+      if (guides[axis] === null) {
+        if (guide !== null) guide.hidden = true;
+        continue;
+      }
+      if (guide === null) {
+        guide = document.createElement('div');
+        guide.className = 'floating-snap-guide';
+        guide.setAttribute('data-axis', axis);
+        guide.setAttribute('aria-hidden', 'true');
+        root.appendChild(guide);
+      }
+      guide.hidden = false;
+      StyleManager.setVariable(guide, '--guide-at', `${Math.round(guides[axis])}px`);
+    }
+  }
+
+  function hideGuides(frame) {
+    showGuides(frame, { x: null, y: null });
+  }
+
+  /**
+   * Keep every handle's `aria-value*` on the box. A focusable `separator` is
+   * the window-splitter role: assistive technology reads the size off it on
+   * every key, so resizing needs no announcement of its own.
+   *
+   * `knownRect` is a box the caller has just written; measuring right after a
+   * style write would force a synchronous layout.
+   */
+  function syncHandles(details, knownRect = null) {
+    if (!isFloating(details)) return;
+    const frame = panelFrame(details);
+    const handles = handlesOf(frame);
+    if (handles.length === 0) return;
+    const state = getState(details);
+    const rect = knownRect ?? frameRect(frame);
+    const { minWidth, minHeight } = sizeLimits(details, state);
+    const { viewportWidth, viewportHeight } = viewport();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    for (const handle of handles) {
+      const edge = handle.dataset.edge;
+      const vertical = edge === 'n' || edge === 's';
+      const value = vertical ? height : width;
+      const min = vertical ? minHeight : minWidth;
+      const max = vertical
+        ? viewportHeight - 2 * FLOATING_MARGIN
+        : viewportWidth - 2 * FLOATING_MARGIN;
+      handle.setAttribute('aria-valuemin', String(Math.round(Math.min(min, max))));
+      handle.setAttribute('aria-valuemax', String(Math.round(Math.max(min, max))));
+      handle.setAttribute('aria-valuenow', String(value));
+      handle.setAttribute('aria-valuetext', `${width} × ${height} pixels`);
+    }
+  }
+
+  function clearMaximized(details) {
+    const state = getState(details);
+    if (state.restoreRect === null || state.restoreRect === undefined) return;
+    state.restoreRect = null;
+    syncMaximized(details);
+  }
+
+  function syncMaximized(details) {
+    const frame = panelFrame(details);
+    const maximized = getState(details).restoreRect != null;
+    frame.classList.toggle('maximized', maximized);
+    const button = frame.querySelector(':scope > .accordion-panel-actions > .accordion-maximize-btn');
+    if (button === null) return;
+    const label = maximized ? 'Restore window size' : 'Maximize window';
+    button.setAttribute('aria-pressed', maximized ? 'true' : 'false');
+    button.setAttribute('aria-label', label);
+    button.title = label;
+  }
+
+  /**
+   * Maximize a floating panel to the free area beside the sidebar, or give it
+   * back the box it had. Moving or resizing a maximized panel keeps its box
+   * and forgets the one to restore.
+   *
+   * @param {HTMLElement} details
+   * @returns {boolean} Whether the panel is maximized now.
+   */
+  function toggleMaximize(details) {
+    if (!isFloating(details)) return false;
+    const frame = panelFrame(details);
+    if (isSheet(frame)) return false;
+    const state = getState(details);
+    if (state.restoreRect != null) {
+      const back = state.restoreRect;
+      state.restoreRect = null;
+      applyRect(details, back);
+    } else {
+      state.restoreRect = frameRect(frame);
+      const { minWidth } = sizeLimits(details, state);
+      applyRect(details, maximizedFloatingRect({
+        sidebarRight: sidebarBox().right,
+        minWidth,
+        ...viewport()
+      }));
+    }
+    raiseToTop(frame);
+    syncMaximized(details);
+    syncHandles(details);
+    notifyGeometry(details);
+    return state.restoreRect != null;
+  }
+
+  /** Fit an edge to the content: height to all of it, width to the opening width. */
+  function fitToContent(details, edge) {
+    const frame = panelFrame(details);
+    const state = getState(details);
+    const start = frameRect(frame);
+    const { minWidth, minHeight } = sizeLimits(details, state);
+    const { viewportWidth, viewportHeight } = viewport();
+    let dx = 0;
+    let dy = 0;
+    if (edge.includes('n') || edge.includes('s')) {
+      const delta = contentHeight(details) - start.height;
+      dy = edge.includes('s') ? delta : -delta;
+    }
+    if (edge.includes('e') || edge.includes('w')) {
+      const target = state.baseFloatSize?.width ?? start.width;
+      const delta = target - start.width;
+      dx = edge.includes('e') ? delta : -delta;
+    }
+    const { rect } = resizeFloatingRect({
+      start, edge, dx, dy, minWidth, minHeight, viewportWidth, viewportHeight
+    });
+    clearMaximized(details);
+    applyRect(details, rect);
+    syncHandles(details, rect);
+    showReadout(details, rect, true);
+    notifyGeometry(details);
+  }
+
+  /**
+   * Move a floating panel by keyboard (Alt+Arrow on its header or a handle).
+   *
+   * @param {HTMLElement} details
+   * @param {KeyboardEvent} event
+   * @returns {boolean} Whether the key was a move.
+   */
+  function moveByKeyboard(details, event) {
+    if (!event.altKey || event.ctrlKey || event.metaKey) return false;
+    const step = event.shiftKey ? KEY_STEP_LARGE_PX : KEY_STEP_PX;
+    const travel = {
+      ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step]
+    }[event.key];
+    if (travel === undefined || !isFloating(details)) return false;
+    const frame = panelFrame(details);
+    if (isSheet(frame)) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    const state = getState(details);
+    const rect = frameRect(frame);
+    const { x, y } = clampFloatingPosition({
+      left: state.floatLeft + travel[0],
+      top: state.floatTop + travel[1],
+      width: rect.width,
+      height: rect.height,
+      ...viewport()
+    });
+    clearMaximized(details);
+    StyleManager.setPosition(frame, { x, y });
+    state.floatLeft = x;
+    state.floatTop = y;
+    announceKeyboardMove(document, `Window moved to ${Math.round(x)}, ${Math.round(y)}.`);
+    return true;
+  }
+
+  function onHandleKeydown(details, handle, e) {
+    if (!isFloating(details)) return;
+    if (moveByKeyboard(details, e)) return;
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    const frame = panelFrame(details);
+    if (isSheet(frame)) return;
+    const travel = keyboardResizeTravel(
+      handle.dataset.edge,
+      e.key,
+      e.shiftKey ? KEY_STEP_LARGE_PX : KEY_STEP_PX,
+      viewport()
+    );
+    if (travel === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const state = getState(details);
+    const { rect } = resizeFloatingRect({
+      start: frameRect(frame),
+      edge: handle.dataset.edge,
+      ...travel,
+      ...sizeLimits(details, state),
+      ...viewport()
+    });
+    clearMaximized(details);
+    applyRect(details, rect);
+    syncHandles(details, rect);
+    showReadout(details, rect, true);
+    notifyGeometry(details);
+  }
+
+  function onHandlePointerdown(details, handle, e) {
+    if (e.button !== 0) return;
+    if (!isFloating(details)) return;
+    const frame = panelFrame(details);
+    if (isSheet(frame)) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const state = getState(details);
+    const edge = handle.dataset.edge;
+    const pointerId = e.pointerId;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const start = frameRect(frame);
+    const limits = sizeLimits(details, state);
+    const { viewportWidth, viewportHeight } = viewport();
+    const snap = snapTargetsFor(
+      details,
+      frame,
+      e.pointerType === 'mouse' ? SNAP_DISTANCE_PX : SNAP_DISTANCE_COARSE_PX
+    );
+
+    setGlobalResizeState(true, HANDLE_CURSORS[edge]);
+    frame.classList.add('resizing');
+    clearMaximized(details);
+    raiseToTop(frame);
+    showReadout(details, start, false);
+    capturePointer(handle, pointerId);
+
+    let rafId = null;
+    let pending = null;
+    const flush = () => {
+      rafId = null;
+      if (pending === null) return;
+      applyRect(details, pending.rect);
+      showGuides(frame, pending.guides);
+      showReadout(details, pending.rect, false);
+    };
+    const onMove = (ev) => {
+      if (ev.pointerId !== pointerId) return;
+      ev.preventDefault();
+      pending = resizeFloatingRect({
+        start,
+        edge,
+        dx: ev.clientX - startX,
+        dy: ev.clientY - startY,
+        ...limits,
+        viewportWidth,
+        viewportHeight,
+        snap
       });
-      syncWidthHandleValue(details, widthHandle);
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+    };
+    const onUp = (ev) => {
+      if (ev.pointerId !== pointerId) return;
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+      if (rafId !== null) { cancelAnimationFrame(rafId); flush(); }
+      releasePointer(handle, pointerId);
+      setGlobalResizeState(false);
+      frame.classList.remove('resizing');
+      hideGuides(frame);
+      hideReadout(details);
+      syncHandles(details);
+      if (pending !== null) notifyGeometry(details);
+    };
+    const signal = state.controller?.signal;
+    handle.addEventListener('pointermove', onMove, { signal });
+    handle.addEventListener('pointerup', onUp, { signal });
+    handle.addEventListener('pointercancel', onUp, { signal });
+  }
+
+  /**
+   * Give a panel its resize handles, readout and keyboard reach, once.
+   *
+   * The handles are focusable only while focus is inside the panel, so Tab
+   * through the page does not stop eight times at every window.
+   *
+   * @param {HTMLElement} details
+   * @param {AbortSignal} signal
+   */
+  function ensureResizeHandles(details, signal) {
+    const frame = panelFrame(details);
+    if (frame === null || handlesOf(frame).length > 0) return;
+    for (const edge of RESIZE_EDGES) {
+      const handle = document.createElement('div');
+      handle.className = 'accordion-resize-handle';
+      handle.setAttribute('data-edge', edge);
+      handle.setAttribute('role', 'separator');
+      if (edge === 'e' || edge === 'w') handle.setAttribute('aria-orientation', 'vertical');
+      if (edge === 'n' || edge === 's') handle.setAttribute('aria-orientation', 'horizontal');
+      handle.setAttribute('aria-label', `Resize window from its ${HANDLE_NAMES[edge]}`);
+      handle.setAttribute(
+        'aria-keyshortcuts',
+        'ArrowLeft ArrowRight ArrowUp ArrowDown Home End Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown'
+      );
+      handle.tabIndex = -1;
+      handle.addEventListener('pointerdown', e => onHandlePointerdown(details, handle, e), { signal });
+      handle.addEventListener('keydown', e => onHandleKeydown(details, handle, e), { signal });
+      handle.addEventListener('dblclick', (e) => {
+        if (!isFloating(details) || isSheet(frame)) return;
+        e.preventDefault();
+        fitToContent(details, edge);
+      }, { signal });
+      handle.addEventListener('focus', () => syncHandles(details), { signal });
+      frame.appendChild(handle);
+    }
+    const readout = document.createElement('div');
+    readout.className = 'floating-size-readout';
+    readout.setAttribute('aria-hidden', 'true');
+    frame.appendChild(readout);
+
+    frame.addEventListener('focusin', () => {
+      for (const handle of handlesOf(frame)) handle.tabIndex = 0;
     }, { signal });
-
-    // Touch resizes too: the handle declares `touch-action: none`, so the
-    // browser leaves the gesture to this handler instead of panning.
-    widthHandle.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-
-      if (!isFloating(details)) return;
-      const state = getState(details);
-      const frame = panelFrame(details);
-
-      const pointerId = e.pointerId;
-      const startX = e.clientX;
-      const rect = frame.getBoundingClientRect();
-      const startWidth = rect.width;
-      const { minWidth } = widthBounds(details, state, rect);
-      const maxWidthConstraint = state.widthConstraints?.max;
-      const baseWidth = state.baseFloatSize?.width ?? startWidth;
-      const maxWidthByScale = Math.max(minWidth, baseWidth * FLOAT_MAX_SCALE);
-      const maxWidth = isFiniteNumber(maxWidthConstraint)
-        ? Math.max(minWidth, maxWidthConstraint)
-        : maxWidthByScale;
-      const viewportWidth = window.innerWidth;
-      const startLeft = rect.left;
-
-      setGlobalResizeState(true);
-      frame.classList.add('resizing');
-      raiseToTop(frame);
-
-      try { widthHandle.setPointerCapture(pointerId); } catch {}
-
-      let rafId = null;
-      let pendingWidth = startWidth;
-
-      function applyResize() {
-        StyleManager.setPosition(frame, { width: Math.round(pendingWidth) });
-        rafId = null;
-      }
-
-      function onMove(ev) {
-        ev.preventDefault();
-        const dx = ev.clientX - startX;
-        const maxWidthByViewport = Math.max(minWidth, viewportWidth - startLeft - 8);
-        pendingWidth = Math.min(
-          Math.max(minWidth, startWidth + dx),
-          Math.min(maxWidth, maxWidthByViewport)
-        );
-        if (!rafId) rafId = requestAnimationFrame(applyResize);
-      }
-
-      function onUp() {
-        widthHandle.removeEventListener('pointermove', onMove);
-        widthHandle.removeEventListener('pointerup', onUp);
-        widthHandle.removeEventListener('pointercancel', onUp);
-        if (rafId) { cancelAnimationFrame(rafId); applyResize(); }
-        try { widthHandle.releasePointerCapture(pointerId); } catch {}
-        setGlobalResizeState(false);
-        frame.classList.remove('resizing');
-        syncWidthHandleValue(details, widthHandle);
-      }
-
-      widthHandle.addEventListener('pointermove', onMove, { signal });
-      widthHandle.addEventListener('pointerup', onUp, { signal });
-      widthHandle.addEventListener('pointercancel', onUp, { signal });
+    frame.addEventListener('focusout', (e) => {
+      if (e.relatedTarget != null && frame.contains(e.relatedTarget)) return;
+      for (const handle of handlesOf(frame)) handle.tabIndex = -1;
     }, { signal });
   }
 
   /**
-   * Take back the handle this module put on the panel.
+   * Take back the handles and readout this module put on the panel's frame.
    *
-   * `ensureResizeHandles` builds the handle once and recognises it by its
-   * presence, so a panel unregistered with the handle still attached would be
-   * re-registered with a handle whose listeners had already been aborted.
+   * `ensureResizeHandles` recognises its handles by their presence, so a panel
+   * unregistered with them attached would be re-registered with handles whose
+   * listeners had already been aborted.
    *
    * @param {HTMLElement} details
    */
   function removeResizeHandles(details) {
-    details.querySelector?.('.accordion-width-handle')?.remove();
+    const frame = panelFrame(details);
+    if (frame === null) return;
+    for (const handle of handlesOf(frame)) handle.remove();
+    readoutOf(frame)?.remove();
   }
 
   // Drag handler for DOCKED panels (undocking)
@@ -297,7 +663,7 @@ export function createAccordionInteractions({
       let ghost = null;
       let willDetach = false;
 
-      try { summary.setPointerCapture(pointerId); } catch {}
+      capturePointer(summary, pointerId);
 
       function onMove(ev) {
         ev.preventDefault();
@@ -327,7 +693,7 @@ export function createAccordionInteractions({
         summary.removeEventListener('pointerup', onUp);
         summary.removeEventListener('pointercancel', onUp);
 
-        try { summary.releasePointerCapture(pointerId); } catch {}
+        releasePointer(summary, pointerId);
 
         if (!didDrag) return;
 
@@ -363,6 +729,8 @@ export function createAccordionInteractions({
       const state = getState(details);
       const allowDock = !!state.dockable;
       const frame = panelFrame(details);
+      // A phone sheet keeps its place at the bottom; its header only toggles.
+      if (isSheet(frame)) return;
 
       e.preventDefault();
 
@@ -388,7 +756,7 @@ export function createAccordionInteractions({
       let cachedSidebarRect = null;
       let isHoveringDock = false;
 
-      try { summary.setPointerCapture(pointerId); } catch {}
+      capturePointer(summary, pointerId);
 
       function clamp(targetLeft, targetTop) {
         return clampFloatingPosition({
@@ -433,6 +801,7 @@ export function createAccordionInteractions({
 
           setGlobalDragState(true);
           raiseToTop(frame);
+          clearMaximized(details);
           frame.classList.add('dragging');
           frame.style.willChange = 'transform';
           cachedSidebarRect = sidebar.getBoundingClientRect();
@@ -461,7 +830,7 @@ export function createAccordionInteractions({
 
         if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
 
-        try { summary.releasePointerCapture(pointerId); } catch {}
+        releasePointer(summary, pointerId);
 
         if (!didDrag) return;
 
@@ -487,18 +856,16 @@ export function createAccordionInteractions({
     }, { signal });
   }
 
-  function syncResizeHandles(details, knownRect = null) {
-    const widthHandle = details.querySelector('.accordion-width-handle');
-    if (widthHandle === null) return;
-    syncWidthHandleValue(details, widthHandle, knownRect);
-  }
-
   return {
     ensureResizeHandles,
     removeResizeHandles,
     setupDockedDrag,
     setupFloatingDrag,
-    syncResizeHandles,
+    syncResizeHandles: syncHandles,
+    firstControlHeight,
+    toggleMaximize,
+    moveByKeyboard,
+    syncMaximized,
   };
 }
 

@@ -32,11 +32,17 @@
  * point size 0.75 and 32% with ultra-light square points.
  *
  * WHERE IT RUNS:
- * Only inside the figure-export worker (`figure-export-worker.js`), on
- * OffscreenCanvas WebGL2 contexts the worker owns. A pass returns its frame as
- * an ImageBitmap (`transferToImageBitmap`), which the page composites or the
- * worker encodes, so packing, upload, drawing and encoding never occupy the
- * page's main thread.
+ * In the figure-export worker's handler (`figure-export-worker.js`), on
+ * OffscreenCanvas WebGL2 contexts that thread owns. A pass returns its frame
+ * as an ImageBitmap (`transferToImageBitmap`), which the page composites or
+ * the worker encodes. The handler runs in the module worker wherever a worker
+ * can create a WebGL2 context, so packing, upload and drawing never occupy
+ * the page's main thread; where it cannot (WebKitGTK and WPE have no WebGL
+ * in workers, https://bugs.webkit.org/show_bug.cgi?id=209809, nor did Safari
+ * 16.4-16.6, or 17.0-17.1 on macOS Ventura,
+ * https://bugs.webkit.org/show_bug.cgi?id=183720), the same
+ * handler draws on the page (`figure-export-worker-client.js`,
+ * `webgl2RasterAvailable`).
  *
  * ISOLATION:
  * This module is only invoked during export and does not touch the normal
@@ -232,7 +238,7 @@ function acquireRasterContext(antialias) {
   }
   if (typeof OffscreenCanvas !== 'function') {
     throw new Error(
-      'Figure-export WebGL2 rasterization requires OffscreenCanvas in the export worker.'
+      'Figure-export WebGL2 rasterization requires OffscreenCanvas.'
     );
   }
   // A minimal drawing buffer first, so hardware limits can be checked before
@@ -281,6 +287,22 @@ function getWebgl2Context(canvas, antialias) {
   return gl;
 }
 
+/**
+ * Whether this thread can draw an export: an OffscreenCanvas with a WebGL2
+ * context. Measured once by the figure-export worker client, which draws on
+ * the page where a worker cannot.
+ *
+ * @returns {boolean}
+ */
+export function webgl2RasterAvailable() {
+  try {
+    acquireRasterContext(false);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Shrink a raster canvas after its pass: an export-sized buffer is not kept. */
 function shrinkRasterCanvas(canvas) {
   canvas.width = 1;
@@ -298,7 +320,7 @@ let spriteZoomLimit = null;
  * sprite the viewer can draw still fits this GPU's point-size range
  * (`ALIASED_POINT_SIZE_RANGE`): a 128-pixel viewer sprite drawn larger than
  * the driver allows would be clamped smaller than the view it reproduces.
- * Read once, from the worker's export context.
+ * Read once, from the export context of the thread that draws.
  *
  * @returns {number}
  */

@@ -119,10 +119,12 @@ test('shared adapter requires unique category labels by exact primitive identity
   ]) {
     await t.test(name, async () => {
       const adapter = new BaseAnnDataAdapter(
-        categoricalLoader({ categories })
+        categoricalLoader({ categories, codes: Int32Array.from([0, 1]) })
       );
+      // The dictionary is read, and refused, with the field's first load.
+      await adapter.initialize();
       await assert.rejects(
-        adapter.initialize(),
+        adapter.getObsFieldData('group'),
         /categorical observation field.*group.*duplicate.*label/i
       );
     });
@@ -134,10 +136,8 @@ test('shared adapter requires unique category labels by exact primitive identity
     codes: Int32Array.from([0, 1, 2])
   }));
   await adapter.initialize();
-  assert.deepEqual(
-    adapter.getObsFields().fields[0].categories,
-    distinct
-  );
+  const field = await adapter.getObsFieldData('group');
+  assert.deepEqual(field.categories, distinct);
 });
 
 test('primitive boolean discovery and code conversion preserve boolean identity', async () => {
@@ -211,6 +211,7 @@ test('a string column is read only when it is loaded: its categories are found t
       categories: null,
       codesDtype: null,
       codesMissingValue: null,
+      palette: null,
       outlierQuantilesPath: null,
     }],
     'its categories and code width are found when it is loaded'
@@ -308,9 +309,9 @@ test('keeps the exact 65,535-category boundary on uint16 without uint32 output',
   }));
   await adapter.initialize();
 
+  // The width is the dictionary's, known once the field is first loaded.
   const listed = adapter.getObsFields().fields[0];
-  assert.equal(listed.codesDtype, 'uint16');
-  assert.equal(listed.codesMissingValue, 65_535);
+  assert.equal(listed.codesDtype, null);
 
   const field = await adapter.getObsFieldData('group');
   assert.equal(field.dtype, 'uint16');
@@ -332,9 +333,9 @@ test('keeps the exact 255-category boundary on uint8', async () => {
   }));
   await adapter.initialize();
 
+  // The width is the dictionary's, known once the field is first loaded.
   const listed = adapter.getObsFields().fields[0];
-  assert.equal(listed.codesDtype, 'uint8');
-  assert.equal(listed.codesMissingValue, 255);
+  assert.equal(listed.codesDtype, null);
 
   const field = await adapter.getObsFieldData('group');
   assert.equal(field.dtype, 'uint8');
@@ -428,7 +429,7 @@ function categoricalFieldList(field) {
     outlier_min_points: 10,
     stored_outlier_latent_key: null,
     latent_key: null,
-    fields: [{ key: 'label', kind: 'category', fieldIndex: 0, outlierQuantilesPath: null, ...field }],
+    fields: [{ key: 'label', kind: 'category', fieldIndex: 0, palette: null, outlierQuantilesPath: null, ...field }],
   };
 }
 
@@ -482,6 +483,7 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
         categories: ['A', 'B'],
         codesDtype: 'uint8',
         codesMissingValue: 255,
+        palette: null,
         outlierQuantilesPath: null,
       }),
       /unsupported categorical codes dtype.*uint64.*uint8.*uint16.*uint32/i
@@ -737,6 +739,8 @@ test('genes analysis preserves numeric zero and false category labels', async ()
             knn: null,
             geneNames: 'index',
             expression: 'X',
+            log1p: {},
+            highlyVariable: null,
             latent: null,
             vectorFields: [],
           })
@@ -756,15 +760,13 @@ test('genes analysis preserves numeric zero and false category labels', async ()
         }
       }
     });
-    const grouped = await controller.getGroupsAndCodes('group');
+    const grouped = await controller.describeGroups('group', null);
     assert.deepEqual(
       grouped.groups.map(group => group.groupName),
       [0, false, 'other']
     );
-    assert.deepEqual(
-      grouped.groups.map(group => Array.from(group.cellIndices)),
-      [[0, 3], [1, 4], [2, 5]]
-    );
+    assert.deepEqual(grouped.groups.map(group => group.count), [2, 2, 2]);
+    assert.deepEqual(grouped.groups.map(group => group.optionId), ['0', 'false', 'other']);
   } finally {
     controller?.close();
     restoreActiveDataset(manager, previous);
@@ -935,7 +937,9 @@ test('DataState keeps exact field descriptors separate from mutable load state',
     assert.ok(runtimeCategory._normalizedLayouts instanceof Set);
     assert.equal(runtimeCategory._normalizedLayouts.size, 0);
     assert.equal(Object.isFrozen(ownedCategoryDescriptor), true);
-    assert.equal(Object.isFrozen(ownedCategoryDescriptor.categories), true);
+    // Its dictionary is read with its first load, not when the file opens.
+    assert.equal(ownedCategoryDescriptor.categories, null);
+    assert.equal(runtimeCategory.categories, null);
     assert.equal(Object.hasOwn(ownedCategoryDescriptor, 'loaded'), false);
     assert.equal(
       Object.hasOwn(ownedCategoryDescriptor, '_loadingPromise'),
@@ -946,13 +950,15 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       false
     );
 
-    runtimeCategory.categories[0] = 'renamed in UI';
-    assert.deepEqual(ownedCategoryDescriptor.categories, [10, 20]);
-
     const loadedCategory = await state.ensureFieldLoaded(
       categoricalIndex,
       { silent: true }
     );
+    assert.deepEqual(runtimeCategory.categories, [10, 20]);
+    // The runtime field owns a copy: renaming in the UI leaves the immutable
+    // descriptor as the file published it.
+    runtimeCategory.categories[0] = 'renamed in UI';
+    assert.equal(ownedCategoryDescriptor.categories, null);
     const loadedContinuous = await state.ensureFieldLoaded(
       continuousIndex,
       { silent: true }

@@ -17,9 +17,8 @@ import {
 } from '../assets/js/data/data-source.js';
 import {
   classifyDataSourceFailure,
-  dataSourceFailureDetail,
-  describeDataSourceFailure,
-  reportDataSourceFailure
+  dataSourceFailureDetails,
+  describeDataSourceFailure
 } from '../assets/js/app/ui/modules/dataset-connections.js';
 
 const CATALOG_URL = 'https://catalog.cellucid.test/exports/datasets.json';
@@ -152,32 +151,27 @@ test('four distinct catalog failures no longer read as one network problem', () 
   assert.match(sentences[3], /not in a format Cellucid can read/);
 });
 
-test('an unclassified failure keeps its raw text as a labelled detail', () => {
+test('the sentence never quotes the raw text; the notification keeps it as its Details', () => {
+  const unclassified = new Error('candidate factory rejected');
   assert.equal(
-    dataSourceFailureDetail(LOADER_FAILURES.absent),
-    '',
-    'a named cause makes the raw text redundant'
-  );
-  assert.equal(
-    reportDataSourceFailure(
-      'The remote server',
-      'could not be reached',
-      new Error('candidate factory rejected')
-    ),
+    describeDataSourceFailure('The remote server', 'could not be reached', unclassified),
     'The remote server could not be reached. Try again; if it keeps failing, '
-    + 'check the address and your connection. Details: candidate factory '
-    + 'rejected'
+    + 'check the address and your connection.'
   );
-  assert.match(
-    reportDataSourceFailure(
-      '"Pancreas"',
-      'could not be opened',
+  assert.equal(dataSourceFailureDetails(unclassified), 'candidate factory rejected');
+  assert.equal(
+    dataSourceFailureDetails(LOADER_FAILURES.absent),
+    LOADER_FAILURES.absent.message,
+    'a named cause still keeps its raw text for the Details'
+  );
+  assert.equal(
+    dataSourceFailureDetails(
       new AggregateError(
         [new Error('first cause'), new Error('second cause')],
         'recovery failed'
       )
     ),
-    /Details: recovery failed Causes: first cause; second cause$/
+    'recovery failed Causes: first cause; second cause'
   );
 });
 

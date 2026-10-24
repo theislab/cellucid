@@ -32,9 +32,12 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
   them, with no default UMAP: three 2-column ``X_umap_scale*_latents`` (the
   guess turns them on), two 3-column arrays (``X_tsne_scale0_latents`` and
   ``spatial``), an integer 4-column ``coordinates`` and six wide latent and
-  PCA arrays, plus a layer and a neighbour graph. The sidebar layout, the
-  dimension choice of a narrow array and the sidebar's scroll position are
-  tested on it (``tests/browser/data-mapping-layout.spec.mjs``).
+  PCA arrays, plus a layer and a neighbour graph, and the colours Scanpy
+  keeps for ``cell_type`` (``uns['cell_type_colors']``). The sidebar layout,
+  the dimension choice of a narrow array and the sidebar's scroll position are
+  tested on it (``tests/browser/data-mapping-layout.spec.mjs``); so are the
+  embedding, camera, point size and palette a file opens with after another
+  dataset (``tests/browser/dataset-switch-opening-view.spec.mjs``).
 
 Every array is drawn from a seeded generator around three clusters, so the
 files are the same on every run.
@@ -190,6 +193,9 @@ def crowded_fixture() -> anndata.AnnData:
     for scale in range(3):
         adata.obsm[f"X_umap_scale{scale}_latents"] = clustered(rng, labels, 2, 0.8)
     adata.obsp["connectivities"] = symmetric_graph(rng, labels, 6)
+    # As ``sc.pl.umap(adata, color="cell_type")`` leaves it: one colour per
+    # category, none of them one Cellucid would pick.
+    adata.uns["cell_type_colors"] = np.array(["#8c564b", "#17becf", "#bcbd22"], dtype=object)
     return adata
 
 

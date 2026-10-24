@@ -47,7 +47,7 @@ async function openRepresentations(page) {
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openCollapsedPanels(page);
-  await page.locator('#user-data-h5ad-input').setInputFiles(REPRESENTATIONS_H5AD);
+  await page.locator('#user-data-file-input').setInputFiles(REPRESENTATIONS_H5AD);
   await expect(page.locator('#dataset-name')).toHaveText('data-mapping-representations');
   await expect.poll(() => page.evaluate(
     () => window._cellucidState.getEnabledRepresentations().length
@@ -342,7 +342,10 @@ test('the checklist turns three columns of a wide PCA on as a 3D representation'
   test.setTimeout(180_000);
   const errors = collectBrowserErrors(page);
   await openRepresentations(page);
-  await page.locator('#data-mapping-disclosure .disclosure-header').click();
+  await page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header').click();
+  // A wide array that is off is listed under "Other arrays", collapsed.
+  const others = page.locator('#data-mapping-more > .disclosure-header');
+  if ((await others.getAttribute('aria-expanded')) !== 'true') await others.click();
   const pcaRow = page.locator('.data-mapping-row').filter({ hasText: 'PCA' });
   await expect(pcaRow).toHaveCount(1);
   await expect(pcaRow.locator('.data-mapping-enable')).not.toBeChecked();

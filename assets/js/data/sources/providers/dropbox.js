@@ -50,7 +50,7 @@ export default Object.freeze({
   match(input) {
     return parseDropbox(input);
   },
-  async open(value, { signal = null } = {}) {
+  async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseDropbox(value);
     if (parsed === null) {
       throw new DataSourceError(
@@ -78,6 +78,7 @@ export default Object.freeze({
       name,
       attribution: { title: name, url: url.href },
       signal,
+      onStep,
     });
     return { title: name, file, attribution: file.attribution };
   },

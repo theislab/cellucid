@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { defineOptions } from '../assets/js/app/analysis/options/option-schema.js';
 import test from 'node:test';
 
 import {
@@ -434,59 +435,19 @@ test('analysis form value publishers preserve every prototype-named key', () => 
   }
 });
 
-test('form-control snapshots preserve a prototype-named DOM control', t => {
-  const previousInput = globalThis.HTMLInputElement;
-  const previousSelect = globalThis.HTMLSelectElement;
-  const previousTextArea = globalThis.HTMLTextAreaElement;
-
-  class FakeInput {
-    constructor(name, value) {
-      this.name = name;
-      this.type = 'text';
-      this.value = value;
-    }
-
-    getAttribute(name) {
-      return name === 'name' ? this.name : null;
-    }
-  }
-  class FakeSelect {}
-  class FakeTextArea {}
-  globalThis.HTMLInputElement = FakeInput;
-  globalThis.HTMLSelectElement = FakeSelect;
-  globalThis.HTMLTextAreaElement = FakeTextArea;
-  t.after(() => {
-    if (previousInput === undefined) delete globalThis.HTMLInputElement;
-    else globalThis.HTMLInputElement = previousInput;
-    if (previousSelect === undefined) delete globalThis.HTMLSelectElement;
-    else globalThis.HTMLSelectElement = previousSelect;
-    if (previousTextArea === undefined) delete globalThis.HTMLTextAreaElement;
-    else globalThis.HTMLTextAreaElement = previousTextArea;
+test('options records preserve every prototype-named option key as an own field', () => {
+  const keys = PROTOTYPE_PROPERTY_NAMES.filter(name => name !== '__proto__');
+  const schema = defineOptions({
+    id: 'prototypeNames',
+    groups: [],
+    options: keys.map((key, index) => ({
+      key, kind: 'number', label: `Option ${index}`, tip: 'analysis-signature', group: 'essentials', default: index,
+    })),
   });
-
-  const controls = PROTOTYPE_PROPERTY_NAMES.map(
-    (name, index) => new FakeInput(name, `control-${index}`),
-  );
-  const ui = Object.create(FormBasedAnalysisUI.prototype);
-  ui._formContainer = {
-    querySelector(selector) {
-      if (selector !== '.analysis-form') return null;
-      return {
-        querySelectorAll() {
-          return controls;
-        },
-      };
-    },
-  };
-
-  const snapshot = ui._snapshotNamedFormControls();
-  assertExactOrdinaryRecord(snapshot, PROTOTYPE_PROPERTY_NAMES);
-  for (const [index, key] of PROTOTYPE_PROPERTY_NAMES.entries()) {
-    assert.deepEqual(snapshot[key], {
-      type: 'value',
-      value: `control-${index}`,
-    });
-  }
+  const record = schema.normalize(schema.defaults());
+  assertExactOrdinaryRecord(record, keys);
+  keys.forEach((key, index) => assert.equal(record[key], index));
+  assert.equal(schema.validate({}).valid, false, 'an inherited value is never read as an option');
 });
 
 test('analysis plot-option writers preserve an own __proto__ schema key', () => {

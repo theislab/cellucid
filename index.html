@@ -14,7 +14,7 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-10-23.09344b5e" />
+  <meta name="cellucid-web-build-id" content="2026-10-24.710ebd25" />
   <!--
     The release version the web app shares with the Python and R packages. A
     deployment is still identified by the build id above; the version names
@@ -45,12 +45,16 @@
     so neither `'unsafe-eval'` nor `'wasm-unsafe-eval'` is granted.
     If you change that JSON, regenerate the hash or the browser blocks the block;
     tests/seo-head-contract.test.mjs recomputes it and fails while they disagree.
+    Google's sign-in and file picker (Google Drive files) load their scripts from
+    accounts.google.com and apis.google.com, only when a Drive file needs them, and
+    show the picker in a frame from docs.google.com.
   -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
     base-uri 'none';
     object-src 'none';
-    script-src 'self' https://www.googletagmanager.com 'sha256-MjWK9VBGU/2U/nGIJV4J7Rj2kXutScQQlqS59UHVf5c=';
+    script-src 'self' https://www.googletagmanager.com https://accounts.google.com https://apis.google.com 'sha256-MjWK9VBGU/2U/nGIJV4J7Rj2kXutScQQlqS59UHVf5c=';
+    frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com;
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https:;
     font-src 'self' data:;
@@ -152,7 +156,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32x32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16x16.png" />
   <link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg" />
-  <link rel="icon" type="image/x-icon" href="assets/img/favicon.ico" />
+  <link rel="icon" type="image/x-icon" href="favicon.ico" />
   <link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png" />
   <link rel="apple-touch-icon" sizes="167x167" href="assets/img/apple-touch-icon-167x167.png" />
   <link rel="apple-touch-icon" sizes="152x152" href="assets/img/apple-touch-icon-152x152.png" />
@@ -208,26 +212,26 @@
     </ul>
   </main>
 
+  <!-- Without JavaScript the app cannot run: the brand card says so over it,
+       as every other screen of the site would. The crawlable description is
+       the visually hidden <main> above. -->
   <noscript>
-    <div class="noscript-message">
-      <h1>Cellucid — Interactive Single-Cell Data Visualization</h1>
-      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
-      <h2>About Cellucid</h2>
-      <p>Cellucid is a free, open-source, GPU-accelerated web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, from Scanpy/AnnData or Seurat.</p>
-      <h3>Features</h3>
-      <ul>
-        <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
-        <li>Gene expression overlays</li>
-        <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
-        <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
-        <li>Animated vector field overlays (velocity / drift)</li>
-        <li>Community annotation voting with optional GitHub sync</li>
-        <li>Connectivity edge visualization (KNN graph)</li>
-        <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
-      </ul>
-      <p><a href="https://docs.cellucid.com/en/latest/">Documentation</a> · <a href="https://github.com/theislab/cellucid">GitHub</a> · <a href="https://docs.cellucid.com/en/latest/citing.html">Cite</a></p>
-      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
-    </div>
+    <section class="page-screen page-screen-fixed" aria-labelledby="noscript-title">
+      <div class="welcome-content">
+        <div class="welcome-header">
+          <img src="assets/img/cellucid-logo.svg" alt="Cellucid" class="welcome-logo" width="260" height="80" />
+        </div>
+        <div class="welcome-body">
+          <h1 id="noscript-title" class="welcome-title">Cellucid needs JavaScript</h1>
+          <p class="welcome-intro">Turn on JavaScript for this site, then reload the page. Cellucid also needs a browser with WebGL2.</p>
+          <ul class="welcome-links" aria-label="More about Cellucid">
+            <li><a href="https://docs.cellucid.com/en/latest/">Documentation</a></li>
+            <li><a href="https://github.com/theislab/cellucid">GitHub</a></li>
+            <li><a href="https://docs.cellucid.com/en/latest/citing.html">Cite Cellucid</a></li>
+          </ul>
+        </div>
+      </div>
+    </section>
   </noscript>
 
   <!-- Welcome Modal (ordinary catalog startup only; hidden until exact startup intent is resolved) -->
@@ -454,42 +458,28 @@
               <button type="button" id="share-dataset-btn" class="btn btn-compact control-group-action" aria-haspopup="dialog" hidden>Share</button>
             </div>
             <div id="dataset-facts-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="dataset-facts-info-btn" tabindex="-1" data-info-tip="dataset" hidden></div>
-            <div id="dataset-info" class="control-box dataset-info">
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Name</span>
-                <span id="dataset-name" class="dataset-info-value">–</span>
+            <!-- Filled by ui/modules/dataset-card.js from the open dataset alone:
+                 every value is rewritten on each dataset change. -->
+            <div id="dataset-info" class="control-box dataset-card" data-state="empty">
+              <div class="dataset-card-title">
+                <span id="dataset-spinner" class="spinner" aria-hidden="true" hidden></span>
+                <p id="dataset-name" class="dataset-card-name">No dataset open</p>
               </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Description</span>
-                <span id="dataset-description" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+              <p id="dataset-summary" class="dataset-card-summary" hidden><span id="dataset-cells"></span> cells · <span id="dataset-genes"></span> genes</p>
+              <p id="dataset-origin" class="dataset-card-origin" hidden></p>
+              <div id="dataset-description-block" class="dataset-card-description-block" hidden>
+                <p id="dataset-description" class="dataset-card-description"></p>
+                <button type="button" id="dataset-description-toggle" class="dataset-card-more" aria-controls="dataset-description" aria-expanded="false" hidden>More</button>
               </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Source</span>
-                <span id="dataset-source" class="dataset-info-value">–</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">URL</span>
-                <span id="dataset-url" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Citation</span>
-                <span id="dataset-citation" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Cells</span>
-                <span id="dataset-cells" class="dataset-info-value">–</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Genes</span>
-                <span id="dataset-genes" class="dataset-info-value">–</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Obs fields</span>
-                <span id="dataset-obs" class="dataset-info-value">–</span>
-              </div>
-              <div class="dataset-info-row">
-                <span class="dataset-info-label">Connectivity</span>
-                <span id="dataset-connectivity" class="dataset-info-value">–</span>
+              <p id="dataset-read" class="dataset-card-read" role="status" aria-live="off" hidden></p>
+              <div id="dataset-details" class="disclosure disclosure-inline dataset-card-details" data-static-disclosure hidden>
+                <button type="button" class="disclosure-header" aria-expanded="false" aria-controls="dataset-details-body">
+                  <span class="disclosure-title">Details</span>
+                  <span class="disclosure-chevron" aria-hidden="true"></span>
+                </button>
+                <div class="disclosure-content" id="dataset-details-body" hidden>
+                  <dl id="dataset-details-list" class="dataset-card-facts"></dl>
+                </div>
               </div>
             </div>
           </div>
@@ -509,7 +499,7 @@
               <button type="button" id="open-data-info-btn" class="info-btn" aria-label="About opening data" aria-controls="open-data-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
             <div id="open-data-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="open-data-info-btn" tabindex="-1" data-info-tip="open-data" hidden></div>
-            <p id="data-source-status" class="control-box dataset-info loading" role="status" aria-live="polite">Starting Cellucid — the data controls below open as soon as it is ready.</p>
+            <p id="data-source-status" class="status-line" role="status" aria-live="polite">Starting Cellucid. The controls below open as soon as it is ready.</p>
             <div class="control-block" data-state-serializer-skip="true">
               <label for="dataset-select">Sample dataset</label>
               <select id="dataset-select" class="obs-select" disabled aria-describedby="data-source-status">
@@ -518,62 +508,52 @@
             </div>
             <div class="control-block relative" id="user-data-block" data-state-serializer-skip="true" role="group" aria-labelledby="user-data-title">
               <div class="field-label-row">
-                <span class="field-label" id="user-data-title">Files</span>
+                <span class="field-label" id="user-data-title">File or folder</span>
                 <button type="button" id="user-data-info-btn" class="info-btn" aria-label="About opening files" aria-controls="user-data-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
               <div id="user-data-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="user-data-info-btn" tabindex="-1" data-info-tip="local-files" hidden></div>
-              <div class="user-data-grid">
-                <button type="button" id="user-data-h5ad-btn" class="btn data-btn" title="Load single .h5ad file" disabled aria-describedby="data-source-status">H5AD</button>
-                <button type="button" id="user-data-zarr-archive-btn" class="btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser" disabled aria-describedby="data-source-status">Zarr ZIP</button>
-                <button type="button" id="user-data-zarr-folder-btn" class="btn data-btn data-btn-wide" title="Load an AnnData Zarr store folder (.zarr)" disabled aria-describedby="data-source-status">Zarr folder</button>
-                <!-- Hidden file inputs -->
-                <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" disabled />
-                <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" disabled />
-                <input type="file" id="user-data-zarr-folder-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
-              </div>
-
-            </div>
-            <div class="control-block relative" id="remote-server-block" data-state-serializer-skip="true">
-              <div class="field-label-row">
-                <label for="remote-server-url" id="remote-title">Server</label>
-                <button type="button" id="remote-info-btn" class="info-btn" aria-label="About server connections" aria-controls="remote-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
-              </div>
-              <div id="remote-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="remote-info-btn" tabindex="-1" data-info-tip="remote-server" hidden></div>
-              <div class="user-data-row">
-                <input type="text" id="remote-server-url" class="obs-select" aria-labelledby="remote-title"
-                       placeholder="http://localhost:8765" disabled
-                       aria-describedby="data-source-status" />
-                <button type="button" id="remote-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
-              </div>
-              <div id="remote-disconnect-container" class="user-data-row" hidden>
-                <button type="button" id="remote-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
-              </div>
-
-            </div>
-            <div class="control-block relative" id="data-link-block" data-state-serializer-skip="true">
-              <div class="field-label-row">
-                <label for="data-link-url" id="data-link-title">Open from link</label>
-                <button type="button" id="data-link-info-btn" class="info-btn" aria-label="About opening data from a link" aria-controls="data-link-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
-              </div>
-              <div id="data-link-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-link-info-btn" tabindex="-1" data-info-tip="data-link" hidden></div>
-              <div class="user-data-row">
-                <input type="text" id="data-link-url" class="obs-select" aria-labelledby="data-link-title"
-                       placeholder="Link, DOI, GSE…, hf:user/repo, owner/repo/path" disabled
-                       aria-describedby="data-source-status" />
-                <button type="button" id="data-link-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
-              </div>
-              <div id="data-link-disconnect-container" class="user-data-row" hidden>
-                <button type="button" id="data-link-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
-              </div>
-              <div id="transfers-block" data-state-serializer-skip="true" hidden>
-                <div class="field-label-row">
-                  <span id="transfers-title">Transfers</span>
-                  <button type="button" id="transfers-info-btn" class="info-btn" aria-label="About transfers" aria-controls="transfers-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <!-- One button: a browser picks either files or one folder per
+                   dialog, so it opens a two-item menu (ui/modules/open-data-menu.js).
+                   A file or folder dropped anywhere on the page opens the same way. -->
+              <div class="open-menu">
+                <button type="button" id="user-data-open-btn" class="btn open-menu-button" aria-haspopup="menu" aria-expanded="false" aria-controls="user-data-open-menu" disabled aria-describedby="data-source-status">Open…</button>
+                <div id="user-data-open-menu" class="open-menu-list" role="menu" aria-labelledby="user-data-open-btn" hidden>
+                  <button type="button" id="user-data-file-item" class="open-menu-item" role="menuitem" tabindex="-1"><span class="open-menu-item-label">File…</span><span class="open-menu-item-hint">.h5ad or .zarr.zip</span></button>
+                  <button type="button" id="user-data-folder-item" class="open-menu-item" role="menuitem" tabindex="-1"><span class="open-menu-item-label">Zarr folder…</span><span class="open-menu-item-hint">.zarr store</span></button>
                 </div>
-                <div id="transfers-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="transfers-info-btn" tabindex="-1" data-info-tip="transfers" hidden></div>
-                <ul id="transfers-list" class="transfers-list" aria-labelledby="transfers-title" aria-live="off"></ul>
+                <input type="file" id="user-data-file-input" class="file-input-hidden" accept=".h5ad,.zip" disabled />
+                <input type="file" id="user-data-folder-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
               </div>
-
+            </div>
+            <div class="control-block relative" id="data-address-block" data-state-serializer-skip="true">
+              <div class="field-label-row">
+                <label for="data-address" id="data-address-title">Link or server</label>
+                <button type="button" id="data-address-info-btn" class="info-btn" aria-label="About links and server addresses" aria-controls="data-address-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="data-address-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-address-info-btn" tabindex="-1" data-info-tip="data-address" hidden></div>
+              <div class="address-row">
+                <input type="text" id="data-address" class="obs-select" aria-labelledby="data-address-title"
+                       placeholder="Link or localhost:8765" disabled
+                       autocomplete="off" spellcheck="false" enterkeyhint="go"
+                       aria-describedby="data-source-status" />
+                <button type="button" id="data-address-open-btn" class="btn" disabled aria-describedby="data-source-status">Open</button>
+              </div>
+              <div id="remote-disconnect-container" class="connection-line" hidden>
+                <span class="connection-kind">Server</span>
+                <span id="remote-connection-target" class="connection-target"></span>
+                <button type="button" id="remote-disconnect-btn" class="btn btn-compact" disabled>Disconnect</button>
+              </div>
+              <div id="data-link-disconnect-container" class="connection-line" hidden>
+                <span class="connection-kind">Link</span>
+                <span id="data-link-connection-target" class="connection-target"></span>
+                <button type="button" id="data-link-disconnect-btn" class="btn btn-compact" disabled>Disconnect</button>
+              </div>
+              <div id="data-sign-in-step" class="connection-line" hidden>
+                <span id="data-sign-in-text" class="connection-target"></span>
+                <button type="button" id="data-sign-in-btn" class="btn btn-compact">Sign in</button>
+                <button type="button" id="data-sign-in-info-btn" class="info-btn" aria-label="About this sign-in" aria-controls="data-sign-in-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="data-sign-in-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-sign-in-info-btn" tabindex="-1" data-info-tip="sign-in-google" hidden></div>
             </div>
           </div>
 
@@ -871,14 +851,8 @@
                 </label>
                 <button type="button" id="antialias-info-btn" class="info-btn" aria-label="About antialiasing" aria-controls="antialias-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
-              <div id="antialias-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="antialias-info-btn" tabindex="-1" data-info-tip="antialiasing" hidden></div>
-              <div
-                id="hp-antialias-status"
-                class="status-line"
-                data-tone="muted"
-                role="status"
-                aria-live="polite"
-              ></div>
+              <!-- How the setting was chosen leads the tip (render-controls.js). -->
+              <div id="antialias-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="antialias-info-btn" tabindex="-1" data-info-tip="antialiasing" hidden><p id="hp-antialias-status" class="info-tip-now" data-info-tip-live></p></div>
             </div>
           </div>
           <!-- Points mode only: level of detail and the overlays. -->
@@ -1510,8 +1484,9 @@
                 Show labels
               </label>
             </div>
-            <!-- Outlier filter: shown for every categorical field of the file; the
-                 note says what it can do and why (ui/modules/outlier-filter-control.js). -->
+            <!-- Outlier filter: shown for every categorical field of the file. Without
+                 a latent space it is one button; with one, the slider and at most one
+                 short line (ui/modules/outlier-filter-control.js). -->
             <div class="control-block" id="outlier-filter-container" hidden>
               <div class="field-label-row">
                 <label for="outlier-filter">Outlier filter</label>
@@ -1525,8 +1500,10 @@
               <div id="outlier-filter-progress" class="job-progress" role="progressbar" aria-label="Outlier distances" aria-valuemin="0" aria-valuemax="100" hidden>
                 <div id="outlier-filter-progress-bar" class="job-progress-bar"></div>
               </div>
-              <p id="outlier-filter-note" class="outlier-filter-note" aria-live="polite" hidden></p>
-              <button type="button" id="outlier-filter-action" class="btn btn-compact outlier-filter-action" hidden>Cancel</button>
+              <div class="outlier-filter-status">
+                <p id="outlier-filter-note" class="outlier-filter-note" aria-live="polite" hidden></p>
+                <button type="button" id="outlier-filter-action" class="btn btn-compact outlier-filter-action" hidden>Cancel</button>
+              </div>
             </div>
             <div id="legend"></div>
           </div>
@@ -1562,7 +1539,9 @@
               <h3 class="section-title" id="highlight-selection-title">Selection</h3>
               <button type="button" id="highlight-selection-info-btn" class="info-btn" aria-label="About selecting cells" aria-controls="highlight-selection-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div id="highlight-selection-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="highlight-selection-info-btn" tabindex="-1" data-info-tip="selection" hidden></div>
+            <!-- The active tool's gesture, or what it needs first, leads the
+                 tip (highlight/step-controls.js publishToolHint). -->
+            <div id="highlight-selection-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="highlight-selection-info-btn" tabindex="-1" data-info-tip="selection" hidden><p id="highlight-tool-hint" class="info-tip-now" data-info-tip-live></p></div>
             <div class="control-block">
               <span class="field-label" id="highlight-mode-title">Tool</span>
               <div class="highlight-mode-buttons" role="group" aria-labelledby="highlight-mode-title" id="highlight-mode" data-state-serializer-pressed-group>
@@ -1571,9 +1550,8 @@
                 <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-proximity" data-mode="proximity">Proximity drag</button>
                 <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-lasso" data-mode="lasso">Lasso</button>
               </div>
-              <div id="highlight-mode-description" class="field-help">
-                Alt+click a cell to highlight its group. Alt+drag to select a range.
-              </div>
+              <!-- What the last gesture did: a step readout or a notice. -->
+              <div id="highlight-mode-description" class="field-help"></div>
             </div>
             <!-- Select mode stands in for a held Alt key, so a touch screen can
                  select at all: while it is on a plain tap, click, or drag runs

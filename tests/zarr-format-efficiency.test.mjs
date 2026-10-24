@@ -72,7 +72,11 @@ function storedZip(entries) {
   return { bytes, spans };
 }
 
-/** A source with latency that records requests and how many run at once. */
+/**
+ * A source with latency that records requests, how many run at once, and
+ * whether one ever started beyond the concurrency of the link it is read over
+ * (`source.link`, once a reader is made for it).
+ */
 function remoteSource(bytes, { latencyMs = 20, policy = {} } = {}) {
   const base = bytesByteSource(bytes, { name: 'remote.zarr.zip', policy: { blockBytes: 64 * 1024, mergeGapBytes: 64 * 1024, maxRequestBytes: 8 * 1024 * 1024, concurrency: 6, cacheBytes: 64 * 1024 * 1024, ...policy } });
   let inFlight = 0;
@@ -80,10 +84,13 @@ function remoteSource(bytes, { latencyMs = 20, policy = {} } = {}) {
     ...base,
     calls: [],
     maxInFlight: 0,
+    link: null,
+    beyondLink: 0,
     async read(offset, length, options) {
       source.calls.push([offset, offset + length]);
       inFlight++;
       source.maxInFlight = Math.max(source.maxInFlight, inFlight);
+      if (source.link !== null && inFlight > source.link.concurrency) source.beyondLink++;
       await new Promise(resolve => setTimeout(resolve, latencyMs));
       inFlight--;
       return base.read(offset, length, options);
@@ -118,7 +125,9 @@ const BIG = bigStore();
 
 async function openRemote(options = {}) {
   const source = remoteSource(BIG.bytes, options);
-  const archive = await openZipArchive(createByteReader(source));
+  const reader = createByteReader(source);
+  source.link = reader.link;
+  const archive = await openZipArchive(reader);
   const root = await openZarr(zipStore(archive));
   return { source, root };
 }
@@ -166,11 +175,15 @@ test('a column read of a 5000-chunk array goes out at once and decodes only its 
   assert.equal(column.length, BIG.rows);
   assert.equal(column[1999], 1999 * BIG.cols + 777);
   assert.equal(root.stats().chunksDecoded, 100);
-  // At most a request per chunk, never more than the policy's in flight; on
-  // this link (round trips, no bandwidth cost) neighbouring chunks' gaps are
-  // fetched with them, so far fewer requests go out.
+  // At most a request per chunk; on this link (round trips, little bandwidth
+  // cost) neighbouring chunks' gaps are fetched with them, so far fewer
+  // requests go out. Whether the gaps pay depends on the bandwidth measured
+  // while the archive opened: when they do not, the hundred requests go out
+  // together. None starts beyond the link's concurrency, which begins at the
+  // policy's six and, on a source that answers many at once, doubles while
+  // that pays (`link.js`).
   assert.ok(source.calls.length <= 100, `${source.calls.length} requests`);
-  assert.ok(source.maxInFlight <= 6, 'never more requests in flight than the policy allows');
+  assert.equal(source.beyondLink, 0, 'never more requests in flight than the link allows');
   // Not 100 round trips in a row, nor 17 waves of six.
   assert.ok(elapsed < 100 * 20 / 2, `took ${elapsed.toFixed(0)} ms`);
 });

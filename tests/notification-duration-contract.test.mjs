@@ -339,7 +339,7 @@ test('a restore failure the serializer already published is not announced twice'
 
   // And the caller that would otherwise repeat it must consult the mark before
   // publishing, not after.
-  const loadFailureStart = controls.indexOf("'Failed to load state:'");
+  const loadFailureStart = controls.indexOf('Failed to load state:');
   assert.notEqual(
     loadFailureStart,
     -1,

@@ -52,9 +52,12 @@ and one with `X_umap`, `X_tsne`, `X_pca` and a vector field bound to `X_umap`.
 `data-mapping-crowded.h5ad` (`tests/browser/data-mapping-layout.spec.mjs`)
 holds twelve embeddings with no default UMAP, as a segmentation export has
 them: three 2-column `X_umap_scale*_latents`, two 3-column arrays, an integer
-4-column `coordinates` and six wide latent and PCA arrays, plus a layer and a
-neighbour graph; the sidebar layout, the dimension choice of a narrow array
-and the sidebar's scroll position are tested on it. The 12,000-cell
+4-column `coordinates` and six wide latent and PCA arrays, plus a layer, a
+neighbour graph and Scanpy's colours for `cell_type`
+(`uns['cell_type_colors']`); the sidebar layout, the dimension choice of a
+narrow array and the sidebar's scroll position are tested on it, and
+`tests/browser/dataset-switch-opening-view.spec.mjs` opens it after another
+dataset (the embedding, camera, point size and palette it opens with). The 12,000-cell
 `data-mapping-representations.h5ad` and `data-mapping-full.h5ad` (with its Zarr
 ZIP) are described in the generator. Every array is drawn from a seeded
 generator, so a second run writes the same bytes.

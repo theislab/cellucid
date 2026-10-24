@@ -12,11 +12,16 @@ import {
   abandonedGestureNotice,
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
+  idleSelectionNoticeHtml,
   selectionNoticeHtml
 } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { removeStepControls, showStepControls } from './step-controls.js';
+import {
+  publishToolHint,
+  removeStepControls,
+  showStepControls
+} from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
@@ -356,8 +361,8 @@ export function initLassoSelection(options) {
     if (destroyed) return;
     const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML =
-        `${HIGHLIGHT_MODE_COPY.lasso}${noticeHtml}`;
+      publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY.lasso);
+      highlightModeDescriptionEl.innerHTML = idleSelectionNoticeHtml(notice);
       removeStepControls(
         documentOwner,
         'lasso',

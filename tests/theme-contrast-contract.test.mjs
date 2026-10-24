@@ -27,6 +27,8 @@ const TEXT_TOKENS = Object.freeze([
   '--color-text-primary',
   '--color-text-secondary',
   '--color-text-tertiary',
+  '--color-text-link',
+  '--color-text-link-hover',
 ]);
 const TEXT_SURFACES = Object.freeze([
   '--color-surface-primary',

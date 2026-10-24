@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" data-viewer-background="studio">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy policy — Cellucid</title>
+  <!--
+    The privacy policy Google and Microsoft link to from their sign-in screens
+    (Google Drive and OneDrive files). A reading page in the site's design:
+    the brand card widened for text (page.css) and the app's theme bootstrap,
+    nothing else. Every statement here is read
+    from the code; when the code changes what it reads, keeps or sends, this
+    page changes with it. The full technical account is the documentation's
+    privacy model page.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; manifest-src 'self';" />
+  <meta name="description" content="What Cellucid reads, keeps and sends: files are read in your browser, sign-ins stay in your browser tab, and no Cellucid server receives your data." />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="canonical" href="https://www.cellucid.com/privacy.html" />
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/img/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <script src="/assets/js/app/ui/core/theme-init.js"></script>
+  <link rel="preload" href="/assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/assets/css/page.css" />
+</head>
+<body class="page">
+  <main class="page-screen" aria-labelledby="privacy-title">
+    <div class="welcome-content welcome-content-wide">
+      <div class="welcome-header">
+        <a href="/"><img src="/assets/img/cellucid-logo.svg" alt="Cellucid" class="welcome-logo" width="260" height="80" /></a>
+      </div>
+
+      <div class="welcome-body page-prose">
+        <h1 id="privacy-title" class="welcome-title">Privacy policy</h1>
+        <p class="page-meta">Last updated 23 October 2026</p>
+
+        <p>Cellucid (www.cellucid.com) is a free, open-source web app for looking at single-cell data. It runs in your browser. This page says what it reads, what it keeps and what it sends.</p>
+
+        <h2>Your data</h2>
+        <p>Cellucid reads your data in your browser, from where it is: a file on your computer, a server you connect to, or a link you open (for example GitHub, Zenodo, Figshare, Google Drive or OneDrive). It reads only the parts a view needs. Your data is never uploaded to a Cellucid server, and nothing Cellucid reads is stored by Cellucid; it stays in your browser's memory and is released when the dataset closes.</p>
+
+        <h2>Google Drive and OneDrive</h2>
+        <ul>
+          <li><strong>What Cellucid accesses.</strong> On Google Drive, only the files you choose for Cellucid in Google's file picker (the <code>drive.file</code> permission), and a file shared with anyone who has its link. On OneDrive, the files your Microsoft account can read (<code>Files.Read</code>, and <code>Files.Read.All</code> only when you open a file someone in your organisation shared with you), and only the file you open. Cellucid only reads; it never changes, creates or deletes a file.</li>
+          <li><strong>Where the data goes.</strong> Your browser reads the file straight from Google or Microsoft. Neither the file nor your sign-in passes through a Cellucid server.</li>
+          <li><strong>Where your sign-in lives.</strong> The access token Google or Microsoft gives Cellucid (and Microsoft's renewal token) is kept in your browser tab's session storage. It survives a reload of the tab and is deleted when the tab closes. It is never saved by Cellucid anywhere else, never put in a link, a saved session or a figure, and never sent anywhere except back to Google or Microsoft.</li>
+          <li><strong>What a link or a saved session records.</strong> Only which service and which file (its id), never a token.</li>
+          <li><strong>Revoking access.</strong> Close the tab, and remove Cellucid at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>, <a href="https://account.live.com/consent/Manage">account.live.com/consent/Manage</a> or, for a work or school account, <a href="https://myapps.microsoft.com">myapps.microsoft.com</a>.</li>
+        </ul>
+        <p>Cellucid's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+
+        <h2>Community annotation (GitHub)</h2>
+        <p>If you sign in with GitHub to share annotations, sign-in and repository requests go through a small Cellucid-operated authentication service, which relays them to GitHub. Your GitHub token is kept in your browser tab's session storage and deleted when the tab closes. What you publish is stored in the GitHub repository you choose, under GitHub's terms.</p>
+
+        <h2>Usage statistics</h2>
+        <p>On www.cellucid.com, Cellucid sends anonymous usage statistics to Google Analytics: page views without the page's query, how long loading took, which features were used, and a dataset's coarse shape (ranges of cell and gene counts). It never sends a dataset's name, contents, link, file name or a sign-in. A copy of Cellucid you run yourself sends nothing.</p>
+
+        <h2>Stored in your browser</h2>
+        <p>Cellucid keeps your preferences (such as the theme) and community-annotation drafts in your browser's storage, and sign-ins in the tab's session storage. Clearing this site's data in your browser removes all of it.</p>
+
+        <h2>Contact</h2>
+        <p>Questions or requests: Kemal Inecik, <a href="mailto:k.inecik@gmail.com">k.inecik@gmail.com</a>. The full technical account is in the documentation's <a href="https://docs.cellucid.com/en/latest/user_guide/web_app/o_accessibility_privacy_security/02_privacy_model.html">privacy model</a>.</p>
+
+        <ul class="welcome-links" aria-label="More about Cellucid">
+          <li><a href="/">Open Cellucid</a></li>
+          <li><a href="https://docs.cellucid.com/en/latest/">Documentation</a></li>
+          <li><a href="https://github.com/theislab/cellucid">GitHub</a></li>
+        </ul>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

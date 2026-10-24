@@ -51,6 +51,8 @@ export function inMemoryAnnDataMapping(dimension = 3, key = IN_MEMORY_OBSM_KEY) 
     knn: null,
     geneNames: 'index',
     expression: null,
+    log1p: {},
+    highlyVariable: null,
     latent: null,
     vectorFields: [],
   };

@@ -22,7 +22,7 @@ import {
   expect,
   test,
 } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import { serveAnnDataServer } from './helpers/anndata-server.mjs';
 import { APP_ORIGIN, SAMPLE_ORIGIN, SAMPLE_PORT, appUrl } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -32,6 +32,7 @@ import {
   H5AD_PATH,
   NONE,
   PENDING_OPTION,
+  UNLISTED_OPTION,
   SAMPLE_CATALOG,
   START,
   TRAJECTORY,
@@ -64,7 +65,7 @@ test('a file chosen while the startup dataset loads replaces it', async ({
   page,
 }) => {
   const { held, productErrors } = await openWithHeldStart(page);
-  await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
   await expectSettledOn(page, H5AD);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, H5AD);
@@ -76,9 +77,10 @@ test('a file chosen while the startup dataset loads replaces it', async ({
 
 test('a Zarr folder chosen while the startup dataset loads replaces it', async ({
   page,
+  browserName,
 }) => {
   const { held, productErrors } = await openWithHeldStart(page);
-  await chooseDirectory(page.locator('#user-data-zarr-folder-input'), ZARR_FOLDER.path);
+  await openZarrFolder(page, browserName, ZARR_FOLDER.path);
   await expectSettledOn(page, ZARR_FOLDER);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, ZARR_FOLDER);
@@ -169,7 +171,7 @@ test('a benchmark run while the startup dataset loads replaces it', async ({
     .poll(() => page.evaluate(() => window._cellucidViewer.getPointCount()))
     .toBe(1000);
   await expectNeverPublished(page, START.name);
-  await expect(page.locator('#dataset-info')).not.toHaveClass(/\bloading\b/);
+  await expect(page.locator('#dataset-info')).not.toHaveAttribute('data-state', 'loading');
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -179,9 +181,9 @@ test('a one-dataset server connected while the startup dataset loads replaces it
 }) => {
   await serveOneDatasetRemote(page, TRAJECTORY);
   const { held, productErrors } = await openWithHeldStart(page);
-  await page.locator('#remote-server-url').fill(SAMPLE_ORIGIN);
-  await page.locator('#remote-connect-btn').click();
-  const remote = { ...TRAJECTORY, select: /^dataset:remote:/ };
+  await page.locator('#data-address').fill(SAMPLE_ORIGIN);
+  await page.locator('#data-address-open-btn').click();
+  const remote = { ...TRAJECTORY, select: UNLISTED_OPTION };
   await expectSettledOn(page, remote);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, remote);
@@ -204,9 +206,9 @@ test('a one-dataset GitHub repository connected while the startup dataset loads 
     }));
   await serveDemoFile(page, `${rawPrefix}${TRAJECTORY.id}.zarr.zip`, TRAJECTORY);
   const { held, productErrors } = await openWithHeldStart(page);
-  await page.locator('#data-link-url').fill('cellucid-tests/one/catalog');
-  await page.locator('#data-link-connect-btn').click();
-  const github = { ...TRAJECTORY, select: /^dataset:link:/ };
+  await page.locator('#data-address').fill('cellucid-tests/one/catalog');
+  await page.locator('#data-address-open-btn').click();
+  const github = { ...TRAJECTORY, select: UNLISTED_OPTION };
   await expectSettledOn(page, github);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, github);
@@ -225,7 +227,7 @@ test('a file chosen while a sample loads replaces it', async ({ page }) => {
   const since = (await readRecord(page)).names.length;
   await page.locator('#dataset-select').selectOption(DEVELOPMENT.select);
   await expect.poll(() => held.started).toBeGreaterThan(0);
-  await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
   await expectSettledOn(page, H5AD);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, H5AD);
@@ -240,6 +242,9 @@ test('a file chosen while a sample loads replaces it', async ({ page }) => {
 // is held. Firefox does not route the requests a dedicated worker makes, so
 // there it cannot be held; Chromium and WebKit run these two cases.
 const HDF5_READER = /\/assets\/js\/formats\/hdf5\/index\.js$/;
+// The worker that fetches it: a read the newer choice replaced ends it, and
+// the held request with it.
+const READER_WORKER = /\/assets\/js\/data\/anndata-reader-worker\.js$/;
 const FIREFOX_WORKER_ROUTING =
   'Firefox does not route requests made by the AnnData reader worker';
 
@@ -251,8 +256,8 @@ test('a sample chosen while a file is still being read replaces it', async ({
   const productErrors = await openStarted(page);
   // The HDF5 reader is fetched when the reader worker starts, so holding it
   // holds the read itself.
-  const held = await holdRequests(page, HDF5_READER, { first: 1 });
-  await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
+  const held = await holdRequests(page, HDF5_READER, { first: 1, worker: READER_WORKER });
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
   await expect.poll(() => held.started).toBeGreaterThan(0);
   // The select shows what is being opened while it is read.
   await expect(page.locator('#dataset-select')).toHaveValue(PENDING_OPTION);
@@ -275,8 +280,8 @@ test('None chosen while a file is still being read clears the dataset', async ({
 }) => {
   test.skip(browserName === 'firefox', FIREFOX_WORKER_ROUTING);
   const productErrors = await openStarted(page);
-  const held = await holdRequests(page, HDF5_READER, { first: 1 });
-  await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
+  const held = await holdRequests(page, HDF5_READER, { first: 1, worker: READER_WORKER });
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
   await expect.poll(() => held.started).toBeGreaterThan(0);
   await page.locator('#dataset-select').selectOption(NONE.select);
   await expectSettledOn(page, NONE);
@@ -397,11 +402,11 @@ test('a server that answers after a newer choice keeps its dataset in the catalo
   await serveOneDatasetRemote(page, DEVELOPMENT, { holdCatalog: catalogHeld });
   await liftConnectionDeadline(page);
   const productErrors = await openStarted(page);
-  await page.locator('#remote-server-url').fill(SAMPLE_ORIGIN);
-  await page.locator('#remote-connect-btn').click();
+  await page.locator('#data-address').fill(SAMPLE_ORIGIN);
+  await page.locator('#data-address-open-btn').click();
   await expect(
     page.locator('#notification-center .notification').filter({
-      hasText: 'Connecting to',
+      hasText: SAMPLE_ORIGIN,
     }),
   ).toHaveCount(1);
   // Chosen after Connect was clicked, so it is the last choice. The server
@@ -409,17 +414,21 @@ test('a server that answers after a newer choice keeps its dataset in the catalo
   await page.locator('#dataset-select').selectOption(TRAJECTORY.select);
   releaseCatalog();
   await expectSettledOn(page, TRAJECTORY);
+  // A server's one dataset is not a choice of the sample list: opening the
+  // address again shows it.
   await expect(
     page.locator('#dataset-select option[value^="dataset:remote:"]'),
-  ).toHaveCount(1);
+  ).toHaveCount(0);
   await expectAnnouncedOnce(
     page,
-    /Connected - dataset ".*" is available in Sample datasets/,
+    /Connected - ".*" was not opened because another dataset was chosen meanwhile/,
   );
   await expectSettledOn(page, TRAJECTORY);
+  // A server's one dataset is not a choice of the sample list: opening the
+  // address again shows it.
   await expect(
     page.locator('#dataset-select option[value^="dataset:remote:"]'),
-  ).toHaveCount(1);
+  ).toHaveCount(0);
   await expectNeverPublished(page, DEVELOPMENT.name);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
@@ -444,11 +453,11 @@ test('a server that answers after a session was applied leaves that dataset and 
   await page.locator('#background-select').selectOption('studio');
   await expect(page.locator('#background-select')).toHaveValue('studio');
 
-  await page.locator('#remote-server-url').fill(SAMPLE_ORIGIN);
-  await page.locator('#remote-connect-btn').click();
+  await page.locator('#data-address').fill(SAMPLE_ORIGIN);
+  await page.locator('#data-address-open-btn').click();
   await expect(
     page.locator('#notification-center .notification').filter({
-      hasText: 'Connecting to',
+      hasText: SAMPLE_ORIGIN,
     }),
   ).toHaveCount(1);
   // The session is applied after Connect was clicked, so it is the later
@@ -460,11 +469,13 @@ test('a server that answers after a session was applied leaves that dataset and 
 
   await expectAnnouncedOnce(
     page,
-    /Connected - dataset ".*" is available in Sample datasets/,
+    /Connected - ".*" was not opened because another dataset was chosen meanwhile/,
   );
+  // A server's one dataset is not a choice of the sample list: opening the
+  // address again shows it.
   await expect(
     page.locator('#dataset-select option[value^="dataset:remote:"]'),
-  ).toHaveCount(1);
+  ).toHaveCount(0);
   await expectSettledOn(page, START);
   await expect(page.locator('#background-select')).toHaveValue('black');
   await expectNeverPublished(page, DEVELOPMENT.name);
@@ -485,15 +496,15 @@ async function connectOneDatasetRemote(page) {
     webSocketPort: REMOTE_SOCKET_PORT,
   });
   const productErrors = await openStarted(page);
-  await page.locator('#remote-server-url').fill(SAMPLE_ORIGIN);
-  await page.locator('#remote-connect-btn').click();
-  await expectSettledOn(page, { ...TRAJECTORY, select: /^dataset:remote:/ });
+  await page.locator('#data-address').fill(SAMPLE_ORIGIN);
+  await page.locator('#data-address-open-btn').click();
+  await expectSettledOn(page, { ...TRAJECTORY, select: UNLISTED_OPTION });
   await expect.poll(() => remote.socketOpened()).toBe(true);
   return { productErrors, remote };
 }
 
 async function expectConnectionLossReported(page) {
-  await expectAnnouncedOnce(page, /connection was lost\. Reconnect to continue/);
+  await expectAnnouncedOnce(page, /connection was lost\. Open its address again to continue/);
   const { notifications } = await readRecord(page);
   // The loss is the one failure the user is told about.
   expect(
@@ -504,7 +515,7 @@ async function expectConnectionLossReported(page) {
   await expect(
     page.locator('#dataset-select option[value^="dataset:remote:"]'),
   ).toHaveCount(0);
-  await expect(page.locator('#remote-connect-btn')).toBeEnabled();
+  await expect(page.locator('#data-address-open-btn')).toBeEnabled();
 }
 
 test('a connection lost while a newer choice loads lets that choice land', async ({
@@ -523,7 +534,10 @@ test('a connection lost while a newer choice loads lets that choice land', async
     }, 300);
   }));
   await expect(page.locator('#dataset-select')).toHaveValue(DEVELOPMENT.select);
-  await expect(page.locator('#dataset-name')).toHaveText(TRAJECTORY.name);
+  // The Dataset box says what is opening; the viewer still shows the
+  // dataset the lost connection served.
+  await expect(page.locator('#dataset-name')).toHaveText(`Loading ${DEVELOPMENT.name}…`);
+  expect(await page.evaluate(() => window._cellucidViewer.getPointCount())).toBe(TRAJECTORY.cells);
   // The loss is said at once, while recovery waits for the choice.
   await expect.poll(async () => (await readRecord(page)).notifications.filter(
     entry => entry.type === 'error' && /connection was lost\./.test(entry.text),
@@ -565,7 +579,7 @@ test('a connection lost while a newer choice loads clears its dataset if that ch
       hasText: DEVELOPMENT.name,
     }),
   ).not.toHaveCount(0);
-  await expectAnnouncedOnce(page, /connection was lost\. Reconnect to continue/);
+  await expectAnnouncedOnce(page, /connection was lost\. Open its address again to continue/);
   await expect(page.locator('#dataset-name')).toHaveText(NONE.name);
   await expect(page.locator('#dataset-select')).toHaveValue(NONE.select);
   await expect
@@ -616,7 +630,9 @@ test('the notebook dataset reports ready to Python once it is on screen', async 
   const productErrors = await observePage(page);
   const events = await serveJupyterBridge(page, TRAJECTORY);
   await page.goto(jupyterUrl(), { waitUntil: 'domcontentloaded' });
-  await expectSettledOn(page, { ...TRAJECTORY, select: /^dataset:jupyter:/ });
+  // A notebook's one dataset is not a choice of the sample list: the list
+  // shows "—" and the Dataset box names it.
+  await expectSettledOn(page, { ...TRAJECTORY, select: UNLISTED_OPTION });
   await expect
     .poll(() => events.filter(event => event?.type === 'ready'))
     .toEqual([
@@ -637,8 +653,8 @@ test('a file chosen while the notebook dataset loads replaces it and Python is n
   const held = await holdOpening(page, TRAJECTORY);
   await page.goto(jupyterUrl(), { waitUntil: 'domcontentloaded' });
   await expect.poll(() => held.started).toBeGreaterThan(0);
-  await expect(page.locator('#user-data-h5ad-input')).toBeEnabled();
-  await page.locator('#user-data-h5ad-input').setInputFiles(H5AD_PATH);
+  await expect(page.locator('#user-data-file-input')).toBeEnabled();
+  await page.locator('#user-data-file-input').setInputFiles(H5AD_PATH);
   await expectSettledOn(page, H5AD);
   await releaseAndDrain(page, held);
   await expectSettledOn(page, H5AD);

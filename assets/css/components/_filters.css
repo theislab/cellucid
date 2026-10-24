@@ -329,6 +329,12 @@
   margin-bottom: var(--space-1-5);
 }
 
+/* What the last gesture did; nothing while no gesture has (the tool's
+   gesture is in the Selection (i)). */
+#highlight-mode-description:empty {
+  display: none;
+}
+
 /* Select mode: the on-screen stand-in for a held Alt key. It changes how
    every tool is triggered, so it leads the Selection group and is drawn as an
    input setting — a switch and a segmented control — never as a pill like the

@@ -23,6 +23,7 @@ import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { asWorkerLoader } from './helpers/worker-loader.mjs';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { H5AD_FORMAT, ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
@@ -1325,6 +1326,8 @@ test('categorical labels read from nested nullable-string groups', async () => {
     dtype: 'categorical',
     categories: ['alpha', 'beta'],
     ordered: false,
+    // No `uns['label_colors']`: no palette.
+    colors: null,
   });
   const field = await reader.getObsField('label');
   assert.deepEqual(Array.from(field.codes), [0, -1, 1]);
@@ -1469,6 +1472,10 @@ test('the adapter reuses retained categories after the reader cache is cleared',
   const scenario = await openCountingCategories('modern-string');
   const adapter = new BaseAnnDataAdapter(asWorkerLoader(scenario.reader));
   await adapter.initialize();
+  // Opening reads no category dictionary; the field's first load does.
+  assert.equal(scenario.categoryReads(), 0);
+  assert.equal(adapter._obsFieldsMetadata[0].categories, null);
+  await adapter.getObsFieldData('label');
   const canonicalCategories = adapter._obsFieldsMetadata[0].categories;
   assert.equal(scenario.categoryReads(), 1);
 
@@ -1806,6 +1813,7 @@ function sourceMetadata() {
       X: null,
       layers: [],
       raw: null,
+      log1p: null,
     },
     stats: {
       has_connectivity: false,
@@ -1864,43 +1872,15 @@ function fakeClientOpen({ pendingByName = new Map(), records = new Map() } = {})
 
 async function withFakeH5adOpen(run) {
   const originalOpen = AnnDataReaderClient.prototype.open;
-  const notificationCenter = getNotificationCenter();
-  const notificationMethods = ['info', 'startDownload', 'updateDownload', 'completeDownload', 'failDownload', 'dismissDownload'];
-  const originalNotifications = new Map(notificationMethods.map(name => [name, notificationCenter[name]]));
   const pendingByName = new Map();
   const records = new Map();
-  const warnings = [];
-  notificationCenter.info = (...args) => {
-    warnings.push(args);
-    return `info-${warnings.length}`;
-  };
-  notificationCenter.startDownload = () => 'fake-download';
-  notificationCenter.updateDownload = () => {};
-  notificationCenter.completeDownload = () => {};
-  notificationCenter.failDownload = () => {};
-  notificationCenter.dismissDownload = () => {};
   AnnDataReaderClient.prototype.open = fakeClientOpen({ pendingByName, records });
   try {
-    await run({ pendingByName, records, warnings });
+    await run({ pendingByName, records });
   } finally {
     AnnDataReaderClient.prototype.open = originalOpen;
-    for (const [name, method] of originalNotifications) {
-      if (method === undefined) delete notificationCenter[name];
-      else notificationCenter[name] = method;
-    }
   }
 }
-
-test('the H5AD direct-load warning is published only after successful adoption', async () => {
-  await withFakeH5adOpen(async ({ warnings }) => {
-    const source = new H5adDataSource();
-    await assert.rejects(source.loadFromFile({ fail: true, name: 'broken.h5ad' }), /invalid broken/i);
-    assert.equal(warnings.length, 0);
-    await source.loadFromFile({ name: 'working.h5ad' });
-    assert.equal(warnings.length, 1);
-    source.clear();
-  });
-});
 
 test('H5adDataSource keeps a working dataset when a replacement fails', async () => {
   await withFakeH5adOpen(async () => {
@@ -1951,16 +1931,15 @@ test('H5adDataSource makes overlapping selections latest-wins', async () => {
   });
 });
 
-test('the H5AD notification owner spans validation and dismisses a stale candidate', async t => {
-  const notifications = getNotificationCenter();
-  const events = captureDownloadNotifications(t);
+test('a superseded H5AD candidate leaves the opening to the newer one, which ends it opened', async t => {
+  const states = [];
+  t.after(getOpeningProgress().subscribe(snapshot => {
+    if (snapshot !== null) states.push(`${snapshot.id}:${snapshot.state}`);
+  }));
   const originalOpen = AnnDataReaderClient.prototype.open;
-  const originalInfo = notifications.info;
   const olderGate = deferred();
-  notifications.info = () => {};
   t.after(() => {
     AnnDataReaderClient.prototype.open = originalOpen;
-    notifications.info = originalInfo;
   });
   AnnDataReaderClient.prototype.open = fakeClientOpen({ pendingByName: new Map([['older.h5ad', olderGate]]) });
 
@@ -1973,10 +1952,10 @@ test('the H5AD notification owner spans validation and dismisses a stale candida
 
   await assert.rejects(older, /superseded/i);
   assert.equal(newer.id, 'h5ad_newer');
-  assert.deepEqual(events.filter(event => event.kind !== 'update').map(event => event.kind), ['start', 'start', 'complete', 'dismiss']);
-  const completedId = events.find(event => event.kind === 'complete').id;
-  const newerStart = events.find(event => event.kind === 'start' && /newer\.h5ad/.test(event.name));
-  assert.equal(completedId, newerStart.id);
+  // One opening on screen for both, ended once, opened.
+  assert.equal(new Set(states.map(state => state.split(':')[0])).size, 1);
+  assert.equal(states.filter(state => !state.endsWith(':running')).length, 1);
+  assert.match(states.at(-1), /:done$/);
 });
 
 test('H5adDataSource has one reader owner and closes it once', async () => {

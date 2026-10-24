@@ -12,18 +12,22 @@
 import { getComputeManager } from '../compute/compute-manager.js';
 import { OperationType } from '../compute/operations.js';
 import { formatCount } from '../../ui/components/display-format.js';
-import { getBasePageIdFromRestOf, isRestOfPageId } from '../shared/page-derivation-utils.js';
 import {
   createFrameThrottle,
-  createSlicedYield,
-  waitForAvailableSlot
+  createSlicedYield
 } from '../shared/concurrency-utils.js';
 import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
-import { PerformanceConfig } from '../shared/performance-config.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
-import { benjaminiHochbergTestable } from './statistical-tests.js';
+import { benjaminiHochbergTestable, bonferroniAdjusted } from './statistical-tests.js';
 import { selectSorted } from '../compute/math-utils.js';
 import { SignaturePageScorer } from './signature-score.js';
+import { pseudobulkGeneTest, pseudobulkUnits } from './pseudobulk.js';
+import { moduleScoreControls } from './module-score.js';
+import { computeGeneMoments } from '../compute/operation-handlers.js';
+import { geneMomentsFor, momentsMean, momentsStd } from '../shared/gene-moments-cache.js';
+import { createRunTunerFor, runGeneStream, taskTiming } from '../shared/gene-stream-runner.js';
+import { TUNER_WINDOW_GENES } from '../shared/run-tuner.js';
+import { getWorkerPool } from '../compute/worker-pool.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { cleanupAnalysisResources } from '../shared/resource-cleanup.js';
 
@@ -74,6 +78,68 @@ function resolveRequestOwnership(options, label) {
     );
   }
   return { isCurrent, registerInvalidationCleanup };
+}
+
+/** Bonferroni over the testable subset, as a boxed list (null where untested). */
+function bonferroniTestable(pValues) {
+  const { adjustedPValues, testedCount, untestableCount } = bonferroniAdjusted(pValues);
+  return {
+    adjustedPValues: Array.from(adjustedPValues, value => (Number.isFinite(value) ? value : null)),
+    testedCount,
+    untestableCount
+  };
+}
+
+/** Whether two ascending index arrays share an element. */
+function sortedIntersect(left, right) {
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) return true;
+    if (left[i] < right[j]) i++;
+    else j++;
+  }
+  return false;
+}
+
+/** Ascending cells, those in a scope (all when null), as a Uint32Array. */
+export function cellsWithin(cells, within) {
+  if (within === null) return Uint32Array.from(cells);
+  let count = 0;
+  for (let i = 0; i < cells.length; i++) if (within[cells[i]] !== 0) count++;
+  const out = new Uint32Array(count);
+  let k = 0;
+  for (let i = 0; i < cells.length; i++) if (within[cells[i]] !== 0) out[k++] = cells[i];
+  return out;
+}
+
+/** First position of an ascending index array at or past `value`. */
+function lowerBoundOf(indices, value) {
+  let lo = 0;
+  let hi = indices.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (indices[mid] < value) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * UCell workers hold one module-global range context each, so one UCell run
+ * owns them at a time; another waits for it.
+ */
+let ucellLease = Promise.resolve();
+async function acquireUcellLease(signal) {
+  const previous = ucellLease;
+  let release;
+  ucellLease = new Promise(resolve => { release = resolve; });
+  await previous;
+  if (signal?.aborted) {
+    release();
+    throw signal.reason;
+  }
+  return release;
 }
 
 const DE_PHASES = Object.freeze(['Loading & Computing', 'Multiple Testing Correction']);
@@ -640,118 +706,127 @@ export class MultiVariableAnalysis {
   // =========================================================================
 
   /**
-   * Perform differential expression analysis between two pages
+   * A page's cells as a differential-expression group: its cells (a "rest
+   * of" page's too), within a scope when one is given.
+   *
+   * @param {string} pageId
+   * @param {Uint8Array|null} [within] - 1 for a cell in scope
+   * @returns {{name: string, cells: Uint32Array}}
+   */
+  pageGroup(pageId, within = null) {
+    const [{ pageName, cellIndices }] = this.dataLayer.getPageCells([pageId]);
+    return { name: pageName, cells: cellsWithin(cellIndices, within) };
+  }
+
+  /**
+   * Differential expression of every gene between two groups of cells.
+   *
+   * The groups are disjoint sets of cells (pages, categories, either within
+   * a scope: the UI resolves them, `pageGroup`). A group under `minCells`
+   * is tested all the same and flagged (`summary.lowN`); a gene is tested
+   * when both groups hold at least two cells with a measured value. Genes
+   * read by cell when that reads less (a few thousand cells of a large
+   * dataset), else streamed by column to the analysis workers, as many in
+   * flight as the run's tuner says (`shared/run-tuner.js`).
    *
    * @param {Object} options
-   * @param {string} options.pageA - First page ID (reference/control)
-   * @param {string} options.pageB - Second page ID (test/treatment)
-   * @param {string[]} [options.geneList] - Subset of genes to test (null = all)
-   * @param {string} [options.method='wilcox'] - 'wilcox' or 'ttest'
-   * @param {number} [options.minCells=10] - Minimum cells required per group
-   * @param {number|'auto'} [options.parallelism='auto'] - Max concurrent genes in-flight (worker-backed)
-   * @param {Object} [options.batchConfig] - Batch settings (preloadCount, memoryBudgetMB, networkConcurrency)
-   * @param {Function} [options.onProgress] - Progress callback
-   * @param {Function} [options.isCurrent] - Exact request ownership predicate
-   * @param {Function} [options.registerInvalidationCleanup] - Required with isCurrent
-   * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [options.job] -
-   *   The run's job: told the cost and every gene done; its signal stops the
-   *   run's reads and worker tasks, and its reads are its own
-   * @returns {Promise<Object>} Differential expression results
-  */
+   * @param {{name: string, cells: Uint32Array}} options.groupA
+   * @param {{name: string, cells: Uint32Array}} options.groupB
+   * @param {string[]|null} [options.geneList] - Genes to test (null: every gene)
+   * @param {'wilcox'|'ttest'|'ttest_overestim_var'} [options.method='wilcox']
+   * @param {'exact'|'normal'|'normal_tie'} [options.pConvention='exact']
+   * @param {'bh'|'bonferroni'} [options.correction='bh']
+   * @param {{mode: 'stored'|'log1p', base: number|null}} [options.foldChange]
+   * @param {string} [options.matrix='mapped'] - The expression matrix read
+   *   (`DataLayer.getExpressionMatrices`); `geneList` names its genes
+   * @param {{name: string, codes: ArrayLike<number>, missingCode: number}|null} [options.replicates=null] -
+   *   A sample field: pseudobulk, each sample's cells of a group one
+   *   observation, Welch's t across them (`stats/pseudobulk.js`); `method`
+   *   and `pConvention` then do not apply
+   * @param {number} [options.minCells=10] - Below it a group is flagged low n
+   * @param {Function} [options.onProgress]
+   * @param {Function} [options.isCurrent]
+   * @param {Function} [options.registerInvalidationCleanup]
+   * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [options.job]
+   * @returns {Promise<Object|null>}
+   */
   async differentialExpression(options) {
     const memScope = startMemoryTracking('DE', 'differentialExpression', { includeUserAgent: true });
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Differential expression options are required');
     }
     const {
-      pageA: requestedPageA,
-      pageB: requestedPageB,
+      groupA,
+      groupB,
       geneList: requestedGeneList = null,
       method = 'wilcox',
+      pConvention = 'exact',
+      correction = 'bh',
+      foldChange = { mode: 'stored', base: null },
+      matrix = 'mapped',
+      replicates = null,
       minCells = 10,
-      parallelism = 'auto',
       onProgress,
-      job = null,
-      // Batch configuration options for optimized loading
-      batchConfig: requestedBatchConfig = {}
+      job = null
     } = options;
     const signal = job?.signal ?? null;
-    const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(
-      options,
-      'Differential expression'
-    );
-    const pageA = requestedPageA;
-    const pageB = requestedPageB;
-    const geneList = Array.isArray(requestedGeneList)
-      ? [...requestedGeneList]
-      : requestedGeneList;
-    const batchConfig = (
-      requestedBatchConfig &&
-      typeof requestedBatchConfig === 'object' &&
-      !Array.isArray(requestedBatchConfig)
-    )
-      ? {
-        preloadCount: requestedBatchConfig.preloadCount,
-        memoryBudgetMB: requestedBatchConfig.memoryBudgetMB,
-        networkConcurrency: requestedBatchConfig.networkConcurrency,
-      }
-      : requestedBatchConfig;
-
-    if (
-      typeof pageA !== 'string' ||
-      pageA.length === 0 ||
-      pageA !== pageA.trim() ||
-      typeof pageB !== 'string' ||
-      pageB.length === 0 ||
-      pageB !== pageB.trim() ||
-      pageA === pageB
-    ) {
-      memScope.end({ error: 'Missing pages' });
-      throw new TypeError(
-        'Differential expression requires two distinct non-empty page IDs'
-      );
+    const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(options, 'Differential expression');
+    const pointCount = this.dataLayer?.state?.pointCount;
+    if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
+      throw new TypeError('Differential expression requires an exact positive dataset pointCount');
     }
-    if (!['wilcox', 'ttest'].includes(method)) {
+    for (const [label, group] of [['A', groupA], ['B', groupB]]) {
+      if (!group || typeof group.name !== 'string' || !(group.cells instanceof Uint32Array)) {
+        throw new TypeError(`Differential expression group ${label} must be { name, cells: Uint32Array }`);
+      }
+      let previous = -1;
+      for (const cell of group.cells) {
+        if (cell <= previous || cell >= pointCount) {
+          throw new RangeError(`Differential expression group ${label} cells must be sorted, unique and in the dataset`);
+        }
+        previous = cell;
+      }
+    }
+    if (sortedIntersect(groupA.cells, groupB.cells)) {
+      throw new RangeError('Differential expression groups must be disjoint; their cells overlap');
+    }
+    if (groupA.cells.length < 2 || groupB.cells.length < 2) {
+      throw new RangeError('Differential expression needs at least 2 cells in each group');
+    }
+    if (!['wilcox', 'ttest', 'ttest_overestim_var'].includes(method)) {
       throw new TypeError(`Unknown differential expression method: ${String(method)}`);
+    }
+    const units = replicates === null
+      ? null
+      : pseudobulkUnits(groupA.cells, groupB.cells, replicates.codes, replicates.missingCode, pointCount);
+    if (units !== null && (units.unitsA < 2 || units.unitsB < 2)) {
+      throw new RangeError(`Pseudobulk needs cells of each group in at least 2 samples of ${replicates.name}`);
+    }
+    if (!['exact', 'normal', 'normal_tie'].includes(pConvention)) {
+      throw new TypeError(`Unknown p-value convention: ${String(pConvention)}`);
+    }
+    if (correction !== 'bh' && correction !== 'bonferroni') {
+      throw new TypeError(`Unknown multiple-testing correction: ${String(correction)}`);
     }
     if (!Number.isSafeInteger(minCells) || minCells < 2) {
       throw new TypeError('minCells must be a safe integer of at least 2');
     }
-    if (
-      parallelism !== 'auto' &&
-      (!Number.isSafeInteger(parallelism) || parallelism <= 0)
-    ) {
-      throw new TypeError(
-        'parallelism must be "auto" or a positive safe integer'
-      );
-    }
     if (onProgress !== undefined && typeof onProgress !== 'function') {
       throw new TypeError('onProgress must be a function when provided');
     }
-    if (
-      !batchConfig ||
-      typeof batchConfig !== 'object' ||
-      Array.isArray(batchConfig)
-    ) {
-      throw new TypeError('batchConfig must be an object');
+    const matrixLabel = this.dataLayer.resolveExpressionMatrix(matrix).label;
+    const allGenes = await this.dataLayer.getGeneKeys(matrix);
+    const geneKeys = requestedGeneList === null ? allGenes : [...requestedGeneList];
+    if (requestedGeneList !== null) {
+      const known = new Set(allGenes);
+      const unknown = geneKeys.find(gene => !known.has(gene));
+      if (unknown !== undefined) {
+        throw new RangeError(`Requested differential expression gene not found: ${unknown}`);
+      }
     }
-    if (
-      geneList !== null &&
-      (
-        !Array.isArray(geneList) ||
-        geneList.length === 0 ||
-        geneList.some(
-          gene =>
-            typeof gene !== 'string' ||
-            gene.length === 0 ||
-            gene !== gene.trim()
-        ) ||
-        new Set(geneList).size !== geneList.length
-      )
-    ) {
-      throw new TypeError(
-        'geneList must be null or unique non-empty gene keys'
-      );
+    if (geneKeys.length === 0) {
+      memScope.end({ error: 'No genes' });
+      throw new Error('No genes available for analysis');
     }
     if (!isCurrent()) {
       memScope.end({ method, stale: true });
@@ -759,612 +834,231 @@ export class MultiVariableAnalysis {
     }
 
     const startTime = performance.now();
+    const groupASize = groupA.cells.length;
+    const groupBSize = groupB.cells.length;
+    const lowN = [groupA, groupB].filter(group => group.cells.length < minCells).map(group => group.name);
+    const testOptions = { pConvention, foldChange };
 
-    const pointCount = this.dataLayer?.state?.pointCount;
-    if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
-      throw new TypeError(
-        'Differential expression requires an exact positive dataset pointCount'
-      );
-    }
-
-    // Get available genes
-    const allGenes = this.dataLayer.getAvailableVariables('gene_expression');
-    if (!Array.isArray(allGenes)) {
-      throw new TypeError('Available gene variables must be an array');
-    }
-    const genesByKey = new Map();
-    for (const gene of allGenes) {
-      if (
-        !gene ||
-        typeof gene !== 'object' ||
-        typeof gene.key !== 'string' ||
-        gene.key.length === 0 ||
-        genesByKey.has(gene.key)
-      ) {
-        throw new TypeError(
-          'Available genes must have unique non-empty keys'
-        );
-      }
-      genesByKey.set(gene.key, gene);
-    }
-    const genesToTest = geneList === null
-      ? allGenes
-      : geneList.map(geneKey => {
-        if (!genesByKey.has(geneKey)) {
-          throw new RangeError(
-            `Requested differential expression gene not found: ${geneKey}`
-          );
-        }
-        return genesByKey.get(geneKey);
-      });
-
-    if (genesToTest.length === 0) {
-      memScope.end({ error: 'No genes' });
-      throw new Error('No genes available for analysis');
-    }
-
-    // Get recommended settings based on data size
-    const recommended = PerformanceConfig.getRecommendedSettings(pointCount, genesToTest.length);
-
-    // Merge user batch config with recommended settings
-    const effectiveBatchConfig = {
-      preloadCount: batchConfig.preloadCount ?? recommended.preloadCount,
-      memoryBudgetMB: batchConfig.memoryBudgetMB ?? recommended.memoryBudgetMB,
-      networkConcurrency: batchConfig.networkConcurrency ?? recommended.networkConcurrency
-    };
-    if (
-      !Number.isSafeInteger(effectiveBatchConfig.preloadCount) ||
-      effectiveBatchConfig.preloadCount <= 0 ||
-      typeof effectiveBatchConfig.memoryBudgetMB !== 'number' ||
-      !Number.isFinite(effectiveBatchConfig.memoryBudgetMB) ||
-      effectiveBatchConfig.memoryBudgetMB <= 0 ||
-      !Number.isSafeInteger(effectiveBatchConfig.networkConcurrency) ||
-      effectiveBatchConfig.networkConcurrency <= 0
-    ) {
-      throw new TypeError(
-        'Differential expression batch settings must be positive exact numbers'
-      );
-    }
-
-    console.log('[DE] Effective config:', {
-      preloadCount: effectiveBatchConfig.preloadCount,
-      memoryBudgetMB: effectiveBatchConfig.memoryBudgetMB,
-      networkConcurrency: effectiveBatchConfig.networkConcurrency,
-      genes: genesToTest.length,
-      cells: pointCount
-    });
-
-    const progressTracker = createDifferentialProgress({
-      total: genesToTest.length,
-      onProgress,
-      isCurrent,
-      job
-    });
+    const progressTracker = createDifferentialProgress({ total: geneKeys.length, onProgress, isCurrent, job });
+    job?.setPlan(
+      `${formatCount(geneKeys.length)} genes in ${groupA.name} (${formatCount(groupASize)} cells) vs ` +
+      `${groupB.name} (${formatCount(groupBSize)} cells)` +
+      (units === null ? '' : `, ${formatCount(units.unitsA)} vs ${formatCount(units.unitsB)} samples`)
+    );
     progressTracker.start();
 
-    /** @type {import('../compute/compute-manager.js').ComputeManager|null} */
     let computeManager = null;
-    /** @type {StreamingGeneLoader|null} */
     let geneLoader = null;
     let didStartHeavyCompute = false;
     let hasAnalysisFailure = false;
     let analysisFailure;
-    let invalidationCleanupClaimed = false;
     if (registerInvalidationCleanup !== undefined) {
+      let claimed = false;
       registerInvalidationCleanup(() => {
-        if (invalidationCleanupClaimed) return;
-        invalidationCleanupClaimed = true;
+        if (claimed) return;
+        claimed = true;
         progressTracker.stop();
         geneLoader?.abort();
       });
     }
+    const stale = () => {
+      progressTracker.stop();
+      memScope.end({ method, stale: true });
+      return null;
+    };
 
     try {
-      if (!isCurrent()) {
-        progressTracker.stop();
-        memScope.end({ method, stale: true });
-        return null;
-      }
-      const pageAInfo = this.dataLayer.getPageInfo(pageA);
-      const pageBInfo = this.dataLayer.getPageInfo(pageB);
-      for (const [pageId, pageInfo] of [
-        [pageA, pageAInfo],
-        [pageB, pageBInfo],
-      ]) {
-        if (
-          !pageInfo ||
-          typeof pageInfo !== 'object' ||
-          typeof pageInfo.name !== 'string' ||
-          pageInfo.name.length === 0
-        ) {
-          throw new Error(
-            `Differential expression page metadata is missing for "${pageId}"`
-          );
-        }
-      }
-
-      /**
-       * Build group specification for a page
-       * @param {string} pageId
-       * @returns {Object} Group specification
-       */
-      const requireSortedUniqueIndices = (indices, owner) => {
-        if (
-          indices === null ||
-          indices === undefined ||
-          !Number.isSafeInteger(indices.length) ||
-          indices.length < 0
-        ) {
-          throw new TypeError(`${owner} must provide an array-like cell index set`);
-        }
-        let previous = -1;
-        for (let index = 0; index < indices.length; index++) {
-          const cellIndex = indices[index];
-          if (
-            !Number.isSafeInteger(cellIndex) ||
-            cellIndex < 0 ||
-            cellIndex >= pointCount ||
-            cellIndex <= previous
-          ) {
-            throw new RangeError(
-              `${owner} cell indices must be sorted, unique, and inside the dataset`
-            );
-          }
-          previous = cellIndex;
-        }
-        return indices;
-      };
-      const buildGroupSpec = (pageId) => {
-        const pageInfo = this.dataLayer.getPageInfo(pageId);
-        if (
-          !pageInfo ||
-          typeof pageInfo.name !== 'string' ||
-          pageInfo.name.length === 0
-        ) {
-          throw new Error(
-            `Differential expression page metadata is missing for "${pageId}"`
-          );
-        }
-        const pageName = pageInfo.name;
-
-        if (isRestOfPageId(pageId)) {
-          const baseId = getBasePageIdFromRestOf(pageId);
-          if (typeof baseId !== 'string' || baseId.length === 0) {
-            throw new TypeError(
-              `Malformed rest-of page ID: ${pageId}`
-            );
-          }
-          const excludedCellIndices = requireSortedUniqueIndices(
-            this.dataLayer.getCellIndicesForPage(baseId),
-            `Rest-of page "${pageId}"`
-          );
-          return { kind: 'rest_of', pageId, pageName, baseId, excludedCellIndices, isRestOf: true };
-        }
-
-        const cellIndices = requireSortedUniqueIndices(
-          this.dataLayer.getCellIndicesForPage(pageId),
-          `Page "${pageId}"`
-        );
-        return { kind: 'explicit', pageId, pageName, cellIndices, isRestOf: false };
-      };
-
-      const groupA = buildGroupSpec(pageA);
-      const groupB = buildGroupSpec(pageB);
-
-      const getGroupSize = (group, totalCells) => {
-        if (group.kind === 'rest_of') {
-          if (group.excludedCellIndices.length > totalCells) {
-            throw new RangeError(
-              'Rest-of exclusions exceed the dataset point count'
-            );
-          }
-          return totalCells - group.excludedCellIndices.length;
-        }
-        return group.cellIndices.length;
-      };
-
-      const groupASize = getGroupSize(groupA, pointCount);
-      const groupBSize = getGroupSize(groupB, pointCount);
-      const hasSortedIntersection = (left, right) => {
-        let leftIndex = 0;
-        let rightIndex = 0;
-        while (leftIndex < left.length && rightIndex < right.length) {
-          const leftCell = left[leftIndex];
-          const rightCell = right[rightIndex];
-          if (leftCell === rightCell) return true;
-          if (leftCell < rightCell) leftIndex++;
-          else rightIndex++;
-        }
-        return false;
-      };
-      const isSortedSubset = (candidate, owner) => {
-        let candidateIndex = 0;
-        let ownerIndex = 0;
-        while (
-          candidateIndex < candidate.length &&
-          ownerIndex < owner.length
-        ) {
-          const candidateCell = candidate[candidateIndex];
-          const ownerCell = owner[ownerIndex];
-          if (candidateCell === ownerCell) {
-            candidateIndex++;
-            ownerIndex++;
-          } else if (candidateCell > ownerCell) {
-            ownerIndex++;
-          } else {
-            return false;
-          }
-        }
-        return candidateIndex === candidate.length;
-      };
-      const sortedUnionSize = (left, right) => {
-        let leftIndex = 0;
-        let rightIndex = 0;
-        let size = 0;
-        while (leftIndex < left.length || rightIndex < right.length) {
-          if (leftIndex >= left.length) {
-            size += right.length - rightIndex;
-            break;
-          }
-          if (rightIndex >= right.length) {
-            size += left.length - leftIndex;
-            break;
-          }
-          const leftCell = left[leftIndex];
-          const rightCell = right[rightIndex];
-          size++;
-          if (leftCell === rightCell) {
-            leftIndex++;
-            rightIndex++;
-          } else if (leftCell < rightCell) {
-            leftIndex++;
-          } else {
-            rightIndex++;
-          }
-        }
-        return size;
-      };
-      let groupsOverlap;
-      if (groupA.kind === 'explicit' && groupB.kind === 'explicit') {
-        groupsOverlap = hasSortedIntersection(
-          groupA.cellIndices,
-          groupB.cellIndices
-        );
-      } else if (groupA.kind === 'explicit') {
-        groupsOverlap = !isSortedSubset(
-          groupA.cellIndices,
-          groupB.excludedCellIndices
-        );
-      } else if (groupB.kind === 'explicit') {
-        groupsOverlap = !isSortedSubset(
-          groupB.cellIndices,
-          groupA.excludedCellIndices
-        );
-      } else {
-        groupsOverlap = sortedUnionSize(
-          groupA.excludedCellIndices,
-          groupB.excludedCellIndices
-        ) < pointCount;
-      }
-      if (groupsOverlap) {
-        throw new RangeError(
-          'Differential expression comparison groups must be disjoint; ' +
-          'their cell memberships overlap'
-        );
-      }
-      if (groupASize < minCells || groupBSize < minCells) {
-        throw new RangeError(
-          `Differential expression requires at least ${minCells} cells per group; ` +
-          `received ${groupASize} and ${groupBSize}`
-        );
-      }
-
-      job?.setPlan(
-        `${formatCount(genesToTest.length)} genes in ` +
-        `${pageAInfo.name} (${formatCount(groupASize)} cells) vs ` +
-        `${pageBInfo.name} (${formatCount(groupBSize)} cells)`
-      );
-
       computeManager = await this._getComputeManager();
-      if (!isCurrent()) {
-        progressTracker.stop();
-        memScope.end({ method, stale: true });
-        return null;
-      }
+      if (!isCurrent()) return stale();
       const backend = computeManager.selectBackend(OperationType.COMPUTE_DIFFERENTIAL);
       didStartHeavyCompute = true;
-
-      // Select the backend once for the complete analysis run. CPU and worker
-      // routes share operation-handlers.js and therefore the same DE contract.
-      const workerStats = backend === 'worker'
-        ? computeManager.getStatus().worker.stats
-        : null;
-      if (
-        backend === 'worker' &&
-        (
-          !workerStats ||
-          !Number.isSafeInteger(workerStats.poolSize) ||
-          workerStats.poolSize <= 0
-        )
-      ) {
-        throw new TypeError(
-          'Worker differential expression requires an exact positive pool size'
-        );
-      }
-      const poolSize = backend === 'worker' ? workerStats.poolSize : 1;
-      // One gene per worker keeps every worker busy; more in flight only
-      // queues. Each in-flight gene holds at most one column (4 bytes per
-      // cell) on its way to a worker, which the run's budget bounds.
-      const bytesPerGene = pointCount * 4;
-      const budget = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
-      const maxByMemory = Math.max(1, Math.floor(budget / bytesPerGene));
-      const maxInFlightGenes = Math.max(1, Math.min(
-        parallelism === 'auto' ? poolSize : parallelism,
-        poolSize,
-        maxByMemory
-      ));
-
-      // Create streaming gene loader with optimized prefetching
-      geneLoader = new StreamingGeneLoader({
-        dataLayer: this.dataLayer,
-        config: effectiveBatchConfig,
-        signal,
-        owner: job?.id ?? null
-      });
+      const poolSize = backend === 'worker' ? computeManager.getStatus().worker.stats.poolSize : 1;
+      const tuner = createRunTunerFor(this.dataLayer, poolSize);
+      geneLoader = new StreamingGeneLoader({ dataLayer: this.dataLayer, tuner, signal, owner: job?.id ?? null, matrix });
 
       /** @type {Array<Object|null>} */
-      const resultsByIndex = new Array(genesToTest.length).fill(null);
-      /** @type {Set<Promise<void>>} */
-      const inFlight = new Set();
-      let executionError = null;
-      let stale = false;
-      let streamError = null;
-
-      // Genes read by column are split into the two groups where they are
-      // tested: the groups cross to the compute threads once, as one byte per
-      // cell, and each gene crosses as its column alone (transferred when the
-      // run owns it). Nothing is gathered on this thread.
-      const groupOfCell = new Uint8Array(pointCount);
-      const membership = group => {
-        const mask = new Uint8Array(pointCount);
-        if (group.kind === 'rest_of') {
-          mask.fill(1);
-          for (const cell of group.excludedCellIndices) mask[cell] = 0;
-        } else {
-          for (const cell of group.cellIndices) mask[cell] = 1;
+      const resultsByIndex = new Array(geneKeys.length).fill(null);
+      const acceptResult = (gene, index, row) => {
+        if (
+          !row ||
+          !Number.isSafeInteger(row.nA) || !Number.isSafeInteger(row.nB) ||
+          row.nA < 0 || row.nB < 0 ||
+          row.nA > groupASize || row.nB > groupBSize
+        ) {
+          throw new TypeError(`Differential expression backend returned invalid sample counts for "${gene}"`);
         }
-        return mask;
+        const tested = row.nA >= 2 && row.nB >= 2 && Number.isFinite(row.pValue);
+        if (tested && (row.pValue < 0 || row.pValue > 1)) {
+          throw new TypeError(`Differential expression backend returned invalid statistics for "${gene}"`);
+        }
+        resultsByIndex[index] = {
+          gene,
+          meanA: row.meanA,
+          meanB: row.meanB,
+          pctA: row.pctA,
+          pctB: row.pctB,
+          log2FoldChange: tested ? row.log2FoldChange : NaN,
+          pValue: tested ? row.pValue : NaN,
+          statistic: tested ? row.statistic : NaN,
+          score: tested ? row.score : NaN,
+          auroc: tested ? row.auroc : NaN,
+          nA: row.nA,
+          nB: row.nB,
+          method: units === null ? method : 'pseudobulk',
+          ...(tested ? {} : {
+            error: units === null
+              ? `Too few measured cells (A: ${row.nA}, B: ${row.nB})`
+              : `Too few samples with a value (A: ${row.nA}, B: ${row.nB})`
+          })
+        };
       };
-      {
-        // The groups are disjoint (checked above).
-        const inA = membership(groupA);
-        const inB = membership(groupB);
-        for (let cell = 0; cell < pointCount; cell++) {
-          groupOfCell[cell] = inA[cell] === 1 ? 1 : (inB[cell] === 1 ? 2 : 0);
+
+      // Two small groups of a large dataset are read by cell, every gene at
+      // once, when that reads less than every gene's column. Pseudobulk sums
+      // each gene's column per sample unit instead.
+      const subset = units === null
+        ? await geneLoader.readCellSubset(geneKeys, groupA.cells, groupB.cells)
+        : null;
+      if (!isCurrent()) return stale();
+      if (subset !== null) {
+        const { pointers, cellIndex, values, groupOfPosition } = subset;
+        const positions = new Uint32Array(cellIndex.buffer, cellIndex.byteOffset, cellIndex.length);
+        // Runs of genes, copied out of the block only as a worker is free
+        // for one: a run is a large task, so one per worker (none waiting)
+        // keeps every copy sent and off this thread, and sixteen short runs
+        // per worker even out uneven genes and the last runs.
+        const runsInFlight = poolSize;
+        const runLength = Math.max(1, Math.ceil(geneKeys.length / (runsInFlight * 16)));
+        const inFlight = new Set();
+        let failure = null;
+        for (let first = 0; first < geneKeys.length && failure === null; first += runLength) {
+          while (inFlight.size >= runsInFlight) await Promise.race(inFlight);
+          if (!isCurrent()) return stale();
+          const last = Math.min(geneKeys.length, first + runLength);
+          const from = pointers[first];
+          const to = pointers[last];
+          const runPointers = new Float64Array(last - first + 1);
+          for (let k = 0; k <= last - first; k++) runPointers[k] = pointers[first + k] - from;
+          let task;
+          task = computeManager.execute(
+            OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET,
+            {
+              groupOfPosition: groupOfPosition.slice(),
+              pointers: runPointers,
+              positions: positions.slice(from, to),
+              values: values.slice(from, to),
+              method,
+              ...testOptions
+            },
+            { backend, timeout: 120000, transfer: true, signal, onTiming: taskTiming(tuner) }
+          ).then(run => {
+            if (!isCurrent()) return;
+            for (let k = 0; k < last - first; k++) {
+              acceptResult(geneKeys[first + k], first + k, {
+                meanA: run.meanA[k], meanB: run.meanB[k], pctA: run.pctA[k], pctB: run.pctB[k],
+                log2FoldChange: run.log2FoldChange[k], pValue: run.pValue[k], statistic: run.statistic[k],
+                score: run.score[k], auroc: run.auroc[k], nA: run.nA[k], nB: run.nB[k]
+              });
+            }
+            progressTracker.itemComplete(last - first);
+          }).catch(error => { failure ??= error; }).finally(() => inFlight.delete(task));
+          inFlight.add(task);
         }
-      }
-      const contextId = `de-${++differentialContextCounter}`;
-      let contextHeld = null;
-      const holdContext = () => {
-        contextHeld ??= computeManager.broadcast(
+        await Promise.all(inFlight);
+        if (failure !== null) throw failure;
+      } else if (units !== null) {
+        // One O(nnz) pass per gene sums it over each sample unit (the dot
+        // plot's per-group kernel, one group a unit); the sample-level test
+        // is a few numbers per unit, here.
+        const contextId = `pseudobulk-${++differentialContextCounter}`;
+        await computeManager.broadcast(
+          OperationType.GROUP_SUMMARY_SET_CONTEXT,
+          () => ({ contextId, cellGroup: units.cellUnit.slice(), groupCount: units.unitCount }),
+          { timeout: 120000, signal, retainAs: contextId }
+        );
+        try {
+          const completed = await runGeneStream({
+            loader: geneLoader,
+            genes: geneKeys,
+            tuner,
+            signal,
+            isCurrent,
+            dispatch: ({ values, owned }, onTiming) => computeManager.execute(
+              OperationType.GROUP_SUMMARY_COMPUTE_GENES,
+              { contextId, genes: [owned ? values : values.slice()], cutoff: 0, bins: 0 },
+              { timeout: 120000, transfer: true, signal, onTiming }
+            ),
+            onResult: ({ gene, index }, summary) => {
+              acceptResult(gene, index, pseudobulkGeneTest(
+                summary.sum, summary.expressing, summary.sizes, units.unitSide, foldChange
+              ));
+              progressTracker.itemComplete(1);
+            }
+          });
+          if (!completed) return stale();
+        } finally {
+          await computeManager.broadcast(
+            OperationType.GROUP_SUMMARY_CLEAR_CONTEXT,
+            () => ({ contextId }),
+            { releases: contextId }
+          );
+        }
+      } else {
+        // Genes read by column are split into the two groups where they are
+        // tested: the groups cross to the compute threads once, one byte a
+        // cell, and each gene as its column alone.
+        const groupOfCell = new Uint8Array(pointCount);
+        for (const cell of groupA.cells) groupOfCell[cell] = 1;
+        for (const cell of groupB.cells) groupOfCell[cell] = 2;
+        const contextId = `de-${++differentialContextCounter}`;
+        await computeManager.broadcast(
           OperationType.SET_TWO_GROUP_CONTEXT,
           () => ({ contextId, groupOfCell: groupOfCell.slice() }),
           backend === 'worker'
             ? { backend, timeout: 120000, signal, retainAs: contextId }
             : { backend, timeout: 120000, signal }
         );
-        return contextHeld;
-      };
-
-      const geneKeys = genesToTest.map(g => g.key);
-
-      /** Check one gene's backend result and record its row. */
-      const acceptResult = (gene, index, deResult) => {
-        if (
-          !deResult ||
-          !Number.isSafeInteger(deResult.nA) ||
-          !Number.isSafeInteger(deResult.nB) ||
-          deResult.nA < 0 ||
-          deResult.nB < 0 ||
-          deResult.nA > groupASize ||
-          deResult.nB > groupBSize
-        ) {
-          throw new TypeError(
-            `Differential expression backend returned invalid sample counts for "${gene}"`
-          );
-        }
-        if (deResult.nA < minCells || deResult.nB < minCells) {
-          resultsByIndex[index] = {
-            gene,
-            error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
-            meanA: deResult.meanA,
-            meanB: deResult.meanB,
-            log2FoldChange: NaN,
-            pValue: NaN,
-            statistic: NaN,
-            nA: deResult.nA,
-            nB: deResult.nB,
-            method
-          };
-          return;
-        }
-        if (
-          deResult.method !== method ||
-          !Number.isFinite(deResult.meanA) ||
-          !Number.isFinite(deResult.meanB) ||
-          !Number.isFinite(deResult.log2FoldChange) ||
-          !Number.isFinite(deResult.statistic) ||
-          !Number.isFinite(deResult.pValue) ||
-          deResult.pValue < 0 ||
-          deResult.pValue > 1
-        ) {
-          throw new TypeError(
-            `Differential expression backend returned invalid statistics for "${gene}"`
-          );
-        }
-        resultsByIndex[index] = { gene, ...deResult };
-      };
-
-      /** Track one dispatched task until it settles. */
-      const track = (request, onResult, completedItems) => {
-        let taskPromise;
-        taskPromise = request
-          .then(result => {
-            if (isCurrent()) onResult(result);
-          })
-          .catch((error) => {
-            executionError ||= error;
-          })
-          .finally(() => {
-            inFlight.delete(taskPromise);
-            if (isCurrent()) progressTracker.itemComplete(completedItems);
-          });
-        inFlight.add(taskPromise);
-      };
-
-      try {
         try {
-          // Two named groups of a large dataset are read by cell, every gene
-          // at once, when that reads less than every gene's column; the genes
-          // are then tested in runs, a run of genes per worker message.
-          const subset = groupA.kind === 'explicit' && groupB.kind === 'explicit'
-            ? await geneLoader.readCellSubset(geneKeys, groupA.cellIndices, groupB.cellIndices)
-            : null;
-          if (!isCurrent()) {
-            stale = true;
-          } else if (subset !== null) {
-            const { pointers, cellIndex, values, groupOfPosition } = subset;
-            // Cell positions are non-negative, so the Int32 entries read as
-            // Uint32 are the same numbers.
-            const positions = new Uint32Array(cellIndex.buffer, cellIndex.byteOffset, cellIndex.length);
-            // A few runs per worker even out uneven genes.
-            const runLength = Math.max(1, Math.ceil(geneKeys.length / (maxInFlightGenes * 4)));
-            for (let first = 0; first < geneKeys.length; first += runLength) {
-              await waitForAvailableSlot(inFlight, maxInFlightGenes);
-              if (!isCurrent()) {
-                stale = true;
-                break;
-              }
-              if (executionError) throw executionError;
-              const last = Math.min(geneKeys.length, first + runLength);
-              const from = pointers[first];
-              const to = pointers[last];
-              const runPointers = new Float64Array(last - first + 1);
-              for (let k = 0; k <= last - first; k++) runPointers[k] = pointers[first + k] - from;
-              track(
-                computeManager.execute(
-                  OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET,
-                  {
-                    groupOfPosition: groupOfPosition.slice(),
-                    pointers: runPointers,
-                    positions: positions.slice(from, to),
-                    values: values.slice(from, to),
-                    method
-                  },
-                  { backend, timeout: 120000, transfer: true, signal }
-                ),
-                run => {
-                  for (let k = 0; k < last - first; k++) {
-                    acceptResult(geneKeys[first + k], first + k, {
-                      meanA: run.meanA[k],
-                      meanB: run.meanB[k],
-                      log2FoldChange: run.log2FoldChange[k],
-                      pValue: run.pValue[k],
-                      statistic: run.statistic[k],
-                      nA: run.nA[k],
-                      nB: run.nB[k],
-                      method: run.method
-                    });
-                  }
-                },
-                last - first
-              );
-            }
-          } else {
-            for await (const { gene, index, values, owned } of geneLoader.streamGenesRaw(geneKeys)) {
-              if (!isCurrent()) {
-                stale = true;
-                geneLoader.abort();
-                break;
-              }
-              await waitForAvailableSlot(inFlight, maxInFlightGenes);
-              if (!isCurrent()) {
-                stale = true;
-                geneLoader.abort();
-                break;
-              }
-              if (executionError) {
-                geneLoader.abort();
-                throw executionError;
-              }
-              await holdContext();
-              track(
-                computeManager.execute(
-                  OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMN,
-                  {
-                    contextId,
-                    // A column the run does not own is shared with a view or
-                    // another run: it is copied rather than emptied by transfer.
-                    values: owned ? values : values.slice(),
-                    method
-                  },
-                  { backend, timeout: 120000, transfer: true, signal }
-                ),
-                deResult => acceptResult(gene, index, deResult),
-                1
-              );
-            }
-          }
-        } catch (error) {
-          streamError = error;
-        }
-
-        // Wait for all pending computations and propagate the first backend error.
-        if (inFlight.size > 0) {
-          await Promise.all(inFlight);
-        }
-      } finally {
-        if (contextHeld !== null) {
-          await contextHeld.then(
-            () => computeManager.broadcast(
-              OperationType.CLEAR_TWO_GROUP_CONTEXT,
-              () => ({ contextId }),
-              backend === 'worker' ? { backend, releases: contextId } : { backend }
+          const completed = await runGeneStream({
+            loader: geneLoader,
+            genes: geneKeys,
+            tuner,
+            signal,
+            isCurrent,
+            dispatch: ({ values, owned }, onTiming) => computeManager.execute(
+              OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMN,
+              // A column the run does not own is shared with a view or
+              // another run: it is copied rather than emptied by transfer.
+              { contextId, values: owned ? values : values.slice(), method, ...testOptions },
+              { backend, timeout: 120000, transfer: true, signal, onTiming }
             ),
-            () => {}
-          ).catch(error => {
-            executionError ||= error;
+            onResult: ({ gene, index }, row) => {
+              acceptResult(gene, index, row);
+              progressTracker.itemComplete(1);
+            }
           });
+          if (!completed) return stale();
+        } finally {
+          await computeManager.broadcast(
+            OperationType.CLEAR_TWO_GROUP_CONTEXT,
+            () => ({ contextId }),
+            backend === 'worker' ? { backend, releases: contextId } : { backend }
+          );
         }
       }
-      if (stale || !isCurrent()) {
-        progressTracker.stop();
-        memScope.end({ method, stale: true });
-        return null;
-      }
-      if (streamError) throw streamError;
-      if (executionError) throw executionError;
-
+      if (!isCurrent()) return stale();
       if (resultsByIndex.some(result => result === null)) {
         throw new Error('Differential expression completed without a result for every gene');
       }
       const results = resultsByIndex;
 
-      // Move to next phase
       progressTracker.nextPhase();
-      if (!isCurrent()) {
-        progressTracker.stop();
-        memScope.end({ method, stale: true });
-        return null;
-      }
+      const adjust = correction === 'bh' ? benjaminiHochbergTestable : bonferroniTestable;
+      const { adjustedPValues, testedCount, untestableCount } = adjust(results.map(result => result.pValue));
+      for (let i = 0; i < results.length; i++) results[i].adjustedPValue = adjustedPValues[i];
 
-      // Apply multiple testing correction (Benjamini-Hochberg)
-      const { testedCount, untestableCount } =
-        this._applyBenjaminiHochberg(results);
-      const correctedResults = results;
-
-      // Sort by p-value
-      correctedResults.sort((a, b) => {
+      // Ranked by p-value; untested genes last.
+      results.sort((a, b) => {
         const finiteA = Number.isFinite(a.pValue);
         const finiteB = Number.isFinite(b.pValue);
         if (finiteA && finiteB) return a.pValue - b.pValue;
@@ -1373,72 +1067,41 @@ export class MultiVariableAnalysis {
         return 0;
       });
 
-      // Calculate summary statistics
-      let significantCount = 0;
-      let upregulated = 0;
-      let downregulated = 0;
-
-      // The Benjamini-Hochberg rejection rule is inclusive: an adjusted value
-      // of exactly alpha is a rejection, which is what `benjaminiHochberg`
-      // reports in `significant` and what the volcano and marker filters use.
-      for (const r of correctedResults) {
-        const adj = r.adjustedPValue;
-        if (adj === null || !Number.isFinite(adj) || adj > 0.05) continue;
-
-        significantCount++;
-        if (r.log2FoldChange > 0) upregulated++;
-        else if (r.log2FoldChange < 0) downregulated++;
-      }
-
       const duration = performance.now() - startTime;
       progressTracker.stop();
-      const genesPerSecond = duration > 0
-        ? Math.round((genesToTest.length * 10_000) / duration) / 10
-        : null;
-
-      memScope.end({
-        genes: correctedResults.length,
-        method,
-        groupASize,
-        groupBSize,
-        durationMs: Math.round(duration)
-      });
-
+      memScope.end({ genes: results.length, method, groupASize, groupBSize, durationMs: Math.round(duration) });
       return {
-        results: correctedResults,
+        results,
         summary: {
-          // genesTested is the Benjamini-Hochberg denominator; genesUntestable
-          // are the panel genes that never produced a p-value because a group
-          // held fewer than `minCells` cells with a measured value. Reporting
-          // them separately is what makes the FDR reconstructable — see
-          // docs/user_guide/web_app/h_analysis/06_analysis_mode_differential_expression_de.md
+          // genesTested is the multiple-testing family; genesUntestable never
+          // produced a p-value (a group held fewer than 2 measured cells).
           genesTested: testedCount,
           genesUntestable: untestableCount,
           minCells,
-          significantGenes: significantCount,
-          upregulated,
-          downregulated,
-          method,
-          pageA,
-          pageB,
-          duration,
-          // Include performance stats
-          throughput: genesPerSecond,
-          batchConfig: effectiveBatchConfig
+          lowN,
+          method: units === null ? method : 'pseudobulk',
+          pConvention,
+          correction,
+          foldChange,
+          matrix,
+          matrixLabel,
+          replicates: units === null
+            ? null
+            : { field: replicates.name, samplesA: units.unitsA, samplesB: units.unitsB, cellsLeftOut: units.cellsLeftOut },
+          groupAName: groupA.name,
+          groupBName: groupB.name,
+          groupASize,
+          groupBSize,
+          duration
         },
         metadata: {
-          pageAName: pageAInfo.name,
-          pageBName: pageBInfo.name,
-          recommendedSettings: recommended
+          pageAName: groupA.name,
+          pageBName: groupB.name,
+          tuning: tuner.snapshot()
         }
       };
-
     } catch (error) {
-      if (!isCurrent()) {
-        progressTracker.stop();
-        memScope.end({ method, stale: true });
-        return null;
-      }
+      if (!isCurrent()) return stale();
       hasAnalysisFailure = true;
       analysisFailure = error;
       progressTracker.stop();
@@ -1459,46 +1122,38 @@ export class MultiVariableAnalysis {
     }
   }
 
-  /**
-   * Apply Benjamini-Hochberg FDR correction in place.
-   *
-   * Genes that never reached a test (min-cell check) carry `pValue: NaN` and
-   * are excluded from the correction family, so the denominator `m` is the
-   * testable subset rather than the panel size. The returned counts are the
-   * two numbers the UI has to report so a reader can reconstruct the FDR.
-   *
-   * @param {Object[]} results - DE rows, mutated with `adjustedPValue`
-   * @returns {{ testedCount: number, untestableCount: number }}
-   */
-  _applyBenjaminiHochberg(results) {
-    const {
-      adjustedPValues,
-      testedCount,
-      untestableCount
-    } = benjaminiHochbergTestable(results.map(result => result.pValue));
-
-    for (let i = 0; i < results.length; i++) {
-      results[i].adjustedPValue = adjustedPValues[i];
-    }
-
-    return { testedCount, untestableCount };
-  }
-
   // =========================================================================
   // Gene Signature Scoring
   // =========================================================================
 
   /**
-   * Compute gene signature score for each cell
+   * Score every cell by one or more gene sets, and summarize the scores of
+   * each page.
+   *
+   * Methods (`docs …/07_analysis_mode_gene_signature.md`):
+   * - `mean`, `median`: of the set genes' values in the cell;
+   * - `mean_z`: each gene z-scored over every cell (ddof 1), then averaged;
+   *   a gene constant over every cell has no z and is left out (reported);
+   * - `module`: scanpy's `score_genes`: the mean of the set genes less the
+   *   mean of control genes drawn from the same expression bins (every gene
+   *   binned by its mean over all cells into `bins` bins by rank;
+   *   `controlSize` drawn per bin with a seeded generator, the set's own
+   *   genes removed);
+   * - `ucell`: UCell's rank-based score (`_ucellScores`).
+   *
+   * Genes are read once each, as whole columns. The set genes must already
+   * be the dataset's (`shared/gene-sets.js` `resolveGenes`).
    *
    * @param {Object} options
-   * @param {string[]} options.genes - List of genes in signature
-   * @param {string[]} options.pageIds - Pages to analyze
-   * @param {string} [options.method='mean'] - 'mean', 'sum', or 'median'
-   * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [options.job] -
-   *   The run's job: told each step; its signal stops the gene reads, which
-   *   are its own
-   * @returns {Promise<Object[]>} Signature scores per page
+   * @param {Array<{name: string, genes: string[]}>} options.geneSets
+   * @param {string[]} options.pageIds
+   * @param {'mean'|'median'|'mean_z'|'module'|'ucell'} [options.method='mean']
+   * @param {number} [options.controlSize=50]
+   * @param {number} [options.bins=25]
+   * @param {number} [options.seed=0]
+   * @param {number} [options.maxRank=1500]
+   * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [options.job]
+   * @returns {Promise<{sets: Array<{name: string, genes: string[], controlGenes: string[], constantGenes: string[], pages: Object[]}>}|null>}
    */
   async computeSignatureScore(options) {
     const memScope = startMemoryTracking('Signature', 'computeSignatureScore', { includeUserAgent: true });
@@ -1506,24 +1161,31 @@ export class MultiVariableAnalysis {
       throw new TypeError('Signature scoring options are required');
     }
     const {
-      genes,
+      geneSets,
       pageIds,
       method = 'mean',
+      controlSize = 50,
+      bins = 25,
+      seed = 0,
+      maxRank = 1500,
       job = null
     } = options;
     const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(
       options,
       'Signature scoring'
     );
-
     if (
-      !Array.isArray(genes) ||
-      genes.length === 0 ||
-      genes.some(gene => typeof gene !== 'string' || gene.length === 0) ||
-      new Set(genes).size !== genes.length
+      !Array.isArray(geneSets) ||
+      geneSets.length === 0 ||
+      geneSets.some(set =>
+        typeof set?.name !== 'string' ||
+        !Array.isArray(set.genes) ||
+        set.genes.length === 0 ||
+        set.genes.some(gene => typeof gene !== 'string' || gene.length === 0) ||
+        new Set(set.genes).size !== set.genes.length)
     ) {
       memScope.end({ error: 'No genes' });
-      throw new TypeError('Signature genes must be unique non-empty strings');
+      throw new TypeError('Signature gene sets must each hold distinct gene keys');
     }
     if (
       !Array.isArray(pageIds) ||
@@ -1534,45 +1196,81 @@ export class MultiVariableAnalysis {
       memScope.end({ error: 'Invalid pages' });
       throw new TypeError('Signature page IDs must be unique non-empty strings');
     }
-    if (!['mean', 'sum', 'median'].includes(method)) {
+    if (!['mean', 'median', 'mean_z', 'module', 'ucell'].includes(method)) {
       memScope.end({ error: 'Invalid method' });
       throw new RangeError(`Unsupported signature scoring method: ${String(method)}`);
+    }
+    for (const [label, value, minimum] of [['controlSize', controlSize, 1], ['bins', bins, 2], ['seed', seed, 0], ['maxRank', maxRank, 1]]) {
+      if (!Number.isSafeInteger(value) || value < minimum) {
+        throw new RangeError(`Signature ${label} must be an integer of at least ${minimum}`);
+      }
     }
     if (!isCurrent()) {
       memScope.end({ stale: true });
       return null;
     }
 
-    const ownedGenes = [...genes];
+    const sets = geneSets.map(set => ({ name: set.name, genes: [...set.genes] }));
     const ownedPageIds = [...pageIds];
+    const signal = job?.signal ?? null;
     let hasAnalysisFailure = false;
     let analysisFailure;
-    if (!isCurrent()) {
+    const stale = () => {
       memScope.end({ method, stale: true });
       return null;
-    }
+    };
 
     try {
-      // Each gene once, as a whole column: its sparse entries from the source
-      // (or a loaded field's dense values), never gathered page by page.
-      job?.step('Reading genes');
-      const columns = await this.dataLayer.readGeneColumns(ownedGenes, {
-        isCurrent,
-        registerInvalidationCleanup,
-        signal: job?.signal ?? null,
-        owner: job?.id ?? null,
-      });
-      job?.step('Scoring cells');
-      if (!isCurrent()) {
-        memScope.end({ method, stale: true });
-        return null;
-      }
       const pointCount = this.dataLayer.state?.pointCount;
       const pages = this.dataLayer.getPageCells(ownedPageIds);
 
-      const results = [];
-      // Scoring hands the event loop back between genes and between slices
-      // of cells.
+      if (method === 'ucell') {
+        const scored = await this._ucellScores({ sets, pages, maxRank, job, isCurrent, registerInvalidationCleanup });
+        if (scored === null || !isCurrent()) return stale();
+        const out = [];
+        for (const set of scored) {
+          const pagesOut = [];
+          for (const page of set.pages) {
+            const statistics = await this._computeBasicStats(page.scores, signal);
+            if (!isCurrent()) return stale();
+            pagesOut.push({ ...page, statistics });
+          }
+          out.push({ ...set, controlGenes: [], constantGenes: [], pages: pagesOut });
+        }
+        memScope.end({ sets: out.length, method });
+        return { sets: out };
+      }
+
+      // Module score: every gene's mean over all cells, its bins, each
+      // set's controls.
+      let controlsBySet = sets.map(() => []);
+      if (method === 'module') {
+        const allGenes = this.dataLayer.getAvailableVariables('gene_expression').map(gene => gene.key);
+        const moments = await this._ensureGeneMoments(allGenes, { job, isCurrent });
+        if (moments === null || !isCurrent()) return stale();
+        controlsBySet = sets.map(set => moduleScoreControls({
+          genes: allGenes,
+          means: allGenes.map(gene => momentsMean(moments.get(gene))),
+          setGenes: set.genes,
+          controlSize,
+          bins,
+          seed
+        }));
+      }
+
+      const union = [...new Set([...sets.flatMap(set => set.genes), ...controlsBySet.flat()])];
+      job?.step('Reading genes');
+      job?.setPlan(`Reads ${formatCount(union.length)} genes`);
+      const columnList = await this.dataLayer.readGeneColumns(union, {
+        isCurrent,
+        registerInvalidationCleanup,
+        signal,
+        owner: job?.id ?? null,
+      });
+      if (!isCurrent()) return stale();
+      const columns = new Map(union.map((gene, index) => [gene, columnList[index]]));
+
+      job?.step('Scoring cells');
       const yieldIfSliceSpent = createSlicedYield();
       const resumeAfterYield = async () => {
         const pending = yieldIfSliceSpent();
@@ -1581,69 +1279,80 @@ export class MultiVariableAnalysis {
         return isCurrent();
       };
 
-      for (const { pageId, pageName, cellIndices } of pages) {
-        if (!isCurrent()) {
-            memScope.end({ method, stale: true });
-          return null;
+      // A mean z-score needs each gene's mean and spread over every cell.
+      const zOf = new Map();
+      if (method === 'mean_z') {
+        for (const gene of new Set(sets.flatMap(set => set.genes))) {
+          const moments = computeGeneMoments({ values: columns.get(gene) });
+          const mean = momentsMean(moments);
+          const sd = momentsStd(moments);
+          zOf.set(gene, Number.isFinite(sd) && sd > 0 ? { scale: 1 / sd, offset: -mean / sd } : null);
         }
-        if (typeof pageName !== 'string' || pageName.length === 0) {
-          throw new TypeError(`Signature page ${pageId} has no name`);
-        }
-        const scorer = new SignaturePageScorer({
-          method,
-          geneCount: ownedGenes.length,
-          cellIndices,
-          pointCount,
-        });
-        for (const column of columns) {
-          scorer.addGene(column);
-          if (!(await resumeAfterYield())) {
-                memScope.end({ method, stale: true });
-            return null;
-          }
-        }
-        const SLICE = 0x10000;
-        for (let from = 0; from < cellIndices.length; from += SLICE) {
-          scorer.scoreCells(from, Math.min(cellIndices.length, from + SLICE));
-          if (!(await resumeAfterYield())) {
-                memScope.end({ method, stale: true });
-            return null;
-          }
-        }
-        const { scores } = scorer;
-
-        // Compute statistics
-        const stats = await this._computeBasicStats(scores, job?.signal ?? null);
-        if (!isCurrent()) {
-            memScope.end({ method, stale: true });
-          return null;
-        }
-
-        results.push({
-          pageId,
-          pageName,
-          scores,
-          cellIndices,
-          statistics: stats,
-          genesUsed: ownedGenes.length,
-          method
-        });
       }
 
-      memScope.end({
-        genes: ownedGenes.length,
-        pages: ownedPageIds.length,
-        method,
-      });
-      return results;
+      const SLICE = 0x10000;
+      const scorePage = async (genes, cellIndices, scorerMethod, affineOf) => {
+        const scorer = new SignaturePageScorer({ method: scorerMethod, geneCount: genes.length, cellIndices, pointCount });
+        for (const gene of genes) {
+          scorer.addGene(columns.get(gene), affineOf(gene));
+          if (!(await resumeAfterYield())) return null;
+        }
+        for (let from = 0; from < cellIndices.length; from += SLICE) {
+          scorer.scoreCells(from, Math.min(cellIndices.length, from + SLICE));
+          if (!(await resumeAfterYield())) return null;
+        }
+        return scorer.scores;
+      };
 
+      const out = [];
+      for (let s = 0; s < sets.length; s++) {
+        const set = sets[s];
+        const controlGenes = controlsBySet[s];
+        let scoredGenes = set.genes;
+        let constantGenes = [];
+        if (method === 'mean_z') {
+          constantGenes = set.genes.filter(gene => zOf.get(gene) === null);
+          scoredGenes = set.genes.filter(gene => zOf.get(gene) !== null);
+        }
+        const pagesOut = [];
+        for (const { pageId, pageName, cellIndices } of pages) {
+          if (!isCurrent()) return stale();
+          if (typeof pageName !== 'string' || pageName.length === 0) {
+            throw new TypeError(`Signature page ${pageId} has no name`);
+          }
+          let scores;
+          if (scoredGenes.length === 0) {
+            scores = new Float32Array(cellIndices.length).fill(NaN);
+          } else if (method === 'mean_z') {
+            scores = await scorePage(scoredGenes, cellIndices, 'mean', gene => zOf.get(gene));
+          } else if (method === 'module') {
+            // The set's per-cell mean less the controls': each mean stored as
+            // float32, as scanpy's are for float32 expression.
+            const unit = () => ({ scale: 1, offset: 0 });
+            const setScores = await scorePage(scoredGenes, cellIndices, 'mean', unit);
+            const controlScores = controlGenes.length === 0 ? null : await scorePage(controlGenes, cellIndices, 'mean', unit);
+            if (setScores === null || (controlGenes.length > 0 && controlScores === null)) return stale();
+            scores = new Float32Array(cellIndices.length);
+            for (let p = 0; p < scores.length; p++) {
+              scores[p] = controlScores === null ? setScores[p] : setScores[p] - controlScores[p];
+            }
+          } else {
+            scores = await scorePage(scoredGenes, cellIndices, method, () => null);
+          }
+          if (scores === null || !isCurrent()) return stale();
+          const statistics = await this._computeBasicStats(scores, signal);
+          if (!isCurrent()) return stale();
+          pagesOut.push({ pageId, pageName, scores, cellIndices, statistics, genesUsed: scoredGenes.length, method });
+        }
+        out.push({ name: set.name, genes: scoredGenes, controlGenes, constantGenes, pages: pagesOut });
+      }
+
+      memScope.end({ genes: union.length, pages: ownedPageIds.length, sets: sets.length, method });
+      return { sets: out };
     } catch (error) {
       hasAnalysisFailure = true;
       analysisFailure = error;
-      if (!isCurrent()) {
-        memScope.end({ method, stale: true });
-        return null;
-      }
+      if (!isCurrent()) return stale();
       memScope.end({ method, error: error.message });
       throw error;
     } finally {
@@ -1656,6 +1365,207 @@ export class MultiVariableAnalysis {
         hasAnalysisFailure,
         analysisFailure
       );
+    }
+  }
+
+  /**
+   * Every gene's moments over all cells (`shared/gene-moments-cache.js`):
+   * those a marker run already computed, and the rest read once, as one job
+   * step, in the analysis workers.
+   *
+   * @param {string[]} genes
+   * @param {{job?: Object|null, isCurrent: () => boolean}} options
+   * @returns {Promise<Map<string, {sum: number, sumSq: number, nonZero: number, n: number}>|null>}
+   */
+  async _ensureGeneMoments(genes, { job = null, isCurrent }) {
+    const cache = geneMomentsFor(this.dataLayer.getDatasetGeneration());
+    const missing = cache.missing(genes);
+    if (missing.length > 0) {
+      job?.step('Reading every gene once for its mean');
+      job?.items(0, missing.length, 'genes');
+      const computeManager = await this._getComputeManager();
+      const backend = computeManager.selectBackend(OperationType.COMPUTE_GENE_MOMENTS);
+      const poolSize = backend === 'worker' ? computeManager.getStatus().worker.stats.poolSize : 1;
+      const tuner = createRunTunerFor(this.dataLayer, poolSize);
+      const signal = job?.signal ?? null;
+      const loader = new StreamingGeneLoader({ dataLayer: this.dataLayer, tuner, signal, owner: job?.id ?? null });
+      let done = 0;
+      const completed = await runGeneStream({
+        loader,
+        genes: missing,
+        tuner,
+        signal,
+        isCurrent,
+        dispatch: ({ values, owned }, onTiming) => computeManager.execute(
+          OperationType.COMPUTE_GENE_MOMENTS,
+          { values: owned ? values : values.slice() },
+          { backend, timeout: 120000, transfer: true, signal, onTiming }
+        ),
+        onResult: ({ gene }, moments) => {
+          cache.set(gene, moments);
+          done++;
+          job?.items(done, missing.length, 'genes');
+        }
+      });
+      if (!completed) return null;
+    }
+    return new Map(genes.map(gene => [gene, cache.get(gene)]));
+  }
+
+  /**
+   * UCell scores (`compute/ucell.js`) of every set for the pages' cells, from
+   * one pass over every gene: the cells are split into one contiguous range
+   * per analysis worker; each worker keeps its range's set-gene values and
+   * counts, and each gene read reaches every worker as its range's entries,
+   * a run of genes per message.
+   *
+   * @returns {Promise<Array<{name: string, genes: string[], pages: Object[]}>|null>}
+   */
+  async _ucellScores({ sets, pages, maxRank, job, isCurrent, registerInvalidationCleanup }) {
+    const signal = job?.signal ?? null;
+    const pointCount = this.dataLayer.state.pointCount;
+    const allGenes = this.dataLayer.getAvailableVariables('gene_expression').map(gene => gene.key);
+    const union = [...new Set(sets.flatMap(set => set.genes))];
+    const slot = new Map(union.map((gene, index) => [gene, index]));
+    const S = union.length;
+    job?.setPlan(`Reads all ${formatCount(allGenes.length)} genes once`);
+    job?.step('Reading the set genes');
+    const setColumns = await this.dataLayer.readGeneColumns(union, {
+      isCurrent, registerInvalidationCleanup, signal, owner: job?.id ?? null
+    });
+    if (!isCurrent()) return null;
+
+    const release = await acquireUcellLease(signal);
+    try {
+      const pool = getWorkerPool();
+      await pool.init();
+      const W = Math.min(pool.getStats().poolSize, pointCount);
+      const bounds = Array.from({ length: W + 1 }, (_, w) => Math.round((w * pointCount) / W));
+      const yieldIfSliceSpent = createSlicedYield();
+
+      // Each range's set values, cell-major: zeros, then each column's
+      // stored entries.
+      job?.step('Ranking cells');
+      const contexts = [];
+      for (let w = 0; w < W; w++) {
+        const from = bounds[w];
+        const to = bounds[w + 1];
+        const setValues = new Float32Array((to - from) * S);
+        for (let s = 0; s < S; s++) {
+          const column = setColumns[s];
+          if (ArrayBuffer.isView(column)) {
+            for (let c = from; c < to; c++) setValues[(c - from) * S + s] = column[c];
+          } else {
+            const { indices, values } = column;
+            for (let k = lowerBoundOf(indices, from); k < indices.length && indices[k] < to; k++) {
+              setValues[(indices[k] - from) * S + s] = values[k];
+            }
+          }
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) await pending;
+        }
+        contexts.push(pool.executeOnWorker(w, 'UCELL_SET_CONTEXT', {
+          cellCount: to - from,
+          setValues,
+          setGeneCount: S,
+          geneCount: allGenes.length,
+          sets: sets.map(set => set.genes.map(gene => slot.get(gene))),
+          maxRank
+        }, { timeout: 120000, transfer: true, signal }));
+      }
+      await Promise.all(contexts);
+      if (!isCurrent()) return null;
+
+      // Every gene once: each worker gets its range's entries of a run of
+      // genes per message.
+      const tuner = createRunTunerFor(this.dataLayer, W);
+      const loader = new StreamingGeneLoader({ dataLayer: this.dataLayer, tuner, signal, owner: job?.id ?? null });
+      job?.items(0, allGenes.length, 'genes');
+      const batches = Array.from({ length: W }, () => ({ genes: 0, pointers: [0], cells: [], values: [] }));
+      const inFlight = new Set();
+      let failure = null;
+      const flush = (w, onTiming) => {
+        const batch = batches[w];
+        if (batch.genes === 0) return;
+        batches[w] = { genes: 0, pointers: [0], cells: [], values: [] };
+        const task = pool.executeOnWorker(w, 'UCELL_ADD_GENES', {
+          pointers: Uint32Array.from(batch.pointers),
+          cells: Uint32Array.from(batch.cells),
+          values: Float32Array.from(batch.values)
+        }, { timeout: 120000, transfer: true, signal, onTiming })
+          .catch(error => { failure ??= error; })
+          .finally(() => inFlight.delete(task));
+        inFlight.add(task);
+      };
+      let done = 0;
+      for await (const { values } of loader.streamGenesRaw(allGenes)) {
+        if (signal?.aborted) throw signal.reason;
+        if (!isCurrent()) {
+          loader.abort();
+          return null;
+        }
+        if (failure !== null) throw failure;
+        const dense = ArrayBuffer.isView(values);
+        for (let w = 0; w < W; w++) {
+          const from = bounds[w];
+          const to = bounds[w + 1];
+          const batch = batches[w];
+          if (dense) {
+            for (let c = from; c < to; c++) {
+              const v = values[c];
+              if (v !== 0) {
+                batch.cells.push(c - from);
+                batch.values.push(v);
+              }
+            }
+          } else {
+            const { indices, values: entries } = values;
+            for (let k = lowerBoundOf(indices, from); k < indices.length && indices[k] < to; k++) {
+              batch.cells.push(indices[k] - from);
+              batch.values.push(entries[k]);
+            }
+          }
+          batch.genes++;
+          batch.pointers.push(batch.cells.length);
+        }
+        done++;
+        // A run of genes per message: one full round of the tuner's window.
+        if (batches[0].genes >= TUNER_WINDOW_GENES) {
+          while (inFlight.size >= tuner.computeInFlight() * W && failure === null) await Promise.race(inFlight);
+          for (let w = 0; w < W; w++) flush(w, taskTiming(tuner));
+        }
+        job?.items(done, allGenes.length, 'genes');
+        const pending = yieldIfSliceSpent();
+        if (pending !== undefined) await pending;
+      }
+      for (let w = 0; w < W; w++) flush(w, taskTiming(tuner));
+      await Promise.all(inFlight);
+      if (failure !== null) throw failure;
+      if (!isCurrent()) return null;
+
+      const finished = await Promise.all(Array.from({ length: W }, (_, w) =>
+        pool.executeOnWorker(w, 'UCELL_FINISH', {}, { timeout: 120000, signal })));
+      if (!isCurrent()) return null;
+      const setCount = sets.length;
+      const all = sets.map(() => new Float32Array(pointCount));
+      for (let w = 0; w < W; w++) {
+        const { scores } = finished[w];
+        const from = bounds[w];
+        for (let c = 0; c < bounds[w + 1] - from; c++) {
+          for (let k = 0; k < setCount; k++) all[k][from + c] = scores[c * setCount + k];
+        }
+      }
+      return sets.map((set, k) => ({
+        name: set.name,
+        genes: set.genes,
+        pages: pages.map(({ pageId, pageName, cellIndices }) => {
+          const scores = new Float32Array(cellIndices.length);
+          for (let p = 0; p < cellIndices.length; p++) scores[p] = all[k][cellIndices[p]];
+          return { pageId, pageName, scores, cellIndices, genesUsed: set.genes.length, method: 'ucell' };
+        })
+      }));
+    } finally {
+      release();
     }
   }
 

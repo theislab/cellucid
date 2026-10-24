@@ -82,6 +82,7 @@ function directProbes({ connectivities = true, hasX = true } = {}) {
     X: hasX ? { storage: 'dense', dtype: 'float32' } : null,
     layers: [],
     raw: null,
+    log1p: null,
   };
 }
 
@@ -116,6 +117,8 @@ test('a file opened in the browser maps by the defaults of the catalog the viewe
     knn: 'connectivities',
     geneNames: 'index',
     expression: 'X',
+    log1p: {},
+    highlyVariable: null,
     latent: null,
     vectorFields: [
       { key: 'velocity_umap_2d', embedding: { key: 'X_umap_2d', columns: [0, 1] } },
@@ -151,6 +154,8 @@ test('a served mapping is read from the catalog and must agree with the identity
     knn: 'neighbors_connectivities',
     geneNames: 'column:symbol',
     expression: 'raw',
+    log1p: {},
+    highlyVariable: null,
     latent: 'X_scvi',
     vectorFields: [],
   };

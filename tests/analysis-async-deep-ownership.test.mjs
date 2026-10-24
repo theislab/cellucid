@@ -3,8 +3,6 @@ import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
-import { createRestOfPageId } from '../assets/js/app/analysis/shared/page-derivation-utils.js';
-import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 import { CancellableJob } from '../assets/js/app/jobs/cancellable-job.js';
 
 function deferred() {
@@ -104,7 +102,7 @@ test('a cancelled signature job stops its gene reads and the run publishes nothi
   let current = true;
   const job = quietJob('Gene signature score');
   const run = analysis.computeSignatureScore({
-    genes: ['Gene A'],
+    geneSets: [{ name: 'S', genes: ['Gene A'] }],
     pageIds: ['page-A'],
     job,
     isCurrent: () => current,
@@ -196,17 +194,21 @@ test('signature snapshots genes and page IDs before its first await', async () =
 
   const genes = ['Gene A', 'Gene B'];
   const pageIds = ['page-original'];
+  const geneSets = [{ name: 'S', genes }];
   const run = analysis.computeSignatureScore({
-    genes,
+    geneSets,
     pageIds,
     method: 'mean',
   });
 
   genes[0] = 'Gene MUTATED';
+  geneSets[0].name = 'MUTATED';
   pageIds[0] = 'page-mutated';
   gate.resolve();
 
-  const [result] = await run;
+  const { sets: [set] } = await run;
+  const [result] = set.pages;
+  assert.equal(set.name, 'S');
 
   assert.notEqual(received.genes, genes);
   assert.notEqual(received.pageIds, pageIds);
@@ -224,6 +226,8 @@ function createDEMembershipProbe(indicesByPage) {
   const computeProbe = new Error('compute manager reached');
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     state: { pointCount: 6 },
     getAvailableVariables() {
       return [{ key: 'Gene A', name: 'Gene A' }];
@@ -257,8 +261,8 @@ test('DE rejects overlapping explicit memberships before gene expression or work
   });
 
   const error = await analysis.differentialExpression({
-    pageA: 'page-A',
-    pageB: 'page-B',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(2, 3, 4) },
     geneList: ['Gene A'],
     method: 'wilcox',
     minCells: 2,
@@ -273,17 +277,13 @@ test('DE rejects overlapping explicit memberships before gene expression or work
   assert.equal(calls.computeManager, 0);
 });
 
-test('DE accepts an explicit page versus the exact rest-of that page', async () => {
-  const pageA = 'page-A';
-  const restOfA = createRestOfPageId(pageA);
-  const { analysis, calls, computeProbe } = createDEMembershipProbe({
-    [pageA]: Uint32Array.of(0, 1, 2),
-  });
+test('DE accepts a group versus its exact complement', async () => {
+  const { analysis, calls, computeProbe } = createDEMembershipProbe({});
 
   await assert.rejects(
     analysis.differentialExpression({
-      pageA,
-      pageB: restOfA,
+      groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+      groupB: { name: 'Rest of A', cells: Uint32Array.of(3, 4, 5) },
       geneList: ['Gene A'],
       method: 'wilcox',
       minCells: 2,

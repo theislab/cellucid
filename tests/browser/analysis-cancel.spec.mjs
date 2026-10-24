@@ -32,8 +32,10 @@ function expression() {
 
 /**
  * Serve the dataset; `hold.ms` holds back each read of the file while set,
- * `hold.held` counts them and `hold.cutOff` counts the reads the page
- * cancelled.
+ * `hold.held` counts them, and `hold.cutOff` counts the reads the page says
+ * it cancelled. That is the read log's line, not the network event: the
+ * reads run in the reader worker, and Firefox reports a worker fetch
+ * aborted mid-response as finished, not failed.
  */
 async function serveDataset(page, hold) {
   const bytes = anndataZarrZip({
@@ -75,8 +77,9 @@ async function serveDataset(page, hold) {
       // The page let go of the request while it was held.
     });
   });
-  page.on('requestfailed', request => {
-    if (request.url().endsWith(file)) hold.cutOff += 1;
+  page.on('console', message => {
+    // A quick read ends in one debug entry with others, a line each.
+    hold.cutOff += message.text().match(/^\[cellucid:read\] .*\(cancelled\)$/gm)?.length ?? 0;
   });
 }
 
@@ -120,13 +123,8 @@ test('differential expression: Cancel stops the run, keeps nothing, and Run agai
   await serveDataset(page, hold);
   const panel = await openWithPages(page, 'differential');
 
-  const [pageA, pageB] = await panel.locator('select.page-select').all();
-  await pageA.selectOption({ label: 'Alpha cells' });
-  await pageB.selectOption({ label: 'Rest of Alpha cells' });
-  // What a run costs is said before it starts.
-  await expect(panel.locator('.analysis-run-cost')).toHaveText(
-    `Tests ${GENE_COUNT} genes in 1,000 vs 2,000 cells.`
-  );
+  await panel.getByRole('combobox', { name: 'Group A' }).selectOption({ label: 'Alpha cells' });
+  await panel.getByRole('combobox', { name: 'Group B' }).selectOption({ label: 'Rest of Alpha cells' });
 
   hold.ms = 4000;
   const run = panel.locator('.analysis-run-btn');
@@ -168,16 +166,15 @@ test('marker genes: Cancel from the notification stops discovery, keeps nothing,
   await serveDataset(page, hold);
   const panel = await openWithPages(page, 'genesPanel');
 
-  await panel.locator('select[name="obsCategory"]').selectOption('cell_type');
-  await expect(panel.locator('.analysis-run-cost')).toHaveText(
-    `Reads ${GENE_COUNT} genes in 3,000 cells, testing each category of cell_type against the rest.`
-  );
+  await panel.getByRole('combobox', { name: 'Group by' }).selectOption('cell_type');
 
   hold.ms = 5000;
   const run = panel.locator('.analysis-run-btn');
+  await expect(run).toBeEnabled();
   await run.click();
   const status = panel.locator('.job-status');
   await expect(status.locator('.job-status-title')).toHaveText('Marker genes');
+  await expect(status.locator('.job-status-plan')).toHaveText(`${GENE_COUNT} genes · 3 of 3 groups tested`);
   // The run's one progress notification, with its own Cancel.
   const notification = page.locator('.notification', { hasText: 'Marker genes:' });
   await expect(notification).toHaveCount(1, { timeout: 5_000 });

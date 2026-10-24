@@ -6,8 +6,9 @@
  *
  * Each index owns one OPFS directory under `cellucid-column-index/`, held by
  * a Web Lock for as long as the reader lives. A directory whose lock nobody
- * holds belongs to a closed or crashed tab and is removed before a new index
- * is written, so spilled indexes never accumulate on disk.
+ * holds belongs to a closed or crashed tab and is removed when the app
+ * starts (`sweepAbandonedIndexes`) and again before a new index is written,
+ * so a crashed tab's spill never lingers on disk.
  *
  * @module data/column-store-placement
  */
@@ -38,6 +39,32 @@ async function removeAbandonedIndexes(parent, locks) {
     await locks.request(lockName(name), { ifAvailable: true }, async lock => {
       if (lock !== null) await parent.removeEntry(name, { recursive: true }).catch(() => {});
     });
+  }
+}
+
+/**
+ * Remove every index directory no live reader holds (a closed or crashed
+ * tab's spill). Run when the app starts; it never throws, and does nothing
+ * where there is no OPFS or no index directory.
+ *
+ * @param {Object} [environment]
+ * @returns {Promise<void>}
+ */
+export async function sweepAbandonedIndexes(environment = globalThis) {
+  const storage = environment?.navigator?.storage;
+  if (typeof storage?.getDirectory !== 'function') return;
+  try {
+    const root = await storage.getDirectory();
+    let parent;
+    try {
+      parent = await root.getDirectoryHandle(INDEX_DIRECTORY);
+    } catch {
+      // No index was ever spilled from this origin.
+      return;
+    }
+    await removeAbandonedIndexes(parent, environment.navigator.locks);
+  } catch {
+    // A storage failure leaves the spill for the next start or index.
   }
 }
 

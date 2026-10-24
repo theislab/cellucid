@@ -1,7 +1,7 @@
 /**
  * LinkDataSource - every dataset opened from a link.
  *
- * A link (`?data=`, or text pasted into "Open from link") names a provider
+ * A link (`?data=`, or text pasted into the Session panel's address bar) names a provider
  * (`sources/registry.js`): GitHub, CELLxGENE, GEO, or any web address. The
  * provider says where the bytes are; this source reads them in one of three
  * forms and knows nothing else about the provider:
@@ -18,6 +18,13 @@
  * Connecting builds a complete candidate before anything is replaced, as the
  * other connection sources do: a failed or superseded link leaves the open
  * one untouched.
+ *
+ * Opening a link is shown from its first moment (`opening-progress.js`):
+ * finding the file at its provider (each provider says its steps), then the
+ * reads of the file. Cancel stops it where it is. The reader worker starts
+ * loading as the link is resolved, so it is ready when the file is found.
+ * A host that ignores range requests serves only the whole file: it is
+ * downloaded once, with its progress shown, and read from memory.
  */
 
 import {
@@ -27,15 +34,18 @@ import {
   isExplainedFailure,
 } from './data-source.js';
 import { createMetadataAbortError } from './metadata-load-contract.js';
-import { getProviderRegistry } from './sources/registry.js';
+import { formatLocator, getProviderRegistry } from './sources/registry.js';
 import {
   AnnDataCatalog,
   CATALOG_FILENAME,
   fetchAnnDataCatalog,
 } from './sources/anndata-catalog.js';
+import { downloadRemoteFile } from './sources/remote-file.js';
 import { createH5adDataSource } from './h5ad.js';
 import { createZarrDataSource } from './zarr.js';
 import { getTransferLog } from './transfer-log.js';
+import { prewarmAnnDataReaderWorker } from './anndata-reader-client.js';
+import { beginOpening, openingCancelledError } from './opening-progress.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -44,17 +54,28 @@ import { getTransferLog } from './transfer-log.js';
 const LINK_SOURCE_TYPE = 'link';
 
 /**
+ * What each provider said about a link this page opened, by its canonical
+ * locator: opening the same link again in this page (Disconnect and open, a
+ * session reopening its dataset) asks the provider nothing, and a file starts
+ * from the first bytes read the first time. Only a link that opened is kept.
+ * @type {Map<string, Object>}
+ */
+const PROVIDER_OPENINGS = new Map();
+
+/**
  * Open one remote AnnData file completely, as a candidate. Its dataset id
  * is the one the file states (`uns['cellucid']['id']`), else the link's.
  *
- * @param {Object} file - An entry from `describeRemoteFile`
+ * @param {Object} file - An entry from `describeRemoteFile`, its `resource`
+ *   the remote file or, for a host that serves only whole files, the
+ *   downloaded `File`
+ * @param {AbortSignal} signal - Stops the opening where it is
  * @returns {Promise<{source: Object, metadata: DatasetMetadata}>}
  */
-async function openAnnDataFile(file) {
+async function openAnnDataFile(file, signal) {
   const source = file.format === 'h5ad'
     ? createH5adDataSource()
     : createZarrDataSource();
-  const host = new URL(file.resource.url).host;
   const identitySource = {
     name: file.attribution.title,
     url: file.attribution.url,
@@ -66,20 +87,20 @@ async function openAnnDataFile(file) {
   try {
     if (file.format === 'h5ad') {
       await source.loadFromFile(file.resource, {
-        showProgress: false,
+        signal,
         defaultDatasetId: file.id,
         name: file.title,
         preferFileName: true,
-        description: `Read in place from ${host}`,
+        description: '',
         source: identitySource,
       });
     } else {
       await source.loadFromArchiveFile(file.resource, {
-        showProgress: false,
+        signal,
         defaultDatasetId: file.id,
         name: file.title,
         preferFileName: true,
-        description: `Read in place from ${host}`,
+        description: '',
         source: identitySource,
       });
     }
@@ -95,21 +116,21 @@ async function openAnnDataFile(file) {
  * Open one Zarr store folder on a web host, as a candidate.
  *
  * @param {{url: string, name: string, title: string, id: string, attribution: Object}} store
+ * @param {AbortSignal} signal - Stops the opening where it is
  * @returns {Promise<{source: Object, metadata: DatasetMetadata}>}
  */
-async function openZarrFolder(store) {
+async function openZarrFolder(store, signal) {
   if (typeof store.id !== 'string' || store.id.length === 0 || store.id.includes('/')) {
     throw new TypeError('A Zarr store id must be a non-empty string without "/" (it becomes zarr://<id>/).');
   }
   const source = createZarrDataSource();
-  const host = new URL(store.url).host;
   try {
     await source.loadFromRemoteFolder({ url: store.url, name: store.name }, {
-      showProgress: false,
+      signal,
       defaultDatasetId: store.id,
       name: store.title,
       preferFileName: true,
-      description: `Read in place from ${host}`,
+      description: '',
       source: { name: store.attribution.title, url: store.attribution.url, filename: store.name },
     });
     return { source, metadata: await source.getMetadata(source.datasetId) };
@@ -245,18 +266,32 @@ export class LinkDataSource {
    * Read what one opening holds, completely.
    * @private
    */
-  async _load(opening, signal) {
+  async _load(opening, signal, progress) {
     if (opening.catalog) {
+      progress.step('Reading the dataset list');
       const { catalog, datasets } = await this._loadCatalog(opening.catalog.baseUrl, opening.title, signal);
       return { catalog, annData: null, datasets };
     }
     if (opening.store) {
-      const annData = await openZarrFolder(opening.store);
+      const annData = await openZarrFolder(opening.store, signal);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.file) {
       const format = opening.file.format === 'zip' ? 'zarr-zip' : opening.file.format;
-      const annData = await openAnnDataFile({ ...opening.file, format });
+      let resource = opening.file.resource;
+      if (opening.file.transport === 'download') {
+        // The host serves no part of the file: all of it, once.
+        progress.step(`Downloading the whole file: ${new URL(resource.url).host} does not serve parts of files`);
+        let counted = 0;
+        resource = await downloadRemoteFile(resource, {
+          signal,
+          onBytes: received => {
+            getTransferLog().record(opening.file.resource.url, { bytes: received - counted, requests: counted === 0 ? 1 : 0 });
+            counted = received;
+          },
+        });
+      }
+      const annData = await openAnnDataFile({ ...opening.file, format, resource }, signal);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     throw new TypeError('A provider opening must hold a catalog, a file or a store.');
@@ -270,19 +305,35 @@ export class LinkDataSource {
    */
   async connect(input) {
     const owner = this._beginOperation('Opening a link was superseded');
+    // The reader worker loads while the link is resolved.
+    prewarmAnnDataReaderWorker();
+    const progress = beginOpening({
+      title: String(input).trim() || 'a link',
+      step: 'Finding the file',
+      onCancel: () => owner.controller.abort(openingCancelledError(String(input).trim())),
+    });
     let loaded = null;
     let transfer = null;
     try {
-      const { provider, locator, opening } = await this._openProvider(
+      const { provider, locator: asked, opening } = await this._openProvider(
         input,
-        owner.controller.signal
+        owner.controller.signal,
+        progress
       );
       this._assertOperation(owner, 'Opening a link');
+      // A provider may name what it opened canonically once it is open (a
+      // OneDrive share link by its drive and item): sessions and `?data=`
+      // then record that, and either opens it again in this page.
+      const locator = typeof opening.locator === 'string' ? formatLocator(provider, opening.locator) : asked;
+      progress.rename(opening.title);
       transfer = getTransferLog().begin(opening.file
         ? {
             key: opening.file.resource.url,
             label: opening.file.title,
-            why: 'reading on demand: only what each view needs',
+            why: opening.file.transport === 'download'
+              ? 'downloading the whole file: its host does not serve parts of files'
+              : 'reading on demand: only what each view needs',
+            mode: opening.file.transport === 'download' ? 'download' : 'in-place',
             total: opening.file.resource.size,
           }
         : opening.store
@@ -296,7 +347,7 @@ export class LinkDataSource {
               label: opening.title,
               why: 'reading on demand: each dataset when it is chosen',
             });
-      loaded = await this._load(opening, owner.controller.signal);
+      loaded = await this._load(opening, owner.controller.signal, progress);
       this._assertOperation(owner, 'Opening a link');
       // Named after what was opened: the dataset, or how many a catalog holds
       // (where it is read from is the entry's own line).
@@ -307,6 +358,8 @@ export class LinkDataSource {
           : `${loaded.datasets.length} datasets`
       );
 
+      PROVIDER_OPENINGS.set(asked, opening);
+      PROVIDER_OPENINGS.set(locator, opening);
       this._releaseAll();
       if (this._transfer !== null) getTransferLog().finish(this._transfer);
       this._transfer = transfer;
@@ -321,6 +374,7 @@ export class LinkDataSource {
       this._connectionRevision++;
       loaded = null;
 
+      progress.end();
       return {
         locator,
         title: opening.title,
@@ -328,11 +382,14 @@ export class LinkDataSource {
         // A catalog names the dataset it opens on; one file is its dataset.
         defaultDatasetId: this._catalog?.defaultDatasetId ?? this._datasets[0]?.id ?? null,
       };
-    } catch (error) {
+    } catch (thrown) {
+      // Cancel names itself as the reason, whatever the stopped read threw.
+      const error = progress.cancelled ? openingCancelledError(String(input).trim()) : thrown;
       if (transfer !== null) {
         getTransferLog().finish(transfer, { error });
         transfer = null;
       }
+      progress.fail(error);
       // The caller reports the outcome (the Connect control, startup, a
       // session reopening its dataset), as for every other source.
       if (
@@ -366,10 +423,14 @@ export class LinkDataSource {
    *
    * @private
    */
-  async _openProvider(input, signal) {
+  async _openProvider(input, signal, progress) {
     try {
       const { provider, value, locator } = this._registry.resolve(input);
-      const opening = await provider.open(value, { signal });
+      const known = PROVIDER_OPENINGS.get(locator);
+      if (known !== undefined) return { provider, value, locator, opening: known };
+      // A bare web address is its own host: the probe that follows names it.
+      progress.step(provider.id === 'url' ? 'Finding the file' : `Finding the file on ${provider.label}`);
+      const opening = await provider.open(value, { signal, onStep: text => progress.step(text) });
       return { provider, value, locator, opening };
     } catch (error) {
       if (error instanceof DataSourceError) {
@@ -434,7 +495,7 @@ export class LinkDataSource {
    * @param {string} datasetId
    * @returns {Promise<DatasetMetadata>}
    */
-  async getMetadata(datasetId) {
+  async getMetadata(datasetId, { signal = null } = {}) {
     this._requireConnected();
     if (!(this._datasets ?? []).some(d => d.id === datasetId)) {
       throw new DataSourceError(
@@ -444,7 +505,7 @@ export class LinkDataSource {
         { datasetId }
       );
     }
-    if (this._catalog !== null) return (await this._catalog.open(datasetId)).metadata;
+    if (this._catalog !== null) return (await this._catalog.open(datasetId, signal)).metadata;
     return this._annData.metadata;
   }
 

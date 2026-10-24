@@ -1825,7 +1825,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function hasUsableWebgl2Context() {
-    // The point pass draws in the export worker on an OffscreenCanvas.
+    // The point pass draws on an OffscreenCanvas (in the export worker, or on
+    // the page where a worker has no WebGL2).
     if (typeof WebGL2RenderingContext !== 'function' || typeof OffscreenCanvas !== 'function') return false;
     try {
       const gl = viewer.getGLContext();

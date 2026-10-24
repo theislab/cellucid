@@ -117,7 +117,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
     'No datasets found',
   ]);
 
-  const notice = page.locator('.dataset-info[role="status"]');
+  const notice = page.locator('#dataset-notice');
   await expect(notice).toBeVisible();
   await expect(notice).toContainText(/Sample datasets could not be (loaded|opened)/);
   // This root is absent rather than blocked, and the notice says so: the 404
@@ -132,7 +132,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
   const retry = notice.getByRole('button', { name: 'Try again' });
   await expect(retry).toBeEnabled();
 
-  await expect(page.locator('#dataset-name')).toHaveText('—');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('#stats')).toHaveText('Points: 0 • Field: None');
   await expect(page.locator('iframe')).toHaveCount(0);
   expect(

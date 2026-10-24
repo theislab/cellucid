@@ -926,7 +926,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
 
 const volcanoPlotDefinition = {
   id: 'volcanoplot',
-  name: 'Volcano Plot',
+  name: 'Volcano plot',
   description: 'Differential expression visualization showing fold change vs significance',
   supportedTypes: ['differential'],
   supportedLayouts: ['single'],
@@ -942,35 +942,10 @@ const volcanoPlotDefinition = {
     highlightGenes: [] // Specific genes to always label
   },
 
+  // The significance and fold-change thresholds and the labels are the
+  // analysis's options (Differential expression's Filters and Labels), drawn
+  // in the expanded view by the analysis, not here.
   optionSchema: {
-    pValueThreshold: {
-      type: 'select',
-      label: 'p-value threshold',
-      options: [
-        { value: 0.001, label: '0.001' },
-        { value: 0.01, label: '0.01' },
-        { value: 0.05, label: '0.05' },
-        { value: 0.1, label: '0.1' }
-      ]
-    },
-    foldChangeThreshold: {
-      type: 'range',
-      label: 'log2 FC threshold',
-      min: 0,
-      max: 3,
-      step: 0.25
-    },
-    useAdjustedPValue: {
-      type: 'checkbox',
-      label: 'Use FDR-adjusted p-values'
-    },
-    labelTopN: {
-      type: 'range',
-      label: 'Maximum gene labels',
-      min: 0,
-      max: 50,
-      step: 5
-    },
     pointSize: {
       type: 'range',
       label: 'Point size',

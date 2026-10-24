@@ -39,9 +39,9 @@ test('latent-space outlier filtering uses the active field raw quantiles', async
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('#outlier-filter-container')).toBeVisible();
-  // Before anything is read, the control says what its first use reads.
+  // Before anything is read, one short line says what its first use reads.
   await expect(page.locator('#outlier-filter-note'))
-    .toContainText('The first use reads the latent space latent_space');
+    .toHaveText(/^First use reads latent_space \(.+\)\.$/);
 
   await page.locator('#outlier-filter').fill('50');
   await page.locator('#outlier-filter').dispatchEvent('change');
@@ -115,7 +115,9 @@ test('stored quantiles filter at once, one field read at a time; a field too sma
   // 'rare' has no category of 10 cells.
   await page.locator('#categorical-field').selectOption({ label: 'rare' });
   await expect(page.locator('#outlier-filter')).toBeDisabled();
-  await expect(page.locator('#outlier-filter-note')).toContainText('No category of “rare” has 10 cells');
+  await expect(page.locator('#outlier-filter')).toBeHidden();
+  await expect(page.locator('#outlier-filter-note')).toHaveText('No category has 10 cells.');
+  await expect(page.locator('#outlier-filter-note')).toHaveAttribute('title', /No category of “rare” has 10 cells/);
   expect(productErrors).toEqual([]);
 });
 
@@ -124,7 +126,7 @@ test('computing can be cancelled: nothing is kept, the slider is back at 100%, a
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('#outlier-filter-note')).toContainText('first use reads the latent space');
+  await expect(page.locator('#outlier-filter-note')).toContainText('First use reads');
 
   // The 120-cell fixture is read in a moment; hold the computation until the
   // test lets it go, as a large remote latent space would, honouring Cancel.
@@ -140,13 +142,13 @@ test('computing can be cancelled: nothing is kept, the slider is back at 100%, a
   await page.locator('#outlier-filter').fill('50');
   await page.locator('#outlier-filter').dispatchEvent('change');
   await expect(page.locator('#outlier-filter-progress')).toBeVisible();
-  await expect(page.locator('#outlier-filter-note')).toContainText('the outlier distances');
+  await expect(page.locator('#outlier-filter-note')).toHaveText('Computing outlier distances…');
   await expect(page.locator('#outlier-filter-action')).toHaveText('Cancel');
   await page.locator('#outlier-filter-action').click();
 
   await expect(page.locator('#outlier-filter-progress')).toBeHidden();
   await expect(page.locator('#outlier-filter')).toHaveValue('100');
-  await expect(page.locator('#outlier-filter-note')).toContainText('first use reads the latent space');
+  await expect(page.locator('#outlier-filter-note')).toContainText('First use reads');
   await expect(page.locator('#active-filters')).toHaveText('No filters active.');
   expect(await page.evaluate(() => window._cellucidState.getActiveField().outlierQuantiles ?? null)).toBeNull();
 
@@ -161,7 +163,7 @@ test('computing can be cancelled: nothing is kept, the slider is back at 100%, a
   expect(productErrors).toEqual([]);
 });
 
-test('without a latent space the control explains itself and opens the setting that turns it on', async ({ page }) => {
+test('without a latent space the control is one button that opens the setting that turns it on', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   const smoke = `${SAMPLE_ORIGIN}/tests/browser/fixtures/current-ui-smoke.h5ad`;
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(smoke)}`, { waitUntil: 'domcontentloaded' });
@@ -169,9 +171,11 @@ test('without a latent space the control explains itself and opens the setting t
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('#outlier-filter-container')).toBeVisible();
-  await expect(page.locator('#outlier-filter')).toBeDisabled();
-  await expect(page.locator('#outlier-filter-note')).toContainText('not in the 2D/3D layout');
+  // No disabled slider and no paragraph: the label, its (i) and one button.
+  await expect(page.locator('#outlier-filter')).toBeHidden();
+  await expect(page.locator('#outlier-filter-note')).toBeHidden();
   await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
+  await expect(page.locator('#outlier-filter-info-btn')).toBeVisible();
   await page.locator('#outlier-filter-action').click();
   const latent = page.locator('#data-mapping-latent');
   await expect(latent).toBeVisible();

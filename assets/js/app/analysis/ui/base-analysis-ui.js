@@ -78,6 +78,7 @@ export async function writePerCellCSV(layout, pageData, variableName) {
     pageName: pd.pageName,
     values: pd.values,
     cellIndices: pd.cellIndices ?? null,
+    setName: pd.setName ?? null,
     categories: pd.categories ?? null,
     missingCode: pd.missingCode ?? null
   }));

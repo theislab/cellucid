@@ -8,6 +8,7 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { beginOpening } from '../../../data/opening-progress.js';
 import {
   isSessionRestoreReportedError
 } from '../../session/session-serializer.js';
@@ -92,11 +93,17 @@ export function initSessionControls({
     return task;
   }
 
-  function showSessionStatus(message, isError = false) {
+  /**
+   * @param {string} message - One short sentence
+   * @param {boolean} [isError]
+   * @param {string} [details] - An error's technical text, folded under the
+   *   message (the notification's Details)
+   */
+  function showSessionStatus(message, isError = false, details = '') {
     if (destroyed) return;
     const notifications = getNotificationCenter();
     if (isError) {
-      notifications.error(message, { category: 'session' });
+      notifications.error(message, { category: 'session', details });
     } else {
       notifications.success(message, { category: 'session' });
     }
@@ -113,7 +120,7 @@ export function initSessionControls({
         showSessionStatus('Session saved successfully');
       } catch (err) {
         if (!ownsOperation(operationGeneration)) return;
-        console.error('Failed to save state:', err);
+        console.error(`Failed to save state: ${err instanceof Error ? err.message : String(err)}`, err);
         showSessionStatus('Failed to save session', true);
       }
       })();
@@ -176,16 +183,17 @@ export function initSessionControls({
     ) {
       return true;
     }
-    const notifications = getNotificationCenter();
-    const openingId = notifications.loading(
-      `Opening the session's dataset from ${describeDatasetSourceRecord(source)}…`,
-      { category: 'session' }
-    );
-    let opened;
+    // Shown by the opening progress; the source and the dataset change that
+    // open it join this opening, and a failure is said where it happened.
+    const opening = beginOpening({
+      title: `the session's dataset from ${describeDatasetSourceRecord(source)}`
+    });
+    let opened = false;
     try {
       opened = await openDatasetSource(source);
     } finally {
-      if (!destroyed) notifications.dismiss(openingId);
+      if (opened) opening.end();
+      else opening.dismiss();
     }
     // A source that could not be opened reported why where it failed.
     return opened && current();
@@ -214,7 +222,9 @@ export function initSessionControls({
         }
       } catch (err) {
         if (!ownsOperation(operationGeneration)) return;
-        console.error('Failed to load state:', err);
+        // The reason is part of the text, so every engine logs the same words
+        // (Firefox prints an Error argument as its name alone).
+        console.error(`Failed to load state: ${err instanceof Error ? err.message : String(err)}`, err);
         // A restore that got as far as its own progress notification has
         // already shown this sentence, prefixed with what it was doing.
         // Announcing it again puts the identical text on screen twice.

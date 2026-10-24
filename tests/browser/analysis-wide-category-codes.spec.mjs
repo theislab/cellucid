@@ -44,7 +44,7 @@ test('every analysis that reads a uint32 categorical field counts each cell unde
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await page.locator('#user-data-file-input').setInputFiles(fixturePath);
   await expect(page.locator('#dataset-name')).toHaveText('uint32 categories');
   await expect.poll(() => page.evaluate(() => Boolean(window._comparisonModule?.dataLayer))).toBe(true);
 
@@ -87,25 +87,21 @@ test('every analysis that reads a uint32 categorical field counts each cell unde
 
     // Marker discovery by the field, through the analysis workers.
     const { GenesPanelController } = await import('/assets/js/app/analysis/genes-panel/genes-panel-controller.js');
+    const { MARKER_OPTIONS } = await import('/assets/js/app/analysis/options/marker-options.js');
     const controller = new GenesPanelController({ dataLayer });
     let markers;
     try {
-      const result = await controller.runAnalysis({
-        obsCategory: 'cell_type',
-        method: 'wilcox',
-        useCache: false,
-        topNPerGroup: 'all',
-        pValueThreshold: 1,
-        foldChangeThreshold: 0,
+      const { stats } = await controller.runAnalysis({
+        options: MARKER_OPTIONS.withDefaults({ groupBy: 'cell_type' }, { categoricalFields: [{ key: 'cell_type' }] }),
       });
       markers = Object.fromEntries(
-        Object.values(result.markers.groups).map(group => [
+        stats.groups.map((group, index) => [
           group.groupName,
-          { id: group.groupId, cells: group.cellCount, genesTested: group.genesTested },
+          { id: group.groupId, cells: group.cellCount, genesTested: stats.genesTestedByGroup[index] },
         ]),
       );
     } finally {
-      await controller.close();
+      controller.close();
     }
 
     return {

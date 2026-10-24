@@ -4,8 +4,8 @@
  *
  * A data mapping (see `data-mapping.js`) names, for one dataset, the embeddings
  * it can be shown with and each dimension's default, the vector fields bound
- * to embeddings, the neighbour graph, gene names, expression matrix and latent
- * space. It is recorded in every session fingerprint, so a
+ * to embeddings, the neighbour graph, gene names, expression matrix, each
+ * matrix's log1p, the highly variable genes and the latent space. It is recorded in every session fingerprint, so a
  * session is restored only onto the same mapping.
  *
  * Every dataset is an AnnData file -- an `.h5ad` or Zarr store this viewer
@@ -23,6 +23,7 @@
 import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
+  compareCodePoints,
   validateDataMapping,
   validateEmbeddingRef,
 } from './data-mapping.js';
@@ -39,6 +40,8 @@ export const MAPPING_GROUP_LABELS = Object.freeze({
   knn: 'neighbour graph',
   geneNames: 'gene names',
   expression: 'expression matrix',
+  log1p: 'expression transform',
+  highlyVariable: 'highly variable genes',
   latent: 'latent space',
   vectorFields: 'vector fields',
 });
@@ -66,9 +69,88 @@ export function describeMappingGroupValue(group, value) {
     return value === 'index' ? 'the var index' : `var column '${value.slice('column:'.length)}'`;
   }
   if (group === 'expression') {
-    return value.startsWith('layer:') ? `layers['${value.slice('layer:'.length)}']` : value;
+    return describeExpressionMatrix(value);
+  }
+  if (group === 'highlyVariable') return `var column '${value}'`;
+  if (group === 'log1p') {
+    const matrices = Object.keys(value);
+    if (matrices.length === 0) return 'values as stored';
+    return `log1p of ${matrices.map(matrix => (
+      `${describeExpressionMatrix(matrix)} (${describeLog1pBase(value[matrix].base)})`
+    )).join(', ')}`;
   }
   return JSON.stringify(value);
+}
+
+function describeExpressionMatrix(value) {
+  return value.startsWith('layer:') ? `layers['${value.slice('layer:'.length)}']` : value;
+}
+
+function describeLog1pBase(base) {
+  return base === null ? 'base e' : `base ${base}`;
+}
+
+/**
+ * The menu value of "as stored" in the expression transform select.
+ */
+export const LOG1P_AS_STORED = 'as-stored';
+
+/**
+ * The menu value one matrix's transform is shown with: `as-stored`, `e`, or
+ * the base as text (`2`).
+ *
+ * @param {Record<string, {base: number|null}>} log1p
+ * @param {string} matrix
+ * @returns {string}
+ */
+export function log1pChoiceOf(log1p, matrix) {
+  if (!Object.hasOwn(log1p, matrix)) return LOG1P_AS_STORED;
+  return log1p[matrix].base === null ? 'e' : String(log1p[matrix].base);
+}
+
+/**
+ * The `log1p` group with one matrix's transform set from a menu value
+ * (`log1pChoiceOf`), in canonical order.
+ *
+ * @param {Record<string, {base: number|null}>} log1p
+ * @param {string} matrix
+ * @param {string} choice
+ * @returns {Record<string, {base: number|null}>}
+ */
+export function withLog1pChoice(log1p, matrix, choice) {
+  const next = { ...log1p };
+  delete next[matrix];
+  if (choice !== LOG1P_AS_STORED) {
+    const base = choice === 'e' ? null : Number(choice);
+    if (base !== null && !(Number.isFinite(base) && base > 0 && base !== 1)) {
+      throw new RangeError(`A log1p base is e or a positive number other than 1, not ${choice}.`);
+    }
+    next[matrix] = { base };
+  }
+  return Object.fromEntries(Object.keys(next).sort(compareCodePoints).map(key => [key, next[key]]));
+}
+
+/**
+ * The transforms the expression transform menu offers: as stored, log1p
+ * base e (Scanpy's default), base 2 and base 10, and any other base the
+ * file's `uns['log1p']` or the mapping names.
+ *
+ * @param {Array<number|null>} knownBases
+ * @returns {Array<{value: string, label: string}>}
+ */
+export function log1pMenu(knownBases) {
+  const bases = [2, 10];
+  for (const base of knownBases) {
+    if (base !== null && !bases.includes(base)) bases.push(base);
+  }
+  return [
+    { value: LOG1P_AS_STORED, label: 'As stored (not log-transformed)' },
+    { value: 'e', label: 'log1p (base e)' },
+    ...bases.sort((left, right) => left - right).map(base => ({
+      value: String(base),
+      label: `log1p (base ${base})`,
+    })),
+  ];
 }
 
 /** The route of the candidate catalog under a dataset base. */

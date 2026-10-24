@@ -333,7 +333,14 @@ async function rasterizePointsToDataUrl(session, {
       exact: rasterPlan.exact,
       ...rasterPlan.deviceRect,
     };
-  return session.request('rasterizePointsPngDataUrl', { raster, placement });
+  const frame = await session.request('rasterizePoints', raster);
+  try {
+    throwIfFigureExportAborted(signal);
+  } catch (error) {
+    frame.close();
+    throw error;
+  }
+  return session.request('encodeRasterPngDataUrl', { bitmap: frame, placement }, [frame]);
 }
 
 /**

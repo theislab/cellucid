@@ -27,8 +27,9 @@
  *   transfer's (GitHub Pages compresses binary files, and a page cannot see
  *   that it did).
  * - Every request is CORS-safelisted (a `HEAD`, a `GET`, one plain range),
- *   so none needs a preflight. A host that says it is busy (429, 503) is
- *   asked again (`fetchWhenNotBusy`).
+ *   so none needs a preflight. A request the host answers as busy or
+ *   failing, whose connection fails or that stalls is made again
+ *   (`fetchWhenNotBusy`, and `readFileHead` for the head).
  *
  * @module data/sources/providers/github
  */
@@ -344,7 +345,7 @@ async function describeGitHubFile(parsed, { signal }) {
   // The head goes out beside the HEAD: an .h5ad's first read, else enough to
   // hold an LFS pointer whole.
   const headBytes = fileFormatOf(name) === 'h5ad' ? HEAD_BYTES : LFS_POINTER_MAX_BYTES;
-  const headRead = readFileHead(url, headBytes, { signal, fetchImpl: fetchWhenNotBusy });
+  const headRead = readFileHead(url, headBytes, { signal });
   headRead.catch(() => {});
   const { size, etag } = await headOf(url, name, signal);
   let head = null;

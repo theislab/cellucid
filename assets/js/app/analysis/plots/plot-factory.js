@@ -94,7 +94,9 @@ export class PlotFactory {
   static async render({ definition, pageData, options, container, layoutEngine }) {
     const traces = definition.buildTraces(pageData, options, layoutEngine);
     const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine);
-    PlotFactory.fitCategoricalTickLabels(layout, traces, container);
+    // A plot whose every category must be named (a dot plot's genes and
+    // groups) sizes its own labels instead (`fitTickLabels: false`).
+    if (definition.fitTickLabels !== false) PlotFactory.fitCategoricalTickLabels(layout, traces, container);
     applyLegendPosition(layout, options?.legendPosition);
     const config = getPlotlyConfig();
 
@@ -121,7 +123,7 @@ export class PlotFactory {
   static async update({ definition, figure, pageData, options, layoutEngine }) {
     const traces = definition.buildTraces(pageData, options, layoutEngine);
     const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine);
-    PlotFactory.fitCategoricalTickLabels(layout, traces, figure);
+    if (definition.fitTickLabels !== false) PlotFactory.fitCategoricalTickLabels(layout, traces, figure);
     applyLegendPosition(layout, options?.legendPosition);
     const Plotly = await createMinimalPlotly();
     const config = getPlotlyConfig();

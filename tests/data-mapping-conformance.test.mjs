@@ -49,7 +49,7 @@ const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.m
 // (tests/testthat/test-data-mapping-conformance.R) pin this same digest.
 // Update all three together.
 const FIXTURE_SHA256 =
-  '9e7e7b443fcdcb4f8891165951459d1cae2c4e198041ddb2ffc3a82577ecb4f6';
+  'a84646cb66451a4ef86d965c9d65ef1dab41276592274fc9fa5f343344640241';
 
 /**
  * A JSON number literal written with a fraction or an exponent, such as
@@ -119,7 +119,7 @@ test('the fixture is the pinned shared copy', () => {
     createHash('sha256').update(FIXTURE_BYTES).digest('hex'),
     FIXTURE_SHA256
   );
-  assert.equal(FIXTURE.version, 3);
+  assert.equal(FIXTURE.version, 4);
   assert.deepEqual(Object.keys(FIXTURE), [
     '_about',
     'version',
@@ -243,6 +243,7 @@ for (const testCase of cases('embeddingSlots')) {
             X: null,
             layers: [],
             raw: null,
+            log1p: null,
           },
           obs_fields: [],
         };
@@ -383,6 +384,8 @@ for (const testCase of cases('defaultVectorBindings')) {
       knn: null,
       geneNames: 'index',
       expression: null,
+      log1p: {},
+      highlyVariable: null,
       latent: null,
       vectorFields: bindings,
     };

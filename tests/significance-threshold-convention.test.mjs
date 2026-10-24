@@ -26,9 +26,7 @@ import {
   benjaminiHochbergAdjusted,
   mannWhitneyU,
 } from '../assets/js/app/analysis/stats/statistical-tests.js';
-import { MarkerDiscoveryEngine } from '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js';
-import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
-import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
+import { rankGroupGenes } from '../assets/js/app/analysis/genes-panel/marker-selection.js';
 import volcanoPlotDefinition from '../assets/js/app/analysis/plots/types/volcanoplot.js';
 
 const ANALYSIS_ROOT = join(
@@ -118,109 +116,23 @@ test('the volcano surfaces count a boundary gene as a discovery', () => {
   assert.equal(byGene.JUST_OVER.direction, 'ns');
 });
 
-test('the marker filter keeps a gene whose p-value equals the threshold', () => {
-  const engine = Object.create(MarkerDiscoveryEngine.prototype);
-  const item = (gene, geneIndex, pValue, log2FoldChange) => ({
-    gene,
-    geneIndex,
-    groupId: 'group',
-    pValue,
-    adjustedPValue: null,
-    log2FoldChange,
-    meanInGroup: 2,
-    meanOutGroup: 1,
-    percentInGroup: 100,
-    percentOutGroup: 50,
-    nIn: 12,
-    nOut: 12,
-  });
-  const items = [
-    item('BOUNDARY', 0, BOUNDARY_ALPHA, 1),
-    item('JUST_OVER', 1, JUST_OVER_ALPHA, 3),
-    item('CLEAR', 2, 0.001, 2),
-  ];
-
-  const groups = [{
-    groupId: 'group',
-    groupName: 'Group',
-    cellCount: 12,
-    color: '#123456',
-  }];
-  const built = engine._buildMarkersFromHeaps({
-    groups,
-    heaps: [{ toArray: () => items.map(entry => ({ ...entry })) }],
-    adjustedByGroup: null,
-    correctionByGroup: null,
-    pValueThreshold: BOUNDARY_ALPHA,
-    foldChangeThreshold: 1,
-    useAdjustedPValue: false,
-  });
-
-  assert.deepEqual(
-    built.group.markers.map(marker => marker.gene),
-    ['CLEAR', 'BOUNDARY'],
-  );
-});
-
-test('the genes panel rebuild keeps a gene whose p-value equals the threshold', () => {
-  const ui = Object.create(GenesPanelUI.prototype);
-  const picked = ui._computeTopMarkersForGroupIndex({
-    groupId: 'group',
-    geneKeys: ['BOUNDARY', 'JUST_OVER', 'CLEAR'],
-    pValuesEffective: Float64Array.from([
-      BOUNDARY_ALPHA,
-      JUST_OVER_ALPHA,
-      0.001,
-    ]),
-    pValuesRaw: Float64Array.from([
-      BOUNDARY_ALPHA,
-      JUST_OVER_ALPHA,
-      0.001,
-    ]),
-    adjPValues: null,
-    log2FC: Float32Array.from([1, 3, 2]),
-    topN: 10,
-    pValueThreshold: BOUNDARY_ALPHA,
-    foldChangeThreshold: 1,
-  });
-
-  assert.deepEqual(picked.map(marker => marker.gene), ['CLEAR', 'BOUNDARY']);
-});
-
-test('the differential-expression modal counts and labels the same inclusive rule', () => {
-  const ui = Object.create(DEAnalysisUI.prototype);
-  ui._lastResult = {
-    data: {
-      results: [
-        { gene: 'BOUNDARY_UP', pValue: 0.001, adjustedPValue: BOUNDARY_ALPHA, log2FoldChange: 1 },
-        { gene: 'BOUNDARY_DOWN', pValue: 0.001, adjustedPValue: BOUNDARY_ALPHA, log2FoldChange: -1 },
-        {
-          gene: 'JUST_OVER',
-          pValue: 0.001,
-          adjustedPValue: JUST_OVER_ALPHA,
-          log2FoldChange: 4,
-        },
-      ],
-      summary: { genesTested: 3, genesUntestable: 0, minCells: 10 },
-    },
-    options: {
-      pValueThreshold: BOUNDARY_ALPHA,
-      foldChangeThreshold: 1,
-      useAdjustedPValue: true,
-      labelTopN: 15,
-    },
+test('the marker filter keeps a gene whose adjusted p-value equals the threshold', () => {
+  const stats = {
+    genes: ['BOUNDARY', 'ABOVE'],
+    groups: [{ groupId: 'g', groupName: 'g', tested: true }],
+    adjustedPValuesByGroup: [Float64Array.of(BOUNDARY_ALPHA, 0.0500001)],
+    pValuesByGroup: [Float64Array.of(0.01, 0.01)],
+    scoresByGroup: [Float32Array.of(2, 3)],
+    log2FoldChangeByGroup: [Float32Array.of(1, 1)],
+    pctInByGroup: [Float32Array.of(50, 50)],
+    pctRefByGroup: [Float32Array.of(10, 10)],
+    aurocByGroup: [Float32Array.of(0.8, 0.8)],
+    meanInGroupByGroup: [Float32Array.of(1, 1)],
   };
-
-  const container = { innerHTML: '' };
-  ui._renderModalStats(container);
-  const html = container.innerHTML;
-
-  assert.match(html, /Upregulated<\/td>\s*<td class="up"><strong>1<\/strong>/);
-  assert.match(html, /Downregulated<\/td>\s*<td class="down"><strong>1<\/strong>/);
-  assert.match(
-    html,
-    /Significant \(FDR ≤ 0\.05, \|log₂FC\| ≥ 1\)<\/td>\s*<td class="significant"><strong>2<\/strong>/,
-  );
+  const order = rankGroupGenes(stats, 0, {
+    direction: 'up', maxAdjP: BOUNDARY_ALPHA, minLog2FC: 0, minPctIn: 0, maxPctRef: 100, rankBy: 'score',
+  });
+  assert.deepEqual(Array.from(order, i => stats.genes[i]), ['BOUNDARY']);
 });
 
 async function collectAnalysisSources(directory) {

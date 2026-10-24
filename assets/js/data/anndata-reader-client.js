@@ -31,6 +31,16 @@ import { setSourceRequestConcurrency } from './fetch-scheduler.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { EmbeddingLoadError, MappingLoadError } from './data-mapping-candidates.js';
 import { DataMappingError } from './data-mapping.js';
+import { onSourceAccessRevoked, resolveSourceAccess } from './sources/access.js';
+
+/** Error details as a record that crosses to the worker. */
+function plainDetails(details) {
+  try {
+    return structuredClone(details);
+  } catch {
+    return String(details);
+  }
+}
 
 function createDefaultWorker() {
   return new Worker(
@@ -40,6 +50,57 @@ function createDefaultWorker() {
 }
 
 let workerFactory = createDefaultWorker;
+
+/**
+ * A reader worker started before any client needs it
+ * (`prewarmAnnDataReaderWorker`), so its module graph loads while a link is
+ * still being resolved; the next client to need a worker adopts it. Null
+ * when there is none.
+ * @type {Worker|null}
+ */
+let spareWorker = null;
+/** Ends the spare when the page is left, while nothing has adopted it. */
+let sparePageHide = null;
+
+/** The spare worker, now owned by the caller, or null. */
+function takeSpareWorker() {
+  const worker = spareWorker;
+  spareWorker = null;
+  if (sparePageHide !== null) {
+    window.removeEventListener('pagehide', sparePageHide);
+    sparePageHide = null;
+  }
+  return worker;
+}
+
+/**
+ * Start one reader worker now, ahead of the client that will read with it:
+ * its module graph and decode workers load while the caller is still
+ * resolving what to open (a provider probe), not after. The next
+ * `AnnDataReaderClient` that needs a worker adopts it. At most one spare
+ * exists: calling this again while one waits does nothing. A spare nothing
+ * adopts is ended when the page is left, or by
+ * `releaseSpareAnnDataReaderWorker` (a client closed before it started a
+ * worker releases it: the open it was for was abandoned).
+ */
+export function prewarmAnnDataReaderWorker() {
+  if (spareWorker !== null) return;
+  spareWorker = workerFactory();
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    sparePageHide = () => releaseSpareAnnDataReaderWorker();
+    window.addEventListener('pagehide', sparePageHide);
+  }
+}
+
+/** End the spare reader worker, if one waits. */
+export function releaseSpareAnnDataReaderWorker() {
+  takeSpareWorker()?.terminate?.();
+}
+
+/** Whether a spare reader worker waits to be adopted (tests). */
+export function hasSpareAnnDataReaderWorker() {
+  return spareWorker !== null;
+}
 
 /**
  * Run `callback` on a later task: after the current task and every promise
@@ -75,6 +136,8 @@ export function setAnnDataReaderWorkerFactory(factory) {
   if (factory !== null && typeof factory !== 'function') {
     throw new TypeError('An AnnData reader worker factory must be a function or null.');
   }
+  // A spare made by the previous factory is not what the next client expects.
+  releaseSpareAnnDataReaderWorker();
   workerFactory = factory ?? createDefaultWorker;
 }
 
@@ -180,13 +243,25 @@ export class AnnDataReaderClient {
      * @type {Array<Object>}
      */
     this._geneReads = [];
+    /**
+     * The open dataset's link as the worker last measured it
+     * (`{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`), or null.
+     * @type {Readonly<Object>|null}
+     */
+    this._link = null;
+    /** Stops hearing of sign-outs (`sources/access.js`), once a worker started. */
+    this._stopAccessRevokes = null;
   }
 
   _ensureWorker() {
     if (this._closed) throw new Error('No AnnData file is open. Call open() first.');
     if (this._worker !== null) return this._worker;
-    const worker = workerFactory();
+    const worker = takeSpareWorker() ?? workerFactory();
     worker.onmessage = event => this._receive(event.data);
+    // A sign-out drops the targets the worker holds (`sources/access.js`).
+    this._stopAccessRevokes ??= onSourceAccessRevoked(ref => {
+      this._worker?.postMessage({ sourceAccessRevoked: ref });
+    });
     worker.onerror = event => {
       event?.preventDefault?.();
       this._failAll(new Error(
@@ -208,6 +283,25 @@ export class AnnDataReaderClient {
   }
 
   _receive(message) {
+    if (message?.event === 'source-access') {
+      // The worker asks for the URL and headers of a file behind a sign-in
+      // or an expiring link; the answer crosses in memory only.
+      const worker = this._worker;
+      resolveSourceAccess(message.ref, { refresh: message.refresh === true }).then(
+        target => worker?.postMessage({ sourceAccess: message.request, target }),
+        error => worker?.postMessage({
+          sourceAccess: message.request,
+          error: {
+            name: error?.name ?? 'Error',
+            message: error?.message ?? String(error),
+            ...(error?.code === undefined ? {} : { code: error.code }),
+            ...(typeof error?.source === 'string' ? { sourceType: error.source } : {}),
+            ...(error?.details === undefined ? {} : { details: plainDetails(error.details) }),
+          },
+        })
+      );
+      return;
+    }
     if (message?.event === 'activity') {
       // What one read operation fetched and decoded, for the read activity
       // log and the console.
@@ -215,7 +309,22 @@ export class AnnDataReaderClient {
       getReadActivityLog().record(activity);
       return;
     }
+    if (message?.event === 'link') {
+      const { event: _event, ...measurement } = message;
+      this._link = Object.freeze(measurement);
+      return;
+    }
     if (message?.event === 'transfer') {
+      if (typeof message.retrying === 'string') {
+        // A request made again after a transient failure.
+        getTransferLog().retrying(message.url, message.retrying);
+        return;
+      }
+      if (message.arriving === true) {
+        // Bytes of a request still under way: the read is alive.
+        getTransferLog().arriving(message.url);
+        return;
+      }
       // A remote file's running totals, for the Transfers log.
       getTransferLog().record(message.url, {
         bytes: message.bytes,
@@ -345,6 +454,24 @@ export class AnnDataReaderClient {
     return this._snapshot?.nVars ?? 0;
   }
 
+  /** The Zarr format version (2 or 3) of an open Zarr store; null for an `.h5ad`. */
+  get zarrVersion() {
+    return this._snapshot?.zarrVersion ?? null;
+  }
+
+  /**
+   * The link the open dataset is read over, as last measured:
+   * `{latencyMs, bytesPerMs, backgroundConcurrency, protocol}` (a local
+   * source: latency 0, and its decode rate in bytes per ms), or null before
+   * the first measurement.
+   *
+   * @returns {Readonly<{latencyMs: number|null, bytesPerMs: number|null,
+   *   backgroundConcurrency: number, protocol: string|null}>|null}
+   */
+  linkMeasurement() {
+    return this._link;
+  }
+
   get obsKeys() {
     return [...(this._snapshot?.obsKeys ?? [])];
   }
@@ -461,6 +588,18 @@ export class AnnDataReaderClient {
       { key: embedding.key, columns: [...embedding.columns] },
       normalize
     );
+  }
+
+  /**
+   * One boolean var column as flags, 1 where true (`AnnDataReader.readVarFlags`).
+   *
+   * @param {'X'|'raw'} axis
+   * @param {string} column
+   * @returns {Promise<Uint8Array>}
+   */
+  readVarFlags(axis, column) {
+    this._requireOpen();
+    return this._call('readVarFlags', axis, column);
   }
 
   async readVarNames(axis, column) {
@@ -675,6 +814,17 @@ export class AnnDataReaderClient {
     this._call('prepareMatrix', element).catch(() => {});
   }
 
+  /**
+   * An obs field's type from its metadata alone (`AnnDataReader.getObsFieldKind`):
+   * nothing is read, so describing every field at open costs no request.
+   *
+   * @param {string} key
+   */
+  getObsFieldKind(key) {
+    this._requireOpen();
+    return this._call('getObsFieldKind', key);
+  }
+
   async getObsFieldInfo(key) {
     this._requireOpen();
     if (this._obsInfo.has(key)) return this._obsInfo.get(key);
@@ -805,11 +955,16 @@ export class AnnDataReaderClient {
     this._worker = null;
     this._source = null;
     this._reopening = null;
+    // Closed before it started a worker: the open a spare was started for
+    // was abandoned, so the spare goes too.
+    if (worker === null) releaseSpareAnnDataReaderWorker();
     if (this._onPageHide !== null) {
       window.removeEventListener('pagehide', this._onPageHide);
       this._onPageHide = null;
     }
     this._failAll(new Error('The AnnData file was closed; the request was superseded'));
+    this._stopAccessRevokes?.();
+    this._stopAccessRevokes = null;
     worker?.terminate?.();
   }
 }

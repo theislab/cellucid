@@ -195,7 +195,13 @@ class DecodePool {
   decode(task) {
     const signal = task.signal ?? null;
     if (signal?.aborted) return Promise.reject(abortReason(signal));
-    if (this.noWorkers) return Promise.resolve().then(task.inThread);
+    if (this.noWorkers) {
+      const startedAt = performance.now();
+      return Promise.resolve().then(task.inThread).then(value => {
+        if (task.kind !== 'run' && value instanceof Uint8Array) noteDecoded(value.length, performance.now() - startedAt);
+        return value;
+      });
+    }
     // Work too small to be worth a message is done here, never batched.
     if (task.kind === 'run' && task.size < this.minBytes) return Promise.resolve().then(task.inThread);
     return new Promise((resolve, reject) => {
@@ -226,6 +232,9 @@ class DecodePool {
     if (job.settled) return;
     job.settled = true;
     job.stopWaiting?.();
+    if (error === null && job.kind !== 'run' && job.startedAt !== undefined && value instanceof Uint8Array) {
+      noteDecoded(value.length, performance.now() - job.startedAt);
+    }
     if (error !== null) job.reject(error);
     else job.resolve(value);
   }
@@ -237,6 +246,7 @@ class DecodePool {
       this.settle(job, null, new Error('A decode worker stopped while decoding a chunk it was given; read it again.'));
       return;
     }
+    job.startedAt ??= performance.now();
     Promise.resolve().then(job.inThread).then(
       value => this.settle(job, value, null),
       error => this.settle(job, null, error)
@@ -352,6 +362,7 @@ class DecodePool {
     if (job.settled) return;
     job.id = this.nextId++;
     job.holder = holder;
+    job.startedAt = performance.now();
     holder.jobs.set(job.id, job);
     if (job.kind === 'run') {
       this.sendRun(holder, job);
@@ -408,6 +419,7 @@ class DecodePool {
     for (const job of live) {
       job.id = id;
       job.holder = holder;
+      job.startedAt = performance.now();
       input.set(job.input, at);
       items.push({ kind: job.kind, description: job.description, start: at, end: at + job.input.length });
       at += job.input.length;
@@ -502,8 +514,25 @@ class DecodePool {
       // Cancelled jobs stay in the queue until it reaches them; they do not wait.
       queued: this.queues.reduce((count, queue) => count + queue.reduce((n, job) => n + (job.settled ? 0 : 1), 0), 0),
       inThreadOnly: this.noWorkers,
+      decodedBytesPerMs,
     };
   }
+}
+
+/**
+ * How fast one chunk is decoded, in decoded bytes per millisecond from the
+ * moment it is handed to a worker (or begun in this thread) to its result:
+ * an exponential moving average over chunks (weight 1/8 for the newest, as
+ * a smoothed round trip is kept in `link.js`), null until a chunk is
+ * decoded. A measure for whoever tunes work to the machine, never a limit.
+ * @type {number|null}
+ */
+let decodedBytesPerMs = null;
+
+function noteDecoded(bytes, ms) {
+  if (!(ms > 0) || bytes <= 0) return;
+  const rate = bytes / ms;
+  decodedBytesPerMs = decodedBytesPerMs === null ? rate : 0.875 * decodedBytesPerMs + 0.125 * rate;
 }
 
 /** @type {DecodePool|null} */
@@ -596,9 +625,12 @@ export function releaseIdleDecodeWorkers() {
   pool?.releaseIdle();
 }
 
-/** Workers, tasks under way and tasks waiting, for diagnostics and tests. */
+/**
+ * Workers, tasks under way and tasks waiting, for diagnostics and tests, and
+ * how fast chunks decode (`decodedBytesPerMs`, null until one has).
+ */
 export function decodePoolStats() {
-  return pool === null ? { workers: 0, running: 0, queued: 0, inThreadOnly: false } : pool.stats();
+  return pool === null ? { workers: 0, running: 0, queued: 0, inThreadOnly: false, decodedBytesPerMs } : pool.stats();
 }
 
 /**

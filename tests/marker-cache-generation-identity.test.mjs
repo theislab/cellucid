@@ -33,6 +33,8 @@ const ANNDATA_MAPPING = Object.freeze({
   knn: null,
   geneNames: 'index',
   expression: 'X',
+  log1p: {},
+  highlyVariable: null,
   latent: null,
   vectorFields: [],
 });
@@ -64,11 +66,11 @@ test('markers from one generation are never served to another under the same dat
   const cache = new MarkerCache({
     identity: { key: JSON.stringify(['load', 'adata', 1]) },
   });
-  await cache.set('cell_type', { marker: 'GENE_ONLY_IN_V1' }, PARAMS);
-  assert.deepEqual(await cache.get('cell_type', PARAMS), { marker: 'GENE_ONLY_IN_V1' });
+  cache.set(PARAMS, { marker: 'GENE_ONLY_IN_V1' });
+  assert.deepEqual(cache.get(PARAMS), { marker: 'GENE_ONLY_IN_V1' });
 
   cache.setIdentity({ key: JSON.stringify(['load', 'adata', 2]) });
-  assert.equal(await cache.get('cell_type', PARAMS), null);
+  assert.equal(cache.get(PARAMS), null);
 });
 
 test('the cache lives in this page only and takes no other identity field', () => {
@@ -77,7 +79,7 @@ test('the cache lives in this page only and takes no other identity field', () =
     /exactly \{ key: non-empty string \}/
   );
   const cache = new MarkerCache({ identity: { key: 'k' } });
-  assert.deepEqual(Object.keys(cache.getStats()).sort(), ['hotCacheSize', 'identityKey', 'maxCategories']);
+  assert.deepEqual(Object.keys(cache.getStats()).sort(), ['bytes', 'entries']);
 });
 
 test('another gene list under the same dataset generation is another identity', () => {

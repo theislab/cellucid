@@ -110,6 +110,25 @@ export function publishSelectBarHint(documentOwner, hint) {
   element.textContent = hint;
 }
 
+/**
+ * Say in the Selection (i) tip what the active tool's gesture is, or what it
+ * needs first. The owner of the tool's idle copy calls this beside the
+ * selection bar's hint: mode-ui.js when the tool changes, and each tool when
+ * it shows nothing in progress.
+ *
+ * @param {Document} documentOwner
+ * @param {string} hint
+ */
+export function publishToolHint(documentOwner, hint) {
+  if (typeof hint !== 'string' || hint.length === 0) {
+    throw new TypeError('Selection tool hint must be a nonempty string.');
+  }
+  const element = documentOwner.getElementById('highlight-tool-hint');
+  if (element === null) return;
+  requireDomElement(element, 'Selection tool hint');
+  element.textContent = hint;
+}
+
 function cellCountText(count) {
   return `${formatCount(count)} ${count === 1 ? 'cell' : 'cells'} selected`;
 }

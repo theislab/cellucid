@@ -136,7 +136,7 @@ export const SOURCE_TYPES = Object.freeze([
 ]);
 
 export const STARTUP_PHASES = Object.freeze([
-  'code-load', 'boot', 'sign-in', 'health', 'catalog', 'identity',
+  'code-load', 'boot', 'sign-in', 'health', 'catalog', 'dataset',
   'positions', 'ui', 'session', 'ready',
 ]);
 
@@ -212,7 +212,7 @@ export const FEATURES = Object.freeze({
   vector_field: null,
   analysis: Object.freeze([
     'simple', 'detailed', 'correlation', 'differential', 'signature',
-    'genes_panel',
+    'genes_panel', 'dotplot', 'composition',
   ]),
   figure_export: null,
   camera_path: null,
@@ -222,7 +222,7 @@ export const FEATURES = Object.freeze({
   benchmark: null,
   data_mapping: Object.freeze([
     'embedding', 'embedding_columns', 'default', 'knn', 'gene_names', 'expression',
-    'latent', 'vector_fields',
+    'log1p', 'highly_variable', 'latent', 'vector_fields',
   ]),
 });
 

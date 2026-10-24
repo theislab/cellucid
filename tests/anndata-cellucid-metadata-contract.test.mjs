@@ -111,7 +111,6 @@ test('an opened file is identified, named, described, cited and sourced by uns[\
     ['h5ad', async () => {
       const source = new H5adDataSource();
       await source.loadFromFile(fixtureFile('ready.h5ad'), {
-        showProgress: false,
         preferFileName: true,
         source: { name: 'H5AD file', filename: 'ready.h5ad' },
       });
@@ -120,7 +119,6 @@ test('an opened file is identified, named, described, cited and sourced by uns[\
     ['zarr.zip', async () => {
       const source = new ZarrDataSource();
       await source.loadFromArchiveFile(fixtureFile('ready.zarr.zip'), {
-        showProgress: false,
         preferFileName: true,
         source: { name: 'Zarr ZIP archive', filename: 'ready.zarr.zip' },
       });
@@ -154,7 +152,6 @@ test('a caller\'s explicit id, name and defaults stand over the file\'s', async 
   const source = new H5adDataSource();
   t.after(() => source.clear());
   await source.loadFromFile(fixtureFile('ready.h5ad'), {
-    showProgress: false,
     datasetId: 'served-id',
     name: 'Served name',
     defaults: { obsKeys: ['score', 'cluster'] },
@@ -173,7 +170,7 @@ test('a file without a name of its own is named by uns[\'title\'] only when it m
   quiet(t);
   const source = new H5adDataSource();
   t.after(() => source.clear());
-  await source.loadFromFile(fixtureFile('ready.h5ad'), { showProgress: false });
+  await source.loadFromFile(fixtureFile('ready.h5ad'));
   const metadata = await source.getMetadata('tiny-ready');
   assert.equal(metadata.name, 'ready', 'without preferFileName the caller\'s name (the file name) stands');
 });
@@ -183,7 +180,7 @@ test('an unknown key in uns[\'cellucid\'] refuses the file when it opens', async
   const source = new H5adDataSource();
   t.after(() => source.clear());
   await assert.rejects(
-    source.loadFromFile(fixtureFile('unknown-key.h5ad'), { showProgress: false }),
+    source.loadFromFile(fixtureFile('unknown-key.h5ad')),
     /uns\['cellucid'\] has unknown key 'colour'/
   );
   assert.equal(source.datasetId, null);

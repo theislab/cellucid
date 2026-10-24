@@ -8,11 +8,11 @@
  *   in input slices, so a bomb is stopped after a few slices of input and an
  *   abort stops the input early;
  * - the format readers (`formats/io/inflate.js`: Zarr gzip and zlib chunks,
- *   ZIP entries) hand the decompressor its whole compressed input and read
- *   the output against the size the format declares, so a bomb is stopped
- *   after a few chunks of output: the decompressor's readable stream applies
- *   backpressure, and the reader cancels it as soon as the output passes the
- *   declared size.
+ *   ZIP entries) feed the decompressor in the same input slices and read the
+ *   output against the size the format declares, so a bomb is stopped after
+ *   a few slices: the reader cancels the stream as soon as the output passes
+ *   the declared size. (Written whole, WebKit's decompressor expanded the
+ *   whole bomb before the reader could stop it.)
  *
  * Both are properties of the browser's `DecompressionStream` and its
  * backpressure, so they are measured here, in each engine the application
@@ -49,10 +49,8 @@ test('native inflate stops a DEFLATE bomb within a few slices of input or output
 }) => {
   await page.goto('/tests/browser/fixtures/catalog/datasets.json');
   const results = await page.evaluate(async input => {
-    const {
-      gzipDecompress,
-      NATIVE_INFLATE_INPUT_SLICE_BYTES: SLICE,
-    } = await import('/assets/js/app/session/codecs/gzip.js');
+    const { gzipDecompress } = await import('/assets/js/app/session/codecs/gzip.js');
+    const { NATIVE_INFLATE_INPUT_SLICE_BYTES: SLICE } = await import('/assets/js/formats/io/inflate.js');
     const { memoryStore, openZarr } = await import('/assets/js/formats/zarr/index.js');
     const { openZipArchive } = await import('/assets/js/formats/zip/index.js');
     const { bytesByteSource } = await import('/assets/js/formats/io/byte-source.js');
@@ -226,15 +224,20 @@ test('native inflate stops a DEFLATE bomb within a few slices of input or output
   ).toBeLessThanOrEqual(4 * results.slice);
   expect(results.gzip.error).toMatch(/Decompressed data exceeds limit/);
 
-  // The format readers stop the output a few chunks past the declared size,
-  // never after the whole bomb has been expanded.
-  const pacedOutputLimit = BOMB_BYTES / 16;
+  // The format readers pace their input as the session codec does: the
+  // decoder is stopped within a few input slices of passing the declared
+  // size, so what it produced past it is bounded by DEFLATE's expansion of
+  // those slices, never the whole bomb.
   for (const id of ['zarr-gzip', 'zarr-zlib', 'zip']) {
     const result = results[id];
     expect(
+      result.input,
+      `${id} inflate consumed ${result.input} of ${result.compressed} input bytes for a ${result.declared}-byte declared size`,
+    ).toBeLessThanOrEqual(4 * results.slice);
+    expect(
       result.output,
-      `${id} inflate produced ${result.output} bytes for a ${result.declared}-byte declared size (bomb: ${BOMB_BYTES})`,
-    ).toBeLessThanOrEqual(pacedOutputLimit);
+      `${id} inflate produced ${result.output} bytes (bomb: ${BOMB_BYTES})`,
+    ).toBeLessThan(BOMB_BYTES / 2);
   }
   expect(results['zarr-gzip'].error)
     .toMatch(/^ZarrFormatError: A gzip chunk decompresses to more than the 1024 bytes it declares/);

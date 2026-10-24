@@ -8,10 +8,14 @@ test('Jupyter bridge owns authenticated parent traffic for its live lifecycle', 
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
+      // What `cellucid.anndata_server` answers (`_health_document`).
       body: JSON.stringify({
         status: 'ok',
-        type: 'exported',
-        version: '0.9.1',
+        type: 'anndata',
+        version: '0.9.4',
+        format: 'h5ad',
+        n_cells: 3,
+        n_genes: 2,
       }),
     });
   });

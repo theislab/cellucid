@@ -182,7 +182,7 @@ test('switches, segments and disclosures carry their state in ARIA', () => {
     ['true', 'false']
   );
 
-  const disclosure = createDisclosure({ title: 'Performance settings', expanded: false });
+  const disclosure = createDisclosure({ title: 'Details', expanded: false });
   assert.equal(disclosure.header.getAttribute('aria-expanded'), 'false');
   assert.equal(disclosure.header.getAttribute('aria-controls'), disclosure.content.id);
   assert.equal(disclosure.content.hidden, true);

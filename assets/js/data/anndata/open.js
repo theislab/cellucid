@@ -41,30 +41,61 @@ function isRemoteFile(file) {
 
 /**
  * The byte reader of one file: a local `File`/`Blob`, or a remote file
- * `{url, size, name, identity, head?}`, whose `head` (`{bytes, etag, ms}`,
+ * `{url, size, name, identity, head?, access?}`, whose `head` (`{bytes, etag, ms}`,
  * read beside the probe of its size: `describeRemoteFile`) is its first read.
+ * A file behind a sign-in or an expiring link names its access
+ * (`{provider, ref}`), which `sourceAccess` turns into the byte source's
+ * `access`; its `url` is then its display link.
  */
-function readerOf(file, { onTransfer = null } = {}) {
+function readerOf(file, { onTransfer = null, sourceAccess = null } = {}) {
   if (typeof Blob !== 'undefined' && file instanceof Blob) {
     return createByteReader(blobByteSource(file));
   }
   if (isRemoteFile(file)) {
     const head = file.head ?? null;
+    if (file.access != null && sourceAccess === null) {
+      throw new TypeError(`${file.name} needs its access, which this reader was not given.`);
+    }
     const source = httpByteSource({
       url: file.url,
       size: file.size,
       name: file.name,
       identity: file.identity ?? null,
       etag: head?.etag ?? null,
-    });
+    }, file.access == null ? {} : { access: sourceAccess(file.access) });
     const reader = createByteReader(source, {
       onTransfer: progress => onTransfer?.({ url: file.url, ...progress }),
       head: head === null ? null : { bytes: head.bytes, ms: head.ms },
     });
     reader.link.watchProtocol(source.url);
+    reportArrivals(reader.link, file.url, onTransfer);
     return reader;
   }
   throw new TypeError('An AnnData file must be a File or a remote file {url, size}.');
+}
+
+/**
+ * What a reader's link does between its counted requests, for whoever
+ * watches the read (the Transfers log, a startup step): while a request's
+ * bytes arrive, `onTransfer` hears `{url, arriving: true}` at most every
+ * `ARRIVAL_INTERVAL_MS` (a read of one large request shows progress before
+ * it completes); each request made again after a transient failure is
+ * `{url, retrying: message}`, the failure naming the request's URL.
+ */
+const ARRIVAL_INTERVAL_MS = 250;
+
+function reportArrivals(link, url, onTransfer) {
+  if (onTransfer === null) return;
+  let last = -Infinity;
+  link.responses.onReceived = () => {
+    const now = performance.now();
+    if (now - last < ARRIVAL_INTERVAL_MS) return;
+    last = now;
+    onTransfer({ url, arriving: true });
+  };
+  link.responses.onRetry = (error, attempts) => {
+    onTransfer({ url, retrying: `${error.message} Asked ${attempts} time${attempts === 1 ? '' : 's'} so far.` });
+  };
 }
 
 function explained(message, cause, extra = {}) {
@@ -113,37 +144,6 @@ export function explainFormatError(error, kind) {
 }
 
 /**
- * `fetch` for a Zarr folder on a web host, measuring the link with every
- * request (`link`) and counting what it sends for the Transfers log
- * (`{url, bytes, requests, ms}` running totals keyed by the folder).
- */
-function measuredFetch(folderUrl, link, onTransfer) {
-  let bytes = 0;
-  let requests = 0;
-  return async (url, init) => {
-    const started = link.begin();
-    let body;
-    let response;
-    try {
-      response = await globalThis.fetch(url, init);
-      if (init?.method === 'HEAD') {
-        link.end(started, null);
-        return response;
-      }
-      body = await response.arrayBuffer();
-    } catch (error) {
-      link.end(started, null);
-      throw error;
-    }
-    link.end(started, body.byteLength);
-    bytes += body.byteLength;
-    requests += 1;
-    onTransfer?.({ url: folderUrl, bytes, requests, ms: performance.now() - started });
-    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-  };
-}
-
-/**
  * @typedef {Object} OpenedStore
  * @property {Object} root - The store root group
  * @property {import('./elements.js').AnnDataFormat} format
@@ -163,15 +163,17 @@ function measuredFetch(folderUrl, link, onTransfer) {
  * @param {{decodedChunkCacheBytes: number, onTransfer?: Function, signal?: AbortSignal|null,
  *   activity?: import('../../formats/io/activity.js').ReadActivity|null}} options
  *   `activity` counts every read of opening (the file's whole structure).
+ *   `sourceAccess(descriptor)`: the byte source access of a remote file that
+ *   names one (`{provider, ref}`: a sign-in or an expiring link).
  * @returns {Promise<OpenedStore>}
  */
-export async function openAnnDataStore({ kind, source }, { decodedChunkCacheBytes, onTransfer = null, signal = null, activity = null }) {
+export async function openAnnDataStore({ kind, source }, { decodedChunkCacheBytes, onTransfer = null, signal = null, activity = null, sourceAccess = null }) {
   try {
     if (kind === 'h5ad') {
       if (!isRemoteFile(source) && source?.size === 0) {
         throw explained('The selected H5AD file is empty. Choose an AnnData .h5ad file or regenerate it with AnnData.');
       }
-      const reader = readerOf(source, { onTransfer });
+      const reader = readerOf(source, { onTransfer, sourceAccess });
       const root = await openHdf5(reader, { signal, activity, decodedChunkCacheBytes });
       return { root, format: H5AD_FORMAT, name: source.name, link: reader.link };
     }
@@ -205,7 +207,7 @@ export async function openAnnDataStore({ kind, source }, { decodedChunkCacheByte
         }
       } else if (source?.archive) {
         name = source.archive.name || 'dataset.zarr.zip';
-        const reader = readerOf(source.archive, { onTransfer });
+        const reader = readerOf(source.archive, { onTransfer, sourceAccess });
         link = reader.link;
         const archive = await openZipArchive(reader, { name, signal, activity });
         store = zipStore(archive, { name });
@@ -213,7 +215,10 @@ export async function openAnnDataStore({ kind, source }, { decodedChunkCacheByte
         name = source.name ?? source.url;
         link = new LinkMeter(REMOTE_POLICY);
         link.watchProtocol(new URL(source.url).href);
-        store = httpStore(source.url, { name, concurrency: link, fetch: measuredFetch(source.url, link, onTransfer) });
+        // Every request measures the link and is counted for the Transfers
+        // log (`{url, bytes, requests, ms}` running totals keyed by the folder).
+        store = httpStore(source.url, { name, concurrency: link, onTransfer });
+        reportArrivals(link, source.url, onTransfer);
       } else {
         throw new TypeError('A Zarr source is a folder {files, rootName}, an archive {archive} or a folder URL {url}.');
       }

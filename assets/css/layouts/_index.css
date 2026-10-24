@@ -1,6 +1,6 @@
 /* layouts/_index.css - Aggregates all layout modules. */
 
 @import '_app.css';
-@import '_not-found.css';
+@import '_page.css';
 @import '_responsive.css';
 @import '_print.css';

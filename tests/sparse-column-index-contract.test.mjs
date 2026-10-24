@@ -405,3 +405,31 @@ test('genes asked for together are weighed together: one reads its ranges, many 
   assert.deepEqual(await index.column(0), denseColumn(fixture, 0));
   assert.equal(valueRanges.length, afterBatch, 'later genes read nothing');
 });
+
+test('an abandoned spill directory is swept when the app starts; a held one is kept', async () => {
+  const { sweepAbandonedIndexes } = await import('../assets/js/data/column-store-placement.js');
+  const removed = [];
+  const held = new Set(['cellucid-column-index/live']);
+  const parent = {
+    async *entries() {
+      yield ['live', {}];
+      yield ['crashed', {}];
+    },
+    async removeEntry(name) {
+      removed.push(name);
+    },
+  };
+  const environment = {
+    navigator: {
+      storage: { getDirectory: async () => ({ getDirectoryHandle: async () => parent }) },
+      locks: { request: async (name, _options, callback) => callback(held.has(name) ? null : { name }) },
+    },
+  };
+  await sweepAbandonedIndexes(environment);
+  assert.deepEqual(removed, ['crashed']);
+  // No OPFS, or no index directory yet: nothing to do, and nothing thrown.
+  await sweepAbandonedIndexes({ navigator: {} });
+  await sweepAbandonedIndexes({
+    navigator: { storage: { getDirectory: async () => ({ getDirectoryHandle: async () => { throw new DOMException('none', 'NotFoundError'); } }) } },
+  });
+});

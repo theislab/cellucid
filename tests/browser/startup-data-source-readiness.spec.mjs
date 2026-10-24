@@ -16,7 +16,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import {
   APP_ORIGIN as ORIGIN,
   SAMPLE_ORIGIN,
@@ -27,7 +27,6 @@ const fixturesDirectory = path.join(
   'fixtures',
 );
 const GOOD_CATALOG = `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
-const BROKEN_CATALOGS = `${ORIGIN}/tests/browser/fixtures/broken-catalogs/`;
 const GOOD_DATASET = Object.freeze({
   id: 'synthetic-cell-types-2d',
   name: 'Synthetic cell-type islands — 2D',
@@ -46,16 +45,11 @@ const LOCAL_DATASET = Object.freeze({
 /** Every control a user can reach to point Cellucid at their own data. */
 const DATA_SOURCE_CONTROLS = Object.freeze([
   '#dataset-select',
-  '#user-data-h5ad-btn',
-  '#user-data-zarr-archive-btn',
-  '#user-data-zarr-folder-btn',
-  '#user-data-h5ad-input',
-  '#user-data-zarr-archive-input',
-  '#user-data-zarr-folder-input',
-  '#remote-server-url',
-  '#remote-connect-btn',
-  '#data-link-url',
-  '#data-link-connect-btn',
+  '#user-data-open-btn',
+  '#user-data-file-input',
+  '#user-data-folder-input',
+  '#data-address',
+  '#data-address-open-btn',
 ]);
 
 const STATUS = '#data-source-status';
@@ -94,7 +88,7 @@ async function readControlStates(page) {
 
 test(
   'no data-source control is offered while its listener is unattached',
-  async ({ page }, testInfo) => {
+  async ({ page, browserName }, testInfo) => {
     await withHeldCatalog(page, async releaseCatalog => {
       await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
         waitUntil: 'domcontentloaded',
@@ -147,10 +141,7 @@ test(
 
     // And they really work, rather than merely looking enabled: a Zarr
     // folder holding a different dataset replaces what startup put on screen.
-    await chooseDirectory(
-      page.locator('#user-data-zarr-folder-input'),
-      LOCAL_DATASET.path,
-    );
+    await openZarrFolder(page, browserName, LOCAL_DATASET.path);
     await expect(page.locator('#dataset-name')).toHaveText(LOCAL_DATASET.name);
     await expect(page.locator('#dataset-cells')).toHaveText(
       String(LOCAL_DATASET.cells),
@@ -171,7 +162,7 @@ test('a keyboard user can reach and use the controls once they open', async ({
   await page.keyboard.press('Escape');
   await expect(page.locator('#welcome-modal')).toBeHidden();
 
-  const input = page.locator('#remote-server-url');
+  const input = page.locator('#data-address');
   await input.focus();
   await expect(input).toBeFocused();
   await page.keyboard.type(`${SAMPLE_ORIGIN}/`);
@@ -180,13 +171,14 @@ test('a keyboard user can reach and use the controls once they open', async ({
   // Tab order is engine policy — WebKit does not put buttons in it unless full
   // keyboard access is on — so operability is what is asserted: the admitted
   // button takes focus and acts on a key press.
-  const connect = page.locator('#remote-connect-btn');
+  const connect = page.locator('#data-address-open-btn');
   await connect.focus();
   await expect(connect).toBeFocused();
   await page.keyboard.press('Enter');
+  // A bare address of this computer is a server, and none answers there.
   await expect(
     page.locator('#notification-center .notification').filter({
-      hasText: /The remote server/,
+      hasText: /The Cellucid server could not be reached/,
     }),
   ).toHaveCount(1);
 });
@@ -194,7 +186,16 @@ test('a keyboard user can reach and use the controls once they open', async ({
 test('a terminal startup failure leaves exactly one dialog on screen', async ({
   page,
 }, testInfo) => {
-  await page.goto(catalogUrl(`${BROKEN_CATALOGS}corrupt-file/`, null), {
+  // Only a failure of the app itself is terminal (a dataset that does not
+  // open leaves the app running): here, a browser with no WebGL2, after
+  // onboarding has opened.
+  await page.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {
+      return kind === 'webgl2' ? null : getContext.call(this, kind, ...rest);
+    };
+  });
+  await page.goto(catalogUrl(GOOD_CATALOG, null), {
     waitUntil: 'domcontentloaded',
   });
 

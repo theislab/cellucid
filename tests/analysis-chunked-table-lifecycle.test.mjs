@@ -92,7 +92,7 @@ test('closing the expanded view and destroying the UI cancel the chunks', async 
       new URL(`../assets/js/app/analysis/ui/analysis-types/${file}`, import.meta.url),
       'utf8'
     );
-    assert.match(mode, /this\._renderTableRows\(tbody, genesToShow, createRowEl,/);
+    assert.match(mode, /this\._renderTableRows\(tbody, \w+, /, `${file} draws its gene table through the cancellable chunked renderer`);
     assert.doesNotMatch(mode, /setTimeout\(renderChunk/);
   }
 });

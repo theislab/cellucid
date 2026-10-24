@@ -721,6 +721,65 @@ test('exports PNG and every explicit SVG strategy through the visible UI', async
   expect(productErrors).toEqual([]);
 });
 
+test('the point pass drawn on the page equals the one drawn in the worker', async ({
+  page,
+}, testInfo) => {
+  // A browser whose workers have no WebGL2 (WebKitGTK, WPE) draws the point
+  // pass on the page, with the same handler. Here both placements export the
+  // same view: the Hybrid SVG's point raster is the same PNG, and the PNG
+  // export completes.
+  const productErrors = observeProductErrors(page);
+  await installExportProbe(page);
+  await openFigureExport(page, `figure-export-point-pass-${testInfo.project.name}`);
+  const pointRasters = svg => [...svg.toString('utf8').matchAll(
+    /<image [^>]*href="(data:image\/png;base64,[A-Za-z0-9+/=]+)"/g,
+  )].map(match => match[1]);
+  const placement = () => page.evaluate(async () => {
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
+    );
+    return client.figureExportRasterizesOnPage();
+  });
+
+  const first = await exportOne({
+    page,
+    testInfo,
+    mode: 'svg',
+    strategy: 'hybrid',
+    artifactLabel: `${testInfo.project.name}-point-pass-measured`,
+  });
+  // The worker was asked; on this engine it answered either way.
+  expect(typeof await placement()).toBe('boolean');
+
+  await page.evaluate(async () => {
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
+    );
+    client.setFigureExportWorkerWebgl2(false);
+  });
+  expect(await placement()).toBe(true);
+  const onPage = await exportOne({
+    page,
+    testInfo,
+    mode: 'svg',
+    strategy: 'hybrid',
+    artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
+  });
+  assertSvgArtifact(onPage.bytes, 'hybrid');
+  expect(pointRasters(onPage.bytes)).toEqual(pointRasters(first.bytes));
+  expect(pointRasters(onPage.bytes).length).toBeGreaterThan(0);
+
+  const png = await exportOne({
+    page,
+    testInfo,
+    mode: 'png',
+    strategy: null,
+    artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
+  });
+  assertPngArtifact(png.bytes);
+  expect(productErrors).toEqual([]);
+});
+
 test('exports the sculpted shader quality as PNG and every SVG strategy', async ({
   page,
 }, testInfo) => {

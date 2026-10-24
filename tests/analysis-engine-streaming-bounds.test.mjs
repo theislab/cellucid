@@ -3,11 +3,13 @@
  * it is tuned for speed:
  *
  * 1. Set identity. The values a comparison sees are exactly the cells that were
- *    selected, in cell-index order, and nothing else. Prefetch depth, network
- *    concurrency and buffer sizing are allowed to change *when* a gene arrives;
- *    they are never allowed to change *which cells* it contributes.
- * 2. The memory bound. The buffer that hides network latency is sized from the
- *    caller's budget, and what it pins has to stay inside that budget.
+ *    selected, in cell-index order, and nothing else. The read-ahead the run
+ *    tuner chooses is allowed to change *when* a gene arrives; it is never
+ *    allowed to change *which cells* it contributes.
+ * 2. The read-ahead is the tuner's: the loader keeps exactly as many genes
+ *    buffered or in flight as the tuner says, and tells it about every read.
+ *    (How the tuner sizes it, inside the memory budget, is
+ *    `analysis-run-tuner-contract.test.mjs`.)
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -17,8 +19,19 @@ import {
   createTwoGroupContext,
   splitTwoGroups
 } from '../assets/js/app/analysis/compute/gene-statistics.js';
-import { getPerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
-import { DEFAULTS } from '../assets/js/app/analysis/genes-panel/constants.js';
+
+/** A tuner that reads `depth` genes ahead and records what it is told. */
+function fixedTuner(depth) {
+  const reads = [];
+  return {
+    reads,
+    pressure: 0,
+    prefetchDepth: () => depth,
+    observeRead(read) { reads.push(read); },
+    setReadsPending() {},
+    onPressure() { this.pressure++; },
+  };
+}
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -143,7 +156,7 @@ test('streamGenes yields exactly the selected cells, in cell-index order', async
 
   const loader = new StreamingGeneLoader({
     dataLayer,
-    config: { preloadCount: 5, networkConcurrency: 3, memoryBudgetMB: 256 }
+    tuner: fixedTuner(5)
   });
 
   const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
@@ -180,7 +193,7 @@ test('a rest-of group is exactly the complement of its excluded cells', async ()
 
   const loader = new StreamingGeneLoader({
     dataLayer,
-    config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 256 }
+    tuner: fixedTuner(4)
   });
 
   const genes = ['GENE0', 'GENE1', 'GENE2', 'GENE3'];
@@ -198,7 +211,7 @@ test('a rest-of group is exactly the complement of its excluded cells', async ()
   }
 });
 
-test('prefetch depth and concurrency never change the streamed set', async () => {
+test('the read-ahead never changes the streamed set', async () => {
   const pointCount = 2000;
   const geneCount = 20;
   const selection = sortedUniqueIndices(pointCount, 400, 91);
@@ -209,13 +222,9 @@ test('prefetch depth and concurrency never change the streamed set', async () =>
 
   /** @type {string[]|null} */
   let reference = null;
-  for (const config of [
-    { preloadCount: 1, networkConcurrency: 1, memoryBudgetMB: 128 },
-    { preloadCount: 3, networkConcurrency: 12, memoryBudgetMB: 512 },
-    { preloadCount: 50, networkConcurrency: 24, memoryBudgetMB: 4096 }
-  ]) {
+  for (const depth of [1, 3, 50]) {
     const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1 });
-    const loader = new StreamingGeneLoader({ dataLayer, config });
+    const loader = new StreamingGeneLoader({ dataLayer, tuner: fixedTuner(depth) });
     const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
     const digest = [];
     const groupA = { isRestOf: false, cellIndices: selection };
@@ -230,7 +239,7 @@ test('prefetch depth and concurrency never change the streamed set', async () =>
     }
     assert.equal(digest.length, geneCount);
     if (reference === null) reference = digest;
-    else assert.deepEqual(digest, reference, `config ${JSON.stringify(config)} changed the set`);
+    else assert.deepEqual(digest, reference, `read-ahead ${depth} changed the set`);
   }
 });
 
@@ -240,7 +249,7 @@ test('streamGenesRaw yields the values of every gene in request order', async ()
   const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1 });
   const loader = new StreamingGeneLoader({
     dataLayer,
-    config: { preloadCount: 6, networkConcurrency: 12, memoryBudgetMB: 512 }
+    tuner: fixedTuner(6)
   });
   const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
   let expectedIndex = 0;
@@ -257,75 +266,23 @@ test('streamGenesRaw yields the values of every gene in request order', async ()
   assert.equal(expectedIndex, geneCount);
 });
 
-test('the prefetch buffer stays inside the memory budget it was given', async () => {
-  // The buffer pins one DataLayer var-field array per buffered gene. Whatever
-  // sizing rule is in force, what it pins must fit the share of the budget the
-  // loader reserves for buffered gene data.
-  const bufferBudgetFraction = 0.3;
-  for (const [pointCount, budgetMB] of [
-    [561_947, 512],
-    [561_947, 256],
-    [219_731, 512],
-    [71_650, 512],
-    [3_696, 512]
-  ]) {
-    const dataLayer = createDataLayer({ pointCount: 16, geneCount: 1 });
-    dataLayer.state.pointCount = pointCount;
-    const loader = new StreamingGeneLoader({
-      dataLayer,
-      config: { preloadCount: 500, networkConcurrency: 12, memoryBudgetMB: budgetMB }
-    });
-    loader._recalculateBufferSize();
-    const pinnedBytes = loader._maxBufferSize * pointCount * 4;
-    const reservedBytes = budgetMB * 1024 * 1024 * bufferBudgetFraction;
-    assert.ok(
-      pinnedBytes <= reservedBytes || loader._maxBufferSize === loader._minimumBufferSize,
-      `${pointCount} cells at ${budgetMB}MB pins ${(pinnedBytes / 2 ** 20).toFixed(1)}MB ` +
-      `against a ${(reservedBytes / 2 ** 20).toFixed(1)}MB reservation`
-    );
-    assert.ok(loader._maxBufferSize >= loader._minimumBufferSize);
-    assert.ok(loader._maxBufferSize <= 500);
-  }
-});
-
-test('the buffer does not throttle the configured network concurrency', async () => {
-  // One gene is one HTTP request, and `_startPrefetch` will not start more loads
-  // than there are free buffer slots. If the buffer is sized below the requested
-  // concurrency, the request parallelism the user asked for silently disappears.
-  const config = getPerformanceConfig();
-  for (const pointCount of [561_947, 219_731, 71_650, 3_696]) {
-    const dataLayer = createDataLayer({ pointCount: 16, geneCount: 1 });
-    dataLayer.state.pointCount = pointCount;
-    const loader = new StreamingGeneLoader({
-      dataLayer,
-      config: { preloadCount: config.batch.defaultPreloadCount }
-    });
-    loader._recalculateBufferSize();
-    assert.ok(
-      loader._maxBufferSize >= config.batch.networkConcurrency,
-      `${pointCount} cells: buffer ${loader._maxBufferSize} caps concurrency ` +
-      `${config.batch.networkConcurrency}`
-    );
-  }
-});
-
-test('concurrent gene loads actually reach the configured concurrency', async () => {
+test('the loader reads exactly as far ahead as the tuner says, and reports every read', async () => {
   const pointCount = 4000;
   const geneCount = 60;
-  const dataLayer = createDataLayer({ pointCount, geneCount, latency: 5 });
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 100, networkConcurrency: 12, memoryBudgetMB: 512 }
-  });
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  let count = 0;
-  for await (const _item of loader.streamGenesRaw(genes)) count++;
-  assert.equal(count, geneCount);
-  assert.equal(
-    dataLayer.getPeakConcurrent(),
-    12,
-    'the loader must saturate the configured request concurrency'
-  );
+  for (const depth of [1, 7, 12]) {
+    const dataLayer = createDataLayer({ pointCount, geneCount, latency: 5 });
+    const tuner = fixedTuner(depth);
+    const loader = new StreamingGeneLoader({ dataLayer, tuner });
+    const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
+    let count = 0;
+    for await (const _item of loader.streamGenesRaw(genes)) count++;
+    assert.equal(count, geneCount);
+    assert.equal(dataLayer.getPeakConcurrent(), depth, `read-ahead ${depth} is filled and never exceeded`);
+    assert.equal(tuner.reads.length, geneCount, 'every read is reported to the tuner');
+    for (const read of tuner.reads) {
+      assert.ok(read.bytes > 0 && read.ms >= 0, 'a read is reported with its bytes and time');
+    }
+  }
 });
 
 test('an aborted stream starts no further requests and lets go of every gene', async () => {
@@ -335,7 +292,7 @@ test('an aborted stream starts no further requests and lets go of every gene', a
   const controller = new AbortController();
   const loader = new StreamingGeneLoader({
     dataLayer,
-    config: { preloadCount: 40, networkConcurrency: 12, memoryBudgetMB: 512 },
+    tuner: fixedTuner(40),
     signal: controller.signal
   });
   const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
@@ -358,42 +315,6 @@ test('an aborted stream starts no further requests and lets go of every gene', a
   assert.equal(loader._loadingGenes.size, 0, 'no load is left running');
   assert.equal(loader._inFlightLoads.size, 0, 'no load task is left unsettled');
   assert.equal(loader._waitingFor.size, 0, 'no consumer is left waiting');
-});
-
-test('the gene-request concurrency defaults agree across the analysis engine', () => {
-  const config = getPerformanceConfig();
-  assert.equal(
-    DEFAULTS.networkConcurrency,
-    config.batch.networkConcurrency,
-    'genes-panel defaults must not diverge from PerformanceConfig'
-  );
-
-  // A preset ladder that is not monotone would mean "high performance" asks for
-  // fewer concurrent requests than the plain default.
-  const ladder = ['lowMemory', 'balanced', 'highPerformance', 'maximum'];
-  for (let i = 1; i < ladder.length; i++) {
-    assert.ok(
-      config.presets[ladder[i]].networkConcurrency >=
-        config.presets[ladder[i - 1]].networkConcurrency,
-      `${ladder[i]} must not request less concurrency than ${ladder[i - 1]}`
-    );
-  }
-  assert.equal(
-    config.presets.balanced.networkConcurrency,
-    config.batch.networkConcurrency,
-    'the balanced preset is the default and must match it'
-  );
-
-  const options = config.getNetworkConcurrencyOptions();
-  const selected = options.filter(option => option.selected);
-  assert.equal(selected.length, 1, 'exactly one concurrency option is the current one');
-  assert.equal(selected[0].value, config.batch.networkConcurrency);
-  for (const preset of ladder) {
-    assert.ok(
-      options.some(option => option.value === config.presets[preset].networkConcurrency),
-      `the ${preset} preset value must be reachable from the selector`
-    );
-  }
 });
 
 test('readCellSubset reads two named groups by cell when the source can, with the same values and no gene loaded whole', async () => {
@@ -435,7 +356,7 @@ test('readCellSubset reads two named groups by cell when the source can, with th
   };
   const loader = new StreamingGeneLoader({
     dataLayer: subsetLayer,
-    config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 64 }
+    tuner: fixedTuner(4)
   });
   const block = await loader.readCellSubset(genes, groupAIndices, groupBIndices);
   assert.equal(asked.length, 1, 'one read for every gene');
@@ -467,7 +388,7 @@ test('readCellSubset reads two named groups by cell when the source can, with th
   // read by column.
   const columnLayer = createDataLayer({ pointCount, geneCount });
   columnLayer.readGeneCellSubset = async () => null;
-  const byGene = new StreamingGeneLoader({ dataLayer: columnLayer, config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 64 } });
+  const byGene = new StreamingGeneLoader({ dataLayer: columnLayer, tuner: fixedTuner(4) });
   assert.equal(await byGene.readCellSubset(genes, groupAIndices, groupBIndices), null);
 });
 
@@ -478,7 +399,7 @@ test('a streamed gene is owned by its run unless a view holds it', async () => {
   const dataLayer = createDataLayer({ pointCount, geneCount: 3, shown: new Set(['GENE1']) });
   const loader = new StreamingGeneLoader({
     dataLayer,
-    config: { preloadCount: 3, networkConcurrency: 3, memoryBudgetMB: 64 }
+    tuner: fixedTuner(3)
   });
   const owned = {};
   for await (const item of loader.streamGenesRaw(genes)) owned[item.gene] = item.owned;
@@ -486,9 +407,8 @@ test('a streamed gene is owned by its run unless a view holds it', async () => {
 
   // Two runs at once each read and own their own entries of a gene.
   const shared = createDataLayer({ pointCount, geneCount: 3, latency: 1 });
-  const config = { preloadCount: 3, networkConcurrency: 3, memoryBudgetMB: 64 };
-  const first = new StreamingGeneLoader({ dataLayer: shared, config });
-  const second = new StreamingGeneLoader({ dataLayer: shared, config });
+  const first = new StreamingGeneLoader({ dataLayer: shared, tuner: fixedTuner(3) });
+  const second = new StreamingGeneLoader({ dataLayer: shared, tuner: fixedTuner(3) });
   const firstItems = [];
   const secondItems = [];
   await Promise.all([

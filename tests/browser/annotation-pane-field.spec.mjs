@@ -62,6 +62,8 @@ const canvasCursor = page => page.evaluate(
 );
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
+// The active tool's gesture, or what it needs first: the Selection (i)'s first line.
+const TOOL_HINT = '#highlight-tool-hint';
 
 /** Focus as both owners publish it: the viewer's pane and the state's view. */
 const focusOf = page => page.evaluate(() => ({
@@ -338,10 +340,10 @@ test('Alt+click in a colored pane selects although the focused view has no field
 
   // One pane on screen has a field, so the panel invites a click rather than
   // asking for a field first.
-  await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+  await expect(page.locator(TOOL_HINT)).toContainText(
     'Alt+click a cell to select',
   );
-  await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+  await expect(page.locator(TOOL_HINT)).not.toContainText(
     'Color by a field first',
   );
 

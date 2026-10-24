@@ -159,8 +159,8 @@ test('the sidebar Connect control adopts a real Python server', async ({
     'Synthetic cell-type islands — 2D',
   );
 
-  await page.locator('#remote-server-url').fill(ANNDATA_SERVER);
-  await page.locator('#remote-connect-btn').click();
+  await page.locator('#data-address').fill(ANNDATA_SERVER);
+  await page.locator('#data-address-open-btn').click();
 
   await expectRendered(page, {
     name: 'Miller lung (real h5ad)',
@@ -217,16 +217,18 @@ test('the Open from link control loads a published GitHub repository', async ({
     'Synthetic cell-type islands — 2D',
   );
 
-  await page.locator('#data-link-url').fill(GITHUB_REPOSITORY);
-  await page.locator('#data-link-connect-btn').click();
+  await page.locator('#data-address').fill(GITHUB_REPOSITORY);
+  await page.locator('#data-address-open-btn').click();
 
   await expect(
     page.locator('#notification-center .notification')
       .filter({ hasText: 'Connected - 3 datasets found' }),
   ).toHaveCount(1, { timeout: 60_000 });
   await expect(
-    page.locator('#dataset-select optgroup[label="Linked data"] option'),
+    page.locator('#dataset-select option[value^="dataset:link:"]'),
   ).toHaveCount(3);
+  // While the catalog is connected the list is its own, named by its host.
+  await expect(page.locator('label[for="dataset-select"]')).toHaveText(/^Dataset from /);
 });
 
 /* ------------------------------------------------------------------ *

@@ -7,25 +7,26 @@
   <!--
     GitHub Pages answers every path it has no file for with this page and an
     HTTP 404 status. It can be served at any depth (/a/b/c), so every URL here
-    is root-absolute. It is the welcome card on the viewer's backdrop, styled by
-    the app's own stylesheet (layouts/_not-found.css), and it takes the theme
-    and backdrop the visitor chose in the app through the same bootstrap script
-    index.html runs; the defaults above are the app's defaults.
+    is root-absolute. It is the brand card on the viewer's backdrop, styled by
+    page.css (the app's tokens, themes and brand card, without the app's
+    panels), and it takes the theme and backdrop the visitor chose in the app
+    through the same bootstrap script index.html runs; the defaults above are
+    the app's defaults.
   -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; manifest-src 'self';" />
   <meta name="robots" content="noindex" />
   <meta name="description" content="This page does not exist. Open Cellucid, the interactive single-cell data visualization app, or read its documentation." />
   <meta name="theme-color" content="#ffffff" />
   <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
-  <link rel="icon" type="image/x-icon" href="/assets/img/favicon.ico" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
   <link rel="apple-touch-icon" sizes="180x180" href="/assets/img/apple-touch-icon.png" />
   <link rel="manifest" href="/site.webmanifest" />
   <script src="/assets/js/app/ui/core/theme-init.js"></script>
   <link rel="preload" href="/assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
-  <link rel="stylesheet" href="/assets/css/main.css" />
+  <link rel="stylesheet" href="/assets/css/page.css" />
 </head>
-<body class="not-found-page">
-  <main class="not-found" aria-labelledby="not-found-title">
+<body class="page">
+  <main class="page-screen" aria-labelledby="not-found-title">
     <div class="welcome-content">
       <div class="welcome-header">
         <img src="/assets/img/cellucid-logo.svg" alt="Cellucid" class="welcome-logo" width="260" height="80" />
@@ -33,7 +34,7 @@
       </div>
 
       <div class="welcome-body">
-        <h1 id="not-found-title" class="not-found-title">Page not found</h1>
+        <h1 id="not-found-title" class="welcome-title">Page not found</h1>
         <p class="welcome-intro">There is nothing at this address. The link may be old, or the address may have a typo. Cellucid itself is one page, and its guides live in the documentation.</p>
 
         <div class="welcome-actions">
@@ -54,7 +55,7 @@
           </a>
         </div>
 
-        <ul class="not-found-links" aria-label="More about Cellucid">
+        <ul class="welcome-links" aria-label="More about Cellucid">
           <li><a href="https://github.com/theislab/cellucid">GitHub</a></li>
           <li><a href="https://docs.cellucid.com/en/latest/citing.html">Cite Cellucid</a></li>
         </ul>

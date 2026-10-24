@@ -35,7 +35,7 @@ async function openPreparedDataset(page) {
 
 async function replaceWithFreshPreparedDataset(page) {
   await page.locator('#dataset-select').selectOption('__none__');
-  await expect(page.locator('#dataset-name')).toHaveText('—');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await page.locator('#dataset-select').selectOption(DATASET_OPTION);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',

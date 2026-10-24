@@ -40,6 +40,7 @@ import {
   ascendingOrder,
   log2FoldChangeOfMeans,
   mannWhitneyPValue,
+  mannWhitneyPValueScanpy,
   sortedAscending,
   welchTTestFromMoments
 } from './math-utils.js';
@@ -345,54 +346,71 @@ function feedTwoSampleBlocks(sampleA, sampleB, a, b, sums) {
 }
 
 /**
- * Differential expression of one gene between two samples: means, log2 fold
- * change, and a Mann-Whitney U (`wilcox`) or Welch (`ttest`) probability —
- * exactly the numbers the same test gives over the dense finite values of
- * each group (`mannWhitneyU`, `welchTTest` and `mean` in math-utils).
+ * Differential expression of one gene between two samples: means, the
+ * fraction of each with a non-zero value (%), a log2 fold change, a score
+ * (rank-sum z or Welch t), AUROC (Wilcoxon) and a probability — under the
+ * default options exactly the numbers the same test gives over the dense
+ * finite values of each group (`mannWhitneyU`, `welchTTest` and `mean` in
+ * math-utils). `statistic` is the test's own: min(U1, U2), or t.
  *
  * @param {GeneSample} sampleA
  * @param {GeneSample} sampleB
- * @param {'wilcox'|'ttest'} method
- * @returns {{meanA: number, meanB: number, log2FoldChange: number, pValue: number, statistic: number, nA: number, nB: number, method?: string}}
+ * @param {'wilcox'|'ttest'|'ttest_overestim_var'} method
+ * @param {{pConvention?: 'exact'|'normal'|'normal_tie', foldChange?: {mode: 'stored'|'log1p', base?: number|null}}} [options]
+ * @returns {{meanA: number, meanB: number, pctA: number, pctB: number, log2FoldChange: number, pValue: number, statistic: number, score: number, auroc: number, nA: number, nB: number, method?: string}}
  */
-export function twoSampleDifferential(sampleA, sampleB, method) {
-  if (method !== 'wilcox' && method !== 'ttest') {
-    throw new RangeError('Differential expression method must be wilcox or ttest');
+export function twoSampleDifferential(sampleA, sampleB, method, options = {}) {
+  if (!TEST_METHODS.includes(method)) {
+    throw new RangeError('Differential expression method must be wilcox, ttest or ttest_overestim_var');
   }
+  const { pConvention = 'exact', foldChange = { mode: 'stored' } } = options;
+  if (!P_CONVENTIONS.includes(pConvention)) throw new RangeError(`Unknown p-value convention ${pConvention}`);
   const a = describeSample(sampleA, 'Group A');
   const b = describeSample(sampleB, 'Group B');
   const nA = a.n;
   const nB = b.n;
+  const pctA = nA > 0 ? (a.nonZero / nA) * 100 : NaN;
+  const pctB = nB > 0 ? (b.nonZero / nB) * 100 : NaN;
   if (nA < 2 || nB < 2) {
     return {
       meanA: NaN,
       meanB: NaN,
+      pctA,
+      pctB,
       log2FoldChange: NaN,
       pValue: NaN,
       statistic: NaN,
+      score: NaN,
+      auroc: NaN,
       nA,
       nB
     };
   }
   const meanA = a.sum / nA;
   const meanB = b.sum / nB;
-  const log2FoldChange = log2FoldChangeOfMeans(meanA, meanB, Math.min(a.minimum, b.minimum));
+  const log2FoldChange = foldChangeOfMeans(meanA, meanB, Math.min(a.minimum, b.minimum), foldChange);
 
   let pValue;
   let statistic;
+  let score;
+  let auroc = NaN;
   if (method === 'wilcox') {
     const sums = new TwoSampleRankSum();
     feedTwoSampleBlocks(sampleA, sampleB, a, b, sums);
     const U1 = sums.rankSumA - (nA * (nA + 1)) / 2;
     const U2 = nA * nB - U1;
     statistic = Math.min(U1, U2);
-    ({ pValue } = mannWhitneyPValue(nA, nB, statistic, { tieTerm: sums.tieTerm }));
+    const comparison = rankSumComparison(sums.rankSumA, nA, nB, sums.tieTerm, pConvention);
+    ({ pValue, score, auroc } = comparison);
   } else {
-    const varianceA = centredSumOfSquares(sampleA, meanA) / (nA - 1);
-    const varianceB = centredSumOfSquares(sampleB, meanB) / (nB - 1);
-    ({ pValue, statistic } = welchTTestFromMoments(meanA, varianceA, nA, meanB, varianceB, nB));
+    const m2A = centredSumOfSquares(sampleA, meanA);
+    const m2B = centredSumOfSquares(sampleB, meanB);
+    const test = welchComparison(meanA, m2A, nA, meanB, m2B, nB, method);
+    statistic = test.score;
+    score = test.score;
+    pValue = test.pValue;
   }
-  return { meanA, meanB, log2FoldChange, pValue, statistic, nA, nB, method };
+  return { meanA, meanB, pctA, pctB, log2FoldChange, pValue, statistic, score, auroc, nA, nB, method };
 }
 
 // ============================================================================
@@ -480,26 +498,121 @@ export function splitTwoGroups(column, context) {
 }
 
 // ============================================================================
-// One group against the rest, every group at once (marker discovery)
+// Fold changes, scores and p-value conventions shared by both kernels
+// ============================================================================
+
+/** scanpy's `logfoldchanges` epsilon (`rank_genes_groups`). */
+const LOG1P_FOLD_CHANGE_EPSILON = 1e-9;
+
+/**
+ * A log2 fold change of two means under a fold-change mode:
+ *
+ * - `stored`: of the values as stored (`log2FoldChangeOfMeans`: pseudocount,
+ *   shifted when values are negative);
+ * - `log1p`: of the means taken back from log1p (scanpy's `logfoldchanges`):
+ *   `log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9))`, expm1 in the base the data
+ *   was logged with (`uns['log1p']['base']`, natural when null).
+ *
+ * @param {number} meanA
+ * @param {number} meanB
+ * @param {number} minimum - Minimum of the compared values (`stored` only)
+ * @param {{mode: 'stored'|'log1p', base?: number|null, pseudocount?: number}} foldChange
+ */
+export function foldChangeOfMeans(meanA, meanB, minimum, foldChange) {
+  if (foldChange.mode === 'log1p') {
+    const scale = foldChange.base == null ? 1 : Math.log(foldChange.base);
+    return Math.log2(
+      (Math.expm1(meanA * scale) + LOG1P_FOLD_CHANGE_EPSILON) /
+      (Math.expm1(meanB * scale) + LOG1P_FOLD_CHANGE_EPSILON)
+    );
+  }
+  return log2FoldChangeOfMeans(meanA, meanB, minimum, foldChange.pseudocount);
+}
+
+export const P_CONVENTIONS = Object.freeze(['exact', 'normal', 'normal_tie']);
+export const TEST_METHODS = Object.freeze(['wilcox', 'ttest', 'ttest_overestim_var']);
+
+/**
+ * A rank-sum comparison's score, AUROC and p-value.
+ *
+ * `score` is the z of the rank sum, `(R − n(N+1)/2) / sqrt(n·m·(N+1)/12·f)`,
+ * scanpy's `scores`, with `f` the tie factor `1 − Σ(t³−t)/(N³−N)` (1 under
+ * the `normal` convention, as scanpy's default `tie_correct=False`). AUROC is
+ * `U / (n·m)`. The p-value is the convention's: `exact` (exact when both
+ * sides are under 50 and untied, else normal with tie and continuity
+ * correction, as R and SciPy), `normal` / `normal_tie` (`2Φ(−|z|)`, scanpy).
+ *
+ * @param {number} rankSum - Rank sum of the group (ranks 1-based, ties averaged)
+ * @param {number} n - Group size
+ * @param {number} m - Reference size
+ * @param {number} tieTerm - Σ(t³ − t) over the tie blocks of both
+ * @param {'exact'|'normal'|'normal_tie'} convention
+ */
+export function rankSumComparison(rankSum, n, m, tieTerm, convention) {
+  const total = n + m;
+  const u = rankSum - (n * (n + 1)) / 2;
+  const auroc = u / (n * m);
+  const tieFactor = convention === 'normal' || total < 2
+    ? 1
+    : 1 - tieTerm / (total ** 3 - total);
+  const sd = Math.sqrt((n * m * (total + 1) / 12) * tieFactor);
+  const score = sd > 0 ? (rankSum - (n * (total + 1)) / 2) / sd : 0;
+  let pValue;
+  if (convention === 'exact') {
+    ({ pValue } = mannWhitneyPValue(n, m, Math.min(u, n * m - u), { tieTerm, allowExact: true }));
+  } else {
+    pValue = sd > 0 ? mannWhitneyPValueScanpy(score) : 1;
+  }
+  return { score, auroc, pValue: Number.isFinite(pValue) ? pValue : NaN };
+}
+
+/**
+ * Welch's t of a group against a reference from centred second moments.
+ * `ttest_overestim_var` divides the reference variance by the group's size
+ * instead of its own (scanpy's `t-test_overestim_var`).
+ */
+function welchComparison(meanA, m2A, nA, meanB, m2B, nB, method) {
+  const nForB = method === 'ttest_overestim_var' ? nA : nB;
+  const test = welchTTestFromMoments(meanA, m2A / (nA - 1), nA, meanB, m2B / (nB - 1), nForB);
+  return {
+    score: test.statistic,
+    pValue: Number.isFinite(test.pValue) ? test.pValue : NaN,
+  };
+}
+
+// ============================================================================
+// Every tested group against its reference (marker discovery)
 // ============================================================================
 
 /**
  * The grouping of a marker run: each cell's group (-1 for a cell in no
- * group) and every group's size.
+ * group: missing, out of scope, or left out of the rest), every group's
+ * size, which groups are tested (an untested group stays in the rest of the
+ * others), and the reference: -1 for the rest, else one group index.
  *
  * @param {Int16Array|Int32Array} cellGroupIndex
  * @param {number} groupCount
+ * @param {{tested?: Uint8Array, reference?: number}} [options]
  */
-export function createGroupingContext(cellGroupIndex, groupCount) {
+export function createGroupingContext(cellGroupIndex, groupCount, { tested = null, reference = -1 } = {}) {
   const groupSize = new Uint32Array(groupCount);
   for (let cell = 0; cell < cellGroupIndex.length; cell++) {
     const group = cellGroupIndex[cell];
     if (group >= 0) groupSize[group]++;
   }
+  const testedMask = tested ?? new Uint8Array(groupCount).fill(1);
+  if (!(testedMask instanceof Uint8Array) || testedMask.length !== groupCount) {
+    throw new TypeError('Tested groups must be a Uint8Array of one flag per group');
+  }
+  if (!Number.isSafeInteger(reference) || reference < -1 || reference >= groupCount) {
+    throw new RangeError('The reference must be -1 (the rest) or a group index');
+  }
   return {
     groupCount,
     cellGroupIndex,
     groupSize,
+    tested: testedMask,
+    reference,
     valueIndex: new DistinctValueIndex(),
     /** Rows of per-group counts, one row per distinct non-zero value. */
     countsByValue: new Uint32Array(64 * groupCount),
@@ -507,34 +620,38 @@ export function createGroupingContext(cellGroupIndex, groupCount) {
 }
 
 /**
- * One-vs-rest statistics of one gene for every group of a grouping: for each
- * group, its cells against every other grouped cell that carries a measured
- * value. Cost is linear in the gene's non-zero entries plus the groups times
- * the distinct values, whatever the cell count.
+ * Statistics of one gene for every tested group of a grouping against its
+ * reference (every other grouped cell, or one group): means, the fraction of
+ * cells with a non-zero value (scanpy's `pct_nz`), a fold change, a score
+ * (rank-sum z or Welch t), AUROC (Wilcoxon) and a p-value. Cost is linear in
+ * the gene's non-zero entries plus the groups times the distinct values.
  *
- * Means are each group's finite values summed in cell order over their count
- * (the rest: the total less the group); a Wilcoxon probability is exactly the
- * two-sample `mannWhitneyU` of the group against the rest; a Welch probability
- * comes from centred second moments of the group and of all grouped cells.
+ * A group is tested for the gene when it and its reference each hold at
+ * least `minCells` (and at least 2) cells with a measured value; otherwise
+ * its p-value is NaN. An untested group's means and fractions are still
+ * reported.
  *
  * @param {GeneSample} sample - The gene in every cell
  * @param {ReturnType<typeof createGroupingContext>} context
- * @param {{method: 'wilcox'|'ttest', minCells: number, pseudocount: number}} options
+ * @param {{method: 'wilcox'|'ttest'|'ttest_overestim_var', minCells: number,
+ *   pConvention?: 'exact'|'normal'|'normal_tie',
+ *   foldChange: {mode: 'stored'|'log1p', base?: number|null, pseudocount?: number}}} options
  */
-export function oneVsRestMarkers(sample, context, { method, minCells, pseudocount }) {
-  const { groupCount, cellGroupIndex, groupSize } = context;
+export function groupMarkers(sample, context, { method, minCells, pConvention = 'exact', foldChange }) {
+  const { groupCount, cellGroupIndex, groupSize, tested, reference } = context;
   if (sample.length !== cellGroupIndex.length) {
     throw new RangeError('Marker gene values must cover exactly the grouped cells');
   }
+  if (!TEST_METHODS.includes(method)) throw new RangeError(`Unknown marker method ${method}`);
+  if (!P_CONVENTIONS.includes(pConvention)) throw new RangeError(`Unknown p-value convention ${pConvention}`);
   const { indices, values } = sample;
   const wilcox = method === 'wilcox';
 
   const nonFinite = new Uint32Array(groupCount);
   const nonZero = new Uint32Array(groupCount);
-  const exprIn = new Uint32Array(groupCount);
   const sumIn = new Float64Array(groupCount);
   let sumAll = 0;
-  let exprAll = 0;
+  let nonZeroAll = 0;
   let minimumNonZero = Infinity;
 
   // Wilcoxon tabulates every non-zero value once per group (count-derived
@@ -545,26 +662,35 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
   let tabulated = wilcox;
   let counts = context.countsByValue;
 
+  // The whole column's moments over every cell, grouped or not
+  // (`shared/gene-moments-cache.js`): the same pass, for free.
+  let columnSum = 0;
+  let columnSumSq = 0;
+  let columnNonZero = 0;
+  let columnNonFinite = 0;
   let previous = -1;
   for (let k = 0; k < indices.length; k++) {
     const cell = indices[k];
     if (cell <= previous || cell >= sample.length) throw sampleOrderError('Marker gene');
     previous = cell;
+    const value = values[k];
+    if (!Number.isFinite(value)) columnNonFinite++;
+    else if (value !== 0) {
+      columnNonZero++;
+      columnSum += value;
+      columnSumSq += value * value;
+    }
     const group = cellGroupIndex[cell];
     if (group < 0) continue;
-    const value = values[k];
     if (!Number.isFinite(value)) {
       nonFinite[group]++;
       continue;
     }
     if (value === 0) continue;
     nonZero[group]++;
+    nonZeroAll++;
     sumIn[group] += value;
     sumAll += value;
-    if (value > 0) {
-      exprIn[group]++;
-      exprAll++;
-    }
     if (value < minimumNonZero) minimumNonZero = value;
     if (tabulated) {
       const row = valueIndex.numberOf(value);
@@ -594,11 +720,14 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
     nAll += nIn[g];
     zerosAll += zeros[g];
   }
-  for (let g = 0; g < groupCount; g++) nOut[g] = nAll - nIn[g];
-  // Minimum over every measured cell: one-vs-rest compares all of them.
+  const restMode = reference < 0;
+  for (let g = 0; g < groupCount; g++) nOut[g] = restMode ? nAll - nIn[g] : nIn[reference];
+  // Minimum over every measured cell, for the shift of a stored fold change.
   const minAll = zerosAll > 0 ? Math.min(minimumNonZero, 0) : minimumNonZero;
 
   const pValues = new Float64Array(groupCount).fill(NaN);
+  const scores = new Float32Array(groupCount).fill(NaN);
+  const auroc = new Float32Array(groupCount).fill(NaN);
   const log2FoldChange = new Float32Array(groupCount).fill(NaN);
   const meanInGroup = new Float32Array(groupCount).fill(NaN);
   const meanOutGroup = new Float32Array(groupCount).fill(NaN);
@@ -608,23 +737,33 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
   const meanIn = new Float64Array(groupCount).fill(NaN);
   const meanOut = new Float64Array(groupCount).fill(NaN);
   for (let g = 0; g < groupCount; g++) {
+    if (nIn[g] > 0) meanIn[g] = sumIn[g] / nIn[g];
+  }
+  for (let g = 0; g < groupCount; g++) {
     const nA = nIn[g];
-    if (nA === 0) continue;
     const nB = nOut[g];
-    meanIn[g] = sumIn[g] / nA;
-    meanOut[g] = nB > 0 ? (sumAll - sumIn[g]) / nB : NaN;
-    meanInGroup[g] = meanIn[g];
-    meanOutGroup[g] = meanOut[g];
-    percentInGroup[g] = (exprIn[g] / nA) * 100;
-    percentOutGroup[g] = nB > 0 ? ((exprAll - exprIn[g]) / nB) * 100 : 0;
-    if (nAll >= 2 && Number.isFinite(meanIn[g]) && Number.isFinite(meanOut[g])) {
-      log2FoldChange[g] = log2FoldChangeOfMeans(meanIn[g], meanOut[g], minAll, pseudocount);
+    if (nA > 0) {
+      meanInGroup[g] = meanIn[g];
+      percentInGroup[g] = (nonZero[g] / nA) * 100;
+    }
+    if (nB > 0) {
+      meanOut[g] = restMode ? (sumAll - sumIn[g]) / nB : meanIn[reference];
+      meanOutGroup[g] = meanOut[g];
+      percentOutGroup[g] = restMode
+        ? ((nonZeroAll - nonZero[g]) / nB) * 100
+        : percentInGroup[reference];
+    }
+    if (nA > 0 && nB > 0) {
+      log2FoldChange[g] = foldChangeOfMeans(meanIn[g], meanOut[g], minAll, foldChange);
     }
   }
 
   const result = {
     nAll,
+    column: { sum: columnSum, sumSq: columnSumSq, nonZero: columnNonZero, n: sample.length - columnNonFinite },
     pValues,
+    scores,
+    auroc,
     log2FoldChange,
     meanInGroup,
     meanOutGroup,
@@ -633,16 +772,13 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
     nIn,
     nOut
   };
-  if (nAll < 2) {
-    if (wilcox) clearCounts(context, counts, valueIndex);
-    return result;
-  }
   const minPerSide = Math.max(2, minCells);
+  const testable = g => tested[g] === 1 && g !== reference && nIn[g] >= minPerSide && nOut[g] >= minPerSide;
 
   if (!wilcox) {
     // Centred second moments: each group about its mean, and all grouped
     // cells about theirs, over the non-zero entries plus each zero's term.
-    const meanAll = sumAll / nAll;
+    const meanAll = nAll > 0 ? sumAll / nAll : 0;
     const m2In = new Float64Array(groupCount);
     let m2All = 0;
     for (let k = 0; k < indices.length; k++) {
@@ -658,36 +794,123 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
       if (nIn[g] > 0) m2In[g] += zeros[g] * meanIn[g] ** 2;
     }
     for (let g = 0; g < groupCount; g++) {
+      if (!testable(g)) continue;
       const nA = nIn[g];
       const nB = nOut[g];
-      if (nA < minPerSide || nB < minPerSide) continue;
-      const meanA = meanIn[g];
-      const meanB = meanOut[g];
-      const meanDifference = meanA - meanB;
-      const betweenM2 = meanDifference ** 2 * nA * nB / nAll;
-      let restM2 = m2All - m2In[g] - betweenM2;
-      const m2Scale = Math.max(1, Math.abs(m2All), Math.abs(m2In[g]), Math.abs(betweenM2));
-      if (restM2 < 0 && restM2 >= -32 * Number.EPSILON * m2Scale) restM2 = 0;
-      const test = welchTTestFromMoments(
-        meanA, m2In[g] / (nA - 1), nA,
-        meanB, restM2 / (nB - 1), nB
-      );
-      pValues[g] = Number.isFinite(test.pValue) ? test.pValue : NaN;
+      let m2Out;
+      if (restMode) {
+        const betweenM2 = (meanIn[g] - meanOut[g]) ** 2 * nA * nB / nAll;
+        m2Out = m2All - m2In[g] - betweenM2;
+        const m2Scale = Math.max(1, Math.abs(m2All), Math.abs(m2In[g]), Math.abs(betweenM2));
+        if (m2Out < 0 && m2Out >= -32 * Number.EPSILON * m2Scale) m2Out = 0;
+      } else {
+        m2Out = m2In[reference];
+      }
+      const test = welchComparison(meanIn[g], m2In[g], nA, meanOut[g], m2Out, nB, method);
+      scores[g] = test.score;
+      pValues[g] = test.pValue;
     }
     return result;
   }
 
-  // Wilcoxon: one pass over the ascending tie blocks ranks every group.
+  if (restMode) {
+    // One pass over the ascending tie blocks ranks every group against all.
+    const rankSum = new Float64Array(groupCount);
+    let tieTerm = 0;
+    let ranked = 0;
+    const addZeroBlock = () => {
+      if (zerosAll === 0) return;
+      if (zerosAll > 1) tieTerm += zerosAll ** 3 - zerosAll;
+      const averageRank = ranked + (zerosAll + 1) / 2;
+      for (let g = 0; g < groupCount; g++) rankSum[g] += zeros[g] * averageRank;
+      ranked += zerosAll;
+    };
+    walkTieBlocks(context, counts, valueIndex, tabulated, sample, nonZero, addZeroBlock, (rowCounts, rowStart, owner, from, to, order) => {
+      let tieCount;
+      if (rowCounts !== null) {
+        tieCount = 0;
+        for (let g = 0; g < groupCount; g++) tieCount += rowCounts[rowStart + g];
+      } else {
+        tieCount = to - from;
+      }
+      if (tieCount > 1) tieTerm += tieCount ** 3 - tieCount;
+      const averageRank = ranked + (tieCount + 1) / 2;
+      if (rowCounts !== null) {
+        for (let g = 0; g < groupCount; g++) rankSum[g] += rowCounts[rowStart + g] * averageRank;
+      } else {
+        for (let k = from; k < to; k++) rankSum[owner[order[k]]] += averageRank;
+      }
+      ranked += tieCount;
+    });
+    for (let g = 0; g < groupCount; g++) {
+      if (!testable(g)) continue;
+      const comparison = rankSumComparison(rankSum[g], nIn[g], nOut[g], tieTerm, pConvention);
+      scores[g] = comparison.score;
+      auroc[g] = comparison.auroc;
+      pValues[g] = comparison.pValue;
+    }
+    return result;
+  }
+
+  // Against one reference group: each tested group is ranked within itself
+  // and the reference only, from the same tie blocks.
+  const r = reference;
+  const pairs = [];
+  for (let g = 0; g < groupCount; g++) if (testable(g)) pairs.push(g);
   const rankSum = new Float64Array(groupCount);
-  let tieTerm = 0;
-  let ranked = 0;
+  const tieTerm = new Float64Array(groupCount);
+  const ranked = new Float64Array(groupCount);
   const addZeroBlock = () => {
-    if (zerosAll === 0) return;
-    if (zerosAll > 1) tieTerm += zerosAll ** 3 - zerosAll;
-    const averageRank = ranked + (zerosAll + 1) / 2;
-    for (let g = 0; g < groupCount; g++) rankSum[g] += zeros[g] * averageRank;
-    ranked += zerosAll;
+    for (const g of pairs) {
+      const block = zeros[g] + zeros[r];
+      if (block === 0) continue;
+      if (block > 1) tieTerm[g] += block ** 3 - block;
+      rankSum[g] += zeros[g] * (ranked[g] + (block + 1) / 2);
+      ranked[g] += block;
+    }
   };
+  walkTieBlocks(context, counts, valueIndex, tabulated, sample, nonZero, addZeroBlock, (rowCounts, rowStart, owner, from, to, order) => {
+    for (const g of pairs) {
+      let inG;
+      let inR;
+      if (rowCounts !== null) {
+        inG = rowCounts[rowStart + g];
+        inR = rowCounts[rowStart + r];
+      } else {
+        inG = 0;
+        inR = 0;
+        for (let k = from; k < to; k++) {
+          const group = owner[order[k]];
+          if (group === g) inG++;
+          else if (group === r) inR++;
+        }
+      }
+      const block = inG + inR;
+      if (block === 0) continue;
+      if (block > 1) tieTerm[g] += block ** 3 - block;
+      rankSum[g] += inG * (ranked[g] + (block + 1) / 2);
+      ranked[g] += block;
+    }
+  });
+  for (const g of pairs) {
+    const comparison = rankSumComparison(rankSum[g], nIn[g], nOut[g], tieTerm[g], pConvention);
+    scores[g] = comparison.score;
+    auroc[g] = comparison.auroc;
+    pValues[g] = comparison.pValue;
+  }
+  return result;
+}
+
+/**
+ * Walk a gene's non-zero measured values in ascending tie blocks, the zeros'
+ * block (`addZeroBlock`) between the negative and the positive values. Each
+ * block reaches `visit` as a row of per-group counts (`rowCounts`,
+ * `rowStart`) when the values were tabulated, or else as the range
+ * `[from, to)` of the ascending order of the measured values (`owner[order[k]]`
+ * is the group of the k-th smallest). Leaves the tabulation empty.
+ */
+function walkTieBlocks(context, counts, valueIndex, tabulated, sample, nonZero, addZeroBlock, visit) {
+  const { groupCount, cellGroupIndex } = context;
   let zeroFed = false;
   if (tabulated) {
     const ascending = valueIndex.ascendingNumbers();
@@ -697,19 +920,14 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
         addZeroBlock();
         zeroFed = true;
       }
-      const rowStart = number * groupCount;
-      let tieCount = 0;
-      for (let g = 0; g < groupCount; g++) tieCount += counts[rowStart + g];
-      if (tieCount > 1) tieTerm += tieCount ** 3 - tieCount;
-      const averageRank = ranked + (tieCount + 1) / 2;
-      for (let g = 0; g < groupCount; g++) rankSum[g] += counts[rowStart + g] * averageRank;
-      ranked += tieCount;
+      visit(counts, number * groupCount, null, 0, 0, null);
     }
     clearCounts(context, counts, valueIndex);
   } else {
     clearCounts(context, counts, valueIndex);
     // Past the tabulation bound: order the non-zero measured cells by value
     // in linear time, then walk their tie blocks.
+    const { indices, values } = sample;
     let measuredCount = 0;
     for (let g = 0; g < groupCount; g++) measuredCount += nonZero[g];
     const measured = values instanceof Float32Array
@@ -735,29 +953,11 @@ export function oneVsRestMarkers(sample, context, { method, minCells, pseudocoun
       }
       let j = i + 1;
       while (j < measuredCount && measured[order[j]] === value) j++;
-      const tieCount = j - i;
-      if (tieCount > 1) tieTerm += tieCount ** 3 - tieCount;
-      const averageRank = ranked + (tieCount + 1) / 2;
-      for (let k = i; k < j; k++) rankSum[owner[order[k]]] += averageRank;
-      ranked += tieCount;
+      visit(null, 0, owner, i, j, order);
       i = j;
     }
   }
   if (!zeroFed) addZeroBlock();
-
-  for (let g = 0; g < groupCount; g++) {
-    const nA = nIn[g];
-    const nB = nOut[g];
-    if (nA < minPerSide || nB < minPerSide) continue;
-    const U1 = rankSum[g] - (nA * (nA + 1)) / 2;
-    const U2 = nA * nB - U1;
-    const { pValue } = mannWhitneyPValue(nA, nB, Math.min(U1, U2), {
-      tieTerm,
-      allowExact: true
-    });
-    pValues[g] = Number.isFinite(pValue) ? pValue : NaN;
-  }
-  return result;
 }
 
 /** Zero the rows a gene used, so the next gene starts from an empty table. */

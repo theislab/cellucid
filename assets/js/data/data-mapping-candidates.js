@@ -34,11 +34,14 @@ import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
   bestGuessEmbeddingSlots,
+  bestGuessTier,
   canonicalEmbeddingId,
   defaultColumns,
   defaultEnabledEmbeddings,
   defaultEmbeddingSlots,
   defaultExpression,
+  defaultHighlyVariable,
+  defaultLog1p,
   defaultVectorBindings,
   parseVectorFieldKey,
   slotDimension,
@@ -125,8 +128,12 @@ function requireShape(value, label) {
  *   varColumns: Array<{key: string, dtype: string}>,
  *   X: {storage: string, dtype: string}|null,
  *   layers: ElementProbe[],
- *   raw: {nVars: number, X: {storage: string, dtype: string}, varColumns: Array<{key: string, dtype: string}>}|null
+ *   raw: {nVars: number, X: {storage: string, dtype: string}, varColumns: Array<{key: string, dtype: string}>}|null,
+ *   log1p: {base: number|null}|null
  * }} AnnDataProbes
+ *
+ * `log1p` is `uns['log1p']` as `sc.pp.log1p` records it: null when the file
+ * has none, else its `base` (null for e, as Scanpy writes None).
  */
 
 function requireElementProbe(probe, label) {
@@ -296,6 +303,20 @@ function describeLayers(probes, nObs, nVars) {
   });
 }
 
+function describeLog1pProbe(probe) {
+  if (probe === null) return null;
+  if (
+    probe === undefined ||
+    typeof probe !== 'object' ||
+    Array.isArray(probe) ||
+    Object.keys(probe).join(',') !== 'base' ||
+    !(probe.base === null || (typeof probe.base === 'number' && Number.isFinite(probe.base) && probe.base > 0 && probe.base !== 1))
+  ) {
+    throw new TypeError("Probed uns['log1p'] must be null or {base}, base null or a positive number other than 1.");
+  }
+  return { base: probe.base };
+}
+
 /**
  * Describe what a loader probed, with the listing-time verdict of every entry.
  *
@@ -331,6 +352,7 @@ export function describeAnnDataProbes(probes) {
           X: describeMatrix(raw.X, 'Probed raw.X'),
           var: { columns: describeVarColumns(raw.varColumns) },
         },
+    log1p: describeLog1pProbe(probes.log1p),
   };
 }
 
@@ -342,8 +364,11 @@ export function describeAnnDataProbes(probes) {
  * and every narrow array is enabled beside them (`defaultEnabledEmbeddings`).
  * `guessed` names the groups that were guessed. The other defaults are the ones this viewer reads
  * from such a file: `obsp['connectivities']` when it is listed, the var index,
- * `X` (else `raw` or a layer, guessed; or no expression matrix), no latent
- * space, and the vector fields the default rule binds.
+ * `X` (else `raw` or a layer, guessed; or no expression matrix), each
+ * matrix's `log1p` by Scanpy's `uns['log1p']` (`defaultLog1p`, guessed), the
+ * `highly_variable` column of the expression matrix's genes when it is boolean
+ * there (`defaultHighlyVariable`, guessed), no latent space, and the vector
+ * fields the default rule binds.
  *
  * `rejected` lists the `[key, reason]` of every array the best guess loaded
  * and refused: the browser has read those values, so its catalog lists them
@@ -377,6 +402,17 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
       layers: described.layers.filter(layer => layer.usable).map(layer => layer.key),
     });
   const latent = Object.hasOwn(chosen, 'latent') ? chosen.latent : null;
+  const log1p = defaultLog1p({
+    log1p: described.log1p,
+    hasX: described.X !== null,
+    raw: described.raw === null || described.raw.X === null ? null : { dtype: described.raw.X.dtype },
+    layers: described.layers.filter(layer => layer.usable).map(layer => layer.key),
+  });
+  const highlyVariable = expression.expression === null
+    ? { highlyVariable: null, guessed: false }
+    : defaultHighlyVariable(
+      expression.expression === 'raw' ? described.raw.var.columns : described.var.columns
+    );
   const entries = obsmEntries(described.obsm);
   const enabled = defaultEnabledEmbeddings(entries, defaults, {
     latentKey: latent,
@@ -395,6 +431,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     X: described.X,
     layers: described.layers,
     raw: described.raw,
+    log1p: described.log1p,
     defaults: {
       kind: ANNDATA_KIND,
       embeddings: {
@@ -406,10 +443,17 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
         : (connectivities === undefined ? null : DEFAULT_KNN_KEY),
       geneNames: Object.hasOwn(chosen, 'geneNames') ? chosen.geneNames : 'index',
       expression: expression.expression,
+      log1p: log1p.log1p,
+      highlyVariable: highlyVariable.highlyVariable,
       latent,
       vectorFields: defaultVectorBindings(entries, enabled),
     },
-    guessed: [...guessed, ...(expression.guessed ? ['expression'] : [])],
+    guessed: [
+      ...guessed,
+      ...(expression.guessed ? ['expression'] : []),
+      ...(log1p.guessed ? ['log1p'] : []),
+      ...(highlyVariable.guessed ? ['highlyVariable'] : []),
+    ],
   };
   return deepFreeze(candidates);
 }
@@ -936,14 +980,18 @@ export async function resolveEmbeddingSlotsAsync(entries, loadCheck) {
       loadCheck: key => (failures.has(key) ? failures.get(key) : null),
     });
     let failed = false;
+    // The guessed slots load together, not one after another.
+    await Promise.all(DIMENSION_SLOTS.map(async slot => {
+      const ref = guess.slots[slot];
+      if (ref === null) return;
+      const checkKey = JSON.stringify([ref.key, ref.columns]);
+      if (!checked.has(checkKey)) checked.set(checkKey, loadCheck(ref.key, [...ref.columns]));
+      await checked.get(checkKey);
+    }));
     for (const slot of DIMENSION_SLOTS) {
       const ref = guess.slots[slot];
       if (ref === null) continue;
-      const checkKey = JSON.stringify([ref.key, ref.columns]);
-      if (!checked.has(checkKey)) {
-        checked.set(checkKey, await loadCheck(ref.key, [...ref.columns]));
-      }
-      const defect = checked.get(checkKey);
+      const defect = await checked.get(JSON.stringify([ref.key, ref.columns]));
       if (defect !== null) {
         failures.set(ref.key, defect);
         failed = true;
@@ -960,6 +1008,40 @@ export async function resolveEmbeddingSlotsAsync(entries, loadCheck) {
   }
 }
 
+
+/**
+ * The dimension slot a file opens on: of the filled slots, the one whose
+ * array's name ranks best (`bestGuessTier`), the higher dimension among
+ * equals.
+ *
+ * Filling a slot only makes a dimension available; which one a view starts
+ * in is this rule. "The highest filled slot" opened a segmentation export on
+ * a 3-column t-SNE or spatial array (the best guess fills 3D with the best
+ * 3-column array, whatever it is) instead of the UMAP it carries in 2D. A
+ * file whose slots are all one UMAP (`X_umap_1d` .. `X_umap_3d`, or launch
+ * defaults naming UMAPs) still opens in its highest dimension.
+ *
+ * @param {Partial<Record<'1d'|'2d'|'3d', {key: string}|null>>} slots
+ * @returns {'1d'|'2d'|'3d'}
+ */
+export function openingSlot(slots) {
+  let opening = null;
+  let openingTier = Infinity;
+  // Ascending, so a later (higher) slot of an equal tier replaces an earlier one.
+  for (const slot of DIMENSION_SLOTS) {
+    const ref = slots[slot] ?? null;
+    if (ref === null) continue;
+    const tier = bestGuessTier(ref.key);
+    if (tier <= openingTier) {
+      opening = slot;
+      openingTier = tier;
+    }
+  }
+  if (opening === null) {
+    throw new RangeError('A file opens on a filled embedding slot; none is filled.');
+  }
+  return opening;
+}
 
 /**
  * Validate the columns one `obsm` read selects: distinct integers, each

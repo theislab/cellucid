@@ -331,6 +331,31 @@ export function probeColumns(frame, format, label) {
 }
 
 /**
+ * One boolean dataframe column as flags, 1 where true: a numpy `bool` array,
+ * or anndata's nullable `boolean` (a missing value is not true). Any other
+ * column is refused: it does not say which rows are marked.
+ *
+ * @returns {Promise<Uint8Array>}
+ */
+export async function readBooleanColumn(frame, key, format, label, nRows, options = {}) {
+  const item = frame.get(key);
+  if (isGroup(item)) {
+    if (encodingType(item) !== 'nullable-boolean') throw new Error(`${label} is not a true/false column`);
+    const contract = nullableContract(item, key, 'nullable-boolean', format, nRows);
+    const [mask, values] = await Promise.all([
+      readBooleanMask(contract.maskArray, contract.valuesLength, `Nullable mask for '${key}'`, options),
+      readBooleanMask(contract.valuesArray, contract.valuesLength, label, options),
+    ]);
+    const flags = new Uint8Array(contract.valuesLength);
+    for (let row = 0; row < flags.length; row++) flags[row] = values[row] === 1 && mask[row] === 0 ? 1 : 0;
+    return flags;
+  }
+  const length = validateOneDimensional(item, format, label, nRows);
+  if (valueKind(item) !== 'bool') throw new Error(`${label} is not a true/false column`);
+  return readBooleanMask(item, length, label, options);
+}
+
+/**
  * One dataframe column as gene-name text (`gene-names.js`): strings,
  * categories and integers name genes; a missing value is null. Float and
  * boolean columns cannot name genes.

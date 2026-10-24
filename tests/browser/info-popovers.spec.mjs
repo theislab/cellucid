@@ -98,7 +98,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await expect(localPopover).toBeVisible();
   await expect(localPopover).toBeFocused();
   await expect(localPopover).toContainText(
-    'Zarr ZIP: a .zarr.zip or .zip holding one AnnData Zarr store'
+    'File…: an .h5ad file, or a .zarr.zip archive holding one AnnData Zarr store'
   );
   expect(
     await localPopover.evaluate(popover => popover.parentElement === document.body)
@@ -110,7 +110,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await page.keyboard.press('Tab');
   await expect(localPopover.locator('.info-tip-close')).toBeFocused();
   const links = localPopover.locator('a.info-tip-link');
-  await expect(links).toHaveCount(2);
+  await expect(links).toHaveCount(3);
   for (const link of await links.all()) {
     await expect(link).toHaveAttribute('target', '_blank');
     await expect(link).toHaveAttribute('rel', /noopener/);
@@ -121,17 +121,17 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await page.keyboard.press('Tab');
   await expect(localPopover).toBeHidden();
   await expect(localButton).toHaveAttribute('aria-expanded', 'false');
-  await expect(page.locator('#user-data-h5ad-btn')).toBeFocused();
+  await expect(page.locator('#user-data-open-btn')).toBeFocused();
 
   await localButton.click();
   await expect(localPopover).toBeVisible();
-  await page.locator('#remote-info-btn').focus();
+  await page.locator('#data-address-info-btn').focus();
   await expect(localPopover).toBeHidden();
   await page.keyboard.press('Enter');
-  await expect(page.locator('#remote-info-tooltip')).toBeVisible();
-  await expect(page.locator('body > #remote-info-tooltip')).toHaveCount(1);
+  await expect(page.locator('#data-address-info-tooltip')).toBeVisible();
+  await expect(page.locator('body > #data-address-info-tooltip')).toHaveCount(1);
   await page.locator('#glcanvas').click({ position: { x: 900, y: 500 } });
-  await expect(page.locator('#remote-info-tooltip')).toBeHidden();
+  await expect(page.locator('#data-address-info-tooltip')).toBeHidden();
 
   const sessionButton = page.locator('#session-state-info-btn');
   await sessionButton.focus();
@@ -225,5 +225,49 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await expect(localButton).toHaveAttribute('aria-expanded', 'false');
 
   expect(webglError).toBe(0);
+  expect(productErrors).toEqual([]);
+});
+
+test('how a control was set and what a tool needs lead their (i) tips, not the sidebar', async ({
+  page
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+
+  // Antialiasing: the sidebar shows the checkbox only; its (i) says how it
+  // was chosen, first under the title.
+  await expect(page.locator('#antialias-controls .status-line')).toHaveCount(0);
+  await page.locator('#antialias-info-btn').click();
+  const antialias = page.locator('#antialias-info-tooltip');
+  await expect(antialias).toBeVisible();
+  const antialiasLine = antialias.locator('.info-tooltip-content > :nth-child(2)');
+  await expect(antialiasLine).toHaveId('hp-antialias-status');
+  await expect(antialiasLine).toHaveText(/^Chosen automatically: [\d,]+ cells in [123]D\.$/);
+  await page.keyboard.press('Escape');
+  // Once chosen by hand, the line goes and the tip is only the tip.
+  await page.locator('#hp-antialias').click();
+  await page.locator('#antialias-info-btn').click();
+  await expect(antialias.locator('#hp-antialias-status')).toBeHidden();
+  await page.keyboard.press('Escape');
+
+  // Highlighting: nothing under the Tool buttons until a gesture did
+  // something; the (i) leads with the tool's gesture or what it needs first.
+  const description = page.locator('#highlight-mode-description');
+  await expect(description).toBeEmpty();
+  await expect(description).toBeHidden();
+  await page.locator('#highlight-selection-info-btn').click();
+  const selection = page.locator('#highlight-selection-info-tooltip');
+  await expect(selection).toBeVisible();
+  const hint = selection.locator('.info-tooltip-content > :nth-child(2)');
+  await expect(hint).toHaveId('highlight-tool-hint');
+  await expect(hint).toHaveText(/^(Alt\+click a cell to select its group\.|Color by a field first \(Coloring & filtering\), then Alt\+click a cell\.)$/);
+  await page.keyboard.press('Escape');
+  await page.locator('#highlight-mode-lasso').click();
+  await page.locator('#highlight-selection-info-btn').click();
+  await expect(selection.locator('#highlight-tool-hint')).toHaveText('Alt+draw around cells to select them.');
+  await page.keyboard.press('Escape');
   expect(productErrors).toEqual([]);
 });

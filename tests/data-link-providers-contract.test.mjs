@@ -17,37 +17,32 @@ import huggingface from '../assets/js/data/sources/providers/huggingface.js';
 import zenodo from '../assets/js/data/sources/providers/zenodo.js';
 import dropbox from '../assets/js/data/sources/providers/dropbox.js';
 import github from '../assets/js/data/sources/providers/github.js';
-import { fileFormatOf, fileTitleOf } from '../assets/js/data/sources/remote-file.js';
+import { downloadRemoteFile, fileFormatOf, fileTitleOf } from '../assets/js/data/sources/remote-file.js';
 import { fetchCatalogFile, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
 
 const ID = '0819e386-e7fd-4212-b732-60e468689f89';
 
-function headers(values) {
-  const lower = Object.fromEntries(
-    Object.entries(values).map(([key, value]) => [key.toLowerCase(), value])
-  );
-  return { get: name => lower[name.toLowerCase()] ?? null };
-}
-
-/** Replace fetch with one answering from `routes(url, init)`. */
+/**
+ * Replace fetch with one answering from `routes(url, init)`, with real
+ * `Response`s: a body, a JSON document or a text, and the answer's headers.
+ */
 function installFetch(t, routes) {
   const original = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method ?? 'GET', headers: init.headers ?? {} });
-    const answer = routes(String(url), init);
-    if (answer === null) {
-      return { ok: false, status: 404, url, headers: headers({}), arrayBuffer: async () => new ArrayBuffer(0) };
-    }
-    return {
-      ok: answer.status < 300,
-      status: answer.status,
-      url,
-      headers: headers(answer.headers ?? {}),
-      arrayBuffer: async () => (answer.body ?? new Uint8Array(0)).slice().buffer,
-      json: async () => answer.json,
-      text: async () => answer.text ?? '',
-    };
+    const answer = routes(String(url), init) ?? { status: 404 };
+    const bodiless = init.method === 'HEAD' || [204, 304].includes(answer.status);
+    const body = bodiless
+      ? null
+      : answer.body !== undefined
+        ? answer.body.slice()
+        : answer.json !== undefined
+          ? JSON.stringify(answer.json)
+          : answer.text ?? '';
+    const response = new Response(body, { status: answer.status, headers: answer.headers ?? {} });
+    Object.defineProperty(response, 'url', { value: String(url) });
+    return response;
   };
   t.after(() => {
     globalThis.fetch = original;
@@ -66,7 +61,7 @@ function fileRoute(size, extra = {}) {
 
 test('every built-in provider meets the contract and no id repeats', () => {
   const ids = DEFAULT_PROVIDERS.map(provider => requireProvider(provider).id);
-  assert.deepEqual(ids, ['cellxgene', 'geo', 'zenodo', 'hf', 'dropbox', 'gh', 'url']);
+  assert.deepEqual(ids, ['cellxgene', 'geo', 'zenodo', 'figshare', 'hf', 'gdrive', 'onedrive', 'dropbox', 'gh', 'url']);
   assert.throws(
     () => new ProviderRegistry([http, http]),
     /already registered/
@@ -76,7 +71,9 @@ test('every built-in provider meets the contract and no id repeats', () => {
     /sign-in provider needs auth/
   );
   for (const provider of DEFAULT_PROVIDERS) {
-    assert.equal(provider.capabilities.private, 'none', `${provider.id} needs no sign-in`);
+    // Google Drive and OneDrive read private files behind a sign-in.
+    const signIn = provider.id === 'gdrive' || provider.id === 'onedrive';
+    assert.equal(provider.capabilities.private, signIn ? 'sign-in' : 'none', provider.id);
   }
 });
 
@@ -171,14 +168,18 @@ test('a web address opens a dataset catalog folder or one AnnData file', async t
   );
 });
 
-test('a host that ignores ranges or is missing is named, not hidden', async t => {
+test('a host that ignores ranges is downloaded whole, with its progress', async t => {
   installFetch(t, (url, init) => (init.method === 'HEAD'
     ? { status: 200, headers: { 'Content-Length': '10' } }
     : { status: 200, headers: { 'Content-Length': '10' }, body: new Uint8Array(10) }));
-  await assert.rejects(
-    http.open('https://example.org/a.h5ad'),
-    /ignores range requests/
-  );
+  const opened = await http.open('https://example.org/a.h5ad');
+  assert.equal(opened.file.transport, 'download');
+  assert.equal(opened.file.resource.size, 10);
+  const received = [];
+  const file = await downloadRemoteFile(opened.file.resource, { onBytes: bytes => received.push(bytes) });
+  assert.equal(file.size, 10);
+  assert.equal(file.name, 'a.h5ad');
+  assert.equal(received.at(-1), 10);
 });
 
 function censusRelease() {

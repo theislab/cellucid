@@ -120,6 +120,13 @@ async function annotateStartupPhases(context, testInfo) {
   }
 }
 
+/**
+ * `CELLUCID_FIGURE_EXPORT_POINT_PASS=page` runs every figure export's point
+ * passes on the page, as on a browser whose workers have no WebGL2
+ * (WebKitGTK, WPE): the run exercises that placement in any engine.
+ */
+const POINT_PASS_ON_PAGE = process.env.CELLUCID_FIGURE_EXPORT_POINT_PASS === 'page';
+
 export const test = playwrightTest.extend({
   // Override the lazy page fixture instead of installing an auto context
   // fixture. An auto fixture materializes an otherwise unused default context
@@ -127,6 +134,19 @@ export const test = playwrightTest.extend({
   // already closed the base page. This boundary retires the application while
   // both its document and context are still live.
   page: async ({ context, page }, use, testInfo) => {
+    if (POINT_PASS_ON_PAGE) {
+      await page.addInitScript(() => {
+        // Only a document served by the application's origin can load it (not
+        // the initial about:blank). The address is absolute: an init script
+        // has no base URL of its own in WebKit.
+        if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+        const client = new URL(
+          '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js',
+          location.href,
+        );
+        import(client.href).then(module => module.setFigureExportWorkerWebgl2(false));
+      });
+    }
     try {
       await use(page);
     } finally {

@@ -445,7 +445,7 @@ Explicit exclusions:
     shows is restored by `core/state` as `liveEmbedding` and by the multiview
     descriptors as each snapshot's `embedding`; the picker redraws from the
     state)
-  - Dataset/connection controls: `dataset-select`, `remote-server-url`, `data-link-url` (sessions assume the dataset is already loaded)
+  - Dataset/connection controls: `dataset-select`, `data-address` (sessions assume the dataset is already loaded)
   - Pointer capture: `pointer-lock` is not restored by anything. It is not a
     preference — it mirrors the browser's live pointer-lock state, and
     `ui/modules/camera-controls.js` forces it unchecked on init and writes it

@@ -1,9 +1,10 @@
 /**
  * Streaming Gene Loader
  *
- * Prefetches genes in batches while streaming them to consumers.
- * Implements a producer-consumer pattern with configurable buffer size
- * and network concurrency for optimal throughput.
+ * Reads genes ahead while streaming them to a consumer, as far ahead as the
+ * run's tuner says (`shared/run-tuner.js`): the genes the workers consume
+ * while one gene is fetched, held to the memory budget. How many reads run
+ * at once is the reader's fetch scheduler's to decide.
  *
  * Genes are read as their non-zero entries (`{length, indices, values}`,
  * about 45 times fewer bytes than a dense column for a median gene), never
@@ -11,32 +12,13 @@
  * streamed as its shared dense array (`DataLayer.readGeneColumn`). The
  * analysis kernels take either (`compute/gene-statistics.js`).
  *
- * Key Features:
- * - Parallel network requests for gene loading
- * - Memory-bounded prefetch buffer
- * - Streaming iteration (yields genes as they become available)
- * - Automatic cleanup of processed genes
- * - Abort support for cancellation
- * - Memory pressure awareness
- *
  * @module data/streaming-gene-loader
  */
 
-import { getPerformanceConfig } from '../shared/performance-config.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import { debug, debugWarn } from '../shared/debug-utils.js';
 import { formatDuration } from '../../notification-center/formatters.js';
 import { createSlicedYield } from '../shared/concurrency-utils.js';
-
-// =============================================================================
-// CONSTANTS
-// =============================================================================
-
-/** Fixed streaming policy; configuration defaults live in PerformanceConfig. */
-const STREAMING_POLICY = {
-  /** Reduce buffer when under memory pressure */
-  pressureBufferReduction: 0.5,
-};
 
 /**
  * Whether `values` is a gene's non-zero entries (`{length, indices, values}`,
@@ -59,13 +41,6 @@ function columnBytes(values) {
 function requirePositiveInteger(value, owner) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${owner} must be a positive safe integer`);
-  }
-  return value;
-}
-
-function requirePositiveFinite(value, owner) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    throw new TypeError(`${owner} must be a positive finite number`);
   }
   return value;
 }
@@ -152,10 +127,7 @@ function requireIndexCollection(indices, owner, valueCount, { sorted = false } =
  * them to the consumer. Uses a bounded buffer to control memory usage.
  *
  * @example
- * const loader = new StreamingGeneLoader({
- *   dataLayer,
- *   config: { preloadCount: 100, networkConcurrency: 12 }
- * });
+ * const loader = new StreamingGeneLoader({ dataLayer, tuner });
  *
  * for await (const { gene, values, owned } of loader.streamGenesRaw(genes)) {
  *   // compute on `values` (transfer it only when `owned`)
@@ -167,14 +139,14 @@ export class StreamingGeneLoader {
    *
    * @param {Object} options
    * @param {Object} options.dataLayer - DataLayer instance for loading genes
-   * @param {Object} [options.config] - Configuration overrides
-   * @param {number} [options.config.preloadCount] - Max genes to prefetch
-   * @param {number} [options.config.networkConcurrency] - Parallel requests
-   * @param {number} [options.config.memoryBudgetMB] - Memory budget
+   * @param {ReturnType<import('../shared/run-tuner.js').createRunTuner>} options.tuner -
+   *   Decides how far ahead to read, and is told every read
    * @param {Function} [options.onProgress] - Progress callback
    * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
    * @param {string|null} [options.owner] - The job the reads are for
    *   (`app/jobs/cancellable-job.js`), which shows them
+   * @param {string} [options.matrix='mapped'] - The expression matrix the
+   *   genes are read from (`DataLayer.readGeneColumn`)
   */
   constructor(options) {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -182,10 +154,11 @@ export class StreamingGeneLoader {
     }
     const {
       dataLayer,
-      config = {},
+      tuner,
       onProgress,
       signal,
       owner = null,
+      matrix = 'mapped',
     } = options;
 
     if (!dataLayer || typeof dataLayer.readGeneColumn !== 'function') {
@@ -193,9 +166,17 @@ export class StreamingGeneLoader {
         '[StreamingGeneLoader] dataLayer must implement readGeneColumn'
       );
     }
-    if (!config || typeof config !== 'object' || Array.isArray(config)) {
-      throw new TypeError('[StreamingGeneLoader] config must be an object');
+    if (
+      !tuner ||
+      typeof tuner.prefetchDepth !== 'function' ||
+      typeof tuner.observeRead !== 'function' ||
+      typeof tuner.setReadsPending !== 'function' ||
+      typeof tuner.onPressure !== 'function'
+    ) {
+      throw new TypeError('[StreamingGeneLoader] a run tuner is required');
     }
+    /** @type {ReturnType<import('../shared/run-tuner.js').createRunTuner>} */
+    this._tuner = tuner;
 
     /** @type {Object} DataLayer instance */
     this.dataLayer = dataLayer;
@@ -205,6 +186,12 @@ export class StreamingGeneLoader {
 
     /** @type {string|null} The job the reads are for */
     this.owner = owner;
+
+    if (typeof matrix !== 'string' || matrix.length === 0) {
+      throw new TypeError('[StreamingGeneLoader] matrix must name an expression matrix');
+    }
+    /** @type {string} The expression matrix the genes are read from */
+    this.matrix = matrix;
 
     /** @type {AbortSignal|null} Abort signal */
     this.signal = signal ?? null;
@@ -219,38 +206,6 @@ export class StreamingGeneLoader {
       throw new TypeError('signal must implement the AbortSignal contract');
     }
 
-    // PerformanceConfig is the sole owner of omitted configuration values.
-    const perfConfig = getPerformanceConfig();
-    const networkConcurrency =
-      config.networkConcurrency ?? perfConfig.batch.networkConcurrency;
-    const memoryBudgetMB =
-      config.memoryBudgetMB ?? perfConfig.memory.defaultBudgetMB;
-    const preloadCount =
-      config.preloadCount ?? perfConfig.batch.defaultPreloadCount;
-    /** @type {number} Network concurrency */
-    this._networkConcurrency = requirePositiveInteger(
-      networkConcurrency,
-      'networkConcurrency'
-    );
-    /** @type {number} Memory budget in MB */
-    this._memoryBudgetMB = requirePositiveFinite(
-      memoryBudgetMB,
-      'memoryBudgetMB'
-    );
-    /** @type {number} Configured preload count */
-    this._configuredPreloadCount = requirePositiveInteger(
-      preloadCount,
-      'preloadCount'
-    );
-    /** @type {number} Minimum pressure-limited buffer size */
-    this._minimumBufferSize = requirePositiveInteger(
-      perfConfig.batch.minPreloadCount,
-      'PerformanceConfig.batch.minPreloadCount'
-    );
-    /** @type {number} Max buffer size (will be recalculated based on memory budget) */
-    this._maxBufferSize = this._configuredPreloadCount;
-    /** @type {number} Estimated bytes per gene (updated during loading) */
-    this._bytesPerGene = 0;
     /** @type {number} Total cells in dataset (for memory estimation) */
     this._totalCells = requirePositiveInteger(
       dataLayer.state?.pointCount,
@@ -284,8 +239,6 @@ export class StreamingGeneLoader {
      * @type {AbortController|null}
      */
     this._runDownloads = null;
-    /** @type {number} Current effective buffer size (may reduce under pressure) */
-    this._effectiveBufferSize = this._maxBufferSize;
     /** @type {number} Unique run ID to detect stale callbacks */
     this._runId = 0;
     /** @type {Map<string, Array<{resolve:Function,reject:Function}>>} */
@@ -372,7 +325,8 @@ export class StreamingGeneLoader {
       if (abortSignal?.aborted) throw abortSignal.reason;
       const block = await this.dataLayer.readGeneCellSubset(geneList, cells, {
         signal: this._subsetRead.signal,
-        owner: this.owner
+        owner: this.owner,
+        matrix: this.matrix
       });
       if (this._subsetRead.signal.aborted) throw this._subsetRead.signal.reason;
       if (block === null) return null;
@@ -554,8 +508,6 @@ export class StreamingGeneLoader {
     this._loadQueue = geneList.slice();
     this._queueHead = 0;
     this._queued = new Set(geneList);
-    this._recalculateBufferSize();
-    this._effectiveBufferSize = this._maxBufferSize;
 
     try {
       this._pressureUnsubscribe =
@@ -574,7 +526,7 @@ export class StreamingGeneLoader {
     debug(
       'StreamingGeneLoader',
       `Starting run ${currentRunId}: ${geneList.length} genes, ` +
-        `buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`
+        `read-ahead=${this._tuner.prefetchDepth()}`
     );
     return currentRunId;
   }
@@ -673,73 +625,16 @@ export class StreamingGeneLoader {
   }
 
   /**
-   * Recalculate buffer size based on memory budget
-   * @private
-   */
-  _recalculateBufferSize() {
-    // What one *buffered* gene costs, which is what this budget bounds.
-    //
-    // The buffer holds each gene's values as read (its non-zero entries, or a
-    // reference to a dense field array a view already holds), so the marginal
-    // cost of keeping one more gene buffered is what those values take: a
-    // `cellCount × 4` array until the first genes arrive, then the running
-    // estimate `_bytesPerGene`. The per-gene working set that surrounds it (the
-    // column in a worker, a copy when the column is shared, the transferred
-    // result) is bounded by the *consumer's* in-flight limit — one gene per
-    // analysis worker in differential expression and marker discovery — and
-    // does not grow when the buffer grows. So it must not be multiplied by the
-    // buffer size.
-    //
-    // Counting it as if it did (the previous 6x factor, which also counted the
-    // buffer's reference as a second copy of the same array) shrank the buffer
-    // to a sixth of the budget the caller asked for. That silently capped
-    // network parallelism too: `_startPrefetch` will not start more loads than
-    // there are free buffer slots, so on a 562k-cell dataset with the default
-    // 512 MB budget the loader could never keep more than 11 requests in flight
-    // no matter what `networkConcurrency` was set to.
-    //
-    // The factor of 2 kept here is one whole array of headroom per buffered
-    // gene, which is more than the transient it can actually be responsible for.
-    const baseBytes = this._totalCells * 4;
-    const overheadMultiplier = 2;
-    const bytesPerGene = this._bytesPerGene > 0
-      ? this._bytesPerGene
-      : baseBytes * overheadMultiplier;
-
-    const budgetBytes = this._memoryBudgetMB * 1024 * 1024;
-
-    // Calculate max genes that fit in budget
-    // Reserve 30% of budget for buffered gene data (keep 70% for compute + other app allocations)
-    const bufferBudget = budgetBytes * 0.3;
-    const maxByMemory = Math.max(
-      this._minimumBufferSize,
-      Math.floor(bufferBudget / bytesPerGene)
-    );
-
-    // Use the smaller of configured preload count and memory-limited count
-    const oldBufferSize = this._maxBufferSize;
-    this._maxBufferSize = Math.min(this._configuredPreloadCount, maxByMemory);
-
-    if (this._maxBufferSize !== oldBufferSize) {
-      debug('StreamingGeneLoader', `Buffer size adjusted: ${oldBufferSize} -> ${this._maxBufferSize} (budget: ${this._memoryBudgetMB}MB, ~${(bytesPerGene / 1024 / 1024).toFixed(2)}MB/gene)`);
-    }
-  }
-
-  /**
-   * Start prefetching genes up to buffer limit
+   * Start reads until the tuner's read-ahead is buffered or under way.
    * @private
    */
   _startPrefetch() {
-    // Calculate how many more we can prefetch
     const currentLoad = this._buffer.size + this._loadingGenes.size;
-    const canPrefetch = Math.max(0, this._effectiveBufferSize - currentLoad);
-
-    // Start new loads up to network concurrency limit
+    const canPrefetch = Math.max(0, this._tuner.prefetchDepth() - currentLoad);
     let started = 0;
 
     while (
       this._queueHead < this._loadQueue.length &&
-      this._loadingGenes.size < this._networkConcurrency &&
       started < canPrefetch &&
       !this._aborted
     ) {
@@ -766,7 +661,7 @@ export class StreamingGeneLoader {
         started++;
       }
     }
-
+    this._tuner.setReadsPending(this._loadingGenes.size);
 
     // Log periodically to help diagnose performance issues
     if (this._stats.genesLoaded > 0 && this._stats.genesLoaded % 100 === 0) {
@@ -785,6 +680,7 @@ export class StreamingGeneLoader {
     if (this._aborted) return;
 
     this._loadingGenes.add(gene);
+    const readStart = performance.now();
 
     try {
       // One of a run's many downloads: the user's own gene loads go first.
@@ -792,7 +688,7 @@ export class StreamingGeneLoader {
       // this run; nothing is installed in field state.
       const { values, owned } = await this.dataLayer.readGeneColumn(
         gene,
-        { priority: 'bulk', signal: this._runDownloads.signal, owner: this.owner }
+        { priority: 'bulk', signal: this._runDownloads.signal, owner: this.owner, matrix: this.matrix }
       );
       const sparse = isSparseColumn(values);
       if (!sparse && !(values instanceof Float32Array)) {
@@ -814,21 +710,12 @@ export class StreamingGeneLoader {
       this._buffer.set(gene, entry);
       this._stats.genesLoaded++;
       this._stats.bytesLoaded += columnBytes(values);
-
-      // The running estimate controls capacity only; it never changes data.
-      // Same accounting as `_recalculateBufferSize`: one buffered gene, plus
-      // as much again of headroom.
-      const newBytesPerGene = columnBytes(values) * 2;
-      this._bytesPerGene = this._bytesPerGene === 0
-        ? newBytesPerGene
-        : Math.round(this._bytesPerGene * 0.8 + newBytesPerGene * 0.2);
-      if (this._stats.genesLoaded % 10 === 0) {
-        this._recalculateBufferSize();
-        this._effectiveBufferSize = Math.min(
-          this._effectiveBufferSize,
-          this._maxBufferSize
-        );
-      }
+      // A shared dense column costs the run nothing to buffer; a read one is
+      // what the read-ahead is sized by.
+      this._tuner.observeRead({
+        bytes: entry.owned ? columnBytes(values) : 0,
+        ms: performance.now() - readStart
+      });
 
       this._resolveGeneWaiters(gene, entry);
     } catch (error) {
@@ -922,31 +809,17 @@ export class StreamingGeneLoader {
   }
 
   /**
-   * Handle memory pressure events
+   * Memory pressure: the tuner reads the budget again and halves the
+   * read-ahead; reads already buffered are kept.
    * @param {Object} event - Memory pressure event
    * @private
    */
   _handleMemoryPressure(event) {
     const level = event?.level;
-    const pressureFloor = Math.min(
-      this._minimumBufferSize,
-      this._maxBufferSize
-    );
-
-    if (level === 'critical') {
-      this._effectiveBufferSize = pressureFloor;
-      debugWarn('StreamingGeneLoader', 'Critical memory pressure - reducing buffer to minimum');
-    } else if (level === 'cleanup' || level === 'warning') {
-      this._effectiveBufferSize = Math.max(
-        pressureFloor,
-        Math.floor(
-          this._maxBufferSize * STREAMING_POLICY.pressureBufferReduction
-        )
-      );
-      console.debug(`[StreamingGeneLoader] Memory pressure (${level}) - reducing buffer to ${this._effectiveBufferSize}`);
-    } else if (level === 'normal' || level === 'unknown') {
-      this._effectiveBufferSize = this._maxBufferSize;
-    } else {
+    if (level === 'critical' || level === 'cleanup' || level === 'warning') {
+      this._tuner.onPressure();
+      debugWarn('StreamingGeneLoader', `Memory pressure (${level}) - read-ahead ${this._tuner.prefetchDepth()}`);
+    } else if (level !== 'normal' && level !== 'unknown') {
       throw new TypeError(`Unknown memory pressure level: ${String(level)}`);
     }
   }

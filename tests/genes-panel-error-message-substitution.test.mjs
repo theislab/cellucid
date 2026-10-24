@@ -109,56 +109,25 @@ test('error tables read by direct key lookup carry no placeholders', () => {
 
 test('formatError refuses to publish a message with an unfilled placeholder', () => {
   assert.throws(
-    () => formatError(GENES_PANEL_ERROR_MESSAGES.GENE_NOT_FOUND),
-    /Missing error template variable: symbol/
+    () => formatError(GENES_PANEL_ERROR_MESSAGES.TOO_FEW_GROUPS),
+    /Missing error template variable: n/
   );
 });
 
 test('a dataset with no gene axis reports the empty axis rather than a gene lookup failure', async () => {
-  const controller = new GenesPanelController({
-    dataLayer: {
-      getAvailableVariables(type) {
-        assert.equal(type, 'gene_expression');
-        return [];
-      }
+  const controller = Object.create(GenesPanelController.prototype);
+  controller.dataLayer = {
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
+    getAvailableVariables(type) {
+      assert.equal(type, 'gene_expression');
+      return [];
     }
-  });
-
+  };
   await assert.rejects(
-    () => controller._runCustomAnalysis({ groups: [], genes: ['CD8A'] }),
+    () => controller.genesToTest({ excludeGenes: [], excludePattern: '', onlyGenes: 'all', onlyGenesList: '' }),
     error => {
       assert.equal(error.message, GENES_PANEL_ERROR_MESSAGES.NO_GENES_AVAILABLE);
-      assert.doesNotMatch(
-        error.message,
-        PLACEHOLDER,
-        'an unfilled placeholder reached the user'
-      );
-      assert.doesNotMatch(
-        error.message,
-        /Check spelling/,
-        'an absent gene axis is not a misspelled gene, and must not advise a respelling'
-      );
-      return true;
-    }
-  );
-});
-
-test('a custom gene the dataset does not publish is named in the error', async () => {
-  const controller = new GenesPanelController({
-    dataLayer: {
-      getAvailableVariables() {
-        return [{ key: 'GATA3' }];
-      }
-    }
-  });
-
-  await assert.rejects(
-    () => controller._runCustomAnalysis({ groups: [], genes: ['CD8A'] }),
-    error => {
-      assert.equal(
-        error.message,
-        'Gene "CD8A" not found in dataset. Check spelling or try another gene.'
-      );
+      assert.doesNotMatch(error.message, PLACEHOLDER, 'an unfilled placeholder reached the user');
       return true;
     }
   );

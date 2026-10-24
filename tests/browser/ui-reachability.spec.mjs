@@ -41,7 +41,7 @@ const LAYOUTS = [
   { name: 'phone landscape 844×390', use: { viewport: { width: 844, height: 390 }, hasTouch: true } },
 ];
 
-const ANALYSIS_MODES = ['simple', 'detailed', 'correlation', 'differential', 'signature', 'genesPanel'];
+const ANALYSIS_MODES = ['simple', 'detailed', 'correlation', 'differential', 'signature', 'genesPanel', 'dotplot', 'composition'];
 
 /**
  * Walk the interactive controls under `scope` and return one line per

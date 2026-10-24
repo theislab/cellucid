@@ -42,8 +42,12 @@ async function openFullFixture(page, input, file) {
   await expect.poll(() => page.evaluate(
     () => window._cellucidState.getMappingCandidates() !== null
   )).toBe(true);
-  const header = page.locator('#data-mapping-disclosure .disclosure-header');
+  const header = page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header');
   if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+  // Arrays that are off and wider than 3 columns, or cannot be drawn, are
+  // listed under "Other arrays", collapsed; open it so every row is listed.
+  const others = page.locator('#data-mapping-more > .disclosure-header');
+  if (await others.isVisible() && (await others.getAttribute('aria-expanded')) !== 'true') await others.click();
   // Every further group is a collapsed disclosure; open them all.
   for (const section of ['genes', 'knn', 'latent', 'vectors']) {
     const groupHeader = page.locator(`[data-mapping-section="${section}"] .disclosure-header`);
@@ -86,8 +90,8 @@ async function findCellPoint(page) {
 }
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the neighbour graph is chosen, redrawn, refused and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -200,8 +204,8 @@ const activeGene = page => page.evaluate(() => {
 });
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: gene names and expression change the gene list, keeping cells and the coloured gene`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -227,8 +231,9 @@ for (const [format, input, file] of [
         'highly_variable · true/false values cannot name genes',
         'dispersions · floating-point values cannot name genes',
       ]);
+      // One short line: what was guessed from the file, then the names note.
       await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint'))
-        .toHaveText("Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
+        .toHaveText("Guessed: highly variable genes. Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
 
       // A highlight and a filtered gene colouring are in place.
       await page.evaluate(() => {
@@ -254,7 +259,8 @@ for (const [format, input, file] of [
       expect(await activeGene(page)).toEqual({ key: 'LYZ', index: 2, filter: range });
       expect(await page.evaluate(() => window._cellucidState.getDataMapping().geneNames)).toBe('column:gene_symbols');
       await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(
-        "1 gene has no 'gene_symbols' value and uses its var index name. "
+        "Guessed: highly variable genes. "
+        + "1 gene has no 'gene_symbols' value and uses its var index name. "
           + "1 duplicate name was made unique, e.g. 'LYZ' → 'LYZ-1'."
       );
       expect(await page.evaluate(() => window._cellucidState.getHighlightedCellCount())).toBe(3);
@@ -319,8 +325,8 @@ const activeOutliers = page => page.evaluate(async () => {
 });
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the latent space of outlier filters is chosen, computed as the server does, and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -336,12 +342,12 @@ for (const [format, input, file] of [
       const note = page.locator('#outlier-filter-note');
       await expect(latent).toHaveValue('');
       await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-      // No latent space: the control says what it does and how to turn it on.
+      // No latent space: one button, whose title names the file's candidates.
       await expect(page.locator('#outlier-filter-container')).toBeVisible();
-      await expect(page.locator('#outlier-filter')).toBeDisabled();
-      await expect(note).toContainText('Choose the latent space in Data mapping');
-      await expect(note).toContainText('X_scVI');
+      await expect(page.locator('#outlier-filter')).toBeHidden();
+      await expect(note).toBeHidden();
       await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
+      await expect(page.locator('#outlier-filter-action')).toHaveAttribute('title', /X_scVI/);
 
       await latent.selectOption('X_scVI');
       await expect(page.locator('.data-mapping-status')).toHaveText('Apply measures outliers in the new space.');
@@ -349,7 +355,7 @@ for (const [format, input, file] of [
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       // Applying reads nothing; the control says what the first use reads.
       await expect(page.locator('#outlier-filter')).toBeEnabled();
-      await expect(note).toContainText('first use reads the latent space X_scVI');
+      await expect(note).toHaveText(/^First use reads X_scVI \(.+\)\.$/);
       expect(await activeOutliers(page)).toBeNull();
       await page.evaluate(() => window._cellucidState.setOutlierThresholdForActive(0.5));
       expect(await activeOutliers(page)).toEqual({
@@ -371,7 +377,8 @@ for (const [format, input, file] of [
       // the threshold is back at 100%, and the space is offered no more.
       await latent.selectOption('X_broken');
       await apply(page);
-      await expect(note).toContainText('NaN at cell 5');
+      await expect(note).toHaveText('This latent space cannot be used.');
+      await expect(note).toHaveAttribute('title', /NaN at cell 5/);
       await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
       await expect(latent.locator('option[value="X_broken"]')).toContainText('NaN at cell 5');
       expect(await activeOutliers(page)).toBeNull();
@@ -414,8 +421,8 @@ for (const [format, input, file] of [
       await latent.selectOption('');
       await apply(page);
       expect(await activeOutliers(page)).toBeNull();
-      await expect(page.locator('#outlier-filter')).toBeDisabled();
-      await expect(page.locator('#outlier-filter-note')).toContainText('Choose the latent space');
+      await expect(page.locator('#outlier-filter')).toBeHidden();
+      await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
       expect(errors).toEqual([]);
     });
   });

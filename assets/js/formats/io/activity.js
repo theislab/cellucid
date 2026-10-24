@@ -85,7 +85,12 @@ export class ReadActivity {
     this._onUpdate = onUpdate;
   }
 
-  /** Requests made and the bytes they fetched. */
+  /**
+   * Requests made and the bytes they fetched. The bytes of a request still
+   * under way are counted as they arrive (`requests` 0), and taken back
+   * (negative bytes) if the request fails, so progress stays live during a
+   * long request and never counts bytes that did not arrive.
+   */
   fetched(bytes, requests = 1) {
     this.bytesFetched += bytes;
     this.requests += requests;

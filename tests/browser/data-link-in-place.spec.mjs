@@ -31,13 +31,17 @@ test('an .h5ad link opens in place from ?data= with range requests only', async 
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  await expect(page.locator('#data-link-url')).toHaveValue(FIXTURE);
-  // The Transfers panel says what is read, from where, and where it goes.
-  const transfer = page.locator('#transfers-list .transfer-row');
-  await expect(transfer).toHaveCount(1);
-  await expect(transfer).toContainText('current-ui-smoke · reading in place');
-  await expect(transfer).toContainText('/tests/browser/fixtures/current-ui-smoke.h5ad');
-  await expect(transfer).toContainText('memory only: nothing is saved to disk');
+  await expect(page.locator('#data-address')).toHaveValue(FIXTURE);
+  // The Dataset box says where it is read from and how much has been read;
+  // the connection is one line under the address bar.
+  await expect(page.locator('#dataset-origin')).toHaveText(`h5ad file · ${new URL(FIXTURE).host}`);
+  await expect(page.locator('#dataset-read')).toHaveText(/^(Reading… )?[\d.]+ (B|KB|MB) read in \d+ requests?$/);
+  await expect(page.locator('#data-link-disconnect-container')).toBeVisible();
+  await expect(page.locator('#data-link-connection-target')).toHaveText(`${new URL(FIXTURE).host}/…/current-ui-smoke.h5ad`);
+  await expect(page.locator('#data-link-connection-target')).toHaveAttribute('title', FIXTURE);
+  await page.locator('#dataset-details .disclosure-header').click();
+  await expect(page.locator('#dataset-details-list')).toContainText('In place from');
+  await expect(page.locator('#transfers-list')).toHaveCount(0);
 
   const gets = reads.filter(read => read.method === 'GET');
   expect(gets.length).toBeGreaterThan(0);
@@ -54,13 +58,13 @@ test('a Zarr ZIP link opens in place from ?data=', async ({ page }) => {
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
 });
 
-test('Open from link refuses text it does not recognise before connecting', async ({ page }) => {
+test('the address bar refuses text it does not recognise before connecting', async ({ page }) => {
   await page.goto(`/?${PINNED}data=` + encodeURIComponent(FIXTURE), { waitUntil: 'domcontentloaded' });
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await page.locator('#data-link-disconnect-btn').click();
-  await page.locator('#data-link-url').fill('not a link');
-  await page.locator('#data-link-connect-btn').click();
+  await page.locator('#data-address').fill('not a link');
+  await page.locator('#data-address-open-btn').click();
   await expect(
     page.locator('#notification-center .notification').filter({ hasText: 'Cellucid does not recognise "not a link"' }),
   ).toHaveCount(1);

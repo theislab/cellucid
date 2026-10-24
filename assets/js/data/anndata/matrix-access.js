@@ -17,9 +17,11 @@
  *   taken only when a whole strip fits that budget.
  * - **CSR** (stored by cell), or **dense** stored in one piece or in chunks
  *   spanning many genes: every gene is spread over the whole matrix, so the
- *   matrix is indexed by gene once, streaming, in the background
- *   (`RowMajorColumnIndex`), and a gene asked for meanwhile is answered from
- *   the same pass.
+ *   matrix is indexed by gene once, streaming (`RowMajorColumnIndex`), and a
+ *   gene asked for meanwhile is answered from the same pass. A CSR matrix of
+ *   a fast link is indexed ahead, in the background (`prepare`); a dense
+ *   one only when its first gene is asked for, since its index holds every
+ *   value (`AnnDataReader.prepareMatrix`).
  *
  * Rows are the mirror image: a CSR row (stored by cell) reads only its own
  * entries; a dense row reads the chunks of its row strip; a CSC matrix is

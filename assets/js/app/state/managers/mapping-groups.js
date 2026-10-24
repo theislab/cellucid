@@ -1,6 +1,7 @@
 /**
  * @fileoverview The data-mapping groups beside the embeddings: the neighbour
- * graph, gene names, expression matrix, latent space and vector fields.
+ * graph, gene names, expression matrix, each matrix's log1p, the highly
+ * variable genes, latent space and vector fields.
  *
  * `DataState.applyDataMapping` (`mapping-manager.js`) owns the transaction.
  * This module adds, per group:
@@ -31,6 +32,7 @@ import {
   DIMENSION_SLOTS,
   EMBEDDING_KEY_PREFIX,
   canonicalEmbeddingId,
+  highlyVariableCandidates,
   vectorFieldKeys,
 } from '../../../data/data-mapping.js';
 import {
@@ -51,9 +53,12 @@ import {
   createVarFieldLoader,
   loadConnectivitySummary,
   loadGeneList,
+  varLoaderMappingOf,
 } from '../../../data/data-loaders.js';
+import { createDatasetFieldLoadSupersededError } from './field/loading.js';
 import {
   describeMappingGroupValue,
+  log1pMenu,
   MAPPING_GROUP_LABELS,
   UNCHANGEABLE_GROUP_CLAUSE,
 } from '../../../data/dataset-mapping.js';
@@ -65,6 +70,8 @@ export const MAPPING_GROUPS = Object.freeze([
   'latent',
   'geneNames',
   'expression',
+  'log1p',
+  'highlyVariable',
 ]);
 
 const RUNTIME_METHODS = Object.freeze([
@@ -99,7 +106,9 @@ export function describeObspCandidate(item) {
 }
 
 /** The groups an AnnData dataset can change. */
-const CHANGEABLE_GROUPS = Object.freeze(['vectorFields', 'knn', 'latent', 'geneNames', 'expression']);
+const CHANGEABLE_GROUPS = Object.freeze([
+  'vectorFields', 'knn', 'latent', 'geneNames', 'expression', 'log1p', 'highlyVariable',
+]);
 
 function formatColumnCount(width) {
   return `${formatCount(width)} ${width === 1 ? 'column' : 'columns'}`;
@@ -107,7 +116,8 @@ function formatColumnCount(width) {
 
 /**
  * Groups staged together: the gene names and the expression matrix are one
- * var axis, read and published as one step.
+ * var axis, read and published as one step; the matrices' log1p and the
+ * highly variable genes are answered by that axis's gene loader, made anew.
  */
 const STAGE_OF_GROUP = Object.freeze({
   vectorFields: 'vectorFields',
@@ -115,6 +125,8 @@ const STAGE_OF_GROUP = Object.freeze({
   latent: 'latent',
   geneNames: 'genes',
   expression: 'genes',
+  log1p: 'genes',
+  highlyVariable: 'genes',
 });
 
 function formatGeneCount(count) {
@@ -244,6 +256,12 @@ export class DataStateMappingGroupMethods {
     if (group === 'geneNames') {
       return this.getGeneNameChoices(this.dataMapping.expression);
     }
+    if (group === 'highlyVariable') {
+      return this.getHighlyVariableChoices(this.dataMapping.expression);
+    }
+    if (group === 'log1p') {
+      return this.getLog1pChoices();
+    }
     if (group === 'latent') {
       const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
       // The latent space the file stores outlier quantiles for filters at
@@ -305,6 +323,45 @@ export class DataStateMappingGroupMethods {
         return { value: `column:${column.key}`, label: column.key, usable: reason === null, reason };
       }),
     ];
+  }
+
+  /**
+   * The highly-variable-gene choices of one expression source: None, then
+   * every boolean column of that axis's var (`raw.var` for `raw`),
+   * `highly_variable` first (`highlyVariableCandidates`).
+   *
+   * @param {string|null} expression
+   * @returns {Array<{value: string|null, label: string, usable: boolean, reason: string|null}>}
+   */
+  getHighlyVariableChoices(expression) {
+    const none = { value: null, label: 'None', usable: true, reason: null };
+    if (expression === null) return [none];
+    const candidates = this.getMappingCandidates();
+    const axisRoute = expressionAxisRoute(candidates, expression);
+    if (axisRoute === null) return [none];
+    return [
+      none,
+      ...highlyVariableCandidates(axisVarColumns(candidates, axisRoute)).map(key => {
+        const reason = this.getMappingChoiceUnusableReason('highlyVariable', key);
+        return { value: key, label: key, usable: reason === null, reason };
+      }),
+    ];
+  }
+
+  /**
+   * The transforms an expression matrix can be read as (`log1pMenu`): as
+   * stored, or log1p of a base, with the base the file's `uns['log1p']`
+   * records and any the mapping names offered too.
+   *
+   * @returns {Array<{value: string, label: string, usable: boolean, reason: null}>}
+   */
+  getLog1pChoices() {
+    const recorded = this.getMappingCandidates().log1p;
+    const bases = [
+      ...(recorded === null ? [] : [recorded.base]),
+      ...Object.values(this.dataMapping.log1p).map(entry => entry.base),
+    ];
+    return log1pMenu(bases).map(choice => ({ ...choice, usable: true, reason: null }));
   }
 
   /**
@@ -416,13 +473,25 @@ export class DataStateMappingGroupMethods {
     if (group === 'vectorFields') {
       return this._describeVectorBindingsRefusal(value);
     }
-    if (group === 'expression' || group === 'geneNames') {
+    if (group === 'expression' || group === 'geneNames' || group === 'highlyVariable') {
+      const expression = this._pendingExpression ?? this.dataMapping.expression;
       const choices = group === 'expression'
         ? this.getMappingGroupChoices('expression')
-        : this.getGeneNameChoices(this._pendingExpression ?? this.dataMapping.expression);
+        : group === 'geneNames'
+          ? this.getGeneNameChoices(expression)
+          : this.getHighlyVariableChoices(expression);
       const choice = choices.find(entry => entry.value === value);
       if (choice === undefined) return 'this dataset does not have';
       return choice.usable ? null : `this dataset cannot use (${choice.reason})`;
+    }
+    if (group === 'log1p') {
+      // Every matrix named must be one of this dataset's.
+      const matrices = this.getMappingGroupChoices('expression')
+        .map(choice => choice.value)
+        .filter(matrix => matrix !== null);
+      return Object.keys(value).every(matrix => matrices.includes(matrix))
+        ? null
+        : 'this dataset does not have';
     }
     return UNCHANGEABLE_GROUP_CLAUSE;
   }
@@ -455,10 +524,11 @@ export class DataStateMappingGroupMethods {
    */
   describeMappingGroupRefusal(current, next) {
     for (const group of MAPPING_GROUPS) {
-      // Gene names are read from the axis of the next expression matrix, so a
-      // name source is checked whenever either changes.
+      // Gene names and the highly variable column are read from the axis of
+      // the next expression matrix, so each is checked whenever either changes.
       const changed = !sameJson(current[group], next[group])
-        || (group === 'geneNames' && !sameJson(current.expression, next.expression));
+        || ((group === 'geneNames' || group === 'highlyVariable')
+          && !sameJson(current.expression, next.expression));
       if (!changed) continue;
       const refusal = this._withPendingExpression(
         next.expression,
@@ -474,6 +544,54 @@ export class DataStateMappingGroupMethods {
       );
     }
     return null;
+  }
+
+  /**
+   * One expression matrix of the open file, read for a computation without
+   * changing what is shown (an analysis's "Expression matrix"): its genes,
+   * named on that matrix's own axis -- by the mapping's gene-name column
+   * where that axis has it (X and every layer share `var`; `raw` has
+   * `raw.var`), else by its index -- and the reader of their values, through
+   * the same `var/{axis}/{names}` routes a mapping reads on every AnnData
+   * path. Nothing is installed in field state; the handle is of this
+   * dataset generation only (`readMatrixSparseColumn`, `readMatrixCellSubset`).
+   *
+   * @param {string} expression - `X`, `raw` or `layer:<key>`
+   * @returns {Promise<{expression: string, generation: number, fields: ReadonlyArray<{key: string, kind: string, path: string}>, loader: Function}>}
+   */
+  async openExpressionMatrix(expression) {
+    if (!this.canChangeMappingGroup('expression')) {
+      throw new Error('This dataset reads only its mapped expression matrix.');
+    }
+    const candidates = this.getMappingCandidates();
+    const axisRoute = expressionAxisRoute(candidates, expression);
+    if (axisRoute === null) {
+      throw new RangeError(`This dataset has no expression matrix ${String(expression)}.`);
+    }
+    const mapping = this.dataMapping;
+    const column = mapping.geneNames === 'index'
+      ? undefined
+      : axisVarColumns(candidates, axisRoute).find(entry => `column:${entry.key}` === mapping.geneNames);
+    const namesRoute = column?.usable === true
+      ? geneNamesRoute(candidates, axisRoute, mapping.geneNames)
+      : 'index';
+    const generation = this._datasetGeneration;
+    const url = `${this._requireMappingRuntime().getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
+    const geneList = await loadGeneList(url, {});
+    if (this._datasetGeneration !== generation) throw createDatasetFieldLoadSupersededError();
+    if (geneList.n_points !== this.pointCount) {
+      throw new RangeError(`${String(expression)} has ${geneList.n_points} cells; the dataset has ${this.pointCount}.`);
+    }
+    const loader = createVarFieldLoader(url, {
+      pointCount: geneList.n_points,
+      mapping: { expression, log1p: mapping.log1p, highlyVariable: null },
+    });
+    return Object.freeze({
+      expression,
+      generation,
+      fields: Object.freeze(geneList.fields.map(field => Object.freeze({ ...field }))),
+      loader,
+    });
   }
 
   /**
@@ -681,7 +799,10 @@ const GROUP_STAGES = Object.freeze({
       }
       const url = `${runtime.getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
       geneList = await loadGeneList(url, {});
-      varFieldLoader = createVarFieldLoader(url, { pointCount: geneList.n_points });
+      varFieldLoader = createVarFieldLoader(url, {
+        pointCount: geneList.n_points,
+        mapping: varLoaderMappingOf(next),
+      });
       sameMatrix = next.expression === current.expression;
       sameAxis = current.expression !== null
         && (current.expression === 'raw') === (next.expression === 'raw');

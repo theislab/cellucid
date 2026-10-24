@@ -53,6 +53,7 @@ import {
   categoryCount,
   nullableContract,
   probeColumns,
+  readBooleanColumn,
   readCategories,
   readCodes,
   readDataFrameIndex,
@@ -254,6 +255,52 @@ async function readUnsTitle(root, readOptions) {
     return null;
   }
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * The colours Scanpy keeps for one categorical obs field,
+ * `uns['<key>_colors']` (one colour per category, in category order, as
+ * `sc.pl.*` writes them), as the stored text; null when the file has none.
+ * Which entries are colours, and whether there are enough of them, is the
+ * page's to judge (`scanpyCategoryPalette`). A palette that cannot be read
+ * is no palette: the field is still shown, in Cellucid's colours.
+ *
+ * @param {Object} root
+ * @param {string} key
+ * @param {{signal?: AbortSignal|null}} readOptions
+ * @returns {Promise<string[]|null>}
+ */
+async function readObsFieldColors(root, key, readOptions) {
+  const node = child(child(root, 'uns'), `${key}_colors`);
+  if (node?.kind !== 'array' || valueKind(node) !== 'string' || node.shape.length !== 1) return null;
+  try {
+    const values = await node.read(undefined, readOptions);
+    return Array.from(values, value => String(value));
+  } catch (error) {
+    if (readOptions.signal?.aborted) throw error;
+    console.warn(`[AnnDataReader] uns['${key}_colors'] could not be read; '${key}' is shown in Cellucid's colours (${error?.message ?? error})`);
+    return null;
+  }
+}
+
+/**
+ * `uns['log1p']` as `sc.pp.log1p` records it: null when the file has none,
+ * else `{base}`, null for the natural logarithm. Scanpy writes `base` as None
+ * for e, which anndata stores as nothing; a base that is not a positive
+ * number other than 1 is not a base a logarithm has, and reads as e too.
+ *
+ * @returns {Promise<{base: number|null}|null>}
+ */
+async function readLog1pRecord(root, readOptions) {
+  const record = child(child(root, 'uns'), 'log1p');
+  if (record === null || record === undefined) return null;
+  const node = isGroup(record) ? child(record, 'base') : null;
+  if (node?.kind !== 'array' || !['float', 'int', 'uint'].includes(valueKind(node))) return { base: null };
+  if (!node.shape.every(extent => extent === 1)) return { base: null };
+  let value = await node.read(undefined, readOptions);
+  if (typeof value !== 'number' && typeof value !== 'bigint') value = value?.[0];
+  const base = Number(value);
+  return { base: Number.isFinite(base) && base > 0 && base !== 1 ? base : null };
 }
 
 /**
@@ -675,6 +722,7 @@ export class AnnDataReader {
       X: matrixX,
       layers: mappingProbes('layers'),
       raw,
+      log1p: await readLog1pRecord(root, {}),
     };
   }
 
@@ -901,6 +949,30 @@ export class AnnDataReader {
    * @param {string|null} column
    * @returns {Promise<{index: string[], values: Array<string|null>}>}
    */
+  /**
+   * One boolean column of `var` (axis `X`) or `raw.var` (axis `raw`) as
+   * flags, one per gene of that axis, 1 where true: which genes a column such
+   * as `highly_variable` marks. Read when asked for, never at open.
+   *
+   * @param {'X'|'raw'} axis
+   * @param {string} column
+   * @returns {Promise<Uint8Array>}
+   */
+  async readVarFlags(axis, column) {
+    this._ensureOpen();
+    const label = `${axis === 'raw' ? 'raw.var' : 'var'}['${column}']`;
+    return this._track('names', `flags of ${label}`, async readOptions => {
+      const generation = this._generation;
+      const { index } = await this.readVarNames(axis, null);
+      const frame = axis === 'raw' ? child(this._root, 'raw').get('var') : this._root.get('var');
+      const { columnOrder } = validateDataFrame(frame, this._format, label);
+      if (!columnOrder.includes(column)) throw new Error(`${label} does not exist`);
+      const flags = await readBooleanColumn(frame, column, this._format, label, index.length, readOptions);
+      this._assertGeneration(generation, `reading ${label}`);
+      return flags;
+    });
+  }
+
   async readVarNames(axis, column) {
     this._ensureOpen();
     const cacheKey = `var_names:${axis}:${column === null ? '' : `column:${column}`}`;
@@ -1195,13 +1267,19 @@ export class AnnDataReader {
 
   /**
    * Start indexing one expression matrix by gene in the background, when its
-   * layout needs it (CSR, dense stored across many genes) and the link reads
-   * ahead (see `open`), so the first gene shown does not wait for the whole
-   * build. Returns at once; a failure reaches the gene reads.
+   * layout needs it (CSR) and the link reads ahead (see `open`), so the first
+   * gene shown does not wait for the whole build. A dense matrix is not
+   * indexed ahead: its index holds every value, as much memory as the matrix
+   * itself (28,317 x 3,136 float32: 663 MB resident at open, for a dataset
+   * whose genes may never be shown), so it is built when the first gene is
+   * asked for (549 ms on that matrix, read from disk) and kept within the
+   * column-index budget like any other. Returns at once; a failure reaches
+   * the gene reads.
    */
   prepareMatrix(element) {
     this._ensureOpen();
     if (!this._readsAhead()) return;
+    if (!isGroup(this._requireMatrixElement(element).node)) return;
     const generation = this._generation;
     this._matrixColumns(element, generation)
       .then(columns => columns.prepare?.())
@@ -1381,9 +1459,18 @@ export class AnnDataReader {
     let result;
     if (categorical) {
       validateCodes(categorical.codes, key, format, this._nObs);
-      result = withCategories
-        ? { dtype: 'categorical', categories: await this._categories(categorical, key, generation, readOptions), ordered: categorical.ordered }
-        : { dtype: 'categorical', categoryCount: categoryCount(categorical.categories, key, format), ordered: categorical.ordered };
+      if (withCategories) {
+        // The palette is read with the categories it colours, as metadata:
+        // the first colouring, a legend or a restored session all need it
+        // before any code is read.
+        const [categories, colors] = await Promise.all([
+          this._categories(categorical, key, generation, readOptions),
+          readObsFieldColors(this._root, key, readOptions),
+        ]);
+        result = { dtype: 'categorical', categories, ordered: categorical.ordered, colors };
+      } else {
+        result = { dtype: 'categorical', categoryCount: categoryCount(categorical.categories, key, format), ordered: categorical.ordered };
+      }
     } else if (NULLABLE_ENCODINGS.has(declared)) {
       const contract = nullableContract(item, key, declared, format, this._nObs);
       result = {
@@ -1403,6 +1490,16 @@ export class AnnDataReader {
   /** An obs field's type and categories, without its values. */
   getObsFieldInfo(key) {
     return this._fieldInfo(key, { withCategories: true });
+  }
+
+  /**
+   * An obs field's type from its metadata alone, nothing read: a
+   * categorical's `categoryCount` and `ordered`, not its categories (a
+   * dictionary of one category per cell is megabytes, read when the field
+   * is first loaded).
+   */
+  getObsFieldKind(key) {
+    return this._fieldInfo(key, { withCategories: false });
   }
 
   /**

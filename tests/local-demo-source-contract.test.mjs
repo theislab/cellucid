@@ -9,8 +9,10 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import { initRepresentationControls } from '../assets/js/app/ui/modules/representation-controls.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { createOpenMenuDom } from './helpers/open-menu-dom.mjs';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
 import {
   DATA_CONFIG,
@@ -572,8 +574,7 @@ test(
         this.focusCalls++;
       },
     };
-    const h5adInput = createInput();
-    const zarrInput = createInput();
+    const fileInput = createInput();
     const folderInput = createInput();
     globalThis.document = { addEventListener() {} };
     globalThis.window = {
@@ -585,6 +586,14 @@ test(
       },
     };
     const notificationEvents = [];
+    // How each opening ended, as the opening progress publishes it.
+    const openingOutcomes = [];
+    const stopOutcomes = getOpeningProgress().subscribe(snapshot => {
+      if (snapshot !== null && snapshot.state !== 'running' && openingOutcomes.at(-1)?.id !== snapshot.id) {
+        openingOutcomes.push({ id: snapshot.id, state: snapshot.state });
+      }
+    });
+    t.after(stopOutcomes);
     notifications.loading = message => {
       const id = `dataset-load-${notificationEvents.length}`;
       notificationEvents.push(['loading', id, message]);
@@ -631,23 +640,18 @@ test(
       dataSourceManager: manager,
       dom: {
         select,
-        userDataH5adBtn: createButton(),
-        userDataH5adInput: h5adInput,
-        userDataZarrArchiveBtn: createButton(),
-        userDataZarrArchiveInput: zarrInput,
-        userDataZarrFolderBtn: createButton(),
-        userDataZarrFolderInput: folderInput,
+        ...createOpenMenuDom({ fileInput, folderInput }),
       },
       noneDatasetValue: '__none__',
       populateDatasetDropdown: failedCatalogOutcome,
     });
 
-    await h5adInput.listeners.get('change')({
+    await fileInput.listeners.get('change')({
       target: {
         files: [{ name: 'working.h5ad' }],
       },
     });
-    await zarrInput.listeners.get('change')({
+    await fileInput.listeners.get('change')({
       target: {
         files: [{ name: 'working.zarr.zip' }],
       },
@@ -661,8 +665,7 @@ test(
       },
     });
 
-    assert.equal(h5adInput.value, '');
-    assert.equal(zarrInput.value, '');
+    assert.equal(fileInput.value, '');
     assert.equal(folderInput.value, '');
     assert.deepEqual(
       activatedMetadata,
@@ -671,10 +674,9 @@ test(
     assert.equal(localCandidates.length, 4);
     assert.equal(manager.getCurrentSourceType(), 'local-user');
     assert.equal(manager.getCurrentDatasetId(), 'local-user');
-    assert.deepEqual(
-      notificationEvents.map(event => event[0]),
-      ['loading', 'fail', 'loading', 'fail', 'loading', 'fail']
-    );
+    // Each load is one opening (`data/opening-progress.js`); the rejected
+    // catalog cannot be listed after it, so each ends failed.
+    assert.deepEqual(openingOutcomes.map(outcome => outcome.state), ['failed', 'failed', 'failed']);
 
     const remoteMetadata = identity(
       'served',
@@ -724,18 +726,17 @@ test(
     const remoteSource = createRemoteCandidate();
     manager.registerSource('remote', remoteSource);
     const remoteConnectBtn = createButton();
-    const remoteServerUrl = createInput(
-      'http://127.0.0.1:8765'
-    );
+    const remoteDisconnectContainer = { hidden: true };
     initDatasetConnections({
       datasetIntents,
       clearDataset: async () => true,
       dataSourceManager: manager,
       dom: {
-        remoteConnectBtn,
+        dataAddressInput: createInput('127.0.0.1:8765'),
+        dataAddressOpenBtn: remoteConnectBtn,
         remoteDisconnectBtn: createButton(),
-        remoteDisconnectContainer: { style: {} },
-        remoteServerUrl,
+        remoteDisconnectContainer,
+        remoteConnectionTarget: { textContent: '', title: '' },
         select,
       },
       noneDatasetValue: '__none__',
@@ -743,23 +744,11 @@ test(
     });
     await remoteConnectBtn.listeners.get('click')();
     assert.equal(remoteConnectBtn.disabled, false);
-    assert.equal(remoteConnectBtn.textContent, 'Reconnect');
+    assert.equal(remoteDisconnectContainer.hidden, false);
     assert.equal(manager.getCurrentSourceType(), 'remote');
     assert.equal(manager.getCurrentDatasetId(), 'served');
     assert.equal(activatedMetadata.at(-1), remoteMetadata);
     assert.equal(remoteCandidates.length, 2);
-    assert.deepEqual(
-      notificationEvents.map(event => event[0]),
-      [
-        'loading',
-        'fail',
-        'loading',
-        'fail',
-        'loading',
-        'fail',
-        'loading',
-        'fail',
-      ]
-    );
+    assert.deepEqual(openingOutcomes.map(outcome => outcome.state), ['failed', 'failed', 'failed', 'failed']);
   }
 );

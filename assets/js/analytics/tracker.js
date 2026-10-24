@@ -194,6 +194,8 @@ const CLICK_CONTROLS = Object.freeze({
   'analysis-header-differential': ['analysis', 'differential'],
   'analysis-header-signature': ['analysis', 'signature'],
   'analysis-header-genesPanel': ['analysis', 'genes_panel'],
+  'analysis-header-dotplot': ['analysis', 'dotplot'],
+  'analysis-header-composition': ['analysis', 'composition'],
   'gene-expression-dropdown': ['color_by_gene'],
 });
 
@@ -255,6 +257,8 @@ const DECLARED_CHANGE_CONTROLS = Object.freeze({
   'data-mapping:knn': ['data_mapping', 'knn'],
   'data-mapping:gene-names': ['data_mapping', 'gene_names'],
   'data-mapping:expression': ['data_mapping', 'expression'],
+  'data-mapping:log1p': ['data_mapping', 'log1p'],
+  'data-mapping:highly-variable': ['data_mapping', 'highly_variable'],
   'data-mapping:latent': ['data_mapping', 'latent'],
   'data-mapping:vector-fields': ['data_mapping', 'vector_fields'],
 });

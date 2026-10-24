@@ -9,9 +9,8 @@
  * - The page chips ("Page 1", "Rest of Page 1") were `<div>`s with a click
  *   listener: choosing which pages an analysis runs over was impossible without
  *   a mouse and announced no role, name or selected state.
- * - The collapsible "Performance Settings" and "Clustering" sections were
- *   `<div>`s with a click listener too, hiding every control inside them from
- *   keyboard users.
+ * - The collapsible settings sections were `<div>`s with a click listener
+ *   too, hiding every control inside them from keyboard users.
  * - Selects built by the shared form helpers had no accessible name at all.
  * - The multi-select popup is appended to `<body>`, so sequential focus never
  *   reached it and Escape left focus stranded.
@@ -36,7 +35,9 @@ const MODES = Object.freeze([
   'correlation',
   'differential',
   'signature',
-  'genesPanel'
+  'genesPanel',
+  'dotplot',
+  'composition'
 ]);
 
 function observeProductErrors(page) {
@@ -237,29 +238,33 @@ test('collapsible settings sections open from the keyboard', async ({ page }) =>
   await openDataset(page);
   await openMode(page, 'genesPanel');
 
-  const headers = page.locator(
-    `${panelFor('genesPanel')} .disclosure-inline .disclosure-header`
-  );
-  await expect(headers).toHaveCount(2);
-
-  for (let index = 0; index < 2; index++) {
-    const header = headers.nth(index);
+  // "More options", then each group of options inside it.
+  const panel = panelFor('genesPanel');
+  const toggleFromKeyboard = async header => {
     await expect(header).toHaveRole('button');
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     const regionId = await header.getAttribute('aria-controls');
     expect(regionId).toBeTruthy();
     const region = page.locator(`[id="${regionId}"]`);
     await expect(region).toBeHidden();
-
     await header.focus();
     await page.keyboard.press('Enter');
     await expect(header).toHaveAttribute('aria-expanded', 'true');
     await expect(region).toBeVisible();
-
     await page.keyboard.press(' ');
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     await expect(region).toBeHidden();
-  }
+  };
+  const more = page.locator(`${panel} .analysis-more-options > .disclosure-header`);
+  await expect(more).toHaveCount(1);
+  await toggleFromKeyboard(more);
+  await more.click();
+  const groups = page.locator(
+    `${panel} .analysis-options-group > .disclosure-header-row > .disclosure-header`
+  );
+  await expect(groups).toHaveCount(4);
+  for (let index = 0; index < 4; index++) await toggleFromKeyboard(groups.nth(index));
+  await more.click();
 
   // The Quick Insights page-selection disclosure follows the same contract.
   await page.locator('#analysis-header-genesPanel').click();
@@ -321,7 +326,7 @@ test('a copied analysis window owns its own controls', async ({ page }) => {
     .click({ force: true });
   const floating = page.locator('#floating-panels-root .analysis-window-panel');
   await expect(floating).toHaveCount(1);
-  await expect(floating.locator('input[name="useCache"]')).toBeVisible();
+  await expect(floating.locator('select[name="groupBy"]')).toBeVisible();
 
   const duplicateIds = await page.evaluate(() => {
     const ids = [...document.querySelectorAll('[id]')].map(element => element.id);
@@ -329,27 +334,21 @@ test('a copied analysis window owns its own controls', async ({ page }) => {
   });
   expect(duplicateIds).toEqual([]);
 
-  // Clicking the copy's label must operate the copy's checkbox, not the
+  // Clicking the copy's label must operate the copy's control, not the
   // sidebar's.
-  const crosstalk = await page.evaluate(() => {
-    const sidebarBox = document
-      .querySelector('#sidebar')
-      .querySelector('input[name="useCache"]');
-    const floatingBox = document
-      .querySelector('#floating-panels-root')
-      .querySelector('input[name="useCache"]');
+  const focused = await page.evaluate(() => {
+    const sidebarSelect = document.querySelector('#sidebar').querySelector('select[name="groupBy"]');
+    const floatingSelect = document.querySelector('#floating-panels-root').querySelector('select[name="groupBy"]');
     const floatingLabel = document
       .querySelector('#floating-panels-root')
-      .querySelector(`label[for="${CSS.escape(floatingBox.id)}"]`);
-    const before = { sidebar: sidebarBox.checked, floating: floatingBox.checked };
+      .querySelector(`label[for="${CSS.escape(floatingSelect.id)}"]`);
     floatingLabel.click();
     return {
-      before,
-      after: { sidebar: sidebarBox.checked, floating: floatingBox.checked }
+      floating: document.activeElement === floatingSelect,
+      sidebar: document.activeElement === sidebarSelect,
     };
   });
-  expect(crosstalk.before).toEqual({ sidebar: true, floating: true });
-  expect(crosstalk.after).toEqual({ sidebar: true, floating: false });
+  expect(focused).toEqual({ floating: true, sidebar: false });
 
   const controls = await readControlNames(
     page,
@@ -415,16 +414,18 @@ test('analysis settings survive collapsing and reopening the panel', async ({
   await openMode(page, 'genesPanel');
 
   const form = panelFor('genesPanel');
-  await page.locator(`${form} select[name="mode"]`).selectOption('ranked');
-  await page.locator(`${form} select[name="method"]`).selectOption('ttest');
-  await page.locator(`${form} input[name="useCache"]`).uncheck();
+  await page.locator(`${form} .analysis-more-options > .disclosure-header`).click();
+  await page.locator(form).getByRole('button', { name: 'Test', exact: true }).click();
+  await page.locator(form).getByRole('combobox', { name: 'Method' }).selectOption('ttest');
+  await page.locator(form).getByRole('button', { name: 'Bonferroni' }).click();
 
   const expectCarried = async () => {
-    await expect(page.locator(`${form} select[name="mode"]`)).toHaveValue('ranked');
-    await expect(page.locator(`${form} select[name="method"]`)).toHaveValue('ttest');
-    await expect(page.locator(`${form} input[name="useCache"]`)).not.toBeChecked();
-    // 'ranked' hides the clustering section; the mode and the sections agree.
-    await expect(page.locator(`${form} .cluster-params`)).toBeHidden();
+    await expect(page.locator(form).getByRole('combobox', { name: 'Method' })).toHaveValue('ttest');
+    await expect(page.locator(form).getByRole('button', { name: 'Bonferroni' })).toHaveAttribute('aria-pressed', 'true');
+    // The Wilcoxon p-value choice applies to Wilcoxon only.
+    await expect(page.locator(form).getByRole('combobox', { name: 'Wilcoxon p-values' })).toHaveCount(0);
+    // The open disclosures are carried with the choices.
+    await expect(page.locator(`${form} .analysis-more-options > .disclosure-header`)).toHaveAttribute('aria-expanded', 'true');
   };
   await expectCarried();
 
@@ -440,45 +441,5 @@ test('analysis settings survive collapsing and reopening the panel', async ({
   );
   await expectCarried();
 
-  expect(productErrors).toEqual([]);
-});
-
-test('choosing a DE comparison page keeps focus on the dropdown', async ({ page }) => {
-  const productErrors = observeProductErrors(page);
-  await openDataset(page);
-  await page.evaluate(async () => {
-    const { createPageComparisonSelector } = await import(
-      '/assets/js/app/analysis/ui/components/selectors.js'
-    );
-    const selector = createPageComparisonSelector({
-      pages: [
-        { id: 'page_a', name: 'Alpha' },
-        { id: 'page_b', name: 'Beta' },
-        { id: 'page_c', name: 'Gamma' },
-      ],
-      selectedIds: ['page_a', 'page_b'],
-      includeDerivedPages: false,
-      getCellCountForPageId: () => 10,
-      onChange(pageIds) {
-        window.__comparisonChanges.push(pageIds);
-      },
-    });
-    window.__comparisonChanges = [];
-    selector.id = 'comparison-focus-probe';
-    document.body.appendChild(selector);
-  });
-  const pageA = page.getByRole('combobox', { name: 'Page A' });
-  const pageB = page.getByRole('combobox', { name: 'Page B' });
-  await pageA.focus();
-  await pageA.selectOption('page_c');
-  await expect(pageA).toBeFocused();
-  await expect(pageA).toHaveValue('page_c');
-  expect(await pageB.evaluate(select => (
-    [...select.options].map(option => [option.value, option.disabled])
-  ))).toEqual([['page_a', false], ['page_b', false], ['page_c', true]]);
-  expect(await page.evaluate(() => window.__comparisonChanges)).toEqual([
-    ['page_c', 'page_b'],
-  ]);
-  await page.evaluate(() => document.getElementById('comparison-focus-probe').remove());
   expect(productErrors).toEqual([]);
 });

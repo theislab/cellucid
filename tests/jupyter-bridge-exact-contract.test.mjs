@@ -1951,6 +1951,8 @@ const REPORTED_MAPPING = Object.freeze({
   knn: 'connectivities',
   geneNames: 'index',
   expression: 'X',
+  log1p: {},
+  highlyVariable: null,
   latent: null,
   vectorFields: [],
 });

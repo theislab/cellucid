@@ -7,6 +7,8 @@ const PREPARED_DATASET_URL =
   + '&dataset=current-ui&acceptance=highlight-selection-feedback-ci';
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
+// The active tool's gesture, or what it needs first: the Selection (i)'s first line.
+const TOOL_HINT = '#highlight-tool-hint';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -233,29 +235,29 @@ test(
     // The fixture loads with no colouring field, which is when Alt+click is inert.
     await expect(page.locator('#categorical-field')).toHaveValue('-1');
     await expect(page.locator('#continuous-field')).toHaveValue('-1');
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
-    await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+    await expect(page.locator(TOOL_HINT)).not.toContainText(
       'Alt+click a cell to select',
     );
 
     const points = await findCellPoints(page, 1);
     await altClick(page, points[0]);
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Alt+click a cell to select',
     );
-    await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+    await expect(page.locator(TOOL_HINT)).not.toContainText(
       'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'None' });
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
 
@@ -451,7 +453,7 @@ test(
     await expect(page.locator(MODE_DESCRIPTION)).toContainText(
       MISSED_CELL_NOTICE,
     );
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Alt+click a cell to select',
     );
     expect(await unifiedState(page)).toMatchObject({
