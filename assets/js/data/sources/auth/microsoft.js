@@ -6,11 +6,20 @@
  * 1. The button's click opens Microsoft's sign-in page in a popup (the
  *    `common` authority: personal and work or school accounts).
  * 2. Microsoft sends the popup back to `assets/auth/callback.html`, which
- *    posts the code and `state` on a `BroadcastChannel` and closes (a
- *    channel, because Microsoft's pages may cut the popup off from its
- *    opener).
+ *    posts the code and `state` on a `BroadcastChannel` (a channel, because
+ *    Microsoft's pages may cut the popup off from its opener). This page
+ *    answers that it received them, and the popup then closes; a popup that
+ *    closes before that ends the sign-in attempt, which the step offers again.
  * 3. This page redeems the code with the verifier it kept in memory: a
  *    single-page application needs no client secret, and none exists.
+ *
+ * A channel reaches only pages that share storage. A page embedded in another
+ * site (a notebook's viewer) has storage of its own, so the popup's message
+ * never reaches it: Cellucid says so before opening the popup when it can
+ * tell, and when the popup closes otherwise. Microsoft accepts plain `http://`
+ * only for this computer's own addresses, and the browser computes PKCE only
+ * on a secure page, so a plain `http://` page on another host is refused
+ * first.
  *
  * Cellucid asks for `Files.Read` first: enough for personal accounts and the
  * files shared with them, and for a work account's own files. Reading a file
@@ -26,6 +35,7 @@
  */
 
 import { PROVIDER_CONFIG } from '../provider-config.js';
+import { embeddedInOtherSite, embeddingOrigin, pageOrigin } from './page-context.js';
 import { createPkce, randomUrlSafe } from './pkce.js';
 import { finalSignInFailure, getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
@@ -35,6 +45,8 @@ export const FILES_READ = `${GRAPH}/Files.Read`;
 export const FILES_READ_ALL = `${GRAPH}/Files.Read.All`;
 export const CALLBACK_PATH = '/assets/auth/callback.html';
 export const SIGN_IN_CHANNEL = 'cellucid-sign-in';
+/** How often the page looks whether the sign-in window is still open. */
+const POPUP_WATCH_MS = 500;
 /** A single-page application's refresh token lasts 24 hours and is not extended (Microsoft's rule). */
 const SPA_REFRESH_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const STORE_NAME = 'microsoft';
@@ -121,7 +133,24 @@ export function createMicrosoftAuth({
 
   /** Why this page cannot sign in to Microsoft, or null. */
   function whyNoSignIn() {
-    return config.clientId ? null : 'Signing in to Microsoft is not configured on this site yet.';
+    if (!config.clientId) return 'Signing in to Microsoft is not configured on this site yet.';
+    if (win.isSecureContext === false) {
+      return `Microsoft sign-in needs https:// or this computer's own address (localhost), not ${pageOrigin(win)}. ` +
+        'Open www.cellucid.com.';
+    }
+    if (embeddedInOtherSite(win) === true) {
+      return `Microsoft sign-in cannot reach Cellucid inside another site's page (${embeddingOrigin(win)}). ` +
+        'Open Cellucid in its own tab, such as www.cellucid.com.';
+    }
+    return null;
+  }
+
+  /** What the person reads when the sign-in window closed without a sign-in. */
+  function closedText() {
+    const text = 'Microsoft\'s sign-in window was closed before it finished.';
+    return embeddingOrigin(win) === null
+      ? text
+      : `${text} If you signed in, the browser kept the sign-in from this embedded page: open Cellucid in its own tab.`;
   }
 
   function adopt(answer, askedAt, previous = null) {
@@ -237,9 +266,19 @@ export function createMicrosoftAuth({
     }
     return new Promise((resolve, reject) => {
       const channel = new win.BroadcastChannel(SIGN_IN_CHANNEL);
+      // The window closes only after this page answers its message, so a
+      // window found closed before that brought no sign-in.
+      const watch = setInterval(() => {
+        if (popup.closed !== true) return;
+        clearInterval(watch);
+        channel.close();
+        reject(new MicrosoftSignInError(closedText(), 'POPUP_CLOSED'));
+      }, POPUP_WATCH_MS);
       channel.onmessage = event => {
         const message = event.data;
-        if (message?.state !== state) return;
+        if (message?.state !== state || message.received === true) return;
+        clearInterval(watch);
+        channel.postMessage({ state, received: true });
         channel.close();
         if (typeof message.code !== 'string') {
           reject(describeMicrosoftError(message.error, message.errorDescription));

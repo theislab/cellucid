@@ -38,6 +38,7 @@ import {
   grantsScope,
 } from '../assets/js/data/sources/auth/microsoft.js';
 import { callbackMessage } from '../assets/js/data/sources/auth/callback-page.js';
+import { embeddedInOtherSite, embeddingOrigin } from '../assets/js/data/sources/auth/page-context.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TOKEN = 'TOKEN-MARKER-91c2';
@@ -197,7 +198,27 @@ test('sign-in steps: a step nobody waits for goes; a final failure ends it; a st
 });
 
 /** Fake Google Identity Services and Picker. */
-function fakeGoogleWindow({ origin = 'https://www.cellucid.com', response = null, error = null } = {}) {
+/**
+ * A page at `origin`, in its own tab, or embedded in a page at `top`: its
+ * address unreadable when it is another origin, named by `ancestorOrigins`
+ * (Chromium, WebKit) or only by the referrer (Firefox).
+ */
+function placePage(win, { origin, top = null, named = 'ancestors' }) {
+  win.location = { origin };
+  win.self = win;
+  if (top === null) {
+    win.top = win;
+    return win;
+  }
+  win.top = top === origin
+    ? { location: { origin } }
+    : { location: { get origin() { throw new DOMException('Blocked a frame', 'SecurityError'); } } };
+  if (named === 'ancestors') win.location.ancestorOrigins = [top];
+  win.document = { ...(win.document ?? {}), referrer: named === 'referrer' ? `${top}/lab/tree/analysis.ipynb` : '' };
+  return win;
+}
+
+function fakeGoogleWindow({ origin = 'https://www.cellucid.com', top = null, response = null, error = null } = {}) {
   const log = { requested: 0, revoked: [], fileIds: null, visible: false, built: null };
   const picker = {
     Response: { ACTION: 'action', DOCUMENTS: 'docs' },
@@ -269,6 +290,7 @@ function fakeGoogleWindow({ origin = 'https://www.cellucid.com', response = null
     },
     gapi: { load: (name, { callback }) => callback() },
   };
+  placePage(win, { origin, top });
   // The client the module configures is the object `initTokenClient` returned.
   const init = win.google.accounts.oauth2.initTokenClient;
   win.google.accounts.oauth2.initTokenClient = options => {
@@ -282,17 +304,58 @@ const GOOGLE_CONFIG = Object.freeze({
   clientId: 'client.apps.googleusercontent.com',
   apiKey: 'AIza-key',
   projectNumber: '123456',
-  signInOrigins: Object.freeze(['https://www.cellucid.com', 'http://127.0.0.1:8765', 'http://localhost:8765']),
+  registeredOrigins: Object.freeze(['https://www.cellucid.com', 'http://127.0.0.1:8765', 'http://localhost:8765']),
 });
 
-test('Google: not configured, or on a local port Google does not know, says so before any popup', () => {
+test('Google: not configured, or on an origin Google does not know, says so before any read or popup', () => {
   const steps = new SignInSteps();
   const empty = createGoogleAuth({ config: { ...GOOGLE_CONFIG, clientId: '', apiKey: '' }, steps, win: fakeGoogleWindow().win });
   assert.equal(empty.whyNoPublicAccess(), 'Google Drive is not configured on this site yet.');
   assert.equal(empty.whyNoSignIn(), 'Signing in to Google is not configured on this site yet.');
-  const local = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ origin: 'http://127.0.0.1:9000' }).win });
-  assert.match(local.whyNoSignIn(), /only on its default port, 8765 \(this page is http:\/\/127\.0\.0\.1:9000\)/);
-  assert.equal(createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ origin: 'http://localhost:8765' }).win }).whyNoSignIn(), null);
+  const at = (origin, top = null) => createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ origin, top }).win });
+  // The registered origins: a public file and a sign-in both work, in a tab
+  // or in a notebook on port 8765.
+  for (const google of [at('https://www.cellucid.com'), at('http://localhost:8765'), at('http://127.0.0.1:8765', 'http://localhost:8888')]) {
+    assert.equal(google.whyNoPublicAccess(), null);
+    assert.equal(google.whyNoSignIn(), null);
+  }
+  // The API key's website restriction is the same list: a public file is
+  // refused, with what to do, wherever a sign-in is.
+  const refusals = new Map([
+    [at('http://127.0.0.1:9000'),
+      'Google Drive works on a local cellucid serve only on its default port, 8765 (this page is http://127.0.0.1:9000). ' +
+      'Start it without --port, or open www.cellucid.com.'],
+    [at('http://127.0.0.1:53124', 'http://localhost:8888'),
+      'Google Drive works in a notebook viewer only on port 8765 (this one is http://127.0.0.1:53124). ' +
+      'Create it with AnnDataViewer(data, port=8765), or open www.cellucid.com.'],
+    [at('http://192.168.1.20:8765'), 'Google Drive works on www.cellucid.com, not on http://192.168.1.20:8765.'],
+    [at('https://hub.example.org', 'https://hub.example.org'), 'Google Drive works on www.cellucid.com, not on https://hub.example.org.'],
+  ]);
+  for (const [google, text] of refusals) {
+    assert.equal(google.whyNoPublicAccess(), text);
+    assert.equal(google.whyNoSignIn(), text);
+  }
+});
+
+test('the page context: where an embedded page sits, and when another site holds it', () => {
+  const page = options => placePage({}, options);
+  assert.equal(embeddingOrigin(page({ origin: 'https://www.cellucid.com' })), null);
+  assert.equal(embeddedInOtherSite(page({ origin: 'https://www.cellucid.com' })), false);
+  // JupyterLab at localhost embeds a viewer at 127.0.0.1: another site, by
+  // ancestorOrigins or, in Firefox, by the referrer.
+  for (const named of ['ancestors', 'referrer']) {
+    const viewer = page({ origin: 'http://127.0.0.1:53124', top: 'http://localhost:8888', named });
+    assert.equal(embeddingOrigin(viewer), 'http://localhost:8888');
+    assert.equal(embeddedInOtherSite(viewer), true);
+  }
+  // The same host on another port is the same site; so is the same origin.
+  assert.equal(embeddedInOtherSite(page({ origin: 'http://127.0.0.1:53124', top: 'http://127.0.0.1:8888' })), false);
+  assert.equal(embeddedInOtherSite(page({ origin: 'https://hub.example.org', top: 'https://hub.example.org' })), false);
+  // Another scheme is another site; two domain names cannot be told apart
+  // without the public suffix list, nor a parent the browser does not name.
+  assert.equal(embeddedInOtherSite(page({ origin: 'https://www.cellucid.com', top: 'http://www.cellucid.com' })), true);
+  assert.equal(embeddedInOtherSite(page({ origin: 'https://www.cellucid.com', top: 'https://lab.example.org' })), null);
+  assert.equal(embeddedInOtherSite(page({ origin: 'https://www.cellucid.com', top: 'https://lab.example.org', named: 'none' })), null);
 });
 
 test('Google: the click asks GIS for drive.file only; the token is kept for the tab and revoked on sign-out', async t => {
@@ -343,16 +406,26 @@ test('Google: a blocked popup and a refused scope are said, and the step stays t
     steps,
     win: fakeGoogleWindow({ response: { access_token: TOKEN, expires_in: 10, scope: 'email' } }).win,
   });
-  narrow.authorize();
+  const narrowed = narrow.authorize();
   await new Promise(resolve => setTimeout(resolve, 0));
   steps.run(steps.list()[0].id);
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(steps.list()[0].problem, /did not grant access to the files you choose/);
+  steps.dismiss(steps.list()[0].id);
+  await assert.rejects(narrowed, /dismissed/);
+  // Google's window closed without a token: the attempt ends, the step stays.
+  const closed = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ error: { type: 'popup_closed' } }).win });
+  closed.authorize().catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  steps.run(steps.list()[0].id);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(steps.list()[0].problem, 'Google\'s sign-in window was closed before it finished.');
+  assert.equal(steps.list()[0].working, false);
 });
 
 /** A fake Microsoft: the popup, the callback's channel and the token endpoint. */
-function fakeMicrosoftWindow(t, { tokenAnswers = [] } = {}) {
-  const log = { opened: [], posts: [] };
+function fakeMicrosoftWindow(t, { tokenAnswers = [], origin = 'https://www.cellucid.com', top = null, secure = true } = {}) {
+  const log = { opened: [], posts: [], received: [], popups: [] };
   const channels = new Set();
   class Channel {
     constructor(name) {
@@ -360,18 +433,25 @@ function fakeMicrosoftWindow(t, { tokenAnswers = [] } = {}) {
       channels.add(this);
     }
 
+    postMessage(message) {
+      log.received.push(message);
+    }
+
     close() {
       channels.delete(this);
     }
   }
   const win = {
-    location: { origin: 'https://www.cellucid.com' },
+    isSecureContext: secure,
     open: url => {
       log.opened.push(new URL(url));
-      return {};
+      const popup = { closed: false };
+      log.popups.push(popup);
+      return popup;
     },
     BroadcastChannel: Channel,
   };
+  placePage(win, { origin, top });
   const deliver = message => {
     for (const channel of [...channels]) {
       if (channel.name === SIGN_IN_CHANNEL) channel.onmessage?.({ data: message });
@@ -411,6 +491,10 @@ test('Microsoft: PKCE in a popup, the code redeemed in the page with the verifie
   fake.deliver({ state: 'someone-else', code: 'wrong' });
   fake.deliver({ state: query.state, code: 'CODE-1' });
   assert.equal(await authorized, TOKEN);
+  // The page answers the window, which closes only then: no closed window
+  // taken for a sign-in that did not finish.
+  assert.deepEqual(fake.log.received, [{ state: query.state, received: true }]);
+  fake.log.popups[0].closed = true;
   const [post] = fake.log.posts;
   assert.equal(post.url, 'https://login.microsoftonline.com/common/oauth2/v2.0/token');
   assert.equal(post.body.grant_type, 'authorization_code');
@@ -478,12 +562,62 @@ test('Microsoft: not configured says so; a blocked popup is said', async t => {
   assert.match(steps.list()[0].problem, /blocked Microsoft's sign-in window/);
 });
 
+test('Microsoft: a plain http:// page of another host, and a page inside another site, say so before any popup', async t => {
+  installSessionStorage(t);
+  const steps = new SignInSteps();
+  const at = options => createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fakeMicrosoftWindow(t, options).win });
+  assert.equal(
+    at({ origin: 'http://192.168.1.20:8765', secure: false }).whyNoSignIn(),
+    'Microsoft sign-in needs https:// or this computer\'s own address (localhost), not http://192.168.1.20:8765. Open www.cellucid.com.'
+  );
+  const notebook = at({ origin: 'http://127.0.0.1:53124', top: 'http://localhost:8888' });
+  assert.equal(
+    notebook.whyNoSignIn(),
+    'Microsoft sign-in cannot reach Cellucid inside another site\'s page (http://localhost:8888). Open Cellucid in its own tab, such as www.cellucid.com.'
+  );
+  await assert.rejects(notebook.authorize(), error => error.code === 'NOT_AVAILABLE' && /in its own tab/.test(error.message));
+  assert.equal(steps.list().length, 0, 'no step offers a sign-in that cannot finish');
+  // Same site (another port of 127.0.0.1), a tab of this computer, or a parent
+  // whose site cannot be told: the popup is offered.
+  assert.equal(at({ origin: 'http://127.0.0.1:53124', top: 'http://127.0.0.1:8888' }).whyNoSignIn(), null);
+  assert.equal(at({ origin: 'http://localhost:9000' }).whyNoSignIn(), null);
+  assert.equal(at({ origin: 'https://www.cellucid.com', top: 'https://lab.example.org' }).whyNoSignIn(), null);
+});
+
+test('Microsoft: a sign-in window closed without a sign-in ends the attempt, and the step offers it again', async t => {
+  installSessionStorage(t);
+  const steps = new SignInSteps();
+  for (const [top, text] of [
+    [null, 'Microsoft\'s sign-in window was closed before it finished.'],
+    ['https://lab.example.org', 'Microsoft\'s sign-in window was closed before it finished. ' +
+      'If you signed in, the browser kept the sign-in from this embedded page: open Cellucid in its own tab.'],
+  ]) {
+    const fake = fakeMicrosoftWindow(t, { top });
+    const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl });
+    const waiting = microsoft.authorize();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const [step] = steps.list();
+    steps.run(step.id);
+    assert.equal(steps.list()[0].working, true);
+    fake.log.popups[0].closed = true;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(steps.list()[0].problem, text);
+    assert.equal(steps.list()[0].working, false);
+    assert.equal(fake.log.received.length, 0);
+    // A message after the window closed is no longer listened for.
+    fake.deliver({ state: Object.fromEntries(fake.log.opened[0].searchParams).state, code: 'LATE' });
+    assert.equal(fake.log.posts.length, 0);
+    steps.dismiss(step.id);
+    await assert.rejects(waiting, /dismissed/);
+  }
+});
+
 test('the provider config holds public identifiers only, empty until the owner registers Cellucid', async () => {
   const source = await readFile(path.join(ROOT, 'assets/js/data/sources/provider-config.js'), 'utf8');
   const { PROVIDER_CONFIG } = await import('../assets/js/data/sources/provider-config.js');
-  assert.deepEqual(Object.keys(PROVIDER_CONFIG.google).sort(), ['apiKey', 'clientId', 'projectNumber', 'signInOrigins']);
+  assert.deepEqual(Object.keys(PROVIDER_CONFIG.google).sort(), ['apiKey', 'clientId', 'projectNumber', 'registeredOrigins']);
   assert.deepEqual(Object.keys(PROVIDER_CONFIG.microsoft).sort(), ['authority', 'clientId']);
-  assert.deepEqual([...PROVIDER_CONFIG.google.signInOrigins], ['https://www.cellucid.com', 'http://127.0.0.1:8765', 'http://localhost:8765']);
+  assert.deepEqual([...PROVIDER_CONFIG.google.registeredOrigins], ['https://www.cellucid.com', 'http://127.0.0.1:8765', 'http://localhost:8765']);
   assert.equal(PROVIDER_CONFIG.microsoft.authority, 'common');
   assert.doesNotMatch(source.replace(/\/\*[\s\S]*?\*\//g, ''), /secret/i, 'no secret is configured');
 });

@@ -20,6 +20,7 @@
  */
 
 import { PROVIDER_CONFIG } from '../provider-config.js';
+import { embeddingOrigin, isLocalOrigin, pageOrigin } from './page-context.js';
 import { getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
 
@@ -58,11 +59,28 @@ export function createGoogleAuth({
   let tokenClient = null;
   let pendingToken = null;
 
-  const origin = () => win.location?.origin ?? '';
+  /**
+   * Why Google refuses this page's origin, or null. The API key's website
+   * restriction and the client ID's JavaScript origins list the same
+   * registered origins, matched exactly, port included: a public file and a
+   * sign-in work on the same pages.
+   */
+  function whyNotThisOrigin() {
+    const here = pageOrigin(win);
+    if (config.registeredOrigins.includes(here)) return null;
+    if (!isLocalOrigin(here)) return `Google Drive works on www.cellucid.com, not on ${here}.`;
+    // A notebook embeds its viewer; `cellucid serve` opens in a tab of its own.
+    return embeddingOrigin(win) === null
+      ? `Google Drive works on a local cellucid serve only on its default port, 8765 (this page is ${here}). ` +
+        'Start it without --port, or open www.cellucid.com.'
+      : `Google Drive works in a notebook viewer only on port 8765 (this one is ${here}). ` +
+        'Create it with AnnDataViewer(data, port=8765), or open www.cellucid.com.';
+  }
 
-  /** Why public Drive files cannot be read on this site, or null. */
+  /** Why public Drive files cannot be read on this page, or null. */
   function whyNoPublicAccess() {
-    return config.apiKey ? null : 'Google Drive is not configured on this site yet.';
+    if (!config.apiKey) return 'Google Drive is not configured on this site yet.';
+    return whyNotThisOrigin();
   }
 
   /** Why this page cannot sign in to Google, or null. */
@@ -70,14 +88,7 @@ export function createGoogleAuth({
     if (!config.clientId || !config.apiKey || !config.projectNumber) {
       return 'Signing in to Google is not configured on this site yet.';
     }
-    if (!config.signInOrigins.includes(origin())) {
-      const local = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin());
-      return local
-        ? `Google sign-in works on a local cellucid serve only on its default port, 8765 (this page is ${origin()}). ` +
-          'Start it without --port, or open www.cellucid.com.'
-        : `Google sign-in works on www.cellucid.com, not on ${origin()}.`;
-    }
-    return null;
+    return whyNotThisOrigin();
   }
 
   function loadScript(url) {

@@ -19,7 +19,7 @@ const TOKEN = 'ya29.TOKEN-MARKER';
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization,range,prefer', 'Access-Control-Expose-Headers': 'Content-Range' };
 
 const CONFIG = `export const PROVIDER_CONFIG = Object.freeze({
-  google: Object.freeze({ clientId: 'test.apps.googleusercontent.com', apiKey: 'test-key', projectNumber: '42', signInOrigins: Object.freeze([${JSON.stringify(APP_ORIGIN)}]) }),
+  google: Object.freeze({ clientId: 'test.apps.googleusercontent.com', apiKey: 'test-key', projectNumber: '42', registeredOrigins: Object.freeze([${JSON.stringify(APP_ORIGIN)}]) }),
   microsoft: Object.freeze({ clientId: 'test-microsoft-client', authority: 'common' }),
 });`;
 
@@ -281,8 +281,10 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const popup = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();
-  await popup;
+  const signInWindow = await popup;
   await expect(page.locator('#dataset-cells')).toHaveText('120');
+  // The return page closed once this page answered that it had the code.
+  await expect.poll(() => signInWindow.isClosed()).toBe(true);
   // The code was redeemed in the page, with the verifier and no secret.
   expect(seen.tokenBodies).toHaveLength(1);
   expect(seen.tokenBodies[0].grant_type).toBe('authorization_code');
@@ -298,5 +300,30 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   await expect(page.locator('#data-link-connection-target')).toHaveAttribute('title', 'onedrive:drive1/ITEM!101');
   expect(page.url()).not.toContain('TEMPAUTH');
   expect(page.url()).not.toContain(TOKEN);
+  expect(errors).toEqual([]);
+});
+
+test('a Microsoft sign-in window closed without signing in ends the attempt, and the button offers it again', async ({ page }) => {
+  const context = page.context();
+  await useTestConfig(context);
+  // The person closes Microsoft's window: it never returns to the callback.
+  await context.route('https://login.microsoftonline.com/common/oauth2/v2.0/authorize?**', route => route.fulfill({
+    status: 200,
+    contentType: 'text/html',
+    body: '<!doctype html><title>Sign in</title>',
+  }));
+  const errors = watchErrors(page);
+  await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
+  await openCollapsedPanels(page);
+  await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
+  const opened = page.waitForEvent('popup');
+  await page.locator('#data-sign-in-btn').click();
+  const popup = await opened;
+  await expect(page.locator('#data-sign-in-text')).toContainText('Finish signing in in the window that opened.');
+  await popup.close();
+  await expect(page.locator('#data-sign-in-text')).toHaveText(
+    'OneDrive file: sign in with Microsoft to open it. Microsoft\'s sign-in window was closed before it finished.'
+  );
+  await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   expect(errors).toEqual([]);
 });

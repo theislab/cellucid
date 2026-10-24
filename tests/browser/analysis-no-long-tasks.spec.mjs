@@ -2,10 +2,18 @@
  * The analysis engine keeps the page responsive: a marker genes run and a
  * differential expression over every gene of a 20 000-cell dataset never
  * block the main thread, the dataset's first gene read included. Chromium
- * reports long tasks (over 50 ms) directly; Firefox and WebKit are held to
- * the same bound by the longest gap between animation frames. The dataset
- * is read over HTTP, not through `page.route` (`helpers/served-fixture.mjs`
- * says why).
+ * reports long tasks (over 50 ms) directly; Firefox and WebKit have no long
+ * task API and are held to the same bound by a heartbeat: a zero-delay timer
+ * re-armed from itself, whose longest wait is the longest the main thread
+ * was held.
+ *
+ * Not the gap between animation frames: a frame also waits for the
+ * compositor, which is not the main thread. Linux WebKit composites in
+ * software, at the Desktop Safari device's scale factor of 2; there frames
+ * came 106 and 461 ms apart during these runs, while Chromium on the same
+ * runners reported no long task for the same flows. The frame gap is still
+ * reported with a failure, beside the heartbeat. The dataset is read over
+ * HTTP, not through `page.route` (`helpers/served-fixture.mjs` says why).
  */
 import { expect, test } from './helpers/test.mjs';
 import { anndataZarrZip } from './helpers/anndata-zarr-zip.mjs';
@@ -16,7 +24,8 @@ const DATASET = 'analysis-responsive';
 const CELLS = 20_000;
 const GROUPS = Array.from({ length: 8 }, (_, group) => `cluster ${group}`);
 const GENES = Array.from({ length: 200 }, (_, gene) => `GENE${gene}`);
-const FRAME_BUDGET_MS = 50;
+/** A long task, as the Long Tasks API counts one. */
+const MAIN_THREAD_BUDGET_MS = 50;
 
 function fixture() {
   const codes = Int8Array.from({ length: CELLS }, (_, cell) => cell % GROUPS.length);
@@ -78,19 +87,40 @@ async function measure(page, flow) {
       });
       observer.observe({ type: 'longtask' });
     }
-    let maxGap = 0;
-    let last = performance.now();
     let running = true;
-    const tick = now => {
-      maxGap = Math.max(maxGap, now - last);
-      last = now;
-      if (running) requestAnimationFrame(tick);
+    let startedAt = performance.now();
+    // The main thread: the longest wait of a timer that re-arms itself at
+    // once, and when in the run it began.
+    let heldMs = 0;
+    let heldAt = 0;
+    let lastBeat = performance.now();
+    const beat = () => {
+      const now = performance.now();
+      if (now - lastBeat > heldMs) {
+        heldMs = now - lastBeat;
+        heldAt = lastBeat - startedAt;
+      }
+      lastBeat = now;
+      if (running) setTimeout(beat, 0);
     };
-    requestAnimationFrame(tick);
-    // Let the frame loop settle before the run starts.
+    setTimeout(beat, 0);
+    // The frames, reported with a failure only (see the header).
+    let frameGapMs = 0;
+    let lastFrame = performance.now();
+    const frame = now => {
+      frameGapMs = Math.max(frameGapMs, now - lastFrame);
+      lastFrame = now;
+      if (running) requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+    // Let the page settle before the run starts.
     await new Promise(resolve => setTimeout(resolve, 200));
-    maxGap = 0;
-    last = performance.now();
+    startedAt = performance.now();
+    heldMs = 0;
+    heldAt = 0;
+    lastBeat = startedAt;
+    frameGapMs = 0;
+    lastFrame = startedAt;
 
     let genes = 0;
     if (flowName === 'markers') {
@@ -114,10 +144,21 @@ async function measure(page, flow) {
       });
       genes = result.summary.genesTested;
     }
+    // A hold that ends the run has no beat after it: the run's end is one.
+    beat();
     running = false;
     observer?.disconnect();
-    return { genes, longTasks, maxGap: Math.round(maxGap), measuredLongTasks: observer !== null, budget };
-  }, { flowName: flow, budget: FRAME_BUDGET_MS });
+    return {
+      genes,
+      longTasks,
+      measuredLongTasks: observer !== null,
+      heldMs: Math.round(heldMs),
+      heldAtMs: Math.round(heldAt),
+      runMs: Math.round(performance.now() - startedAt),
+      frameGapMs: Math.round(frameGapMs),
+      budget,
+    };
+  }, { flowName: flow, budget: MAIN_THREAD_BUDGET_MS });
 }
 
 for (const flow of ['markers', 'differential']) {
@@ -131,7 +172,10 @@ for (const flow of ['markers', 'differential']) {
     if (result.measuredLongTasks) {
       expect(result.longTasks, `long tasks during the ${flow} run (ms)`).toEqual([]);
     } else {
-      expect(result.maxGap, `longest gap between frames during the ${flow} run (ms)`).toBeLessThanOrEqual(FRAME_BUDGET_MS);
+      expect(
+        result.heldMs,
+        `longest the main thread was held during the ${flow} run (ms): ${JSON.stringify(result)}`,
+      ).toBeLessThanOrEqual(MAIN_THREAD_BUDGET_MS);
     }
   });
 }

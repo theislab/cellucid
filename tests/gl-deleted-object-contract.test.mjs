@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   deleteGlObject,
@@ -98,7 +99,7 @@ test('objects deleted by method name go through the same owners', () => {
 });
 
 test('renderers delete programs and textures only through the helpers', () => {
-  const root = new URL('../assets/js/rendering/', import.meta.url).pathname;
+  const root = fileURLToPath(new URL('../assets/js/rendering/', import.meta.url));
   const files = [];
   const walk = dir => {
     for (const name of readdirSync(dir)) {
@@ -108,7 +109,7 @@ test('renderers delete programs and textures only through the helpers', () => {
     }
   };
   walk(root);
-  walk(new URL('../assets/js/app/ui/modules/figure-export/', import.meta.url).pathname);
+  walk(fileURLToPath(new URL('../assets/js/app/ui/modules/figure-export/', import.meta.url)));
   const direct = [];
   for (const file of files) {
     const relative = path.relative(root, file);

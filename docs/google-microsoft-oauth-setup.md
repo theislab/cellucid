@@ -20,85 +20,118 @@ it; public Figshare items need nothing.
 The design, with the facts it rests on, is
 `cellucid-private/plans/drive-onedrive-figshare-2026-10-23.md`. The user-facing
 page is `docs/user_guide/web_app/b_data_loading/16_private_drive_onedrive.md`
-in `cellucid-python`; the privacy policy is `privacy.html`.
+in `cellucid-python`; the privacy policy is `privacy.html`, linked from the
+home page's footer. The same setup, click by click for the site owner, is
+`cellucid-private/guides/google-drive-and-onedrive-setup.md`.
 
-## Google (about 30 minutes)
+## Google (about 40 minutes, plus DNS for brand verification)
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create
-   the project **Cellucid**. Note its **project number** (Dashboard → Project
-   info): it is `google.projectNumber`.
+   the project **Cellucid** (no organization, no billing account). Its
+   **project number** (Welcome page, or IAM & Admin → Settings) is
+   `google.projectNumber`; not the project ID.
 2. **APIs & Services → Library**: enable **Google Drive API** and **Google
    Picker API**.
-3. **Google Auth Platform → Branding**:
-   - App name **Cellucid**, a support email, a logo (optional; a logo triggers
-     Google's brand review, 2-3 days).
-   - Home page `https://www.cellucid.com`.
-   - Privacy policy `https://www.cellucid.com/privacy.html`.
-   - Authorized domain `cellucid.com`, verified in Google Search Console with a
-     DNS TXT record.
-4. **Audience**: user type **External**, publishing status **In production**.
-   With only `drive.file`, a non-sensitive scope, there is no review and no
-   user cap.
-5. **Data access**: add the one scope
-   `https://www.googleapis.com/auth/drive.file`. Nothing else.
-6. **Clients → Create client → Web application**, named "Cellucid web":
-   - Authorized JavaScript origins: `https://www.cellucid.com`,
-     `http://127.0.0.1:8765`, `http://localhost:8765` (the default port of
-     `cellucid serve`; Google matches ports exactly, so other local ports
-     cannot sign in to Google, and the app says so).
-   - No redirect URIs (the popup token model needs none).
-   - Copy the **Client ID** into `google.clientId`. Do not copy the client
-     secret.
-7. **APIs & Services → Credentials → Create credentials → API key**, named
-   "Cellucid web":
+3. **APIs & Services → Credentials → Create credentials → API key**, named
+   "Cellucid web", no service account:
    - Application restrictions: **Websites**:
      `https://www.cellucid.com/*`, `http://127.0.0.1:8765/*`,
      `http://localhost:8765/*`, `https://docs.google.com/*` (the Picker
      needs this one).
    - API restrictions: **Google Drive API** and **Google Picker API**.
    - Copy the key into `google.apiKey`.
-8. **Billing → Budgets & alerts**: set a budget alert. Every Drive read by any
-   Cellucid user counts against this one project (projects created after
-   2026-05-01: 1 TB of egress a day, 400 M quota units a day; Google plans to
-   charge for overage later in 2026). Watch **APIs & Services → Google Drive
-   API → Quotas** after launch.
+4. **Google Auth Platform → Get started**: app name **Cellucid**, a support
+   email, audience **External**, a contact email.
+5. **Branding**: no logo (a logo forces a brand review), home page
+   `https://www.cellucid.com`, privacy policy
+   `https://www.cellucid.com/privacy.html`, no terms of service, authorized
+   domain `cellucid.com`, a developer contact.
+6. **Data Access**: add the one scope
+   `https://www.googleapis.com/auth/drive.file`, listed under non-sensitive
+   scopes. Nothing else.
+7. **Audience → Publish app**: **In production**. With only `drive.file`
+   there is no app verification and no user cap; *Testing* admits listed test
+   users only, for 7 days.
+8. **Clients → Create client → Web application**, named "Cellucid web":
+   - Authorized JavaScript origins: `https://www.cellucid.com`,
+     `http://127.0.0.1:8765`, `http://localhost:8765`, no trailing `/`.
+   - No redirect URIs (the popup token model needs none).
+   - Copy the **Client ID** into `google.clientId`. Do not copy the client
+     secret. Google deletes a client unused for six months.
+9. **Brand verification** (the consent screen names "Cellucid" instead of
+   "cellucid.com"): verify `cellucid.com` as a **Domain** property in
+   [Search Console](https://search.google.com/search-console) with the
+   project owner's account (DNS TXT record at `@`, kept for good); then
+   **Branding → Verify branding**, and **Publish branding** within 7 days of
+   "Ready to publish". Google checks that the home page describes the app and
+   links the privacy policy (the sidebar footer's **Privacy**), on the same
+   domain.
 
-## Microsoft (about 30 minutes; publisher verification separately)
+The API key and the client share `provider-config.js`'s
+`google.registeredOrigins`: Google matches an origin exactly, port included,
+and has no port wildcard, so a public file and a sign-in work on the same
+pages. On any other page Cellucid says where Drive works (a local
+`cellucid serve` on another port, a notebook viewer on its free port, another
+host) before any request.
 
-1. Sign in to [entra.microsoft.com](https://entra.microsoft.com) with a
-   **work or school** account in a tenant you control (an app registered with
-   a personal Microsoft account can never be publisher verified). Add and
-   verify the custom domain `cellucid.com` (DNS TXT).
-2. **App registrations → New registration**:
+Quotas: no billing account is needed. Every Drive read by any Cellucid user
+counts against this one project (projects created after 2026-05-01: 1 TB of
+egress and 400 M quota units a day; Google plans to charge above that later
+in 2026, with 90 days' notice). If a billing account is ever added, set a
+budget alert (**Billing → Budgets & alerts**). Watch **APIs & Services →
+Google Drive API → Quotas** after launch.
+
+## Microsoft (about 60 minutes; publisher verification separately)
+
+1. A tenant you administer: for an individual, the one Microsoft offers is an
+   Azure free account (card check; the tenant and the registration outlive the
+   30-day subscription). In it, create a **work account** with the Global
+   Administrator role and register with it: an app registered by a personal
+   Microsoft account can never be publisher verified.
+2. [entra.microsoft.com](https://entra.microsoft.com) → **Entra ID → App
+   registrations → New registration**:
    - Name **Cellucid**.
-   - Supported account types: **Accounts in any organizational directory and
-     personal Microsoft accounts**.
+   - Supported account types: **Any Entra ID Tenant + Personal Microsoft
+     accounts** (older label: "Accounts in any organizational directory … and
+     personal Microsoft accounts").
    - Redirect URI: platform **Single-page application**, value
      `https://www.cellucid.com/assets/auth/callback.html`.
 3. **Authentication**:
    - Add the single-page application redirect URI
      `http://localhost/assets/auth/callback.html` (Microsoft ignores the port
      of `localhost`, so every `cellucid serve` port works).
-   - In **Manifest**, add to `replyUrlsWithType`:
-     `{"url": "http://127.0.0.1/assets/auth/callback.html", "type": "Spa"}`
-     (`127.0.0.1` can only be added there; it is `cellucid serve`'s default
-     host).
-   - Leave implicit grant and public client flows **off**.
+   - In **Manifest**, add `"http://127.0.0.1/assets/auth/callback.html"` to
+     `spa.redirectUris` (`127.0.0.1`, `cellucid serve`'s default host, can only
+     be added there; the Microsoft Graph manifest replaced
+     `replyUrlsWithType` in January 2025).
+   - Leave implicit grant (access and ID tokens) and public client flows
+     **off**.
    - Do not create a client secret or a certificate.
 4. **API permissions → Microsoft Graph → Delegated**: `Files.Read`,
-   `Files.Read.All`, `offline_access`, `openid`. Do not grant admin consent
-   for your own tenant unless you mean to; `Files.Read.All` is asked for only
-   when a work account opens a colleague's file.
-5. **Branding & properties**: publisher domain `cellucid.com`, home page
-   `https://www.cellucid.com`, privacy statement
-   `https://www.cellucid.com/privacy.html`, a logo.
-6. **Publisher verification** (recommended, for work accounts): join the
-   Microsoft AI Cloud Partner Program (free), complete its business
-   verification, then enter the Partner One ID under **Branding & properties →
-   Publisher verification** (needs Application Administrator plus Partner
-   Admin, and MFA). Without it, organisations with risk-based step-up consent
-   block their users from consenting.
-7. Copy the **Application (client) ID** into `microsoft.clientId`.
+   `Files.Read.All`, `offline_access`, `openid` (`User.Read` stays). No
+   `Files.ReadWrite…`, no application permissions, and no admin consent for
+   your own tenant; `Files.Read.All` is asked for only when a work account
+   opens a colleague's file.
+5. **Branding & properties**: home page `https://www.cellucid.com`, privacy
+   statement `https://www.cellucid.com/privacy.html`; a logo is optional.
+6. Copy the **Application (client) ID** into `microsoft.clientId` (not the
+   directory or object ID).
+7. **Publisher verification** (optional, for work accounts): verify the custom
+   domain `cellucid.com` in the tenant (DNS TXT), set it as the app's
+   publisher domain, join the Microsoft AI Cloud Partner Program (an
+   organisation, with an email at that domain), then enter the Partner One ID
+   under **Branding & properties**, signed in with the work account and MFA.
+   Without it, organisations with risk-based step-up consent block their users
+   from consenting; `Files.Read.All` needs an administrator under Microsoft's
+   default consent policy either way.
+
+Microsoft accepts plain `http://` only for `localhost` and `127.0.0.1`, and a
+browser computes PKCE only on a secure page, so a plain `http://` page on
+another host is refused before the popup. The popup reports back over a
+`BroadcastChannel`, which a page embedded in another site (a notebook at
+`localhost` showing a viewer at `127.0.0.1`) cannot hear: Cellucid refuses
+that case before the popup when the sites can be told apart, and a popup
+closed without a sign-in ends the attempt.
 
 ## After both
 
@@ -127,9 +160,11 @@ in `cellucid-python`; the privacy policy is `privacy.html`.
    (Cloud console metrics), and the egress counter.
 5. Google: a public file opens with no sign-in on www.cellucid.com, and is
    refused with the referrer restriction from another origin.
-6. Microsoft: `/shares/{id}/driveItem` with `Files.Read` and `Prefer:
-   redeemSharingLink` (personal and work); the file appears in "Shared with
-   me"; CORS and `Range` on the `@microsoft.graph.downloadUrl` host for
+6. Microsoft: `/shares/{id}/driveItem` with `Files.Read` alone and `Prefer:
+   redeemSharingLink` (personal and work). The Graph reference names
+   `Files.ReadWrite` as its least permission; if `Files.Read` is refused, the
+   scopes change in code, docs and the registration together. The file
+   appears in "Shared with me"; CORS and `Range` on the `@microsoft.graph.downloadUrl` host for
    personal (`*.microsoftpersonalcontent.com`) and work
    (`<tenant>-my.sharepoint.com`); how long a download URL works.
 7. Microsoft, work tenant with the default consent policy: a colleague's file
@@ -145,3 +180,8 @@ in `cellucid-python`; the privacy policy is `privacy.html`.
     signing in; `?data=gdrive:<id>` and `?data=onedrive:<drive>/<item>` links
     open for a collaborator the file is shared with, and are refused, with the
     reason, for an account it is not shared with.
+11. Where each works: `cellucid serve` at `http://127.0.0.1:8765` (Microsoft
+    only if the `127.0.0.1` manifest entry saved), another port, a notebook
+    viewer on its free port and with `AnnDataViewer(data, port=8765)`, from a
+    notebook at `localhost` and at `127.0.0.1`; each refusal is the message
+    `google.js` / `microsoft.js` give for that page.

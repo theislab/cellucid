@@ -103,12 +103,21 @@ test('a still highlight lets the scene go quiet; only a pulsing one keeps drawin
   // `full` pulses its ring, which is a time-driven effect that draws: the loop
   // names it as the reason for the next frame, so it never settles, and the
   // frames keep being drawn. Frames, not a wall-clock window, because a slow
-  // renderer may draw none in a short window.
+  // renderer may draw none in a short window. A pulse frame waits until the
+  // main thread has been free as long as the last frame held it
+  // (`ambient-frame-pacing.js`), so on a renderer whose frame outlasts a
+  // display interval two frames can both fall in that wait: poll until a
+  // window holds a pulse frame, twice, so the pulse is seen to go on.
   await selectQuality('full');
   await expect.poll(() => page.evaluate(
     () => window._cellucidViewer.getFrameScheduleState().animationCause,
   )).toBe('highlight');
-  expect(await countDrawsOverFrames(page, 2)).toBeGreaterThan(0);
+  for (let round = 0; round < 2; round++) {
+    await expect.poll(() => countDrawsOverFrames(page, 2)).toBeGreaterThan(0);
+  }
+  expect((await page.evaluate(
+    () => window._cellucidViewer.getFrameScheduleState(),
+  )).settled).toBe(false);
 
   // Clearing the selection ends the animation and the scene goes quiet again.
   await page.evaluate(() => {

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "build_id": "2026-10-24.710ebd25",
+  "build_id": "2026-10-24.c2183a70",
   "assets": [
     {
       "path": "404.html",
@@ -58,8 +58,8 @@
     },
     {
       "path": "assets/css/components/_accordion.css",
-      "sha256": "785a3f52db419ee99fb34585735b866e724b12094b775a342d2507af90393ad9",
-      "bytes": 25841,
+      "sha256": "7905aad903a720d6dafdd6e172f2ced92dbee3b48fd6f816e03db079bcde1cf8",
+      "bytes": 25858,
       "content_type": "text/css; charset=utf-8"
     },
     {
@@ -3388,20 +3388,26 @@
     },
     {
       "path": "assets/js/data/sources/auth/callback-page.js",
-      "sha256": "cef1dfaf68989e4337ab90bf5a03364e8c16627946627555a56d559ea8339955",
-      "bytes": 1738,
+      "sha256": "7114fa26a87bfd5c366a9d051e16fb215ddd3e6d7592d2c9c05c468892ea563a",
+      "bytes": 2351,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/data/sources/auth/google.js",
-      "sha256": "c8f9617ade5f116cba7a2263b162d5d62a5b48d5b2eb11986acefe0584dab51d",
-      "bytes": 11353,
+      "sha256": "77a3c7964d325bbaab6e3ad27d43b9a6e8fb6f5958c79fe55c830c4bd4f0ffcb",
+      "bytes": 11980,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/data/sources/auth/microsoft.js",
-      "sha256": "be66beff28946ba6400c91deb2167f8646996ddcb0fb3549b889a3fa352bb876",
-      "bytes": 12132,
+      "sha256": "8da1c593c8409c87e0a05a270f54eb6eefa63b80fc96adb30d4646d2da8084ed",
+      "bytes": 14242,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
+      "path": "assets/js/data/sources/auth/page-context.js",
+      "sha256": "abbd762f3c36c7373a798fef2e7f89a12873e67991fa2bd40f5d413457cdc908",
+      "bytes": 2477,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -3412,8 +3418,8 @@
     },
     {
       "path": "assets/js/data/sources/auth/sign-in.js",
-      "sha256": "d9e098356e27ae5f849d3f8bb47034a55e7745b436822a3b0294e0177de17253",
-      "bytes": 6781,
+      "sha256": "6bc35092abffa9a8cd1eccb093024ac3474f353f4cd0225240ad1a47c6b7474a",
+      "bytes": 6764,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -3424,8 +3430,8 @@
     },
     {
       "path": "assets/js/data/sources/provider-config.js",
-      "sha256": "26900f0948062480819aaa753534da17b6ed72c788fe5acdebbcfe8aa0762507",
-      "bytes": 1604,
+      "sha256": "faf0bd2303fe8d7e2c5c2022d93a82eafe4394e46fdb96e29b030ff722d8b44d",
+      "bytes": 1756,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -3903,6 +3909,12 @@
       "content_type": "application/javascript; charset=utf-8"
     },
     {
+      "path": "assets/js/rendering/ambient-frame-pacing.js",
+      "sha256": "3ddcd0dd63dbff9b24ed3204239e9ff89d83f7a30e93452bdaf6c7c88d702c06",
+      "bytes": 4111,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
       "path": "assets/js/rendering/backdrops/backdrop-look-raster.js",
       "sha256": "f396472e746b1c89012504515b3b9a7e8cb5238064a34c4b1cfcd55f3277eee8",
       "bytes": 6623,
@@ -4234,8 +4246,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "9a4c0b8d527948b863b0872ea8a815edb627ea84dc2d0283cf18aa4636322aaa",
-      "bytes": 373394,
+      "sha256": "42ffd1581d27a8e00c88ce12388e9c259cf9ec2b5269b2eddb4482f346455d06",
+      "bytes": 374713,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -4312,8 +4324,8 @@
     },
     {
       "path": "index.html",
-      "sha256": "ea33c7cdab32806da2df37bd35efb18ae66ff65585fcb87f5ae6c31d020c4695",
-      "bytes": 131070,
+      "sha256": "35546deb1b52dd88380009b3c0a87bb74fcc65ddbbd62d6ba7bd03b8c163e7d0",
+      "bytes": 131139,
       "content_type": "text/html; charset=utf-8"
     },
     {

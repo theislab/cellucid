@@ -2,9 +2,11 @@
  * The page Microsoft's sign-in returns to (`assets/auth/callback.html`). It
  * hands the authorization code and `state` to the Cellucid tab that opened
  * the sign-in, over a `BroadcastChannel` (Microsoft's pages may cut a popup
- * off from its opener), removes them from its own address, and closes. It
- * keeps nothing, loads nothing else, and redeems nothing: the opener alone
- * holds the verifier the code is redeemed with.
+ * off from its opener), removes them from its own address, and closes once
+ * that tab answers that it received them: the tab takes a window that closed
+ * before then for a sign-in that did not finish. It keeps nothing, loads
+ * nothing else, and redeems nothing: the opener alone holds the verifier the
+ * code is redeemed with.
  *
  * @module data/sources/auth/callback-page
  */
@@ -35,9 +37,18 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     if (status) status.textContent = 'There is no sign-in to finish here. You can close this window.';
   } else {
     const channel = new BroadcastChannel(SIGN_IN_CHANNEL);
+    channel.onmessage = event => {
+      if (event.data?.state !== message.state || event.data.received !== true) return;
+      channel.close();
+      if (status) {
+        status.textContent = message.code === undefined
+          ? 'The sign-in did not finish; Cellucid says why. You can close this window.'
+          : 'Signed in. You can close this window.';
+      }
+      window.close();
+    };
+    // A tab embedded in another site's page cannot hear this window.
+    if (status) status.textContent = 'Finishing sign-in… If this window stays open, close it and open Cellucid in its own tab.';
     channel.postMessage(message);
-    channel.close();
-    if (status) status.textContent = 'Signed in. You can close this window.';
-    window.close();
   }
 }

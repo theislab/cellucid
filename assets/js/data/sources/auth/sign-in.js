@@ -101,8 +101,8 @@ export class SignInSteps {
   /**
    * Take a step's action: called from the button's click handler, so the
    * sign-in popup opens inside the click. Taking it again while it is under
-   * way starts it over (a sign-in window closed by hand cannot always be
-   * seen from here): the earlier attempt's outcome is then ignored.
+   * way starts it over (a sign-in window lost behind others opens anew): the
+   * earlier attempt's outcome is then ignored.
    *
    * @param {number} id
    */

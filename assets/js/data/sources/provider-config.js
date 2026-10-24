@@ -21,11 +21,13 @@ export const PROVIDER_CONFIG = Object.freeze({
     /** Google Cloud project number: the Picker's app id. */
     projectNumber: '',
     /**
-     * The origins registered as authorized JavaScript origins of the client
-     * ID. Google matches an origin exactly, port included, so a local
-     * `cellucid serve` signs in to Google only on its default port, 8765.
+     * The origins registered with Google, in both places: the API key's
+     * website restriction (as `<origin>/*`) and the client ID's authorized
+     * JavaScript origins. Google matches an origin exactly, port included, so
+     * a local Cellucid reads Drive files only on port 8765, the default of
+     * `cellucid serve`; elsewhere the app says where Drive works.
      */
-    signInOrigins: Object.freeze([
+    registeredOrigins: Object.freeze([
       'https://www.cellucid.com',
       'http://127.0.0.1:8765',
       'http://localhost:8765',

@@ -56,6 +56,7 @@ import {
 } from './camera-state-contract.js';
 import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
 import { createSceneMsaaTarget } from './scene-msaa-target.js';
+import { createAmbientFramePacer } from './ambient-frame-pacing.js';
 import {
   MAXIMUM_POINT_SIZE,
   MINIMUM_POINT_SIZE,
@@ -127,6 +128,9 @@ const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
 // frames after every change, and a slow renderer never reached its second
 // frame inside it anyway.
 const FRAME_SETTLE_MIN_FRAMES = 2;
+// The frame cause of the highlight pulse when nothing else asks for a frame:
+// the ambient frame `ambient-frame-pacing.js` paces to the measured frame cost.
+const AMBIENT_FRAME_CAUSE = 'highlight';
 // The raw GL getter and guarded renderer facade remain available so cleanup
 // diagnostics can inspect exact owners. Renderer methods and property writes
 // are actively fenced at either terminal boundary; the raw GL object is
@@ -1979,6 +1983,9 @@ export function createViewer({
   // What last started a settle window: 'invalidated', 'resize', or the
   // time-driven effect's name (see sceneAnimationCause). Diagnostics only.
   let lastFrameCause = null;
+  // Holds back pulse-only frames until the main thread has been free as long
+  // as the last frame held it (ambient-frame-pacing.js).
+  const ambientFramePacer = createAmbientFramePacer();
   // Opt-in tracing of what invalidates frames (setFrameInvalidationTracing).
   let frameInvalidationTracing = false;
   let lastFrameInvalidationTrace = null;
@@ -5530,10 +5537,12 @@ export function createViewer({
     if (backdropLookCause !== null) return backdropLookCause;
     if (renderMode === 'smoke' && smokeRenderer.needsContinuousFrames()) return 'smoke';
     if (overlayManager?.needsContinuousFrames() === true) return 'overlay';
-    if (highlightTools !== null && highlightTools.isHighlightAnimating()) return 'highlight';
     if (projectileSystem.isAnimating()) return 'projectile';
     if (presentedCameraSettlement.isPending()) return 'camera-settlement';
     if (lodConvergingInLastFrame) return 'lod';
+    // Last, so 'highlight' names a frame the pulse alone asks for: the one
+    // kind of frame the ambient pacer may hold back.
+    if (highlightTools !== null && highlightTools.isHighlightAnimating()) return AMBIENT_FRAME_CAUSE;
     return null;
   }
 
@@ -5563,6 +5572,7 @@ export function createViewer({
   function render() {
     // This callback is the armed frame; it re-arms only while drawing goes on.
     animationHandle = null;
+    const frameStartedAt = performance.now();
     if (disposed || webglContextLost || renderPaused) {
       // Stopped: queued phase work runs from a frame of its own.
       reconcileFramePhases();
@@ -5580,6 +5590,14 @@ export function createViewer({
     const frameSize = canvasResizeObserver.getSize();
     const now = performance.now();
     const frameCause = nextFrameCause(frameSize);
+    if (frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer.isDue(now)) {
+      // The pulse alone asks for this frame, and the main thread has not yet
+      // been free for as long as the last frame held it: leave the loop
+      // unarmed and come back when the frame is due.
+      ambientFramePacer.wakeWhenDue(ensureFrameScheduled);
+      drainAfterFramePhase();
+      return;
+    }
     if (frameCause !== null) {
       lastFrameCauseTime = now;
       lastFrameCause = frameCause;
@@ -5606,6 +5624,7 @@ export function createViewer({
     sceneTargetChangedThisFrame = true;
     sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
     lodConvergingInLastFrame = false;
+    ambientFramePacer.frameDrawn(frameStartedAt);
     try {
       renderSceneFrame();
     } catch (error) {
@@ -7667,6 +7686,9 @@ export function createViewer({
         // Whether a frame callback is requested: false once the loop has
         // stopped on a settled scene, until something asks for a frame.
         frameArmed: animationHandle !== null,
+        // The pulse's pacing: what the last drawn frame cost the main thread
+        // and how long until a pulse-only frame is due again.
+        ambientPacing: ambientFramePacer.snapshot(),
         // With tracing on: the call stack of the last invalidation, so a
         // frame that should not have been drawn names who asked for it.
         lastInvalidationTrace: lastFrameInvalidationTrace,
@@ -10106,6 +10128,7 @@ export function createViewer({
 	      if (!disposed) {
 	        disposed = true;
 	        renderPaused = true;
+	        ambientFramePacer.dispose();
 	        const scheduledAnimationHandle = animationHandle;
 	        animationHandle = null;
 	        if (scheduledAnimationHandle !== null) {

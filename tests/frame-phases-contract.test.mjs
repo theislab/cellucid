@@ -163,6 +163,20 @@ test('a frame that changed no pixel skips the resolve', () => {
 });
 
 
+test('a frame the highlight pulse alone asks for waits for the ambient pacer', () => {
+  const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
+  const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));
+  // Not yet due: no draw and no animation frame; the pacer's timer re-arms.
+  assert.match(render, /if \(frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer\.isDue\(now\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.wakeWhenDue\(ensureFrameScheduled\);\n\s*drainAfterFramePhase\(\);\n\s*return;/);
+  // Every drawn frame is measured.
+  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt\);\n\s*try \{\n\s*renderSceneFrame\(\);/);
+  // The pulse is the last cause named, so 'highlight' means nothing else asks.
+  const causes = viewer.slice(viewer.indexOf('  function sceneAnimationCause() {'), viewer.indexOf('  function nextFrameCause('));
+  assert.match(causes, /return AMBIENT_FRAME_CAUSE;\n\s*return null;\n\s*\}/);
+  assert.match(viewer, /^const AMBIENT_FRAME_CAUSE = 'highlight';$/m);
+});
+
+
 test('the frame loop stops once the scene has settled and starts again on demand', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));

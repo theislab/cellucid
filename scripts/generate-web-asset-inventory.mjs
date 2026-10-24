@@ -171,10 +171,12 @@ export async function stampBuildId({ rootDir, paths, today = new Date() }) {
   return buildId;
 }
 
-// The site is one page, so its sitemap lists one URL. Its <lastmod> is the
+// The app is one page, so its sitemap lists one URL. Its <lastmod> is the
 // date half of the build id: the day the shipped bytes last changed, which is
 // when the page a crawler fetches last changed. The generator writes it beside
-// the inventory, and --check refuses a sitemap that names another day.
+// the inventory, and --check refuses a sitemap that names another day. The
+// privacy policy is reached by the home page's footer link and carries its own
+// canonical; it is not listed, because the build date is not the day it changed.
 const SITEMAP_FILENAME = 'sitemap.xml';
 export const SITE_URL = 'https://www.cellucid.com/';
 

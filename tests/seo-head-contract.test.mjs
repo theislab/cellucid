@@ -5,7 +5,10 @@
  * - One canonical address. The canonical link, the Open Graph URL, the JSON-LD
  *   `url` and the sitemap's only entry are the same string, trailing slash
  *   included; a mismatch tells a crawler there are two pages competing for one.
- *   Query-string app states are not pages and are never listed.
+ *   Query-string app states are not pages and are never listed. The privacy
+ *   policy (privacy.html, its own canonical) is found through the footer link
+ *   Google's brand verification asks the home page for; it is not listed,
+ *   because the build date would misdate it.
  * - A sitemap that cannot go stale. Its one `<lastmod>` is the date half of the
  *   build id, the day the shipped bytes last changed; the build id itself is
  *   pinned to the exact bytes by web-asset-inventory-contract, and the
@@ -180,6 +183,15 @@ test('crawlable text says what Cellucid is and links out without taking Tab stop
   // The visible app links to the documentation too: the welcome card and footer.
   assert.match(INDEX, new RegExp(`<a href="${DOCS}" target="_blank" rel="noopener noreferrer" class="welcome-btn welcome-btn-link">`));
   assert.match(INDEX, new RegExp(`<a href="${DOCS}" target="_blank" rel="noopener noreferrer">Docs</a>`));
+});
+
+test('the home page links its privacy policy, as Google\'s brand verification requires', async () => {
+  // A quiet footer link beside Docs, Cite and GitHub; a new tab keeps the app's state.
+  const footer = only(/<div id="copyright">([\s\S]*?)<\/div>/g, INDEX, 'footer');
+  assert.match(footer, /GitHub<\/a> · <a href="privacy\.html" target="_blank" rel="noopener">Privacy<\/a><\/p>/);
+  const privacy = await read('privacy.html');
+  assert.match(privacy, /<link rel="canonical" href="https:\/\/www\.cellucid\.com\/privacy\.html" \/>/);
+  assert.doesNotMatch(privacy, /<meta name="robots"/, 'the privacy policy is indexable');
 });
 
 test('no link names the retired documentation host', () => {
