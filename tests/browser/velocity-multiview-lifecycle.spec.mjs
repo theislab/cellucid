@@ -1,24 +1,12 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { VECTOR_DATASET, listVectorDataset } from './helpers/vector-catalog.mjs';
 
-const CURRENT_UI_DATASET =
-  '/tests/browser/fixtures/exports/current-ui-prepared/';
 const PROCESS_INTENSIVE = Object.freeze({
   tag: '@browser-process-intensive',
 });
-
-function createVelocityBytes(nCells) {
-  const bytes = Buffer.alloc(
-    nCells * 2 * Float32Array.BYTES_PER_ELEMENT,
-  );
-  for (let index = 0; index < nCells; index++) {
-    bytes.writeFloatLE(0.01, index * 2 * 4);
-    bytes.writeFloatLE((index % 3) * 0.0025, ((index * 2) + 1) * 4);
-  }
-  return bytes;
-}
 
 async function installVelocityGlAudit(page) {
   await page.addInitScript(() => {
@@ -145,36 +133,6 @@ async function installVelocityGlAudit(page) {
   });
 }
 
-async function installVelocityFixture(page) {
-  await page.route(
-    `**${CURRENT_UI_DATASET}dataset_identity.json`,
-    async route => {
-      const response = await route.fetch();
-      const identity = await response.json();
-      identity.vector_fields = {
-        default_field: 'velocity_umap',
-        fields: {
-          velocity_umap: {
-            label: 'velocity_umap',
-            files: {
-              X_umap_2d: 'vectors/0_0.bin',
-            },
-          },
-        },
-      };
-      await route.fulfill({ response, json: identity });
-    },
-  );
-  await page.route(
-    `**${CURRENT_UI_DATASET}vectors/0_0.bin`,
-    route => route.fulfill({
-      status: 200,
-      contentType: 'application/octet-stream',
-      body: createVelocityBytes(120),
-    }),
-  );
-}
-
 async function advanceFrames(page, count) {
   if (!Number.isSafeInteger(count) || count < 1) {
     throw new RangeError('Velocity audit frame count must be a positive integer.');
@@ -233,15 +191,15 @@ test(
     });
 
     await installVelocityGlAudit(page);
-    await installVelocityFixture(page);
+    await listVectorDataset(page);
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-multiview-lifecycle`,
+      `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui-vector&acceptance=velocity-multiview-lifecycle`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      VECTOR_DATASET.name,
     );
     await page.locator('#categorical-field').selectOption({
       label: 'cell_type',
@@ -437,15 +395,15 @@ test(
       productErrors.push(`page: ${error.stack || error.message}`);
     });
 
-    await installVelocityFixture(page);
+    await listVectorDataset(page);
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-allocation-failure`,
+      `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui-vector&acceptance=velocity-allocation-failure`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      VECTOR_DATASET.name,
     );
     // The injection below fails the next framebuffer *anyone* asks for, and the
     // scene multisample target is the other thing in the frame that asks. It
@@ -526,15 +484,15 @@ test(
       productErrors.push(`page: ${error.stack || error.message}`);
     });
 
-    await installVelocityFixture(page);
+    await listVectorDataset(page);
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-init-retry`,
+      `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui-vector&acceptance=velocity-init-retry`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
-      'Current UI prepared fixture',
+      VECTOR_DATASET.name,
     );
     await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');

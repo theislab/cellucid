@@ -41,15 +41,15 @@ Cellucid is split by responsibility:
 |---|---|---|
 | `cellucid` (this repo) | Web app (UI + state + WebGL rendering) | are fixing UI bugs, rendering/performance, figure export, sessions, or community annotation frontend |
 | `cellucid-python` | Python package + CLI + Sphinx docs | are fixing `prepare`/`serve`/`show_anndata`, server endpoints, Jupyter hooks, or documentation site pages |
-| `cellucid-r` | R package exporter | are changing `cellucid_prepare()` / R export format logic |
+| `cellucid-r` | R package writing the same Cellucid-ready AnnData from R | are changing the R writer (`cellucid_prepare()`) or adding R-side docs/tests |
 | `cellucid-annotation` | GitHub repo template for annotation | are changing repo schema/validation/workflows |
 | `cellucid-datasets` | The published demo catalog | are correcting a published generation or its catalog entry |
 | `cellucid-demo-custom-datasets` | Worked example of publishing your own datasets | are changing that guide or its synthetic examples |
 
 If you’re unsure where a bug belongs, open an issue in the repo you’re currently using and include:
 - where the UI ran (hosted app vs local app vs Jupyter iframe),
-- how data was loaded (Prepared, H5AD, Zarr ZIP, remote server, GitHub, or
-  Jupyter),
+- how data was loaded (H5AD, Zarr folder, Zarr ZIP, sample dataset, link,
+  remote server, or Jupyter),
 - and the smallest reproduction you can share.
 
 ---
@@ -141,8 +141,13 @@ High-level map:
   - `app/session/`: `.cellucid-session` save/load bundles
   - `app/ui/modules/figure-export/`: figure export
   - `app/community-annotations/`: GitHub-backed community annotation sync/auth
-- `cellucid/assets/js/data/`: data sources + loaders (exports/h5ad/zarr/remote/github/jupyter)
+- `cellucid/assets/js/data/`: data sources + loaders (AnnData `.h5ad`/Zarr/`.zarr.zip` files, links and catalogs, `cellucid serve`, Jupyter)
+  - `data/anndata/`: the one AnnData reader (elements, data frames, dense and sparse matrices) over any store
+  - `data/sources/`: dataset catalogs (`datasets.json`, `anndata-catalog.js`) and link providers
+- `cellucid/assets/js/formats/`: file-format readers with no Cellucid knowledge — `hdf5/`, `zarr/` (v2 and v3, folder/ZIP/HTTP stores), `zip/`, and `io/` (byte sources, range reads, the decode worker pool)
 - `cellucid/assets/js/rendering/`: WebGL2 viewer + shaders + overlays
+- `cellucid/assets/js/workers/`: `worker-script.js`, where every worker starts from (`startWorker`)
+- `cellucid/assets/workers/`: generated worker bundles and `scripts.js` (never edited; see Testing & validation)
 - `cellucid/assets/css/`: design system (tokens/themes/components)
 
 ---
@@ -183,28 +188,65 @@ node scripts/validate-tokens.js
 
 ## Testing & validation
 
-Node.js 20 or newer is required (`package.json` sets `engines.node`). Install
-the exact dependencies once, then run the suites:
+Node.js 22.15 or newer is required (`package.json` sets `engines.node`): the
+Zstandard contracts compress their inputs with `node:zlib`'s Zstandard encoder,
+which Node.js 20 does not have. Install the exact dependencies once, then run
+the suites:
 
 ```bash
 npm ci
 npm test                    # every web contract in tests/*.test.mjs
 npm run test:browser        # Playwright suites in tests/browser/
-npm run test:worker-bundle  # dry-run build of the community-annotation Worker
+npm run test:worker-bundle  # dry-run build of the community-annotation Cloudflare Worker
 ```
 
 After changing any shipped file (`index.html`, `assets/`, root assets), run
-`node scripts/generate-web-asset-inventory.mjs`. It rewrites
+`node scripts/generate-web-asset-inventory.mjs` (after `npm ci`: it builds the
+worker bundles with the pinned esbuild). It rewrites
 `cellucid-web-assets.json` and stamps the build id in `index.html` as
 `<date>.<digest>`, a digest of every shipped file, so the footer, the situation
 report and the Python web cache name the exact build. It also writes
-`sitemap.xml`, whose `<lastmod>` is the date half of that build id. `npm test`
+`sitemap.xml`, whose `<lastmod>` is the date half of that build id, and
+`.well-known/security.txt`, whose `Expires` is a year after it. `npm test`
 fails until it has been run.
+
+The same run gives every script a URL that names its bytes, so a deploy can
+never pair a module cached from the previous build with one of the next
+(GitHub Pages caches every file for ten minutes and ignores query strings).
+Each page that runs ES modules declares one `<script type="importmap">`; the
+generator fills it with every `assets/**/*.js` mapped to
+`<path>?v=<first 12 hex digits of its SHA-256>`, adds the same `?v=` to each
+`<script src>` of every shipped page, and writes the `script-src` hashes of
+each page's inline scripts (the import map, the JSON-LD block) into its
+Content-Security-Policy. Nothing of this needs a build step to run: a static
+server ignores the query, so an edited module loads before the generator has
+run; after it, every changed module has a new URL and a plain reload loads it.
+
+Workers get no import map, so the same run builds each worker (and each module
+a worker imports by URL), listed in `WORKER_ENTRIES` of
+`scripts/build-worker-bundles.mjs`, into one file named by its bytes:
+`assets/workers/<name>.<first 12 hex digits of its SHA-256>.js`, with a source
+map back to the sources, and writes `assets/workers/scripts.js`, the URL of
+each. That folder is generated only: never edit it, and commit it with the
+sources (GitHub Pages builds nothing). A page served under any name but
+`localhost`, `127.0.0.1` or `[::1]` starts its workers from the bundles; on this
+machine they start from their sources (`assets/js/workers/worker-script.js`),
+so an edited worker module is live on the next reload with nothing built, and
+`http://deployed.localhost:<port>/` opens a local server's tree as a deployed
+site. A new worker is started with `startWorker(<entry>Script(), …)` once its
+entry is in `WORKER_ENTRIES`; `npm test` refuses a worker started any other
+way, and bundles that are not exactly what the sources build
+(`tests/worker-bundles-contract.test.mjs`). Run
+`CELLUCID_BROWSER_TEST_APP_HOST=deployed.localhost npm run test:browser -- <specs>`
+to run browser specs as a deployed site (a spec that holds a module a worker
+imports by its source path runs from `127.0.0.1` only).
 
 What search engines and link previews read — the `<head>` metadata, the JSON-LD
 block and its hash in the Content-Security-Policy, the visually hidden "About
-Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, `llms.txt` and
-`site.webmanifest` — is pinned by `tests/seo-head-contract.test.mjs`.
+Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, the reading pages
+(`privacy.html`, `terms.html`, `accessibility.html`), `.well-known/security.txt`,
+`llms.txt` and `site.webmanifest` — is pinned by
+`tests/seo-head-contract.test.mjs`.
 
 `npm test` runs `scripts/run-web-tests.mjs`, which discovers every
 `tests/*.test.mjs` file and runs them under the Node.js test runner — so a new
@@ -212,9 +254,9 @@ contract file is picked up by adding it, with nothing to register. These are
 the same commands `.github/workflows/test.yml` runs, so a green local run is the
 same check CI applies:
 
-- `npm test` runs on Ubuntu, macOS, and Windows across Node 20/22/24/26, with
-  `cellucid-demo-custom-datasets` and `cellucid-datasets` checked out beside the
-  repository so the cross-repository fixture and session-preset contracts run.
+- `npm test` runs on Ubuntu, macOS, and Windows across Node 22/24/26, with
+  `cellucid-datasets` (its catalog and session presets) checked out beside the
+  repository so the cross-repository session-preset contracts run.
 - On every push and pull request the browser suite runs chromium, firefox, and
   webkit on Ubuntu, plus webkit on macOS. Every engine on every operating
   system runs nightly and on manual dispatch (**Actions → Web contracts → Run

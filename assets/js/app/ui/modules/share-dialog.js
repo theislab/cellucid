@@ -19,7 +19,7 @@ import { copyWithFeedback, wireAppDialog } from '../components/app-dialog.js';
 
 export const PUBLIC_APP_URL = 'https://www.cellucid.com/';
 export const BADGE_IMAGE_URL = `${PUBLIC_APP_URL}assets/img/open-in-cellucid.svg`;
-const SHAREABLE_SOURCE_TYPES = new Set(['local-demo', 'remote', 'github-repo']);
+const SHAREABLE_SOURCE_TYPES = new Set(['local-demo', 'remote', 'link']);
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '0.0.0.0']);
 
 function escapeAttribute(text) {
@@ -49,12 +49,19 @@ function isLoopbackServer(serverUrl) {
 export function buildShareUrl(sourceType, href) {
   if (!SHAREABLE_SOURCE_TYPES.has(sourceType)) return null;
   const params = readDataSourceUrlParameters(href);
+  if (sourceType === 'link') {
+    // A link names its own dataset when it holds one; a loopback web address
+    // reopens only on this computer.
+    const locator = params.get('data');
+    if (locator === null) return null;
+    if (/^https?:\/\//i.test(locator) && isLoopbackServer(locator)) return null;
+    return `${PUBLIC_APP_URL}?${params.toString()}`;
+  }
   if (!params.has('dataset')) return null;
   if (sourceType === 'remote') {
     const server = params.get('remote');
     if (server === null || isLoopbackServer(server)) return null;
   }
-  if (sourceType === 'github-repo' && !params.has('github')) return null;
   if (sourceType === 'local-demo' && params.get('source') !== 'local-demo') {
     params.set('source', 'local-demo');
   }

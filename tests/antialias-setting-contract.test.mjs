@@ -292,8 +292,8 @@ test('nothing mid-frame binds the default framebuffer behind the target', () => 
   assert.match(smokeSource, /sceneFramebuffer/);
   assert.match(
     viewerSource,
-    /outputFramebuffer: sceneMsaaTarget\.getSceneFramebuffer\(\)/,
-    'the overlay context must be given the scene target'
+    /outputFramebuffer: layered\s*\?\s*pulseLayerCache\.baseFramebuffer\(\)\s*:\s*sceneMsaaTarget\.getSceneFramebuffer\(\)/,
+    'the overlay context must be given the scene target (or, while the pulse keeps the base layer, the base framebuffer)'
   );
 });
 
@@ -692,78 +692,60 @@ test('a preference that cannot be stored rolls the control and renderer back', t
 });
 
 // ---------------------------------------------------------------------------
-// A restored session reaches the preference
+// A restored session leaves the preference alone
 // ---------------------------------------------------------------------------
 
 /**
  * A saved session, complete: `restoreUIControls` refuses a payload that does
  * not name every control currently in the sidebar, so a partial one would fail
- * for the wrong reason.
+ * for the wrong reason. Antialiasing is a device capability, so a session
+ * never carries it.
  */
-function savedSession(antialiasChecked) {
+function savedSession() {
   return {
     'hp-lod-enabled': { type: 'checkbox', checked: false },
     'hp-frustum-culling': { type: 'checkbox', checked: false },
-    'hp-antialias': { type: 'checkbox', checked: antialiasChecked },
     'hp-shader-quality': { type: 'select', value: 'full' },
     'hp-lod-force': { type: 'range', value: '-1' },
   };
 }
 
-test('a restored session leaves the antialiasing preference alone', t => {
+test('a session is restored without touching the antialiasing preference', () => {
   // The defect this replaces: a restore dispatched `change`, the owner
   // persisted it, and a session became the last writer of a device preference.
   // Every sample publishes an advertised default state, so turning
   // antialiasing off and reloading re-applied the saved value and stored it -
-  // the setting could never stay off, which is what a user sees as "I switched
-  // it off, refreshed, and it came back".
-  const storage = makeStorage();
-  t.after(installDocument(storage));
+  // the setting could never stay off.
+  for (const chosen of ['on', 'off']) {
+    const storage = makeStorage();
+    const restoreDocument = installDocument(storage);
+    try {
+      storage.setItem(ANTIALIAS_STORAGE_KEY, chosen);
+      const { dom } = bootstrap({ storage });
+      const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
-  // This machine has explicitly chosen on, and the incoming session says off.
-  storage.setItem(ANTIALIAS_STORAGE_KEY, 'on');
-  const { dom } = bootstrap({ storage });
-  const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
+      serializer.restoreUIControls(savedSession());
 
-  serializer.restoreUIControls(savedSession(false));
-
-  assert.equal(
-    dom.hpAntialiasCheckbox.checked,
-    true,
-    'the box must keep showing what this machine actually drew with'
-  );
-  assert.equal(
-    storage.getItem(ANTIALIAS_STORAGE_KEY),
-    'on',
-    'a session must not overwrite the preference this machine chose'
-  );
-  assert.equal(
-    dom.hpAntialiasStatus.textContent,
-    '',
-    'an explicit choice needs no explanation, before or after a restore'
-  );
+      assert.equal(
+        dom.hpAntialiasCheckbox.checked,
+        chosen === 'on',
+        'the box must keep showing what this machine actually draws with'
+      );
+      assert.equal(
+        storage.getItem(ANTIALIAS_STORAGE_KEY),
+        chosen,
+        'a session must not overwrite the preference this machine chose'
+      );
+      assert.equal(dom.hpAntialiasStatus.textContent, '');
+    } finally {
+      restoreDocument();
+    }
+  }
 });
 
-test('the opposite direction is also left alone', t => {
-  // A machine that chose "off" must keep it when a session says "on", which is
-  // the direction the user actually hit.
-  const storage = makeStorage();
-  t.after(installDocument(storage));
-
-  storage.setItem(ANTIALIAS_STORAGE_KEY, 'off');
-  const { dom } = bootstrap({ storage });
-  const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
-
-  serializer.restoreUIControls(savedSession(true));
-
-  assert.equal(dom.hpAntialiasCheckbox.checked, false);
-  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'off');
-});
-
-test('the control is captured into a session without being listed anywhere', t => {
-  // The inventory is a signal, not a hand-maintained call list: any `input[id]`
-  // in the sidebar is captured. That is what stops this control from being the
-  // next one someone forgets to add.
+test('the control is never captured into a session', t => {
+  // A device capability describes the machine that draws, not the view: the
+  // session does not carry it, so no session can carry it to another machine.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
@@ -774,25 +756,31 @@ test('the control is captured into a session without being listed anywhere', t =
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
   const captured = serializer.collectUIControls();
 
-  assert.deepEqual(captured['hp-antialias'], { type: 'checkbox', checked: false });
+  assert.equal(Object.hasOwn(captured, 'hp-antialias'), false);
+  assert.deepEqual(captured, savedSession());
 });
 
-test('restoring the value the control already holds stores nothing new', t => {
+test('a session that names the antialiasing control is refused', t => {
+  // It is not a session control, exactly like a control that does not exist.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
   const { dom } = bootstrap({ storage });
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
-  serializer.restoreUIControls(savedSession(true));
-
+  assert.throws(
+    () => serializer.restoreUIControls({
+      ...savedSession(),
+      'hp-antialias': { type: 'checkbox', checked: false },
+    }),
+    /hp-antialias.*does not exist/
+  );
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
 });
 
 test('a restore does not depend on storage it never writes', t => {
-  // Previously a restore wrote this preference, so a full storage failed the
-  // whole session. It writes nothing now, so an unwritable storage is no
-  // longer a reason a session cannot be restored.
+  // A restore writes no device preference, so an unwritable storage is not a
+  // reason a session cannot be restored.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
@@ -800,7 +788,7 @@ test('a restore does not depend on storage it never writes', t => {
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
   storage.failWrites = new Error('Storage is full.');
 
-  assert.doesNotThrow(() => serializer.restoreUIControls(savedSession(false)));
+  assert.doesNotThrow(() => serializer.restoreUIControls(savedSession()));
   assert.equal(dom.hpAntialiasCheckbox.checked, true);
 });
 

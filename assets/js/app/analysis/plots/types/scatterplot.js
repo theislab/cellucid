@@ -16,13 +16,149 @@ import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { generateCategoryColors } from '../../shared/color-utils.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { textHeight, textWidth } from '../text-measure.js';
+import { fitToSize } from '../size-fit.js';
+
+/** The statistics boxes' text and frame, in px. */
+const STATS_FONT_SIZE = 10;
+const STATS_BORDER_PAD = 4;
+const STATS_BORDER_WIDTH = 1;
+/** Room between two boxes, and between a box and the legend. */
+const STATS_GAP = 6;
+/** The plot's margins (`layout.margin`). */
+const SCATTER_MARGIN = Object.freeze({ l: 60, r: 20, t: 30, b: 50 });
+/** Plotly's vertical legend: each entry's height, and what a legend adds to its text. */
+const LEGEND_ENTRY_HEIGHT = 19;
+const LEGEND_FRAME_HEIGHT = 11;
+const LEGEND_FRAME_WIDTH = 52;
+const LEGEND_FONT_SIZE = 10;
+
+/** Width and height of one framed annotation of `lines`, in px. */
+function framedSize(lines, theme) {
+  const width = Math.max(...lines.map(line => textWidth(line.text, {
+    size: STATS_FONT_SIZE, family: theme.fontFamily, weight: line.bold ? 'bold' : 'normal'
+  })));
+  const frame = 2 * (STATS_BORDER_PAD + STATS_BORDER_WIDTH);
+  return { width: Math.ceil(width) + frame, height: Math.ceil(textHeight(lines.length, STATS_FONT_SIZE)) + frame };
+}
+
+/**
+ * Where the legend sits in the plot area, as a box in px from its top-left,
+ * or null when it is outside it or not drawn.
+ */
+function legendBox(layout, entries, plotWidth, plotHeight) {
+  if (layout.showlegend !== true || entries.length === 0) return null;
+  const legend = layout.legend ?? {};
+  if (legend.orientation === 'h' || legend.x > 1 || legend.x < 0 || legend.y > 1 || legend.y < 0) return null;
+  const width = Math.max(...entries.map(name => textWidth(name, { size: LEGEND_FONT_SIZE, family: getPlotTheme().fontFamily })))
+    + LEGEND_FRAME_WIDTH;
+  // Plotly scrolls a legend taller than the plot area within it.
+  const height = Math.min(plotHeight, LEGEND_FRAME_HEIGHT + entries.length * LEGEND_ENTRY_HEIGHT);
+  const left = legend.xanchor === 'right' ? plotWidth - width : legend.xanchor === 'center' ? (plotWidth - width) / 2 : 0;
+  const top = legend.yanchor === 'top' ? 0 : legend.yanchor === 'bottom' ? plotHeight - height : (plotHeight - height) / 2;
+  return { left, top, right: left + width, bottom: top + height };
+}
+
+function boxesMeet(a, b) {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+/**
+ * Lay out the statistics of each page in the plot area, in px, so that no
+ * box lands on another or on the legend at any size of the plot: one box per
+ * page, stacked in the top corner the legend leaves free, else side by side,
+ * else one compact box of R² values (each in its page's color). When none
+ * of them fits beside an automatic legend, the legend gives way (it is
+ * dropped only from the automatic placement, as the volcano plot's is);
+ * where not even the compact box fits, the statistics are left to the
+ * expanded view and its table.
+ *
+ * @param {Array<{color: string, lines: Array<{text: string, bold?: boolean}>, compact: string}>} stats
+ * @param {Object} layout - The finished layout; `showlegend` may be turned off
+ * @param {string[]} legendEntries - The names the legend lists
+ * @param {{width: number, height: number}} viewport
+ * @param {boolean} legendIsAutomatic
+ * @returns {Object[]} The annotations
+ */
+function placeStatistics(stats, layout, legendEntries, viewport, legendIsAutomatic) {
+  if (stats.length === 0) return [];
+  if (!(viewport.width > 0) || !(viewport.height > 0)) {
+    throw new RangeError('Scatter plot container must have a positive size to place its statistics');
+  }
+  const theme = getPlotTheme();
+  const plotWidth = viewport.width - SCATTER_MARGIN.l - SCATTER_MARGIN.r;
+  const plotHeight = viewport.height - SCATTER_MARGIN.t - SCATTER_MARGIN.b;
+  const sizes = stats.map(entry => framedSize(entry.lines, theme));
+  const boxAnnotation = (entry, size, left, top) => ({
+    text: entry.lines.map(line => (line.bold ? `<b>${line.text}</b>` : line.text)).join('<br>'),
+    x: 0, y: 1, xref: 'paper', yref: 'paper', xanchor: 'left', yanchor: 'top',
+    xshift: left, yshift: -top,
+    align: 'left',
+    showarrow: false,
+    font: { family: theme.fontFamily, size: STATS_FONT_SIZE, color: entry.color },
+    bgcolor: theme.legend.bg,
+    borderpad: STATS_BORDER_PAD,
+    bordercolor: entry.color,
+    borderwidth: STATS_BORDER_WIDTH
+  });
+  const arrangements = () => {
+    const legend = legendBox(layout, legendEntries, plotWidth, plotHeight);
+    // The top corner away from a legend on the left.
+    const fromRight = legend !== null && legend.left === 0 && legend.right < plotWidth;
+    const at = (left, width) => (fromRight ? plotWidth - left - width : left);
+    const fits = boxes => boxes.every(box => (
+      box.left >= 0 && box.top >= 0 && box.right <= plotWidth && box.bottom <= plotHeight &&
+      (legend === null || !boxesMeet(box, {
+        left: legend.left - STATS_GAP, right: legend.right + STATS_GAP, top: legend.top - STATS_GAP, bottom: legend.bottom + STATS_GAP
+      }))
+    ));
+    const placed = [];
+    // One column of boxes.
+    let top = 0;
+    const column = sizes.map(size => {
+      const left = at(0, size.width);
+      const box = { left, top, right: left + size.width, bottom: top + size.height };
+      top += size.height + STATS_GAP;
+      return box;
+    });
+    placed.push(column);
+    // One row of boxes.
+    let left = 0;
+    placed.push(sizes.map(size => {
+      const boxLeft = at(left, size.width);
+      left += size.width + STATS_GAP;
+      return { left: boxLeft, top: 0, right: boxLeft + size.width, bottom: size.height };
+    }));
+    for (const boxes of placed) {
+      if (fits(boxes)) return stats.map((entry, index) => boxAnnotation(entry, sizes[index], boxes[index].left, boxes[index].top));
+    }
+    // One compact box: each page's R² in its color.
+    const compactLines = stats.map(entry => ({ text: entry.compact }));
+    const compact = framedSize(compactLines, theme);
+    const compactLeft = at(0, compact.width);
+    if (fits([{ left: compactLeft, top: 0, right: compactLeft + compact.width, bottom: compact.height }])) {
+      return [{
+        ...boxAnnotation({ lines: compactLines, color: theme.legend.border }, compact, compactLeft, 0),
+        text: stats.map(entry => `<span style="color:${entry.color}">${entry.compact}</span>`).join('<br>'),
+        font: { family: theme.fontFamily, size: STATS_FONT_SIZE, color: theme.text }
+      }];
+    }
+    return null;
+  };
+  let annotations = arrangements();
+  if (annotations === null && legendIsAutomatic && layout.showlegend === true) {
+    layout.showlegend = false;
+    annotations = arrangements();
+  }
+  return annotations ?? [];
+}
 
 // Correlation plots use Plotly's SVG Cartesian trace in every browser. The main
 // Cellucid renderer owns the page's WebGL context; Plotly must not allocate a
 // second context or replace scientific output with its WebGL-failure overlay.
 const scatterPlotDefinition = {
   id: 'scatterplot',
-  name: 'Scatter Plot',
+  name: 'Scatter plot',
   description: 'Correlation between two continuous variables',
   supportedTypes: ['correlation', 'continuous_pair'],
   supportedLayouts: ['overlay', 'side-by-side'],
@@ -130,8 +266,17 @@ const scatterPlotDefinition = {
     }
 
     const traces = [];
-    const annotations = [];
+    const stats = [];
     const theme = getPlotTheme();
+    // One color per category across every page, and one legend entry each.
+    const allCategories = new Set();
+    for (const pageResult of pageResults) {
+      if (pageResult.colorValues && pageResult.colorValues.length > 0 && pageResult.colorVariable) {
+        for (const value of pageResult.colorValues) allCategories.add(value ?? 'Unknown');
+      }
+    }
+    const sharedCategoryColors = generateCategoryColors([...allCategories].filter(c => c != null).sort(), theme);
+    const listedCategories = new Set();
 
     // Determine if we should show density instead of points
     const totalPoints = pageResults.reduce((sum, pr) => sum + (pr.xValues?.length || 0), 0);
@@ -226,7 +371,7 @@ const scatterPlotDefinition = {
       } else if (hasColorBy && colorData) {
         // Color by categorical variable - create separate trace per category
         const categories = [...new Set(colorData)].filter(c => c != null).sort();
-        const categoryColors = generateCategoryColors(categories, theme);
+        const categoryColors = sharedCategoryColors;
 
         for (const cat of categories) {
           const catX = [];
@@ -239,6 +384,7 @@ const scatterPlotDefinition = {
           }
 
           if (catX.length === 0) continue;
+          const firstOfCategory = !listedCategories.has(cat);
 
           traces.push({
             type: PLOTLY_2D_SCATTER_TRACE_TYPE,
@@ -247,6 +393,7 @@ const scatterPlotDefinition = {
             // that Plotly never draws, so it keeps the raw value.
             name: escapeHtml(cat),
             legendgroup: cat,
+            showlegend: firstOfCategory,
             x: catX,
             y: catY,
               marker: {
@@ -260,6 +407,7 @@ const scatterPlotDefinition = {
               `${escapeHtml(pageResult.colorVariable)}: ${escapeHtml(cat)}<extra></extra>`,
             hoverlabel: COMMON_HOVER_STYLE
           });
+          listedCategories.add(cat);
         }
       } else {
         // Regular cross-browser SVG scatter plot.
@@ -337,27 +485,15 @@ const scatterPlotDefinition = {
         const pValue = pageResult.pValue;
         const significance = pValue < 0.001 ? '***' : pValue < 0.01 ? '**' : pValue < 0.05 ? '*' : '';
 
-        annotations.push({
-          text: `<b>${safePageName}</b><br>` +
-                `R² = ${rSquared.toFixed(3)}${significance}<br>` +
-                `r = ${pageResult.r.toFixed(3)}<br>` +
-                `n = ${xData.length}`,
-          x: 0.02,
-          y: 0.98 - i * 0.15,
-          xref: 'paper',
-          yref: 'paper',
-          xanchor: 'left',
-          yanchor: 'top',
-          showarrow: false,
-          font: {
-            family: theme.fontFamily,
-            size: 10,
-            color: color
-          },
-          bgcolor: theme.legend.bg,
-          borderpad: 4,
-          bordercolor: color,
-          borderwidth: 1
+        stats.push({
+          color,
+          lines: [
+            { text: safePageName, bold: true },
+            { text: `R² = ${rSquared.toFixed(3)}${significance}` },
+            { text: `r = ${pageResult.r.toFixed(3)}` },
+            { text: `n = ${xData.length}` }
+          ],
+          compact: `R² = ${rSquared.toFixed(3)}${significance}`
         });
       }
     }
@@ -396,8 +532,6 @@ const scatterPlotDefinition = {
       tickfont: { size: 10, color: theme.textMuted }
     };
 
-    layout.annotations = annotations;
-
     layout.legend = {
       x: 1,
       y: 1,
@@ -409,8 +543,26 @@ const scatterPlotDefinition = {
       font: { size: 10 }
     };
 
-    layout.margin = { l: 60, r: 20, t: 30, b: 50 };
+    layout.margin = { ...SCATTER_MARGIN };
     applyLegendPosition(layout, options.legendPosition);
+    const legendEntries = traces
+      .filter(trace => trace.showlegend !== false && trace.type !== 'histogram2dcontour')
+      .map(trace => trace.name);
+    const legendShown = layout.showlegend;
+    // The statistics are placed for the size the plot is drawn at, and again
+    // whenever it is resized (`size-fit.js`).
+    const statisticsFor = element => {
+      const sized = { ...layout, showlegend: legendShown };
+      const annotations = placeStatistics(
+        stats,
+        sized,
+        legendEntries,
+        { width: element.clientWidth, height: element.clientHeight },
+        (options.legendPosition ?? 'auto') === 'auto'
+      );
+      return { annotations, showlegend: sized.showlegend };
+    };
+    Object.assign(layout, statisticsFor(container));
 
     // Render with Plotly
     const config = getPlotlyConfig();
@@ -418,7 +570,8 @@ const scatterPlotDefinition = {
 
     try {
       const Plotly = await createMinimalPlotly();
-      return await Plotly.newPlot(container, traces, layout, config);
+      const figure = await Plotly.newPlot(container, traces, layout, config);
+      return fitToSize(figure, () => Plotly.relayout(figure, statisticsFor(figure)));
     } catch (err) {
       console.error('[ScatterPlot] Render error:', err);
       throw new Error(`Failed to render scatter plot: ${err.message}`);

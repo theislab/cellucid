@@ -12,9 +12,11 @@
  */
 
 import {
-  assertExactKeys,
-  assertSafeInteger
+  assertSafeInteger,
 } from '../schema-contract.js';
+import { createSlicedInputStream } from '../../../formats/io/inflate.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
  * @param {AbortSignal | null | undefined} signal
@@ -43,17 +45,6 @@ const GZIP_FIXED_HEADER_BYTES = 10;
 const GZIP_TRAILER_BYTES = 8;
 const UINT32_MODULUS = 0x100000000;
 
-/**
- * Input bytes handed to a native decompressor per pull.
- *
- * Every supported engine's `DecompressionStream` inflates each written chunk
- * to completion before it honours backpressure, so a whole payload written as
- * one chunk lets a DEFLATE bomb expand without bound before any reader limit
- * can cancel it. Feeding the input in slices of this size bounds the output
- * produced past a reader's limit to DEFLATE's maximum expansion of one slice
- * (1032 x 32 KiB, about 33 MiB), at a few percent of inflate throughput.
- */
-export const NATIVE_INFLATE_INPUT_SLICE_BYTES = 32 * 1024;
 
 function readUint32LE(bytes, offset) {
   return (
@@ -106,45 +97,6 @@ function requireSingleMemberEnvelope(compressed, exactOutputBytes) {
 }
 
 /**
- * Stream byte parts to a native decompressor in bounded slices, one slice
- * per pull, so inflation advances only as fast as its reader consumes it.
- *
- * @param {readonly Uint8Array[]} parts
- * @returns {ReadableStream<Uint8Array>}
- */
-export function createSlicedInputStream(parts) {
-  for (const part of parts) {
-    if (!(part instanceof Uint8Array)) {
-      throw new TypeError('Native decompressor input must be Uint8Array parts.');
-    }
-  }
-  let partIndex = 0;
-  let partOffset = 0;
-  return new ReadableStream({
-    pull(controller) {
-      while (
-        partIndex < parts.length
-        && partOffset >= parts[partIndex].byteLength
-      ) {
-        partIndex += 1;
-        partOffset = 0;
-      }
-      if (partIndex === parts.length) {
-        controller.close();
-        return;
-      }
-      const part = parts[partIndex];
-      const end = Math.min(
-        part.byteLength,
-        partOffset + NATIVE_INFLATE_INPUT_SLICE_BYTES,
-      );
-      controller.enqueue(part.subarray(partOffset, end));
-      partOffset = end;
-    },
-  }, { highWaterMark: 0 });
-}
-
-/**
  * Convert a Uint8Array into a ReadableStream<Uint8Array>.
  * @param {Uint8Array} bytes
  * @returns {ReadableStream<Uint8Array>}
@@ -170,7 +122,7 @@ function bytesToStream(bytes) {
  * @returns {Promise<Uint8Array>}
  */
 async function streamToUint8Array(stream, options) {
-  assertExactKeys(
+  requireExactKeys(
     options,
     ['maxBytes', 'signal'],
     'Gzip stream reader options'
@@ -208,7 +160,7 @@ async function streamToUint8Array(stream, options) {
 
       total += chunk.byteLength;
       if (maxBytes != null && total > maxBytes) {
-        throw new Error(`Decompressed data exceeds limit (${total} > ${maxBytes} bytes).`);
+        throw new Error(`Decompressed data exceeds limit (${total} > ${formatCountOf(maxBytes, 'byte')}).`);
       }
 
       if (maxBytes === null) {
@@ -223,7 +175,7 @@ async function streamToUint8Array(stream, options) {
             if (!(allocationError instanceof RangeError)) throw allocationError;
             // Out of memory, not a malformed stream: keep it a RangeError.
             throw new RangeError(
-              `Decompressed data needs ${maxBytes} bytes; the browser could not allocate them.`,
+              `Decompressed data needs ${formatCountOf(maxBytes, 'byte')}; the browser could not allocate them.`,
               { cause: allocationError },
             );
           }
@@ -240,15 +192,13 @@ async function streamToUint8Array(stream, options) {
     // no further input is inflated for a result nobody will read.
     await reader.cancel(error).catch(() => {});
     throw error;
-  } finally {
-    reader.releaseLock();
   }
 
   if (maxBytes !== null) {
     if (boundedOutput !== null) {
       if (boundedOffset !== maxBytes) {
         throw new Error(
-          `Decompressed data produced ${boundedOffset} bytes; expected exactly ${maxBytes}.`
+          `Decompressed data produced ${formatCountOf(boundedOffset, 'byte')}; expected exactly ${maxBytes}.`
         );
       }
       return boundedOutput;
@@ -256,7 +206,7 @@ async function streamToUint8Array(stream, options) {
     if (firstBoundedChunk !== null) {
       if (firstBoundedChunk.byteLength !== maxBytes) {
         throw new Error(
-          `Decompressed data produced ${firstBoundedChunk.byteLength} bytes; `
+          `Decompressed data produced ${formatCountOf(firstBoundedChunk.byteLength, 'byte')}; `
           + `expected exactly ${maxBytes}.`
         );
       }
@@ -298,7 +248,7 @@ export async function gzipDecompress(compressed, options) {
   if (!(compressed instanceof Uint8Array)) {
     throw new TypeError('Gzip compressed input must be a Uint8Array.');
   }
-  assertExactKeys(
+  requireExactKeys(
     options,
     ['maxOutputBytes', 'signal'],
     'Gzip decompression options'
@@ -348,7 +298,7 @@ export async function gzipCompress(uncompressed, options) {
   if (!(uncompressed instanceof Uint8Array)) {
     throw new TypeError('Gzip uncompressed input must be a Uint8Array.');
   }
-  assertExactKeys(options, ['signal'], 'Gzip compression options');
+  requireExactKeys(options, ['signal'], 'Gzip compression options');
   const signal = assertSignal(options.signal, 'Gzip compression signal');
   throwIfAborted(signal);
 

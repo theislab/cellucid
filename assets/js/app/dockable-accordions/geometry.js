@@ -16,7 +16,7 @@
  * whose header cannot be reached cannot be moved, docked, or closed. This margin
  * is what keeps it recoverable.
  */
-const FLOATING_MARGIN = 8;
+export const FLOATING_MARGIN = 8;
 
 /**
  * Clamp a floating panel's top-left so its header stays reachable.
@@ -105,4 +105,222 @@ export function clearOfOpenHeaders({
   // Never shorter than one header, whatever the window's own minimum.
   if (room < Math.max(minHeight, step)) return { ...position, height };
   return { x: position.x, y: below, height: Math.min(height, room) };
+}
+
+/** The eight places a window is resized from: four edges and four corners. */
+export const RESIZE_EDGES = Object.freeze(['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']);
+
+/**
+ * The candidate within `distance` of `value` that lies nearest to it, or null.
+ *
+ * @param {number} value
+ * @param {number[]} candidates
+ * @param {number} distance
+ * @returns {number|null}
+ */
+function nearestWithin(value, candidates, distance) {
+  let best = null;
+  let bestGap = distance;
+  for (const candidate of candidates) {
+    const gap = Math.abs(candidate - value);
+    if (gap <= bestGap) {
+      best = candidate;
+      bestGap = gap;
+    }
+  }
+  return best;
+}
+
+/**
+ * The rectangle a window takes when one of its edges or corners moves.
+ *
+ * Only the edges named by `edge` move: `e` moves the right edge, `nw` the top
+ * and left edges, and so on. A moving edge stops where the window would fall
+ * below its minimum size or leave the viewport (less the margin), so the
+ * opposite edge never moves. Then, within `snap.distance`, the moving edge
+ * lands on the nearest snap line — another window's edge, the sidebar, the
+ * middle of the free area — or at a snap size measured from the fixed edge.
+ * `guides` names the line it landed on, for the 1 px guide.
+ *
+ * @param {object} args
+ * @param {{left: number, top: number, width: number, height: number}} args.start
+ * @param {string} args.edge - One of {@link RESIZE_EDGES}.
+ * @param {number} args.dx - Horizontal pointer travel since the start.
+ * @param {number} args.dy - Vertical pointer travel since the start.
+ * @param {number} args.minWidth
+ * @param {number} args.minHeight
+ * @param {number} args.viewportWidth
+ * @param {number} args.viewportHeight
+ * @param {{xs?: number[], ys?: number[], widths?: number[], heights?: number[], distance: number}|null} [args.snap]
+ * @returns {{rect: {left: number, top: number, width: number, height: number}, guides: {x: number|null, y: number|null}}}
+ */
+export function resizeFloatingRect({
+  start,
+  edge,
+  dx,
+  dy,
+  minWidth,
+  minHeight,
+  viewportWidth,
+  viewportHeight,
+  snap = null
+}) {
+  if (!RESIZE_EDGES.includes(edge)) {
+    throw new TypeError(`Unknown resize edge "${edge}"`);
+  }
+  const lowX = FLOATING_MARGIN;
+  const highX = Math.max(lowX, viewportWidth - FLOATING_MARGIN);
+  const lowY = FLOATING_MARGIN;
+  const highY = Math.max(lowY, viewportHeight - FLOATING_MARGIN);
+  let left = start.left;
+  let top = start.top;
+  let right = start.left + start.width;
+  let bottom = start.top + start.height;
+  const guides = { x: null, y: null };
+  const distance = snap?.distance ?? 0;
+  const clamp = (value, low, high) => Math.min(Math.max(value, low), Math.max(low, high));
+
+  if (edge.includes('e')) {
+    let next = clamp(right + dx, left + minWidth, highX);
+    if (distance > 0) {
+      const lines = [...(snap.xs ?? []), ...(snap.widths ?? []).map(w => left + w)]
+        .filter(x => x >= left + minWidth && x <= highX);
+      const snapped = nearestWithin(next, lines, distance);
+      if (snapped !== null) { next = snapped; guides.x = snapped; }
+    }
+    right = next;
+  } else if (edge.includes('w')) {
+    let next = clamp(left + dx, lowX, right - minWidth);
+    if (distance > 0) {
+      const lines = [...(snap.xs ?? []), ...(snap.widths ?? []).map(w => right - w)]
+        .filter(x => x >= lowX && x <= right - minWidth);
+      const snapped = nearestWithin(next, lines, distance);
+      if (snapped !== null) { next = snapped; guides.x = snapped; }
+    }
+    left = next;
+  }
+  if (edge.includes('s')) {
+    let next = clamp(bottom + dy, top + minHeight, highY);
+    if (distance > 0) {
+      const lines = [...(snap.ys ?? []), ...(snap.heights ?? []).map(h => top + h)]
+        .filter(y => y >= top + minHeight && y <= highY);
+      const snapped = nearestWithin(next, lines, distance);
+      if (snapped !== null) { next = snapped; guides.y = snapped; }
+    }
+    bottom = next;
+  } else if (edge.includes('n')) {
+    let next = clamp(top + dy, lowY, bottom - minHeight);
+    if (distance > 0) {
+      const lines = [...(snap.ys ?? []), ...(snap.heights ?? []).map(h => bottom - h)]
+        .filter(y => y >= lowY && y <= bottom - minHeight);
+      const snapped = nearestWithin(next, lines, distance);
+      if (snapped !== null) { next = snapped; guides.y = snapped; }
+    }
+    top = next;
+  }
+  return {
+    rect: { left, top, width: right - left, height: bottom - top },
+    guides
+  };
+}
+
+/**
+ * The pointer travel an arrow key stands for on a resize handle.
+ *
+ * An arrow moves the handle in its own direction, along the axes the handle
+ * moves on: ArrowRight on the right edge widens, on the left edge narrows.
+ * Home shrinks to the minimum and End grows to the viewport; the travel is
+ * the viewport size, which the clamp in {@link resizeFloatingRect} cuts to
+ * what is possible.
+ *
+ * @param {string} edge
+ * @param {string} key
+ * @param {number} step
+ * @param {{viewportWidth: number, viewportHeight: number}} viewport
+ * @returns {{dx: number, dy: number}|null} null for a key that does not resize.
+ */
+export function keyboardResizeTravel(edge, key, step, { viewportWidth, viewportHeight }) {
+  const horizontal = edge.includes('e') || edge.includes('w');
+  const vertical = edge.includes('n') || edge.includes('s');
+  const outX = edge.includes('e') ? 1 : -1;
+  const outY = edge.includes('s') ? 1 : -1;
+  switch (key) {
+    case 'ArrowLeft': return horizontal ? { dx: -step, dy: 0 } : null;
+    case 'ArrowRight': return horizontal ? { dx: step, dy: 0 } : null;
+    case 'ArrowUp': return vertical ? { dx: 0, dy: -step } : null;
+    case 'ArrowDown': return vertical ? { dx: 0, dy: step } : null;
+    case 'Home':
+      return {
+        dx: horizontal ? -outX * viewportWidth : 0,
+        dy: vertical ? -outY * viewportHeight : 0
+      };
+    case 'End':
+      return {
+        dx: horizontal ? outX * viewportWidth : 0,
+        dy: vertical ? outY * viewportHeight : 0
+      };
+    default: return null;
+  }
+}
+
+/**
+ * The rectangle of a maximized window: the free area beside a visible
+ * sidebar, inside the margin. When the free area is narrower than the
+ * window's minimum, the whole viewport is used.
+ *
+ * @param {{sidebarRight: number, minWidth: number, viewportWidth: number, viewportHeight: number}} args
+ * @returns {{left: number, top: number, width: number, height: number}}
+ */
+export function maximizedFloatingRect({ sidebarRight, minWidth, viewportWidth, viewportHeight }) {
+  const besideSidebar = sidebarRight + FLOATING_MARGIN;
+  const freeWidth = viewportWidth - besideSidebar - FLOATING_MARGIN;
+  const left = sidebarRight > 0 && freeWidth >= minWidth ? besideSidebar : FLOATING_MARGIN;
+  return {
+    left,
+    top: FLOATING_MARGIN,
+    width: Math.max(0, viewportWidth - left - FLOATING_MARGIN),
+    height: Math.max(0, viewportHeight - 2 * FLOATING_MARGIN)
+  };
+}
+
+/**
+ * Snap lines for resizing one window: the viewport inside the margin, the
+ * sidebar's edge and the middle of the free area beside it, and every other
+ * window's edges; snap sizes: the sidebar's width and the content's height.
+ *
+ * @param {object} args
+ * @param {number} args.viewportWidth
+ * @param {number} args.viewportHeight
+ * @param {number} args.sidebarRight - 0 when the sidebar is hidden.
+ * @param {number} args.sidebarWidth - 0 when the sidebar is hidden.
+ * @param {Array<{left: number, top: number, right: number, bottom: number}>} args.others
+ * @param {number} args.contentHeight - The height that shows all content; 0 when unknown.
+ * @param {number} args.distance
+ * @returns {{xs: number[], ys: number[], widths: number[], heights: number[], distance: number}}
+ */
+export function floatingSnapTargets({
+  viewportWidth,
+  viewportHeight,
+  sidebarRight,
+  sidebarWidth,
+  others,
+  contentHeight,
+  distance
+}) {
+  const freeLeft = sidebarRight > 0 ? sidebarRight + FLOATING_MARGIN : FLOATING_MARGIN;
+  const freeRight = viewportWidth - FLOATING_MARGIN;
+  const xs = [FLOATING_MARGIN, freeRight, (freeLeft + freeRight) / 2];
+  if (sidebarRight > 0) xs.push(freeLeft);
+  const ys = [FLOATING_MARGIN, viewportHeight - FLOATING_MARGIN, viewportHeight / 2];
+  for (const other of others) {
+    xs.push(other.left, other.right);
+    ys.push(other.top, other.bottom);
+  }
+  return {
+    xs,
+    ys,
+    widths: sidebarWidth > 0 ? [sidebarWidth] : [],
+    heights: contentHeight > 0 ? [contentHeight] : [],
+    distance
+  };
 }

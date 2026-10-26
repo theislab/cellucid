@@ -1,8 +1,9 @@
 /**
  * @fileoverview Ownership boundary for immutable scientific field descriptors.
  *
- * Manifest field descriptors are exact scientific input contracts. DataState
- * fields are mutable runtime records that acquire payloads and UI bookkeeping.
+ * Field descriptors from the field lists (`data-loaders.js`) are exact
+ * scientific input contracts. DataState fields are mutable runtime records
+ * that acquire payloads and UI bookkeeping.
  * These two objects must never be the same object.
  */
 

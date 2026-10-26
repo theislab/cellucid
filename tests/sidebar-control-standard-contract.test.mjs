@@ -221,9 +221,12 @@ test('component CSS names colours through tokens', () => {
 test('!important appears only where it overrides a third party or an inline owner', () => {
   // Plotly injects unlayered styles that outrank every layered rule; the
   // canvas cursor and the notification progress width are written inline by
-  // their owners; a drag in progress must win over every transition.
+  // their owners; a drag in progress must win over every transition; the
+  // full-screen expanded view on a narrow screen overrides the sizes its
+  // resize writes inline (kept for a wider screen).
   const ALLOWED = new Map([
     ['assets/css/components/_analysis.css', /\.modebar|plot/],
+    ['assets/css/components/_modals.css', /^\s*\.analysis-modal-(?:content|options|stats-panel)\b/],
     ['assets/css/components/_notifications.css', /indeterminate/],
     ['assets/css/components/_filters.css', /#glcanvas/],
     ['assets/css/components/_accordion.css', /dock-dragging|dock-resizing|\.dragging|\.resizing/],

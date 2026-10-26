@@ -41,11 +41,11 @@ export function createControlScope(name) {
  *
  * @param {Element} element
  * @param {string} scope
- * @param {string} fallbackKey - Used when the element has no id yet.
+ * @param {string} idlessKey - Used when the element has no id yet.
  * @returns {string} The element's id after scoping.
  */
-function scopeElementId(element, scope, fallbackKey) {
-  const suffix = element.id.length > 0 ? element.id : fallbackKey;
+function scopeElementId(element, scope, idlessKey) {
+  const suffix = element.id.length > 0 ? element.id : idlessKey;
   const scoped = `${scope}-${suffix}`;
   if (element.id !== scoped) element.id = scoped;
   return scoped;

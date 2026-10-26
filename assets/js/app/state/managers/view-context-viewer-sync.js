@@ -9,43 +9,17 @@
 
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { getPageColor } from '../../utils/page-colors.js';
-import { fillNeutralGray } from '../core/constants.js';
 import { adoptScientificFieldDescriptors } from './field/descriptor-ownership.js';
 import {
+  createNeutralColors,
+  createShownCellVisibilityMask,
   markSnapshotPublishedColors,
+  recordAlphaBytesMirror,
+  transparencyArrayWrites,
   writableTransparency,
 } from './per-cell-array-ownership.js';
-
-/**
- * Own a manifest field's centroids by layout: `centroidsByEmbedding` is keyed
- * by embedding id, which is the layout key of that embedding. An id the
- * dimension manager has not registered has no reachable centroids. The arrays
- * are copied so lazy in-place normalization owns them; malformed shapes pass
- * through unchanged for buildCentroidsForField to reject.
- */
-function ownCentroidsByLayout(centroidsByEmbedding, dimensionManager) {
-  if (
-    centroidsByEmbedding === null
-    || typeof centroidsByEmbedding !== 'object'
-    || Array.isArray(centroidsByEmbedding)
-  ) {
-    return centroidsByEmbedding;
-  }
-  const owned = new Map();
-  for (const [layoutKey, centroids] of Object.entries(centroidsByEmbedding)) {
-    if (!dimensionManager.hasLayout(layoutKey)) continue;
-    owned.set(layoutKey, Array.isArray(centroids)
-      ? centroids.map((centroid) => (
-          centroid !== null
-          && typeof centroid === 'object'
-          && Array.isArray(centroid.position)
-            ? { ...centroid, position: [...centroid.position] }
-            : centroid
-        ))
-      : centroids);
-  }
-  return owned;
-}
+import { recordUnfilteredVisibility } from './filter-manager.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 const SYNTHETIC_SCENE_KEYS = Object.freeze([
   'colors',
@@ -178,6 +152,16 @@ function requireSyntheticViewer(viewer) {
   return viewer;
 }
 
+/**
+ * Record on `state` the transparency array (and its write count) whose bytes
+ * the live viewer now holds, or forget it (`null`).
+ */
+function recordLiveViewerTransparency(state, transparency) {
+  state._liveViewerTransparency = transparency === null
+    ? null
+    : { transparency, writes: transparencyArrayWrites(transparency) };
+}
+
 export const viewContextViewerSyncMethods = {
   _pushColorsToViewer() {
     if (this._isLiveView()) {
@@ -190,6 +174,19 @@ export const viewContextViewerSyncMethods = {
   },
 
   _pushTransparencyToViewer() {
+    if (this._isLiveView()) {
+      const held = this._liveViewerTransparency;
+      if (
+        held !== null
+        && held !== undefined
+        && held.transparency === this.categoryTransparency
+        && held.writes === transparencyArrayWrites(this.categoryTransparency)
+      ) {
+        // The live viewer already holds exactly these bytes: they were
+        // published from this array and it has not been written since.
+        return;
+      }
+    }
     // IMPORTANT: Do NOT call _pushColorsToViewer() here!
     // The alpha texture fast path in hp-renderer handles transparency updates efficiently
     // without requiring full buffer rebuilds. Calling updateColors() here would set
@@ -201,7 +198,9 @@ export const viewContextViewerSyncMethods = {
     // - Alpha-buffer case: uses an alpha-only dirty flag for efficient partial updates
     try {
       if (this._isLiveView()) {
+        recordLiveViewerTransparency(this, null);
         this.viewer.updateTransparency(this.categoryTransparency);
+        recordLiveViewerTransparency(this, this.categoryTransparency);
       } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
         this.viewer.updateSnapshotAttributes(this.activeViewId, { transparency: this.categoryTransparency });
       }
@@ -294,44 +293,48 @@ export const viewContextViewerSyncMethods = {
   },
 
   initScene(positions, obs) {
+    // The active field indexes the inventories this replaces. It is retired
+    // first, before an inventory, the renderer or any listener sees the new
+    // dataset: an index kept any longer points into the new dataset's fields
+    // or genes (outside them, or at another field), and every synchronous
+    // notification below -- the renderer's new points, the centroid reset,
+    // the view contexts -- would read it there.
+    this.activeFieldIndex = -1;
+    this.activeVarFieldIndex = -1;
+    this.activeFieldSource = null;
+    this._activeCategoryCounts = null;
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
+    // The replaced dataset's outlier jobs stop reading its latent space, and
+    // what was kept from its cells goes: the visibility count's arrays (its
+    // transparency and outlier quantiles) and the page-count scratch.
+    this.retireOutlierJobs();
+    this._filteredCountMemo = null;
+    this._highlightMembershipScratch = null;
     // A new dataset starts with the gene list it was published with.
     this._varAxisGeneration = 0;
     // Dataset swap: ensure GPU overlay resources referencing the previous dataset
     // are released before we upload new buffers.
     this.viewer.resetVectorFieldOverlay?.();
 
-    const manifestFields = obs?.fields || [];
-    this._obsFieldDescriptors = adoptScientificFieldDescriptors(manifestFields);
-    const normalizedFields = manifestFields.map((field) => {
-      const hasCentroids = field !== null && typeof field === 'object'
-        && Object.hasOwn(field, 'centroidsByEmbedding');
-      const rest = { ...field };
-      delete rest.centroidsByEmbedding;
+    const obsFields = obs?.fields || [];
+    this._obsFieldDescriptors = adoptScientificFieldDescriptors(obsFields);
+    const normalizedFields = obsFields.map((field) => {
       return {
-        ...rest,
+        ...field,
         categories: Array.isArray(field?.categories)
           ? [...field.categories]
           : field?.categories,
         loaded: Boolean(field?.values || field?.codes),
         _loadingPromise: null,
         _loadingSignal: null,
-        // Centroids are normalized lazily and in place, once per layout.
-        // The record of which layouts are done has to have exactly the
-        // lifetime of the arrays it describes: every view context clones this
-        // field shallowly, so the copied centroid arrays and this one Set are
-        // shared by all of them. A per-clone `null` let a view kept before the
-        // field's first colouring normalize the shared arrays a second time.
-        // The arrays themselves are copied so normalization never rewrites the
-        // dataset generation's manifest.
-        ...(hasCentroids
-          ? {
-              centroidsByLayout: ownCentroidsByLayout(
-                field.centroidsByEmbedding,
-                this.dimensionManager
-              )
-            }
-          : {}),
+        // A categorical field's centroids are computed in the browser, once
+        // per layout, from its codes and the layout's positions, and cached
+        // here. The cache and the record of which layouts are done have
+        // exactly the field's lifetime: every view context clones this field
+        // shallowly, so this one Map and this one Set are shared by all of
+        // them. A per-clone `null` let a view kept before the field's first
+        // colouring normalize the shared arrays a second time.
+        ...(field?.kind === 'category' ? { centroidsByLayout: new Map() } : {}),
         _normalizedLayouts: new Set()
       };
     });
@@ -358,7 +361,7 @@ export const viewContextViewerSyncMethods = {
       positions.length % positionsDimension !== 0
     ) {
       throw new TypeError(
-        `Scene positions must be a Float32Array with exactly ${positionsDimension} values per cell.`
+        `Scene positions must be a Float32Array with exactly ${formatCountOf(positionsDimension, 'value')} per cell.`
       );
     }
     this.positionsArray = positions;
@@ -366,11 +369,16 @@ export const viewContextViewerSyncMethods = {
 
     this.pointCount = positions.length / positionsDimension;
 
-    this.colorsArray = fillNeutralGray(new Uint8Array(this.pointCount * 4));
+    this.colorsArray = createNeutralColors(this.pointCount);
     this.categoryTransparency = new Uint8Array(this.pointCount).fill(1);
-    this.cellVisibilityMask = new Uint8Array(this.pointCount).fill(1);
+    this.cellVisibilityMask = createShownCellVisibilityMask(this.pointCount);
+    // Every cell shown, with opaque alpha bytes: the first visibility pass
+    // (no filter yet) adopts this generation instead of writing it again.
+    recordUnfilteredVisibility(this.categoryTransparency, this.cellVisibilityMask);
+    recordAlphaBytesMirror(this.colorsArray, this.categoryTransparency);
     this.filteredCount = { shown: this.pointCount, total: this.pointCount };
 
+    recordLiveViewerTransparency(this, null);
     this.viewer.setData({
       positions,
       colors: this.colorsArray,
@@ -378,6 +386,7 @@ export const viewContextViewerSyncMethods = {
       dimensionLevel: positionsDimension,
       layoutKey
     });
+    recordLiveViewerTransparency(this, this.categoryTransparency);
 
     this.clearCentroids();
     this.viewer.setCentroids({
@@ -395,21 +404,13 @@ export const viewContextViewerSyncMethods = {
     this.activePageId = 'page_1';
     this._highlightPageIdCounter = 1;
     this.highlightArray = new Uint8Array(this.pointCount);
-    this._highlightedCellIndices = [];
+    // No cell is highlighted: the published list is exactly empty.
+    this._highlightedCellIndices = new Uint32Array(0);
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null;
     this._cachedTotalHighlightCount = null;
     this._cachedHighlightLodMembership = null;
 
-    // Publish the new dataset with no active field/filter owner before any
-    // synchronous state notification escapes. A prior categorical selection
-    // can have the same field index in the replacement manifest while its
-    // codes are still intentionally lazy; exposing that stale index lets UI
-    // listeners initialize filter metadata against the wrong generation.
-    this.activeFieldIndex = -1;
-    this.activeVarFieldIndex = -1;
-    this.activeFieldSource = null;
-    this._activeCategoryCounts = null;
     this._batchMode = false;
     this._batchDepth = 0;
     this._batchDirty = {
@@ -440,7 +441,7 @@ export const viewContextViewerSyncMethods = {
     const exact = requireSyntheticScene(scene);
     const viewer = requireSyntheticViewer(this.viewer);
     const transparency = new Uint8Array(exact.pointCount).fill(1);
-    const cellVisibilityMask = new Uint8Array(exact.pointCount).fill(1);
+    const cellVisibilityMask = createShownCellVisibilityMask(exact.pointCount);
     const highlights = new Uint8Array(exact.pointCount);
     const emptyCentroidPositions = new Float32Array(0);
     const emptyCentroidColors = new Uint8Array(0);
@@ -465,6 +466,9 @@ export const viewContextViewerSyncMethods = {
       : [];
     const previousViewId = this.activeViewId;
 
+    // The live viewer's transparency is about to be replaced: what it held
+    // is no longer known, so the next publication is sent.
+    recordLiveViewerTransparency(this, null);
     try {
       viewer.setData({
         positions: exact.positions,
@@ -498,6 +502,9 @@ export const viewContextViewerSyncMethods = {
     }
 
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
+    this.retireOutlierJobs();
+    this._filteredCountMemo = null;
+    this._highlightMembershipScratch = null;
     viewer.clearSnapshotViews();
     viewer.resetVectorFieldOverlay();
 
@@ -537,7 +544,6 @@ export const viewContextViewerSyncMethods = {
     this.centroidCount = 0;
     this.centroidPositions = emptyCentroidPositions;
     this.centroidColors = emptyCentroidColors;
-    this.centroidOutliers = new Float32Array(0);
     this.centroidLabels = [];
 
     this.highlightPages = [{
@@ -549,7 +555,7 @@ export const viewContextViewerSyncMethods = {
     this.activePageId = 'page_1';
     this._highlightPageIdCounter = 1;
     this.highlightArray = highlights;
-    this._highlightedCellIndices = [];
+    this._highlightedCellIndices = new Uint32Array(0);
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null;
     this._cachedTotalHighlightCount = null;

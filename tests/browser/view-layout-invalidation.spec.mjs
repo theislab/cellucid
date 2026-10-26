@@ -11,13 +11,14 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=view-layout-invalidation-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=view-layout-invalidation-ci';
 // Large enough that the live and kept views build spatial indices and LOD.
 const POINT_COUNT = 30_000;
 
@@ -29,15 +30,7 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await page.locator('#benchmark-section > summary').click();
-  await page.locator('#benchmark-count').fill(String(POINT_COUNT));
-  await page.locator('#benchmark-pattern').selectOption('atlas');
-  await page.locator('#benchmark-run').click();
-  await expect
-    .poll(() => page.evaluate(() => window._cellucidState.pointCount), {
-      timeout: 120_000,
-    })
-    .toBe(POINT_COUNT);
+  await loadSyntheticDataset(page, { pointCount: POINT_COUNT, pattern: 'atlas' });
 
   // A second layout of the live dimension: the same cells mirrored in x.
   await page.evaluate(() => {

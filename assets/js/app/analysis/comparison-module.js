@@ -18,8 +18,9 @@ import { getMemoryMonitor } from './shared/memory-monitor.js';
 import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
 import { debugError } from './shared/debug-utils.js';
 import { closeModal } from './ui/components/modal.js';
+import { analysisViewSizes } from './shared/analysis-view-sizes.js';
 import { setOwnDataProperty } from '../../utils/exact-record.js';
-import { createInfoTip } from '../ui/components/controls.js';
+import { createGroup, createInfoTip } from '../ui/components/controls.js';
 
 // Import unified UI manager and analysis type factories
 import { createAnalysisUIManager } from './ui/analysis-ui-manager.js';
@@ -29,7 +30,10 @@ import { createCorrelationAnalysisUI } from './ui/analysis-types/correlation-ana
 import { createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
 import { createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
 import { createGenesPanelUI } from './ui/analysis-types/genes-panel-ui.js';
+import { createCompositionUI } from './ui/analysis-types/composition-ui.js';
+import { createDotplotUI } from './ui/analysis-types/dotplot-ui.js';
 import { createAnalysisWindowManager } from './ui/analysis-window-manager.js';
+import { prefetchPlotly } from './plots/plotly-loader.js';
 
 // Import plot types to register them
 import './plots/types/barplot.js';
@@ -42,6 +46,7 @@ import './plots/types/heatmap.js';
 import './plots/types/volcanoplot.js';
 import './plots/types/scatterplot.js';
 import './plots/types/gene-heatmap.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 /**
  * Comparison Module class
@@ -80,6 +85,10 @@ export class ComparisonModule {
   constructor(options) {
     this.state = options.state;
     this.container = options.container;
+    if (typeof options.colorByGene !== 'function') {
+      throw new TypeError('The analysis module needs colorByGene(geneKey), the sidebar gene selector\'s');
+    }
+    this._colorByGene = options.colorByGene;
 
     // Initialize components - DataLayer now includes all enhanced features by default
     this.dataLayer = createDataLayer(this.state);
@@ -174,7 +183,7 @@ export class ComparisonModule {
       if (cleanupErrors.length > 1) {
         throw new AggregateError(
           cleanupErrors,
-          `Comparison cleanup failed in ${cleanupErrors.length} operations`
+          `Comparison cleanup failed in ${formatCountOf(cleanupErrors.length, 'operation')}`
         );
       }
     });
@@ -200,18 +209,25 @@ export class ComparisonModule {
     // Analysis type accordion (minimalist design). Each header is a native
     // disclosure button; the copy action is its sibling rather than a button
     // nested inside it, so both controls stay operable and announced.
-    // What each mode does is told by its (i), beside the title.
-    const ANALYSIS_MODES = [
-      { mode: 'simple', title: 'Quick', tip: 'analysis-quick' },
-      { mode: 'detailed', title: 'Detailed', tip: 'analysis-detailed' },
-      { mode: 'correlation', title: 'Correlation', tip: 'analysis-correlation' },
-      { mode: 'differential', title: 'Differential expression', tip: 'analysis-differential' },
-      { mode: 'signature', title: 'Gene signature', tip: 'analysis-signature' },
-      { mode: 'genesPanel', title: 'Marker genes', tip: 'analysis-marker-genes' },
+    // What each mode does is told by its (i), beside the title. The rows are
+    // grouped by what they are asked of: genes, cells, or a field to explore.
+    const ANALYSIS_SECTIONS = [
+      { title: 'Genes', modes: [
+        { mode: 'genesPanel', title: 'Marker genes', tip: 'analysis-marker-genes' },
+        { mode: 'differential', title: 'Differential expression', tip: 'analysis-differential' },
+        { mode: 'dotplot', title: 'Dot plot', tip: 'analysis-dotplot' },
+        { mode: 'signature', title: 'Gene signature', tip: 'analysis-signature' },
+      ] },
+      { title: 'Cells', modes: [
+        { mode: 'composition', title: 'Composition', tip: 'analysis-composition' },
+      ] },
+      { title: 'Explore', modes: [
+        { mode: 'simple', title: 'Quick', tip: 'analysis-quick' },
+        { mode: 'detailed', title: 'Detailed', tip: 'analysis-detailed' },
+        { mode: 'correlation', title: 'Correlation', tip: 'analysis-correlation' },
+      ] },
     ];
-    this._modeToggleContainer = document.createElement('div');
-    this._modeToggleContainer.className = 'disclosure-list analysis-mode-list';
-    this._modeToggleContainer.innerHTML = ANALYSIS_MODES.map(({ mode, title }) => `
+    const modeRow = ({ mode, title }) => `
       <div class="disclosure analysis-mode" data-mode="${mode}">
         <div class="disclosure-header-row">
           <button type="button" id="analysis-header-${mode}" class="disclosure-header" aria-expanded="false" aria-controls="analysis-panel-${mode}">
@@ -221,8 +237,19 @@ export class ComparisonModule {
           <button type="button" class="analysis-mode-copy-btn accordion-copy-btn" aria-label="Copy ${title} analysis window" title="Copy ${title} analysis window"></button>
         </div>
         <div class="disclosure-content analysis-mode-content" id="analysis-panel-${mode}" data-mode="${mode}" role="region" aria-labelledby="analysis-header-${mode}" hidden></div>
-      </div>`).join('');
-    for (const { mode, title, tip } of ANALYSIS_MODES) {
+      </div>`;
+    this._modeToggleContainer = document.createElement('div');
+    this._modeToggleContainer.className = 'analysis-mode-sections';
+    for (const section of ANALYSIS_SECTIONS) {
+      const group = createGroup({ title: section.title });
+      group.root.classList.add('analysis-mode-section');
+      const list = document.createElement('div');
+      list.className = 'disclosure-list analysis-mode-list';
+      list.innerHTML = section.modes.map(modeRow).join('');
+      group.body.appendChild(list);
+      this._modeToggleContainer.appendChild(group.root);
+    }
+    for (const { mode, title, tip } of ANALYSIS_SECTIONS.flatMap(section => section.modes)) {
       const row = this._modeToggleContainer.querySelector(
         `.analysis-mode[data-mode="${mode}"] > .disclosure-header-row`
       );
@@ -244,7 +271,7 @@ export class ComparisonModule {
         return;
       }
       // Only a mode's own header switches modes: the disclosures inside a
-      // mode's form (Clustering, Performance settings) are headers too, and
+      // mode's form (Clustering, for one) are headers too, and
       // their clicks bubble through this list.
       const header = target?.closest(
         '.analysis-mode > .disclosure-header-row > .disclosure-header'
@@ -315,7 +342,8 @@ export class ComparisonModule {
     }
     const subscriptions = [
       ['page:changed', () => this.onPagesChanged()],
-      ['highlight:changed', () => this.onHighlightChanged()]
+      ['highlight:changed', () => this.onHighlightChanged()],
+      ['visibility:changed', () => this.onCellVisibilityChanged()]
     ];
     try {
       for (const [eventName, handler] of subscriptions) {
@@ -428,6 +456,28 @@ export class ComparisonModule {
       icon: 'grid',
       tooltip: 'Discover and visualize marker genes across cell groups'
     });
+
+    // Dot plot
+    this._uiManager.register({
+      id: 'dotplot',
+      name: 'Dot plot',
+      factory: createDotplotUI,
+      minPages: 0,
+      maxPages: null,
+      icon: 'grid',
+      tooltip: 'Mean expression and fraction expressing of genes across groups'
+    });
+
+    // Composition
+    this._uiManager.register({
+      id: 'composition',
+      name: 'Composition',
+      factory: createCompositionUI,
+      minPages: 0,
+      maxPages: null,
+      icon: 'bar-chart',
+      tooltip: 'Cell-type proportions across samples and conditions'
+    });
   }
 
   /**
@@ -474,7 +524,7 @@ export class ComparisonModule {
           );
           this._notifications.error(
             `Could not create the analysis window: ${error.message}`,
-            { category: 'analysis', title: 'Analysis Window Error' }
+            { category: 'analysis', title: 'Analysis window error' }
           );
         });
       }
@@ -485,7 +535,7 @@ export class ComparisonModule {
       );
       this._notifications.error(
         `Could not create the analysis window: ${error.message}`,
-        { category: 'analysis', title: 'Analysis Window Error' }
+        { category: 'analysis', title: 'Analysis window error' }
       );
     }
   }
@@ -500,7 +550,7 @@ export class ComparisonModule {
    *
    * ARIA: Updates aria-expanded attributes for screen reader accessibility
    *
-   * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'|'genesPanel'} mode
+   * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'|'genesPanel'|'dotplot'|'composition'} mode
    */
   _setAnalysisMode(mode) {
     const allItems = this._modeToggleContainer.querySelectorAll('.analysis-mode');
@@ -518,6 +568,8 @@ export class ComparisonModule {
     // Toggle behavior: only open if it wasn't already open
     if (!isAlreadyOpen && clickedItem) {
       setModeItemOpen(clickedItem, true);
+      // Every analysis draws with Plotly: it loads while this one is set up.
+      prefetchPlotly();
 
       // Only switch UI manager when actually opening a new/different mode
       if (mode !== this._analysisMode) {
@@ -679,6 +731,15 @@ export class ComparisonModule {
 
     // Notify floating analysis windows too
     this._analysisWindowManager.onHighlightChanged();
+  }
+
+  /**
+   * The shown cells changed (a filter): an analysis scoped to "Visible cells"
+   * reads other cells now, in the panel and in every window.
+   */
+  onCellVisibilityChanged() {
+    this._uiManager.onCellVisibilityChanged();
+    this._analysisWindowManager.onCellVisibilityChanged();
   }
 
   // ===========================================================================
@@ -909,15 +970,6 @@ export class ComparisonModule {
   }
 
   /**
-   * Fetch bulk gene expression data with progress
-   * @param {Object} options - { pageIds, geneList, forceReload, onProgress }
-   * @returns {Promise<Object>}
-   */
-  async fetchBulkGeneExpression(options) {
-    return this.dataLayer.fetchBulkGeneExpression(options);
-  }
-
-  /**
    * Get cache statistics from enhanced data layer
    * @returns {Object}
    */
@@ -1066,6 +1118,8 @@ export class ComparisonModule {
           managerTasks.push(closeTask);
         }
       }
+      // Window and expanded-view sizes belong to the dataset they were given on.
+      runSynchronous(() => analysisViewSizes.clear());
       if (uiManager !== null && uiManager !== undefined) {
         runSynchronous(() => uiManager.clearActiveMode());
         const resetTask = runSynchronous(() => uiManager.reset());
@@ -1084,7 +1138,7 @@ export class ComparisonModule {
         : new AggregateError(
             exactErrors,
             `Dataset reload analysis reset failed in ` +
-              `${exactErrors.length} operations`
+              `${formatCountOf(exactErrors.length, 'operation')}`
           );
       void Promise.allSettled(managerTasks).then(() => {
         rejectOwnedReset(setupError);
@@ -1148,7 +1202,9 @@ export class ComparisonModule {
       correlation: this._uiManager?.getUI('correlation'),
       de: this._uiManager?.getUI('differential'),
       signature: this._uiManager?.getUI('signature'),
-      genesPanel: this._uiManager?.getUI('genesPanel')
+      genesPanel: this._uiManager?.getUI('genesPanel'),
+      dotplot: this._uiManager?.getUI('dotplot'),
+      composition: this._uiManager?.getUI('composition')
     };
   }
 
@@ -1167,6 +1223,161 @@ export class ComparisonModule {
    */
   getUIManager() {
     return this._uiManager;
+  }
+
+  /**
+   * Colour the cells by one gene of a result (a marker or a DE gene), through
+   * the sidebar's gene selector, so its search box names the gene shown. A
+   * gene the shown expression matrix lacks (a result read from another
+   * matrix) is said in a notification; a newer choice supersedes this one.
+   *
+   * @param {string} geneKey
+   * @returns {Promise<void>}
+   */
+  async colorByGene(geneKey) {
+    const known = this.dataLayer.getAvailableVariables('gene_expression').some(gene => gene.key === geneKey);
+    if (!known) {
+      this._notifications.info(`${geneKey} is not in the expression matrix shown`, { category: 'analysis' });
+      return;
+    }
+    try {
+      await this._colorByGene(geneKey);
+    } catch (error) {
+      this._notifications.error(`Colouring by ${geneKey} failed: ${error.message}`, { category: 'analysis' });
+    }
+  }
+
+  /**
+   * Open one analysis in the docked panel and hand it a preset — the "Send to"
+   * path between analyses (marker genes → gene signature or dot plot). The
+   * row opens the way a click opens it, scrolls into view, and the analysis
+   * applies the preset through its own `applyPreset(preset)`, which validates
+   * it and refuses what it cannot use.
+   *
+   * @param {string} modeId - A registered analysis id.
+   * @param {Object} preset - Analysis-specific values; see each analysis's `applyPreset`.
+   * @returns {Promise<void>}
+   */
+  async openAnalysis(modeId, preset) {
+    const uiManager = this._uiManager;
+    if (!uiManager) throw new Error('The analysis panel is not initialized');
+    if (uiManager.getTypeInfo(modeId) === null) {
+      throw new Error(`Unknown analysis "${modeId}"`);
+    }
+    if (preset === null || typeof preset !== 'object' || Array.isArray(preset)) {
+      throw new TypeError(`The preset for analysis "${modeId}" must be an object`);
+    }
+    if (this._getOpenMode() !== modeId) this._setAnalysisMode(modeId);
+    const ui = uiManager.getUI(modeId);
+    if (typeof ui?.applyPreset !== 'function') {
+      throw new Error(`Analysis "${modeId}" does not accept presets`);
+    }
+    await ui.applyPreset(preset);
+    this._modeToggleContainer
+      ?.querySelector(`.analysis-mode[data-mode="${modeId}"]`)
+      ?.scrollIntoView?.({ block: 'nearest' });
+  }
+
+  // ===========================================================================
+  // Session state (docked analysis panel)
+  // ===========================================================================
+
+  /**
+   * The docked mode whose row is open, or null when every row is closed.
+   * @returns {string|null}
+   * @private
+   */
+  _getOpenMode() {
+    if (!this._modeToggleContainer) return null;
+    for (const item of this._modeToggleContainer.querySelectorAll('.analysis-mode')) {
+      if (isModeItemOpen(item)) return item.dataset.mode;
+    }
+    return null;
+  }
+
+  /**
+   * The docked analysis panel for a session: which mode row is open, and for
+   * every mode created so far its settings (`ui.exportSettings()`) and result
+   * (`ui.exportResult()`: null, or `{kind, version, payload}` of JSON values
+   * and typed arrays; see shared/analysis-result-session.js). A mode never
+   * opened holds its defaults and is left out.
+   *
+   * @returns {{openMode: string|null, modes: Object<string, {settings: Object, result: null|Object}>}}
+   */
+  exportSessionState() {
+    const uiManager = this._uiManager;
+    if (!uiManager) throw new Error('The analysis panel is not initialized');
+    const modes = {};
+    for (const { id } of uiManager.getAllTypes()) {
+      if (!uiManager.isInitialized(id)) continue;
+      const ui = uiManager.getUI(id);
+      setOwnDataProperty(modes, id, {
+        settings: ui.exportSettings(),
+        result: ui.exportResult()
+      });
+    }
+    const openMode = this._getOpenMode();
+    if (openMode !== null && !Object.hasOwn(modes, openMode)) {
+      throw new Error(`The open analysis mode "${openMode}" has no initialized panel`);
+    }
+    return { openMode, modes };
+  }
+
+  /**
+   * Restore `exportSessionState()` output: open the saved mode row the way a
+   * click does (or close the open one), then for each mode apply its
+   * settings and then its result. The value is checked whole before anything
+   * changes; a mode's own settings and result are checked by its UI, and the
+   * first refusal is thrown.
+   *
+   * @param {{openMode: string|null, modes: Object<string, {settings: Object, result: null|Object}>}} state
+   * @returns {Promise<void>}
+   */
+  async importSessionState(state) {
+    const uiManager = this._uiManager;
+    if (!uiManager) throw new Error('The analysis panel is not initialized');
+    const isRecord = value => (
+      value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+    );
+    const exactKeys = (value, keys) => (
+      isRecord(value) && Object.keys(value).sort().join('\u0000') === [...keys].sort().join('\u0000')
+    );
+    if (!exactKeys(state, ['openMode', 'modes'])) {
+      throw new TypeError('Analysis session state must hold exactly openMode and modes');
+    }
+    if (!isRecord(state.modes)) {
+      throw new TypeError('Analysis session modes must be an object');
+    }
+    for (const [modeId, mode] of Object.entries(state.modes)) {
+      if (uiManager.getTypeInfo(modeId) === null) {
+        throw new Error(`Analysis session names an unknown mode "${modeId}"`);
+      }
+      if (!exactKeys(mode, ['settings', 'result'])) {
+        throw new TypeError(`Analysis session mode "${modeId}" must hold exactly settings and result`);
+      }
+      if (!isRecord(mode.settings)) {
+        throw new TypeError(`Analysis session mode "${modeId}" settings must be an object`);
+      }
+      if (mode.result !== null && !isRecord(mode.result)) {
+        throw new TypeError(`Analysis session mode "${modeId}" result must be null or an object`);
+      }
+    }
+    const { openMode } = state;
+    if (openMode !== null && !Object.hasOwn(state.modes, openMode)) {
+      throw new TypeError('Analysis session openMode must be null or one of its modes');
+    }
+
+    const currentOpenMode = this._getOpenMode();
+    if (openMode !== currentOpenMode) {
+      // _setAnalysisMode toggles: naming the open row closes it.
+      this._setAnalysisMode(openMode ?? currentOpenMode);
+    }
+    for (const [modeId, mode] of Object.entries(state.modes)) {
+      const ui = uiManager.getUI(modeId);
+      ui.importSettings(structuredClone(mode.settings));
+      await ui.importResult(mode.result);
+    }
   }
 }
 

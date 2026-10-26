@@ -101,7 +101,7 @@ export function intersectionMembership(pages, pointCount) {
 }
 
 /** Number of pages in a mask. */
-export function maskPageCount(mask) {
+function maskPageCount(mask) {
   let remaining = mask >>> 0;
   let count = 0;
   while (remaining !== 0) {

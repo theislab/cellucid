@@ -197,7 +197,6 @@ function createDimensionState({
     followsDefault: true,
     centroidPositions: null,
     centroidColors: null,
-    centroidOutliers: null,
     centroidLabels: [],
   };
   const manager = createLayoutManagerStub({
@@ -222,7 +221,6 @@ function createDimensionState({
       activeViewId: 'live',
       centroidColors: null,
       centroidLabels: [],
-      centroidOutliers: null,
       centroidPositions: null,
       dimensionManager: manager,
       getFieldForView() {
@@ -279,7 +277,6 @@ function snapshotContext() {
     followsDefault: true,
     centroidPositions: null,
     centroidColors: null,
-    centroidOutliers: null,
     centroidLabels: [],
   };
 }

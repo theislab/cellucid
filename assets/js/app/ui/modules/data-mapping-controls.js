@@ -5,8 +5,7 @@
  * be shown with -- any `obsm` array of an `.h5ad` or Zarr file read in the
  * browser (an array of two or more columns at any selection of 1 to 3 of
  * them, chosen in its row's editor; one wider than three columns in as many
- * selections as wanted), or the embeddings a prepared dataset carries -- and
- * the user turns any number on, of any mix of 1D, 2D and 3D, and makes one per
+ * selections as wanted) -- and the user turns any number on, of any mix of 1D, 2D and 3D, and makes one per
  * dimension the default. Views then show any representation that is on (see
  * the Compare views picker). Choices are staged until Apply, so editing
  * columns does not load an array once per axis; turning a representation on
@@ -14,22 +13,21 @@
  * as one transaction; Revert drops the staged choices. The other groups the
  * dataset can change -- genes, neighbour graph, latent space, vector fields
  * -- follow as their own disclosures (`data-mapping/groups.js`), staged with
- * the embeddings and applied in the same transaction; what it cannot change
- * is listed under "Read from file".
+ * the embeddings and applied in the same transaction.
  *
  * When a file opens on a best guess (it has no default UMAP), this module
- * tells the user what was shown and where to change it, and opens the
- * checklist (on a phone it only marks it open, so the plot is not covered).
+ * tells the user what was shown in a notification whose Show opens the
+ * checklist. Nothing opens on its own: every new dataset starts with the
+ * group collapsed.
  *
  * @module ui/modules/data-mapping-controls
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
 import {
-  ANNDATA_KIND,
   DIMENSIONAL_UMAP_KEYS,
   DIMENSION_SLOTS,
-  UNSUFFIXED_UMAP_KEY,
+  UMAP_KEYS,
   compareEmbeddingRefs,
   dimensionSlot,
   slotDimension,
@@ -38,11 +36,12 @@ import {
   validateEmbeddingColumns,
 } from '../../../data/data-mapping.js';
 import { EmbeddingLoadError, MappingLoadError, obsmWidth } from '../../../data/data-mapping-candidates.js';
+import { LOG1P_AS_STORED, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
+import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 import {
   buildDataMappingPanel,
   createRepresentationRow,
-  renderFactRows,
   setText,
   syncChildren,
 } from './data-mapping/dom.js';
@@ -58,8 +57,9 @@ import {
   renderVectorSection,
   VECTOR_SECTION,
 } from './data-mapping/groups.js';
+import { sameJson } from '../../utils/same-json.js';
+import { PLACES, placePath } from '../place-names.js';
 
-const PHONE_LAYOUT_QUERY = '(max-width: 720px)';
 // Var columns that usually hold gene symbols (the Ensembl hint names one).
 const SYMBOL_COLUMNS = Object.freeze([
   'gene_symbols',
@@ -77,8 +77,10 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'describeDataMappingRefusal',
   'getDataMapping',
   'getDataMappingOrigin',
+  'getDatasetGeneration',
   'getDimensionManager',
   'getGeneNameChoices',
+  'getHighlyVariableChoices',
   'getGuessedMappingGroups',
   'getMappingCandidates',
   'getMappingGroupChoices',
@@ -88,9 +90,6 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'on',
 ]);
 
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
 
 function cloneRef(ref) {
   return { key: ref.key, columns: ref.columns === null ? null : [...ref.columns] };
@@ -102,10 +101,12 @@ function sameRef(left, right) {
 
 /**
  * Every `obsm` key the default embedding rule accepts, as the best-guess
- * notification names them: "X_umap_1d, X_umap_2d, X_umap_3d or X_umap". Built
+ * notification names them: "X_umap_1d, X_umap_2d, X_umap_3d, X_umap, X_UMAP,
+ * X_wnn.umap or X_ref.umap". Built
  * from the rule's own constants, so the message cannot drift from the rule.
  */
-export const DEFAULT_UMAP_KEYS_TEXT = `${DIMENSIONAL_UMAP_KEYS.join(', ')} or ${UNSUFFIXED_UMAP_KEY}`;
+const RULE_KEYS = [...DIMENSIONAL_UMAP_KEYS, ...UMAP_KEYS];
+export const DEFAULT_UMAP_KEYS_TEXT = `${RULE_KEYS.slice(0, -1).join(', ')} or ${RULE_KEYS.at(-1)}`;
 
 /**
  * The notification of a best guess: which arrays are shown, and where to
@@ -135,7 +136,7 @@ export function describeBestGuess(mapping, guessed, widthOf) {
   return (
     `This file has no default UMAP (${DEFAULT_UMAP_KEYS_TEXT}). `
     + `Showing ${list}. `
-    + 'Change it under Session › Data mapping.'
+    + `Change it under ${placePath(PLACES.session, PLACES.dataMapping)}.`
   );
 }
 
@@ -153,7 +154,6 @@ export function initDataMappingControls({ state, root }) {
     throw new TypeError('Data mapping controls require their root element.');
   }
   const ownerDocument = root.ownerDocument;
-  const ownerWindow = ownerDocument.defaultView;
   const lifecycle = new AbortController();
   let destroyed = false;
   let expanded = false;
@@ -217,9 +217,13 @@ export function initDataMappingControls({ state, root }) {
       const ref = mapping.embeddings.defaults[slot];
       defaults[slot] = ref === null ? null : cloneRef(ref);
     }
-    // Listed like the picker: by dimension, highest first; each dimension's
-    // default first; then by name. Unusable arrays come last.
+    // Embeddings (1 to 3 columns) first, then wider arrays (components and
+    // latent spaces), then the arrays that cannot be drawn; within each, like
+    // the picker: by dimension, highest first; each dimension's default
+    // first; then by name.
+    const group = choice => (!choice.usable ? 2 : (choice.width ?? 0) > 3 ? 1 : 0);
     const choices = [...state.getRepresentationChoices()].sort((left, right) => (
+      group(left) - group(right) ||
       (right.dimension ?? 0) - (left.dimension ?? 0) ||
       Number(right.isDefault) - Number(left.isDefault) ||
       left.name.localeCompare(right.name)
@@ -239,6 +243,10 @@ export function initDataMappingControls({ state, root }) {
           name: choice.name,
           added: false,
           open: previous?.open ?? false,
+          // Listed under "Other arrays": wider than a 3D layout (or not an
+          // array that can be drawn) and off when the list was staged. It
+          // stays there while the list is edited.
+          wide: !choice.enabled && (choice.width === null || choice.width > 3),
         };
       }),
       defaults,
@@ -299,18 +307,39 @@ export function initDataMappingControls({ state, root }) {
 
   /** Fill the disclosure of every group this dataset can change. */
   function renderGroupSections(mapping) {
+    // Every expression choice is the modality shown's (a dataset of several).
+    state.withMappingModality(shownGroupValue(mapping, 'modality') ?? null, () => renderSections(mapping));
+  }
+
+  function renderSections(mapping) {
     for (const section of GROUP_SECTIONS) {
       const fields = new Map();
       const summary = [];
       for (const { group } of section.fields) {
         let choices = state.getMappingGroupChoices(group);
         if (choices === null) continue;
-        // Gene names are columns of the axis of the expression shown.
-        if (group === 'geneNames' && mapping.kind === ANNDATA_KIND) {
-          choices = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'));
+        // One modality is nothing to choose.
+        if (group === 'modality' && choices.length < 2) continue;
+        const expression = shownGroupValue(mapping, 'expression');
+        // Gene names and the highly variable column are columns of the axis
+        // of the expression shown.
+        if (group === 'geneNames') {
+          choices = state.getGeneNameChoices(expression);
         }
-        const value = shownGroupValue(mapping, group);
-        summary.push(choiceLabel(choices, value));
+        if (group === 'highlyVariable') {
+          choices = state.getHighlyVariableChoices(expression);
+        }
+        // The transform shown is the one of the expression matrix shown;
+        // without a matrix there is none to choose.
+        if (group === 'log1p' && expression === null) continue;
+        const value = group === 'log1p'
+          ? log1pChoiceOf(shownGroupValue(mapping, 'log1p'), expression)
+          : shownGroupValue(mapping, group);
+        // The header names what differs from a plain file: a transform and
+        // a highly variable column only when there is one.
+        const quiet = (group === 'highlyVariable' && value === null)
+          || (group === 'log1p' && value === LOG1P_AS_STORED);
+        if (!quiet) summary.push(choiceLabel(choices, value));
         fields.set(group, {
           options: choices.map(choice => ({
             value: encodeChoice(choice.value),
@@ -347,8 +376,8 @@ export function initDataMappingControls({ state, root }) {
    * changed, else the Ensembl hint.
    */
   function genesHint(mapping) {
-    const pending = changedGroups(mapping).some(group => group === 'geneNames' || group === 'expression');
-    const set = pending ? null : namesInUse(mapping);
+    const pending = changedGroups(mapping).some(group => group === 'geneNames' || group === 'expression' || group === 'modality');
+    const set = pending ? null : namesInUse();
     const note = set === null
       ? null
       : uniqueNamesNote({
@@ -356,18 +385,21 @@ export function initDataMappingControls({ state, root }) {
           renamed: set.renamed,
           source: set.source,
         });
-    const guess = !pending && state.getGuessedMappingGroups().includes('expression')
-      ? 'Expression is guessed: this file has no X.'
-      : '';
+    const guessedGroups = pending ? [] : state.getGuessedMappingGroups();
+    // One short line: what was guessed (expression without an X; Scanpy's
+    // records, uns['log1p'] and var['highly_variable']), then the names note.
+    const guessed = [
+      guessedGroups.includes('expression') ? 'expression (no X)' : null,
+      guessedGroups.includes('log1p') ? 'log1p values' : null,
+      guessedGroups.includes('highlyVariable') ? 'highly variable genes' : null,
+    ].filter(Boolean);
+    const guess = guessed.length === 0 ? '' : `Guessed: ${guessed.join(', ')}.`;
     return [guess, note ?? ensemblHint(mapping)].filter(Boolean).join(' ');
   }
 
   /** The gene-name set the gene list in use was made from. */
-  function namesInUse(mapping) {
-    const sets = state.varData?.geneNameSets ?? [];
-    if (mapping.kind === ANNDATA_KIND) return sets[0] ?? null;
-    const source = mapping.geneNames === 'index' ? null : mapping.geneNames.slice('column:'.length);
-    return sets.find(set => set.source === source) ?? null;
+  function namesInUse() {
+    return state.varData?.geneNames ?? null;
   }
 
   /**
@@ -383,9 +415,7 @@ export function initDataMappingControls({ state, root }) {
     if (keys.length === 0) return '';
     const ensembl = keys.filter(key => /^ENS[A-Z]*G\d+/.test(key)).length;
     if (ensembl < 0.9 * keys.length) return '';
-    const symbol = (mapping.kind === ANNDATA_KIND
-      ? state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
-      : state.getMappingGroupChoices('geneNames') ?? [])
+    const symbol = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
       .find(choice => choice.usable && SYMBOL_COLUMNS.includes(choice.label));
     return symbol === undefined
       ? ''
@@ -411,8 +441,10 @@ export function initDataMappingControls({ state, root }) {
   /** What Apply changes in the other groups, in short sentences. */
   function describeGroupConsequences(next, groupsChanged) {
     const parts = [];
-    if (groupsChanged.includes('expression') || groupsChanged.includes('geneNames')) {
+    if (groupsChanged.includes('expression') || groupsChanged.includes('geneNames') || groupsChanged.includes('modality')) {
       parts.push('Apply keeps each coloured gene it finds and closes analysis windows.');
+    } else if (groupsChanged.includes('log1p') || groupsChanged.includes('highlyVariable')) {
+      parts.push('Apply closes analysis windows, which read these.');
     }
     if (groupsChanged.includes('knn')) {
       parts.push(next.knn === null
@@ -484,46 +516,6 @@ export function initDataMappingControls({ state, root }) {
     return null;
   }
 
-  function factRows(mapping) {
-    const dimensionManager = state.getDimensionManager();
-    const nameOfRef = ref => {
-      try {
-        return representationName(dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref)));
-      } catch {
-        return ref.key;
-      }
-    };
-    const bindings = mapping.vectorFields.map(binding => (
-      `${binding.field ?? binding.key} → ${nameOfRef(binding.embedding)}`
-    ));
-    // Only what this dataset cannot change; every other group has its own
-    // disclosure above.
-    const rows = [];
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('knn')) {
-      rows.push({ label: 'Neighbour graph', value: mapping.knn === null ? 'None' : `obsp['${mapping.knn}']` });
-    }
-    if (!state.canChangeMappingGroup('geneNames')) {
-      rows.push({
-        label: 'Gene names',
-        value: mapping.geneNames === 'index' ? 'var index' : `var['${mapping.geneNames.slice(7)}']`,
-      });
-    }
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('expression')) {
-      let expression = 'None';
-      if (mapping.expression === 'X') expression = 'X';
-      else if (mapping.expression === 'raw') expression = 'raw.X';
-      else if (mapping.expression !== null) expression = `layers['${mapping.expression.slice(6)}']`;
-      rows.push({ label: 'Expression', value: expression });
-    }
-    if (mapping.kind === ANNDATA_KIND && !state.canChangeMappingGroup('latent')) {
-      rows.push({ label: 'Latent space', value: mapping.latent === null ? 'None' : `obsm['${mapping.latent}']` });
-    }
-    if (!state.canChangeMappingGroup('vectorFields')) {
-      rows.push({ label: 'Vector fields', value: bindings.length === 0 ? 'None' : bindings.join(', ') });
-    }
-    return rows;
-  }
-
   function describeCurrent(mapping) {
     const dimensionManager = state.getDimensionManager();
     const count = mapping.embeddings.enabled.length;
@@ -535,7 +527,8 @@ export function initDataMappingControls({ state, root }) {
         return `${representationName(layout)} ${slot.toUpperCase()}`;
       });
     const parts = [`${count} on`, ...defaults];
-    if (state.getGuessedMappingGroups().length > 0) parts.push('guessed');
+    // The embeddings' own guesses; the other groups say theirs in their sections.
+    if (state.getGuessedMappingGroups().some(group => group.startsWith('embeddings.'))) parts.push('guessed');
     return parts.join(' · ');
   }
 
@@ -552,7 +545,7 @@ export function initDataMappingControls({ state, root }) {
       rowNodes.clear();
       setText(panel.description, '—');
       panel.rows.replaceChildren();
-      renderFactRows(panel.facts, []);
+      panel.more.content.replaceChildren();
       for (const node of [...groupNodes.values(), vectorNode]) node.root.hidden = true;
       return;
     }
@@ -595,6 +588,9 @@ export function initDataMappingControls({ state, root }) {
         guessed: isDefault && slot !== null && guessed.has(`embeddings.${slot}`)
           && sameRef(mapping.embeddings.defaults[slot], row.ref),
         open: configurable && row.open,
+        widthNote: row.wide && row.width !== null && !row.enabled
+          ? `${formatCountOf(row.width, 'column')}`
+          : null,
         add: configurable && canAddColumns && row.width > 3
           ? {
               key: row.ref.key,
@@ -613,15 +609,14 @@ export function initDataMappingControls({ state, root }) {
     });
     const listed = new Set(staged.rows.map(row => row.uid));
     for (const uid of rowNodes.keys()) if (!listed.has(uid)) rowNodes.delete(uid);
-    syncChildren(panel.rows, nodes);
+    const wide = staged.rows.map(row => row.wide === true);
+    const moreNodes = nodes.filter((_, index) => wide[index]);
+    const mainNodes = nodes.filter((_, index) => !wide[index]);
+    syncChildren(panel.more.content, moreNodes);
+    panel.more.root.hidden = moreNodes.length === 0;
+    setText(panel.more.title, `Other arrays (${moreNodes.length})`);
+    syncChildren(panel.rows, moreNodes.length === 0 ? mainNodes : [...mainNodes, panel.more.root]);
     renderGroupSections(mapping);
-    const facts = factRows(mapping);
-    renderFactRows(panel.facts, facts);
-    panel.fixed.root.hidden = facts.length === 0;
-    setText(panel.fixedDescription, facts
-      .filter(fact => fact.value !== 'None')
-      .map(fact => fact.label)
-      .join(', ') || 'Nothing else');
 
     const next = nextMapping(mapping);
     const embeddingsChanged = !sameJson(next.embeddings, mapping.embeddings);
@@ -646,7 +641,7 @@ export function initDataMappingControls({ state, root }) {
             const moves = state.previewRepresentationMoves(next);
             parts.push(moves === 0
               ? 'Apply offers these embeddings to every view.'
-              : `Apply also switches ${moves === 1 ? '1 view' : `${moves} views`} to the new default.`);
+              : `Apply also switches ${moves === 1 ? '1 view' : `${formatCountOf(moves, 'view')}`} to the new default.`);
           }
           parts.push(...describeGroupConsequences(next, groupsChanged));
           panel.status.set(parts.join(' '), 'muted');
@@ -743,6 +738,7 @@ export function initDataMappingControls({ state, root }) {
         enabled: true,
         added: true,
         open: true,
+        wide: false,
       });
       settleDefaults();
       render();
@@ -775,7 +771,7 @@ export function initDataMappingControls({ state, root }) {
       const bindings = shownGroupValue(mapping, VECTOR_SECTION.group)
         .filter(binding => bindingKey(binding) !== target.value);
       if (target.checked) bindings.push(JSON.parse(target.value));
-      stagedGroups.set(VECTOR_SECTION.group, sortVectorBindings(bindings, mapping.kind));
+      stagedGroups.set(VECTOR_SECTION.group, sortVectorBindings(bindings));
       render();
       return;
     }
@@ -783,14 +779,44 @@ export function initDataMappingControls({ state, root }) {
     const group = target.dataset.mappingGroup;
     if (!SECTION_GROUPS.includes(group)) return;
     groupErrors.delete(group);
+    if (group === 'log1p') {
+      // The menu sets the transform of the expression matrix shown only.
+      stagedGroups.set('log1p', withLog1pChoice(
+        shownGroupValue(mapping, 'log1p'),
+        shownGroupValue(mapping, 'expression'),
+        target.value
+      ));
+      render();
+      return;
+    }
     const value = decodeChoice(target.value);
     stagedGroups.set(group, value);
-    if (group === 'expression' && mapping.kind === ANNDATA_KIND) {
+    if (group === 'modality') {
+      // Another modality is read with its own matrices and columns: back to
+      // the mapping's when it is the mapping's, else to its defaults.
+      for (const [key, groupValue] of Object.entries(
+        value === mapping.modality
+          ? { expression: mapping.expression, geneNames: mapping.geneNames, log1p: mapping.log1p, highlyVariable: mapping.highlyVariable }
+          : state.defaultModalityGroups(value)
+      )) {
+        stagedGroups.set(key, groupValue);
+      }
+      render();
+      return;
+    }
+    if (group === 'expression') {
       // Another axis keeps a gene-name column only if it has one of that
       // name (raw has its own var); otherwise the names come from its index.
-      const names = shownGroupValue(mapping, 'geneNames');
-      const available = state.getGeneNameChoices(value).some(choice => choice.value === names);
-      if (!available) stagedGroups.set('geneNames', 'index');
+      state.withMappingModality(shownGroupValue(mapping, 'modality') ?? null, () => {
+        const names = shownGroupValue(mapping, 'geneNames');
+        const available = state.getGeneNameChoices(value).some(choice => choice.value === names);
+        if (!available) stagedGroups.set('geneNames', 'index');
+        // Likewise the highly variable column, which is otherwise none.
+        const marked = shownGroupValue(mapping, 'highlyVariable');
+        if (!state.getHighlyVariableChoices(value).some(choice => choice.value === marked)) {
+          stagedGroups.set('highlyVariable', null);
+        }
+      });
     }
     render();
   }
@@ -799,24 +825,29 @@ export function initDataMappingControls({ state, root }) {
     const mapping = state.getDataMapping();
     if (busy || mapping === null || staged === null) return;
     const next = nextMapping(mapping);
+    // The apply belongs to the dataset shown now. Once another one is
+    // published (`datasetPublished` has reset the panel for it), the outcome
+    // -- the transaction refuses to finish -- writes nothing into its panel.
+    const generation = state.getDatasetGeneration();
+    const superseded = () => destroyed || state.getDatasetGeneration() !== generation;
     droppedGenes = [];
     busy = true;
     panel.status.set('Loading…', 'muted');
     render();
     try {
       await state.applyDataMapping(next, { origin: 'user' });
-      if (destroyed) return;
+      if (superseded()) return;
       unstage();
       stagedGroups.clear();
       groupErrors.clear();
       loadError = null;
       panel.status.set(describeApplied(droppedGenes), 'success');
     } catch (error) {
-      if (destroyed) return;
+      if (superseded()) return;
       loadError = error instanceof Error ? error.message : String(error);
       if (error instanceof EmbeddingLoadError) {
-        // An embedding failed its load-time check (in the browser, or a
-        // server's 422): it stays off, with its reason. The type, not the
+        // An embedding failed its load-time check: it stays off, with its
+        // reason. The type, not the
         // key, says so: one obsm key can also be a latent space or a vector
         // field, whose refusal belongs to that group.
         unstage();
@@ -840,7 +871,9 @@ export function initDataMappingControls({ state, root }) {
       panel.status.set(loadError, 'danger');
     } finally {
       busy = false;
-      if (!destroyed) {
+      if (superseded()) {
+        if (!destroyed) render();
+      } else {
         const message = panel.status.root.textContent;
         const tone = panel.status.root.dataset.tone;
         render();
@@ -861,9 +894,10 @@ export function initDataMappingControls({ state, root }) {
   /**
    * Show the checklist: open the Session section and the Embeddings
    * disclosure, and on request the sidebar (the phone sheet), then bring it
-   * into view.
+   * into view. `focusGroup` (a group such as `latent`) brings that group's
+   * choice into view and focuses it instead.
    */
-  function reveal({ openSidebar = false } = {}) {
+  function reveal({ openSidebar = false, focusGroup = null } = {}) {
     if (destroyed) return;
     const sidebar = ownerDocument.getElementById('sidebar');
     if (openSidebar && sidebar?.classList.contains('hidden')) {
@@ -872,6 +906,15 @@ export function initDataMappingControls({ state, root }) {
     const section = ownerDocument.getElementById('session-section');
     if (section instanceof HTMLDetailsElement && !section.open) section.open = true;
     setExpanded(true);
+    const target = focusGroup === null ? null : ownerDocument.getElementById(`data-mapping-${focusGroup}`);
+    if (target !== null) {
+      // The group's own disclosure opens too.
+      const section = GROUP_SECTIONS.find(entry => entry.fields.some(field => field.group === focusGroup));
+      if (section !== undefined) groupNodes.get(section.id)?.disclosure.setExpanded(true);
+      target.scrollIntoView({ block: 'center' });
+      target.focus({ preventScroll: true });
+      return;
+    }
     panel.disclosure.root.scrollIntoView({ block: 'nearest' });
     if (openSidebar) panel.disclosure.header.focus({ preventScroll: true });
   }
@@ -898,12 +941,6 @@ export function initDataMappingControls({ state, root }) {
       duration: 0,
       action: { label: 'Show', run: () => reveal({ openSidebar: true }) },
     });
-    const phone = ownerWindow?.matchMedia?.(PHONE_LAYOUT_QUERY).matches === true;
-    if (phone) {
-      setExpanded(true);
-    } else {
-      reveal();
-    }
   }
 
   /** An applied mapping: drop staged choices that are now current. */
@@ -922,6 +959,10 @@ export function initDataMappingControls({ state, root }) {
    */
   function datasetPublished() {
     if (destroyed) return;
+    // Every dataset starts collapsed: the notification's Show opens it.
+    setExpanded(false);
+    panel.more.setExpanded(false);
+    for (const node of [...groupNodes.values(), vectorNode]) node.disclosure.setExpanded(false);
     staged = null;
     previousRows = [];
     stagedGroups.clear();
@@ -946,6 +987,9 @@ export function initDataMappingControls({ state, root }) {
     droppedGenes = [...dropped];
   });
   const unsubscribeMapping = state.on('mapping:changed', onMappingChanged);
+  // A choice found unusable when it was read (a latent space with a NaN)
+  // is offered no more.
+  const unsubscribeChoices = state.on('mapping:choices-changed', () => render());
 
   datasetPublished();
 
@@ -958,6 +1002,7 @@ export function initDataMappingControls({ state, root }) {
       destroyed = true;
       lifecycle.abort();
       unsubscribeMapping();
+      unsubscribeChoices();
       unsubscribeVarAxis();
       root.replaceChildren();
     },

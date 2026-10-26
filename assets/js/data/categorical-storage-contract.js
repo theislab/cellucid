@@ -1,31 +1,30 @@
 /**
- * The sole current on-disk contract for categorical code storage.
+ * The one contract for how the viewer holds a categorical field's codes.
  *
- * A categorical observation column is stored as an array of integer codes plus
+ * A categorical observation column is held as an array of integer codes plus
  * an ordered category list. The width of that array decides two things at once,
  * and they must never come apart: which code is reserved to mean "missing", and
  * how many real categories are left over. Every width spends its terminal code
  * on the missing marker, so `uint8` addresses 255 categories (codes 0-254),
  * `uint16` 65,535 (codes 0-65,534) and `uint32` 4,294,967,295 (codes up to
- * 4,294,967,294). Writers pick the narrowest width that holds a column, so a
- * column needs `uint32` only past 65,535 categories and every narrower export
- * is unchanged.
+ * 4,294,967,294). The narrowest width that holds a column is used, so a column
+ * needs `uint32` only past 65,535 categories.
  *
- * This module is the single derivation point on the reader side, and the exact
- * peer of `_categorical_storage` and `_declared_categorical_storage` in the
- * Python exporter and `.categorical_code_dtype` in the R exporter. All three
- * writers already resolve width and sentinel in one function each; the readers
- * did not, and derived the same pair independently in five places. A reader
- * that disagreed with a writer by one would not fail loudly — it would read the
- * missing marker as a real category, or a real category as missing, and colour
- * cells by a label they do not have.
+ * This module is the single derivation point: the AnnData adapter picks the
+ * width a field's codes are narrowed to, and every reader of codes (colouring,
+ * filters, analysis, sessions) resolves the missing marker from the array's
+ * own width here. A reader that disagreed by one would not fail loudly — it
+ * would read the missing marker as a real category, or a real category as
+ * missing, and colour cells by a label they do not have.
  *
  * @module data/categorical-storage-contract
  */
 
+import { formatCountOf } from '../utils/format-units.js';
+
 /**
  * @typedef {Object} CategoricalCodeStorage
- * @property {'uint8'|'uint16'|'uint32'} dtype - The on-disk code width.
+ * @property {'uint8'|'uint16'|'uint32'} dtype - The code width.
  * @property {Uint8ArrayConstructor|Uint16ArrayConstructor|Uint32ArrayConstructor} TypedArrayClass
  * @property {number} missingValue - The reserved code meaning "no category".
  * @property {number} maxCategories - How many real categories this width holds.
@@ -68,7 +67,7 @@ export const CATEGORICAL_CODE_DTYPES = Object.freeze(['uint8', 'uint16', 'uint32
 export const MAX_CATEGORICAL_CATEGORIES = STORAGE_BY_DTYPE.uint32.maxCategories;
 
 /**
- * Resolve the storage a manifest or file already declared.
+ * Resolve the storage a file or a field descriptor already declared.
  *
  * Use this when the width arrives from outside and the question is what that
  * width obliges — the reader's direction.
@@ -114,7 +113,7 @@ export function requireCategoricalCategoryCount(nCategories, label) {
     // The advice has to fit both directions this ceiling is met from: a column
     // arriving in a dataset, and a column the user is building in the app.
     throw new Error(
-      `${label} has ${nCategories.toLocaleString('en-US')} categories, but ` +
+      `${label} has ${formatCountOf(nCategories, 'category', 'categories')}, but ` +
       'Cellucid supports at most ' +
       `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')}. ` +
       'Reduce or merge categories.'
@@ -126,8 +125,7 @@ export function requireCategoricalCategoryCount(nCategories, label) {
 /**
  * Choose the narrowest storage that holds a given number of categories.
  *
- * Use this when the categories are in hand and the width has to be picked —
- * the writer's direction, matching `_categorical_storage` in Python.
+ * Use this when the categories are in hand and the width has to be picked.
  *
  * @param {unknown} nCategories
  * @param {string} label - What to name in the failure.
@@ -186,4 +184,35 @@ export function isCategoricalCodes(codes) {
  */
 export function missingCategoryCode(codes) {
   return categoricalStorageForCodes(codes, 'Categorical codes').missingValue;
+}
+
+/**
+ * Narrow one field's codes, as an AnnData file stores them (an integer per
+ * cell, -1 for a missing category), to the narrowest storage that holds its
+ * categories, the missing ones becoming that storage's marker. The reader
+ * worker does this before a field crosses to the page, so the page receives
+ * the array it keeps and never re-encodes it.
+ *
+ * @param {ArrayLike<number>} codes - One code per cell: -1, or 0 to nCategories - 1
+ * @param {number} nCategories
+ * @param {string} label - What to name in a failure.
+ * @returns {Uint8Array|Uint16Array|Uint32Array}
+ */
+export function narrowCategoricalCodes(codes, nCategories, label) {
+  const { TypedArrayClass, missingValue } = categoricalStorageForCount(nCategories, label);
+  const narrowed = new TypedArrayClass(codes.length);
+  for (let index = 0; index < codes.length; index++) {
+    const code = codes[index];
+    if (code === -1) {
+      narrowed[index] = missingValue;
+    } else if (code >= 0 && code < nCategories && code === Math.trunc(code)) {
+      narrowed[index] = code;
+    } else {
+      throw new RangeError(
+        `${label} has invalid code ${String(code)} at index ${index}; ` +
+        `expected -1 or an integer from 0 to ${nCategories - 1}`
+      );
+    }
+  }
+  return narrowed;
 }

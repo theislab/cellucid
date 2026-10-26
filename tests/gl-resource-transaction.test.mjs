@@ -40,6 +40,7 @@ function createShaderGl({
   const gl = {
     ARRAY_BUFFER: 0x8892,
     ARRAY_BUFFER_BINDING: 0x8894,
+    CURRENT_PROGRAM: 0x8b8d,
     COMPILE_STATUS: 0x8B81,
     CONTEXT_LOST_WEBGL: 0x9242,
     FLOAT: 0x1406,
@@ -142,6 +143,7 @@ function createShaderGl({
     getParameter(parameter) {
       if (parameter === gl.ARRAY_BUFFER_BINDING) return null;
       if (parameter === gl.VERTEX_ARRAY_BINDING) return null;
+      if (parameter === gl.CURRENT_PROGRAM) return null;
       throw new TypeError(`unexpected parameter ${parameter}`);
     },
     getError() {
@@ -350,6 +352,9 @@ test('SmokeRenderer disposal retains and retries only exact failed owners', () =
     deleteVertexArray(resource) {
       calls.push(['vertexArray', resource.id]);
     },
+    // Nothing is current: no program is unbound before its deletion.
+    CURRENT_PROGRAM: 0x8b8d,
+    getParameter: () => null,
     deleteProgram(resource) {
       calls.push(['program', resource.id]);
     },
@@ -519,6 +524,9 @@ test('GPU noise disposal fences generation and retries only failed handles', () 
     Object.create(GPUNoiseGenerator.prototype),
     {
       gl: {
+        // Nothing is current: no program is unbound before its deletion.
+        CURRENT_PROGRAM: 0x8b8d,
+        getParameter: () => null,
         deleteProgram: resource => recordAttempt('program', resource),
         deleteVertexArray: resource => (
           recordAttempt('vertexArray', resource)

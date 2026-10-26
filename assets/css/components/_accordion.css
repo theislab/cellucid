@@ -23,8 +23,16 @@
   z-index: var(--z-layer, var(--z-floating));
 }
 
+/* A <details> lays its content out in its own slot, out of reach of the
+   card's flex column, so the content is held to the window's height here:
+   the window's own height (or the viewport, when that is smaller) less the
+   header (`--floating-header-height`, measured by the dockable owner) and
+   the card's border. The content is then the scroller. */
 .accordion-floating > .accordion-section .accordion-content {
-  max-height: var(--floating-content-max-height, none);
+  max-height: min(
+    calc(var(--pos-height) - var(--floating-header-height, 0px) - 2 * var(--border-width-1)),
+    calc(100dvh - var(--space-4) - var(--floating-header-height, 0px) - 2 * var(--border-width-1))
+  );
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -130,6 +138,7 @@
 }
 
 .accordion-dock-btn,
+.accordion-maximize-btn,
 .accordion-copy-btn,
 .accordion-close-btn {
   display: none;
@@ -157,6 +166,21 @@
   line-height: 1;
 }
 
+.accordion-maximize-btn::before {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border: var(--border-width-1) solid currentColor;
+  border-top-width: 2px;
+}
+
+/* Maximized: two overlapping boxes, "restore". */
+.accordion-maximize-btn[aria-pressed="true"]::before {
+  width: 7px;
+  height: 7px;
+  box-shadow: 2px -2px 0 -1px var(--color-surface-secondary), 2px -2px 0 0 currentColor;
+}
+
 .accordion-close-btn::before {
   content: '×';
   font-size: var(--control-glyph-md);
@@ -164,6 +188,7 @@
 }
 
 .accordion-dock-btn:hover,
+.accordion-maximize-btn:hover,
 .accordion-copy-btn:hover,
 .accordion-close-btn:hover {
   background: var(--color-surface-elevated);
@@ -171,12 +196,14 @@
 }
 
 .accordion-dock-btn:active,
+.accordion-maximize-btn:active,
 .accordion-copy-btn:active,
 .accordion-close-btn:active {
   background: var(--color-interactive-secondary-active);
 }
 
 .accordion-dock-btn:focus-visible,
+.accordion-maximize-btn:focus-visible,
 .accordion-copy-btn:focus-visible,
 .accordion-close-btn:focus-visible {
   outline: 2px solid var(--color-border-focus);
@@ -210,7 +237,10 @@
 .accordion-panel.accordion-floating {
   pointer-events: auto;
   position: fixed;
+  /* A panel keeps the size it was given; a smaller viewport only clips it
+     to itself, so widening the window again gives the size back. */
   max-width: calc(100vw - var(--space-4));
+  max-height: calc(100dvh - var(--space-4));
   /* Use flex column so the card fills the window */
   display: flex;
   flex-direction: column;
@@ -237,7 +267,7 @@
   overflow: hidden;
   border: var(--border-default);
   background: var(--color-surface-elevated);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-floating);
   contain: layout style;
 }
 
@@ -257,11 +287,6 @@
   background: var(--color-surface-elevated);
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-}
-
-/* Force scrollbar visibility when content overflows */
-.accordion-floating > .accordion-section .accordion-content.has-overflow {
-  overflow-y: scroll;
 }
 
 /* Keep content visible during drag */
@@ -290,7 +315,7 @@ body.dock-dragging {
 }
 
 body.dock-resizing {
-  cursor: ew-resize !important;
+  cursor: var(--dock-resize-cursor, ew-resize) !important;
 }
 
 /* REDESIGNED: Dragging state - GPU optimized with proper containment */
@@ -317,45 +342,241 @@ body.dock-resizing {
   contain: layout style;
 }
 
-/* Width resize handle (right edge) - similar to sidebar resize */
-.accordion-width-handle {
+/* Resize handles: four edges and four corners on the frame of a floating
+   panel. Edges are 8 px bands straddling the border and corners 16 px
+   squares centred on it; a finger gets 24 px edges and 32 px corners. A
+   handle reaches at most 12 px past the border, so with a window kept 8 px
+   inside the viewport every handle's middle is on screen. A handle shows a
+   2 px accent line along its border on hover, focus or drag; the
+   bottom-right corner always shows a faint grip, so the window reads as
+   resizable before the pointer finds an edge. */
+.accordion-resize-handle {
+  --handle-edge: 8px;
+  --handle-corner: 16px;
+  --handle-outside: calc(var(--handle-edge) / 2);
+  --handle-corner-outside: calc(var(--handle-corner) / 2);
   display: none;
   position: absolute;
-  top: 0;
-  bottom: 0;
-  right: calc(-1 * var(--space-2));
-  width: var(--space-4);
-  cursor: ew-resize;
-  touch-action: none;
   z-index: var(--z-raised);
+  touch-action: none;
 }
 
-.accordion-width-handle::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: var(--space-1);
-  height: var(--space-10);
-  background: color-mix(in srgb, var(--color-border-strong) 15%, transparent);
-  border-radius: var(--radius-sm);
-  transition: background-color var(--duration-fast) var(--easing-standard);
+@media (pointer: coarse) {
+  .accordion-resize-handle {
+    --handle-edge: 24px;
+    --handle-corner: 32px;
+    --handle-outside: 12px;
+    --handle-corner-outside: 12px;
+  }
 }
 
-.accordion-width-handle:hover::after,
-.accordion-floating.resizing .accordion-width-handle::after {
-  background: color-mix(in srgb, var(--color-border-strong) 35%, transparent);
-}
-
-.accordion-floating .accordion-width-handle {
+.accordion-floating > .accordion-resize-handle {
   display: block;
 }
 
-/* Keep the resize grab area off the scrollbars (header-only). */
-.accordion-floating .accordion-width-handle {
-  bottom: auto;
-  height: var(--space-10);
+.accordion-resize-handle[data-edge="n"],
+.accordion-resize-handle[data-edge="s"] {
+  left: calc(var(--handle-corner) - var(--handle-corner-outside));
+  right: calc(var(--handle-corner) - var(--handle-corner-outside));
+  height: var(--handle-edge);
+  cursor: ns-resize;
+}
+
+.accordion-resize-handle[data-edge="n"] { top: calc(-1 * var(--handle-outside)); }
+.accordion-resize-handle[data-edge="s"] { bottom: calc(-1 * var(--handle-outside)); }
+
+.accordion-resize-handle[data-edge="e"],
+.accordion-resize-handle[data-edge="w"] {
+  top: calc(var(--handle-corner) - var(--handle-corner-outside));
+  bottom: calc(var(--handle-corner) - var(--handle-corner-outside));
+  width: var(--handle-edge);
+  cursor: ew-resize;
+}
+
+.accordion-resize-handle[data-edge="e"] { right: calc(-1 * var(--handle-outside)); }
+.accordion-resize-handle[data-edge="w"] { left: calc(-1 * var(--handle-outside)); }
+
+.accordion-resize-handle[data-edge="ne"],
+.accordion-resize-handle[data-edge="se"],
+.accordion-resize-handle[data-edge="sw"],
+.accordion-resize-handle[data-edge="nw"] {
+  width: var(--handle-corner);
+  height: var(--handle-corner);
+}
+
+.accordion-resize-handle[data-edge="ne"] {
+  top: calc(-1 * var(--handle-corner-outside));
+  right: calc(-1 * var(--handle-corner-outside));
+  cursor: nesw-resize;
+}
+
+.accordion-resize-handle[data-edge="se"] {
+  bottom: calc(-1 * var(--handle-corner-outside));
+  right: calc(-1 * var(--handle-corner-outside));
+  cursor: nwse-resize;
+}
+
+.accordion-resize-handle[data-edge="sw"] {
+  bottom: calc(-1 * var(--handle-corner-outside));
+  left: calc(-1 * var(--handle-corner-outside));
+  cursor: nesw-resize;
+}
+
+.accordion-resize-handle[data-edge="nw"] {
+  top: calc(-1 * var(--handle-corner-outside));
+  left: calc(-1 * var(--handle-corner-outside));
+  cursor: nwse-resize;
+}
+
+/* The accent line sits on the panel's border, whatever the handle's reach. */
+.accordion-resize-handle::after {
+  content: '';
+  position: absolute;
+  background: var(--color-border-focus);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--easing-standard);
+}
+
+.accordion-resize-handle[data-edge="n"]::after,
+.accordion-resize-handle[data-edge="s"]::after {
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.accordion-resize-handle[data-edge="n"]::after { top: calc(var(--handle-outside) - 1px); }
+.accordion-resize-handle[data-edge="s"]::after { bottom: calc(var(--handle-outside) - 1px); }
+
+.accordion-resize-handle[data-edge="e"]::after,
+.accordion-resize-handle[data-edge="w"]::after {
+  top: 0;
+  bottom: 0;
+  width: 2px;
+}
+
+.accordion-resize-handle[data-edge="e"]::after { right: calc(var(--handle-outside) - 1px); }
+.accordion-resize-handle[data-edge="w"]::after { left: calc(var(--handle-outside) - 1px); }
+
+/* A corner lights the two borders it moves, as an L. */
+.accordion-resize-handle[data-edge="ne"]::after,
+.accordion-resize-handle[data-edge="se"]::after,
+.accordion-resize-handle[data-edge="sw"]::after,
+.accordion-resize-handle[data-edge="nw"]::after {
+  width: calc(var(--handle-corner) - var(--handle-corner-outside) + 1px);
+  height: calc(var(--handle-corner) - var(--handle-corner-outside) + 1px);
+  background: transparent;
+  border: 0 solid var(--color-border-focus);
+}
+
+.accordion-resize-handle[data-edge="ne"]::after {
+  top: calc(var(--handle-corner-outside) - 1px); right: calc(var(--handle-corner-outside) - 1px);
+  border-top-width: 2px; border-right-width: 2px;
+}
+
+.accordion-resize-handle[data-edge="se"]::after {
+  bottom: calc(var(--handle-corner-outside) - 1px); right: calc(var(--handle-corner-outside) - 1px);
+  border-bottom-width: 2px; border-right-width: 2px;
+}
+
+.accordion-resize-handle[data-edge="sw"]::after {
+  bottom: calc(var(--handle-corner-outside) - 1px); left: calc(var(--handle-corner-outside) - 1px);
+  border-bottom-width: 2px; border-left-width: 2px;
+}
+
+.accordion-resize-handle[data-edge="nw"]::after {
+  top: calc(var(--handle-corner-outside) - 1px); left: calc(var(--handle-corner-outside) - 1px);
+  border-top-width: 2px; border-left-width: 2px;
+}
+
+@media (hover: hover) {
+  .accordion-resize-handle:hover::after {
+    opacity: 1;
+  }
+}
+
+.accordion-resize-handle:focus-visible::after,
+.accordion-floating.resizing > .accordion-resize-handle:active::after {
+  opacity: 1;
+}
+
+.accordion-resize-handle:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+/* The always-visible grip in the bottom-right corner: three short diagonal
+   strokes inside the card. */
+.accordion-resize-handle[data-edge="se"]::before {
+  content: '';
+  position: absolute;
+  right: calc(var(--handle-corner-outside) + 2px);
+  bottom: calc(var(--handle-corner-outside) + 2px);
+  width: 9px;
+  height: 9px;
+  background: linear-gradient(
+    135deg,
+    transparent 0 45%, var(--color-text-tertiary) 45% 52%,
+    transparent 52% 64%, var(--color-text-tertiary) 64% 71%,
+    transparent 71% 83%, var(--color-text-tertiary) 83% 90%,
+    transparent 90%
+  );
+  opacity: var(--opacity-50);
+  pointer-events: none;
+}
+
+/* The size while it changes, in the window's own corner. */
+.floating-size-readout {
+  display: none;
+  position: absolute;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  z-index: var(--z-raised);
+  padding: var(--space-0-5) var(--space-1-5);
+  border: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-elevated);
+  color: var(--color-text-secondary);
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+}
+
+.accordion-floating.resizing > .floating-size-readout,
+.accordion-floating.size-readout-visible > .floating-size-readout {
+  display: block;
+}
+
+/* The line an edge snapped to, across the whole viewport. */
+.floating-snap-guide {
+  position: fixed;
+  z-index: var(--z-raised);
+  background: var(--color-border-focus);
+  pointer-events: none;
+}
+
+.floating-snap-guide[data-axis="x"] {
+  top: 0;
+  bottom: 0;
+  left: var(--guide-at);
+  width: 1px;
+}
+
+.floating-snap-guide[data-axis="y"] {
+  left: 0;
+  right: 0;
+  top: var(--guide-at);
+  height: 1px;
+}
+
+.floating-snap-guide[hidden] {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accordion-resize-handle::after {
+    transition: none;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -557,7 +778,8 @@ body.dock-dragging .accordion-panel:not(.accordion-floating) > .accordion-sectio
   white-space: normal;
 }
 
-/* Four short lines: who made it, docs and citing, the licence, the build. */
+/* Four short lines: who made it; docs, citing, source, privacy and terms; the
+   licence and accessibility; the build. */
 #copyright p {
   margin: 0;
   line-height: var(--leading-normal);

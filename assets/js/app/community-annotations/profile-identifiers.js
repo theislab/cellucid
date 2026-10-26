@@ -5,6 +5,9 @@
  * as ORCID URLs, compact ORCID values, LinkedIn URLs, or @handles.
  */
 
+import { requireObjectRecord } from '../../utils/exact-record.js';
+import { formatCountOf } from '../../utils/format-units.js';
+
 const ORCID_ID = /^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$/;
 const LINKEDIN_HANDLE = /^[a-z0-9-]{3,120}$/;
 const PROFILE_NAME_MAX_CODEPOINTS = 120;
@@ -20,13 +23,6 @@ function exceedsCodePointLimit(value, maximum) {
   return false;
 }
 
-function assertRecord(value, label) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be a JSON object`);
-  }
-  return value;
-}
-
 function optionalExactString(
   value,
   label,
@@ -40,7 +36,7 @@ function optionalExactString(
   ) {
     throw new Error(
       `${label} must be null or an exact string of at most ` +
-      `${maximumLength} characters`
+      `${formatCountOf(maximumLength, 'character')}`
     );
   }
   return value || null;
@@ -92,30 +88,30 @@ export function assertExactOptionalProfileText(value, label, maximumLength) {
     exceedsCodePointLimit(value, maximumLength)
   ) {
     throw new Error(
-      `${label} must be an exact string of at most ${maximumLength} characters`
+      `${label} must be an exact string of at most ${formatCountOf(maximumLength, 'character')}`
     );
   }
   return value;
 }
 
 export function parseOrcidPersonName(document) {
-  const root = assertRecord(document, 'ORCID person response');
+  const root = requireObjectRecord(document, 'ORCID person response');
   if (root.name === null) return null;
-  const name = assertRecord(root.name, 'ORCID person response.name');
+  const name = requireObjectRecord(root.name, 'ORCID person response.name');
   const givenNode = name['given-names'];
   const familyNode = name['family-name'];
   const given =
     givenNode === null
       ? null
       : optionalExactString(
-          assertRecord(givenNode, 'ORCID person response.name.given-names').value,
+          requireObjectRecord(givenNode, 'ORCID person response.name.given-names').value,
           'ORCID person response.name.given-names.value'
         );
   const family =
     familyNode === null
       ? null
       : optionalExactString(
-          assertRecord(familyNode, 'ORCID person response.name.family-name').value,
+          requireObjectRecord(familyNode, 'ORCID person response.name.family-name').value,
           'ORCID person response.name.family-name.value'
         );
   const parts = [given, family].filter((part) => part !== null);
@@ -123,19 +119,19 @@ export function parseOrcidPersonName(document) {
 }
 
 export function parseOrcidExpandedSearch(document, { maximumResults = 8 } = {}) {
-  const root = assertRecord(document, 'ORCID expanded-search response');
+  const root = requireObjectRecord(document, 'ORCID expanded-search response');
   const results = root['expanded-result'];
   if (!Array.isArray(results)) {
     throw new Error('ORCID expanded-search response.expanded-result must be an array');
   }
   if (results.length > maximumResults) {
     throw new Error(
-      `ORCID expanded-search returned more than the requested ${maximumResults} results`
+      `ORCID expanded-search returned more than the requested ${formatCountOf(maximumResults, 'result')}`
     );
   }
   const seen = new Set();
   return results.map((entry, index) => {
-    const record = assertRecord(
+    const record = requireObjectRecord(
       entry,
       `ORCID expanded-search response.expanded-result[${index}]`
     );

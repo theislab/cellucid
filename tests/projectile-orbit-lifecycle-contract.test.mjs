@@ -288,6 +288,9 @@ function createOrbitHarness({
       );
       increment(vertexArrayDeleteAttempts, vao.id);
     },
+    // Nothing is current: no program is unbound before its deletion.
+    CURRENT_PROGRAM: 0x8b8d,
+    getParameter: () => null,
     deleteProgram(program) {
       increment(programDeleteAttempts, program.id);
       if (programFailuresRemaining.delete(program.id)) {

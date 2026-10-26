@@ -10,7 +10,7 @@ import {
   ORBIT_ANCHOR_VS,
   ORBIT_ANCHOR_FS,
 } from './shaders/orbit-anchor-shaders.js';
-import { configureStraightAlphaBlending, createProgram } from './gl-utils.js';
+import { configureStraightAlphaBlending, createProgram, deleteProgramReleasingUse } from './gl-utils.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 
 const VIEW_BUFFER_PROPERTIES = Object.freeze([
@@ -112,7 +112,7 @@ export class OrbitAnchorRenderer {
 
     if (this.program !== null) {
       try {
-        gl.deleteProgram(this.program);
+        deleteProgramReleasingUse(gl, this.program);
         this.program = null;
       } catch (error) {
         failures.push(error);
@@ -1162,9 +1162,12 @@ export class OrbitAnchorRenderer {
     const fogNear = viewRadius * 0.2;
     const fogFar = viewRadius * 4.0;
 
-    const camX = cx + viewRadius * Math.sin(viewTheta) * Math.cos(viewPhi);
-    const camY = cy + viewRadius * Math.sin(viewPhi);
-    const camZ = cz + viewRadius * Math.cos(viewTheta) * Math.cos(viewPhi);
+    // The pane's eye, by the viewer's orbit convention (`updateCamera`:
+    // phi is the polar angle from +Y, theta turns from +X towards +Z): the
+    // shading's view direction (specular, rim) is the camera's.
+    const camX = cx + viewRadius * Math.sin(viewPhi) * Math.cos(viewTheta);
+    const camY = cy + viewRadius * Math.cos(viewPhi);
+    const camZ = cz + viewRadius * Math.sin(viewPhi) * Math.sin(viewTheta);
 
     configureStraightAlphaBlending(gl);
 
@@ -1233,6 +1236,4 @@ export class OrbitAnchorRenderer {
   getShowAnchor() {
     return this.showAnchor;
   }
-
-  updateLabels() {}
 }

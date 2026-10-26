@@ -27,6 +27,8 @@
  * leaving the person to wonder whether it was one cell or a million.
  */
 
+import { formatCountOf, countNoun, formatCount } from '../utils/format-units.js';
+
 /** How many offending cell indices to name. Enough to check, few enough to read. */
 export const NON_FINITE_EXAMPLE_LIMIT = 5;
 
@@ -84,9 +86,6 @@ export function hasUndrawableValues(tally) {
   return tally.positiveInfinity > 0 || tally.negativeInfinity > 0;
 }
 
-function formatCount(count) {
-  return count.toLocaleString();
-}
 
 function describeKinds(tally) {
   const parts = [];
@@ -152,16 +151,16 @@ function describeUndrawablePayload({ subject, tally }) {
   const noun = owner.kind === 'gene' ? 'Gene' : 'Field';
   const undrawable = tally.positiveInfinity + tally.negativeInfinity;
   const examples = tally.examples
-    .map(index => index.toLocaleString())
+    .map(index => formatCount(index))
     .join(', ');
   const lines = [
     `${noun} "${owner.name}" contains ${formatCount(undrawable)} `
-    + `infinite value${undrawable === 1 ? '' : 's'}, so it has no colour scale.`,
-    `Of ${formatCount(tally.total)} cells: ${describeKinds(tally)}.`,
+    + `infinite ${countNoun(undrawable, 'value')}, so it has no colour scale.`,
+    `Of ${formatCountOf(tally.total, 'cell')}: ${describeKinds(tally)}.`,
   ];
   if (examples.length > 0) {
     lines.push(
-      `First affected cell${tally.examples.length === 1 ? '' : 's'}: ${examples}`
+      `First affected ${countNoun(tally.examples.length, 'cell')}: ${examples}`
       + `${undrawable > tally.examples.length ? ', …' : ''}.`
     );
   }
@@ -189,13 +188,13 @@ function describeEmptyPayload({ subject, tally }) {
   const noun = owner.kind === 'gene' ? 'Gene' : 'Field';
   return [
     `${noun} "${owner.name}" has no value in any of `
-    + `${formatCount(tally.total)} cells, so it has no colour scale.`,
+    + `${formatCountOf(tally.total, 'cell')}, so it has no colour scale.`,
     `Every value is NaN, which Cellucid reads as "not measured here".`,
     owner.kind === 'gene'
       ? 'Check that the expression matrix being served is the one that was '
         + 'normalized, not an empty layer.'
-      : 'Check that the column was computed for this dataset before it was '
-        + 'served or exported.',
+      : 'Check that the column was computed for this dataset before the file '
+        + 'was written.',
   ].join('\n');
 }
 
@@ -203,46 +202,26 @@ function describeEmptyPayload({ subject, tally }) {
  * What a transport failure on a continuous payload most likely means.
  *
  * Keyed by HTTP status, in the cause-then-action shape `dataset-connections.js`
- * uses for data-source failures. The 500 entry is the one that matters here: the
- * Python server validates a gene column before it sends a byte, and a column
- * containing NaN or an infinity is refused — but that refusal is reported as a
- * bare internal error, so the browser cannot name the cause and can only say
- * where to read it. Everything else is the ordinary transport vocabulary.
+ * uses for data-source failures. A server only ever sends the bytes of an
+ * AnnData store, which the reader checks itself, so this is the ordinary
+ * transport vocabulary.
  */
 const TRANSPORT_FAILURES = Object.freeze({
   404: Object.freeze({
     cause: 'The server does not have this payload.',
     action:
       'The dataset may have been replaced while it was open. Reload the page '
-      + 'to pick up the current manifest.',
+      + 'to open it again.',
   }),
   416: Object.freeze({
     cause: 'The server refused the byte range this payload was read with.',
-    action: 'Reload the page to read the payload without a range request.',
-  }),
-  422: Object.freeze({
-    // The server examined the payload and refused it. Its body carries the
-    // counted reason, which is quoted above this line, so there is nothing to
-    // add about the cause — only about what nothing else can say.
-    cause:
-      'The server examined this payload and will not publish it.',
     action:
-      'Repair the values at the source and reload. Nothing in the viewer can '
-      + 'work around a value that has no position on a colour scale.',
+      'The file may have changed while it was open. Reload the page to open '
+      + 'it again.',
   }),
   500: Object.freeze({
-    cause:
-      'The server failed while producing the payload. For gene expression '
-      + 'this is most often a column that is not entirely finite: the server '
-      + 'refuses a gene containing NaN or ±Infinity, because neither has a '
-      + 'position on a colour scale.',
-    action:
-      'A server new enough to say so answers 422 and names the gene. An older '
-      + 'one prints the reason to its own console. If the values are the '
-      + 'cause, repair the matrix — '
-      + '`adata.X.data[~np.isfinite(adata.X.data)] = 0` for a sparse matrix, '
-      + '`np.nan_to_num(adata.X, copy=False)` for a dense one — and restart '
-      + 'the server.',
+    cause: 'The server failed while reading the file this payload is in.',
+    action: 'The server prints the reason to its own console.',
   }),
   503: Object.freeze({
     cause: 'The server is not serving this dataset right now.',

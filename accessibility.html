@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" data-viewer-background="studio">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Accessibility — Cellucid</title>
+  <!--
+    The accessibility statement, linked from the footer. A reading page in the
+    site's design, built as privacy.html is (page.css and the app's theme
+    bootstrap, nothing else). Every claim is held by a test or stated in the
+    documentation's accessibility guide (o_accessibility_privacy_security/
+    01_accessibility.md in cellucid-python), which has the detail; when either
+    changes, this page changes with it. The WCAG aim is drafted for the
+    owner's approval.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; manifest-src 'self';" />
+  <meta name="description" content="How accessible Cellucid is: keyboard, screen readers, contrast and reduced motion, the limits of a WebGL plot, and how to report a barrier." />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="canonical" href="https://www.cellucid.com/accessibility.html" />
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/img/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <script src="/assets/js/app/ui/core/theme-init.js?v=65a0632676cd"></script>
+  <link rel="preload" href="/assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/assets/css/page.css" />
+</head>
+<body class="page">
+  <main class="page-screen" aria-labelledby="accessibility-title">
+    <div class="welcome-content welcome-content-wide">
+      <div class="welcome-header">
+        <a href="/"><img src="/assets/img/cellucid-logo.svg" alt="Cellucid" class="welcome-logo" width="260" height="80" /></a>
+      </div>
+
+      <div class="welcome-body page-prose">
+        <h1 id="accessibility-title" class="welcome-title">Accessibility</h1>
+        <p class="page-meta">Last updated 24 October 2026</p>
+
+        <p>Cellucid should work for everyone who looks at single-cell data. This page says what works, what does not yet, and how to tell us when something is in your way. Cellucid aims to meet WCAG 2.2 at level AA.</p>
+
+        <h2>What works</h2>
+        <ul>
+          <li><strong>Keyboard.</strong> Panels, fields, buttons and analysis windows are reached with Tab and used with Enter, Space and the arrow keys, with a visible focus ring. The plot is the first Tab stop, and its camera moves with keys. Press <kbd>?</kbd> for every shortcut.</li>
+          <li><strong>Screen readers.</strong> Controls are named and announce their state. The plot has a name and a description of its keys, and opening progress and notifications are announced.</li>
+          <li><strong>Contrast and colour.</strong> Text meets AA contrast in the light and the dark theme. The first 24 category colours stay distinct for red–green colour blindness, and figure export previews three kinds of colour blindness.</li>
+          <li><strong>Motion.</strong> With your system's reduce-motion setting on, transitions stop and camera paths jump to their end.</li>
+          <li><strong>Phones and touch.</strong> The interface fits a phone screen, and every control is large enough to tap.</li>
+        </ul>
+
+        <h2>Known limits</h2>
+        <ul>
+          <li><strong>The plot is a picture.</strong> Cells are drawn with WebGL on a canvas, so a screen reader cannot read out single cells. Legends, values and analysis results are text.</li>
+          <li><strong>Selecting cells needs a pointer.</strong> Lasso and click selection have no keyboard equivalent yet; no key needs to be held while you point. Without a pointer, select cells with the Python or R package.</li>
+          <li><strong>Many categories.</strong> Beyond 24 categories, colours are not chosen for colour blindness, and blue–yellow colour blindness is not covered.</li>
+          <li><strong>WebGL 2 is required.</strong> Cellucid runs in current Chrome, Edge, Firefox and Safari; without WebGL 2 it cannot draw.</li>
+          <li><strong>Not audited.</strong> Cellucid has not had a formal accessibility audit, so it does not claim conformance.</li>
+        </ul>
+
+        <h2>Tell us</h2>
+        <p>If something stops you from using Cellucid, <a href="https://github.com/theislab/cellucid/issues">open an issue on GitHub</a> or write to Kemal Inecik, <a href="mailto:k.inecik@gmail.com">k.inecik@gmail.com</a>. Say what you were trying to do, and which browser and assistive technology you use. The documentation's <a href="https://docs.cellucid.com/en/latest/user_guide/web_app/o_accessibility_privacy_security/01_accessibility.html">accessibility guide</a> has the details, including every keyboard shortcut.</p>
+
+        <ul class="welcome-links" aria-label="More about Cellucid">
+          <li><a href="/">Open Cellucid</a></li>
+          <li><a href="https://docs.cellucid.com/en/latest/">Documentation</a></li>
+          <li><a href="/privacy.html">Privacy</a></li>
+          <li><a href="/terms.html">Terms</a></li>
+        </ul>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

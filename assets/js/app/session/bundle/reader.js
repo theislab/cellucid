@@ -14,20 +14,18 @@
 
 import {
   MAX_FRAME_BYTES,
+  NOT_A_SESSION_FILE_MESSAGE,
   SESSION_BUNDLE_MAGIC_BYTES,
   U32_BYTES,
   bytesToU32LE
 } from './format.js';
 import {
-  assertExactKeys,
   assertNonEmptyString,
-  assertPlainRecord,
-  assertSafeInteger
+  assertSafeInteger,
 } from '../schema-contract.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
-/**
- * @param {AbortSignal | null | undefined} signal
- */
 /**
  * The byte stream ended before a read it was asked for. Kept distinct so the
  * header check can tell "too short to be a session file" from a real failure.
@@ -39,8 +37,9 @@ class UnexpectedEndOfFileError extends Error {
   }
 }
 
-const NOT_A_SESSION_FILE_MESSAGE = 'Invalid session file (bad MAGIC header).';
-
+/**
+ * @param {AbortSignal | null | undefined} signal
+ */
 function throwIfAborted(signal) {
   if (signal !== null && signal.aborted) {
     throw new DOMException('Aborted', 'AbortError');
@@ -53,7 +52,7 @@ class StreamByteReader {
    * @param {{ totalBytes: number | null, signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null }} options
    */
   constructor(reader, options) {
-    assertExactKeys(
+    requireExactKeys(
       options,
       ['totalBytes', 'signal', 'onProgress'],
       'Session byte reader options'
@@ -114,7 +113,7 @@ class StreamByteReader {
       const remaining = this._totalBytes - this._position;
       if (n > remaining) {
         throw new UnexpectedEndOfFileError(
-          `Unexpected end of file (need ${n} bytes, only ${remaining} remaining).`
+          `Unexpected end of file (need ${formatCountOf(n, 'byte')}, only ${remaining} remaining).`
         );
       }
     }
@@ -190,7 +189,7 @@ class StreamByteReader {
  * @returns {Promise<{ manifest: any, totalBytes: number|null, chunkStream: AsyncGenerator<BundleChunkRead, void, void>, cancel: (reason: unknown) => Promise<void> }>}
  */
 export async function readBundle(source, options) {
-  assertExactKeys(
+  requireExactKeys(
     options,
     ['signal', 'onProgress'],
     'Session bundle reader options'
@@ -266,23 +265,21 @@ export async function readBundle(source, options) {
       }
       throw error;
     }
-    for (let i = 0; i < SESSION_BUNDLE_MAGIC_BYTES.byteLength; i++) {
-      if (magic[i] !== SESSION_BUNDLE_MAGIC_BYTES[i]) {
-        throw new Error(NOT_A_SESSION_FILE_MESSAGE);
-      }
+    if (!SESSION_BUNDLE_MAGIC_BYTES.every((byte, i) => magic[i] === byte)) {
+      throw new Error(NOT_A_SESSION_FILE_MESSAGE);
     }
 
     // 2) Manifest length
     const manifestByteLength = await byteReader.readU32LE();
     if (manifestByteLength <= 0) {
-      throw new Error(`Invalid manifest length: ${manifestByteLength} bytes.`);
+      throw new Error(`Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')}.`);
     }
     if (
       byteReader.totalBytes != null
       && manifestByteLength > byteReader.totalBytes - byteReader.position
     ) {
       throw new Error(
-        `Invalid manifest length: ${manifestByteLength} bytes is more than the session file holds (session file truncated?).`
+        `Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')} is more than the session file holds (session file truncated?).`
       );
     }
 
@@ -296,7 +293,7 @@ export async function readBundle(source, options) {
       if (error instanceof RangeError) {
         // The browser's longest string is the only limit left on a manifest.
         throw new Error(
-          `Session manifest of ${manifestByteLength} bytes is longer than this browser can hold as text.`,
+          `Session manifest of ${formatCountOf(manifestByteLength, 'byte')} is longer than this browser can hold as text.`,
           { cause: error },
         );
       }
@@ -321,7 +318,7 @@ export async function readBundle(source, options) {
       for (let i = 0; i < manifest.chunks.length; i++) {
         throwIfAborted(signal);
         const meta = manifest.chunks[i];
-        assertPlainRecord(meta, `Session manifest chunk ${i}`);
+        requirePlainRecord(meta, `Session manifest chunk ${i}`);
         const metaId = assertNonEmptyString(
           meta.id,
           `Session manifest chunk ${i} id`,
@@ -352,7 +349,6 @@ export async function readBundle(source, options) {
       }
       await byteReader.assertEnd();
       readerSettled = true;
-      reader.releaseLock();
     } catch (error) {
       await cancel(error);
       throw error;

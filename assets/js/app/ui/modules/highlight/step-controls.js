@@ -18,12 +18,12 @@
 
 import {
   requireDomElement,
-  requireExactKeys,
   requireMethods,
-  requireSafeInteger
+  requireSafeInteger,
 } from './exact-contract.js';
 import { selectBarNotice } from './mode-copy.js';
-import { formatCount } from '../../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /** Every tool that owns a step-control block, in toolbelt order. */
 export const STEP_CONTROL_TOOLS = Object.freeze([
@@ -110,8 +110,27 @@ export function publishSelectBarHint(documentOwner, hint) {
   element.textContent = hint;
 }
 
+/**
+ * Say in the Selection (i) tip what the active tool's gesture is, or what it
+ * needs first. The owner of the tool's idle copy calls this beside the
+ * selection bar's hint: mode-ui.js when the tool changes, and each tool when
+ * it shows nothing in progress.
+ *
+ * @param {Document} documentOwner
+ * @param {string} hint
+ */
+export function publishToolHint(documentOwner, hint) {
+  if (typeof hint !== 'string' || hint.length === 0) {
+    throw new TypeError('Selection tool hint must be a nonempty string.');
+  }
+  const element = documentOwner.getElementById('highlight-tool-hint');
+  if (element === null) return;
+  requireDomElement(element, 'Selection tool hint');
+  element.textContent = hint;
+}
+
 function cellCountText(count) {
-  return `${formatCount(count)} ${count === 1 ? 'cell' : 'cells'} selected`;
+  return `${formatCountOf(count, 'cell')} selected`;
 }
 
 /**

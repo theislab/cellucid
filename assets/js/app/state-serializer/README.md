@@ -7,8 +7,10 @@ It is **not** the save/load orchestrator:
 - Features persist state via small **contributors** under `cellucid/assets/js/app/session/contributors/`
 
 Current constraints:
-- Only the one current state document is accepted; incompatible documents are
-  rejected and the document carries no version field.
+- Only the one current state document is accepted: session format 2, whose
+  version is part of the file signature (`CELLUCID_SESSION/2\n`, see
+  `session/bundle/format.js`). Any file without that signature is refused
+  with `NOT_A_SESSION_FILE_MESSAGE`.
 - The reader implements one exact current document shape and rejects every
   other shape; restoration is always all-or-nothing.
 - Sessions are treated as **untrusted input** with exact profiles, bounds,
@@ -36,7 +38,7 @@ UI refresh succeeds. Any later failure rolls back earlier state.
 
 Ordinary user state is saved and restored through the **Save** and **Load**
 buttons under Session file. Separately, an official catalog generation may explicitly advertise
-one SHA-256-pinned five-chunk `default.cellucid-session`; Cellucid applies that
+one SHA-256-pinned seven-chunk `default.cellucid-session`; Cellucid applies that
 bounded static view automatically after the scientific dataset is published.
 Other startup/data-source paths are not probed.
 
@@ -56,8 +58,8 @@ This is the source-of-truth list of what the current session system persists.
 
 Scheduled eagerly:
 - **Camera state** (position/orbit target/navigation mode, etc.)
-  - Locked cameras: one global camera state
-  - Unlocked cameras: per-view camera states (live + each snapshot view)
+  - Every view's own camera (live + each snapshot view) and whether cameras
+    are linked; the focused view's camera is that view's, not stored twice
 - **Representations**
   - The embedding reference the live view shows (`liveEmbedding`)
   - The embedding reference each snapshot view shows (`embedding`); a view’s
@@ -66,7 +68,9 @@ Scheduled eagerly:
   - Layout mode (single/grid)
   - Active view id (which view is focused)
   - Live view hidden (if applicable)
-  - Snapshot descriptors (label/meta) and the replay plan that rebuilds them
+  - Per view: embedding, camera, active field, filters, and centroid point
+    and label toggles; a view's label and filter summary are derived and
+    recomputed when it is rebuilt
 - **Active coloring field selection**
   - Active obs field key (categorical/continuous)
   - Active var field key (gene expression)
@@ -76,7 +80,8 @@ Scheduled eagerly:
   - “Modified-only” filters for obs + var fields
   - Per-snapshot filters (replayed per view during multiview restore)
 - **Generic sidebar controls state**
-  - Checkboxes/selects/ranges/text inputs (by DOM id)
+  - Checkboxes/selects/ranges/text inputs (by DOM id), including the
+    background and the app theme
   - Accordion open/closed state (by DOM id; visible summary copy is never an
     identity)
   - Pressed-button groups (by DOM id), recording which button is pressed —
@@ -85,6 +90,9 @@ Scheduled eagerly:
 - **Floating panels layout** (non-analysis)
   - Which accordion sections were floated
   - Their geometry + open/closed state
+- **Figure Export settings** (`ui/figure-export`): the panel's own validated
+  record (`exportSessionSettings()` / `importSessionSettings()`), applied in
+  the presentation stage
 
 ### Filtering/Coloring “Overlays” (rename/delete/user-defined fields)
 
@@ -106,7 +114,12 @@ This answers: “Do I keep ALL renamed/deleted things in Filtering/Coloring?” 
 
 Saved:
 - **Eager**: highlight pages + group metadata **without** memberships
-- **Lazy**: exactly one compact binary membership chunk per advertised group
+- **Lazy**: exactly one compact binary membership chunk per advertised group,
+  in the smallest of five encodings (`session/codecs/cell-set.js`): sorted
+  gaps, a bitset over all cells, runs, or — for a category group on a dataset
+  observation field — a bitset over that category's cells or the whole
+  category, checked on restore against the category's size and digest
+- Groups record `fieldKey`/`categoryName`; positions are resolved on restore
 
 Restored:
 - Metadata precedes membership arrays.
@@ -116,7 +129,8 @@ Restored:
 ### User-Defined Categorical Codes
 
 Saved:
-- One chunk per user-defined categorical field: `user-defined/codes/<fieldId>`
+- One chunk per user-defined categorical field: `user-defined/codes/<fieldId>`,
+  as raw codes, runs, or codes packed at 1, 2 or 4 bits, whichever is smallest
 - **Eager** only for fields required to render the initial view (active coloring + snapshot actives)
 - **Lazy** for everything else
 
@@ -127,17 +141,18 @@ Restored:
   Priority and within-priority order must exactly match the target active-field
   dependency graph.
 
-### Analysis Windows + Caches
+### Analysis
 
-Saved:
-- **Eager**: open floating analysis windows (modeId + geometry + exportSettings)
-- **Eager**: one `analysis/cache-inventory`, including an empty artifact list
-- **Lazy**: DataLayer bulk-gene cache artifacts
+Saved (eager, typed JSON — `session/codecs/typed-json.js`, so result columns
+are stored as their raw values):
+- `analysis/windows`: open floating analysis windows (modeId, geometry,
+  settings, result)
+- `analysis/docked`: the sidebar analysis panel (`comparisonModule.exportSessionState()`:
+  the open mode and every initialized mode's settings and result)
 
-Restored:
-- Windows and the exact declared cache inventory commit together.
-- Cache container ownership swaps without copying cell-scale arrays; in-flight
-  writers are generation-isolated so they cannot contaminate the replacement.
+Restored in the presentation stage, after every state participant commits.
+Per-cell gene values an analysis read are not stored; they are re-read from
+the dataset.
 
 ---
 
@@ -148,15 +163,19 @@ These are the chunk IDs you will see inside a `.cellucid-session` file:
 | Chunk id | Priority | Dataset dependent | Contains |
 |---|---:|---:|---|
 | `core/field-overlays` | eager | yes | rename/delete registries + user-defined field definitions (metadata only) |
-| `core/state` | eager | yes | camera + UI controls + each view's representation + filters + active fields + multiview descriptors |
-| `ui/dockable-layout` | eager | no | floating non-analysis panels geometry + open/closed |
-| `analysis/windows` | eager | yes | open analysis windows descriptors (settings + geometry) |
-| `highlights/meta` | eager | yes | highlight pages + group shells (no cellIndices) |
-| `analysis/cache-inventory` | eager | yes | exact ordered analysis-artifact ids, including an empty list |
 | `cinematic/camera` | eager | yes | exact Camera Path, settings, and explicit empty state |
+| `core/state` | eager | yes | UI controls + the live view's representation, filters and active field + the multiview graph (layout, link state, every view's camera and centroid toggles, each kept view's representation, filters and active field) |
+| `ui/dockable-layout` | eager | no | floating non-analysis panels geometry + open/closed |
+| `ui/figure-export` | eager | no | Figure Export settings record |
+| `analysis/windows` | eager | yes | floating analysis windows: mode, geometry, settings, result (typed JSON) |
+| `analysis/docked` | eager | yes | sidebar analysis panel: open mode, each mode's settings and result (typed JSON) |
+| `highlights/meta` | eager | yes | highlight pages + group shells (no cellIndices) |
 | `user-defined/codes/<fieldId>` | eager/lazy | yes | user-defined categorical codes (binary) |
-| `highlights/cells/<groupId>` | lazy | yes | highlight group membership indices (binary) |
-| `analysis/artifacts/bulk-gene/<cacheKey>` | lazy | yes | one cache artifact named by the eager inventory |
+| `highlights/cells/<groupId>` | lazy | yes | highlight group membership (binary cell set) |
+
+The manifest also carries `requires` — every dataset observation field and
+gene the views and highlights use — which is checked, naming every missing key,
+before any chunk applies.
 
 Dataset mismatch behavior:
 - If the bundle’s dataset fingerprint does not match the currently loaded dataset:
@@ -170,9 +189,10 @@ families are complete and ordered. Unknown, missing, duplicate, aliased,
 reordered, or dishonestly described chunks are rejected before success.
 
 The official published-default path is deliberately different. It accepts
-exactly the first five static gzip/JSON chunks through `highlights/meta`, in
-that order, only after catalog manifest and SHA-256 verification. It contains
-no cinematic/cache data and is not accepted by the generic Session file **Load**.
+exactly the seven static chunks other than `cinematic/camera`
+(`PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE`), in that order, only after catalog
+manifest and SHA-256 verification. It contains no cinematic data and is not
+accepted by the generic Session file **Load**.
 
 ---
 
@@ -183,12 +203,14 @@ cell identifiers. Those indices are only meaningful against one ordering of the
 dataset, so the manifest fingerprint has to pin that ordering, not just the
 dataset.
 
-`datasetFingerprint` has exactly six fields:
+`datasetFingerprint` has exactly six fields. The route a dataset was opened
+through is not one of them: the same dataset opened from another host restores
+its sessions, and `cellOrder` proves the cells are in the same order.
 
 | Field | Derived from | Shape |
 |---|---|---|
-| `sourceType` | `dataSourceManager.getCurrentSourceType()` | string or `null` |
-| `datasetId` | `dataSourceManager.getCurrentDatasetId()` | string or `null` |
+| `datasetId` | `dataSourceManager.getCurrentIdentityId()` | string or `null` |
+| `name` | `dataSourceManager.getCurrentMetadata().name` | string or `null`; used in messages, never compared |
 | `cellCount` | `state.pointCount` | safe integer |
 | `varCount` | source var fields in `state.varData.fields` (user-defined fields excluded) | safe integer |
 | `cellOrder` | see below | `{ embedding, dimension, digest }` |
@@ -196,19 +218,17 @@ dataset.
 
 `dataMapping` names the stored arrays the dataset is shown with: the embeddings
 that are on (`embeddings.enabled`, any number of each dimension), the default
-of each dimension (`embeddings.defaults`), and the vector bindings, and for an
-AnnData source the
-neighbour graph, gene names, expression matrix and latent space. It is resolved
-once per load by `data/dataset-mapping.js` (from `dataset_identity.json` for a
-prepared export, from the AnnData candidate catalog for an `.h5ad` or Zarr file
-opened in the browser or an object a Python server serves) and changed in the
+of each dimension (`embeddings.defaults`), the vector bindings, the neighbour
+graph, gene names, expression matrix and latent space. It is resolved
+once per load by `data/dataset-mapping.js` (from the AnnData candidate catalog
+of the `.h5ad` or Zarr file opened in the browser, or of the object a Python
+server serves) and changed in the
 Session › Data mapping panel (`state/managers/mapping-manager.js`). The panel
 changes only the embeddings (which are on, and each dimension's default); the
 other groups are fixed for the session.
 
-`cellOrder.embedding` names the layout the live view shows: an export's
-embedding id with `columns: null`, or an AnnData `obsm` key with its 0-based
-columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3.
+`cellOrder.embedding` names the layout the live view shows: an AnnData `obsm`
+key with its 0-based columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3.
 `cellOrder.digest` is 16 lowercase hex characters produced by
 `digestCellOrder(state.positionsArray, dimension)` in
 `cellucid/assets/js/app/session/session-context.js`. The digest is defined over
@@ -217,7 +237,7 @@ cell, and the axes a 1D or 2D embedding does not have are folded in as zero
 words, so the digest does not depend on the in-memory layout.
 
 Why the coordinates:
-- The four scalars all survive a row permutation. Re-export a dataset at the
+- The scalars all survive a row permutation. Re-export a dataset at the
   same id from re-sorted input and every one of them is unchanged, while every
   stored row index now denotes a different cell.
 - Observation and variable names are also invariant under a row permutation, so
@@ -245,12 +265,12 @@ surfaced verbatim by the session controls:
 
 | Cause | Where it is raised | What the user is told |
 |---|---|---|
-| Fingerprint with only the four pre-`cellOrder` keys | `assertDatasetFingerprint()`, during manifest validation | the file was saved before Cellucid recorded which cells a selection contains, so its selections can never be confirmed; re-create them and save again |
-| Fingerprint with `cellOrder` but no `dataMapping` | `assertDatasetFingerprint()`, during manifest validation | the file was saved by an earlier release, before sessions recorded the data mapping; re-create the view and save again |
-| Any of the four scalars differs | `verifySessionFingerprint()` | it is a different dataset, with both saved and current cell/gene counts named |
+| A file without the format-2 signature | the signature, `bundle/reader.js` | `NOT_A_SESSION_FILE_MESSAGE` |
+| The id or a count differs | `verifySessionFingerprint()` | it is a different dataset, with both saved and current cell/gene counts, or both identities, named |
 | `dataMapping` differs in a group the viewer cannot change (graph, gene names, expression, latent space, vector fields), or turns on an embedding this dataset cannot show | `verifySessionFingerprint()` | the group or the embedding is named, by its embedding id or `obsm` key |
 | `cellOrder.embedding` names no layout of this dataset | `verifySessionFingerprint()` | the embedding is named |
 | `cellOrder.digest` differs, everything else matches | `verifySessionFingerprint()` | same name and counts, different cell order, so every saved selection would mark the wrong cells |
+| A field or gene in `requires` is missing (checked under the session's mapping) | `describeMissingRequiredFields()` | every missing key is named |
 
 A session whose embeddings differ from the open dataset's, but which the
 dataset can show, is not refused: before any chunk restores a view, the
@@ -265,12 +285,9 @@ someone their data was re-ordered when the session only named another embedding
 teaches them to distrust a sound dataset. Keep the causes separate when changing
 this code.
 
-A file carrying only the four scalars is refused, not accepted. Accepting it
-would preserve exactly the unverifiable state the record exists to eliminate,
-permanently, for every file already written.
-
 The published-default path is not exempt. `restorePublishedDefaultState()`
-shares `validateManifest()` and the same fingerprint verification, so an
+shares `validateManifest()`, the same fingerprint verification and the same
+`requires` check, so an
 advertised `default.cellucid-session` must carry `cellOrder` and `dataMapping`,
 and must have been captured in the generation's default data mapping.
 
@@ -286,7 +303,8 @@ The **`core/state`** eager chunk uses these helper modules:
 - `cellucid/assets/js/app/state-serializer/active-fields.js`
   - Active obs/var field selection snapshot/restore
 - `cellucid/assets/js/app/state-serializer/multiview.js`
-  - Restores multiview by replaying filters/active-fields per snapshot, then freezing each view
+  - Restores multiview by replaying each kept view once on the live view and
+    freezing it, then applying the live view's own state last
 
 ### `ui-controls.js` — Sidebar + Floating UI Controls
 
@@ -358,8 +376,7 @@ Two consequences bind anything that touches this path:
   back on a rejected publication leaves a mismatch, which is raised and rolls
   the session back. Silence is never an outcome.
 
-`#hp-antialias` is **captured and validated like every other control, and
-deliberately not applied on restore** — the one member of
+`#hp-antialias` is **neither captured nor restored** — the one member of
 `DEVICE_PREFERENCE_CONTROL_IDS`. Its owner publishes to the viewer *and* to
 `localStorage`: antialiasing is a live setting (`rendering/scene-msaa-target.js`)
 whose stored preference describes the machine rather than the view.
@@ -372,14 +389,12 @@ reloading re-applied the saved value and stored it, and the setting could never
 stay off; a shared session did the same to whoever opened it.
 
 The stored preference also has a third state, `auto`, which no session can
-express: a checkbox records ticked or unticked, and `auto` is neither. That is a
-second reason a restore must not reach it — replaying a captured tick would
-convert "let the dataset decide" into a choice the user never made.
-
-It stays in the inventory rather than being marked skip, because that keeps the
-published presets valid and keeps a control vanishing from the markup a
-detectable event. See
+express: a checkbox records ticked or unticked, and `auto` is neither. See
 `cellucid/assets/js/app/ui/core/antialias-preference.js`.
+
+The app theme (`#theme-select`) is a session control like any other: its
+`change` reaches the ThemeManager, which shows and stores the restored theme
+exactly as a choice made by hand.
 
 `restoreUIControls` also accepts `deferControlIds`, which moves the named
 controls to the **end of the same restore call** and returns a function that
@@ -410,12 +425,15 @@ Explicit exclusions:
   The continuous legend's range sliders (`minimum-1b`, …) are the case that
   made saved sessions unloadable.
 - Any subtree marked with `data-state-serializer-skip="true"` is ignored.
-  - Figure Export root is skipped in `cellucid/index.html`
-  - Figure Export controls subtree is also skipped in `cellucid/assets/js/app/ui/modules/figure-export/figure-export-ui.js`
+  - Figure Export root is skipped in `cellucid/index.html`, and its controls
+    subtree in `figure-export-ui.js`; the panel's settings are saved as one
+    record instead (`ui/figure-export`)
   - Benchmark section is skipped in `cellucid/index.html`
   - Dataset selection + connection UI is skipped in `cellucid/index.html` (sample dataset picker, local/remote/GitHub connect controls)
   - Community Annotation section is skipped in `cellucid/index.html` (network/auth-driven; sessions do not persist votes/moderation/UI state)
-  - Floating analysis windows are skipped in `cellucid/assets/js/app/analysis/ui/analysis-window-manager.js`
+  - Floating analysis windows and the docked analysis panels are skipped in
+    `cellucid/assets/js/app/analysis/ui/`; they are saved by their own
+    contributors (`analysis/windows`, `analysis/docked`)
 - Some IDs are intentionally skipped by `DOMAIN_OWNED_IDS`, either because a
   feature owner restores them or because they are not a preference at all.
   This is the complete list; `tests/session-docs-current-contract.test.mjs`
@@ -427,7 +445,7 @@ Explicit exclusions:
     shows is restored by `core/state` as `liveEmbedding` and by the multiview
     descriptors as each snapshot's `embedding`; the picker redraws from the
     state)
-  - Dataset/connection controls: `dataset-select`, `remote-server-url`, `github-repo-url` (sessions assume the dataset is already loaded)
+  - Dataset/connection controls: `dataset-select`, `data-address` (sessions assume the dataset is already loaded)
   - Pointer capture: `pointer-lock` is not restored by anything. It is not a
     preference — it mirrors the browser's live pointer-lock state, and
     `ui/modules/camera-controls.js` forces it unchecked on init and writes it
@@ -444,8 +462,11 @@ Categorical fields:
 - filter enabled/disabled (`_categoryFilterEnabled`)
 - colormap override (`_colormapId`)
 - outlier enabled + threshold (`_outlierFilterEnabled`, `_outlierThreshold`);
-  the export writes latent outlier quantiles only for categorical fields, so
-  this is the only entry kind that carries them
+  latent outlier quantiles exist only for categorical fields, so this is the
+  only entry kind that carries them. Restore gets the quantiles a threshold
+  below 100% needs (stored in the file, or computed with progress and Cancel,
+  `state/managers/outlier-quantiles.js`); a threshold whose quantiles cannot
+  be got is not applied, and a notification names it with the reason
 
 Fields are recorded by `source:key` and categories by name, never by position.
 A position in the obs/var inventory or in `field.categories` is not pinned by
@@ -484,17 +505,24 @@ Restore:
 ### `multiview.js` — Snapshot View Restore (“Keep View”)
 
 Session bundles intentionally do **not** store per-cell buffers (colors/transparency/etc).
-Instead, snapshot views are restored by:
-1) Reset to a known base context
-2) Replay saved per-view filters + active fields
-3) Freeze the view via `state.getSnapshotPayload()` + `viewer.createSnapshotView(...)`
+Instead, `core-state.js` first requests every field, gene and embedding any
+view names, together (the embeddings pinned until the views are built), and
+`restoreMultiview()` then, for each kept view:
+1) applies its filters (`restoreFilters` clears every field first, so each
+   replay is a complete state and nothing is reset in between)
+2) applies its active field and embedding
+3) freezes the view via `state.getSnapshotPayload()` + `viewer.createSnapshotView(...)`
+   and sets its centroid toggles
+
+and finally applies the live view's own filters, active field, embedding,
+centroid toggles and camera.
 
 Per snapshot, this restores:
-- view label/meta
-- per-view filters + active fields (drives coloring/filtering)
+- per-view filters + active fields (drives coloring/filtering; the label and
+  filter summary are recomputed from them)
 - per-view outlier threshold
 - per-view representation (its embedding reference)
-- per-view camera state when cameras are unlocked
+- per-view camera state and centroid point/label toggles
 
 Important details:
 - Snapshot representation restoration uses `state.restoreViewEmbedding(viewId, ref)`, which resolves the saved reference to the layout the view shows; a view that shows its dimension's default follows it again.
@@ -512,7 +540,8 @@ Important details:
 ## What Is NOT Kept (Intentional Exclusions)
 
 The session system does **not** persist:
-- Figure Export module UI state (inputs/modals/results)
+- The antialiasing preference (a device capability)
+- Per-cell gene values analyses read (re-read from the dataset)
 - Benchmarking/performance test UI state
 - Community Annotation state (votes, comments, moderation UI, GitHub sync/auth, drafts)
 - The dataset itself (data files are not embedded; the session assumes the dataset is already loaded)

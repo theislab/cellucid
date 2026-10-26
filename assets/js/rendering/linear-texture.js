@@ -24,6 +24,8 @@
  * The bytes in the texture are the source bytes, item for item, in order.
  */
 
+import { formatCountOf } from '../utils/format-units.js';
+
 /** GLSL: the texel of item `index` in a linear texture laid out as `layout`. */
 export const LINEAR_TEXEL_GLSL = `
 // The texel of item \`index\` in a linear texture (rendering/linear-texture.js):
@@ -69,13 +71,13 @@ export function planLinearTexture(itemCount, maxTextureSize, maxArrayLayers) {
   const layers = Math.ceil(rows / maxTextureSize);
   if (layers > maxArrayLayers) {
     throw new RangeError(
-      `${itemCount.toLocaleString('en-US')} items need ${layers} texture layers; this GPU allows ${maxArrayLayers}.`
+      `${formatCountOf(itemCount, 'item')} need ${layers} texture layers; this GPU allows ${maxArrayLayers}.`
     );
   }
   const rowsPerLayer = Math.ceil(rows / layers);
   // Shader indices are signed 32-bit integers.
   if (count > 2 ** 31 - 1) {
-    throw new RangeError(`${itemCount.toLocaleString('en-US')} items exceed the shader's integer index range.`);
+    throw new RangeError(`${formatCountOf(itemCount, 'item')} exceed the shader's integer index range.`);
   }
   return Object.freeze({
     itemCount,

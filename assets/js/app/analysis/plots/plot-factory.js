@@ -27,6 +27,19 @@ import { applyLegendPosition } from '../shared/legend-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { escapeHtml } from '../../utils/dom-utils.js';
 import { isPlotlyPrecomputable, plotlyBoxSummary, sortLikePlotly } from './plotly-box-statistics.js';
+import { POINT_LAYER } from './point-layer.js';
+import { fitToSize } from './size-fit.js';
+import { textHeight, textWidth } from './text-measure.js';
+
+/** A horizontal legend entry: its marker, and the room after its text, in px. */
+const LEGEND_ENTRY_CHROME = 46;
+/** The smallest plot area a legend above it may leave, in px. */
+const LEGEND_MIN_PLOT_HEIGHT = 100;
+
+/** The size a plot is drawn at, in CSS px: its graph div's box. */
+function viewportOf(element) {
+  return { width: element?.clientWidth ?? 0, height: element?.clientHeight ?? 0 };
+}
 
 // Tick-label metrics, in multiples of the tick font size.
 //
@@ -91,19 +104,27 @@ export class PlotFactory {
    * @returns {Promise<Object>} Plotly figure reference
    */
   static async render({ definition, pageData, options, container, layoutEngine }) {
-    const traces = definition.buildTraces(pageData, options, layoutEngine);
-    const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine);
-    PlotFactory.fitCategoricalTickLabels(layout, traces, container);
+    // A plot type may lay itself out for the size it is drawn at (`viewport`),
+    // and is laid out again whenever that size changes (`size-fit.js`).
+    const viewport = viewportOf(container);
+    const traces = definition.buildTraces(pageData, options, layoutEngine, viewport);
+    const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine, viewport);
+    // A plot whose every category must be named (a dot plot's genes and
+    // groups) sizes its own labels instead (`fitTickLabels: false`).
+    if (definition.fitTickLabels !== false) PlotFactory.fitCategoricalTickLabels(layout, traces, container);
     applyLegendPosition(layout, options?.legendPosition);
+    PlotFactory.fitLegendAbove(layout, traces, viewport, options?.legendPosition);
     const config = getPlotlyConfig();
 
+    let figure;
     try {
       const Plotly = await createMinimalPlotly();
-      return await Plotly.newPlot(container, traces, layout, config);
+      figure = await Plotly.newPlot(container, traces, layout, config);
     } catch (err) {
       console.error(`[${definition.id}] Render error:`, err);
       throw new Error(`Failed to render ${definition.name}: ${err.message}`);
     }
+    return fitToSize(figure, () => PlotFactory.update({ definition, figure, pageData, options, layoutEngine }));
   }
 
   /**
@@ -118,10 +139,12 @@ export class PlotFactory {
    * @returns {Promise<Object>} Updated Plotly figure
   */
   static async update({ definition, figure, pageData, options, layoutEngine }) {
-    const traces = definition.buildTraces(pageData, options, layoutEngine);
-    const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine);
-    PlotFactory.fitCategoricalTickLabels(layout, traces, figure);
+    const viewport = viewportOf(figure);
+    const traces = definition.buildTraces(pageData, options, layoutEngine, viewport);
+    const layout = PlotFactory.layoutForTraces(definition, traces, pageData, options, layoutEngine, viewport);
+    if (definition.fitTickLabels !== false) PlotFactory.fitCategoricalTickLabels(layout, traces, figure);
     applyLegendPosition(layout, options?.legendPosition);
+    PlotFactory.fitLegendAbove(layout, traces, viewport, options?.legendPosition);
     const Plotly = await createMinimalPlotly();
     const config = getPlotlyConfig();
 
@@ -144,6 +167,7 @@ export class PlotFactory {
       }
     }
 
+    fitToSize(figure, () => PlotFactory.update({ definition, figure, pageData, options, layoutEngine }));
     if (mustFullRender) {
       if (typeof Plotly.purge !== 'function') {
         throw new Error('Plotly.purge is required when the trace type changes');
@@ -153,6 +177,68 @@ export class PlotFactory {
     }
 
     return Plotly.react(figure, traces, layout, config);
+  }
+
+  // ===========================================================================
+  // LEGEND FITTING
+  // ===========================================================================
+
+  /**
+   * Make room for the automatic legend above the plot, or leave it out.
+   *
+   * The base layout draws the legend as rows above the plot area, in a top
+   * margin of fixed height; entries that wrap to more rows than the margin
+   * holds were drawn over the plot's axis labels. The rows are counted from
+   * the measured entries at the drawn width and the margin is made their
+   * height; when that would squeeze the plot below `LEGEND_MIN_PLOT_HEIGHT`,
+   * the legend is left out of the automatic placement (as the volcano
+   * plot's is), and choosing a position still shows it.
+   *
+   * @param {Object} layout - Mutated in place
+   * @param {Object[]} traces
+   * @param {{width: number, height: number}} viewport
+   * @param {string|undefined|null} legendPosition
+   */
+  static fitLegendAbove(layout, traces, viewport, legendPosition) {
+    const legend = layout?.legend;
+    if (
+      (legendPosition ?? 'auto') !== 'auto' ||
+      layout.showlegend === false ||
+      legend?.orientation !== 'h' ||
+      !(legend.y >= 1) ||
+      !(viewport.width > 0) || !(viewport.height > 0) ||
+      !Array.isArray(traces)
+    ) {
+      return layout;
+    }
+    const names = traces
+      .filter(trace => trace?.showlegend !== false && typeof trace?.name === 'string' && trace.name.length > 0)
+      .map(trace => trace.name);
+    if (names.length === 0) return layout;
+    const font = {
+      size: legend.font?.size ?? getPlotTheme().legendFontSize,
+      family: legend.font?.family ?? layout.font?.family ?? getPlotTheme().fontFamily
+    };
+    const margin = layout.margin ?? {};
+    const available = viewport.width - (margin.l ?? 0) - (margin.r ?? 0);
+    let rows = 1;
+    let used = 0;
+    for (const name of names) {
+      const entry = textWidth(name, font) + LEGEND_ENTRY_CHROME;
+      if (used > 0 && used + entry > available) {
+        rows++;
+        used = 0;
+      }
+      used += entry;
+    }
+    const legendHeight = Math.ceil(rows * Math.max(19, textHeight(1, font.size) + 6)) + 8;
+    const top = Math.max(margin.t ?? 0, legendHeight + 8);
+    if (viewport.height - top - (margin.b ?? 0) < LEGEND_MIN_PLOT_HEIGHT) {
+      layout.showlegend = false;
+    } else {
+      layout.margin = { ...margin, t: top };
+    }
+    return layout;
   }
 
   // ===========================================================================
@@ -373,11 +459,11 @@ export class PlotFactory {
    * @param {Object} [layoutEngine]
    * @returns {Object} Plotly layout object
    */
-  static layoutForTraces(definition, traces, pageData, options, layoutEngine) {
+  static layoutForTraces(definition, traces, pageData, options, layoutEngine, viewport) {
     if (Array.isArray(traces) && traces.length === 0) {
       return PlotFactory.createEmptyStateLayout('No values to plot');
     }
-    return definition.buildLayout(pageData, options, layoutEngine);
+    return definition.buildLayout(pageData, options, layoutEngine, viewport);
   }
 
   // ===========================================================================
@@ -517,19 +603,17 @@ export class PlotFactory {
       trace[valueAxis] = violinInput.sorted;
       if (violinInput.kde !== null) trace._precomputedKDE = violinInput.kde;
       // And the calcdata entry its box calc would build from them, which the
-      // vendored violin calc then takes instead of a record per value. Every
-      // value is still drawn when all points are shown, so that mode keeps
-      // Plotly's own calc.
-      if (showPoints !== 'all') {
-        const { pts, ...box } = violinInput.box;
-        trace._precomputedViolin = {
-          sorted: violinInput.sorted,
-          box,
-          // Plotly writes drawing state onto its point records: each trace
-          // gets its own.
-          pts: showPoints === 'outliers' ? pts.map(({ v, i }) => ({ v, i })) : []
-        };
-      }
+      // vendored violin calc then takes instead of a record per value. With
+      // all points shown the points are the sorted values themselves, which
+      // the point layer reads as they are (no record per value).
+      const { pts, ...box } = violinInput.box;
+      trace._precomputedViolin = {
+        sorted: violinInput.sorted,
+        box,
+        // Plotly writes drawing state onto its point records: each trace
+        // gets its own.
+        pts: showPoints === 'outliers' ? pts.map(({ v, i }) => ({ v, i })) : []
+      };
     } else if (boxStatistics === null) {
       // Plotly's raw-value calc sorts the values through a comparator; handed
       // them already in its own order (sortLikePlotly, linear time) that sort
@@ -545,6 +629,12 @@ export class PlotFactory {
 
     if (!isVertical) {
       trace.orientation = 'h';
+    }
+
+    // Points are laid out by Plotly and drawn as one image per box or violin
+    // (point-layer.js), never as one SVG path per point.
+    if (showPoints !== 'none') {
+      trace._cellucidPointLayer = POINT_LAYER;
     }
 
     // Box-specific options

@@ -1,39 +1,45 @@
 /**
- * FormBasedAnalysisUI - Base class for form-based analysis UIs
+ * FormBasedAnalysisUI - the one form mechanism of every analysis with a Run
+ * button (marker genes, differential expression, gene signature,
+ * correlation, composition, dot plot).
  *
- * Common pattern for analysis types that follow:
- * - Form inputs at top
- * - Run button
- * - Results display below
- * - Expandable modal view (matching Detailed Analysis pattern)
+ * The form is drawn from the analysis's options schema
+ * (`options/option-schema.js`, `options/render-options-form.js`): its
+ * essentials, then "More options" in collapsed groups, then the Run row (one
+ * muted line saying why Run is disabled, when it is, and the Run button;
+ * nothing under it). The options are one validated record
+ * (`this._options`); sessions save `{options, selectedPages, view}`. Typing
+ * never runs anything. An option change re-applies a display option to the
+ * shown result, or marks the result stale (dimmed, with a "Stale · Run"
+ * chip) until the next run.
  *
- * Used by: DEAnalysisUI, GeneSignatureUI
+ * Subclasses implement:
+ * - static getRequirements() - { minPages, maxPages, description }
+ * - _getTitle()
+ * - _getOptionsSchema() - the analysis's schema
+ * - _runAnalysisImpl(options, requestId, job) - the result `{ data, ... }`,
+ *   or null when superseded
+ * - _showResult(result, requestId) - render the completed result
  *
- * Subclasses must implement:
- * - static getRequirements() - Return { minPages, maxPages, description }
- * - _getTitle() - Return analysis title
- * - _renderFormControls(wrapper) - Render form inputs into wrapper
- * - _getFormValues() - Extract form values as object
- * - _runAnalysisImpl(formValues) - Execute analysis, return result object
- * - _showResult(result) - Render the completed result
- *
- * Subclasses may override:
- * - _validateForm(formValues) - Custom form validation
- * - _getLoadingMessage() - Custom loading message
- * - _getSuccessMessage() - Custom success message
- * - _getRunButtonText() - Custom button text
- * - _getClassName() - CSS class prefix
- * - _renderModalPlot(container) - Custom modal plot rendering
- * - _renderModalOptions(container) - Custom modal options rendering
- * - _renderModalStats(container) - Custom modal statistics rendering
- * - _renderModalAnnotations(container) - Custom modal annotations rendering
+ * Subclasses may implement:
+ * - _getOptionsContext() - what the data offers the schema (default {})
+ * - _renderFormLead(wrapper) - controls above the options (a page selector)
+ * - _getRunNoun() - Run's accessible name is "Run <noun>"
+ * - _getRunBlocker(options) - why Run is disabled, or null
+ * - _isDisplayOption(key) / _rebuildForDisplay(options) - options that
+ *   re-render the shown result without recomputing it
+ * - _exportViewState() / _importViewState(view) - viewer state saved in the
+ *   session's `view` record beside the open disclosures
+ * - _getExtraSettingKeys() / _exportExtraSettings() / _importExtraSettings()
+ * - _getSuccessMessage(), _getClassName(), and the _renderModal* methods
  *
  * @module analysis-types/base/form-based-analysis
  */
 
 import { BaseAnalysisUI } from '../../base-analysis-ui.js';
 import { createButton, createStatusLine } from '../../../../ui/components/controls.js';
-import { runAnalysisWithLoadingState } from '../../../shared/analysis-utils.js';
+import { renderOptionsForm } from '../../../options/render-options-form.js';
+import { sameOptionValue } from '../../../options/option-schema.js';
 import {
   createAnalysisModal,
   openModal,
@@ -48,31 +54,7 @@ import { selectablePageIdSet } from '../../../shared/page-derivation-utils.js';
 import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
-import { setOwnDataProperty } from '../../../../../utils/exact-record.js';
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function requireExactKeys(value, expectedKeys, label) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  const actualKeys = Object.keys(value).sort();
-  const sortedExpected = [...expectedKeys].sort();
-  if (
-    actualKeys.length !== sortedExpected.length ||
-    actualKeys.some((key, index) => key !== sortedExpected[index])
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly: ${sortedExpected.join(', ')}`
-    );
-  }
-}
+import { isPlainRecord, requireExactKeys } from '../../../../../utils/exact-record.js';
 
 function requirePageIds(pageIds) {
   if (!Array.isArray(pageIds)) {
@@ -94,32 +76,15 @@ function requirePageIds(pageIds) {
   }
 }
 
-function requireFormControlSnapshot(snapshot) {
-  if (!isPlainObject(snapshot)) {
-    throw new TypeError('Form-based analysis formControls must be an object');
+function requireView(view) {
+  if (!isPlainRecord(view) || !isPlainRecord(view.disclosures)) {
+    throw new TypeError('Form-based analysis view must hold its disclosures');
   }
-  for (const [name, control] of Object.entries(snapshot)) {
-    if (name.length === 0) {
-      throw new TypeError('Form control names must be non-empty strings');
-    }
-    requireExactKeys(control, ['type', 'value'], `Form control "${name}"`);
-    if (control.type === 'checkbox') {
-      if (typeof control.value !== 'boolean') {
-        throw new TypeError(
-          `Form control "${name}" checkbox value must be a boolean`
-        );
-      }
-    } else if (control.type === 'value') {
-      if (typeof control.value !== 'string') {
-        throw new TypeError(
-          `Form control "${name}" value must be a string`
-        );
-      }
-    } else {
-      throw new TypeError(
-        `Form control "${name}" type must be checkbox or value`
-      );
-    }
+  const { disclosures } = view;
+  requireExactKeys(disclosures, ['groups', 'more'], 'Form-based analysis view disclosures');
+  if (typeof disclosures.more !== 'boolean' || !Array.isArray(disclosures.groups) ||
+      disclosures.groups.some(id => typeof id !== 'string')) {
+    throw new TypeError('Form-based analysis view disclosures must be { more: boolean, groups: string[] }');
   }
 }
 
@@ -218,149 +183,328 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Prevent overlapping re-renders on rapid option changes
     this._optionRenderRevision = 0;
 
+    /** @type {Object|null} The validated options record (the schema's). */
+    this._options = null;
+    /** @type {{more: boolean, groups: string[]}} Open "More options" disclosures. */
+    this._disclosures = { more: false, groups: [] };
+    /** @type {ReturnType<typeof renderOptionsForm>|null} */
+    this._optionsForm = null;
+    /** The options and pages the shown result was computed with. */
+    this._resultInputs = null;
+    /** Highlight changes since the shown result was computed. */
+    this._highlightRevision = 0;
+    /**
+     * The visible cells' digest (`_visibleCellsDigest`) the form was last
+     * brought up to date for: the input of an analysis scoped to "Visible
+     * cells" (`_scopesByVisibleCells`), which moves only when the set of
+     * visible cells does, not on every visibility pass (a recolour runs one).
+     */
+    this._seenVisibleDigest = null;
+    /** `_visibleCellsDigest`'s last answer and what it read. */
+    this._visibleDigestCache = null;
+    /** Changes recorded while another mode was shown (`noteHiddenChange`). */
+    this._missedInputChange = false;
+    /** Display redraws: the latest one's token is current. */
+    this._displayRevision = 0;
+    this._runRow = null;
+
+    /** The gene loader last asked for highly variable genes, and its answer. */
+    this._highlyVariable = { loader: null, marked: false };
     // Note: _selectedPages, _lastResult, and _isLoading are inherited from BaseAnalysisUI
   }
 
+  // ===========================================================================
+  // Options
+  // ===========================================================================
+
   /**
-   * Snapshot current form control values by their `name` attribute.
-   * This intentionally captures settings only (not results).
-   * @returns {Record<string, { type: 'checkbox'|'value', value: string|boolean }>}
-   * @protected
+   * The options schema of this analysis.
+   * @abstract
+   * @returns {ReturnType<import('../../../options/option-schema.js').defineOptions>}
    */
-  _snapshotNamedFormControls() {
-    /** @type {Record<string, { type: 'checkbox'|'value', value: string|boolean }>} */
-    const out = {};
-    const form = this._formContainer?.querySelector?.('.analysis-form');
-    if (!form) {
-      throw new Error(
-        'Form-based analysis settings require an initialized analysis form'
-      );
-    }
-
-    form.querySelectorAll('input[name], select[name], textarea[name]').forEach((el) => {
-      const name = el.getAttribute('name');
-      if (typeof name !== 'string' || name.length === 0) {
-        throw new TypeError('Named form controls require a non-empty name');
-      }
-      if (Object.hasOwn(out, name)) {
-        throw new TypeError(`Form control name "${name}" is duplicated`);
-      }
-      let control;
-      if (el instanceof HTMLInputElement && el.type === 'checkbox') {
-        control = { type: 'checkbox', value: el.checked };
-      } else if (el instanceof HTMLInputElement) {
-        control = { type: 'value', value: el.value };
-      } else if (el instanceof HTMLSelectElement) {
-        control = { type: 'value', value: el.value };
-      } else if (el instanceof HTMLTextAreaElement) {
-        control = { type: 'value', value: el.value };
-      } else {
-        throw new TypeError(`Form control "${name}" has an unsupported element type`);
-      }
-      setOwnDataProperty(out, name, control);
-    });
-
-    requireFormControlSnapshot(out);
-    return out;
+  _getOptionsSchema() {
+    throw new Error('_getOptionsSchema() must be implemented by subclass');
   }
 
   /**
-   * Apply a snapshot produced by _snapshotNamedFormControls().
-   * @param {Record<string, { type: 'checkbox'|'value', value: string|boolean }>|null|undefined} snapshot
-   * @protected
+   * What the data offers the options (fields, groups, genes, pages).
+   * @returns {Object}
    */
-  _applyNamedFormControls(snapshot) {
-    requireFormControlSnapshot(snapshot);
-    const form = this._formContainer?.querySelector?.('.analysis-form');
-    if (!form) {
-      throw new Error(
-        'Form-based analysis settings require an initialized analysis form'
-      );
+  _getOptionsContext() {
+    return {};
+  }
+
+  /** The options record, created from the defaults on first use. */
+  _requireOptions() {
+    if (this._options === null) {
+      this._options = this._getOptionsSchema().defaults(this._getOptionsContext());
     }
-
-    const namedElements = new Map();
-    form.querySelectorAll('input[name], select[name], textarea[name]').forEach((element) => {
-      const name = element.getAttribute('name');
-      if (typeof name !== 'string' || name.length === 0) {
-        throw new TypeError('Named form controls require a non-empty name');
-      }
-      if (namedElements.has(name)) {
-        throw new TypeError(`Form control name "${name}" is duplicated`);
-      }
-      namedElements.set(name, element);
-    });
-
-    const operations = [];
-    for (const [name, data] of Object.entries(snapshot)) {
-      const el = namedElements.get(name);
-      if (!el) {
-        throw new Error(`Form control "${name}" was not found`);
-      }
-
-      if (data.type === 'checkbox' && el instanceof HTMLInputElement && el.type === 'checkbox') {
-        operations.push(() => {
-          el.checked = data.value;
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        continue;
-      }
-
-      if (data.type === 'value' && (el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) {
-        operations.push(() => {
-          el.value = data.value;
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        continue;
-      }
-
-      if (data.type === 'value' && el instanceof HTMLTextAreaElement) {
-        operations.push(() => {
-          el.value = data.value;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-        });
-        continue;
-      }
-
-      throw new TypeError(
-        `Form control "${name}" snapshot type does not match its element`
-      );
-    }
-
-    for (const apply of operations) {
-      apply();
-    }
+    return this._options;
   }
 
   /**
-   * Validate the complete settings schema owned by a concrete form analysis.
-   *
-   * A settings snapshot is imported before the importing panel has rendered —
-   * that is how a floating analysis window is populated — so this cannot ask a
-   * page selector that does not exist yet, and Differential Expression and
-   * Marker Genes never build one at all. It resolves the shared selectable
-   * domain instead, which is what the exporting panel was selecting from.
-   *
-   * @param {unknown} settings
-   * @param {string[]} expectedKeys
-   * @returns {{ selectedPages: string[], formControls: Object }}
+   * Replace the options (a restored session, a preset): validated by the
+   * schema, shown in the form.
+   * @param {Object} options
    * @protected
    */
-  _requireExactFormSettings(settings, expectedKeys) {
-    requireExactKeys(settings, expectedKeys, 'Form-based analysis settings');
+  _setOptions(options) {
+    const schema = this._getOptionsSchema();
+    this._options = schema.normalize(options, this._getOptionsContext());
+    this._optionsForm?.setValue(this._options);
+    this._handleOptionsChanged(null);
+  }
+
+  /** The data changed: dependent choices are reconciled and the form redrawn. @protected */
+  _refreshOptionsContext() {
+    if (this._optionsForm !== null) {
+      this._options = this._optionsForm.setContext(this._getOptionsContext());
+    } else if (this._options !== null) {
+      this._options = this._reconcileOptions(this._getOptionsContext());
+    }
+    this._updateRunRow();
+  }
+
+  /**
+   * The record with each value the data no longer offers (a field gone after
+   * a dataset change) back at its default; every other choice is kept.
+   * @private
+   */
+  _reconcileOptions(context) {
+    const schema = this._getOptionsSchema();
+    if (schema.validate(this._options, context).valid) return this._options;
+    return schema.normalize(
+      Object.fromEntries(schema.keys.map(key => [
+        key,
+        schema.refuse(key, this._options[key], this._options, context) === null
+          ? this._options[key]
+          : schema.defaultOf(key, context)
+      ])),
+      context
+    );
+  }
+
+  /**
+   * Whether the data mapping marks highly variable genes (the "Only genes
+   * in: Highly variable" choice). Asked of each gene loader once: the first
+   * call starts the read and answers false; the answer redraws the form. A
+   * changed mapping makes a new loader, which is asked again.
+   * @protected
+   */
+  _highlyVariableAvailable() {
+    const loader = this.dataLayer.state?.varFieldLoader ?? null;
+    if (loader !== this._highlyVariable.loader) {
+      this._highlyVariable = { loader, marked: false };
+      if (loader !== null) {
+        void loader.highlyVariableGenes().then(genes => {
+          if (this._isDestroyed || this._highlyVariable.loader !== loader) return;
+          this._highlyVariable = { loader, marked: Array.isArray(genes) && genes.length > 0 };
+          if (this._highlyVariable.marked) this._refreshOptionsContext();
+        }, error => {
+          if (this._isDestroyed || this._highlyVariable.loader !== loader) return;
+          this._notifications.error(`Highly variable genes could not be read: ${error.message}`, { category: 'analysis' });
+        });
+      }
+    }
+    return this._highlyVariable.marked;
+  }
+
+  /** Whether an option only changes how the shown result is drawn. @protected */
+  _isDisplayOption(key) {
+    return false;
+  }
+
+  /**
+   * The shown result rebuilt for new display options (filters, ranking,
+   * rescaling), from what the shown result holds: nothing is read or
+   * computed again. Null when there is nothing to redraw.
+   * @param {Object} options
+   * @returns {Promise<Object|null>|Object|null}
+   * @protected
+   */
+  _rebuildForDisplay(options) {
+    return null;
+  }
+
+  /**
+   * Redraw the shown result for the current display options. Render only: it
+   * never starts an analysis request, so it cannot supersede a run; while a
+   * run is in progress it does nothing (the run applies the latest display
+   * options when it publishes). Its own token (`{display}`) is current until
+   * the next redraw or run.
+   * @returns {Promise<void>}
+   * @protected
+   */
+  async _redrawForDisplay() {
+    if (this._isDestroyed || this._isLoading || this._lastResult === null) return;
+    const token = { display: ++this._displayRevision };
+    const rebuilt = await this._rebuildForDisplay(structuredClone(this._options));
+    if (rebuilt === null || rebuilt === undefined || !this._isCurrentAnalysisRequest(token)) return;
+    await this._showResult(rebuilt, token);
+    if (!this._isCurrentAnalysisRequest(token)) return;
+    await this._publishAnalysisResult(rebuilt, token);
+    this._updateStale();
+  }
+
+  /**
+   * A display redraw's token is current until the next redraw or run; an
+   * analysis request id, as the base class says.
+   * @override
+   */
+  _isCurrentAnalysisRequest(requestId) {
+    if (requestId !== null && typeof requestId === 'object' && Number.isSafeInteger(requestId.display)) {
+      return (
+        !this._isDestroyed &&
+        requestId.display === this._displayRevision &&
+        this._activeAnalysisRequestId === null
+      );
+    }
+    return super._isCurrentAnalysisRequest(requestId);
+  }
+
+  /** Why Run is disabled for these options, or null. @protected */
+  _getRunBlocker(options) {
+    return null;
+  }
+
+  /** Run's accessible name is "Run <noun>". @protected */
+  _getRunNoun() {
+    return this._getTitle().toLowerCase();
+  }
+
+  /** Controls drawn above the options (a page selector). @protected */
+  _renderFormLead(wrapper) {}
+
+  /** Add to the rendered options form (a swap beside two choices). @protected */
+  _decorateOptionsForm(form) {}
+
+  /** The subclass's own viewer state, saved in the session `view` record. @protected */
+  _exportViewState() {
+    return {};
+  }
+
+  /** Restore what `_exportViewState` saved. @protected */
+  _importViewState(view) {}
+
+  /** Settings keys a subclass adds beside options, selectedPages and view. @protected */
+  _getExtraSettingKeys() {
+    return [];
+  }
+
+  /** @protected */
+  _exportExtraSettings() {
+    return {};
+  }
+
+  /** @protected */
+  _importExtraSettings(settings) {}
+
+  /**
+   * An option changed (key null: several at once). A display option is
+   * re-applied to the shown result; anything else marks it stale.
+   * @private
+   */
+  _handleOptionsChanged(key) {
+    this._updateRunRow();
+    if (this._lastResult === null || this._resultInputs === null) return;
+    // Display options that changed are re-applied to the shown result; any
+    // other change leaves it stale until the next run.
+    const shown = this._resultInputs.options;
+    const displayChanged = this._getOptionsSchema().keys.filter(name =>
+      this._isDisplayOption(name) && !sameOptionValue(shown[name], this._options[name]));
+    if (displayChanged.length > 0 && !this._isLoading) {
+      this._resultInputs.options = {
+        ...shown,
+        ...Object.fromEntries(displayChanged.map(name => [name, this._options[name]]))
+      };
+      this._trackInteractiveTask(this._redrawForDisplay(), `${this._getTitle()} display`);
+    }
+    this._updateStale();
+  }
+
+  /** Whether the shown result was computed from other inputs than the form's. */
+  _isResultStale() {
+    if (this._lastResult === null || this._resultInputs === null) return false;
+    const { options, pages, highlightRevision, visibleDigest } = this._resultInputs;
+    if (highlightRevision !== this._highlightRevision) return true;
+    if (this._scopesByVisibleCells(options) && visibleDigest !== this._visibleCellsDigest()) return true;
+    if (!sameOptionValue(pages, [...this._selectedPages])) return true;
+    const schema = this._getOptionsSchema();
+    return schema.keys.some(key => !this._isDisplayOption(key) && !sameOptionValue(options[key], this._options[key]));
+  }
+
+  /** Dim the shown result and offer a run when it no longer matches the form. @private */
+  _updateStale() {
+    const container = this._resultContainer;
+    if (!(container instanceof HTMLElement)) return;
+    const stale = this._isResultStale();
+    container.classList.toggle('analysis-result-stale', stale);
+    let chip = container.querySelector(':scope > .analysis-stale-chip');
+    if (!stale) {
+      if (chip !== null) chip.remove();
+      return;
+    }
+    if (chip === null) {
+      chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'analysis-chip analysis-chip-warning analysis-stale-chip';
+      chip.textContent = 'Stale · Run';
+      chip.title = 'The settings or pages changed since this result: run again';
+      chip.addEventListener('click', () => this._runAgain());
+      container.prepend(chip);
+    }
+  }
+
+  /** Disable Run with its reason when the options cannot run. @private */
+  _updateRunRow() {
+    if (this._runRow === null || this._options === null) return;
+    const { button, reason } = this._runRow;
+    const blocker = this._isLoading ? null : this._getRunBlocker(this._options);
+    if (button.dataset.running !== 'true') button.disabled = blocker !== null;
+    reason.hidden = blocker === null;
+    reason.textContent = blocker ?? '';
+    if (blocker === null) button.removeAttribute('title');
+    else button.title = blocker;
+  }
+
+  /**
+   * Export a settings-only snapshot for cloning/copying and sessions.
+   * Results are exported by `exportResult`.
+   * @override
+   */
+  exportSettings() {
+    requirePageIds(this._selectedPages);
+    return {
+      options: structuredClone(this._requireOptions()),
+      selectedPages: [...this._selectedPages],
+      view: {
+        disclosures: structuredClone(this._optionsForm?.getView() ?? this._disclosures),
+        ...this._exportViewState()
+      },
+      ...this._exportExtraSettings()
+    };
+  }
+
+  /**
+   * Validate a settings record (exactly `{options, selectedPages, view}` plus
+   * the subclass's extra keys) without applying it.
+   * @protected
+   */
+  _requireSettings(settings) {
+    requireExactKeys(
+      settings,
+      ['options', 'selectedPages', 'view', ...this._getExtraSettingKeys()],
+      `${this._getTitle()} settings`
+    );
     requirePageIds(settings.selectedPages);
-    requireFormControlSnapshot(settings.formControls);
     const pages = this.dataLayer.getPages();
     if (!Array.isArray(pages)) {
-      throw new TypeError(
-        'Form-based analysis page inventory must be an array'
-      );
+      throw new TypeError('Form-based analysis page inventory must be an array');
     }
     const availablePageIds = selectablePageIdSet(pages);
     for (const pageId of settings.selectedPages) {
       if (!availablePageIds.has(pageId)) {
-        throw new Error(
-          `Form-based analysis page "${pageId}" was not found`
-        );
+        throw new Error(`Form-based analysis page "${pageId}" was not found`);
       }
       if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
         throw new RangeError(
@@ -368,29 +512,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         );
       }
     }
-    return {
-      selectedPages: [...settings.selectedPages],
-      formControls: structuredClone(settings.formControls)
-    };
+    requireView(settings.view);
+    const options = this._getOptionsSchema().normalize(settings.options, this._getOptionsContext());
+    return { ...settings, options };
   }
 
   /**
-   * Validate custom page colors against the shared selectable page domain.
-   *
-   * `importSettings` validates one settings object against two page rules: its
-   * `selectedPages` through `_requireExactFormSettings` above, and its
-   * `customPageColors` here. Those have to be the same rule. This one used to
-   * resolve its domain from `this._pageSelector._getPages()` — the widget's
-   * current view — which agrees with `selectablePageIdSet` only because every
-   * form-based selector happens to be built with `includeDerivedPages: true`
-   * (`correlation-analysis-ui.js:441`, `gene-signature-ui.js:360`). That option
-   * defaults to `false` (`page-selector.js:168`), so the next selector built
-   * without it would have accepted a rest-of page as a selection and refused a
-   * colour for the very same page, out of one saved session.
-   *
-   * The selector is still required, because `_applyCustomPageColors` is what
-   * consumes the result and `importSettings` must fail before it mutates
-   * anything rather than half-way through applying.
+   * Validate custom page colors against the shared selectable page domain
+   * (the one `_requireSettings` judges `selectedPages` by): a session cannot
+   * hold a page it may select and may not colour.
    *
    * @param {unknown} entries
    * @returns {Array<[string, string]>}
@@ -401,15 +531,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       throw new TypeError('Custom page colors must be an array');
     }
     if (!this._pageSelector) {
-      throw new Error(
-        'Custom page color settings require an initialized page selector'
-      );
+      throw new Error('Custom page color settings require an initialized page selector');
     }
     const pages = this.dataLayer.getPages();
     if (!Array.isArray(pages)) {
-      throw new TypeError(
-        'Form-based analysis page inventory must be an array'
-      );
+      throw new TypeError('Form-based analysis page inventory must be an array');
     }
     const availablePageIds = selectablePageIdSet(pages);
     const colors = [];
@@ -423,18 +549,14 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         typeof entry[1] !== 'string' ||
         !/^#[0-9a-fA-F]{6}$/.test(entry[1])
       ) {
-        throw new TypeError(
-          'Custom page colors must contain [pageId, #rrggbb] pairs'
-        );
+        throw new TypeError('Custom page colors must contain [pageId, #rrggbb] pairs');
       }
       const [pageId, color] = entry;
       if (!availablePageIds.has(pageId)) {
         throw new Error(`Custom color page "${pageId}" was not found`);
       }
       if (seenPageIds.has(pageId)) {
-        throw new TypeError(
-          `Page "${pageId}" has more than one custom color`
-        );
+        throw new TypeError(`Page "${pageId}" has more than one custom color`);
       }
       seenPageIds.add(pageId);
       colors.push([pageId, color]);
@@ -449,9 +571,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _applyCustomPageColors(colors) {
     if (!this._pageSelector) {
-      throw new Error(
-        'Custom page color settings require an initialized page selector'
-      );
+      throw new Error('Custom page color settings require an initialized page selector');
     }
     const state = this._pageSelector.exportState();
     this._pageSelector.importState({
@@ -462,39 +582,38 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Apply settings after the concrete subclass has validated its complete shape.
-   * @param {{ selectedPages: string[], formControls: Object }} settings
-   * @protected
-   */
-  _applyFormSettings(settings) {
-    this.onPageSelectionChange([...settings.selectedPages]);
-    this._applyNamedFormControls(settings.formControls);
-  }
-
-  /**
-   * Export a settings-only snapshot for cloning/copying.
-   * Results (plots/data) are intentionally excluded.
+   * Import a settings snapshot produced by exportSettings().
    * @override
-   */
-  exportSettings() {
-    requirePageIds(this._selectedPages);
-    return {
-      selectedPages: [...this._selectedPages],
-      formControls: this._snapshotNamedFormControls()
-    };
-  }
-
-  /**
-   * Import a settings snapshot previously produced by exportSettings().
-   * @override
-   * @param {{ selectedPages: string[], formControls: Record<string, { type: 'checkbox'|'value', value: string|boolean }> }} settings
    */
   importSettings(settings) {
-    const validated = this._requireExactFormSettings(
-      settings,
-      ['formControls', 'selectedPages']
-    );
-    this._applyFormSettings(validated);
+    const validated = this._requireSettings(settings);
+    const { disclosures, ...viewState } = validated.view;
+    this._disclosures = { more: disclosures.more, groups: [...disclosures.groups] };
+    this._options = validated.options;
+    this._importExtraSettings(validated);
+    this._importViewState(viewState);
+    this.onPageSelectionChange([...validated.selectedPages]);
+  }
+
+  /**
+   * Open with preset options (`ComparisonModule.openAnalysis`): the
+   * defaults with the preset's options over them, and its pages if it names
+   * them.
+   * @param {{options?: Object, selectedPages?: string[]}} preset
+   */
+  async applyPreset(preset) {
+    if (!isPlainRecord(preset)) throw new TypeError(`${this._getTitle()} preset must be an object`);
+    for (const key of Object.keys(preset)) {
+      if (key !== 'options' && key !== 'selectedPages') {
+        throw new TypeError(`${this._getTitle()} preset has no "${key}"`);
+      }
+    }
+    const options = this._getOptionsSchema().withDefaults(preset.options ?? {}, this._getOptionsContext());
+    if (preset.selectedPages !== undefined) {
+      requirePageIds(preset.selectedPages);
+      this.onPageSelectionChange([...preset.selectedPages]);
+    }
+    this._setOptions(options);
   }
 
   // ===========================================================================
@@ -530,22 +649,14 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Extract form values from the form
-   * @abstract
-   * @returns {Object} Form values object
-   */
-  _getFormValues() {
-    throw new Error('_getFormValues() must be implemented by subclass');
-  }
-
-  /**
    * Run the analysis implementation
    * @abstract
-   * @param {Object} formValues - Values from _getFormValues()
+   * @param {Object} options - The validated options record
    * @param {number} requestId - Current analysis request generation
-   * @returns {Promise<Object>} Analysis result object
+   * @param {import('../../../../jobs/cancellable-job.js').CancellableJob} job
+   * @returns {Promise<Object|null>} Analysis result object
    */
-  async _runAnalysisImpl(formValues, requestId) {
+  async _runAnalysisImpl(options, requestId, job) {
     throw new Error('_runAnalysisImpl() must be implemented by subclass');
   }
 
@@ -562,14 +673,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return 'form-analysis';
   }
 
-  /**
-   * Get loading notification message
-   * Override for custom message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    return 'Running analysis...';
-  }
 
   /**
    * Get success notification message
@@ -578,25 +681,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _getSuccessMessage() {
     return 'Analysis complete';
-  }
-
-  /**
-   * Get run button text
-   * Override for custom text
-   * @returns {string}
-   */
-  _getRunButtonText() {
-    return 'Run Analysis';
-  }
-
-  /**
-   * Validate form values before running analysis
-   * Override for custom validation
-   * @param {Object} formValues - Values from _getFormValues()
-   * @returns {{ valid: boolean, error?: string }}
-   */
-  _validateForm(formValues) {
-    return { valid: true };
   }
 
   /**
@@ -629,7 +713,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
   async _ensurePreviewPlotSlot({
     containerId,
-    height = null
+    height = null,
+    minWidth = null
   }) {
     if (!(this._resultContainer instanceof HTMLElement)) {
       throw new TypeError(
@@ -646,15 +731,22 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (height !== null && (!Number.isFinite(height) || height <= 0)) {
       throw new RangeError('Analysis preview height must be positive');
     }
+    if (minWidth !== null && (!Number.isFinite(minWidth) || minWidth <= 0)) {
+      throw new RangeError('Analysis preview minimum width must be positive');
+    }
+    // A plot that needs more room than the panel gives (every name of a dot
+    // plot) is drawn wider, and its frame scrolls across.
+    const sizeHost = host => {
+      if (height !== null) host.style.height = `${height}px`;
+      host.style.minWidth = minWidth === null ? '' : `${minWidth}px`;
+    };
 
     if (
       this._previewPlotSlot != null &&
       this._previewPlotHost?.isConnected !== false &&
       this._previewPlotHost?.parentNode?.parentNode === this._resultContainer
     ) {
-      if (height !== null) {
-        this._previewPlotHost.style.height = `${height}px`;
-      }
+      sizeHost(this._previewPlotHost);
       return this._previewPlotSlot;
     }
 
@@ -671,7 +763,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     const host = document.createElement('div');
     host.className = 'analysis-preview-plot-host';
     host.id = containerId;
-    if (height !== null) host.style.height = `${height}px`;
+    sizeHost(host);
     previewContainer.appendChild(host);
     this._resultContainer.appendChild(previewContainer);
 
@@ -700,6 +792,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @param {string} options.containerId - Exact id for the plot host.
    * @param {boolean} [options.expandable=false] - Offer the full-view control.
    * @param {number|null} [options.height=null] - Fixed preview height in px.
+   * @param {number|null} [options.minWidth=null] - The narrowest the plot is
+   *   drawn, in px: a narrower panel scrolls it across.
    * @param {Function} [options.onRendered] - Plot-slot render callback.
    * @returns {Promise<HTMLElement|null>} The rendered candidate, or null.
    */
@@ -709,6 +803,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     containerId,
     expandable = false,
     height = null,
+    minWidth = null,
     onRendered
   }) {
     if (typeof expandable !== 'boolean') {
@@ -736,7 +831,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     );
     const slot = await this._ensurePreviewPlotSlot({
       containerId,
-      height
+      height,
+      minWidth
     });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
@@ -843,6 +939,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     );
     modal._analysisPlotSlot = slot;
     this._modalPlotSlot = slot;
+    // Whoever creates the slot owns its teardown: closing waits for a
+    // running render to settle before the modal is cleaned up.
+    if (modal._beforeClose == null) {
+      modal._beforeClose = () => this._destroyModalPlotOwner(modal);
+    }
     return slot;
   }
 
@@ -998,6 +1099,55 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
+   * Show a result restored from a session through the same render and
+   * publication path a fresh run takes, so the two draw identically.
+   *
+   * @param {Object} result - The decoded result, shaped as `_runAnalysisImpl`
+   *   returns it.
+   * @param {Object} [options]
+   * @param {() => void} [options.beforePublish] - Restores the state a run
+   *   sets beside its result, after the render and before publication.
+   * @returns {Promise<void>}
+   * @protected
+   */
+  async _restoreAnalysisResult(result, { beforePublish = null } = {}) {
+    if (this._isDestroyed) {
+      throw new Error(`${this.constructor.name} was destroyed before its result was restored`);
+    }
+    if (!isPlainRecord(result) || !Object.hasOwn(result, 'data')) {
+      throw new TypeError('A restored analysis result must be an object with data');
+    }
+    await this._discardFormResult();
+    const requestId = this._startAnalysisRequest();
+    if (requestId === null) {
+      throw new Error(`${this.constructor.name} could not start restoring its result`);
+    }
+    const releaseBusy = this._claimBusy();
+    try {
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        throw new Error(`Restoring the ${this.constructor.name} result was superseded`);
+      }
+      if (beforePublish !== null) beforePublish();
+      await this._publishAnalysisResult(result, requestId);
+      // A restored result was computed from the options restored with it.
+      this._resultInputs = {
+        options: structuredClone(this._requireOptions()),
+        pages: [...this._selectedPages],
+        highlightRevision: this._highlightRevision,
+        visibleDigest: this._visibleCellsDigest()
+      };
+      this._updateStale();
+      if (this.onResultChange !== null && this.onResultChange !== undefined) {
+        this.onResultChange(result);
+      }
+    } finally {
+      releaseBusy();
+      this._finishAnalysisRequest(requestId);
+    }
+  }
+
+  /**
    * Publish a completed analysis as this UI's current result.
    *
    * The overlay used to be bound to whichever result was current when it was
@@ -1048,6 +1198,26 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         { category: 'analysis', title: 'Analysis error' }
       );
     }
+  }
+
+  /**
+   * A gene of a result as a button: choosing it colours the cells by the
+   * gene, through the sidebar's gene selector (`ComparisonModule.colorByGene`).
+   *
+   * @param {string} gene
+   * @returns {HTMLButtonElement}
+   * @protected
+   */
+  _createGeneButton(gene) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'analysis-gene-link';
+    button.textContent = gene;
+    button.title = `Colour cells by ${gene}`;
+    button.addEventListener('click', () => {
+      void this.comparisonModule.colorByGene(gene);
+    });
+    return button;
   }
 
   /**
@@ -1465,6 +1635,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._formContainer.className = `${this._getClassName()}-form-container`;
     this._container.appendChild(this._formContainer);
 
+    // The running, cancelled or failed state of the analysis's job.
+    this._container.appendChild(this._getJobStatusView().root);
+
     // Result container (hidden initially)
     this._resultContainer = document.createElement('div');
     this._resultContainer.className = `${this._getClassName()}-result-container`;
@@ -1476,20 +1649,18 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Render the control panel (form)
+   * Render the form: the lead (a page selector), the options, the Run row.
+   * The options record lives on the UI, so a rebuild (collapsing and opening
+   * the accordion) keeps every choice.
    * @override
    */
   _renderControls() {
-    // Collapsing an analysis accordion and opening it again rebuilds the form,
-    // which threw away every choice the user had made in it — the Marker Genes
-    // mode, statistical method and cache checkbox all snapped back to their
-    // defaults. Carry the named control values across the rebuild.
-    const carriedValues = this._captureFormControlValues();
+    this._optionsForm?.destroy();
+    this._optionsForm = null;
+    this._runRow = null;
     this._formContainer.innerHTML = '';
 
-    // Validate requirements
     const validation = this.validateRequirements(this._selectedPages);
-
     if (!validation.valid) {
       this._formContainer.appendChild(createStatusLine({
         tone: 'warning',
@@ -1498,176 +1669,171 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       return;
     }
 
-    // Create form wrapper
     const wrapper = document.createElement('div');
     wrapper.className = 'analysis-form';
+    this._renderFormLead(wrapper);
 
-    // Let subclass render form controls
-    this._renderFormControls(wrapper);
+    const context = this._getOptionsContext();
+    const schema = this._getOptionsSchema();
+    if (this._options === null) {
+      this._options = schema.defaults(context);
+    } else {
+      this._options = this._reconcileOptions(context);
+    }
+    this._optionsForm = renderOptionsForm({
+      schema,
+      value: this._options,
+      context,
+      view: this._disclosures,
+      onChange: (record, key) => {
+        this._options = record;
+        this._handleOptionsChanged(key);
+      },
+      onViewChange: view => {
+        this._disclosures = view;
+      }
+    });
+    wrapper.appendChild(this._optionsForm.root);
+    this._decorateOptionsForm(this._optionsForm);
 
-    // Scope ids to this UI instance, so a copied window cannot steal the
-    // sidebar's controls through a duplicate id.
-    applyFormControlAccessibility(wrapper, this._controlScope);
-    // Restore before the intent listeners exist: re-stating the values the user
-    // already chose is not a fresh edit and must not schedule an analysis.
-    this._restoreFormControlValues(wrapper, carriedValues);
-
-    const handleInputIntent = () => this._handleFormInputIntent();
-    wrapper.addEventListener('input', handleInputIntent);
-    wrapper.addEventListener('change', handleInputIntent);
-
-    // The run button is the one action that commits this form's work.
-    wrapper.appendChild(createButton({
-      label: this._getRunButtonText(),
+    const runRow = document.createElement('div');
+    runRow.className = 'analysis-run-row';
+    const reason = document.createElement('p');
+    reason.className = 'analysis-run-reason';
+    reason.hidden = true;
+    const button = createButton({
+      label: 'Run',
       variant: 'primary',
       className: 'analysis-run-btn',
       onClick: () => this._runAnalysis()
-    }));
+    });
+    button.setAttribute('aria-label', `Run ${this._getRunNoun()}`);
+    runRow.append(reason, button);
+    wrapper.appendChild(runRow);
+    this._runRow = { button, reason };
 
+    applyFormControlAccessibility(wrapper, this._controlScope);
     this._formContainer.appendChild(wrapper);
+    this._updateRunRow();
   }
 
   /**
-   * Snapshot the current named form-control values, if a form is rendered.
-   *
-   * Unlike {@link _snapshotNamedFormControls} this is lenient: it is used to
-   * carry a user's choices across a rebuild of the same form, so a missing form
-   * is simply "nothing to carry" rather than an error.
-   *
-   * @returns {Map<string, {checkbox: boolean, value: string|boolean}>|null}
+   * Run again after a cancel or a failure: the form's run.
+   * @override
+   */
+  _runAgain() {
+    if (this._isDestroyed) return;
+    this._trackInteractiveTask(this._runAnalysis(), this._getTitle());
+  }
+
+  /** @override */
+  _getJobTitle() {
+    return this._getTitle();
+  }
+
+  /**
+   * Hold the run button at "Running…" until `job` ends or its request is
+   * invalidated.
+   * @param {number} requestId
+   * @param {import('../../../../jobs/cancellable-job.js').CancellableJob} job
    * @protected
    */
-  _captureFormControlValues() {
-    const form = this._formContainer?.querySelector?.('.analysis-form');
-    if (!form) return null;
-    const values = new Map();
-    for (const element of form.querySelectorAll(
-      'input[name], select[name], textarea[name]'
-    )) {
-      const name = element.getAttribute('name');
-      if (typeof name !== 'string' || name.length === 0) continue;
-      if (values.has(name)) continue;
-      values.set(
-        name,
-        element instanceof HTMLInputElement && element.type === 'checkbox'
-          ? { checkbox: true, value: element.checked }
-          : { checkbox: false, value: element.value }
-      );
-    }
-    return values;
+  _holdRunButton(requestId, job) {
+    const runBtn = this._runRow?.button ?? null;
+    if (runBtn === null) return;
+    runBtn.disabled = true;
+    runBtn.dataset.running = 'true';
+    runBtn.textContent = 'Running…';
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      delete runBtn.dataset.running;
+      runBtn.textContent = 'Run';
+      runBtn.disabled = false;
+      this._updateRunRow();
+    };
+    const unsubscribe = job.subscribe(() => {
+      if (job.running) return;
+      unsubscribe();
+      restore();
+    });
+    this._registerAnalysisInvalidationCleanup(requestId, restore);
   }
 
   /**
-   * Re-apply carried values to a freshly rendered form.
-   *
-   * A control that no longer exists, changed kind, or no longer offers the
-   * stored option keeps the new form's default — a selection that is no longer
-   * valid for the current dataset must not survive.
-   *
-   * @param {HTMLElement} root - The freshly rendered form.
-   * @param {Map<string, {checkbox: boolean, value: string|boolean}>|null} values
-   * @protected
-   */
-  _restoreFormControlValues(root, values) {
-    if (values === null || values.size === 0) return;
-    for (const element of root.querySelectorAll(
-      'input[name], select[name], textarea[name]'
-    )) {
-      const stored = values.get(element.getAttribute('name'));
-      if (stored === undefined) continue;
-      const isCheckbox = element instanceof HTMLInputElement
-        && element.type === 'checkbox';
-      if (stored.checkbox !== isCheckbox) continue;
-      if (isCheckbox) {
-        if (element.checked === stored.value) continue;
-        element.checked = stored.value;
-      } else {
-        if (
-          element instanceof HTMLSelectElement &&
-          ![...element.options].some(option => option.value === stored.value)
-        ) {
-          continue;
-        }
-        if (element.value === stored.value) continue;
-        element.value = stored.value;
-      }
-      element.dispatchEvent(new Event(
-        element instanceof HTMLTextAreaElement ? 'input' : 'change',
-        { bubbles: true }
-      ));
-    }
-  }
-
-  /**
-   * Run the analysis with loading state management
+   * Run the analysis as a cancellable job: its status view shows what it is
+   * doing with Cancel; the result is shown only once it is complete.
    */
   async _runAnalysis() {
     if (this._isDestroyed) return;
-    // Get form values
-    const formValues = structuredClone(this._getFormValues());
-
-    // Validate form
-    const validation = this._validateForm(formValues);
-    if (!validation.valid) {
-      if (
-        typeof validation.error !== 'string' ||
-        validation.error.length === 0 ||
-        validation.error !== validation.error.trim()
-      ) {
-        throw new TypeError('Invalid form validation requires an exact error message');
-      }
-      this._invalidateAnalysisRequest();
-      this._notifications.error(validation.error);
+    const options = structuredClone(this._requireOptions());
+    // Run is disabled while a blocker holds; a run started another way (a
+    // preset, "Run again") stops here, saying why on the Run row.
+    if (this._getRunBlocker(options) !== null) {
+      this._updateRunRow();
       return;
     }
+    const pages = [...this._selectedPages];
+    const highlightRevision = this._highlightRevision;
+    const visibleDigest = this._visibleCellsDigest();
 
     const requestId = this._startAnalysisRequest();
     if (requestId === null) return;
     const releaseBusy = this._claimBusy();
-    const discardTask = this._discardFormResult();
-    // Get run button for state management
-    const runBtn = this._formContainer.querySelector('.analysis-run-btn');
+    const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
+    this._holdRunButton(requestId, job);
 
     try {
-      const result = await runAnalysisWithLoadingState({
-        component: this,
-        runButton: runBtn,
-        loadingMessage: this._getLoadingMessage(),
-        successMessage: this._getSuccessMessage(),
-        analysisFunction: async () => {
-          if (discardTask && typeof discardTask.then === 'function') {
-            await discardTask;
-          }
-          if (!this._isCurrentAnalysisRequest(requestId)) return null;
-          return this._runAnalysisImpl(formValues, requestId);
-        },
-        isCurrent: () => this._isCurrentAnalysisRequest(requestId),
-        registerInvalidationCleanup: cleanup =>
-          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
-      });
+      const result = this._isCurrentAnalysisRequest(requestId)
+        ? await this._runAnalysisImpl(options, requestId, job)
+        : null;
 
-      if (result !== null) {
-        if (!isPlainObject(result)) {
-          throw new TypeError('Form-based analysis must return an exact result object');
-        }
-        if (!Object.hasOwn(result, 'data')) {
-          throw new TypeError('Form-based analysis result must contain data');
-        }
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-        await this._showResult(result, requestId);
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-
-        // Publish result/data only after the owned render transaction commits.
-        await this._publishAnalysisResult(result, requestId);
-
-        // Callback
-        if (this.onResultChange !== null && this.onResultChange !== undefined) {
-          if (typeof this.onResultChange !== 'function') {
-            throw new TypeError('onResultChange must be a function');
-          }
-          this.onResultChange(result);
-        }
+      if (result === null || !this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
       }
+      if (!isPlainRecord(result)) {
+        throw new TypeError('Form-based analysis must return an exact result object');
+      }
+      if (!Object.hasOwn(result, 'data')) {
+        throw new TypeError('Form-based analysis result must contain data');
+      }
+      job.step('Drawing the result');
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
+
+      // Publish result/data only after the owned render transaction commits.
+      await this._publishAnalysisResult(result, requestId);
+      this._resultInputs = { options, pages, highlightRevision, visibleDigest };
+      // Display options changed while the run went: drawn now, once.
+      const schema = this._getOptionsSchema();
+      const displayChanged = schema.keys.filter(name =>
+        this._isDisplayOption(name) && !sameOptionValue(options[name], this._options[name]));
+      if (displayChanged.length > 0) {
+        this._resultInputs.options = {
+          ...options,
+          ...Object.fromEntries(displayChanged.map(name => [name, this._options[name]]))
+        };
+        this._finishAnalysisRequest(requestId);
+        await this._redrawForDisplay();
+      }
+      this._updateStale();
+      job.succeed(this._getSuccessMessage(this._lastResult ?? result));
+
+      if (this.onResultChange !== null && this.onResultChange !== undefined) {
+        if (typeof this.onResultChange !== 'function') {
+          throw new TypeError('onResultChange must be a function');
+        }
+        this.onResultChange(result);
+      }
+    } catch (error) {
+      if (!this._isCurrentAnalysisRequest(requestId)) {
+        job.cancel();
+        return;
+      }
+      // The job's status view and notification say why; a cancel is calm.
+      this._failAnalysisJob(job, error);
     } finally {
       releaseBusy();
       this._finishAnalysisRequest(requestId);
@@ -1679,27 +1845,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   // ===========================================================================
 
   /**
-   * Invalidate a manual form request as soon as its displayed inputs change.
-   * @protected
-   */
-  _handleFormInputIntent() {
-    if (this._isDestroyed) return;
-    this._invalidateAnalysisRequest();
-    const cleanup = this._discardFormResult();
-    if (cleanup && typeof cleanup.then === 'function') {
-      void cleanup.catch(error => {
-        this._createModalCloseErrorHandler()(error);
-      });
-    }
-    return cleanup;
-  }
-
-  /**
    * Remove result state and render owners that no longer match the form.
    * @protected
    */
   _discardFormResult() {
     this._optionRenderRevision += 1;
+    this._clearJobStatus();
     const cleanupTasks = [];
     if (this._previewPlotSlot != null) {
       cleanupTasks.push(this._previewPlotSlot.invalidate());
@@ -1711,8 +1862,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         '.analysis-actions'
       );
       if (actions) actions.remove();
+      const staleChip = this._resultContainer.querySelector(':scope > .analysis-stale-chip');
+      if (staleChip !== null) staleChip.remove();
+      this._resultContainer.classList.remove('analysis-result-stale');
       this._resultContainer.hidden = true;
     }
+    this._resultInputs = null;
     if (this._modal) {
       const modal = this._modal;
       const closeTask = closeModal(modal);
@@ -1736,7 +1891,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Update when page selection changes
+   * Update when page selection changes: the shown result is kept and marked
+   * stale; nothing runs.
    * @param {string[]} pageIds - Selected page IDs
    */
   onPageSelectionChange(pageIds) {
@@ -1747,32 +1903,102 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     );
     this._selectedPages = [...pageIds];
     this._currentConfig.pages = this._selectedPages;
-    this._invalidateAnalysisRequest();
-    const cleanup = this._discardFormResult();
-    if (cleanup && typeof cleanup.then === 'function') {
-      void cleanup.catch(error => {
-        this._createModalCloseErrorHandler()(error);
-      });
-    }
     this._renderControls();
-    return cleanup;
+    this._updateStale();
   }
 
   /**
-   * Highlight membership is scientific input for every form-based analysis,
-   * including DE and Marker Genes whose config has no base dataSource field.
+   * Highlight membership is scientific input for every form-based analysis:
+   * a change marks the shown result stale; nothing runs.
    * @override
    */
   onHighlightChanged() {
     this._updatePageSelectorCounts();
-    this._invalidateAnalysisRequest();
-    const cleanup = this._discardFormResult();
-    if (cleanup && typeof cleanup.then === 'function') {
-      void cleanup.catch(error => {
-        this._createModalCloseErrorHandler()(error);
-      });
+    this._highlightRevision += 1;
+    this._refreshOptionsContext();
+    this._updateStale();
+  }
+
+  /**
+   * Whether these options read the cells the view shows ("Visible cells"),
+   * so a filter change is a change of input.
+   * @protected
+   */
+  _scopesByVisibleCells(options) {
+    return options?.cells === 'visible' || options?.within === 'visible';
+  }
+
+  /**
+   * A digest of which cells the view shows (its transparency, one byte a
+   * cell), or null without one. Kept while the transparency array and its
+   * write count are the same, so asking costs a pass over the cells only
+   * after a visibility write.
+   * @protected
+   */
+  _visibleCellsDigest() {
+    const state = this.dataLayer?.state;
+    const transparency = state?.categoryTransparency;
+    if (!(transparency instanceof Uint8Array)) return null;
+    const epoch = state._transparencyEpoch ?? 0;
+    const kept = this._visibleDigestCache;
+    if (kept !== null && kept.array === transparency && kept.epoch === epoch) return kept.digest;
+    // FNV-1a over the bytes, four at a time where the array is aligned.
+    let hash = 0x811c9dc5;
+    const whole = transparency.byteOffset % 4 === 0 ? transparency.length >>> 2 : 0;
+    const words = new Uint32Array(transparency.buffer, transparency.byteOffset, whole);
+    for (let index = 0; index < whole; index++) hash = Math.imul(hash ^ words[index], 0x01000193);
+    for (let index = whole * 4; index < transparency.length; index++) {
+      hash = Math.imul(hash ^ transparency[index], 0x01000193);
     }
-    return cleanup;
+    const digest = `${transparency.length}:${(hash >>> 0).toString(16)}`;
+    this._visibleDigestCache = { array: transparency, epoch, digest };
+    return digest;
+  }
+
+  /**
+   * Whether the set of visible cells changed since the form last caught up
+   * with it. @returns {boolean}
+   * @private
+   */
+  _syncVisibleCells() {
+    const digest = this._visibleCellsDigest();
+    if (digest === this._seenVisibleDigest) return false;
+    this._seenVisibleDigest = digest;
+    return true;
+  }
+
+  /**
+   * A visibility pass ran (a filter, or a recolour). Only an analysis scoped
+   * to "Visible cells" reads the shown cells, and only a change of them is a
+   * change of its input: its groups are read again and its result is stale.
+   */
+  onCellVisibilityChanged() {
+    if (!this._scopesByVisibleCells(this._options)) return;
+    if (!this._syncVisibleCells()) return;
+    this._refreshOptionsContext();
+    this._updateStale();
+  }
+
+  /**
+   * An input changed while another mode is shown: recorded now (so nothing
+   * cached from before is reused), brought up to date when shown (`onShown`).
+   *
+   * @param {'highlight'|'cell-visibility'} kind
+   */
+  noteHiddenChange(kind) {
+    if (kind === 'highlight') this._highlightRevision += 1;
+    else if (kind !== 'cell-visibility') throw new RangeError(`Unknown analysis input change: ${String(kind)}`);
+    this._missedInputChange = true;
+  }
+
+  /** Shown again: catch up with the changes recorded while hidden. */
+  onShown() {
+    if (!this._missedInputChange) return;
+    this._missedInputChange = false;
+    if (this._scopesByVisibleCells(this._options)) this._syncVisibleCells();
+    this._updatePageSelectorCounts();
+    this._refreshOptionsContext();
+    this._updateStale();
   }
 
   // ===========================================================================
@@ -1825,6 +2051,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
           .map(outcome => outcome.reason)
       );
 
+      this._optionsForm?.destroy();
+      this._optionsForm = null;
+      this._runRow = null;
       this._previewPlotSlot = null;
       this._previewPlotHost = null;
       this._modalPlotSlot = null;

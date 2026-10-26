@@ -13,8 +13,8 @@ import {
   assertGenerationResponse,
   FETCHED_PATTERNS
 } from './generation-contract.js';
-
-const WORKER_URL = new URL('./generation-worker.js', import.meta.url).href;
+import { benchmarkGenerationWorkerScript } from '../../../../../workers/scripts.js';
+import { startWorker } from '../../../../workers/worker-script.js';
 
 /**
  * Generate a synthetic dataset without blocking the main thread.
@@ -75,7 +75,7 @@ export function generateSyntheticDataOffThread(options = {}) {
   }
 
   return new Promise((resolve, reject) => {
-    const worker = new Worker(WORKER_URL, { type: 'module' });
+    const worker = startWorker(benchmarkGenerationWorkerScript(), { type: 'module' });
     let settled = false;
     const finish = (settle, value) => {
       if (settled) return;

@@ -20,28 +20,19 @@ import {
 } from '../../../../data/categorical-storage-contract.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
-import { getCategoryColor } from '../../../../data/palettes.js';
+import { carryCategoryStateByCategory } from '../../../utils/categorical-ops.js';
 import {
   createDatasetFieldLoadSupersededError
 } from './loading.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
+import { requireFields } from './overlay-internals.js';
+import { requireObjectKeys, requireObjectRecord } from '../../../../utils/exact-record.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
     throw new TypeError('Field source must be exactly obs or var');
   }
   return source;
-}
-
-function requireRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-  ) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  return value;
 }
 
 function requireMethod(owner, methodName, label) {
@@ -73,7 +64,7 @@ function requireIdentifier(value, label) {
 }
 
 function requireField(field, label) {
-  requireRecord(field, label);
+  requireObjectRecord(field, label);
   StateValidator.validateFieldKey(field.key);
   if (
     field.kind !== FieldKind.CATEGORY
@@ -90,14 +81,8 @@ function requireInventory(owner, source, { allowAbsent = false } = {}) {
     ? owner.varData
     : owner.obsData;
   if (allowAbsent && data === null) return [];
-  requireRecord(data, `${source} field data`);
-  if (!Array.isArray(data.fields)) {
-    throw new TypeError(`${source} field inventory must be an array`);
-  }
-  data.fields.forEach((field, index) => {
-    requireField(field, `${source} field inventory[${index}]`);
-  });
-  return data.fields;
+  requireObjectRecord(data, `${source} field data`);
+  return requireFields(data.fields, `${source} field inventory`);
 }
 
 function requireFieldAt(owner, source, fieldIndex) {
@@ -183,13 +168,7 @@ function requireUserDefinedOwner(owner) {
 }
 
 function requireExactOptions(options, allowedKeys, label) {
-  requireRecord(options, label);
-  for (const key of Object.keys(options)) {
-    if (!allowedKeys.has(key)) {
-      throw new TypeError(`${label} contains unknown key "${key}"`);
-    }
-  }
-  return options;
+  return requireObjectKeys(options, [], allowedKeys, label);
 }
 
 function readDatasetGeneration(owner) {
@@ -295,6 +274,8 @@ export class FieldOverlayPublicMethods {
     const varFields = this.varData === null
       ? null
       : requireInventory(this, FieldSource.VAR);
+    // Each inventory reads only the fields edited since it last showed the
+    // registries (overlay-internals.js).
     this._applyOverlaysToFields(obsFields, FieldSource.OBS);
     this._applyOverlaysToFields(varFields, FieldSource.VAR);
     this._injectUserDefinedFields();
@@ -370,7 +351,8 @@ export class FieldOverlayPublicMethods {
 
     this._propagateRenameToViewContexts(src, field);
     this._refreshHighlightGroupsForField(src, fieldIndex);
-    getFieldRegistry().invalidate();
+    // The field registry indexes fields by their original keys, which a
+    // rename keeps: it stays valid.
     this.updateFilterSummary();
     this._syncActiveContext();
     this._refreshInactiveViewLabels();
@@ -514,7 +496,9 @@ export class FieldOverlayPublicMethods {
     }
 
     getFieldRegistry().invalidate();
-    if (!wasActive) this.computeGlobalVisibility();
+    // Every obs field's filter takes part in which cells are shown; a gene's
+    // only while it colours the view, and clearing it has recomputed them.
+    if (!wasActive && src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { originalKey });
     return true;
@@ -538,37 +522,24 @@ export class FieldOverlayPublicMethods {
     }
     if (field._isPurged === true) return true;
 
-    const isUserDefined = field._isUserDefined === true;
-
-    if (isUserDefined) {
-      const fieldId = requireIdentifier(
-        field._userDefinedId,
-        'User-defined field id'
-      );
-      const registry = requireUserDefinedOwner(this);
-      const template = requireField(
-        registry.getField(fieldId),
-        'User-defined field template'
-      );
-      if (template._userDefinedId !== fieldId) {
-        throw new Error('User-defined field template ownership is inconsistent');
-      }
-      field._isPurged = true;
-      template._isDeleted = true;
-      template._isPurged = true;
-    } else {
-      const originalKey = requireOriginalKey(field);
-      this._deleteRegistry.markPurged(src, originalKey);
-      field._isDeleted = true;
-      field._isPurged = true;
+    if (field._isUserDefined === true) {
+      // The registry owns a user-defined field's storage and releases it
+      // (`purgeUserDefinedField`); flags alone left its codes resident.
+      requireIdentifier(field._userDefinedId, 'User-defined field id');
+      return this.purgeUserDefinedField(field._userDefinedId, src);
     }
+
+    const originalKey = requireOriginalKey(field);
+    this._deleteRegistry.markPurged(src, originalKey);
+    field._isDeleted = true;
+    field._isPurged = true;
 
     getFieldRegistry().invalidate();
     this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, {
       purged: true,
-      userDefinedId: isUserDefined ? field._userDefinedId : null
+      userDefinedId: null
     });
     return true;
   }
@@ -645,7 +616,9 @@ export class FieldOverlayPublicMethods {
     }
 
     getFieldRegistry().invalidate();
-    this.computeGlobalVisibility();
+    // A restored gene colours no view, so only an obs field's filter can
+    // change which cells are shown.
+    if (src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.RESTORE, {
       originalKey,
@@ -918,7 +891,7 @@ export class FieldOverlayPublicMethods {
 
       let sourceKey = requireOriginalKey(field);
       if (Object.hasOwn(field, '_sourceField') && field._sourceField !== null) {
-        requireRecord(field._sourceField, 'Categorical source descriptor');
+        requireObjectRecord(field._sourceField, 'Categorical source descriptor');
         sourceKey = requireIdentifier(
           field._sourceField.sourceKey,
           'Categorical source descriptor.sourceKey'
@@ -945,7 +918,7 @@ export class FieldOverlayPublicMethods {
         },
         this
       );
-      requireRecord(created, 'Categorical duplicate creation result');
+      requireObjectRecord(created, 'Categorical duplicate creation result');
       const createdId = requireIdentifier(
         created.id,
         'Categorical duplicate field id'
@@ -972,7 +945,7 @@ export class FieldOverlayPublicMethods {
           'Categorical duplicate source colors must match its categories'
         );
       }
-      requireRecord(
+      requireObjectRecord(
         field._categoryVisible,
         'Categorical duplicate source visibility'
       );
@@ -1027,7 +1000,7 @@ export class FieldOverlayPublicMethods {
           _operation: { type: 'copy-field', source: src, sourceKey }
         }
       });
-      requireRecord(created, 'Continuous duplicate creation result');
+      requireObjectRecord(created, 'Continuous duplicate creation result');
       const createdId = requireIdentifier(
         created.id,
         'Continuous duplicate field id'
@@ -1070,7 +1043,7 @@ export class FieldOverlayPublicMethods {
         '_positiveStats'
       ]) {
         if (Object.hasOwn(field, key)) {
-          aliasField[key] = { ...requireRecord(field[key], key) };
+          aliasField[key] = { ...requireObjectRecord(field[key], key) };
         }
       }
       for (const key of [
@@ -1297,49 +1270,6 @@ export class FieldOverlayPublicMethods {
 
       const { centroidsByLayout, normalizedLayouts } =
         registry.computeCentroidsByLayout(codes, categories, this);
-      this.ensureCategoryMetadata(existing);
-      const oldIndexByCategory = new Map();
-      for (
-        let categoryIndex = 0;
-        categoryIndex < existing.categories.length;
-        categoryIndex++
-      ) {
-        oldIndexByCategory.set(
-          existing.categories[categoryIndex],
-          categoryIndex
-        );
-      }
-      const categoryColors = new Array(categories.length);
-      const categoryVisible = {};
-      for (
-        let categoryIndex = 0;
-        categoryIndex < categories.length;
-        categoryIndex++
-      ) {
-        const previousIndex = oldIndexByCategory.get(
-          categories[categoryIndex]
-        );
-        if (previousIndex === undefined) {
-          categoryColors[categoryIndex] = getCategoryColor(categoryIndex);
-          categoryVisible[categoryIndex] = true;
-        } else {
-          const previousColor = existing._categoryColors[previousIndex];
-          if (
-            !Array.isArray(previousColor)
-            || previousColor.length !== 3
-            || previousColor.some(channel => !Number.isFinite(channel))
-          ) {
-            throw new TypeError(
-              `Existing category color ${previousIndex} is invalid`
-            );
-          }
-          categoryColors[categoryIndex] = [...previousColor];
-          categoryVisible[categoryIndex] = requireBoolean(
-            existing._categoryVisible[previousIndex],
-            `Existing category visibility ${previousIndex}`
-          );
-        }
-      }
       const sourceField = (
         meta === undefined
         || !Object.hasOwn(meta, '_sourceField')
@@ -1353,43 +1283,29 @@ export class FieldOverlayPublicMethods {
         ? existing._operation
         : meta._operation;
       if (sourceField !== null) {
-        requireRecord(sourceField, 'User-defined categorical source metadata');
+        requireObjectRecord(sourceField, 'User-defined categorical source metadata');
       }
       if (operation !== null) {
-        requireRecord(operation, 'User-defined categorical operation metadata');
+        requireObjectRecord(operation, 'User-defined categorical operation metadata');
       }
-      const updated = requireBoolean(
-        registry.updateField(fieldId, {
-          categories: [...categories],
-          codes,
-          centroidsByLayout,
-          normalizedLayouts,
-          sourceField,
-          operation
-        }),
-        'User-defined categorical template update result'
-      );
-      if (!updated) {
-        throw new Error(
-          'User-defined categorical template update did not complete'
-        );
-      }
+      const nextCategories = [...categories];
+      this.ensureCategoryMetadata(existing);
+      // Every view's copy of the column takes the new definition; each keeps
+      // the colour and visibility of every category it already had.
+      this._publishUserDefinedCategorical(fieldId, {
+        categories: nextCategories,
+        codes,
+        centroidsByLayout,
+        normalizedLayouts,
+        sourceField,
+        operation
+      }, state => carryCategoryStateByCategory(state.categories, nextCategories, state));
 
-      existing.categories = [...categories];
-      existing.codes = codes;
-      existing.centroidsByLayout = centroidsByLayout;
-      existing._normalizedLayouts = normalizedLayouts;
-      existing.loaded = true;
-      existing._sourceField = sourceField;
-      existing._operation = operation;
-      existing._categoryColors = categoryColors;
-      existing._categoryVisible = categoryVisible;
-      delete existing._categoryCounts;
-      delete existing.outlierQuantiles;
-      delete existing._outlierThreshold;
-
-      getFieldRegistry().invalidate();
       this._syncActiveContext();
+      // Every view that shows the column, or hides some of its categories, is
+      // drawn again from its new codes: its colours, and its centroids, which
+      // a category gains with its first cell and loses with its last.
+      this._redrawViewsUsingUserDefinedField(fieldId, { includeFocused: true });
       this._notifyFieldChange(
         FieldSource.OBS,
         existingIndex,
@@ -1409,7 +1325,7 @@ export class FieldOverlayPublicMethods {
       },
       this
     );
-    requireRecord(created, 'User-defined categorical creation result');
+    requireObjectRecord(created, 'User-defined categorical creation result');
     const createdId = requireIdentifier(
       created.id,
       'User-defined categorical creation id'

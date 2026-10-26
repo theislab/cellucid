@@ -2,11 +2,11 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function observeProductErrors(page) {
@@ -46,16 +46,27 @@ async function installExportProbe(page) {
       return createObjectURL(blob);
     };
 
-    const canvasToBlob = HTMLCanvasElement.prototype.toBlob;
-    HTMLCanvasElement.prototype.toBlob = function toBlob(callback, ...args) {
-      return canvasToBlob.call(this, blob => {
-        events.push({
-          kind: 'canvas-blob-ready',
-          type: blob?.type ?? null,
-          size: blob?.size ?? null,
-        });
-        callback(blob);
-      }, ...args);
+    // Every encode runs in the figure-export worker; its answers are
+    // recorded as they reach the page.
+    const NativeWorker = window.Worker;
+    window.Worker = class RecordingWorker extends NativeWorker {
+      set onmessage(handler) {
+        super.onmessage = handler === null ? null : (event) => {
+          const result = event.data?.result;
+          if (result instanceof Blob) {
+            events.push({
+              kind: 'worker-blob-ready',
+              type: result.type,
+              size: result.size,
+            });
+          }
+          handler(event);
+        };
+      }
+
+      get onmessage() {
+        return super.onmessage;
+      }
     };
   });
 }
@@ -67,7 +78,7 @@ async function openFigureExport(page, acceptance) {
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells',
@@ -215,8 +226,8 @@ function assertCurrentMetadata(metadata, {
     website: 'https://cellucid.com',
   });
   expect(Number.isFinite(Date.parse(metadata.exportedAt))).toBe(true);
-  expect(metadata.dataset.name).toBe('Current UI prepared fixture');
-  expect(metadata.dataset.id).toBe('current-ui-prepared');
+  expect(metadata.dataset.name).toBe('Current UI fixture');
+  expect(metadata.dataset.id).toBe('current-ui');
   // Provenance names every exported panel; a single-view export carries one
   // record and no panel letter, and the "no filters" placeholder is not a
   // filter.
@@ -279,7 +290,7 @@ function assertSvgArtifact(bytes, strategy) {
   }
 }
 
-test('export cancellation settles native canvas work and cleans download staging', async ({
+test('export cancellation settles worker work and cleans download staging', async ({
   page,
 }, testInfo) => {
   await page.goto(
@@ -290,36 +301,27 @@ test('export cancellation settles native canvas work and cleans download staging
   );
 
   const result = await page.evaluate(async () => {
-    const { canvasToBlob } = await import(
-      '/assets/js/app/ui/modules/figure-export/utils/export-helpers.js'
+    const { openFigureExportWorkerSession } = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
     );
     const { downloadBlob } = await import('/assets/js/app/utils/download.js');
 
-    let lateCanvasCallback = null;
-    const canvasController = new AbortController();
-    const canvasPromise = canvasToBlob(
-      {
-        toBlob(callback, type) {
-          if (type !== 'image/png') {
-            throw new Error(`Unexpected canvas type: ${type}`);
-          }
-          lateCanvasCallback = callback;
-        },
-      },
-      'image/png',
-      {
-        signal: canvasController.signal,
-        failureMessage: 'Browser cancellation fixture failed.',
-      }
-    );
-    canvasController.abort();
-    let canvasAbortName = null;
+    // A worker request settles at the abort; the worker's late answer is
+    // discarded and the worker keeps serving the next export.
+    const workerController = new AbortController();
+    const aborted = openFigureExportWorkerSession({ signal: workerController.signal });
+    const workerPromise = aborted.request('spriteZoomLimit', {});
+    workerController.abort();
+    let workerAbortName = null;
     try {
-      await canvasPromise;
+      await workerPromise;
     } catch (error) {
-      canvasAbortName = error?.name ?? null;
+      workerAbortName = error?.name ?? null;
     }
-    lateCanvasCallback(new Blob(['late'], { type: 'image/png' }));
+    aborted.close();
+    const next = openFigureExportWorkerSession();
+    const workerServesNext = Number.isFinite(await next.request('spriteZoomLimit', {}));
+    next.close();
 
     const downloadController = new AbortController();
     const originalAppendChild = document.body.appendChild;
@@ -368,7 +370,8 @@ test('export cancellation settles native canvas work and cleans download staging
 
     return {
       ...calls,
-      canvasAbortName,
+      workerAbortName,
+      workerServesNext,
       downloadAbortName,
       danglingAnchors:
         document.querySelectorAll('a[download="cancelled.svg"]').length,
@@ -376,7 +379,8 @@ test('export cancellation settles native canvas work and cleans download staging
   });
 
   expect(result).toEqual({
-    canvasAbortName: 'AbortError',
+    workerAbortName: 'AbortError',
+    workerServesNext: true,
     clicks: 0,
     createdUrls: 1,
     danglingAnchors: 0,
@@ -399,18 +403,33 @@ test('figure-export UI teardown aborts a pending renderer without download or te
   page.on('download', download => {
     downloads.push(download.suggestedFilename());
   });
+  // Hold the worker's encoded PNG: the renderer is then pending on it.
   await page.evaluate(() => {
-    window.__figureExportNativeToBlob =
-      HTMLCanvasElement.prototype.toBlob;
-    window.__figureExportLateToBlob = null;
-    HTMLCanvasElement.prototype.toBlob = function holdToBlob(callback) {
-      window.__figureExportLateToBlob = callback;
+    window.__figureExportNativeWorker = window.Worker;
+    window.__figureExportLateEncode = null;
+    window.Worker = class HoldingWorker extends window.__figureExportNativeWorker {
+      set onmessage(handler) {
+        super.onmessage = handler === null ? null : (event) => {
+          if (
+            event.data?.result instanceof Blob &&
+            event.data.result.type === 'image/png'
+          ) {
+            window.__figureExportLateEncode = () => handler(event);
+            return;
+          }
+          handler(event);
+        };
+      }
+
+      get onmessage() {
+        return super.onmessage;
+      }
     };
   });
 
   await page.locator('#figure-export-btn').click();
   await page.waitForFunction(
-    () => typeof window.__figureExportLateToBlob === 'function'
+    () => typeof window.__figureExportLateEncode === 'function'
   );
   await page.evaluate(() => {
     const controls = document.querySelector('#figure-export-controls');
@@ -420,12 +439,11 @@ test('figure-export UI teardown aborts a pending renderer without download or te
     controls.__cellucidCleanup();
   });
   await page.evaluate(() => {
-    const callback = window.__figureExportLateToBlob;
-    HTMLCanvasElement.prototype.toBlob =
-      window.__figureExportNativeToBlob;
-    callback(new Blob(['late encoder result'], { type: 'image/png' }));
-    delete window.__figureExportLateToBlob;
-    delete window.__figureExportNativeToBlob;
+    const deliver = window.__figureExportLateEncode;
+    window.Worker = window.__figureExportNativeWorker;
+    deliver();
+    delete window.__figureExportLateEncode;
+    delete window.__figureExportNativeWorker;
   });
 
   await page.waitForTimeout(500);
@@ -703,6 +721,65 @@ test('exports PNG and every explicit SVG strategy through the visible UI', async
   expect(productErrors).toEqual([]);
 });
 
+test('the point pass drawn on the page equals the one drawn in the worker', async ({
+  page,
+}, testInfo) => {
+  // A browser whose workers have no WebGL2 (WebKitGTK, WPE) draws the point
+  // pass on the page, with the same handler. Here both placements export the
+  // same view: the Hybrid SVG's point raster is the same PNG, and the PNG
+  // export completes.
+  const productErrors = observeProductErrors(page);
+  await installExportProbe(page);
+  await openFigureExport(page, `figure-export-point-pass-${testInfo.project.name}`);
+  const pointRasters = svg => [...svg.toString('utf8').matchAll(
+    /<image [^>]*href="(data:image\/png;base64,[A-Za-z0-9+/=]+)"/g,
+  )].map(match => match[1]);
+  const placement = () => page.evaluate(async () => {
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
+    );
+    return client.figureExportRasterizesOnPage();
+  });
+
+  const first = await exportOne({
+    page,
+    testInfo,
+    mode: 'svg',
+    strategy: 'hybrid',
+    artifactLabel: `${testInfo.project.name}-point-pass-measured`,
+  });
+  // The worker was asked; on this engine it answered either way.
+  expect(typeof await placement()).toBe('boolean');
+
+  await page.evaluate(async () => {
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
+    );
+    client.setFigureExportWorkerWebgl2(false);
+  });
+  expect(await placement()).toBe(true);
+  const onPage = await exportOne({
+    page,
+    testInfo,
+    mode: 'svg',
+    strategy: 'hybrid',
+    artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
+  });
+  assertSvgArtifact(onPage.bytes, 'hybrid');
+  expect(pointRasters(onPage.bytes)).toEqual(pointRasters(first.bytes));
+  expect(pointRasters(onPage.bytes).length).toBeGreaterThan(0);
+
+  const png = await exportOne({
+    page,
+    testInfo,
+    mode: 'png',
+    strategy: null,
+    artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
+  });
+  assertPngArtifact(png.bytes);
+  expect(productErrors).toEqual([]);
+});
+
 test('exports the sculpted shader quality as PNG and every SVG strategy', async ({
   page,
 }, testInfo) => {
@@ -902,7 +979,7 @@ test('delivers the staged SVG and PNG batch as one atomic ZIP', async ({
   );
   const pngReadyIndex = events.findIndex(
     event => (
-      event.kind === 'canvas-blob-ready' &&
+      event.kind === 'worker-blob-ready' &&
       event.type === 'image/png'
     ),
   );

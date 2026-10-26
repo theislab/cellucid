@@ -92,21 +92,6 @@ export function writeFogUniforms(
   }
 }
 
-/**
- * The transmittance `fogTransmittance` returns, in JavaScript, for the
- * consumers that reproduce fog outside a shader (the figure export's vector
- * strategies).
- *
- * @param {number} viewDistance
- * @param {number} fogDensity
- * @param {number} fogNear
- * @param {number} fogFar
- * @returns {number}
- */
-export function fogTransmittanceAt(viewDistance, fogDensity, fogNear, fogFar) {
-  return 2 ** (-fogScale(fogDensity, fogNear, fogFar) * Math.max(viewDistance - fogNear, 0));
-}
-
 /** `fogOpacity` in JavaScript. */
 export function fogOpacityAt(transmittance) {
   return transmittance * (0.1 + 0.9 * transmittance);

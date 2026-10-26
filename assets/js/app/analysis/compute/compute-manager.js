@@ -6,7 +6,11 @@
  * backend does not change the scientific contract. An execution error is
  * returned unchanged to the caller.
  *
- * A terminal worker pool (crash, timeout, or running-task abort) fails the
+ * Every operation takes a `signal`: aborting it rejects the operation with
+ * an `AbortError` at once and stops its work (`worker-pool.js`); it is not
+ * a failure and never retires the pool.
+ *
+ * A terminal worker pool (crash or timeout) fails the
  * operations it owned and is then retired: `getStatus()` keeps reporting the
  * failure, and the next `init()` or `execute()` discovers a fresh pool rather
  * than rejecting every later worker operation until the page reloads.
@@ -19,12 +23,17 @@ import {
 } from './operations.js';
 import { executeOperation } from './operation-handlers.js';
 import { debug } from '../shared/debug-utils.js';
+// A cancelled operation never starts.
+import { throwIfAborted } from '../../jobs/cancellable-job.js';
+import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 let workerPoolModule = null;
 let computeManagerInstance = null;
 
 const BACKENDS = new Set(['worker', 'cpu']);
-const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer']);
+const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer', 'onTiming', 'worker']);
+const BROADCAST_OPTIONS = new Set([...EXECUTION_OPTIONS, 'retainAs', 'releases']);
 
 function now() {
   if (
@@ -39,18 +48,6 @@ function now() {
     throw new Error('performance.now() returned an invalid timestamp');
   }
   return timestamp;
-}
-
-function requirePlainRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
-  return value;
 }
 
 /**
@@ -128,7 +125,7 @@ export class ComputeManager {
       this._workerStatus = BackendStatus.AVAILABLE;
       debug(
         'ComputeManager',
-        `Worker pool available: ${pool.getStats().poolSize} workers`
+        `Worker pool available: ${formatCountOf(pool.getStats().poolSize, 'worker')}`
       );
     } catch (error) {
       const failure = error instanceof Error
@@ -158,14 +155,9 @@ export class ComputeManager {
     this._initialized = false;
   }
 
-  _validateExecutionOptions(options) {
-    requirePlainRecord(options, 'Execution options');
-
-    for (const key of Object.keys(options)) {
-      if (!EXECUTION_OPTIONS.has(key)) {
-        throw new Error(`Unknown execution option: ${key}`);
-      }
-    }
+  _validateExecutionOptions(options, allowed = EXECUTION_OPTIONS) {
+    requireClonedRecord(options, 'Execution options');
+    requireKeys(options, [], allowed, 'Execution options');
     if (Object.hasOwn(options, 'backend') && !BACKENDS.has(options.backend)) {
       throw new TypeError(`Unknown compute backend: ${options.backend}`);
     }
@@ -187,6 +179,18 @@ export class ComputeManager {
       && typeof options.transfer !== 'boolean'
     ) {
       throw new TypeError('Compute transfer must be exactly boolean');
+    }
+    if (
+      Object.hasOwn(options, 'onTiming')
+      && typeof options.onTiming !== 'function'
+    ) {
+      throw new TypeError('Compute onTiming must be a function');
+    }
+    if (
+      Object.hasOwn(options, 'worker')
+      && (!Number.isSafeInteger(options.worker) || options.worker < 0)
+    ) {
+      throw new TypeError('Compute worker must be a non-negative safe integer');
     }
   }
 
@@ -255,17 +259,22 @@ export class ComputeManager {
   }
 
   /**
-   * Execute an operation exactly once on its preselected backend.
+   * Execute an operation exactly once on its preselected backend. `worker`
+   * runs it on that analysis worker: a task whose genes were delivered there
+   * over a gene route (`analysis/data/gene-route.js`).
    */
   async execute(operation, payload, options = {}) {
     this._validateExecutionOptions(options);
     await this.init();
 
     const backend = this.selectBackend(operation, options.backend);
+    if (options.worker !== undefined && backend !== 'worker') {
+      throw new Error(`A task for analysis worker ${options.worker} runs on the worker backend, not ${backend}`);
+    }
     const startedAt = now();
     const result = await this._executeOnBackend(backend, operation, payload, options);
     const elapsedMs = now() - startedAt;
-    requirePlainRecord(result, `Compute result for ${operation}`);
+    requireClonedRecord(result, `Compute result for ${operation}`);
 
     return {
       ...result,
@@ -277,12 +286,55 @@ export class ComputeManager {
     };
   }
 
+  /**
+   * Run an operation once on every compute thread of the selected backend —
+   * each analysis worker, or this thread for the CPU backend — for state an
+   * operation holds there (a run's groups) before the run's per-gene work.
+   *
+   * @param {string} operation
+   * @param {(threadIndex: number) => Object} payloadFor - A payload per thread
+   *   (each is transferred, so each must own its buffers)
+   * `retainAs` / `releases` name state a worker keeps for later tasks, which
+   * a worker replaced after a cancelled task gets again (`WorkerPool.broadcast`).
+   *
+   * @param {{backend?: 'worker'|'cpu', timeout?: number, signal?: AbortSignal|null, retainAs?: string, releases?: string}} [options]
+   * @returns {Promise<Object[]>} One result per thread
+   */
+  async broadcast(operation, payloadFor, options = {}) {
+    this._validateExecutionOptions(options, BROADCAST_OPTIONS);
+    if (typeof payloadFor !== 'function') {
+      throw new TypeError('Broadcast payloads must come from a function of the thread index');
+    }
+    await this.init();
+    const backend = this.selectBackend(operation, options.backend);
+    if (backend === 'cpu') {
+      throwIfAborted(options.signal);
+      return [executeOperation(operation, payloadFor(0))];
+    }
+    const pool = this._workerBackend;
+    if (!pool) throw new Error('Web Worker backend is unavailable');
+    const { timeout = 30000, signal = null, retainAs, releases } = options;
+    const kept = {};
+    if (retainAs !== undefined) kept.retainAs = retainAs;
+    if (releases !== undefined) kept.releases = releases;
+    try {
+      return await pool.broadcast(operation, payloadFor, { timeout, signal, ...kept });
+    } finally {
+      this._retireTerminalWorker();
+    }
+  }
+
   async _executeOnBackend(backend, operation, payload, options) {
     switch (backend) {
       case 'worker':
         return this._executeWorker(operation, payload, options);
-      case 'cpu':
-        return this._executeCPU(operation, payload);
+      case 'cpu': {
+        throwIfAborted(options.signal);
+        const startedAt = now();
+        const result = await this._executeCPU(operation, payload);
+        options.onTiming?.({ queueMs: 0, runMs: now() - startedAt });
+        return result;
+      }
       default:
         throw new Error(`Unknown compute backend: ${backend}`);
     }
@@ -294,14 +346,27 @@ export class ComputeManager {
       throw new Error('Web Worker backend is unavailable');
     }
 
-    const { timeout = 30000, signal = null, transfer } = options;
+    const { timeout = 30000, signal = null, transfer, onTiming, worker } = options;
     const workerOptions = { timeout, signal };
     if (transfer !== undefined) workerOptions.transfer = transfer;
+    if (onTiming !== undefined) workerOptions.onTiming = onTiming;
     try {
-      return await backend.execute(operation, payload, workerOptions);
+      return worker === undefined
+        ? await backend.execute(operation, payload, workerOptions)
+        : await backend.executeOnWorker(worker, operation, payload, workerOptions);
     } finally {
       this._retireTerminalWorker();
     }
+  }
+
+  /**
+   * The worker pool behind the worker backend, for a run that opens a gene
+   * route to its workers; null when the worker backend is unavailable.
+   *
+   * @returns {import('./worker-pool.js').WorkerPool|null}
+   */
+  workerPool() {
+    return this._workerStatus === BackendStatus.AVAILABLE ? this._workerBackend : null;
   }
 
   async _executeCPU(operation, payload) {

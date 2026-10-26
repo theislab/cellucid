@@ -22,14 +22,13 @@ test('category codes are proven per array and category count', () => {
   );
 });
 
-function referenceColors(field, n) {
+function referenceColors(field, n, missingCode) {
   const colors = new Uint8Array(n * 4);
-  const transparency = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     const code = field.codes[i];
     let rgb;
     let alpha;
-    if (code === 255) {
+    if (code === missingCode) {
       rgb = [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8];
       alpha = 1;
     } else if (!field._categoryVisible[code]) {
@@ -40,16 +39,19 @@ function referenceColors(field, n) {
       alpha = 1;
     }
     colors.set([...rgb, Math.round(alpha * 255)], i * 4);
-    transparency[i] = alpha;
   }
-  return { colors, transparency };
+  return { colors };
 }
 
-for (const aligned of [true, false]) {
-  test(`table-driven category colors match the per-cell rule (${aligned ? 'aligned' : 'unaligned'} buffer)`, () => {
+for (const [Codes, missingCode] of [
+  [Uint8Array, 0xff],
+  [Uint16Array, 0xffff],
+  [Uint32Array, 0xffffffff],
+]) for (const aligned of [true, false]) {
+  test(`table-driven category colors match the per-cell rule (${Codes.name}, ${aligned ? 'aligned' : 'unaligned'} buffer)`, () => {
     const n = 1_000;
-    const codes = new Uint8Array(n);
-    for (let i = 0; i < n; i++) codes[i] = i % 7 === 6 ? 255 : (i * 7919) % 5;
+    const codes = new Codes(n);
+    for (let i = 0; i < n; i++) codes[i] = i % 7 === 6 ? missingCode : (i * 7919) % 5;
     const field = {
       kind: 'category',
       categories: ['a', 'b', 'c', 'd', 'e'],
@@ -63,24 +65,14 @@ for (const aligned of [true, false]) {
     const state = {
       pointCount: n,
       colorsArray: new Uint8Array(buffer, aligned ? 0 : 1, n * 4),
-      // A byte no visibility can hold, so every entry the table writes shows.
+      // A byte no visibility can hold, so a write to it would show.
       categoryTransparency: new Uint8Array(n).fill(7),
     };
-    const expected = referenceColors(field, n);
+    const expected = referenceColors(field, n, missingCode);
 
-    DataStateColorMethods.prototype._writeCategoryColors.call(state, field, true);
+    DataStateColorMethods.prototype._writeCategoryColors.call(state, field);
     assert.deepEqual(state.colorsArray, expected.colors);
-    assert.deepEqual(state.categoryTransparency, expected.transparency);
-
-    // Without transparency the alpha array is left for _syncColorsAlpha.
-    state.categoryTransparency.fill(9);
-    DataStateColorMethods.prototype._writeCategoryColors.call(state, field, false);
-    assert.ok(state.categoryTransparency.every(alpha => alpha === 9));
-    for (let i = 0; i < n; i++) {
-      assert.deepEqual(
-        Array.from(state.colorsArray.subarray(i * 4, i * 4 + 3)),
-        Array.from(expected.colors.subarray(i * 4, i * 4 + 3))
-      );
-    }
+    // Visibility is the visibility pass's to publish: the table writes colors only.
+    assert.ok(state.categoryTransparency.every(alpha => alpha === 7));
   });
 }

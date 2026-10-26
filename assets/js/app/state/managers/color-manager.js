@@ -13,24 +13,31 @@ import {
   COLOR_PICKER_PALETTE,
   CONTINUOUS_COLORMAPS,
   DEFAULT_COLORMAP_ID,
-  getCategoryColor,
+  defaultCategoryColor,
   getCssStopsForColormap
 } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { requireCategoryCodesInInventory } from './category-codes.js';
-import { computeCentroidsForDimension } from '../../registries/user-defined-fields/centroids.js';
+import {
+  computeCentroidsForDimension,
+  computeCentroidsForDimensionInSlices,
+} from '../../registries/user-defined-fields/centroids.js';
+import { prepareCategoryTotals } from './field/summary.js';
+import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 import {
   UndrawableContinuousPayloadError,
-  createNonFiniteTally,
   hasUndrawableValues,
-  recordNonFiniteValue,
 } from '../../../data/continuous-payload-diagnosis.js';
+import {
+  scanContinuousColumn,
+  writeContinuousColors,
+} from './continuous-colors.js';
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
 import {
+  recordAlphaBytesMirror,
   writableColorAlphaBytes,
   writableColors,
-  writableTransparency,
 } from './per-cell-array-ownership.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
 
@@ -50,28 +57,11 @@ const CONTINUOUS_VALUE_SCANS = new WeakMap();
 function scanContinuousValues(values) {
   let scan = CONTINUOUS_VALUE_SCANS.get(values);
   if (scan !== undefined) return scan;
-  let min = Infinity;
-  let max = -Infinity;
-  let minPositive = Infinity;
-  let maxPositive = -Infinity;
   // The range scan is also the diagnosis scan. Reporting on the first
   // offending value would name one flat index and nothing else; counting them
   // here costs one pass that was already being made, and turns the refusal
   // into something the person looking at the screen can act on.
-  const tally = createNonFiniteTally(values.length);
-  for (let index = 0; index < values.length; index++) {
-    const value = values[index];
-    if (!Number.isFinite(value)) {
-      recordNonFiniteValue(tally, value, index);
-      continue;
-    }
-    if (value < min) min = value;
-    if (value > max) max = value;
-    if (value > 0) {
-      if (value < minPositive) minPositive = value;
-      if (value > maxPositive) maxPositive = value;
-    }
-  }
+  const { tally, min, max, minPositive, maxPositive } = scanContinuousColumn(values);
   scan = Object.freeze({
     drawable: !hasUndrawableValues(tally) && min !== Infinity,
     tally,
@@ -220,6 +210,13 @@ function computeContinuousDomain(field, meta, useLog) {
     usingFilter: useFilterRange
   };
 }
+
+/**
+ * Main-thread time one slice of an activation's preparation takes before it
+ * yields (`prepareCategoryFieldActivation`): well inside a 50 ms task, so
+ * input and frames run between slices.
+ */
+const ACTIVATION_SLICE_MS = 8;
 
 export class DataStateColorMethods {
   _updateActiveCategoryCounts() {
@@ -413,20 +410,14 @@ export class DataStateColorMethods {
     return computeContinuousDomain(field, meta, field._useLogScale);
   }
 
-  updateColorsContinuous(field, { resetTransparency = false } = {}) {
-    requireBoolean(resetTransparency, 'Continuous transparency reset');
-    this.ensureContinuousMetadata(field);
+  /**
+   * Write every cell's color for a continuous field: RGB from the field's
+   * colormap and domain, alpha from the current transparency, in one pass.
+   */
+  updateColorsContinuous(field) {
     const domain = this.getContinuousColorDomain(field);
     const colormap = requireColormap(field._colormapId);
-    const useLog = domain.scale === 'log';
-    const domainMin = domain.min;
-    const domainMax = domain.max;
-    const logMin = useLog ? Math.log10(domainMin) : 0;
-    const denom = useLog ? (Math.log10(domainMax) - logMin) : (domainMax - domainMin);
-    const isConstantDomain = denom === 0;
-    const values = field.values;
     const n = this.pointCount;
-
     if (
       !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
@@ -435,39 +426,13 @@ export class DataStateColorMethods {
     ) {
       throw new TypeError('Continuous coloring requires complete color and transparency buffers.');
     }
-    if (resetTransparency) {
-      writableTransparency(this).fill(1);
-    }
-    const colors = writableColors(this);
-
-    const sample = [0, 0, 0];
-    for (let i = 0; i < n; i++) {
-      const v = values[i];
-      let r, g, b;
-      if (Number.isNaN(v) || (useLog && v <= 0)) {
-        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
-      } else {
-        let t;
-        if (isConstantDomain) {
-          t = 0.5;
-        } else if (useLog) {
-          t = (Math.log10(v) - logMin) / denom;
-        } else {
-          t = (v - domainMin) / denom;
-        }
-        const c = colormap.sampleInto(t, sample);
-        // Convert from 0-1 float to 0-255 uint8
-        r = Math.round(c[0] * 255);
-        g = Math.round(c[1] * 255);
-        b = Math.round(c[2] * 255);
-      }
-      const j = i * 4;
-      colors[j] = r;
-      colors[j + 1] = g;
-      colors[j + 2] = b;
-      // Alpha will be synced from categoryTransparency in syncColorsAlpha
-    }
-    this._syncColorsAlpha();
+    writeContinuousColors(
+      writableColors(this),
+      field.values,
+      this.categoryTransparency,
+      domain,
+      colormap
+    );
   }
 
   // Sync alpha from categoryTransparency to packed RGBA colorsArray
@@ -491,6 +456,7 @@ export class DataStateColorMethods {
       }
       colors[j] = value * 255;
     }
+    recordAlphaBytesMirror(colors, alpha);
     if (colors !== published && String(this.activeViewId) === 'live') {
       // The live viewer and renderer hold the state's colors by reference;
       // a copy-on-write moved the state to a new array, so it is republished.
@@ -507,7 +473,7 @@ export class DataStateColorMethods {
     if (field._categoryColors === undefined) {
       categoryColors = new Array(numCats);
       for (let i = 0; i < numCats; i++) {
-        categoryColors[i] = getCategoryColor(i);
+        categoryColors[i] = defaultCategoryColor(field, i);
       }
     } else {
       if (
@@ -582,18 +548,20 @@ export class DataStateColorMethods {
       throw new TypeError('Category coloring requires complete category, color, and transparency buffers.');
     }
     this.ensureCategoryMetadata(field);
-    this._writeCategoryColors(field, true);
+    this._writeCategoryColors(field);
   }
 
   /**
-   * Write every cell's category color; with `writeTransparency`, also its
-   * visibility (hidden categories get alpha 0). Without it the alpha bytes are
-   * left for `_syncColorsAlpha` to restore from `categoryTransparency`.
+   * Write every cell's category color (hidden categories with alpha 0).
+   * Visibility is not written: every caller recomputes it next
+   * (`computeGlobalVisibility`), which publishes the transparency and the
+   * alpha bytes from the mask and every filter, so a transparency written
+   * here would be overwritten before anything read it (and would withdraw
+   * the visibility result the pass can reuse).
    *
    * @param {object} field Category field with resolved colors and visibility.
-   * @param {boolean} writeTransparency
    */
-  _writeCategoryColors(field, writeTransparency) {
+  _writeCategoryColors(field) {
     const n = this.pointCount;
     const codes = field.codes;
     const numCats = field.categories.length;
@@ -606,11 +574,10 @@ export class DataStateColorMethods {
     );
     const missingCode = missingCategoryCode(codes);
 
-    // One RGBA word and one alpha per code, resolved once: every cell of a
-    // category gets identical bytes, so the per-cell loop is two table reads.
-    // Slot `numCats` holds the missing-value color.
+    // One RGBA word per code, resolved once: every cell of a category gets
+    // identical bytes, so the per-cell loop is one table read. Slot `numCats`
+    // holds the missing-value color.
     const rgbaBytes = new Uint8Array((numCats + 1) * 4);
-    const alphaByCode = new Uint8Array(numCats + 1);
     for (let code = 0; code <= numCats; code++) {
       let r, g, b, alpha;
       if (code === numCats) {
@@ -632,21 +599,14 @@ export class DataStateColorMethods {
       rgbaBytes[j + 1] = g;
       rgbaBytes[j + 2] = b;
       rgbaBytes[j + 3] = alpha * 255;
-      alphaByCode[code] = alpha;
     }
     // Byte-identical words in both views, so platform byte order is moot.
     const rgbaWords = new Uint32Array(rgbaBytes.buffer);
     const colors = writableColors(this);
-    const colorWords = colors.byteOffset % 4 === 0
-      ? new Uint32Array(colors.buffer, colors.byteOffset, n)
-      : null;
-    const transparency = writeTransparency ? writableTransparency(this) : null;
-    for (let i = 0; i < n; i++) {
-      const code = codes[i];
-      const slot = code === missingCode ? numCats : code;
-      if (colorWords !== null) {
-        colorWords[i] = rgbaWords[slot];
-      } else {
+    if (colors.byteOffset % 4 !== 0) {
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        const slot = code === missingCode ? numCats : code;
         const j = i * 4;
         const k = slot * 4;
         colors[j] = rgbaBytes[k];
@@ -654,15 +614,29 @@ export class DataStateColorMethods {
         colors[j + 2] = rgbaBytes[k + 2];
         colors[j + 3] = rgbaBytes[k + 3];
       }
-      if (writeTransparency) transparency[i] = alphaByCode[slot];
+      return;
     }
+    const colorWords = new Uint32Array(colors.buffer, colors.byteOffset, n);
+    if (codes instanceof Uint32Array) {
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        colorWords[i] = rgbaWords[code === missingCode ? numCats : code];
+      }
+      return;
+    }
+    // Uint8 and Uint16 codes index tables spanning their whole dtype, the
+    // missing code's entry holding the missing-value slot, so each cell is
+    // one table read and no comparison.
+    const wordBySpan = new Uint32Array(missingCode + 1);
+    wordBySpan.set(rgbaWords.subarray(0, numCats));
+    wordBySpan[missingCode] = rgbaWords[numCats];
+    for (let i = 0; i < n; i++) colorWords[i] = wordBySpan[codes[i]];
   }
 
   clearCentroids() {
     this.centroidCount = 0;
     this.centroidPositions = null;
     this.centroidColors = null; // RGBA uint8
-    this.centroidOutliers = null;
     this.centroidLabels = [];
     this._removeLabelsForView(this.activeViewId);
     if (this.viewer && typeof this.viewer.setCentroidLabels === 'function') {
@@ -670,6 +644,61 @@ export class DataStateColorMethods {
     }
     this._pushCentroidsToViewer();
     this._syncActiveContext();
+  }
+
+  /**
+   * Do ahead, in slices, the dataset-length work activating a loaded
+   * category field would otherwise do in one task: its per-category totals
+   * and its centroids for the active view's layout (the ones
+   * `buildCentroidsForField` computes when they are missing). Each slice
+   * takes about `ACTIVATION_SLICE_MS` of main-thread time and a macrotask
+   * runs between slices, so activating a field of any size never holds the
+   * main thread for one long task. The results are the ones the activation
+   * computes (the same additions in the same order), kept where it looks for
+   * them; a result is kept only while its field, codes, layout and positions
+   * are still the current ones.
+   *
+   * @param {object} field - A loaded category field of this dataset.
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<void>}
+   */
+  async prepareCategoryFieldActivation(field, { signal = null } = {}) {
+    requireCategoryField(field);
+    const codes = field.codes;
+    if (!isCategoricalCodes(codes) || codes.length !== this.pointCount) return;
+    const slices = { signal, sliceMs: ACTIVATION_SLICE_MS, yieldToMacrotask };
+    const generation = this._datasetGeneration;
+    await prepareCategoryTotals(codes, field.categories.length, slices);
+    if (this._datasetGeneration !== generation || field.codes !== codes) return;
+
+    const layoutKey = this.getViewLayoutKey(this.activeViewId);
+    const centroidsByLayout = field.centroidsByLayout;
+    if (
+      !(centroidsByLayout instanceof Map) ||
+      centroidsByLayout.has(layoutKey) ||
+      field._isUserDefined === true ||
+      typeof this.dimensionManager?.getResidentPositions !== 'function'
+    ) {
+      return;
+    }
+    const dimension = this.dimensionManager.getLayout(layoutKey).dimension;
+    const positions = this.dimensionManager.getResidentPositions(layoutKey);
+    if (!(positions instanceof Float32Array) || positions.length !== this.pointCount * dimension) return;
+    const centroids = await computeCentroidsForDimensionInSlices(
+      codes, field.categories, positions, dimension, slices
+    );
+    if (
+      this._datasetGeneration !== generation ||
+      field.codes !== codes ||
+      field.centroidsByLayout !== centroidsByLayout ||
+      centroidsByLayout.has(layoutKey) ||
+      this.dimensionManager.getResidentPositions(layoutKey) !== positions
+    ) {
+      return;
+    }
+    centroidsByLayout.set(layoutKey, centroids);
+    if (!(field._normalizedLayouts instanceof Set)) field._normalizedLayouts = new Set();
+    field._normalizedLayouts.add(layoutKey);
   }
 
   buildCentroidsForField(field, options) {
@@ -757,10 +786,12 @@ export class DataStateColorMethods {
         || !Array.isArray(centroid.position)
         || centroid.position.length !== currentDim
         || !Number.isSafeInteger(centroid.n_points)
-        || centroid.n_points < 0
+        || centroid.n_points < 1
       ) {
+        // A centroid is the centre of the cells of a category that holds
+        // some; a category no cell holds has none.
         throw new TypeError(
-          `Centroid ${centroidIndex} must contain an exact ${currentDim}D position and point count.`
+          `Centroid ${centroidIndex} must contain an exact ${currentDim}D position and a positive point count.`
         );
       }
       for (let coordinate = 0; coordinate < centroid.position.length; coordinate++) {
@@ -824,8 +855,6 @@ export class DataStateColorMethods {
 
     this.centroidPositions = new Float32Array(this.centroidCount * 3);
     this.centroidColors = new Uint8Array(this.centroidCount * 4); // RGBA uint8
-    this.centroidOutliers = new Float32Array(this.centroidCount);
-    this.centroidOutliers.fill(-1.0);
 
     this.centroidLabels = [];
     if (allowLabels && this.labelLayer) this._removeLabelsForView(viewKey);

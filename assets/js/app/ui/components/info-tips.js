@@ -11,12 +11,16 @@
  *
  * Markup in static HTML names its tip with `data-info-tip="<key>"` on the
  * `.info-tooltip` element; components built in JavaScript pass the key to
- * {@link renderInfoTip}. `tests/info-tips-contract.test.mjs` holds every key
+ * {@link renderInfoTip}. An element inside the tooltip marked
+ * `data-info-tip-live` is a line its component keeps current (how a setting
+ * was chosen, what a tool needs first): it is kept, first under the title. `tests/info-tips-contract.test.mjs` holds every key
  * used to an entry here, every entry to a docs link, and every link to a page
  * and heading anchor that exists in the documentation.
  *
  * @module ui/components/info-tips
  */
+
+import { PLACES, placePath } from '../place-names.js';
 
 export const DOCS_BASE_URL = 'https://docs.cellucid.com/en/latest/user_guide/web_app/';
 
@@ -41,11 +45,12 @@ const TIPS = {
   'dataset': {
     title: 'Dataset',
     body: [
-      'Facts about the dataset that is open now: its name and description, where it was loaded from, and how many cells, genes and obs fields it has.',
-      'Connectivity counts the edges of the neighbour graph in use. Without one, KNN connectivity edges and the KNN drag tool are unavailable.',
+      'The dataset that is open: its name, cells and genes, where it is read from (format and host) and its description. Details lists its source, citation, file, size, obs fields, embeddings, layers, raw, neighbour graph, latent space and vector fields.',
+      'Data read in place from a host shows how much has been read so far. Nothing is saved to disk: what was read stays in memory and is released when the dataset closes. A read that has to be made again is said in a notification.',
       'Sessions and community annotations are tied to this dataset’s identity, so they only restore onto the same dataset.',
     ],
     links: [
+      doc('The Dataset box', 'b_data_loading/01_loading_options_overview', 'the-dataset-box'),
       doc('Dataset identity', 'b_data_loading/06_dataset_identity_why_it_matters', 'the-one-sentence-definition'),
     ],
   },
@@ -53,7 +58,7 @@ const TIPS = {
     title: 'Data mapping',
     body: [
       'Which stored arrays this dataset is drawn from: the embeddings views can show -- any number, of any mix of 1D, 2D and 3D -- the neighbour graph, the gene names and expression matrix, the latent space of outlier filters and the vector fields.',
-      'An AnnData file (an `.h5ad` or Zarr ZIP opened in the browser, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices; a prepared dataset can choose among the embeddings, gene-name sets and vector fields it was exported with.',
+      'A dataset (an `.h5ad` or Zarr store opened in the browser, from a link or the samples, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices.',
       'A file without a UMAP opens on a best guess, marked guessed. Sessions record the mapping and restore it.',
     ],
     links: [
@@ -90,17 +95,17 @@ const TIPS = {
     title: 'Latent space',
     body: [
       'The `obsm` space (scVI, PCA) where a categorical field’s outlier filter measures each cell’s distance to its category’s centre; the filter hides the farthest share of each category.',
-      'Apply reads the space and computes the outliers before anything changes; a space with a missing value is refused and stays unavailable. Filter thresholds are kept. None removes outlier filters.',
+      'Apply reads nothing: an outlier filter in use is measured again in the new space, with progress and Cancel, and keeps its threshold. A space with a missing value is refused when it is first read. The space a file stores outlier distances for is marked “outliers stored” and filters at once. None turns outlier filters off.',
     ],
     links: [
       doc('Latent space', 'b_data_loading/13_data_mapping', 'latent-space'),
-      doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'what-this-filter-is-and-is-not'),
+      doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'stored-or-computed'),
     ],
   },
   'data-mapping-vectors': {
     title: 'Vector fields',
     body: [
-      'Which `obsm` arrays are drawn as vectors (velocity, drift) on which embedding. An array fits an embedding as wide as its dimension, or as wide as the embedding’s array, read at the same columns; arrays named for it are marked suggested.',
+      'Which `obsm` arrays are drawn as vectors (velocity, drift) on which embedding. An array fits an embedding as wide as its dimension, or as wide as the embedding’s array, read at the same columns. An array named for an embedding the way scVelo names it (`velocity_umap` for `X_umap`, `velocity_branches` for `X_branches`) is marked suggested and is bound when the file opens.',
       'A view draws a vector field only while it shows an embedding the field is bound to. Values are read when the overlay first shows them.',
     ],
     links: [
@@ -119,29 +124,18 @@ const TIPS = {
       doc('KNN drag', 'f_highlighting_selection/02_selection_tools_document_each_tool', 'tool-4-knn-drag-alt-click-drag-degree'),
     ],
   },
-  'data-mapping-fixed': {
-    title: 'Read from file',
-    body: [
-      'What a prepared dataset is read with that this panel cannot change: its gene names when it was exported with one name set, and its vector fields when it was exported with none.',
-      'Its neighbour graph, expression matrix and latent space were fixed when it was exported with `cellucid prepare`. An AnnData file has nothing fixed: every group is a menu.',
-    ],
-    links: [
-      doc('What stays fixed', 'b_data_loading/13_data_mapping', 'what-stays-fixed'),
-    ],
-  },
   'open-data': {
     title: 'Open data',
     body: [
-      'Four ways to open a dataset. Opening one replaces the dataset that is open now.',
+      'Three ways to open a dataset. Opening one replaces the dataset that is open now.',
       {
         list: [
-          'Sample: a prepared public dataset, downloaded on demand.',
-          'Files: a file or folder from this computer. Nothing is uploaded.',
-          'Server: a `cellucid serve` process on this machine or through an SSH tunnel.',
-          'GitHub: prepared exports published in a public repository.',
+          'Sample dataset: a public dataset, read in place as each view needs it. While a catalog of several datasets is connected, this list shows its datasets instead.',
+          'File or folder from this computer: AnnData (`.h5ad`, `.zarr.zip`, a `.zarr` folder), a Seurat or SingleCellExperiment object (`.rds`, `.rda`/`.RData`), MuData (`.h5mu`, MuData Zarr), Loom (`.loom`), a 10x Cell Ranger `.h5`, a Cell Ranger outs/ folder, or a MatrixMarket folder. Nothing is uploaded.',
+          'Link or server: a link or an id of published data, or the address of a `cellucid serve` server.',
         ],
       },
-      'For large datasets, a prepared export (from `cellucid prepare`) loads fastest on every route.',
+      'Every format is read as AnnData. For large datasets, an AnnData file written by `cellucid prepare` reads fastest.',
     ],
     links: [
       doc('Loading options', 'b_data_loading/01_loading_options_overview', 'at-a-glance'),
@@ -149,48 +143,44 @@ const TIPS = {
     ],
   },
   'local-files': {
-    title: 'Files',
+    title: 'File or folder',
     body: [
+      'Open… offers two choices, because a browser dialog picks files or one folder, never both:',
       {
         list: [
-          'H5AD: one `.h5ad` file, read in the browser. Quick for previews; very large files are limited by browser memory.',
-          'Zarr ZIP: a `.zarr.zip` or `.zip` holding one AnnData Zarr store. It opens in Safari, Chrome, Edge and Firefox alike.',
-          'Prepared: a folder written by `cellucid prepare`. It loads lazily and is the fastest option for large data.',
+          'File…: an `.h5ad`, `.rds`, `.rda`/`.RData`, `.h5mu`, `.loom` or 10x Cell Ranger `.h5` file, or a `.zarr.zip` archive holding one AnnData or MuData Zarr store. An `.h5seurat` file is recognised and refused, with the line that converts it.',
+          'Folder…: a `.zarr` store folder (AnnData, as `cellucid.prepare()` and `cellucid_prepare()` write it, or MuData Zarr), a Cell Ranger outs/ folder, whose UMAP and t-SNE are read with its matrix, or a MatrixMarket folder (a `matrix.mtx` with its features and barcodes). Choose the folder itself.',
         ],
       },
-      'Files stay on this computer: they are read by the browser and never uploaded.',
+      'You can also drop a file or a folder anywhere on the page. Files stay on this computer: the browser reads them and nothing is uploaded.',
+      'Safari’s folder dialog leaves out hidden files (names starting with “.”), where a Zarr v2 store keeps its metadata: in Safari, drag the folder onto the page or open its `.zarr.zip`. A Zarr v3 store opens either way.',
     ],
     links: [
       doc('Browser file picker', 'b_data_loading/03_browser_file_picker_tutorial', 'fast-path-wet-lab-friendly'),
-      doc('What Cellucid reads', 'b_data_loading/07_folder_file_format_expectations_high_level_link_to_spec', 'the-four-things-cellucid-can-load-practical-view'),
+      doc('Hidden metadata files', 'b_data_loading/03_browser_file_picker_tutorial', 'hidden-metadata-files'),
+      doc('What Cellucid reads', 'b_data_loading/07_file_format_expectations', 'what-cellucid-reads'),
     ],
   },
-  'remote-server': {
-    title: 'Server',
+  'data-address': {
+    title: 'Link or server',
     body: [
-      'Connects to a running `cellucid serve` process, which streams the dataset to the browser as it is needed.',
+      'One address bar for published data and for a Cellucid server. What you type decides which:',
       {
         list: [
-          'Same machine: run `cellucid serve data.h5ad`, then Connect to the address it prints (`localhost:8765` by default).',
-          'Remote machine: forward the port first with `ssh -L 8765:localhost:8765 user@host`.',
+          'A port (`8765`), `localhost:8765` or `host:port`: the `cellucid serve` server there.',
+          'A link or an id: a CELLxGENE link or id, an NCBI GEO accession (`GSE123456`), a Zenodo or Figshare record or DOI, a Hugging Face dataset (`hf:user/repo`), a Dropbox, Google Drive or OneDrive file link (OneDrive, and Drive files that are not public, after a sign-in), or a GitHub link or `owner/repo/path`.',
+          'A web address ending in `.h5ad`, `.h5mu`, `.loom`, `.h5`, `.rds`, `.rda`, `.zip`, `.zarr` or `datasets.json`: that file, store or catalog.',
+          'Any other web address: a server when one answers there, otherwise a folder of datasets.',
         ],
       },
-      'Serving a prepared folder is fastest; `.h5ad` and `.zarr` are read lazily on the server.',
+      'What is connected is shown under the bar, with Disconnect. Linked data is read in place, only what each view needs, and kept in memory only; its host must allow other sites to read it (CORS).',
     ],
     links: [
+      doc('The address bar', 'b_data_loading/14_open_from_link', 'the-address-bar'),
+      doc('What you can paste', 'b_data_loading/14_open_from_link', 'what-you-can-paste'),
       doc('Server mode', 'b_data_loading/04_server_tutorial', 'fast-path-cli'),
       doc('SSH tunnel', 'b_data_loading/04_server_tutorial', 'remote-server-access-ssh-tunnel-workflow'),
-    ],
-  },
-  'github-data': {
-    title: 'GitHub',
-    body: [
-      'Opens prepared exports from a public GitHub repository. Enter `owner/repo/path`, where the path is the folder that holds `datasets.json`.',
-      'Use this to share datasets without running a server: anyone with the path can open them.',
-    ],
-    links: [
-      doc('Publish a dataset repository', 'b_data_loading/11_custom_dataset_repository', 'the-repository-contract'),
-      doc('Remote demo', 'b_data_loading/02_local_demo_tutorial', 'step-4-publish-to-a-public-github-repo-remote-demo'),
+      doc('Why a link is refused', 'b_data_loading/14_open_from_link', 'why-a-link-can-be-refused'),
     ],
   },
   'session-file': {
@@ -233,7 +223,7 @@ const TIPS = {
     body: [
       'Changes what a point looks like. Full adds lighting and fog. Sculpted shades every point as a soft-lit, glossy ball with smooth edges and its legend colour at the centre, keeps fog, and holds highlighted cells still instead of pulsing them. Light drops lighting and fog, Ultra-light draws squares instead of round dots.',
       'It barely changes speed. In 3D views depth testing discards most hidden points before shading. 2D views are drawn without depth and every quality draws them without a discard, so on a dense million-cell 2D embedding with antialiasing on the qualities measured within a few percent of one another (one Apple M1 Pro).',
-      'For speed in 3D, reach for point size, filtering or Performance below instead.',
+      `For speed in 3D, reach for point size, filtering or ${PLACES.performance.name} below instead.`,
     ],
     links: [
       doc('Shader quality', 'c_core_interactions/03_render_modes_points_vs_volumetric_smoke', 'points-mode'),
@@ -308,19 +298,19 @@ const TIPS = {
   'connectivity': {
     title: 'Connectivity',
     body: [
-      'Draws the dataset’s neighbour graph as lines between cells. It is available when the dataset has one; for an AnnData file, choose the graph under Session › Data mapping.',
+      `Draws the dataset’s neighbour graph as lines between cells. It is available when the dataset has one; for an AnnData file, choose the graph under ${placePath(PLACES.session, PLACES.dataMapping)}.`,
       'Only edges between visible cells are drawn, so filters thin the graph too. Max edges caps how many are drawn; on large datasets keep it low to stay fast.',
     ],
     links: [
       doc('Connectivity edges', 'c_core_interactions/07_screenshots', 'connectivity-edges'),
-      doc('Include a graph', 'b_data_loading/04_server_tutorial', 'connectivity-is-opt-in-on-this-path'),
+      doc('Name a graph when serving', 'b_data_loading/04_server_tutorial', 'launch-choices-what-the-viewer-opens-on'),
       doc('Choose a graph', 'b_data_loading/13_data_mapping', 'neighbour-graph'),
     ],
   },
   'vector-field': {
     title: 'Vector field',
     body: [
-      'Animates particles along per-cell vectors, such as RNA velocity or drift, each exported for one embedding.',
+      'Animates particles along per-cell vectors, such as RNA velocity or drift, each bound to one embedding.',
       'It appears when the view shows an embedding the dataset has a vector field for. Particle density and trail length cost the most. With Sync with LOD on, a reduced level of detail also draws fewer particles, spawned only from the cells that level shows.',
     ],
     links: [
@@ -364,7 +354,7 @@ const TIPS = {
   'view-representation': {
     title: 'What a view shows',
     body: [
-      'The embedding the selected view shows: any one turned on under Session › Data mapping, of any dimension. Two views can show two 3D embeddings, or a 3D and a 2D one.',
+      `The embedding the selected view shows: any one turned on under ${placePath(PLACES.session, PLACES.dataMapping)}, of any dimension. Two views can show two 3D embeddings, or a 3D and a 2D one.`,
       'Keys 1, 2 and 3 show that dimension’s default in the selected view; pressed again, they step through its other embeddings.',
       'Every view shows the same cells, so a highlight or selection in one appears in all. Colouring, filters, camera, navigation mode, centroid labels and vector fields stay with each view. Sessions keep each view’s embedding.',
     ],
@@ -476,8 +466,8 @@ const TIPS = {
   'analysis-correlation': {
     title: 'Correlation',
     body: [
-      'How two variables move together within each selected page: a scatter plot of X against Y, and the correlation coefficient r with its p-value per page.',
-      'Only cells with a value for both variables count. Color the points by a categorical field to look for groups that drive the relationship.',
+      'How two variables move together within each selected page: a scatter plot of X against Y, and the correlation r with its p-value per page. Choose X and Y (an obs field or a gene) and the pages, then press Run.',
+      'Only cells with a value for both count. Colour by a categorical field (More options) to look for groups that drive the relationship.',
     ],
     links: [
       doc('Correlation mode', 'h_analysis/05_analysis_mode_correlation_analysis', 'what-correlation-mode-is-for'),
@@ -496,106 +486,192 @@ const TIPS = {
   'analysis-differential': {
     title: 'Differential expression',
     body: [
-      'Finds genes that differ between two groups of cells: two pages, or a page and the rest of it. Every gene is tested, in batches, and ranked by significance.',
-      'Each gene gets a log2 fold change and a p-value corrected for multiple testing (FDR). Press Run; the result opens as a volcano plot with adjustable thresholds.',
+      'Tests every gene between two groups of cells: two pages (a page and its rest too), or categories of a field, such as disease against healthy. Within (More options) keeps the comparison inside some cells, such as one cell type.',
+      'Each gene gets a score, a log2 fold change and an adjusted p-value; the volcano marks those passing Max adjusted p and Min |log2FC| (1 by default). A group under Min cells per group is still tested and flagged low n.',
     ],
     links: [
       doc('Differential expression', 'h_analysis/06_analysis_mode_differential_expression_de', 'what-de-is-for-in-cellucid'),
-      doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+      doc('Groups', 'h_analysis/06_analysis_mode_differential_expression_de', 'groups-pages-or-categories'),
     ],
   },
-  'analysis-test-method': {
-    title: 'Statistical method',
-    body: [
-      'Wilcoxon (Mann–Whitney U) compares ranks, so it makes no assumption about the shape of the expression distribution and is robust to outliers. It is the usual choice for single-cell data.',
-      'The t-test (Welch’s) compares means and assumes roughly normal values; it is faster and fine for large groups of well-behaved data.',
-    ],
-    links: [
-      doc('DE statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
-      doc('Marker statistics', 'h_analysis/08_analysis_mode_genes_panel', 'statistics-what-is-computed'),
-    ],
-  },
-  'analysis-performance': {
-    title: 'Performance settings',
+  'analysis-test-options': {
+    title: 'Test',
     body: [
       {
         list: [
-          'Batch size: how many genes are loaded and tested at a time; the recommended size is computed from the cell and gene counts.',
-          'Memory budget: the most working memory the analysis may hold.',
-          'Network parallelism: how many genes are requested at once from the data source.',
-          'Compute parallelism: how many test batches run at once; Auto uses every worker the browser started.',
+          'Wilcoxon rank-sum: compares ranks, assumes no distribution shape, robust to outliers; the usual choice. Its score is the rank-sum z.',
+          't-test (Welch): compares means; its score is t.',
+          't-test, overestimated variance: scanpy’s conservative variant, the reference’s variance divided by the group’s size.',
         ],
       },
-      'Lower values use less memory and network; higher values finish sooner on a strong machine.',
+      'Fold change from: Automatic undoes log1p when the file says its matrix is log-transformed (scanpy’s logfoldchanges), else uses the values as stored.',
     ],
     links: [
-      doc('When DE is slow', 'h_analysis/06_analysis_mode_differential_expression_de', 'performance-settings-when-de-is-slow'),
+      doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+      doc('Marker test', 'h_analysis/08_analysis_mode_genes_panel', 'test'),
+    ],
+  },
+  'analysis-wilcoxon-p': {
+    title: 'Wilcoxon p-values',
+    body: [
+      'Exact or continuity-corrected (the default) matches R’s wilcox.test and SciPy: exact when both sides have under 50 cells and no ties, else the normal approximation with tie and continuity correction.',
+      'Normal approximation is scanpy’s rank_genes_groups default (no tie correction, no continuity correction); Normal, tie-corrected is scanpy with tie_correct=True.',
+    ],
+    links: [
+      doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+    ],
+  },
+  'analysis-multiple-testing': {
+    title: 'Multiple testing',
+    body: [
+      'Benjamini–Hochberg controls the false discovery rate; Bonferroni multiplies each p-value by the number of tests and controls the chance of any false positive.',
+      'Only genes actually tested count: a gene too few cells measured, or one left out by the gene filters, is not in the family.',
+    ],
+    links: [
+      doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+    ],
+  },
+  'analysis-fold-change': {
+    title: 'Fold change',
+    body: [
+      'Automatic: when the file records log1p (uns[\'log1p\']), the means are taken back from log1p, log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9)) as scanpy computes logfoldchanges; otherwise log2 of the means as stored, with a small pseudocount and a shift for negative values.',
+    ],
+    links: [
+      doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+    ],
+  },
+  'analysis-expression-matrix': {
+    title: 'Expression matrix',
+    body: [
+      'The matrix the genes are read from, for this analysis alone: Mapped is the one the Data mapping shows; X, each layer or raw can be chosen without changing what is shown.',
+      'Each matrix names its genes on its own axis: X and the layers share var, raw has raw.var (raw often holds genes X lacks). A gene a matrix lacks is named as not found.',
+      'Only Mapped is listed when the file has no other usable matrix, or the dataset cannot change its expression matrix.',
+    ],
+    links: [
+      doc('Expression matrix', 'h_analysis/08_analysis_mode_genes_panel', 'expression-matrix'),
+    ],
+  },
+  'analysis-replicates': {
+    title: 'Replicates',
+    body: [
+      'None (cells): every cell is an observation, as scanpy’s rank_genes_groups tests.',
+      'A sample field (pseudobulk): each sample’s cells of a group are one observation, its mean expression; the test is Welch’s t between the two groups’ samples. Cells of one sample are not independent, so this is the test to trust when the groups come from different donors or conditions. Each group needs cells in at least 2 samples; no variance moderation (limma, edgeR, DESeq2) is applied.',
+    ],
+    links: [
+      doc('Replicates', 'h_analysis/06_analysis_mode_differential_expression_de', 'replicates-pseudobulk'),
+    ],
+  },
+  'analysis-groups-and-cells': {
+    title: 'Groups and cells',
+    body: [
+      'Groups to test: every category, or the ones you pick. Untested groups stay in the rest unless Rest includes is Selected groups only.',
+      'Cells: every cell, the visible ones (the active view’s filters), or one page’s. Cells outside are left out of every group.',
+    ],
+    links: [
+      doc('Groups and cells', 'h_analysis/08_analysis_mode_genes_panel', 'groups-and-cells'),
+    ],
+  },
+  'analysis-small-groups': {
+    title: 'Small groups',
+    body: [
+      'A group with fewer cells than Min cells per group is never an error. Skip and list leaves it untested (its cells stay in the rest) and names it in the result; Pool tests the small groups together as one; Test anyway tests every group of two or more cells and marks the small ones low n.',
+    ],
+    links: [
+      doc('Small groups', 'h_analysis/08_analysis_mode_genes_panel', 'small-groups'),
+    ],
+  },
+  'analysis-filters': {
+    title: 'Filters',
+    body: [
+      'Which tested genes are shown: up or down in the group, adjusted p at most Max adjusted p, |log2FC| at least the minimum, expressed in enough of the group’s cells and few enough of the reference’s.',
+      'Filters change what is shown, never what is tested: they apply at once, without running again. Marker genes ranks rather than filters, so its fold-change minimum is 0; differential expression keeps the volcano’s convention of 1.',
+    ],
+    links: [
+      doc('Filters', 'h_analysis/08_analysis_mode_genes_panel', 'filters'),
+      doc('DE filters', 'h_analysis/06_analysis_mode_differential_expression_de', 'filters-and-labels'),
+    ],
+  },
+  'analysis-gene-filters': {
+    title: 'Genes tested',
+    body: [
+      'Exclude mitochondrial, ribosomal or hemoglobin genes, or any name matching a pattern; or test only highly variable genes or a list. Excluded genes are not tested at all (scanpy’s mask_var), so they do not count in multiple testing.',
+    ],
+    links: [
+      doc('Excluded and selected genes', 'h_analysis/08_analysis_mode_genes_panel', 'excluded-and-selected-genes'),
+    ],
+  },
+  'analysis-ranking': {
+    title: 'Ranking',
+    body: [
+      'The order of each group’s markers: by score (scanpy’s order), adjusted p, log2 fold change, AUROC or the difference in expressing fractions; ties keep the dataset’s gene order. Top genes per group is how many each group shows.',
+    ],
+    links: [
+      doc('Ranking', 'h_analysis/08_analysis_mode_genes_panel', 'ranking'),
     ],
   },
   'analysis-signature': {
     title: 'Gene signature',
     body: [
-      'Scores every cell by a set of genes, such as a pathway or a cell-type marker list, and compares the scores across the pages you choose.',
-      'Genes the dataset does not have are skipped. The score updates as you edit the list.',
+      'Scores every cell by one or more gene sets, such as a pathway or a cell-type marker list, and compares the scores across the pages you choose. Press Run; editing the sets afterwards marks the result stale.',
+      'Genes the dataset does not have are left out of the score and named in the result.',
     ],
     links: [
       doc('Gene signature', 'h_analysis/07_analysis_mode_gene_signature', 'what-a-gene-signature-is-user-facing'),
     ],
   },
-  'gene-signature-genes': {
-    title: 'Signature genes',
+  'analysis-gene-sets': {
+    title: 'Gene sets',
     body: [
-      'Type gene symbols separated by commas, such as CD3E, CD4, CD8A. Symbols are matched to the dataset’s gene names; a symbol it does not contain is left out of the score.',
+      'Type a gene (the dataset’s names are suggested) or paste a list separated by commas, semicolons, spaces or new lines. Import reads a gene list, a CSV or TSV table, or a GMT file; From markers makes one set per group of the last marker result.',
+      'Names match exactly, else ignoring case when only one gene matches. A name with no match is kept in the set, marked not found, and left out of the score.',
     ],
     links: [
-      doc('Signature input', 'h_analysis/07_analysis_mode_gene_signature', 'inputs-genes-pages'),
+      doc('Gene sets', 'h_analysis/07_analysis_mode_gene_signature', 'gene-sets'),
+      doc('Genes not in the dataset', 'h_analysis/07_analysis_mode_gene_signature', 'genes-not-in-the-dataset'),
     ],
   },
-  'gene-signature-scoring': {
-    title: 'Scoring',
+  'signature-methods': {
+    title: 'Scoring method',
     body: [
-      'The score of a cell is the mean, sum or median of its expression over the signature genes. Mean is the usual choice; sum grows with the number of genes, and median ignores a single extreme gene.',
-      'Normalization then rescales the scores: Z-score in standard deviations from the mean, Min-Max to the range 0 to 1, or None.',
+      {
+        list: [
+          'Mean or median of the set’s values in the cell.',
+          'Mean z-score: each gene standardized over all cells first, so every gene weighs the same.',
+          'Module score: scanpy’s score_genes, the set’s mean less that of control genes drawn from the same expression bins.',
+          'Rank-based (UCell): from each gene’s rank within the cell, so it does not depend on normalization; reads every gene once.',
+        ],
+      },
     ],
     links: [
-      doc('Scoring algorithm', 'h_analysis/07_analysis_mode_gene_signature', 'scoring-algorithm-exact'),
-      doc('Normalization', 'h_analysis/07_analysis_mode_gene_signature', 'normalization-options-what-they-do'),
+      doc('Methods', 'h_analysis/07_analysis_mode_gene_signature', 'methods'),
     ],
   },
   'analysis-marker-genes': {
     title: 'Marker genes',
     body: [
-      'Finds the genes that mark each category of a categorical field, testing each group against all other cells, and shows them as a ranked list or a heatmap.',
-      'Results are cached per field and settings, so reopening is instant; untick Use cached results to recompute.',
+      'Finds the genes that mark each category of a field, testing each group against the rest of the cells or against one reference group, and shows them as a ranked list or a heatmap.',
+      'Small groups are skipped, pooled or flagged, never an error. A run is kept in memory, so running the same settings again is instant.',
     ],
     links: [
       doc('Marker genes', 'h_analysis/08_analysis_mode_genes_panel', 'what-marker-genes-is-for'),
     ],
   },
-  'marker-genes-mode': {
-    title: 'Mode',
+  'marker-genes-group-by': {
+    title: 'Group by',
     body: [
-      {
-        list: [
-          'Ranked genes: the top markers of each group, sorted by significance.',
-          'Clustered: a heatmap of the markers with genes and groups ordered by hierarchical clustering.',
-          'Custom genes: a heatmap of the genes you list.',
-        ],
-      },
+      'The categorical field whose categories are compared, such as cell type or cluster. Each category is one group.',
     ],
     links: [
-      doc('Ranked genes', 'h_analysis/08_analysis_mode_genes_panel', 'ranked-genes-mode'),
-      doc('Clustered', 'h_analysis/08_analysis_mode_genes_panel', 'clustered-mode'),
+      doc('Group by', 'h_analysis/08_analysis_mode_genes_panel', 'group-by-and-compare-against'),
     ],
   },
-  'marker-genes-clustering': {
-    title: 'Clustering',
+  'marker-genes-reference': {
+    title: 'Compare against',
     body: [
-      'How the heatmap orders genes (rows) and groups (columns). Distance: Correlation (1 − Pearson r, the default) groups genes with similar patterns, Euclidean compares raw values, Cosine compares direction only.',
-      'Linkage: Average gives balanced clusters, Complete compact ones, Single chained ones. Untick a clustering box to keep that axis in its original order.',
+      'Rest compares each group with every other cell (scanpy’s reference=\'rest\'). Group compares each group with one reference group you choose, such as a control.',
     ],
     links: [
-      doc('Clustered mode', 'h_analysis/08_analysis_mode_genes_panel', 'clustered-mode'),
+      doc('Compare against', 'h_analysis/08_analysis_mode_genes_panel', 'group-by-and-compare-against'),
     ],
   },
   'export-framing': {
@@ -656,7 +732,7 @@ const TIPS = {
       'With a repository connected, only its authors (maintain or admin) can change the list, and publishing writes it for everyone.',
     ],
     links: [
-      doc('Manage annotation', 'j_community_annotation/03_ui_reference', 'manage-annotation-author-only'),
+      doc('Annotated columns', 'j_community_annotation/03_ui_reference', 'annotated-columns-author-only'),
     ],
   },
   'cell-info': {
@@ -664,7 +740,7 @@ const TIPS = {
     body: [
       'Shows a card for the cell under the pointer: its value of the field the view is coloured by and, for a continuous field, where that value sits on the colour scale. For a categorical field it counts the cells of that category visible in the view, which are exactly the cells selecting the category would pick. It works in every view of a grid.',
       'On a touch screen, press and hold a cell. The card stays until the next touch.',
-      'It is on by default. It never loads a field and never redraws the plot, and it waits while the camera moves. On datasets above two million cells the first hover builds a spatial index, which takes a moment once.',
+      'It is on by default. It never loads a field and never redraws the plot, and it waits while the camera moves. On a view of 250,000 cells or more the lookup walks a spatial index, built once in a worker while the page is idle: until it is ready, the card does not show on that view.',
     ],
     links: [
       doc('Cell info', 'd_fields_coloring_legends/08_cell_info', 'what-the-card-shows'),
@@ -699,7 +775,7 @@ const TIPS = {
       'Off: colors span the field’s full data range, so one color always means the same value, whatever the range.',
     ],
     links: [
-      doc('Rescale to the range', 'd_fields_coloring_legends/03_color_by_behavior', 'rescale-colorbar-to-slider-range-contrast-control'),
+      doc('Rescale to range', 'd_fields_coloring_legends/03_color_by_behavior', 'rescale-to-range-contrast-control'),
     ],
   },
   'live-filtering': {
@@ -726,11 +802,13 @@ const TIPS = {
   'outlier-filter': {
     title: 'Outlier filter',
     body: [
-      'Hides cells far from the centre of their category in the latent space. The value is a within-category quantile: at 95% the farthest 5% of each category are hidden; at 100% nothing is.',
-      'It appears for categorical fields whose export includes outlier scores, and applies to the active field in the selected view.',
+      'Hides cells far from the centre of their category in a latent space (an `obsm` array such as scVI or PCA), not in the 2D/3D layout. The value is a share of each category: at 95% the farthest 5% of every category are hidden; at 100% nothing is.',
+      'Without a latent space the filter is one button, Choose latent space, which opens ' + PLACES.dataMapping.name + ' (“Outliers in”) with this file’s candidate arrays; its title names them. A file written by `prepare()` or `cellucid_prepare()` with a latent space stores every categorical field’s distances, so the filter works at once; for any other file the first use reads the latent space once to compute them, with progress and Cancel, and says how much it reads.',
+      'Only categories of at least 10 cells are measured (a file or launch can set another number, `centroid_min_points`). The filter applies to the active field in the selected view.',
     ],
     links: [
       doc('Outlier filtering', 'e_filtering/02_outlier_filtering_per_active_field', 'what-this-filter-is-and-is-not'),
+      doc('Stored or computed', 'e_filtering/02_outlier_filtering_per_active_field', 'stored-or-computed'),
     ],
   },
 
@@ -824,7 +902,7 @@ const TIPS = {
   'shortcuts-navigation': {
     title: 'Navigation keys',
     body: [
-      'W A S D orbit, pan or move depending on the navigation mode; hold Shift to go faster. Their speed is the Keyboard speed setting in Navigation.',
+      `W A S D orbit, pan or move depending on the navigation mode; hold Shift to go faster. Their speed is the Keyboard speed setting in ${PLACES.navigation.name}.`,
     ],
     links: [
       doc('Camera shortcuts', 'c_core_interactions/02_camera_controls_advanced', 'keyboard-shortcuts-that-affect-camera-navigation'),
@@ -863,7 +941,7 @@ const TIPS = {
     title: 'Synthetic data',
     body: [
       'Replaces the open dataset with generated points, to find how many cells this device draws smoothly. Reload the page to get the dataset back.',
-      'The pattern changes how hard the data is: Uniform random is the worst case for level of detail and culling, Atlas-like resembles a real atlas. Change rendering settings in Visualization while it runs.',
+      `The pattern changes how hard the data is: Uniform random is the worst case for level of detail and culling, Atlas-like resembles a real atlas. Change rendering settings in ${PLACES.visualization.name} while it runs.`,
     ],
     links: [
       doc('Benchmark tools', 'n_benchmarking_performance/05_benchmark_tools', 'quick-start-3-minutes'),
@@ -912,7 +990,7 @@ const TIPS = {
       'It does not change the voting rules and publishes nothing; it is only for colouring and analysis here.',
     ],
     links: [
-      doc('Derived consensus column', 'j_community_annotation/02_author_guide', 'build-a-derived-consensus-column-optional-local'),
+      doc('Consensus column', 'j_community_annotation/02_author_guide', 'build-a-consensus-column-optional-local'),
     ],
   },
   'community-consensus-settings': {
@@ -990,7 +1068,7 @@ const TIPS = {
     title: 'Open in Cellucid badge',
     body: [
       'Markdown for a README, a wiki page or an issue. It renders as a small badge that opens this dataset in one click.',
-      'Put it in the repository that hosts your exports.',
+      'Put it in the repository that hosts your data.',
     ],
     links: [
       doc('Badge', 'l_sessions_sharing/13_share_links_badges_and_embeds', 'open-in-cellucid-badge'),
@@ -1009,6 +1087,130 @@ const TIPS = {
     ],
     links: [
       doc('Embedding', 'l_sessions_sharing/13_share_links_badges_and_embeds', 'embed-in-a-web-page'),
+    ],
+  },
+
+  // ----------------------------------------------- Composition and dot plot
+  'analysis-composition': {
+    title: 'Composition',
+    body: [
+      'Counts the cells of every cell type in every sample, shows the proportions as stacked bars and, with a condition, tests each cell type for a change in proportion between the conditions.',
+      'The samples are the replicates; without a samples field the cells are, and the result says so.',
+    ],
+    links: [doc('Composition', 'h_analysis/12_analysis_mode_composition', 'what-composition-answers')],
+  },
+  'composition-cell-types': {
+    title: 'Cell types',
+    body: ['The categorical field whose categories are counted. By default the field the cells are colored by.'],
+    links: [doc('Cell types, samples and condition', 'h_analysis/12_analysis_mode_composition', 'cell-types-samples-and-condition')],
+  },
+  'composition-samples': {
+    title: 'Samples',
+    body: [
+      'The field naming each cell’s sample, donor or library: the biological replicate the tests run across. Found by its name when there is one.',
+      'A sample with cells in two conditions is counted once per condition.',
+    ],
+    links: [doc('Cell types, samples and condition', 'h_analysis/12_analysis_mode_composition', 'cell-types-samples-and-condition')],
+  },
+  'composition-condition': {
+    title: 'Condition',
+    body: ['The field whose groups are compared, such as disease or treatment. None shows the composition without a test.'],
+    links: [doc('Cell types, samples and condition', 'h_analysis/12_analysis_mode_composition', 'cell-types-samples-and-condition')],
+  },
+  'composition-cells': {
+    title: 'Cells',
+    body: ['Count all cells, the cells the view shows (its filters applied), or the cells of one highlight page. Cells missing any of the fields are not counted.'],
+    links: [doc('Cells', 'h_analysis/12_analysis_mode_composition', 'cells')],
+  },
+  'composition-only-types': {
+    title: 'Only these cell types',
+    body: ['Count only the chosen cell types: their proportions then add up to 100% among themselves, such as T-cell subsets within T cells.'],
+    links: [doc('Cells', 'h_analysis/12_analysis_mode_composition', 'cells')],
+  },
+  'composition-test': {
+    title: 'Test',
+    body: [
+      'Each cell type is tested across samples: logit proportions with Welch’s t-test or ANOVA (as propeller, without its empirical-Bayes moderation, so more conservative with few samples), ranks of proportions (Wilcoxon or Kruskal-Wallis), or centred log-ratios.',
+      'At least two samples per condition are needed.',
+    ],
+    links: [doc('Tests', 'h_analysis/12_analysis_mode_composition', 'tests'), doc('Without samples', 'h_analysis/12_analysis_mode_composition', 'without-samples')],
+  },
+  'composition-correction': {
+    title: 'Multiple testing',
+    body: ['Adjusts the p-values over the cell types: Benjamini-Hochberg (false discovery rate) or Bonferroni.'],
+    links: [doc('Tests', 'h_analysis/12_analysis_mode_composition', 'tests')],
+  },
+  'composition-display': {
+    title: 'Display',
+    body: ['Bars per sample or per condition, the order of the cell types, and proportions or counts. Changing these redraws the result without counting again.'],
+    links: [doc('Display', 'h_analysis/12_analysis_mode_composition', 'display')],
+  },
+  'analysis-dotplot': {
+    title: 'Dot plot',
+    body: [
+      'For each listed gene and each group: the color is the mean expression, the size the fraction of cells expressing it. Matrix plot shows the means only.',
+      'Only the listed genes are read.',
+    ],
+    links: [doc('Dot plot', 'h_analysis/13_analysis_mode_dot_plot', 'what-a-dot-plot-shows')],
+  },
+  'dotplot-group-by': {
+    title: 'Group by',
+    body: ['The categorical field whose groups are the rows. By default the field the cells are colored by.'],
+    links: [doc('Group by and genes', 'h_analysis/13_analysis_mode_dot_plot', 'group-by-and-genes')],
+  },
+  'dotplot-genes': {
+    title: 'Genes',
+    body: [
+      'One or more named gene sets, each a bracketed block of columns. Type, paste or import genes, or take them from the marker genes result.',
+      'Genes the dataset lacks are left out and listed on a chip.',
+    ],
+    links: [doc('Group by and genes', 'h_analysis/13_analysis_mode_dot_plot', 'group-by-and-genes')],
+  },
+  'dotplot-groups': {
+    title: 'Groups and cells',
+    body: ['Show all groups or a chosen few, of all cells, the visible cells or one highlight page.'],
+    links: [doc('Groups and cells', 'h_analysis/13_analysis_mode_dot_plot', 'groups-and-cells')],
+  },
+  'dotplot-values': {
+    title: 'Values',
+    body: [
+      'The color: the mean, or the mean scaled 0–1 or to z per gene. A cell expresses a gene when its value is above the cutoff (0). The mean can be taken over the expressing cells only.',
+      'As scanpy’s dotplot.',
+    ],
+    links: [doc('Values', 'h_analysis/13_analysis_mode_dot_plot', 'values')],
+  },
+  'dotplot-layout': {
+    title: 'Layout',
+    body: ['Dot plot, matrix plot or stacked violin (each gene’s distribution per group), swapped axes, the group order (by size or a dendrogram), the color map and the largest dot. Changing these redraws without reading again.'],
+    links: [doc('Layout', 'h_analysis/13_analysis_mode_dot_plot', 'layout')],
+  },
+
+  // ------------------------------------------- Sign-in steps (Drive, OneDrive)
+  'sign-in-google': {
+    title: 'Google Drive sign-in',
+    body: [
+      'What Cellucid gets: access to the files you choose for it in Google’s file picker, which opens already showing this file. Google words it as “see, edit, create and delete” because that permission has no read-only form; Cellucid only reads.',
+      'Where the data goes: your browser reads the file straight from Google. The file and the sign-in never pass through a Cellucid server.',
+      'What is kept: the sign-in, in this tab only, until it is closed. It is never put in a link, a session file or a figure. It lasts about an hour; then one click renews it.',
+      'To revoke it: myaccount.google.com/permissions.',
+    ],
+    links: [
+      doc('Google Drive', 'b_data_loading/16_private_drive_onedrive', 'google-drive'),
+      doc('What is kept', 'b_data_loading/16_private_drive_onedrive', 'what-cellucid-sees-and-keeps'),
+      doc('Revoke access', 'b_data_loading/16_private_drive_onedrive', 'revoke-access'),
+    ],
+  },
+  'sign-in-microsoft': {
+    title: 'OneDrive sign-in',
+    body: [
+      'OneDrive serves no file without a sign-in, even one shared with anyone. What Cellucid gets: permission to read your files and the files shared with you, used only for the file you open.',
+      'A work or school account opening a colleague’s file needs one more permission, which many organisations let only an administrator approve, once for everyone.',
+      'Where the data goes: your browser reads the file straight from Microsoft; the file and the sign-in never pass through a Cellucid server. What is kept: the sign-in, in this tab only, until it is closed; it renews itself for 24 hours. To revoke it: account.live.com/consent/Manage, or myapps.microsoft.com for a work account.',
+    ],
+    links: [
+      doc('OneDrive', 'b_data_loading/16_private_drive_onedrive', 'onedrive-and-sharepoint'),
+      doc('Administrator approval', 'b_data_loading/16_private_drive_onedrive', 'work-and-school-accounts-administrator-approval'),
+      doc('Revoke access', 'b_data_loading/16_private_drive_onedrive', 'revoke-access'),
     ],
   },
 };
@@ -1100,6 +1302,10 @@ export function renderInfoTip(popover, key) {
   close.textContent = '×';
   header.append(title, close);
   content.appendChild(header);
+  // The component's own live lines stay, first under the title.
+  for (const live of popover.querySelectorAll('[data-info-tip-live]')) {
+    content.appendChild(live);
+  }
 
   for (const block of tip.body) {
     if (typeof block === 'string') {

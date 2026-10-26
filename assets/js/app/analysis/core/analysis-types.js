@@ -12,7 +12,7 @@
  * is for formal AnalysisConfig object validation (e.g., for serialization/persistence).
  */
 
-import { setOwnDataProperty } from '../../../utils/exact-record.js';
+import { isObjectRecord, setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // =============================================================================
 // TYPE DEFINITIONS (JSDoc for IDE support)
@@ -135,10 +135,6 @@ import { setOwnDataProperty } from '../../../utils/exact-record.js';
 // =============================================================================
 // VALIDATION UTILITIES
 // =============================================================================
-
-function isObjectRecord(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 
 /**
  * Validation result type

@@ -44,13 +44,67 @@ export function requireOutlierQuantiles(quantiles, pointCount) {
   return quantiles;
 }
 
+/**
+ * Whether outlier quantiles hold at least one available value. An unavailable
+ * quantile is -1, and a field where no category reached `centroid_min_points`
+ * has nothing but those, so its control would filter nothing. Remembered per
+ * array: the scan stops at the first available value, and an all-unavailable
+ * array is scanned once.
+ */
+const OUTLIER_AVAILABILITY = new WeakMap();
+export function hasAvailableOutlierQuantile(quantiles) {
+  if (!quantiles || quantiles.length === 0) return false;
+  let available = OUTLIER_AVAILABILITY.get(quantiles);
+  if (available === undefined) {
+    available = false;
+    for (let index = 0; index < quantiles.length; index++) {
+      if (quantiles[index] >= 0) {
+        available = true;
+        break;
+      }
+    }
+    OUTLIER_AVAILABILITY.set(quantiles, available);
+  }
+  return available;
+}
+
 export const colorOutlierMethods = {
-  setOutlierThresholdForActive(threshold) {
+  /**
+   * Set the active categorical field's outlier threshold. The field's
+   * quantiles are got on the first threshold below 1 (never when the field
+   * is picked: `state/managers/outlier-quantiles.js`); the filter applies
+   * once they arrive, at the threshold the control holds by then. Cancelled
+   * or failed, the threshold is back at 1 and the field's outlier status
+   * says why.
+   *
+   * @param {number} threshold
+   * @returns {Promise<void>} Settles once the threshold is applied, or the
+   *   quantiles were cancelled or failed.
+   */
+  async setOutlierThresholdForActive(threshold) {
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
       throw new RangeError('Outlier threshold must be a finite value from 0 through 1.');
     }
     const field = this.getActiveField();
-    if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) return;
+    if (!field || this.activeFieldSource !== 'obs' || field.kind !== 'category') return;
+    const fieldIndex = this.activeFieldIndex;
+    if (!(field.outlierQuantiles instanceof Float32Array)) {
+      const { state } = this.getOutlierFilterStatus(fieldIndex);
+      if (state !== 'available' && state !== 'running' && state !== 'failed') return;
+      field._outlierThreshold = threshold;
+      if (threshold >= 0.9999) return;
+      let quantiles;
+      try {
+        quantiles = await this.ensureOutlierQuantiles(fieldIndex);
+      } catch {
+        // Cancelled or failed: the outlier status says which, and why.
+        return;
+      }
+      if (quantiles === null || this.getActiveField() !== field) return;
+      this.computeGlobalVisibility();
+      return;
+    }
+    if (!field.outlierQuantiles.length) return;
     field._outlierThreshold = threshold;
     this.computeGlobalVisibility();
   },

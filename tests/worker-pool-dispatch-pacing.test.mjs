@@ -15,8 +15,9 @@ import {
 function installWorkers(t) {
   const original = globalThis.Worker;
   const workers = [];
-  class EchoWorker {
+  class EchoWorker extends EventTarget {
     constructor() {
+      super();
       this.received = [];
       workers.push(this);
     }

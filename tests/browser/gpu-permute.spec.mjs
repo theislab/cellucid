@@ -1,19 +1,21 @@
 /**
  * Stores in a draw order are gathered on the GPU (GpuPermuter): the bytes
  * written must equal a CPU gather exactly -- 1, 2 and 3 words a point
- * (colours, 1D/2D/3D positions), into a new store or in place -- at sizes
- * around the texture row width, and the pass must leave every binding it
- * touches as it found it.
+ * (colours, 1D/2D/3D positions), into a new store, in place from page
+ * memory, or in place from the store itself (its words drawn into the
+ * source texture on the GPU) -- at sizes around the texture row width, and
+ * the pass must leave every binding and state it touches as it found it.
+ * The highlight colour words of a store's slots are the CPU's.
  * End to end, a recolour of an ordered live store holds the recoloured bytes
  * in the live draw order, and an adopted store holds its positions in it.
  */
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
 test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
   const pageErrors = [];
@@ -67,6 +69,18 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
       gl.activeTexture(gl.TEXTURE3);
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, sentinel);
+      // A complete framebuffer of the caller's, bound across the pass.
+      const framebuffer = gl.createFramebuffer();
+      const colour = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, colour);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, 64, 64);
+      gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, colour);
+      gl.viewport(3, 4, 50, 60);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.enable(gl.BLEND);
+      gl.colorMask(true, false, true, false);
 
       const store = (bytes, data = null) => {
         const buffer = gl.createBuffer();
@@ -87,8 +101,10 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
         permuter.writeWords(fresh, array, record, wordsPerPoint);
         const inPlace = store(0, array);
         permuter.writeWords(inPlace, array, record, wordsPerPoint);
-        words[wordsPerPoint] = { array, fresh, inPlace };
-        created.push(fresh, inPlace);
+        const fromStore = store(0, array);
+        permuter.writeWords(fromStore, { buffer: fromStore, words: array.length }, record, wordsPerPoint);
+        words[wordsPerPoint] = { array, fresh, inPlace, fromStore };
+        created.push(fresh, inPlace, fromStore);
       }
 
       const restored = gl.getParameter(gl.ARRAY_BUFFER_BINDING) === sentinel
@@ -97,6 +113,10 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
         && gl.getParameter(gl.ACTIVE_TEXTURE) === gl.TEXTURE3
         && gl.getParameter(gl.TRANSFORM_FEEDBACK_BINDING) === null
         && gl.isEnabled(gl.RASTERIZER_DISCARD) === false
+        && gl.getParameter(gl.FRAMEBUFFER_BINDING) === framebuffer
+        && Array.from(gl.getParameter(gl.VIEWPORT)).join() === '3,4,50,60'
+        && gl.isEnabled(gl.SCISSOR_TEST) && gl.isEnabled(gl.BLEND)
+        && gl.getParameter(gl.COLOR_WRITEMASK).join() === 'true,false,true,false'
         && (() => {
           gl.activeTexture(gl.TEXTURE0);
           const zero = gl.getParameter(gl.TEXTURE_BINDING_2D) === unit0
@@ -109,6 +129,12 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
         })();
 
       gl.bindVertexArray(null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteRenderbuffer(colour);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.disable(gl.BLEND);
+      gl.colorMask(true, true, true, true);
       const read = (buffer, bytes) => {
         const out = new Uint8Array(bytes);
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -118,8 +144,8 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
       };
       let rgbaMismatch = 0;
       for (const wordsPerPoint of [1, 2, 3]) {
-        const { array, fresh, inPlace } = words[wordsPerPoint];
-        for (const buffer of [fresh, inPlace]) {
+        const { array, fresh, inPlace, fromStore } = words[wordsPerPoint];
+        for (const buffer of [fresh, inPlace, fromStore]) {
           const got = new Uint32Array(read(buffer, count * wordsPerPoint * 4).buffer);
           for (let slot = 0; slot < count; slot++) {
             for (let word = 0; word < wordsPerPoint; word++) {
@@ -128,9 +154,43 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
           }
         }
       }
+      // Highlight words of every slot: bytes a point (intensity, shown),
+      // the word the CPU packs for an admitted cell, 0 for any other.
+      const byteTexture = bytes => {
+        const texture = gl.createTexture();
+        const bytePlan = linear.planLinearTextureFor(gl, count);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+        linear.allocateLinearTexture(gl, gl.R8UI, bytePlan);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        linear.writeLinearTextureRows(gl, bytePlan, gl.RED_INTEGER, gl.UNSIGNED_BYTE, bytes, 1);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+        return { texture, plan: bytePlan };
+      };
+      const intensity = new Uint8Array(count);
+      const shown = new Uint8Array(count);
+      for (let i = 0; i < count; i++) {
+        intensity[i] = [0, 2, 3, 128, 255][random() % 5];
+        shown[i] = random() % 3 === 0 ? 0 : 1;
+      }
+      const highlightTexture = byteTexture(intensity);
+      const shownTexture = byteTexture(shown);
+      const highlightWords = store(count * 4);
+      permuter.writeHighlightWords(highlightWords, count, record, highlightTexture, shownTexture, 3);
+      const gotWords = new Uint32Array(read(highlightWords, count * 4).buffer);
+      let highlightMismatch = 0;
+      for (let slot = 0; slot < count; slot++) {
+        const i = indices[slot];
+        const expected = intensity[i] >= 3 && shown[i] === 1 ? (0x00ffffff | (intensity[i] << 24)) >>> 0 : 0;
+        if (gotWords[slot] !== expected) highlightMismatch++;
+      }
+      gl.deleteBuffer(highlightWords);
+      gl.deleteTexture(highlightTexture.texture);
+      gl.deleteTexture(shownTexture.texture);
       results.push({
         count,
         rgbaMismatch,
+        highlightMismatch,
         restored,
         error: gl.getError(),
       });
@@ -147,6 +207,7 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
     expect(row, `count ${row.count}`).toEqual({
       count: row.count,
       rgbaMismatch: 0,
+      highlightMismatch: 0,
       restored: true,
       error: 0,
     });
@@ -159,7 +220,7 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;

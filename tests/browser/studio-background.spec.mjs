@@ -49,7 +49,7 @@ async function openFixture(page) {
     cellCount: 3_000,
   });
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);

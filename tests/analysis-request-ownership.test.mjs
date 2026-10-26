@@ -1,11 +1,18 @@
+/**
+ * A form analysis publishes only its newest run: an older completion or
+ * failure never renders, an invalidated render is never adopted, the Run
+ * button follows the newest run, and a highlight change marks a shown result
+ * stale rather than discarding or re-running it
+ * (`ui/analysis-types/base/form-based-analysis.js`).
+ */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { CorrelationAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/correlation-analysis-ui.js';
-import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
-import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
+import { defineOptions } from '../assets/js/app/analysis/options/option-schema.js';
+
+globalThis.HTMLElement ??= class HTMLElement {};
 
 function deferred() {
   let resolve;
@@ -17,51 +24,13 @@ function deferred() {
   return { promise, reject, resolve };
 }
 
-function correlationForm(owner) {
-  return {
-    owner,
-    variableX: { type: 'continuous_obs', key: `x-${owner}` },
-    variableY: { type: 'continuous_obs', key: `y-${owner}` },
-  };
-}
-
-function signatureForm(owner) {
-  return {
-    owner,
-    genes: [`gene-${owner}`],
-    method: 'mean',
-    normalize: 'none',
-    plotType: 'violinplot',
-  };
-}
-
-function createAutoAnalysisHarness(UIClass, formValues) {
-  const ui = new UIClass({
-    comparisonModule: {},
-    dataLayer: {},
-    multiVariableAnalysis: {},
-  });
-  const pendingByOwner = new Map();
-  const renders = [];
-  const errors = [];
-  const forms = [...formValues];
-
-  ui._canRunAnalysis = () => true;
-  ui._getFormValues = () => forms.shift();
-  ui._runAnalysisImpl = ({ owner }) => {
-    const pending = deferred();
-    pendingByOwner.set(owner, pending);
-    return pending.promise;
-  };
-  ui._showResult = async result => {
-    renders.push(result.owner);
-  };
-  ui._showError = message => {
-    errors.push(message);
-  };
-
-  return { errors, pendingByOwner, renders, ui };
-}
+const SCHEMA = defineOptions({
+  id: 'manual',
+  groups: [],
+  options: [
+    { key: 'size', kind: 'number', label: 'Size', tip: 'analysis-signature', group: 'essentials', default: 1 },
+  ],
+});
 
 class ManualFormHarness extends FormBasedAnalysisUI {
   static getRequirements() {
@@ -72,345 +41,143 @@ class ManualFormHarness extends FormBasedAnalysisUI {
     return 'Manual';
   }
 
-  _renderFormControls() {}
-
-  _getFormValues() {
-    return {};
+  _getOptionsSchema() {
+    return SCHEMA;
   }
 
-  async _showResult() {}
+  async _showResult(result) {
+    this.renders.push(result.data.owner);
+  }
 }
 
-for (const analysisCase of [
-  {
-    label: 'Correlation',
-    UIClass: CorrelationAnalysisUI,
-    forms: [correlationForm('older'), correlationForm('newer')],
-  },
-  {
-    label: 'Gene Signature',
-    UIClass: GeneSignatureUI,
-    forms: [signatureForm('older'), signatureForm('newer')],
-  },
-]) {
-  test(`${analysisCase.label} publishes only the newest out-of-order completion`, async () => {
-    const {
-      pendingByOwner,
-      renders,
-      ui,
-    } = createAutoAnalysisHarness(analysisCase.UIClass, analysisCase.forms);
-
-    const olderRun = ui._runAnalysisIfValid();
-    const newerRun = ui._runAnalysisIfValid();
-
-    try {
-      pendingByOwner.get('older').resolve({
-        owner: 'older',
-        data: { owner: 'older' },
-      });
-      await olderRun;
-
-      assert.deepEqual(
-        renders,
-        [],
-        'an older completion must not render while a newer request is pending',
-      );
-      assert.equal(
-        ui.isLoading(),
-        true,
-        'an older finally block must not clear the newer loading generation',
-      );
-
-      pendingByOwner.get('newer').resolve({
-        owner: 'newer',
-        data: { owner: 'newer' },
-      });
-      await newerRun;
-
-      assert.deepEqual(renders, ['newer']);
-      assert.equal(ui.getLastResult().owner, 'newer');
-      assert.equal(ui._currentPageData.owner, 'newer');
-      assert.equal(ui.isLoading(), false);
-    } finally {
-      pendingByOwner.get('older')?.resolve({
-        owner: 'older',
-        data: { owner: 'older' },
-      });
-      pendingByOwner.get('newer')?.resolve({
-        owner: 'newer',
-        data: { owner: 'newer' },
-      });
-      await Promise.allSettled([olderRun, newerRun]);
-    }
-  });
-
-  test(`${analysisCase.label} suppresses stale failure publication`, async () => {
-    const {
-      errors,
-      pendingByOwner,
-      renders,
-      ui,
-    } = createAutoAnalysisHarness(analysisCase.UIClass, analysisCase.forms);
-
-    const olderRun = ui._runAnalysisIfValid();
-    const newerRun = ui._runAnalysisIfValid();
-
-    try {
-      pendingByOwner.get('older').reject(new Error('older failure'));
-      await olderRun;
-
-      assert.deepEqual(errors, []);
-      assert.deepEqual(renders, []);
-      assert.equal(
-        ui.isLoading(),
-        true,
-        'a stale failure must not end the newer loading generation',
-      );
-
-      pendingByOwner.get('newer').resolve({
-        owner: 'newer',
-        data: { owner: 'newer' },
-      });
-      await newerRun;
-
-      assert.deepEqual(errors, []);
-      assert.deepEqual(renders, ['newer']);
-      assert.equal(ui.getLastResult().owner, 'newer');
-      assert.equal(ui.isLoading(), false);
-    } finally {
-      pendingByOwner.get('older')?.resolve({
-        owner: 'older',
-        data: { owner: 'older' },
-      });
-      pendingByOwner.get('newer')?.resolve({
-        owner: 'newer',
-        data: { owner: 'newer' },
-      });
-      await Promise.allSettled([olderRun, newerRun]);
-    }
-  });
-
-  test(`${analysisCase.label} does not adopt result data before its render commits`, async () => {
-    const renderStarted = deferred();
-    const renderSettlement = deferred();
-    const {
-      pendingByOwner,
-      ui,
-    } = createAutoAnalysisHarness(analysisCase.UIClass, [
-      analysisCase.forms[0],
-    ]);
-    ui._showResult = async () => {
-      renderStarted.resolve();
-      await renderSettlement.promise;
-    };
-
-    const run = ui._runAnalysisIfValid();
-    pendingByOwner.get('older').resolve({
-      owner: 'older',
-      data: { owner: 'older' },
-    });
-    await renderStarted.promise;
-
-    ui._invalidateAnalysisRequest();
-    renderSettlement.resolve();
-    await run;
-
-    assert.equal(
-      ui.getLastResult(),
-      null,
-      'an invalidated render candidate must not become the exported result',
-    );
-    assert.equal(
-      ui._currentPageData,
-      null,
-      'an invalidated render candidate must not become exported page data',
-    );
-    assert.equal(ui.isLoading(), false);
-  });
-}
-
-test('manual form invalidation immediately releases its button and suppresses stale rejection', async () => {
-  const implementation = deferred();
-  const terminal = [];
-  const button = { disabled: false, textContent: 'Run Analysis' };
-  const ui = new ManualFormHarness({
-    comparisonModule: {},
-    dataLayer: {},
-  });
-  ui._formContainer = {
-    querySelector() {
-      return button;
-    },
-  };
-  ui._validateForm = () => ({ valid: true });
-  ui._runAnalysisImpl = () => implementation.promise;
+function createHarness(pending) {
+  const ui = new ManualFormHarness({ comparisonModule: {}, dataLayer: {} });
+  ui.renders = [];
   ui._notifications = {
-    loading() {
-      return 'manual-A';
-    },
-    complete(id) {
-      terminal.push(['complete', id]);
-    },
-    fail(id) {
-      terminal.push(['fail', id]);
-    },
-    dismiss(id) {
-      terminal.push(['dismiss', id]);
-    },
-  };
-
-  const run = ui._runAnalysis();
-  assert.deepEqual(button, {
-    disabled: true,
-    textContent: 'Running...',
-  });
-
-  ui._invalidateAnalysisRequest();
-  assert.deepEqual(
-    button,
-    { disabled: false, textContent: 'Run Analysis' },
-    'input invalidation must make the same visible Run control usable immediately',
-  );
-
-  implementation.reject(new Error('stale implementation failure'));
-  await run;
-  assert.deepEqual(terminal, [['dismiss', 'manual-A']]);
-  assert.equal(ui.getLastResult(), null);
-  assert.equal(ui.isLoading(), false);
-});
-
-test('a newer manual form run never captures an older Running label', async () => {
-  const older = deferred();
-  const newer = deferred();
-  const pending = [older, newer];
-  const button = { disabled: false, textContent: 'Run Analysis' };
-  const ui = new ManualFormHarness({
-    comparisonModule: {},
-    dataLayer: {},
-  });
-  ui._formContainer = {
-    querySelector() {
-      return button;
-    },
-  };
-  ui._validateForm = () => ({ valid: true });
-  ui._runAnalysisImpl = () => pending.shift().promise;
-  ui._notifications = {
-    loading() {
-      return `manual-${pending.length}`;
-    },
+    loading: () => 'manual',
     complete() {},
     fail() {},
     dismiss() {},
+    error() {},
   };
+  const button = { disabled: false, textContent: 'Run', dataset: {}, removeAttribute() {}, setAttribute() {} };
+  ui._runRow = { button, reason: { hidden: true, textContent: '' } };
+  ui._runAnalysisImpl = () => pending.shift().promise;
+  return { ui, button };
+}
 
+test('only the newest of two runs publishes, whichever completes first', async () => {
+  const older = deferred();
+  const newer = deferred();
+  const { ui } = createHarness([older, newer]);
+  const olderRun = ui._runAnalysis();
+  const newerRun = ui._runAnalysis();
+  older.resolve({ data: { owner: 'older' } });
+  await olderRun;
+  assert.deepEqual(ui.renders, [], 'an older completion never renders');
+  assert.equal(ui.isLoading(), true, 'and does not end the newer run');
+  newer.resolve({ data: { owner: 'newer' } });
+  await newerRun;
+  assert.deepEqual(ui.renders, ['newer']);
+  assert.equal(ui.getLastResult().data.owner, 'newer');
+  assert.equal(ui.isLoading(), false);
+});
+
+test('an older run\'s failure is not published', async () => {
+  const older = deferred();
+  const newer = deferred();
+  const { ui } = createHarness([older, newer]);
+  const olderRun = ui._runAnalysis();
+  const olderJob = ui._shownJob;
+  const newerRun = ui._runAnalysis();
+  older.reject(new Error('older failure'));
+  await olderRun;
+  assert.notEqual(olderJob.state, 'failed', 'a superseded run is cancelled, never failed');
+  newer.resolve({ data: { owner: 'newer' } });
+  await newerRun;
+  assert.deepEqual(ui.renders, ['newer']);
+});
+
+test('an invalidated render is never adopted as the result', async () => {
+  const run = deferred();
+  const renderStarted = deferred();
+  const renderSettlement = deferred();
+  const { ui } = createHarness([run]);
+  ui._showResult = async () => {
+    renderStarted.resolve();
+    await renderSettlement.promise;
+  };
+  const running = ui._runAnalysis();
+  run.resolve({ data: { owner: 'older' } });
+  await renderStarted.promise;
+  ui._invalidateAnalysisRequest();
+  renderSettlement.resolve();
+  await running;
+  assert.equal(ui.getLastResult(), null);
+  assert.equal(ui._currentPageData, null);
+  assert.equal(ui.isLoading(), false);
+});
+
+test('invalidating a run frees Run at once and cancels its job', async () => {
+  const run = deferred();
+  const { ui, button } = createHarness([run]);
+  const running = ui._runAnalysis();
+  assert.equal(button.textContent, 'Running…');
+  assert.equal(button.disabled, true);
+  const job = ui._shownJob;
+  ui._invalidateAnalysisRequest();
+  assert.equal(button.textContent, 'Run');
+  assert.equal(button.disabled, false);
+  assert.equal(job.state, 'cancelled');
+  assert.equal(job.signal.aborted, true);
+  run.reject(new Error('stale failure'));
+  await running;
+  assert.equal(job.state, 'cancelled', 'a stale failure never turns a cancel into a failure');
+  assert.equal(ui.getLastResult(), null);
+});
+
+test('a newer run never captures an older Running label', async () => {
+  const older = deferred();
+  const newer = deferred();
+  const { ui, button } = createHarness([older, newer]);
   const olderRun = ui._runAnalysis();
   const newerRun = ui._runAnalysis();
   newer.resolve({ data: { owner: 'newer' } });
   await newerRun;
-
-  assert.deepEqual(button, {
-    disabled: false,
-    textContent: 'Run Analysis',
-  });
-  assert.equal(ui.getLastResult().data.owner, 'newer');
-
+  assert.equal(button.textContent, 'Run');
   older.resolve({ data: { owner: 'older' } });
   await olderRun;
   assert.equal(ui.getLastResult().data.owner, 'newer');
-  assert.deepEqual(button, {
-    disabled: false,
-    textContent: 'Run Analysis',
-  });
+  assert.equal(button.textContent, 'Run');
+  assert.equal(button.disabled, false);
 });
 
-test('manual form highlight changes invalidate active scientific ownership', () => {
-  const ui = new ManualFormHarness({
-    comparisonModule: {},
-    dataLayer: {},
-  });
+test('a highlight change marks a shown result stale; it neither discards nor re-runs it', async () => {
+  const run = deferred();
+  const { ui } = createHarness([run]);
   ui._updatePageSelectorCounts = () => {};
-  const requestId = ui._startAnalysisRequest();
-  let cleanups = 0;
-  ui._registerAnalysisInvalidationCleanup(requestId, () => {
-    cleanups += 1;
-  });
-
+  run.resolve({ data: { owner: 'shown' } });
+  await ui._runAnalysis();
+  assert.equal(ui._isResultStale(), false);
   ui.onHighlightChanged();
-
-  assert.equal(ui._isCurrentAnalysisRequest(requestId), false);
-  assert.equal(cleanups, 1);
+  assert.equal(ui.getLastResult().data.owner, 'shown');
+  assert.equal(ui._isResultStale(), true);
+  assert.deepEqual(ui.renders, ['shown']);
 });
 
-test('DE comparison changes invalidate active scientific ownership immediately', () => {
-  const ui = new DEAnalysisUI({
-    comparisonModule: {},
-    dataLayer: {
-      getCellCountForPageId() {
-        return 1;
-      },
-    },
-  });
-  const requestId = ui._startAnalysisRequest();
-  let cleanups = 0;
-  ui._registerAnalysisInvalidationCleanup(requestId, () => {
-    cleanups += 1;
-  });
-
-  ui._handleComparisonChange(['page-A', 'page-B']);
-
-  assert.equal(ui._isCurrentAnalysisRequest(requestId), false);
-  assert.equal(cleanups, 1);
-});
-
-test('DE progress updates mutate only their request-local tracker', () => {
-  const calls = [];
-  const makeTracker = owner => ({
-    setPhase(value) {
-      calls.push([owner, 'phase', value]);
-    },
-    setTotalItems(value) {
-      calls.push([owner, 'total', value]);
-    },
-    setCompletedItems(value) {
-      calls.push([owner, 'completed', value]);
-    },
-    setMessage(value) {
-      calls.push([owner, 'message', value]);
-    },
-  });
-  const ui = Object.create(DEAnalysisUI.prototype);
-  const olderTracker = makeTracker('older');
-  ui._progressTracker = makeTracker('newer');
-
-  ui._updateProgress({
-    phase: 'Loading & Computing',
-    progress: 50,
-    loaded: 1,
-    total: 2,
-    message: 'One of two',
-  }, olderTracker);
-
-  assert.deepEqual(calls, [
-    ['older', 'phase', 'Loading & Computing'],
-    ['older', 'total', 2],
-    ['older', 'completed', 1],
-    ['older', 'message', 'One of two'],
-  ]);
-});
-
-test('differential expression stops before data access when its owner is stale', async () => {
-  const accessError = new Error('stale DE reached dataset access');
+test('differential expression stops before testing when its owner is stale', async () => {
   const analysis = new MultiVariableAnalysis({
     state: { pointCount: 10 },
-    getAvailableVariables() {
-      throw accessError;
-    },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
+    getAvailableVariables: () => [{ key: 'G' }],
   });
-
+  analysis._getComputeManager = async () => {
+    throw new Error('a stale run reached the compute threads');
+  };
   const result = await analysis.differentialExpression({
-    pageA: 'page-A',
-    pageB: 'page-B',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(5, 6, 7) },
     method: 'wilcox',
     isCurrent: () => false,
     registerInvalidationCleanup() {},

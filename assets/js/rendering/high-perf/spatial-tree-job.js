@@ -4,7 +4,7 @@
  * (`spatial-tree-worker.js`) and as the renderer computes it inline where no
  * worker can take the job (`createInlineSpatialTreeBuilder`).
  */
-import { buildSpatialTree, spatialTreeTransferList } from './spatial-tree.js';
+import { buildSpatialTree, decodeSpatialTree, encodeSpatialTree } from './spatial-tree.js';
 import { computeTreeDrawOrder, drawOrderTransferList } from './draw-order.js';
 
 /**
@@ -44,9 +44,28 @@ function packLeafIndices(tree, pointCount) {
 }
 
 /**
+ * A build's result as the worker sends it: the tree as typed arrays
+ * (`encodeSpatialTree`) and the draw order, every buffer transferred.
+ *
  * @param {{tree: object, order: object}} result
- * @returns {ArrayBuffer[]}
+ * @param {1|2|3} dimensionLevel
+ * @returns {{reply: {tree: object, order: object}, transfer: ArrayBuffer[]}}
  */
-export function spatialTreeJobTransferList(result) {
-  return [...spatialTreeTransferList(result.tree), ...drawOrderTransferList(result.order)];
+export function encodeSpatialTreeJobResult(result, dimensionLevel) {
+  const { encoded, transfer } = encodeSpatialTree(result.tree, dimensionLevel);
+  return {
+    reply: { tree: encoded, order: result.order },
+    transfer: [...transfer, ...drawOrderTransferList(result.order)],
+  };
+}
+
+/**
+ * The result `encodeSpatialTreeJobResult` encoded, as `buildSpatialTreeJob`
+ * returned it.
+ *
+ * @param {{tree: object, order: object}} reply
+ * @returns {{tree: {bounds: object, root: object}, order: object}}
+ */
+export function decodeSpatialTreeJobResult(reply) {
+  return { tree: decodeSpatialTree(reply.tree), order: reply.order };
 }

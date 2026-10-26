@@ -1,0 +1,9 @@
+{
+  "default": "current-ui",
+  "datasets": [
+    {
+      "id": "current-ui",
+      "path": "current-ui.h5ad"
+    }
+  ]
+}

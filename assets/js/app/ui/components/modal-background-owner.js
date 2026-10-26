@@ -7,6 +7,8 @@
  * attributes are restored when the final layer releases ownership.
  */
 
+import { formatCountOf } from '../../../utils/format-units.js';
+
 const layers = [];
 const originalStates = new Map();
 const auxiliaryLayers = new Map();
@@ -137,7 +139,7 @@ function placeAuxiliaryLayers(top) {
   if (errors.length > 1) {
     throw new AggregateError(
       errors,
-      `Modal auxiliary placement failed for ${errors.length} elements`
+      `Modal auxiliary placement failed for ${formatCountOf(errors.length, 'element')}`
     );
   }
 }
@@ -179,7 +181,7 @@ function restoreAllAuxiliaryPlacements() {
   if (errors.length > 1) {
     throw new AggregateError(
       errors,
-      `Modal auxiliary restoration failed for ${errors.length} elements`
+      `Modal auxiliary restoration failed for ${formatCountOf(errors.length, 'element')}`
     );
   }
 }
@@ -206,7 +208,7 @@ function reconcileBody() {
   if (errors.length > 1) {
     throw new AggregateError(
       errors,
-      `Modal document reconciliation failed for ${errors.length} elements`
+      `Modal document reconciliation failed for ${formatCountOf(errors.length, 'element')}`
     );
   }
 }
@@ -256,7 +258,7 @@ function restoreAllOriginalStates() {
   if (errors.length > 1) {
     throw new AggregateError(
       errors,
-      `Modal document restoration failed for ${errors.length} elements`
+      `Modal document restoration failed for ${formatCountOf(errors.length, 'element')}`
     );
   }
 }

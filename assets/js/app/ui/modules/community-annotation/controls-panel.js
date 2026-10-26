@@ -18,6 +18,7 @@
  * @module ui/modules/community-annotation/controls-panel
  */
 
+import { annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
 import {
   getAnnotationRepoForDataset,
 } from '../../../community-annotations/repo-store.js';
@@ -51,6 +52,7 @@ import {
 } from './consensus-math.js';
 import { copyTextToClipboard } from './browser-integration.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
+import { PLACES } from '../../place-names.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
 
@@ -230,7 +232,7 @@ export function createControlsPanel(controller) {
     container.innerHTML = '';
     infoPopoverSequence = 0;
 
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const datasetId = annotationDatasetIdOf(dataSourceManager) || null;
     const cacheUsername = getCacheUserKey();
     const repo = getAnnotationRepoForDataset(datasetId, cacheUsername);
     const repoConnectedForGating = isAnnotationRepoConnected(datasetId, cacheUsername);
@@ -614,7 +616,7 @@ export function createControlsPanel(controller) {
 
     const manageDisclosure = createPeerDisclosure(
       'manage',
-      'Annotated columns',
+      PLACES.annotatedColumns.name,
       'community-annotated-columns'
     );
     const manageContent = manageDisclosure.content;
@@ -874,7 +876,7 @@ export function createControlsPanel(controller) {
       }, { label: 'Unable to clear the local annotation session' });
     });
 
-    const cacheDatasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const cacheDatasetId = annotationDatasetIdOf(dataSourceManager) || null;
     const cacheUser = getCacheUserKey();
     const cacheUserId = getCacheUserId();
     const repoRef = getAnnotationRepoForDataset(cacheDatasetId, cacheUser) || null;

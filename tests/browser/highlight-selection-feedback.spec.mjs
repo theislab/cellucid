@@ -1,12 +1,14 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=highlight-selection-feedback-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=highlight-selection-feedback-ci';
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
+// The active tool's gesture, or what it needs first: the Selection (i)'s first line.
+const TOOL_HINT = '#highlight-tool-hint';
 
 function observeProductErrors(page) {
   const errors = [];
@@ -23,7 +25,7 @@ async function openPreparedDataset(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells'
@@ -156,7 +158,11 @@ async function armSelection(page, tool, gesture) {
 }
 
 const unifiedState = page => page.evaluate(
-  () => window._cellucidViewer.getUnifiedSelectionState(),
+  () => {
+    // The candidates are a cell list (Uint32Array); hand them over as numbers.
+    const state = window._cellucidViewer.getUnifiedSelectionState();
+    return { ...state, candidates: Array.from(state.candidates) };
+  },
 );
 
 test(
@@ -229,29 +235,29 @@ test(
     // The fixture loads with no colouring field, which is when Alt+click is inert.
     await expect(page.locator('#categorical-field')).toHaveValue('-1');
     await expect(page.locator('#continuous-field')).toHaveValue('-1');
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
-    await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+    await expect(page.locator(TOOL_HINT)).not.toContainText(
       'Alt+click a cell to select',
     );
 
     const points = await findCellPoints(page, 1);
     await altClick(page, points[0]);
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Alt+click a cell to select',
     );
-    await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+    await expect(page.locator(TOOL_HINT)).not.toContainText(
       'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'None' });
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Color by a field first',
     );
 
@@ -447,7 +453,7 @@ test(
     await expect(page.locator(MODE_DESCRIPTION)).toContainText(
       MISSED_CELL_NOTICE,
     );
-    await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+    await expect(page.locator(TOOL_HINT)).toContainText(
       'Alt+click a cell to select',
     );
     expect(await unifiedState(page)).toMatchObject({

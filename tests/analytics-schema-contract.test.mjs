@@ -40,7 +40,7 @@ const PII_SHAPED = Object.freeze([
   'https://alice:ghp_secret@github.com/lab/private',
   'http://10.1.2.3:8765/?token=abc',
   'AML relapse donor 7',
-  'Failed to fetch https://lab.example/exports/patient7/embeddings/0_2d.bin',
+  'Failed to fetch https://lab.example/data/patient7.h5ad',
   'x'.repeat(101),
 ]);
 
@@ -318,10 +318,16 @@ test('the schema covers every call site, and every declared event has one', asyn
 
 test('the code-load watch reports one schema-valid failure, only on production', async () => {
   const source = await read('assets/js/app/ui/core/code-load-watch.js');
-  const run = (enabled, search) => {
+  // `failure` is how the graph fails: a module that did not download (an
+  // `error` on its script element), or one that did not run (an uncaught
+  // error on the window before main.js marked the root, settled once the
+  // document is parsed).
+  const run = (enabled, search, failure) => {
     const calls = [];
     let listener = null;
+    let parsed = null;
     class HTMLScriptElement {}
+    class ErrorEvent {}
     const script = Object.assign(new HTMLScriptElement(), {
       type: 'module',
       src: 'https://www.cellucid.com/assets/js/app/main.js',
@@ -329,13 +335,19 @@ test('the code-load watch reports one schema-valid failure, only on production',
     const root = { dataset: {} };
     const context = vm.createContext({
       HTMLScriptElement,
+      ErrorEvent,
       URL,
       URLSearchParams,
-      location: { origin: 'https://www.cellucid.com' },
+      // The build check after a failure finds no connection here.
+      fetch: () => Promise.reject(new TypeError('offline')),
+      location: { origin: 'https://www.cellucid.com', pathname: '/' },
       document: {
+        readyState: 'loading',
         baseURI: 'https://www.cellucid.com/',
         documentElement: root,
         getElementById: () => null,
+        querySelector: () => null,
+        addEventListener: (type, handler) => { if (type === 'DOMContentLoaded') parsed = handler; },
       },
       window: {
         cellucidAnalyticsEnabled: enabled,
@@ -345,20 +357,32 @@ test('the code-load watch reports one schema-valid failure, only on production',
       },
     });
     vm.runInContext(source, context);
-    listener({ target: script });
-    listener({ target: script });
+    if (failure === 'download') {
+      listener({ target: script });
+      listener({ target: script });
+    } else {
+      const error = vm.runInContext(
+        "new SyntaxError(\"The requested module './x.js' does not provide an export named 'y'\")",
+        context
+      );
+      listener(Object.assign(new ErrorEvent(), { target: context.window, error, filename: '' }));
+      listener(Object.assign(new ErrorEvent(), { target: context.window, error, filename: '' }));
+      parsed();
+    }
     return calls;
   };
-  const production = run(true, '?remote=http%3A%2F%2F10.1.2.3&dataset=x');
-  assert.equal(production.length, 1);
-  const [[command, name, params]] = production;
-  assert.equal(command, 'event');
-  // Copied out of the vm realm, whose objects have their own prototype.
-  assert.deepEqual(validateEvent(name, JSON.parse(JSON.stringify(params))), {
-    startup_phase: 'code-load',
-    source_type: 'remote',
-    error_code: 'CODE_LOAD_FAILED',
-    error_name: 'Error',
-  });
-  assert.deepEqual(run(false, ''), []);
+  for (const failure of ['download', 'run']) {
+    const production = run(true, '?remote=http%3A%2F%2F10.1.2.3&dataset=x', failure);
+    assert.equal(production.length, 1, failure);
+    const [[command, name, params]] = production;
+    assert.equal(command, 'event');
+    // Copied out of the vm realm, whose objects have their own prototype.
+    assert.deepEqual(validateEvent(name, JSON.parse(JSON.stringify(params))), {
+      startup_phase: 'code-load',
+      source_type: 'remote',
+      error_code: 'CODE_LOAD_FAILED',
+      error_name: 'Error',
+    });
+    assert.deepEqual(run(false, '', failure), []);
+  }
 });

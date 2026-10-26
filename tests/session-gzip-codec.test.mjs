@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { constants, gunzipSync, gzipSync } from 'node:zlib';
 
+import { gzipDecompress } from '../assets/js/app/session/codecs/gzip.js';
 import {
   NATIVE_INFLATE_INPUT_SLICE_BYTES,
   createSlicedInputStream,
-  gzipDecompress,
-} from '../assets/js/app/session/codecs/gzip.js';
+} from '../assets/js/formats/io/inflate.js';
 
 const encoder = new TextEncoder();
 

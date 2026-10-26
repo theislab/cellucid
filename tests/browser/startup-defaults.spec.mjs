@@ -1,8 +1,8 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 
 const DEFAULT_STARTUP_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&acceptance=startup-defaults-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&acceptance=startup-defaults-ci`;
 
 test('every startup shows onboarding and adopts the catalog default with exact UI defaults', async ({
   page,
@@ -13,9 +13,9 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   await page.goto(DEFAULT_STARTUP_URL, { waitUntil: 'domcontentloaded' });
 
   await expect(page.locator('#welcome-modal')).toBeVisible();
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#dataset-select')).toHaveValue(
-    'dataset:local-demo:current-ui-prepared',
+    'dataset:local-demo:current-ui',
   );
   await expect(page.locator('#cinematic-camera-section')).not.toHaveAttribute('open', '');
   await expect(page.locator('#community-annotation-section')).not.toHaveAttribute('open', '');
@@ -70,7 +70,7 @@ test('the default light studio publishes stable light framebuffer pixels', async
   await page.goto(DEFAULT_STARTUP_URL, { waitUntil: 'domcontentloaded' });
   await page.keyboard.press('Escape');
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const evidence = await page.evaluate(async () => {

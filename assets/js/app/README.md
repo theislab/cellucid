@@ -1,7 +1,8 @@
 # Cellucid App Layer
 
 This directory contains the browser-side application layer (state + UI wiring) that sits on top of:
-- `assets/js/data/` (data source + loaders)
+- `assets/js/data/` (data sources, the AnnData reader in `data/anndata/`, catalogs and loaders)
+- `assets/js/formats/` (HDF5, Zarr and ZIP readers and the byte I/O under them; no Cellucid knowledge)
 - `assets/js/rendering/` (WebGL viewer)
 
 Primary goals:
@@ -35,12 +36,14 @@ app/
 ├── utils/                   # App-layer utilities (DRY)
 │   ├── number-utils.js
 │   ├── dom-utils.js
-│   ├── debug.js
 │   └── event-emitter.js
 │
+├── analysis/                # Analysis windows, compute workers, plots, statistics
+├── community-annotations/   # GitHub-backed community annotation sync/auth (REPO_SETUP.md)
 ├── registries/              # Field registries (rename/delete/user-defined)
 ├── main.js                  # Application entry point
-├── session/                 # Session bundle persistence (.cellucid-session)
+├── session/                 # Session bundle persistence (.cellucid-session, format 2)
+├── state-serializer/        # Per-concern state capture/restore used by sessions (README.md)
 ├── notification-center.js   # User-facing notifications
 ├── dockable-accordions.js   # Floating panels
 ├── sidebar-metrics.js

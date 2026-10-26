@@ -3,7 +3,8 @@ import {
   expect,
   test,
 } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -57,7 +58,7 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       resolveWorkerRelease = resolve;
     });
 
-    await page.route('**/generation-worker.js', async route => {
+    await page.route(workerScriptPattern('benchmarkGenerationWorker'), async route => {
       workerRequests += 1;
       publishWorkerRequest();
       await workerRelease;
@@ -88,7 +89,7 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     });
 
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=benchmark-runtime-ci`,
+      `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=benchmark-runtime-ci`,
       { waitUntil: 'domcontentloaded' }
     );
     await dismissWelcome(page);

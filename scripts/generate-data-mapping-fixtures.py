@@ -11,7 +11,7 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
 - ``data-mapping-wide.h5ad``: only a wide ``X_pca`` (and a DataFrame), so the
   guess shows its columns 0 and 1 in 2D.
 - ``data-mapping-multi.h5ad``: ``X_umap`` (the default 2D embedding), ``X_tsne``
-  and ``X_pca``, plus ``velocity_umap_2d`` bound to ``X_umap``.
+  and ``X_pca``, plus ``velocity_umap`` bound to ``X_umap``.
 - ``data-mapping-representations.h5ad`` (12,000 cells, enough for spatial
   trees and LOD): two 3D embeddings (``X_umap_3d``, the default, and
   ``X_phate``), two 2D ones (``X_umap_2d``, the default, and ``X_tsne``), a
@@ -24,40 +24,69 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
   duplicate and an empty value, a categorical ``feature_type`` and two columns
   that cannot name genes. ``X``, the layers ``counts`` and ``log1p``, and a
   ``raw`` with its own, wider var axis. ``X_scVI`` as a latent space, an
-  ``X_broken`` embedding with a NaN at cell 5, and vectors: the default
-  ``velocity_umap_2d``, scVelo-style ``velocity_tsne`` for ``X_tsne`` and
-  ``velocity_pca`` as wide as ``X_pca``.
+  ``X_broken`` embedding with a NaN at cell 5, and vectors named the way
+  scVelo names them, each bound by default to the embedding it is named for:
+  ``velocity_umap`` for ``X_umap``, ``velocity_tsne`` for ``X_tsne`` and
+  ``velocity_pca``, as wide as ``X_pca``.
 - ``data-mapping-crowded.h5ad``: many embeddings, as a segmentation export has
   them, with no default UMAP: three 2-column ``X_umap_scale*_latents`` (the
   guess turns them on), two 3-column arrays (``X_tsne_scale0_latents`` and
   ``spatial``), an integer 4-column ``coordinates`` and six wide latent and
-  PCA arrays, plus a layer and a neighbour graph. The sidebar layout, the
-  dimension choice of a narrow array and the sidebar's scroll position are
-  tested on it (``tests/browser/data-mapping-layout.spec.mjs``).
+  PCA arrays, plus a layer and a neighbour graph, and the colours Scanpy
+  keeps for ``cell_type`` (``uns['cell_type_colors']``). The sidebar layout,
+  the dimension choice of a narrow array and the sidebar's scroll position are
+  tested on it (``tests/browser/data-mapping-layout.spec.mjs``); so are the
+  embedding, camera, point size and palette a file opens with after another
+  dataset (``tests/browser/dataset-switch-opening-view.spec.mjs``).
 
 Every array is drawn from a seeded generator around three clusters, so the
 files are the same on every run.
 
-``data-mapping-full.expected.json`` records what ``cellucid-python`` itself
-computes from ``data-mapping-full.h5ad`` -- per neighbour graph the canonical
-edges (as SHA-256 digests of their little-endian bytes) or the reason the
-graph is refused -- so the browser's readers are tested against the server's
-own output (cross-path parity). It needs ``cellucid`` installed. Run from the
-repository root:
+``data-mapping-full.expected.json`` records what the browser must read from
+``data-mapping-full.h5ad`` and its Zarr ZIP, computed here with numpy and
+scipy, independently of the browser's code. Digests are SHA-256 of
+little-endian bytes. The rules are the ones ``cellucid-python``'s AnnData
+server applied, ported here so the expectations need no ``cellucid``:
+
+- ``knn``, per ``obsp`` graph: refused when it is not exactly symmetric;
+  otherwise its edges, each unordered pair once as ``source < destination``
+  sorted by source then destination (stored zeros are not edges), the most
+  edges at any one cell, the largest weight, and every weight divided by the
+  largest as float32 (``strength``).
+- ``genes``, per expression matrix (``X``, ``raw``, ``layer-{k}``) and name
+  source (the var index or ``column-{k}``, every var column that can name
+  genes): the unique names and the make-unique record, and every gene's
+  values as float32.
+- ``latent``, per usable ``obsm`` array and categorical obs field: the outlier
+  quantiles by the rule of ``scripts/generate-latent-outlier-conformance.py``
+  (imported from it, one implementation), or the reason the array is refused.
+- ``vectors``, per binding: the vector array at its columns, scaled by the
+  bound embedding's normalization (``2 / largest column range``), as float32.
+
+Run from the repository root:
 
 ```bash
-python scripts/generate-data-mapping-fixtures.py
+python scripts/generate-data-mapping-fixtures.py          # write
+python scripts/generate-data-mapping-fixtures.py --check  # compare
 ```
+
+``--check`` writes nothing and exits non-zero when any fixture on disk
+differs from what this script writes.
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import importlib.util
+import json
+import math
+import numbers
+import sys
 import tempfile
 import zipfile
+from collections.abc import Callable, Sequence
 from pathlib import Path
-
-import hashlib
-import json
 
 import anndata
 import numpy as np
@@ -122,7 +151,7 @@ def multi_fixture() -> anndata.AnnData:
     adata.obsm["X_umap"] = clustered(rng, labels, 2, 0.8)
     adata.obsm["X_tsne"] = clustered(rng, labels, 2, 1.0)
     adata.obsm["X_pca"] = clustered(rng, labels, 6, 1.2)
-    adata.obsm["velocity_umap_2d"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
+    adata.obsm["velocity_umap"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
     return adata
 
 
@@ -164,6 +193,9 @@ def crowded_fixture() -> anndata.AnnData:
     for scale in range(3):
         adata.obsm[f"X_umap_scale{scale}_latents"] = clustered(rng, labels, 2, 0.8)
     adata.obsp["connectivities"] = symmetric_graph(rng, labels, 6)
+    # As ``sc.pl.umap(adata, color="cell_type")`` leaves it: one colour per
+    # category, none of them one Cellucid would pick.
+    adata.uns["cell_type_colors"] = np.array(["#8c564b", "#17becf", "#bcbd22"], dtype=object)
     return adata
 
 
@@ -227,7 +259,7 @@ def full_fixture() -> anndata.AnnData:
     broken = clustered(rng, labels, 2, 1.0)
     broken[5, 0] = np.nan
     adata.obsm["X_broken"] = broken
-    adata.obsm["velocity_umap_2d"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
+    adata.obsm["velocity_umap"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
     adata.obsm["velocity_tsne"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
     adata.obsm["velocity_pca"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 6)).astype(np.float32)
     adata.obsp["connectivities"] = symmetric_graph(rng, labels, 6)
@@ -237,111 +269,316 @@ def full_fixture() -> anndata.AnnData:
     return adata
 
 
-def digest(values: np.ndarray, dtype: str) -> str:
-    """SHA-256 of one array's little-endian bytes in ``dtype``."""
-    return hashlib.sha256(np.ascontiguousarray(values, dtype=dtype).tobytes()).hexdigest()
+# ---------------------------------------------------------------------------
+# The expectations of data-mapping-full.expected.json: a numpy reference of
+# the rules the browser must follow, independent of the browser's code.
+# ---------------------------------------------------------------------------
 
-
-def full_expectations(adata: anndata.AnnData) -> dict:
-    """What cellucid-python serves from the full fixture, for parity tests."""
-    from cellucid.connectivity_contract import validate_connectivity_edges
-
-    graphs: dict[str, dict] = {}
-    for key in adata.obsp:
-        try:
-            edges = validate_connectivity_edges(adata.obsp[key], n_cells=adata.n_obs)
-        except ValueError as error:
-            graphs[key] = {"refused": "symmetric" in str(error)}
-            continue
-        graphs[key] = {
-            "n_edges": int(edges.n_edges),
-            "max_neighbors": int(edges.max_neighbors),
-            "sources": digest(edges.sources, "<u4"),
-            "destinations": digest(edges.destinations, "<u4"),
-            "weights": digest(edges.weights, "<f8"),
-        }
-    return {
-        "n_obs": int(adata.n_obs),
-        "knn": graphs,
-        "genes": gene_expectations(adata),
-        **latent_and_vector_expectations(adata),
-    }
-
+# Categories with fewer cells than this get no outlier quantiles.
+CENTROID_MIN_POINTS = 10
 
 # Vector bindings the parity tests read: (vector key, its columns, embedding
 # key, the embedding's columns).
 FULL_VECTOR_BINDINGS = (
-    ("velocity_umap_2d", (0, 1), "X_umap", (0, 1)),
+    ("velocity_umap", (0, 1), "X_umap", (0, 1)),
     ("velocity_tsne", (0, 1), "X_tsne", (0, 1)),
     ("velocity_pca", (2, 3), "X_pca", (2, 3)),
     ("velocity_pca", (0, 1, 2), "X_pca", (0, 1, 2)),
 )
 
 
-def latent_and_vector_expectations(adata: anndata.AnnData) -> dict:
-    """Outlier quantiles per latent space and categorical field, and vector payloads, as served."""
-    from cellucid import AnnDataAdapter
-    from cellucid.anndata_mapping import MappingLoadError
+def latent_outlier_rule() -> Callable[[np.ndarray, np.ndarray, int, int], np.ndarray]:
+    """``latent_outlier_quantiles`` of ``generate-latent-outlier-conformance.py``: one rule, one copy."""
+    path = Path(__file__).with_name("generate-latent-outlier-conformance.py")
+    spec = importlib.util.spec_from_file_location("latent_outlier_conformance", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.latent_outlier_quantiles
 
-    adapter = AnnDataAdapter(adata, dataset_name="full", dataset_id="full")
-    try:
-        catalog = adapter.get_mapping_candidates()
-        keys = [item["key"] for item in catalog["obsm"]]
-        obs_keys = adapter.get_obs_keys()
-        categorical = [
-            index for index, key in enumerate(obs_keys) if adapter.get_obs_field_kind(key) == "category"
-        ]
-        latent: dict[str, dict] = {}
-        for index, item in enumerate(catalog["obsm"]):
-            if not item["usable"]:
-                continue
-            outcomes: dict[str, str] = {}
-            for field_index in categorical:
-                try:
-                    payload = adapter.get_mapped_outliers(index, field_index)
-                except MappingLoadError as error:
-                    outcomes = {"refused": error.reason}
-                    break
-                outcomes[obs_keys[field_index]] = hashlib.sha256(payload).hexdigest()
-            latent[item["key"]] = outcomes
-        vectors: dict[str, str] = {}
-        for vector_key, vector_columns, embedding_key, embedding_columns in FULL_VECTOR_BINDINGS:
-            payload = adapter.get_mapped_vectors(
-                keys.index(vector_key), vector_columns, keys.index(embedding_key), embedding_columns
-            )
-            name = f"{vector_key}@{embedding_key}[{','.join(map(str, embedding_columns))}]"
-            vectors[name] = hashlib.sha256(payload).hexdigest()
-        return {"latent": latent, "vectors": vectors}
-    finally:
-        adapter.close()
+
+def digest(values: np.ndarray, dtype: str) -> str:
+    """SHA-256 of one array's little-endian bytes in ``dtype``."""
+    return hashlib.sha256(np.ascontiguousarray(values, dtype=dtype).tobytes()).hexdigest()
+
+
+def float32_values(values: np.ndarray, *, label: str) -> np.ndarray:
+    """Real values that stay finite and nonzero as float32, as float32."""
+    array = np.asarray(values)
+    if array.dtype.kind not in "iuf" or not np.isfinite(array).all():
+        raise ValueError(f"{label} is not finite and real.")
+    with np.errstate(over="ignore", invalid="ignore"):
+        narrowed = array.astype(np.float32)
+    if not np.isfinite(narrowed).all() or np.any((array != 0) & (narrowed == 0)):
+        raise ValueError(f"{label} is outside the float32 range.")
+    return narrowed
+
+
+def value_defect(values: np.ndarray) -> str | None:
+    """The first value of an array (rows are cells) that cannot be read, as the browser words it."""
+    array = np.asarray(values)
+    if array.dtype.kind not in "iuf":
+        return "not a numeric array"
+    if array.ndim == 1:
+        array = array.reshape(-1, 1)
+    with np.errstate(over="ignore", invalid="ignore"):
+        finite = np.isfinite(array)
+        if not finite.all():
+            row = int(np.argwhere(~finite)[0][0])
+            value = float(array[row][~finite[row]][0])
+            kind = "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+            return f"{kind} at cell {row}"
+        narrowed = array.astype(np.float32)
+        bad = ~np.isfinite(narrowed) | ((array != 0) & (narrowed == 0))
+        if bad.any():
+            return f"not representable as float32 at cell {int(np.argwhere(bad)[0][0])}"
+    return None
+
+
+# -- knn ---------------------------------------------------------------------
+
+
+def knn_expectation(matrix: object, n_cells: int) -> dict:
+    """One ``obsp`` graph's canonical edges, or its refusal.
+
+    A graph must be square over the cells, real, finite, non-negative, with a
+    zero diagonal, and exactly symmetric in topology and weight; one that is
+    not symmetric is refused (never repaired). Stored zeros are not edges. Each
+    edge is its pair with ``source < destination``, sorted by source, then
+    destination; ``max_neighbors`` is the most edges at any one cell.
+    """
+    graph = sparse.csr_matrix(matrix)
+    if graph.shape != (n_cells, n_cells):
+        raise ValueError(f"graph shape {graph.shape} is not ({n_cells}, {n_cells})")
+    weights = graph.data.astype(np.float64)
+    if graph.dtype.kind not in "iufb" or not np.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError("graph weights must be real, finite and non-negative")
+    graph = graph.copy()
+    graph.sum_duplicates()
+    graph.eliminate_zeros()
+    if graph.diagonal().any():
+        raise ValueError("graph diagonal must be zero")
+    if (graph != graph.T).nnz:
+        return {"refused": True}
+    upper = sparse.triu(graph, k=1).tocoo()
+    sources = upper.row.astype(np.int64)
+    destinations = upper.col.astype(np.int64)
+    weights = upper.data.astype(np.float64)
+    order = np.lexsort((destinations, sources))
+    sources, destinations, weights = sources[order], destinations[order], weights[order]
+    degrees = np.bincount(sources, minlength=n_cells) + np.bincount(destinations, minlength=n_cells)
+    largest = float(weights.max()) if weights.size else 0.0
+    return {
+        "n_edges": int(sources.size),
+        "max_neighbors": int(degrees.max()),
+        "sources": digest(sources, "<u4"),
+        "destinations": digest(destinations, "<u4"),
+        # What the web app's edge payload carries: the largest weight and
+        # every weight relative to it, rounded to float32 for rendering.
+        "max_weight": largest,
+        "strength": digest((weights / largest).astype(np.float32) if weights.size else weights, "<f4"),
+    }
+
+
+# -- genes -------------------------------------------------------------------
+
+
+def var_column_usable(column: pd.Series) -> bool:
+    """Whether a var column can name genes: not floating-point, not true/false."""
+    return column.dtype.kind not in "fb"
+
+
+def is_missing_name(value: object) -> bool:
+    """``None``, ``""``, NaN, and pandas' missing values."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, float):
+        return math.isnan(value)
+    return type(value).__name__ in {"NAType", "NaTType"}
+
+
+def gene_name_text(value: object) -> str | None:
+    """A var value as a gene name (Python ``str()``), or None when it is missing."""
+    if is_missing_name(value):
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool | np.bool_):
+        return "True" if value else "False"
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return None if math.isnan(number) else str(number)
+    raise TypeError(f"a gene name must be text or a number, got {type(value).__name__}")
+
+
+def make_unique_names(names: Sequence[str | None], index: Sequence[str]) -> tuple[list[str], list[list[str]], int]:
+    """anndata's ``make_index_unique`` rule, after empty names take the index name.
+
+    Returns the unique names, every ``[from, to]`` renaming in order, and the
+    count of names taken from the index. The first occurrence keeps its name;
+    each later one becomes ``name-k``, ``k`` counting up per name and skipping
+    any name already present or produced.
+    """
+    filled: list[str] = []
+    from_index = 0
+    for position, name in enumerate(names):
+        if is_missing_name(name):
+            filled.append(index[position])
+            from_index += 1
+        else:
+            filled.append(str(name))
+    taken = set(filled)
+    seen: set[str] = set()
+    counters: dict[str, int] = {}
+    unique: list[str] = []
+    renamed: list[list[str]] = []
+    for name in filled:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+            continue
+        while True:
+            counters[name] = counters.get(name, 0) + 1
+            candidate = f"{name}-{counters[name]}"
+            if candidate not in taken:
+                break
+        taken.add(candidate)
+        unique.append(candidate)
+        renamed.append([name, candidate])
+    return unique, renamed, from_index
 
 
 def gene_expectations(adata: anndata.AnnData) -> dict:
-    """Per gene route: the unique names and each gene's float32 digest, as served."""
-    from cellucid import AnnDataAdapter
+    """Per expression matrix and name source: the unique names, their record, each gene's float32 digest."""
+    axes: list[tuple[str, object, pd.DataFrame]] = [("X", adata.X, adata.var)]
+    if adata.raw is not None:
+        axes.append(("raw", adata.raw.X, adata.raw.var))
+    # Layers are numbered by their position in the file's key order.
+    axes += [(f"layer-{index}", adata.layers[key], adata.var) for index, key in enumerate(adata.layers)]
+    routes: dict[str, dict] = {}
+    for axis, matrix, var in axes:
+        index = [str(name) for name in var.index]
+        dense = matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix)
+        values = [
+            digest(float32_values(dense[:, gene], label=f"{axis} gene {gene}"), "<f4")
+            for gene in range(dense.shape[1])
+        ]
+        sources: list[tuple[str, str | None]] = [("index", None)]
+        sources += [
+            (f"column-{position}", str(key))
+            for position, key in enumerate(var.columns)
+            if var_column_usable(var[key])
+        ]
+        for names, source in sources:
+            raw_names = index if source is None else [gene_name_text(value) for value in var[source].tolist()]
+            unique, renamed, from_index = make_unique_names(raw_names, index)
+            routes[f"{axis}/{names}"] = {
+                "names": unique,
+                "gene_names": {
+                    "source": source,
+                    "filled_from_index": from_index,
+                    "renamed": renamed,
+                },
+                "values": values,
+            }
+    return routes
 
-    adapter = AnnDataAdapter(adata, dataset_name="full", dataset_id="full")
-    try:
-        catalog = adapter.get_mapping_candidates()
-        axes = ["X", "raw", *(f"layer-{index}" for index in range(len(catalog["layers"])))]
-        routes: dict[str, dict] = {}
-        for axis in axes:
-            columns = catalog["raw"]["var"]["columns"] if axis == "raw" else catalog["var"]["columns"]
-            for names in ["index", *(f"column-{k}" for k, column in enumerate(columns) if column["usable"])]:
-                manifest = adapter.get_mapped_var_manifest(axis, names)
-                gene_names = [name for _index, name in manifest["fields"]]
-                digests = [
-                    hashlib.sha256(adapter.get_mapped_gene_values(axis, names, index)).hexdigest()
-                    for index in range(len(gene_names))
-                ]
-                routes[f"{axis}/{names}"] = {
-                    "names": gene_names,
-                    "name_set": manifest["gene_name_sets"][0],
-                    "values": digests,
-                }
-        return routes
-    finally:
-        adapter.close()
+
+# -- latent ------------------------------------------------------------------
+
+
+def usable_obsm_keys(adata: anndata.AnnData) -> list[str]:
+    """``obsm`` arrays a mapping can use: dense, numeric, one row per cell, one or two dimensions."""
+    usable = []
+    for key in adata.obsm:
+        value = adata.obsm[key]
+        if not isinstance(value, np.ndarray):
+            continue  # a DataFrame or a sparse array
+        has_columns = value.ndim == 1 or (value.ndim == 2 and value.shape[1] >= 1)
+        if has_columns and value.shape[0] == adata.n_obs and value.dtype.kind in "iuf":
+            usable.append(str(key))
+    return usable
+
+
+def is_categorical_field(series: pd.Series) -> bool:
+    """Categories, true/false values, strings and objects are categorical; numbers are continuous."""
+    if isinstance(series.dtype, pd.CategoricalDtype) or pd.api.types.is_bool_dtype(series):
+        return True
+    if pd.api.types.is_numeric_dtype(series):
+        return False
+    return pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)
+
+
+def latent_expectations(adata: anndata.AnnData) -> dict:
+    """Per usable ``obsm`` array and categorical obs field, the outlier-quantile digest or the refusal."""
+    quantiles_of = latent_outlier_rule()
+    fields = [key for key in adata.obs.columns if is_categorical_field(adata.obs[key])]
+    latent: dict[str, dict] = {}
+    for key in usable_obsm_keys(adata):
+        values = np.asarray(adata.obsm[key])
+        values = values.reshape(-1, 1) if values.ndim == 1 else values
+        defect = value_defect(values)
+        if defect is not None:
+            latent[key] = {"refused": defect}
+            continue
+        values = float32_values(values, label=f"obsm[{key!r}]")
+        outcomes: dict[str, str] = {}
+        for field in fields:
+            categorical = adata.obs[field].astype("category")
+            codes = categorical.cat.codes.to_numpy(dtype=np.int32)
+            quantiles = quantiles_of(values, codes, len(categorical.cat.categories), CENTROID_MIN_POINTS)
+            outcomes[str(field)] = digest(quantiles, "<f4")
+        latent[key] = outcomes
+    return latent
+
+
+# -- vectors -----------------------------------------------------------------
+
+
+def vector_expectations(adata: anndata.AnnData) -> dict:
+    """Per binding, the digest of the vector payload as float32.
+
+    A vector array binds to an embedding's columns when it is as wide as the
+    embedding's array and read at the same columns, or exactly as wide as the
+    embedding's dimension and read whole. Its values are multiplied, in
+    float64, by the embedding's normalization factor -- 2 over the largest
+    range of the embedding's selected columns -- and rounded once to float32.
+    """
+    vectors: dict[str, str] = {}
+    for vector_key, vector_columns, embedding_key, embedding_columns in FULL_VECTOR_BINDINGS:
+        vector = np.asarray(adata.obsm[vector_key])
+        embedding = np.asarray(adata.obsm[embedding_key])
+        dimension = len(embedding_columns)
+        same_columns = vector.shape[1] == embedding.shape[1] and vector_columns == embedding_columns
+        whole = vector.shape[1] == dimension and vector_columns == tuple(range(dimension))
+        if not (same_columns or whole):
+            raise ValueError(f"{vector_key} cannot be bound to {embedding_key} at {vector_columns}")
+        if value_defect(embedding[:, embedding_columns]) or value_defect(vector[:, vector_columns]):
+            raise ValueError(f"{vector_key} at {embedding_key} reads a value that is not finite")
+        selected = embedding[:, embedding_columns].astype(np.float64)
+        largest_range = float((selected.max(axis=0) - selected.min(axis=0)).max())
+        if largest_range <= 0:
+            raise ValueError(f"{embedding_key} has no coordinate variation")
+        scaled = vector[:, vector_columns].astype(np.float64) * (2.0 / largest_range)
+        name = f"{vector_key}@{embedding_key}[{','.join(map(str, embedding_columns))}]"
+        vectors[name] = digest(scaled.astype(np.float32), "<f4")
+    return vectors
+
+
+def full_expectations(adata: anndata.AnnData) -> dict:
+    """What the browser must read from the full fixture, for the parity tests."""
+    return {
+        "n_obs": int(adata.n_obs),
+        "knn": {str(key): knn_expectation(adata.obsp[key], int(adata.n_obs)) for key in adata.obsp},
+        "genes": gene_expectations(adata),
+        "latent": latent_expectations(adata),
+        "vectors": vector_expectations(adata),
+    }
 
 
 def write_zarr_zip(adata: anndata.AnnData, target: Path, root: str) -> None:
@@ -363,23 +600,51 @@ def write_zarr_zip(adata: anndata.AnnData, target: Path, root: str) -> None:
         staged.replace(target)
 
 
-def main() -> None:
+def write_fixtures(directory: Path) -> list[Path]:
+    """Write every fixture into ``directory``; return their paths."""
+    targets: list[Path] = []
+
+    def target(name: str) -> Path:
+        targets.append(directory / name)
+        return targets[-1]
+
     guess = guess_fixture()
-    guess.write_h5ad(FIXTURE_DIRECTORY / "data-mapping-guess.h5ad")
-    write_zarr_zip(guess, FIXTURE_DIRECTORY / "data-mapping-guess.zarr.zip", "data-mapping-guess.zarr")
-    wide_fixture().write_h5ad(FIXTURE_DIRECTORY / "data-mapping-wide.h5ad")
-    multi_fixture().write_h5ad(FIXTURE_DIRECTORY / "data-mapping-multi.h5ad")
-    representations_fixture().write_h5ad(
-        FIXTURE_DIRECTORY / "data-mapping-representations.h5ad", compression="gzip"
-    )
-    crowded_fixture().write_h5ad(FIXTURE_DIRECTORY / "data-mapping-crowded.h5ad")
+    guess.write_h5ad(target("data-mapping-guess.h5ad"))
+    write_zarr_zip(guess, target("data-mapping-guess.zarr.zip"), "data-mapping-guess.zarr")
+    wide_fixture().write_h5ad(target("data-mapping-wide.h5ad"))
+    multi_fixture().write_h5ad(target("data-mapping-multi.h5ad"))
+    representations_fixture().write_h5ad(target("data-mapping-representations.h5ad"), compression="gzip")
+    crowded_fixture().write_h5ad(target("data-mapping-crowded.h5ad"))
     full = full_fixture()
-    full.write_h5ad(FIXTURE_DIRECTORY / "data-mapping-full.h5ad")
-    write_zarr_zip(full, FIXTURE_DIRECTORY / "data-mapping-full.zarr.zip", "data-mapping-full.zarr")
-    (FIXTURE_DIRECTORY / "data-mapping-full.expected.json").write_text(
-        json.dumps(full_expectations(full), indent=2, sort_keys=True) + "\n"
+    full.write_h5ad(target("data-mapping-full.h5ad"))
+    write_zarr_zip(full, target("data-mapping-full.zarr.zip"), "data-mapping-full.zarr")
+    target("data-mapping-full.expected.json").write_text(
+        json.dumps(full_expectations(full), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    return targets
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--check", action="store_true", help="compare with the fixtures on disk; write nothing")
+    arguments = parser.parse_args()
+    if not arguments.check:
+        write_fixtures(FIXTURE_DIRECTORY)
+        return 0
+    with tempfile.TemporaryDirectory(prefix="cellucid-data-mapping-check-") as temporary:
+        differing = [
+            written.name
+            for written in write_fixtures(Path(temporary))
+            if not (FIXTURE_DIRECTORY / written.name).is_file()
+            or (FIXTURE_DIRECTORY / written.name).read_bytes() != written.read_bytes()
+        ]
+    if differing:
+        for name in differing:
+            print(f"{FIXTURE_DIRECTORY / name} differs from what this script writes.", file=sys.stderr)
+        return 1
+    print(f"Every data-mapping fixture in {FIXTURE_DIRECTORY} matches.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -16,7 +16,8 @@ import { bindDropZone } from './components/drop-zone.js';
 import { StyleManager } from '../../utils/style-manager.js';
 import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
 import { ICONS, bindDisclosure, createIconButton } from './components/controls.js';
-import { formatCompactCount, formatCount } from './components/display-format.js';
+import { formatCompactCount } from './components/display-format.js';
+import { formatCount, formatCountOf } from '../../utils/format-units.js';
 import { OverlapStrategy } from '../utils/field-constants.js';
 import {
   MAX_INTERSECTION_PAGES,
@@ -35,6 +36,7 @@ import {
   createKeyboardMove,
   getKeyboardMoveInstructionsId
 } from './keyboard-move.js';
+import { requireObjectRecord } from '../../utils/exact-record.js';
 
 const DROP_MIME = 'application/x-highlight-page';
 
@@ -53,6 +55,22 @@ const DROP_MIME = 'application/x-highlight-page';
  * most recent one, while the Create button stayed enabled and the column that
  * appeared did not match the numbers on screen.
  */
+/** Whether two `_previewInputs` describe the same cells. */
+function samePreviewInputs(left, right) {
+  if (left === null || right === null) return false;
+  if (left.strategy !== right.strategy || left.pointCount !== right.pointCount) return false;
+  if (left.pages.length !== right.pages.length) return false;
+  for (let index = 0; index < left.pages.length; index++) {
+    const a = left.pages[index];
+    const b = right.pages[index];
+    if (a.pageId !== b.pageId || a.lists.length !== b.lists.length) return false;
+    for (let list = 0; list < a.lists.length; list++) {
+      if (a.lists[list] !== b.lists[list]) return false;
+    }
+  }
+  return true;
+}
+
 export const PREVIEW_INVALIDATING_EVENTS = Object.freeze([
   'page:changed',
   'highlight:changed'
@@ -65,19 +83,8 @@ const STRATEGIES = new Set([
   OverlapStrategy.INTERSECTIONS
 ]);
 
-function requireRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-  ) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  return value;
-}
-
 function requireMethod(owner, methodName, label) {
-  requireRecord(owner, label);
+  requireObjectRecord(owner, label);
   if (typeof owner[methodName] !== 'function') {
     throw new TypeError(`${label} must implement ${methodName}()`);
   }
@@ -304,14 +311,15 @@ export class CategoryBuilder {
   /**
    * Re-read everything the builder shows from the current highlight state.
    *
-   * Clearing `_previewKey` is the load-bearing line: the preview is cached on
-   * strategy plus page identity, neither of which moves when a page's cells do.
+   * The preview is recomputed only when what it counts moved: its key
+   * (`_previewInputs`) holds each dropped page's enabled cell lists, which a
+   * page's cells cannot move without replacing. A rename or recolour (a
+   * colour drag fires one per input event) keeps the preview.
    */
   _resyncFromState() {
     this._assertInitialized();
     this._syncDatasetAvailability();
     this._reconcileDroppedPages();
-    this._previewKey = null;
     this._renderDroppedItems();
     this._updatePreview(true);
     this._updateConfirmState();
@@ -340,7 +348,7 @@ export class CategoryBuilder {
       pageIndex < this._state.highlightPages.length;
       pageIndex++
     ) {
-      const page = requireRecord(
+      const page = requireObjectRecord(
         this._state.highlightPages[pageIndex],
         `Highlight page ${pageIndex}`
       );
@@ -384,7 +392,7 @@ export class CategoryBuilder {
     );
     this._droppedPages = this._droppedPages.flatMap(
       (droppedPage, droppedIndex) => {
-        requireRecord(droppedPage, `Dropped page ${droppedIndex}`);
+        requireObjectRecord(droppedPage, `Dropped page ${droppedIndex}`);
         requireIdentifier(
           droppedPage.pageId,
           `Dropped page ${droppedIndex} id`
@@ -598,7 +606,7 @@ export class CategoryBuilder {
     }
     if (fromIndex === toIndex) return;
     const [moved] = this._droppedPages.splice(fromIndex, 1);
-    requireRecord(moved, 'Dragged page');
+    requireObjectRecord(moved, 'Dragged page');
     this._droppedPages.splice(toIndex, 0, moved);
     this._renderDroppedItems();
     this._updatePreview(true);
@@ -668,7 +676,7 @@ export class CategoryBuilder {
     const fragment = this._document.createDocumentFragment();
 
     this._droppedPages.forEach((p, idx) => {
-      requireRecord(p, `Dropped page ${idx}`);
+      requireObjectRecord(p, `Dropped page ${idx}`);
       const page = this._getPage(p.pageId);
       if (typeof p.label !== 'string') {
         throw new TypeError(
@@ -950,6 +958,27 @@ export class CategoryBuilder {
     return radio.value;
   }
 
+  /**
+   * What the preview counts: the strategy, the dataset size, and each dropped
+   * page with the cell lists of its enabled groups (compared by identity: a
+   * highlight list is replaced, never written in place).
+   * @private
+   */
+  _previewInputs(strategy) {
+    return {
+      strategy,
+      pointCount: this._state.pointCount,
+      pages: this._droppedPages.map(({ pageId }) => {
+        const page = this._getPage(pageId);
+        const lists = [];
+        for (const group of page.highlightedGroups) {
+          if (group?.enabled === true) lists.push(group.cellIndices);
+        }
+        return { pageId, lists };
+      }),
+    };
+  }
+
   _computePreview(overlapStrategy) {
     this._assertInitialized();
     if (!STRATEGIES.has(overlapStrategy)) {
@@ -976,7 +1005,7 @@ export class CategoryBuilder {
         groupIndex < page.highlightedGroups.length;
         groupIndex++
       ) {
-        const group = requireRecord(
+        const group = requireObjectRecord(
           page.highlightedGroups[groupIndex],
           `Highlight page "${pageId}" group ${groupIndex}`
         );
@@ -1114,8 +1143,8 @@ export class CategoryBuilder {
       return;
     }
 
-    const nextKey = `${strategy}:${this._droppedPages.map((p) => p.pageId).join('|')}`;
-    const shouldRecompute = nextKey !== this._previewKey;
+    const nextKey = this._previewInputs(strategy);
+    const shouldRecompute = !samePreviewInputs(nextKey, this._previewKey);
     if (shouldRecompute) {
       this._preview = this._computePreview(strategy);
       this._previewKey = nextKey;
@@ -1123,7 +1152,7 @@ export class CategoryBuilder {
 
     conflictSection.hidden = this._preview.overlapCount === 0;
     if (!conflictSection.hidden) {
-      conflictText.textContent = `${formatCount(this._preview.overlapCount)} cells appear in multiple pages`;
+      conflictText.textContent = `${formatCountOf(this._preview.overlapCount, 'cell')} appear in multiple pages`;
     }
 
     uncoveredSection.hidden = this._preview.uncoveredCount === 0;
@@ -1276,7 +1305,7 @@ export class CategoryBuilder {
 
     const stats = this._document.createElement('div');
     stats.className = 'preview-stats';
-    stats.textContent = `Total: ${formatCount(this._state.pointCount)} cells · ${formatCount(categoriesWrap.childElementCount)} categories`;
+    stats.textContent = `Total: ${formatCountOf(this._state.pointCount, 'cell')} · ${formatCountOf(categoriesWrap.childElementCount, 'category', 'categories')}`;
 
     preview.replaceChildren(categoriesWrap, stats);
     this._updateConfirmState();
@@ -1374,7 +1403,7 @@ export class CategoryBuilder {
       );
     }
     for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
-      const field = requireRecord(
+      const field = requireObjectRecord(
         fields[fieldIndex],
         `Observation field ${fieldIndex}`
       );
@@ -1451,7 +1480,7 @@ export class CategoryBuilder {
     if (labels.length > MAX_CATEGORICAL_CATEGORIES) {
       return (
         'A field supports at most '
-        + `${formatCount(MAX_CATEGORICAL_CATEGORIES)} categories`
+        + `${formatCountOf(MAX_CATEGORICAL_CATEGORIES, 'category', 'categories')}`
       );
     }
     return null;
@@ -1499,7 +1528,7 @@ export class CategoryBuilder {
 
     try {
       const draft = this._buildDraft();
-      const result = requireRecord(
+      const result = requireObjectRecord(
         this._state.createCategoricalFromPages(draft),
         'Create categorical result'
       );
@@ -1521,7 +1550,7 @@ export class CategoryBuilder {
       }
       getNotificationCenter().complete(
         notifyId,
-        `Created "${draft.key}" (${result.field.categories.length} categories)`
+        `Created "${draft.key}" (${formatCountOf(result.field.categories.length, 'category', 'categories')})`
       );
       this._handleCancel();
     } catch (error) {

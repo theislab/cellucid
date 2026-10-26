@@ -1,815 +1,465 @@
 /**
- * Gene Signature Score UI Component
+ * Gene signature: score every cell by one or more gene sets and compare the
+ * scores across pages.
  *
- * Provides gene signature scoring functionality:
- * - Custom gene list input
- * - Multiple scoring methods (mean, sum, median)
- * - Normalization options (z-score, min-max)
- * - Distribution visualization (violin/box/histogram)
+ * The form is the options schema's (`options/signature-options.js`): the
+ * gene sets (`ui/components/gene-set-editor.js`), the pages, Run; scoring
+ * and display under More options. Typing never runs: a change after a run
+ * dims the result with "Stale · Run". Genes the dataset does not have are
+ * left out of the score and named in the result ("2 not found").
  *
- * Extends FormBasedAnalysisUI for form + results pattern.
+ * @module analysis-types/gene-signature-ui
  */
 
-import { formatCount } from '../../../ui/components/display-format.js';
-import { createStatusLine } from '../../../ui/components/controls.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { createSelectField } from '../../shared/dom-utils.js';
-import { createField } from '../../../ui/components/controls.js';
-import {
-  signatureScoresToCSV,
-  downloadCSV
-} from '../../shared/analysis-utils.js';
-// renderGeneChips moved inline to modal annotations
+import { downloadCSV } from '../../shared/analysis-utils.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
-import { applyFormControlAccessibility } from '../components/control-accessibility.js';
 import {
   preparePageStatistics,
   renderSummaryStats,
   renderStatisticalAnnotations
 } from '../components/stats-display.js';
 import { createSlicedYield } from '../../shared/concurrency-utils.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetGenes,
+  requireDatasetPages
+} from '../../shared/analysis-result-session.js';
+import { SIGNATURE_DISPLAY_KEYS, SIGNATURE_OPTIONS } from '../../options/signature-options.js';
+import { createGeneIndex, resolveGenes } from '../../shared/gene-sets.js';
+import { writePerCellCSV } from '../base-analysis-ui.js';
+
+const METHOD_LABELS = Object.freeze({
+  mean: 'mean',
+  median: 'median',
+  mean_z: 'mean z-score',
+  module: 'module score',
+  ucell: 'UCell'
+});
 
 /**
- * Gene Signature Score UI Component
+ * Gene signature UI
  * @extends FormBasedAnalysisUI
  */
 export class GeneSignatureUI extends FormBasedAnalysisUI {
   constructor(options) {
     super(options);
-
-    // Page selector component
     this._pageSelector = null;
     this._pageSelectContainer = null;
-
-    // Persist gene list input across re-renders
-    this._savedGeneList = '';
-
-    // Bind methods
-    this._handlePageChange = this._handlePageChange.bind(this);
-    this._handlePageColorChange = this._handlePageColorChange.bind(this);
+    /** Which set "One at a time" shows. */
+    this._shownSet = 0;
+    this._geneIndex = null;
+    this._geneIndexOf = null;
   }
 
-  // ===========================================================================
-  // Page Selection Handlers
-  // ===========================================================================
-
-  _handlePageChange(pageIds) {
-    this._selectedPages = pageIds || [];
-    this._currentConfig.pages = this._selectedPages;
-    // Trigger auto-update (like detailed mode)
-    this._scheduleUpdate();
-  }
-
-  _handlePageColorChange(pageId, color) {
-    this.dataLayer?.setPageColor?.(pageId, color);
-    // Trigger auto-update to reflect color changes
-    this._scheduleUpdate();
-  }
-
-  // ===========================================================================
-  // Auto-calculation Logic (like Detailed mode)
-  // ===========================================================================
-
-  /**
-   * Override _canRunAnalysis to check for genes instead of variable
-   * @override
-   */
-  _canRunAnalysis() {
-    const genes = this._getGeneList();
-    return genes.length > 0 && this._selectedPages.length > 0;
-  }
-
-  /**
-   * Override to run analysis automatically when inputs are valid
-   * @override
-   */
-  async _runAnalysisIfValid(scheduledRequestId = null) {
-    if (this._isDestroyed) return;
-    if (
-      scheduledRequestId !== null &&
-      !this._isCurrentAnalysisIntent(scheduledRequestId)
-    ) {
-      return;
-    }
-    if (!this._canRunAnalysis()) {
-      this._invalidateAnalysisRequest();
-      await this._hideResult();
-      return;
-    }
-
-    const requestId = this._startAnalysisRequest(scheduledRequestId);
-    if (requestId === null) return;
-    const releaseBusy = this._claimBusy();
-    try {
-      const formValues = structuredClone(this._getFormValues());
-      const validation = this._validateForm(formValues);
-      if (!validation.valid) {
-        await this._showError(validation.error, requestId);
-        return;
-      }
-      const result = await this._runAnalysisImpl(formValues, requestId);
-
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      if (result) {
-        await this._showResult(result, requestId);
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-        await this._publishAnalysisResult(result, requestId);
-      }
-    } catch (err) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[GeneSignatureUI] Analysis failed:', err);
-      await this._showError('Analysis failed: ' + err.message, requestId);
-    } finally {
-      releaseBusy();
-      this._finishAnalysisRequest(requestId);
-    }
-  }
-
-  /**
-   * Hide result container
-   */
-  _hideResult() {
-    return this._discardFormResult();
-  }
-
-  /**
-   * Show error message
-   */
-  async _showError(message, requestId = null) {
-    await this._discardFormResult();
-    if (
-      requestId !== null &&
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return false;
-    }
-    if (this._resultContainer) {
-      this._resultContainer.hidden = false;
-      this._resultContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message }).root
-      );
-    }
-    this._notifications?.error?.(message, { category: 'analysis' });
-    return true;
-  }
-
-  /**
-   * Update when highlights change (cells added/removed from pages)
-   * Override base class to check for genes instead of dataSource.variable
-   * @override
-   */
-  onHighlightChanged() {
-    // This mode recalculates by itself, so a highlight change re-runs it
-    // (deferred while the panel is hidden) instead of discarding the result
-    // the way the run-button forms do.
-    this._applyHighlightChangeWhenShown();
-  }
-
-  /**
-   * @override
-   */
-  _applyHighlightChange() {
-    this._updatePageSelectorCounts();
-
-    if (this._canRunAnalysis()) {
-      this._scheduleUpdate();
-    }
-  }
-
-  // ===========================================================================
-  // Required Abstract Method Implementations
-  // ===========================================================================
-
-  /**
-   * Get page requirements for gene signature
-   * @static
-   * @returns {{ minPages: number, maxPages: number|null, description: string, geneExpression: true }}
-   */
   static getRequirements() {
     return {
-      // Gene Signature has its own internal page selector; don't block rendering
-      // when the global page selection is empty.
+      // Gene signature has its own page selector.
       minPages: 0,
-      maxPages: null, // No limit
+      maxPages: null,
       description: 'Select pages to analyze',
       geneExpression: true
     };
   }
 
-  /**
-   * Get the analysis title
-   * @returns {string}
-   */
   _getTitle() {
-    return 'Gene signature score';
+    return 'Gene signature';
   }
 
-  /**
-   * Get CSS class prefix
-   * @returns {string}
-   */
   _getClassName() {
     return 'gene-signature';
   }
 
-  /**
-   * Get loading notification message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    const genes = this._getGeneList();
-    return `Computing signature score (${genes.length} genes)...`;
-  }
-
-  /**
-   * Get success notification message
-   * @returns {string}
-   */
   _getSuccessMessage() {
     return 'Signature scoring complete';
   }
 
-  /**
-   * Override _renderControls to not render a button (auto-calculate like detailed mode)
-   * @override
-   */
-  _renderControls() {
-    // Rebuilding the form on every accordion reopen must not discard the
-    // choices already made in it.
-    const carriedValues = this._captureFormControlValues();
-    this._formContainer.innerHTML = '';
+  // ===========================================================================
+  // Options
+  // ===========================================================================
 
-    // Validate requirements
-    const validation = this.validateRequirements(this._selectedPages);
-
-    if (!validation.valid) {
-      this._formContainer.appendChild(createStatusLine({
-        tone: 'warning',
-        text: validation.error || this.getRequirementText()
-      }).root);
-      return;
-    }
-
-    // Create form wrapper (no button - auto-calculates)
-    const wrapper = document.createElement('div');
-    wrapper.className = 'analysis-form';
-
-    // Let subclass render form controls
-    this._renderFormControls(wrapper);
-
-    // Same form-control accessibility pass the base class runs: scoped ids and
-    // a label bound to every control. Overriding _renderControls to drop the
-    // run button must not also drop that.
-    applyFormControlAccessibility(wrapper, this._controlScope);
-    this._restoreFormControlValues(wrapper, carriedValues);
-
-    this._formContainer.appendChild(wrapper);
-
-    // Trigger initial calculation if inputs are valid
-    this._scheduleUpdate();
+  _getOptionsSchema() {
+    return SIGNATURE_OPTIONS;
   }
 
-  /**
-   * Render form-specific controls
-   * @param {HTMLElement} wrapper - Form wrapper element
-   */
-  _renderFormControls(wrapper) {
-    // Gene list input, named by its visible label: a placeholder vanishes as
-    // soon as anything is typed.
-    const geneListInput = document.createElement('textarea');
-    geneListInput.name = 'genes';
-    geneListInput.className = 'obs-select gene-list-input';
-    geneListInput.placeholder = 'CD3E, CD4, CD8A, FOXP3…';
-    geneListInput.rows = 4;
-    // Restore persisted gene list value
-    if (this._savedGeneList) {
-      geneListInput.value = this._savedGeneList;
-    }
-    // Save gene list on input and trigger auto-update
-    geneListInput.addEventListener('input', () => {
-      this._savedGeneList = geneListInput.value;
-      this._scheduleUpdate();
-    });
-    wrapper.appendChild(createField({
-      label: 'Signature genes',
-      control: geneListInput,
-      tip: 'gene-signature-genes'
-    }));
-
-    // Page selector (matching Detailed and Correlation analysis modes)
-    this._renderPageSelector(wrapper);
-
-    const scheduleUpdate = () => this._scheduleUpdate();
-    wrapper.appendChild(createSelectField({
-      label: 'Scoring method',
-      name: 'method',
-      tip: 'gene-signature-scoring',
-      options: [
-        { value: 'mean', label: 'Mean expression', selected: true },
-        { value: 'sum', label: 'Sum expression' },
-        { value: 'median', label: 'Median expression' }
-      ],
-      onChange: scheduleUpdate
-    }).root);
-
-    wrapper.appendChild(createSelectField({
-      label: 'Normalization',
-      name: 'normalize',
-      options: [
-        { value: 'none', label: 'None', selected: true },
-        { value: 'zscore', label: 'Z-score' },
-        { value: 'minmax', label: 'Min-Max (0-1)' }
-      ],
-      onChange: scheduleUpdate
-    }).root);
-
-    wrapper.appendChild(createSelectField({
-      label: 'Visualization',
-      name: 'plotType',
-      options: [
-        { value: 'violinplot', label: 'Violin plot', selected: true },
-        { value: 'boxplot', label: 'Box plot' },
-        { value: 'histogram', label: 'Histogram' }
-      ],
-      onChange: scheduleUpdate
-    }).root);
+  _getOptionsContext() {
+    return {
+      getGenes: () => this._geneNames(),
+      getMarkerSets: () => {
+        const sets = this.comparisonModule?.getUIManager?.()?.getUI?.('genesPanel')?.getMarkerGeneSets?.() ?? [];
+        return sets.length > 0 ? sets : null;
+      }
+    };
   }
 
-  /**
-   * Render page selector using shared PageSelectorComponent
-   * @param {HTMLElement} wrapper
-   */
-  _renderPageSelector(wrapper) {
-    let pages;
-    try {
-      pages = this.dataLayer.getPages();
-    } catch (err) {
-      console.error('[GeneSignatureUI] Failed to get pages:', err);
-      return;
+  _isDisplayOption(key) {
+    return SIGNATURE_DISPLAY_KEYS.includes(key);
+  }
+
+  /** The dataset's gene names (shared with the gene index). */
+  _geneNames() {
+    const variables = this.dataLayer.getAvailableVariables('gene_expression');
+    if (this._geneIndexOf !== variables) {
+      this._geneIndexOf = variables;
+      this._names = variables.map(variable => variable.key);
+      this._geneIndex = createGeneIndex(this._names);
     }
+    return this._names;
+  }
 
-    if (pages.length === 0) return;
+  /** Each set's genes matched to the dataset. */
+  _resolveSets(geneSets) {
+    this._geneNames();
+    return geneSets.map(set => ({ name: set.name, ...resolveGenes(set.genes, this._geneIndex) }));
+  }
 
-    // Create container for the component
+  _getRunBlocker(options) {
+    if (this._selectedPages.length === 0) return 'Select at least one page';
+    const resolved = this._resolveSets(options.geneSets);
+    if (options.geneSets.every(set => set.genes.length === 0)) return 'Add genes to a set';
+    if (resolved.every(set => set.resolved.length === 0)) return 'None of the genes are in this dataset';
+    return null;
+  }
+
+  // ===========================================================================
+  // Form
+  // ===========================================================================
+
+  _renderFormLead(wrapper) {
+    const pages = this.dataLayer.getPages();
+    if (!Array.isArray(pages) || pages.length === 0) return;
     this._pageSelectContainer = document.createElement('div');
     wrapper.appendChild(this._pageSelectContainer);
-
-    // Destroy previous instance if exists
     this._pageSelector?.destroy();
-
-    // Create PageSelectorComponent
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: this._handlePageChange,
-      onColorChange: this._handlePageColorChange,
+      onSelectionChange: pageIds => {
+        this._selectedPages = pageIds || [];
+        this._currentConfig.pages = this._selectedPages;
+        this._updateRunRow();
+        this._updateStale();
+      },
+      onColorChange: (pageId, color) => this.dataLayer?.setPageColor?.(pageId, color),
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages.length > 0
-        ? this._selectedPages
-        : undefined,
+      initialSelection: this._selectedPages.length > 0 ? this._selectedPages : undefined,
       includeDerivedPages: true,
-      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
-      label: 'Compare pages'
+      getCellCountForPageId: pageId => this.dataLayer.getCellCountForPageId(pageId),
+      label: 'Pages'
     });
     this._selectedPages = this._pageSelector.getSelectedPages();
     this._currentConfig.pages = [...this._selectedPages];
   }
 
-  /**
-   * Get the gene list from textarea
-   * @private
-   * @returns {string[]}
-   */
-  _getGeneList() {
-    const form = this._formContainer?.querySelector('.analysis-form');
-    const geneListInput = form?.querySelector('.gene-list-input');
-    if (!geneListInput) return [];
+  // ===========================================================================
+  // Run
+  // ===========================================================================
 
-    return geneListInput.value
-      .split(',')
-      .map(g => g.trim())
-      .filter(g => g);
-  }
-
-  /**
-   * Extract form values
-   * @returns {Object}
-   */
-  _getFormValues() {
-    const form = this._formContainer.querySelector('.analysis-form');
-    return {
-      genes: this._getGeneList(),
-      method: form.querySelector('[name="method"]').value,
-      normalize: form.querySelector('[name="normalize"]').value,
-      plotType: form.querySelector('[name="plotType"]').value
-    };
-  }
-
-  /**
-   * Validate form values
-   * @param {Object} formValues
-   * @returns {{ valid: boolean, error?: string }}
-   */
-  _validateForm(formValues) {
-    if (!formValues.genes || formValues.genes.length === 0) {
-      return { valid: false, error: 'Please enter at least one gene' };
-    }
-    const seenGenes = new Set();
-    for (const gene of formValues.genes) {
-      if (seenGenes.has(gene)) {
-        return {
-          valid: false,
-          error: `Gene "${gene}" is listed more than once; list each gene once`
-        };
-      }
-      seenGenes.add(gene);
-    }
-    if (!['mean', 'sum', 'median'].includes(formValues.method)) {
-      return { valid: false, error: 'Select mean, sum, or median signature scoring' };
-    }
-    if (!['none', 'zscore', 'minmax'].includes(formValues.normalize)) {
-      return { valid: false, error: 'Select a supported signature normalization' };
-    }
-    if (!['violinplot', 'boxplot', 'histogram'].includes(formValues.plotType)) {
-      return { valid: false, error: 'Select a supported signature visualization' };
-    }
-    return { valid: true };
-  }
-
-  /**
-   * Run the gene signature analysis
-   * @param {Object} formValues - Form values
-   * @returns {Promise<Object>} Analysis result
-   */
-  async _runAnalysisImpl(formValues, requestId = null) {
+  async _runAnalysisImpl(options, requestId, job) {
     const pageIds = [...this._selectedPages];
-    // Compute signature scores
-    const signatureResults = await this.multiVariableAnalysis.computeSignatureScore({
-      genes: formValues.genes,
+    const resolution = this._resolveSets(options.geneSets);
+    const scored = resolution.filter(set => set.resolved.length > 0);
+    const result = await this.multiVariableAnalysis.computeSignatureScore({
+      geneSets: scored.map(set => ({ name: set.name, genes: set.resolved })),
       pageIds,
-      method: formValues.method,
-      isCurrent: requestId === null
-        ? undefined
-        : () => this._isCurrentAnalysisRequest(requestId),
-      registerInvalidationCleanup: requestId === null
-        ? undefined
-        : cleanup =>
-          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
+      method: options.method,
+      controlSize: options.controlSize,
+      bins: options.bins,
+      seed: options.seed,
+      maxRank: options.maxRank,
+      job,
+      isCurrent: () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: cleanup => this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
-    if (
-      requestId !== null &&
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return null;
-    }
+    if (result === null || !this._isCurrentAnalysisRequest(requestId)) return null;
 
-    // Apply normalization if requested
-    if (formValues.normalize !== 'none') {
-      await this._normalizeResults(signatureResults, formValues.normalize);
-      if (requestId !== null && !this._isCurrentAnalysisRequest(requestId)) return null;
-    }
+    const sets = result.sets.map(set => {
+      const resolved = resolution.find(entry => entry.name === set.name);
+      return {
+        name: set.name,
+        genes: set.genes,
+        controlGenes: set.controlGenes,
+        constantGenes: set.constantGenes,
+        unmatched: [...resolved.unmatched, ...resolved.ambiguous.map(entry => entry.requested)],
+        pages: set.pages.map(page => ({
+          pageId: page.pageId,
+          pageName: page.pageName,
+          scores: page.scores,
+          cellIndices: page.cellIndices
+        }))
+      };
+    });
+    // Sets with no gene of this dataset are named, not scored.
+    const unscored = resolution
+      .filter(set => set.resolved.length === 0)
+      .map(set => ({ name: set.name, unmatched: [...set.unmatched, ...set.ambiguous.map(entry => entry.requested)] }));
+    const built = await this._buildResult({ sets, unscored, method: options.method }, options);
+    return this._isCurrentAnalysisRequest(requestId) ? built : null;
+  }
 
-    const data = signatureResults.map(sr => ({
-      pageId: sr.pageId,
-      pageName: sr.pageName,
-      // Keep raw scores to avoid duplicating large arrays; plots/stats filter as needed.
-      values: sr.scores,
-      variableInfo: { name: 'Signature Score', kind: 'continuous' }
-    }));
-    // The summary and tests the expanded view shows, computed by the analysis
-    // workers for large pages so that drawing the view only reads them.
+  /**
+   * The drawn result from the raw scores: rescaled, laid out per the display
+   * options. The raw scores are kept, so a display change redraws from them.
+   */
+  async _buildResult(raw, options) {
+    const { plotType, rescale, layout } = options;
+    const multiple = raw.sets.length > 1;
+    const shown = layout === 'each' && multiple
+      ? [raw.sets[Math.min(this._shownSet, raw.sets.length - 1)]]
+      : raw.sets;
+    const data = [];
+    for (const set of shown) {
+      for (const page of set.pages) {
+        data.push({
+          pageId: multiple ? `${page.pageId}::${set.name}` : page.pageId,
+          pageName: multiple && layout === 'side' ? `${page.pageName} · ${set.name}` : page.pageName,
+          values: page.scores.slice(),
+          cellIndices: page.cellIndices,
+          setName: set.name,
+          variableInfo: { name: 'Signature score', kind: 'continuous' }
+        });
+      }
+    }
+    await rescaleScores(data, rescale);
     await preparePageStatistics(data, 'continuous_obs');
-    if (requestId !== null && !this._isCurrentAnalysisRequest(requestId)) return null;
-
-    // Format for visualization
+    const geneCount = raw.sets.reduce((sum, set) => sum + set.genes.length, 0);
     return {
       type: 'signature',
-      plotType: formValues.plotType,
+      plotType,
       data,
-      options: {
-        showPoints: 'outliers',
-        showMean: true
-      },
-      title: 'Gene signature score',
-      subtitle: `${formValues.genes.length} genes: ${formValues.genes.slice(0, 5).join(', ')}${formValues.genes.length > 5 ? '...' : ''}`,
-      metadata: {
-        genes: formValues.genes,
-        method: formValues.method,
-        normalize: formValues.normalize
-      }
+      raw,
+      options: { showPoints: 'outliers', showMean: true },
+      title: 'Gene signature',
+      subtitle: raw.sets.length === 1
+        ? `${raw.sets[0].name} · ${formatCountOf(raw.sets[0].genes.length, 'gene')} · ${METHOD_LABELS[raw.method]}`
+        : `${formatCountOf(raw.sets.length, 'set')} · ${formatCountOf(geneCount, 'gene')} · ${METHOD_LABELS[raw.method]}`,
+      metadata: { method: raw.method }
     };
   }
 
-  // ===========================================================================
-  // Normalization
-  // ===========================================================================
-
-  /**
-   * Normalize results
-   * @param {Object[]} results
-   * @param {string} method
-   * @returns {Object[]}
-   */
-  async _normalizeResults(results, method) {
-    // Every pass walks every score on this thread, so it hands the event loop
-    // back between slices of a large page.
-    const yieldIfSliceSpent = createSlicedYield();
-    const pause = async () => {
-      const pending = yieldIfSliceSpent();
-      if (pending !== undefined) await pending;
-    };
-    if (method === 'zscore') {
-      // Z-score normalization across all values (streaming; avoids huge temporary arrays)
-      let count = 0;
-      let meanVal = 0;
-      let m2 = 0;
-
-      for (const r of results) {
-        const scores = r?.scores || [];
-        for (let i = 0; i < scores.length; i++) {
-          if ((i & 0xffff) === 0xffff) await pause();
-          const x = scores[i];
-          if (!isFiniteNumber(x)) continue;
-          count++;
-          const delta = x - meanVal;
-          meanVal += delta / count;
-          const delta2 = x - meanVal;
-          m2 += delta * delta2;
-        }
-      }
-
-      if (count === 0) return results;
-      const stdVal = Math.sqrt(m2 / count);
-      const denom = stdVal || 1;
-
-      for (const r of results) {
-        const scores = r?.scores || [];
-        for (let i = 0; i < scores.length; i++) {
-          if ((i & 0xffff) === 0xffff) await pause();
-          const x = scores[i];
-          scores[i] = isFiniteNumber(x) ? (x - meanVal) / denom : NaN;
-        }
-      }
-
-      return results;
-    } else if (method === 'minmax') {
-      // Min-max normalization
-      let min = Infinity;
-      let max = -Infinity;
-      let count = 0;
-
-      for (const r of results) {
-        const scores = r?.scores || [];
-        for (let i = 0; i < scores.length; i++) {
-          if ((i & 0xffff) === 0xffff) await pause();
-          const x = scores[i];
-          if (!isFiniteNumber(x)) continue;
-          count++;
-          if (x < min) min = x;
-          if (x > max) max = x;
-        }
-      }
-
-      if (count === 0) return results;
-      const range = (max - min) || 1;
-
-      for (const r of results) {
-        const scores = r?.scores || [];
-        for (let i = 0; i < scores.length; i++) {
-          if ((i & 0xffff) === 0xffff) await pause();
-          const x = scores[i];
-          scores[i] = isFiniteNumber(x) ? (x - min) / range : NaN;
-        }
-      }
-
-      return results;
-    }
-
-    return results;
+  _rebuildForDisplay(options) {
+    const raw = this._lastResult?.raw;
+    return raw === undefined ? null : this._buildResult(raw, options);
   }
 
   // ===========================================================================
-  // Custom Result Rendering
+  // Result
   // ===========================================================================
 
-  /**
-   * Show analysis result with signature-specific visualization
-   * @param {Object} result - Analysis result
-   */
   async _showResult(result, requestId) {
     const plotContainerId = this._instanceId ? `${this._instanceId}-signature-analysis-plot` : 'signature-analysis-plot';
-    return this._renderPreviewPlot({
+    const rendered = await this._renderPreviewPlot({
       result,
       requestId,
       containerId: plotContainerId,
       expandable: true
     });
+    if (rendered !== null && this._isCurrentAnalysisRequest(requestId)) this._renderResultHeader(result);
+    return rendered;
   }
 
-  // ===========================================================================
-  // Modal Rendering - Overrides from FormBasedAnalysisUI
-  // ===========================================================================
+  /** Chips above the plot: genes not found, constant genes, the shown set. */
+  _renderResultHeader(result) {
+    const container = this._resultContainer;
+    container.querySelector(':scope > .analysis-result-header')?.remove();
+    const header = document.createElement('div');
+    header.className = 'analysis-result-header';
+    // Chips sit in one wrapping row, each its own width.
+    const chips = document.createElement('div');
+    chips.className = 'analysis-result-chips';
+    const { raw } = result;
+    const notFound = [
+      ...raw.sets.flatMap(set => set.unmatched),
+      ...raw.unscored.flatMap(set => set.unmatched)
+    ];
+    if (notFound.length > 0) {
+      const chip = document.createElement('span');
+      chip.className = 'analysis-chip analysis-chip-warning';
+      chip.textContent = `${formatCount(notFound.length)} not found`;
+      chip.title = `Not in this dataset, left out of the score: ${notFound.join(', ')}`;
+      chips.appendChild(chip);
+    }
+    const constant = raw.sets.flatMap(set => set.constantGenes);
+    if (constant.length > 0) {
+      const chip = document.createElement('span');
+      chip.className = 'analysis-chip';
+      chip.textContent = `${formatCount(constant.length)} constant`;
+      chip.title = `The same in every cell, so without a z-score; left out: ${constant.join(', ')}`;
+      chips.appendChild(chip);
+    }
+    if (raw.sets.length > 1 && this._options?.layout === 'each') {
+      raw.sets.forEach((set, index) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'analysis-flag';
+        button.textContent = set.name;
+        button.setAttribute('aria-pressed', String(index === this._shownSet));
+        button.addEventListener('click', () => {
+          this._shownSet = index;
+          this._trackInteractiveTask(this._redrawForDisplay(), 'Gene signature set');
+        });
+        chips.appendChild(button);
+      });
+    }
+    if (chips.childElementCount > 0) header.appendChild(chips);
+    if (header.childElementCount > 0) container.prepend(header);
+  }
 
-  /**
-   * Render signature statistics in modal (matching Detailed analysis style)
-   * @param {HTMLElement} container - Modal stats container
-   */
   _renderModalStats(container) {
-    const result = this._lastResult;
-    const pageData = result?.data;
-
+    const pageData = this._lastResult?.data;
     if (!pageData || pageData.length === 0) {
       container.innerHTML = '<p class="empty-state">Statistics not available</p>';
       return;
     }
-
-    // Use the same renderSummaryStats function as DetailedAnalysisUI
-    renderSummaryStats(container, pageData, 'Signature Score');
+    renderSummaryStats(container, pageData, 'Signature score');
   }
 
-  /**
-   * Render signature annotations in modal (statistical analysis + gene list)
-   * @param {HTMLElement} container - Modal annotations container
-   */
   _renderModalAnnotations(container) {
     const result = this._lastResult;
     const pageData = result?.data;
-    const genes = result?.metadata?.genes;
-
     container.innerHTML = '';
-
-    // Statistical analysis section (like detailed mode)
     if (pageData && pageData.length >= 2) {
-      const statsSection = document.createElement('div');
-      statsSection.className = 'modal-statistical-analysis';
-
-      const statsTitle = document.createElement('h5');
-      statsTitle.textContent = 'Statistical analysis';
-      statsSection.appendChild(statsTitle);
-
-      const statsContainer = document.createElement('div');
-      // Gene signature scores are continuous data
-      renderStatisticalAnnotations(statsContainer, pageData, 'continuous_obs');
-      statsSection.appendChild(statsContainer);
-
-      container.appendChild(statsSection);
-    } else if (pageData && pageData.length < 2) {
-      const empty = document.createElement('p');
-      empty.className = 'empty-state';
-      empty.textContent = 'Select 2+ pages for statistics.';
-      container.appendChild(empty);
+      const section = document.createElement('div');
+      section.className = 'modal-statistical-analysis';
+      const title = document.createElement('h5');
+      title.textContent = 'Statistical analysis';
+      section.appendChild(title);
+      const stats = document.createElement('div');
+      renderStatisticalAnnotations(stats, pageData, 'continuous_obs');
+      section.appendChild(stats);
+      container.appendChild(section);
     }
-
-    // Gene list section
-    if (genes && genes.length > 0) {
-      const geneSection = document.createElement('div');
-      geneSection.className = 'modal-gene-section';
-
-      const geneTitle = document.createElement('h5');
-      geneTitle.textContent = `Genes in signature (${formatCount(genes.length)})`;
-      geneSection.appendChild(geneTitle);
-
+    for (const set of result?.raw?.sets ?? []) {
+      const section = document.createElement('div');
+      section.className = 'modal-gene-section';
+      const title = document.createElement('h5');
+      title.textContent = `${set.name} (${formatCountOf(set.genes.length, 'gene')})`;
+      section.appendChild(title);
       const chips = document.createElement('div');
       chips.className = 'gene-chips modal-gene-chips';
-
-      const frag = document.createDocumentFragment();
-      for (const gene of genes) {
-        const chip = document.createElement('span');
-        chip.className = 'gene-chip';
-        chip.textContent = String(gene ?? '');
-        frag.appendChild(chip);
+      for (const [genes, className, hint] of [
+        [set.genes, 'gene-chip', null],
+        [set.unmatched, 'gene-chip gene-chip-missing', 'Not in this dataset'],
+        [set.constantGenes, 'gene-chip gene-chip-missing', 'Constant: no z-score']
+      ]) {
+        for (const gene of genes) {
+          const chip = document.createElement('span');
+          chip.className = className;
+          chip.textContent = gene;
+          if (hint !== null) chip.title = hint;
+          chips.appendChild(chip);
+        }
       }
-      chips.appendChild(frag);
-      geneSection.appendChild(chips);
-
-      container.appendChild(geneSection);
+      section.appendChild(chips);
+      if (set.controlGenes.length > 0) {
+        const controls = document.createElement('p');
+        controls.className = 'analysis-run-reason';
+        controls.textContent = `Controls: ${formatCountOf(set.controlGenes.length, 'gene')}`;
+        controls.title = set.controlGenes.join(', ');
+        section.appendChild(controls);
+      }
+      container.appendChild(section);
     }
-
-    if (container.innerHTML === '') {
+    if (container.childElementCount === 0) {
       container.innerHTML = '<p class="empty-state">No annotations available</p>';
     }
   }
 
-  /**
-   * Export signature results as CSV from modal
-   */
-  _exportModalCSV() {
-    this._exportResultsCSV();
-  }
-
-  // ===========================================================================
-  // Export Functions
-  // ===========================================================================
-
-  /**
-   * Export plot as PNG
-   */
-  async _exportPlotPNG() {
-    const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
-    if (!plotEl) return;
-
-    await this._exportPNG(plotEl, {
-      filename: 'gene_signature_score',
-      width: 1200,
-      height: 800
-    });
-  }
-
-  /**
-   * Export results as CSV (signature-specific format)
-   */
-  _exportResultsCSV() {
-    if (!this._lastResult?.data) return;
-
-    const csv = signatureScoresToCSV(this._lastResult.data);
-    downloadCSV(csv, 'gene_signature_scores', this._notifications);
-  }
-
-  // ===========================================================================
-  // Settings Export/Import
-  // ===========================================================================
-
-  exportSettings() {
-    const base = super.exportSettings();
-    if (!this._pageSelector) {
-      throw new Error(
-        'Gene signature settings require an initialized page selector'
-      );
+  /** CSV: `page,set,cell_index,score`, every finite score of every set. */
+  async _exportModalCSV() {
+    const raw = this._lastResult?.raw;
+    if (!raw) return;
+    try {
+      const pages = raw.sets.flatMap(set => set.pages.map(page => ({
+        pageName: page.pageName,
+        setName: set.name,
+        values: page.scores,
+        cellIndices: page.cellIndices
+      })));
+      const csv = await writePerCellCSV('signature-scores', pages);
+      downloadCSV(csv, 'gene_signature_scores', this._notifications);
+    } catch (err) {
+      this._notifications.error(`CSV export failed: ${err.message}`, { category: 'download' });
     }
-    if (
-      base.formControls.genes?.type !== 'value' ||
-      base.formControls.genes.value !== this._savedGeneList
-    ) {
-      throw new TypeError(
-        'Gene signature savedGeneList must exactly match the genes form control'
-      );
-    }
-    const customColors = this._pageSelector.getCustomColors();
+  }
+
+  // ===========================================================================
+  // Sessions
+  // ===========================================================================
+
+  _getExtraSettingKeys() {
+    return ['customPageColors'];
+  }
+
+  _exportExtraSettings() {
     return {
-      ...base,
-      savedGeneList: this._savedGeneList,
-      customPageColors: Array.from(customColors.entries())
+      customPageColors: this._pageSelector === null
+        ? []
+        : Array.from(this._pageSelector.getCustomColors().entries())
     };
   }
 
-  importSettings(settings) {
-    const base = this._requireExactFormSettings(
-      settings,
-      [
-        'customPageColors',
-        'formControls',
-        'savedGeneList',
-        'selectedPages'
-      ]
-    );
-    if (typeof settings.savedGeneList !== 'string') {
-      throw new TypeError(
-        'Gene signature savedGeneList must be a string'
-      );
+  _importExtraSettings(settings) {
+    if (this._pageSelector !== null) {
+      this._applyCustomPageColors(this._requireCustomPageColors(settings.customPageColors));
     }
-    if (
-      base.formControls.genes?.type !== 'value' ||
-      base.formControls.genes.value !== settings.savedGeneList
-    ) {
-      throw new TypeError(
-        'Gene signature savedGeneList must exactly match the genes form control'
-      );
-    }
-    const method = base.formControls.method;
-    if (
-      method?.type !== 'value' ||
-      !new Set(['mean', 'median', 'sum']).has(method.value)
-    ) {
-      throw new TypeError('Gene signature method control is unsupported');
-    }
-    const normalization = base.formControls.normalize;
-    if (
-      normalization?.type !== 'value' ||
-      !new Set(['minmax', 'none', 'zscore']).has(normalization.value)
-    ) {
-      throw new TypeError(
-        'Gene signature normalization control is unsupported'
-      );
-    }
-    const plotType = base.formControls.plotType;
-    if (
-      plotType?.type !== 'value' ||
-      !new Set(['boxplot', 'histogram', 'violinplot']).has(plotType.value)
-    ) {
-      throw new TypeError(
-        'Gene signature plot type control is unsupported'
-      );
-    }
-    const customPageColors = this._requireCustomPageColors(
-      settings.customPageColors
-    );
+  }
 
-    this._savedGeneList = settings.savedGeneList;
-    this._applyFormSettings(base);
-    this._applyCustomPageColors(customPageColors);
+  _exportViewState() {
+    return { shownSet: this._shownSet };
+  }
+
+  _importViewState(view) {
+    const keys = Object.keys(view);
+    if (keys.length !== 1 || !Number.isSafeInteger(view.shownSet) || view.shownSet < 0) {
+      throw new TypeError('Gene signature view must hold exactly shownSet');
+    }
+    this._shownSet = view.shownSet;
+  }
+
+  /**
+   * The shown result for a session: every set's raw scores per page (typed
+   * columns), its genes, controls and genes not found.
+   * @returns {null|{kind: 'signature', version: number, payload: unknown}}
+   */
+  exportResult() {
+    const raw = this._lastResult?.raw;
+    if (!raw) return null;
+    return createResultEnvelope('signature', raw);
+  }
+
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const raw = readResultEnvelope(envelope, 'signature');
+    if (!Array.isArray(raw?.sets) || !Array.isArray(raw.unscored) || typeof raw.method !== 'string') {
+      throw new TypeError('A gene signature result must hold its sets');
+    }
+    for (const set of raw.sets) {
+      await requireDatasetGenes(this.dataLayer, [...set.genes, ...set.controlGenes], 'The gene signature result');
+      requireDatasetPages(this.dataLayer, set.pages.map(page => page?.pageId), 'The gene signature result');
+      for (const page of set.pages) {
+        if (!ArrayBuffer.isView(page.scores)) {
+          throw new TypeError(`Gene signature scores of "${page.pageId}" must be a typed array`);
+        }
+        const cellCount = this.dataLayer.getCellCountForPageId(page.pageId);
+        if (page.scores.length !== cellCount) {
+          throw new RangeError(
+            `Gene signature result holds ${page.scores.length} scores for cell group ` +
+            `"${page.pageId}", which now has ${formatCountOf(cellCount, 'cell')}`
+          );
+        }
+      }
+    }
+    const result = await this._buildResult(raw, this._requireOptions());
+    await this._restoreAnalysisResult(result);
   }
 
   // ===========================================================================
@@ -820,34 +470,21 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
     const errors = [];
-    if (this._pageSelector !== null && this._pageSelector !== undefined) {
-      if (typeof this._pageSelector.destroy !== 'function') {
-        errors.push(
-          new TypeError('Gene Signature page selector must implement destroy()')
-        );
-      } else {
-        try {
-          this._pageSelector.destroy();
-        } catch (error) {
-          errors.push(error);
-        }
-      }
+    try {
+      this._pageSelector?.destroy();
+    } catch (error) {
+      errors.push(error);
     }
     this._pageSelector = null;
     this._pageSelectContainer = null;
-    this._savedGeneList = '';
     const parentTask = super.destroy();
     if (errors.length === 0) return parentTask;
     const destruction = Promise.resolve(parentTask).then(
       () => {
-        if (errors.length === 1) throw errors[0];
-        throw new AggregateError(errors, 'Gene Signature UI cleanup failed');
+        throw errors.length === 1 ? errors[0] : new AggregateError(errors, 'Gene signature UI cleanup failed');
       },
       parentError => {
-        throw new AggregateError(
-          [...errors, parentError],
-          'Gene Signature UI cleanup failed'
-        );
+        throw new AggregateError([...errors, parentError], 'Gene signature UI cleanup failed');
       }
     );
     this._destroyPromise = destruction;
@@ -857,7 +494,61 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 }
 
 /**
- * Factory function to create gene signature UI
+ * Rescale the drawn scores: z-score (population sd) or 0–1, per set over
+ * every page it was scored on, sliced so a large page does not hold the
+ * thread.
+ */
+async function rescaleScores(data, method) {
+  if (method === 'none') return;
+  const yieldIfSliceSpent = createSlicedYield();
+  const pause = async () => {
+    const pending = yieldIfSliceSpent();
+    if (pending !== undefined) await pending;
+  };
+  // Each set on its own scale, over every page it was scored on: pages stay
+  // comparable, and two sets' scores are not mixed into one mean.
+  const pagesBySet = new Map();
+  for (const page of data) {
+    const pages = pagesBySet.get(page.setName) ?? [];
+    pages.push(page);
+    pagesBySet.set(page.setName, pages);
+  }
+  for (const pages of pagesBySet.values()) {
+    let count = 0;
+    let mean = 0;
+    let m2 = 0;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const page of pages) {
+      const values = page.values;
+      for (let i = 0; i < values.length; i++) {
+        if ((i & 0xffff) === 0xffff) await pause();
+        const x = values[i];
+        if (!isFiniteNumber(x)) continue;
+        count++;
+        const delta = x - mean;
+        mean += delta / count;
+        m2 += delta * (x - mean);
+        if (x < min) min = x;
+        if (x > max) max = x;
+      }
+    }
+    if (count === 0) continue;
+    const scale = method === 'zscore' ? (Math.sqrt(m2 / count) || 1) : ((max - min) || 1);
+    const shift = method === 'zscore' ? mean : min;
+    for (const page of pages) {
+      const values = page.values;
+      for (let i = 0; i < values.length; i++) {
+        if ((i & 0xffff) === 0xffff) await pause();
+        const x = values[i];
+        values[i] = isFiniteNumber(x) ? (x - shift) / scale : NaN;
+      }
+    }
+  }
+}
+
+/**
+ * Factory function to create the gene signature UI
  * @param {Object} options
  * @returns {GeneSignatureUI}
  */

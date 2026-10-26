@@ -51,12 +51,14 @@ export class DeleteRegistry extends BaseRegistry {
   markDeleted(source, originalKey) {
     requireSourceAndKey(source, originalKey);
     this._deletedFields.add(makeFieldId(source, originalKey));
+    this._recordEdit(source, originalKey);
   }
 
   markRestored(source, originalKey) {
     requireSourceAndKey(source, originalKey);
     this._deletedFields.delete(makeFieldId(source, originalKey));
     this._purgedFields.delete(makeFieldId(source, originalKey));
+    this._recordEdit(source, originalKey);
   }
 
   markPurged(source, originalKey) {
@@ -64,6 +66,7 @@ export class DeleteRegistry extends BaseRegistry {
     const id = makeFieldId(source, originalKey);
     this._deletedFields.add(id);
     this._purgedFields.add(id);
+    this._recordEdit(source, originalKey);
   }
 
   isDeleted(source, originalKey) {
@@ -85,6 +88,20 @@ export class DeleteRegistry extends BaseRegistry {
       .filter((id) => id.startsWith(prefix))
       .filter((id) => !this._purgedFields.has(id))
       .map((id) => id.slice(prefix.length));
+  }
+
+  /**
+   * Whether any field of `source` is deleted.
+   * @param {string} source - 'obs' | 'var'
+   * @returns {boolean}
+   */
+  hasEntriesFor(source) {
+    if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+      throw new TypeError('Delete source must be exactly obs or var');
+    }
+    const prefix = `${source}:`;
+    for (const id of this._deletedFields) if (id.startsWith(prefix)) return true;
+    return false;
   }
 
   getCounts() {
@@ -137,10 +154,12 @@ export class DeleteRegistry extends BaseRegistry {
     }
     this._deletedFields = deletedSet;
     this._purgedFields = new Set(purged);
+    this._recordReplacement();
   }
 
   clear() {
     this._deletedFields.clear();
     this._purgedFields.clear();
+    this._recordReplacement();
   }
 }

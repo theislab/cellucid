@@ -16,6 +16,7 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { PLACES, placePath } from '../place-names.js';
 
 const CYCLE_NOTICE_MS = 2200;
 
@@ -130,7 +131,7 @@ export function initRepresentationControls({ state, dom, callbacks }) {
     if (busy) {
       select.title = 'Switching…';
     } else if (representations.length < 2) {
-      select.title = 'This dataset shows one embedding. Turn more on in Session › Data mapping.';
+      select.title = `This dataset shows one embedding. Turn more on in ${placePath(PLACES.session, PLACES.dataMapping)}.`;
     }
   }
 
@@ -166,7 +167,7 @@ export function initRepresentationControls({ state, dom, callbacks }) {
     const representations = state.getEnabledRepresentations();
     if (!representations.some(item => item.dimension === dimension)) {
       getNotificationCenter().info(
-        `No ${dimension}D embedding is on. Turn one on in Session › Data mapping.`,
+        `No ${dimension}D embedding is on. Turn one on in ${placePath(PLACES.session, PLACES.dataMapping)}.`,
         { category: 'dimension', duration: CYCLE_NOTICE_MS }
       );
       return;

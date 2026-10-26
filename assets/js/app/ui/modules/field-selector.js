@@ -30,6 +30,7 @@ import {
   createFieldInteractionOwner,
   isFieldInteractionSupersededError
 } from './field-interaction-owner.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
@@ -67,33 +68,6 @@ const REQUIRED_STATE_METHODS = [
   'renameField',
   'setActiveField'
 ];
-
-function requirePlainRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
-  return value;
-}
-
-function requireExactKeys(value, allowedKeys, label) {
-  requirePlainRecord(value, label);
-  for (const key of Object.keys(value)) {
-    if (!allowedKeys.has(key)) {
-      throw new TypeError(`${label} contains unknown key "${key}"`);
-    }
-  }
-  for (const key of allowedKeys) {
-    if (!Object.hasOwn(value, key)) {
-      throw new TypeError(`${label} requires key "${key}"`);
-    }
-  }
-  return value;
-}
 
 function requireMethod(owner, methodName, label) {
   if (
@@ -311,7 +285,7 @@ export function initFieldSelector(options) {
     }
   }
   for (const methodName of [
-    'getCurrentDatasetId',
+    'getCurrentIdentityId',
     'offDatasetChange',
     'onDatasetChange'
   ]) {
@@ -988,6 +962,19 @@ export function initFieldSelector(options) {
         ) {
           throw createDatasetFieldLoadSupersededError();
         }
+        if (field.kind === 'category') {
+          // The dataset-length part of the activation, in slices.
+          await state.prepareCategoryFieldActivation(field, {
+            signal: token.signal
+          });
+          interactionOwner.assertCurrent(token);
+          if (
+            readDatasetGeneration() !== datasetGeneration
+            || state.getFields()?.[index] !== field
+          ) {
+            throw createDatasetFieldLoadSupersededError();
+          }
+        }
         const info = requireFieldInfo(
           state.setActiveField(index),
           field,
@@ -1124,6 +1111,7 @@ export function initFieldSelector(options) {
     new Set([
       'clearGeneSelection',
       'clearLocalSelectionUI',
+      'colorByGene',
       'destroy',
       'initGeneExpressionDropdown',
       'selectGene',
@@ -1492,9 +1480,9 @@ export function initFieldSelector(options) {
     geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
   }
 
-  async function selectGene(originalIdx) {
+  async function colorByGene(geneKey) {
     assertAlive();
-    return geneSelector.selectGene(originalIdx);
+    return geneSelector.colorByGene(geneKey);
   }
 
   function clearGeneSelection() {
@@ -1508,7 +1496,7 @@ export function initFieldSelector(options) {
     destroy,
     activateField,
     prepareDatasetReplacement,
-    selectGene,
+    colorByGene,
     settleAllInteractions,
     settleCurrentInteraction,
     syncFromState,

@@ -1,112 +1,362 @@
+/**
+ * The AnnData Zarr contract: what the app reads from an AnnData Zarr store,
+ * and what it refuses, through the Zarr package (`formats/zarr`) and the one
+ * AnnData reader (`data/anndata`), and through the public `AnnDataFileSource`.
+ *
+ * Stores are real: built in memory as Zarr v2 entries (`.zgroup`, `.zattrs`,
+ * `.zarray` and chunk bytes, including canonical frames written by
+ * numcodecs) and opened with `openZarr`. Format-neutral reader guarantees are
+ * also covered in `anndata-reader-contract.test.mjs`; the codecs on their own
+ * in `zarr-format-codecs.test.mjs` and `zarr-format-conformance.test.mjs`.
+ */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import * as zarrCodecs from '../assets/js/data/zarr-codecs.js';
 import {
-  decodeLz4Block,
-  decodeVLenUtf8,
-  getZarrDtypeInfo
-} from '../assets/js/data/zarr-codecs.js';
-import * as zarrSourceModule from '../assets/js/data/zarr.js';
-import * as zarrLoaderModule from '../assets/js/data/zarr-loader.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
-import { ZarrLoader } from '../assets/js/data/zarr-loader.js';
-
-const zarrModule = { ...zarrSourceModule, ...zarrLoaderModule };
+  ZarrFormatError,
+  ZarrUnsupportedError,
+  memoryStore,
+  openZarr,
+} from '../assets/js/formats/zarr/index.js';
+import { lz4DecodeBlockInto } from '../assets/js/formats/zarr/codecs/lz4.js';
+import { vlenDecode } from '../assets/js/formats/zarr/codecs/vlen.js';
+import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
+import { ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
+import { readSparseMatrix, sparseContract } from '../assets/js/data/anndata/sparse.js';
+import { nullableContract } from '../assets/js/data/anndata/dataframe.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
+import { asWorkerLoader } from './helpers/worker-loader.mjs';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
 import {
-  buildCscFromCsr,
+  connectivityEdgesOf,
   extractConnectivityEdges,
-  getSparseColumn
-} from '../assets/js/data/sparse-utils.js';
+} from '../assets/js/data/connectivity-edges.js';
 import {
   EmbeddingLoadError,
   describeAnnDataProbes,
 } from '../assets/js/data/data-mapping-candidates.js';
-import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
+import {
+  annData,
+  array,
+  categorical,
+  chunksOf,
+  dataFrame,
+  dense,
+  group,
+  mapping,
+  minimalAnnData,
+  nullable,
+  recordingView,
+  sparse,
+  stringFrame,
+  strings,
+  zarrEntries,
+} from './helpers/anndata-store.mjs';
+import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
-/** One gene's column of X, found by its stored var name. */
-function geneColumnByName(loader, name) {
-  const index = loader.varNames.indexOf(name);
-  assert.notEqual(index, -1, `gene '${name}' is on the var index`);
-  return loader.getMatrixColumn('X', index);
+const MiB = 1024 * 1024;
+const encoder = new TextEncoder();
+const SUPERSEDED = /dataset.*(changed|superseded)|superseded.*dataset/i;
+
+// ---------------------------------------------------------------------------
+// Stores built from entries.
+// ---------------------------------------------------------------------------
+
+/** JSON metadata bytes (a string is written as it is). */
+function json(value) {
+  return encoder.encode(typeof value === 'string' ? value : JSON.stringify(value));
 }
 
-/** One gene's values through a data source's adapter, found in its var manifest. */
-async function sourceGeneValuesByName(source, name) {
-  const manifest = await source.getVarManifest();
-  const field = manifest.fields.find(([, fieldName]) => fieldName === name);
-  assert.ok(field, `gene '${name}' is in the var manifest`);
-  return source.getAdapter().getGeneValues(`var/${field[0]}.values.f32`);
+function isChunkKey(key) {
+  return !/(^|\/)\.z(group|attrs|array|metadata)$/.test(key);
 }
 
 /**
- * Call a private X column reader the way `getMatrixColumn` does: with the
- * resident X state (created when none is resident) and X's description.
+ * A memory store over entries (key → bytes) that lists every chunk key it
+ * serves in `fetched`; `onChunk(key)` runs before a chunk is served and may
+ * wait, or throw to fail that read.
  */
-function readXColumn(loader, index, { sparse }) {
-  loader._requireMatrixElement = async element => {
-    assert.equal(element, 'X');
-    return { path: 'X', label: 'X', sparse, nVars: loader._nVars };
+function entryStore(entries, { name = 'fixture.zarr', onChunk = null } = {}) {
+  const inner = memoryStore(entries, { name });
+  const fetched = [];
+  const backend = {
+    name,
+    async get(key, options) {
+      if (onChunk !== null && isChunkKey(key)) await onChunk(key);
+      const bytes = await inner.get(key, options);
+      if (bytes !== null && isChunkKey(key)) fetched.push(key);
+      return bytes;
+    },
+    getMany(keys, options) {
+      return Promise.all(keys.map(key => backend.get(key, options)));
+    },
+    getRanges: inner.getRanges,
+    storedSize: inner.storedSize,
+    list: inner.list,
+    stats: inner.stats,
   };
-  return loader.getMatrixColumn('X', index);
+  return { backend, fetched };
 }
 
-/** Describe X without reading store metadata, for loaders built from stubs. */
-function stubXElement(loader, { sparse, nVars }) {
-  loader._requireMatrixElement = async element => {
-    assert.equal(element, 'X');
-    return { path: 'X', label: 'X', sparse, nVars };
+/** Open entries as a Zarr store; `reads` records every array read made through it. */
+async function openRoot(entries, { name = 'fixture.zarr', onChunk = null, decodedChunkCacheBytes = 64 * MiB } = {}) {
+  const { backend, fetched } = entryStore(entries, { name, onChunk });
+  const opened = await openZarr(backend, { decodedChunkCacheBytes });
+  const reads = [];
+  return { opened, root: recordingView(opened, reads), fetched, reads };
+}
+
+/** Open entries (or a described tree) as an AnnData reader. */
+async function openAnnData(entriesOrTree, {
+  name = 'fixture.zarr',
+  onChunk = null,
+  decodedChunkCacheBytes = 64 * MiB,
+  reader = new AnnDataReader(),
+} = {}) {
+  const entries = entriesOrTree instanceof Map ? entriesOrTree : zarrEntries(entriesOrTree);
+  const { opened, root, fetched, reads } = await openRoot(entries, { name, onChunk, decodedChunkCacheBytes });
+  await reader.open(root, { format: ZARR_FORMAT, name, decodedChunkBytes: decodedChunkCacheBytes });
+  return { reader, opened, root, fetched, reads };
+}
+
+/** Reads of one array path recorded by `openRoot`. */
+function readsOf(reads, path) {
+  return reads.filter(read => read.path === `/${path}`);
+}
+
+/** One array, alone in a store, read whole. */
+async function readArray(path, meta, chunks = {}) {
+  const entries = new Map([['.zgroup', json({ zarr_format: 2 })], [`${path}/.zarray`, json(meta)]]);
+  for (const [key, bytes] of Object.entries(chunks)) entries.set(`${path}/${key}`, bytes);
+  const { opened } = await openRoot(entries);
+  return opened.get(path).read();
+}
+
+/** A promise with its resolver. */
+function deferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * An `onChunk` that holds the first fetch of `key` until released, and says
+ * when that fetch has started.
+ */
+function holdFirst(key) {
+  const started = deferred();
+  const released = deferred();
+  let held = false;
+  return {
+    started: started.promise,
+    release: () => released.resolve(),
+    async onChunk(chunkKey) {
+      if (held || chunkKey !== key) return;
+      held = true;
+      started.resolve();
+      await released.promise;
+    },
   };
 }
 
-/** An adapter whose obsm entries are described from the loader's probes. */
-async function adapterWithDescribedObsm(loader, options = {}) {
-  const adapter = new BaseAnnDataAdapter(loader, options);
+function metadata(overrides) {
+  return {
+    zarr_format: 2,
+    shape: [1],
+    chunks: [1],
+    dtype: '<i4',
+    compressor: null,
+    fill_value: 0,
+    filters: null,
+    order: 'C',
+    ...overrides
+  };
+}
+
+function currentArrayAttrs(meta, overrides = {}) {
+  const dtype = meta?.dtype;
+  const isString =
+    dtype === '|O' ||
+    (typeof dtype === 'string' && /^[|<>=]?[SU]/.test(dtype));
+  return {
+    'encoding-type': isString ? 'string-array' : 'array',
+    'encoding-version': '0.2.0',
+    ...overrides,
+  };
+}
+
+/** Write one array's metadata and chunks into `entries` (replacing what was there). */
+function setArray(entries, path, meta, chunks = {}, attrs = currentArrayAttrs(meta)) {
+  for (const key of [...entries.keys()]) {
+    if (key.startsWith(`${path}/`)) entries.delete(key);
+  }
+  entries.set(`${path}/.zarray`, json(meta));
+  if (attrs !== null) entries.set(`${path}/.zattrs`, json(attrs));
+  for (const [key, bytes] of Object.entries(chunks)) entries.set(`${path}/${key}`, bytes);
+}
+
+function littleEndianBytes(values, setter, bytesPerValue) {
+  const bytes = new Uint8Array(values.length * bytesPerValue);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, index) => {
+    view[setter](index * bytesPerValue, value, true);
+  });
+  return bytes;
+}
+
+function vlenUtf8Bytes(values) {
+  const encoded = values.map(value => encoder.encode(value));
+  const totalBytes = 4 + encoded.reduce(
+    (sum, bytes) => sum + 4 + bytes.length,
+    0
+  );
+  const result = new Uint8Array(totalBytes);
+  const view = new DataView(result.buffer);
+  view.setUint32(0, values.length, true);
+  let cursor = 4;
+  for (const bytes of encoded) {
+    view.setUint32(cursor, bytes.length, true);
+    cursor += 4;
+    result.set(bytes, cursor);
+    cursor += bytes.length;
+  }
+  return result;
+}
+
+function bytesFromHex(hex) {
+  return Uint8Array.from(hex.match(/../g) ?? [], byte => Number.parseInt(byte, 16));
+}
+
+function bytesFromBase64(base64) {
+  return Uint8Array.from(Buffer.from(base64, 'base64'));
+}
+
+/** A real in-memory File, as a folder picker hands one over. */
+function memoryFile(value) {
+  const bytes = typeof value === 'string' ? encoder.encode(value) : value;
+  return new File([bytes], 'memory');
+}
+
+/** A folder selection of a store's entries (bytes become Files; other objects are kept). */
+function fileListFromMap(files, rootName) {
+  return Array.from(files, ([path, value]) => {
+    const file = value instanceof Uint8Array ? memoryFile(value) : value;
+    return {
+      name: path.split('/').at(-1),
+      webkitRelativePath: `${rootName}/${path}`,
+      size: Number.isFinite(file.size) ? file.size : 0,
+      text: () => file.text(),
+      arrayBuffer: () => file.arrayBuffer()
+    };
+  });
+}
+
+function captureDownloadNotifications(t) {
+  const notifications = getNotificationCenter();
+  const methodNames = [
+    'startDownload',
+    'updateDownload',
+    'completeDownload',
+    'failDownload',
+    'dismissDownload',
+  ];
+  const originals = new Map(
+    methodNames.map(name => [name, notifications[name]])
+  );
+  const events = [];
+  let nextId = 0;
+
+  notifications.startDownload = name => {
+    const id = `download-${++nextId}`;
+    events.push({ id, kind: 'start', name });
+    return id;
+  };
+  notifications.updateDownload = (id, loaded, total) => {
+    events.push({ id, kind: 'update', loaded, total });
+  };
+  notifications.completeDownload = id => {
+    events.push({ id, kind: 'complete' });
+  };
+  notifications.failDownload = (id, message) => {
+    events.push({ id, kind: 'fail', message });
+  };
+  notifications.dismissDownload = id => {
+    events.push({ id, kind: 'dismiss' });
+  };
+
+  t.after(() => {
+    for (const [name, method] of originals) {
+      if (method === undefined) delete notifications[name];
+      else notifications[name] = method;
+    }
+  });
+  return events;
+}
+
+/** One gene's column of X, found by its stored var name. */
+function geneColumnByName(reader, name) {
+  const index = reader.varNames.indexOf(name);
+  assert.notEqual(index, -1, `gene '${name}' is on the var index`);
+  return reader.getMatrixColumn('X', index);
+}
+
+/** One gene's values through a data source's adapter, found in its gene list. */
+async function sourceGeneValuesByName(source, name) {
+  const list = await source.getGeneList();
+  const field = list.fields.find(gene => gene.key === name);
+  assert.ok(field, `gene '${name}' is in the gene list`);
+  return source.getAdapter().getGeneValues(field.path);
+}
+
+/** An adapter whose obsm entries are described from the reader's probes. */
+async function adapterWithDescribedObsm(reader, options = {}) {
+  const adapter = new BaseAnnDataAdapter(reader, options);
   adapter._describedObsm =
-    describeAnnDataProbes(await loader.probeMapping()).obsm;
+    describeAnnDataProbes(await reader.probeMapping()).obsm;
   return adapter;
 }
 
-/** Mapping probes for an obsm of dense arrays with the given widths. */
-function obsmProbes(nObs, widths) {
-  return {
-    nObs,
-    nVars: 0,
-    obsm: Object.entries(widths).map(([key, width]) => ({
-      key,
-      storage: 'dense',
-      shape: [nObs, width],
-      dtype: 'float32',
-      numeric: true,
-      nnz: null,
-    })),
-    obsp: [],
-    varColumns: [],
-    X: null,
-    layers: [],
-    raw: null,
-  };
+/**
+ * The working store of most tests: two cells (`cell-0`, `cell-1`), genes A
+ * and B in a dense float32 X, and a 2-D UMAP.
+ */
+function completeTree({ embeddingValues, geneValues }) {
+  return minimalAnnData({
+    nObs: 2,
+    genes: ['A', 'B'],
+    X: dense(Float32Array.from(geneValues), [2, 2]),
+    obsm: mapping({ X_umap_2d: dense(Float32Array.from(embeddingValues), [2, 2]) }),
+  });
 }
 
-/**
- * Give a loader plottable mapping metadata: one 2-column X_umap_2d whose
- * reads return distinct values per cell.
- */
-function stubPlottableObsm(loader, nObs) {
-  loader.getDatasetMetadata = async () => ({
-    stats: { n_cells: nObs, n_genes: 0 },
-    probes: obsmProbes(nObs, { X_umap_2d: 2 }),
-    obs_fields: [],
+function completeZarrStoreFiles(values) {
+  return zarrEntries(completeTree(values));
+}
+
+/** A store with `nObs` cells, the given genes, a UMAP, and extra root children. */
+function storeWith({ nObs = 2, genes = ['A', 'B'], X = undefined, obs = {}, obsm = undefined, extra = {} } = {}) {
+  return minimalAnnData({ nObs, genes, X, obs, obsm, extra });
+}
+
+/** A store whose X is the given sparse matrix. */
+function sparseStore(options = {}) {
+  const shape = options.shape ?? [2, 3];
+  return storeWith({
+    nObs: shape[0],
+    genes: Array.from({ length: shape[1] }, (_, i) => `g${i}`),
+    X: sparse({ data: new Float32Array([1, 2]), indices: new Int32Array([0, 2]), indptr: new Int32Array([0, 1, 2]), ...options, shape }),
   });
-  loader.readObsmColumns = async (_key, columns) => Float64Array.from(
-    { length: nObs * columns.length },
-    (_, index) => 10 * Math.floor(index / columns.length) +
-      columns[index % columns.length]
-  );
+}
+
+/** A store with a connectivity graph `obsp['connectivities']`. */
+function connectivityStore(connectivities, nObs = 2) {
+  return storeWith({ nObs, extra: { obsp: mapping({ connectivities }) } });
 }
 
 const CANONICAL_SPLIT_BLOSC_BASE64 =
@@ -165,95 +415,6 @@ function bloscLz4Metadata(overrides = {}) {
   };
 }
 
-function littleEndianBytes(values, setter, bytesPerValue) {
-  const bytes = new Uint8Array(values.length * bytesPerValue);
-  const view = new DataView(bytes.buffer);
-  values.forEach((value, index) => {
-    view[setter](index * bytesPerValue, value, true);
-  });
-  return bytes;
-}
-
-function vlenUtf8Bytes(values) {
-  const encoder = new TextEncoder();
-  const encoded = values.map(value => encoder.encode(value));
-  const totalBytes = 4 + encoded.reduce(
-    (sum, bytes) => sum + 4 + bytes.length,
-    0
-  );
-  const result = new Uint8Array(totalBytes);
-  const view = new DataView(result.buffer);
-  view.setUint32(0, values.length, true);
-  let cursor = 4;
-  for (const bytes of encoded) {
-    view.setUint32(cursor, bytes.length, true);
-    cursor += 4;
-    result.set(bytes, cursor);
-    cursor += bytes.length;
-  }
-  return result;
-}
-
-function sparseLoader({
-  format = 'csr',
-  shape = [2, 3],
-  data = [1, 2],
-  dataDtype = '<f4',
-  dataBytes = littleEndianBytes(data, 'setFloat32', 4),
-  indices = [0, 2],
-  indptr = [0, 1, 2],
-  indicesDtype = '<i4',
-  indicesBytes = littleEndianBytes(indices, 'setInt32', 4)
-} = {}) {
-  const loader = new ZarrLoader();
-  const files = new Map([
-    ['.zgroup', memoryFile('{"zarr_format":2}')],
-    ['.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'anndata',
-      'encoding-version': '0.1.0'
-    }))],
-    ['X/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': `${format}_matrix`,
-      'encoding-version': '0.1.0',
-      shape
-    }))],
-    ['X/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['X/data/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [data.length],
-      chunks: [Math.max(1, data.length)],
-      dtype: dataDtype
-    })))],
-    ['X/data/0', memoryFile(dataBytes)],
-    ['X/indices/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [indices.length],
-      chunks: [Math.max(1, indices.length)],
-      dtype: indicesDtype
-    })))],
-    ['X/indices/0', memoryFile(indicesBytes)],
-    ['X/indptr/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [indptr.length],
-      chunks: [indptr.length],
-      dtype: '<i4'
-    })))],
-    ['X/indptr/0', memoryFile(littleEndianBytes(indptr, 'setInt32', 4))]
-  ]);
-  loader._files = files;
-  return loader;
-}
-
-function connectivityLoader(options = {}, nObs = 2) {
-  const loader = sparseLoader(options);
-  loader._files = new Map(
-    Array.from(loader._files, ([path, file]) => [
-      path.replace(/^X(?=\/)/, 'obsp/connectivities'),
-      file
-    ])
-  );
-  setCurrentMapping(loader._files, 'obsp');
-  loader._nObs = nObs;
-  return loader;
-}
-
 function reorderBloscPhysicalBlocks(frame, physicalOrder) {
   const source = Uint8Array.from(frame);
   const sourceView = new DataView(source.buffer);
@@ -286,667 +447,131 @@ function reorderBloscPhysicalBlocks(frame, physicalOrder) {
   return reordered;
 }
 
-function bytesFromHex(hex) {
-  return Uint8Array.from(hex.match(/../g) ?? [], byte => Number.parseInt(byte, 16));
-}
+// ---------------------------------------------------------------------------
+// Array metadata, codecs and element types.
+// ---------------------------------------------------------------------------
 
-function bytesFromBase64(base64) {
-  return Uint8Array.from(Buffer.from(base64, 'base64'));
-}
-
-function memoryFile(value) {
-  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
-  return {
-    async text() {
-      return new TextDecoder().decode(bytes);
-    },
-    async arrayBuffer() {
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    }
-  };
-}
-
-function currentArrayAttrs(meta, overrides = {}) {
-  const dtype = meta?.dtype;
-  const isString =
-    dtype === '|O' ||
-    (typeof dtype === 'string' && /^[|<>=]?[SU]/.test(dtype));
-  return {
-    'encoding-type': isString ? 'string-array' : 'array',
-    'encoding-version': '0.2.0',
-    ...overrides,
-  };
-}
-
-function setCurrentArrayAttrs(files, path, meta, overrides = {}) {
-  files.set(
-    `${path}/.zattrs`,
-    memoryFile(JSON.stringify(currentArrayAttrs(meta, overrides)))
-  );
-}
-
-function setCurrentGroup(files, path, attrs) {
-  files.set(`${path}/.zgroup`, memoryFile('{"zarr_format":2}'));
-  files.set(`${path}/.zattrs`, memoryFile(JSON.stringify(attrs)));
-}
-
-function setCurrentMapping(files, path) {
-  setCurrentGroup(files, path, {
-    'encoding-type': 'dict',
-    'encoding-version': '0.1.0',
-  });
-}
-
-function deferredMemoryFile(value) {
-  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
-  let markStarted;
-  let releaseRead;
-  const started = new Promise(resolve => {
-    markStarted = resolve;
-  });
-  const released = new Promise(resolve => {
-    releaseRead = resolve;
-  });
-  return {
-    started,
-    release() {
-      releaseRead();
-    },
-    file: {
-      async text() {
-        return new TextDecoder().decode(bytes);
-      },
-      async arrayBuffer() {
-        markStarted();
-        await released;
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      }
-    }
-  };
-}
-
-function fileListFromMap(files, rootName) {
-  return Array.from(files, ([path, file]) => ({
-    name: path.split('/').at(-1),
-    webkitRelativePath: `${rootName}/${path}`,
-    size: Number.isFinite(file.size) ? file.size : 0,
-    text: () => file.text(),
-    arrayBuffer: () => file.arrayBuffer()
-  }));
-}
-
-function captureDownloadNotifications(t) {
-  const notifications = getNotificationCenter();
-  const methodNames = [
-    'startDownload',
-    'updateDownload',
-    'completeDownload',
-    'failDownload',
-    'dismissDownload',
-  ];
-  const originals = new Map(
-    methodNames.map(name => [name, notifications[name]])
-  );
-  const events = [];
-  let nextId = 0;
-
-  notifications.startDownload = name => {
-    const id = `download-${++nextId}`;
-    events.push({ id, kind: 'start', name });
-    return id;
-  };
-  notifications.updateDownload = (id, loaded, total) => {
-    events.push({ id, kind: 'update', loaded, total });
-  };
-  notifications.completeDownload = id => {
-    events.push({ id, kind: 'complete' });
-  };
-  notifications.failDownload = (id, message) => {
-    events.push({ id, kind: 'fail', message });
-  };
-  notifications.dismissDownload = id => {
-    events.push({ id, kind: 'dismiss' });
-  };
-
-  t.after(() => {
-    for (const [name, method] of originals) {
-      if (method === undefined) delete notifications[name];
-      else notifications[name] = method;
-    }
-  });
-  return events;
-}
-
-function arrayLoader(path, metadata, chunkFiles, attrs = null) {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    [`${path}/.zarray`, memoryFile(JSON.stringify(metadata))],
-    [
-      `${path}/.zattrs`,
-      memoryFile(JSON.stringify(attrs ?? currentArrayAttrs(metadata)))
-    ],
-    ...Object.entries(chunkFiles).map(([chunkKey, bytes]) => [
-      `${path}/${chunkKey}`,
-      memoryFile(bytes)
-    ])
-  ]);
-  return loader;
-}
-
-function canonicalObsDataframeAttrs(overrides = {}) {
-  return {
-    'encoding-type': 'dataframe',
-    'encoding-version': '0.2.0',
-    _index: '_index',
-    'column-order': [],
-    ...overrides
-  };
-}
-
-function canonicalVarDataframeAttrs(overrides = {}) {
-  return {
-    'encoding-type': 'dataframe',
-    'encoding-version': '0.2.0',
-    _index: '_index',
-    'column-order': [],
-    ...overrides
-  };
-}
-
-function denseStructureLoader({
-  xShape = [2, 2],
-  obsCount = 2,
-  varNames = ['A', 'B']
-} = {}) {
-  const loader = new ZarrLoader();
-  const xChunks = xShape.map(dimension => Math.max(1, dimension));
-  const varCount = varNames.length;
-  const obsNames = Array.from(
-    { length: obsCount },
-    (_, index) => `cell-${index}`
-  );
-  const files = new Map([
-    ['.zgroup', memoryFile('{"zarr_format":2}')],
-    ['.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'anndata',
-      'encoding-version': '0.1.0'
-    }))],
-    ['X/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: xShape,
-      chunks: xChunks,
-      dtype: '<f4'
-    })))],
-    [
-      'X/.zattrs',
-      memoryFile(JSON.stringify(currentArrayAttrs({ dtype: '<f4' })))
-    ],
-    ['obs/.zgroup', memoryFile('{"zarr_format":2}')],
-    [
-      'obs/.zattrs',
-      memoryFile(JSON.stringify(canonicalObsDataframeAttrs()))
-    ],
-    ['obs/_index/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [obsCount],
-      chunks: [Math.max(1, obsCount)],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    [
-      'obs/_index/.zattrs',
-      memoryFile(JSON.stringify(currentArrayAttrs({ dtype: '|O' })))
-    ],
-    ['var/.zgroup', memoryFile('{"zarr_format":2}')],
-    [
-      'var/.zattrs',
-      memoryFile(JSON.stringify(canonicalVarDataframeAttrs()))
-    ],
-    ['var/_index/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [varCount],
-      chunks: [Math.max(1, varCount)],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    [
-      'var/_index/.zattrs',
-      memoryFile(JSON.stringify(currentArrayAttrs({ dtype: '|O' })))
-    ]
-  ]);
-  if (obsCount > 0) {
-    files.set('obs/_index/0', memoryFile(vlenUtf8Bytes(obsNames)));
-  }
-  if (varCount > 0) {
-    files.set(
-      'var/_index/0',
-      memoryFile(vlenUtf8Bytes(varNames))
+test('Zarr v2 arrays require a fill_value and refuse a codec they cannot decode', async t => {
+  await t.test('missing fill_value', async () => {
+    const candidate = metadata({});
+    delete candidate.fill_value;
+    await assert.rejects(
+      readArray('values', candidate, { 0: new Uint8Array(4) }),
+      error => error instanceof ZarrFormatError && /has no 'fill_value'/.test(error.message)
     );
-  }
-  loader._files = files;
-  return loader;
-}
+  });
 
-function setNullableStringIndex(
-  loader,
-  axis,
-  values,
-  mask = new Uint8Array(values.length),
-  valuesDtype = '|O'
-) {
-  const base = `${axis}/_index`;
-  loader._files.delete(`${base}/.zarray`);
-  loader._files.delete(`${base}/0`);
-  loader._files.set(
-    `${base}/.zgroup`,
-    memoryFile('{"zarr_format":2}')
-  );
-  loader._files.set(
-    `${base}/.zattrs`,
-    memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-string-array',
-      'encoding-version': '0.1.0'
-    }))
-  );
-  loader._files.set(
-    `${base}/values/.zarray`,
-    memoryFile(JSON.stringify(metadata({
-      shape: [values.length],
-      chunks: [Math.max(1, values.length)],
-      dtype: valuesDtype,
-      fill_value: valuesDtype === '|O' ? 0 : 0,
-      filters: valuesDtype === '|O' ? [{ id: 'vlen-utf8' }] : null
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    `${base}/values`,
-    { dtype: valuesDtype }
-  );
-  loader._files.set(
-    `${base}/values/0`,
-    memoryFile(
-      valuesDtype === '|O'
-        ? vlenUtf8Bytes(values)
-        : littleEndianBytes(values, 'setInt32', 4)
-    )
-  );
-  loader._files.set(
-    `${base}/mask/.zarray`,
-    memoryFile(JSON.stringify(metadata({
-      shape: [mask.length],
-      chunks: [Math.max(1, mask.length)],
-      dtype: '|b1',
-      fill_value: false
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    `${base}/mask`,
-    { dtype: '|b1' }
-  );
-  loader._files.set(`${base}/mask/0`, memoryFile(mask));
-  return loader;
-}
-
-function metadata(overrides) {
-  return {
-    zarr_format: 2,
-    shape: [1],
-    chunks: [1],
-    dtype: '<i4',
-    compressor: null,
-    fill_value: 0,
-    filters: null,
-    order: 'C',
-    ...overrides
-  };
-}
-
-test('Zarr v2 arrays require exact mandatory metadata and defined absent-chunk fills', async t => {
-  for (const key of ['compressor', 'fill_value', 'filters']) {
-    await t.test(`missing ${key}`, () => {
+  // zarr-python reads an array without `compressor` or `filters` as one with
+  // neither; so does this reader.
+  for (const key of ['compressor', 'filters']) {
+    await t.test(`missing ${key} reads as none`, async () => {
       const candidate = metadata({});
       delete candidate[key];
-      assert.throws(
-        () => zarrCodecs.validateZarrArrayMetadata(candidate),
-        new RegExp(`required.*${key}|${key}.*required`, 'i')
+      assert.deepEqual(
+        Array.from(await readArray('values', candidate, { 0: littleEndianBytes([5], 'setInt32', 4) })),
+        [5]
       );
     });
   }
 
-  await t.test('object null compressor identity is unsupported', () => {
-    assert.throws(
-      () => zarrCodecs.validateZarrArrayMetadata(
-        metadata({ compressor: { id: 'null' } })
-      ),
-      /compressor.*null.*unsupported|unsupported.*compressor.*null/i
-    );
-  });
-
-  await t.test('null fill never becomes plausible numeric zeros', async () => {
-    const meta = metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '<f4',
-      fill_value: null,
-    });
-    const loader = arrayLoader('values', meta, {});
+  await t.test('an object compressor named null is a codec it cannot decode', async () => {
     await assert.rejects(
-      loader._readArray('values'),
-      /absent.*chunk.*fill.*undefined|null.*fill.*absent.*chunk/i
+      readArray('values', metadata({ compressor: { id: 'null' } }), { 0: new Uint8Array(4) }),
+      error => error instanceof ZarrUnsupportedError && /'null'/.test(error.message)
     );
   });
 });
 
-test('AnnData string arrays require the exact Zarr object plus VLenUTF8 storage', async t => {
-  const invalidCases = [
-    [
-      'fixed-width byte strings',
-      metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|S1',
-        fill_value: 'AA=='
-      })
-    ],
-    [
-      'object strings without VLenUTF8',
-      metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|O',
-        filters: null
-      })
-    ]
-  ];
+test('AnnData string arrays accept any string storage, and object arrays need a string codec', async t => {
+  // anndata writes variable-length UTF-8; other writers use fixed-length
+  // strings, which read as the same text.
+  await t.test('fixed-width byte strings are text', async () => {
+    const entries = zarrEntries(storeWith({ nObs: 1 }));
+    entries.set('obs/.zattrs', json({
+      'encoding-type': 'dataframe', 'encoding-version': '0.2.0', _index: '_index', 'column-order': ['label'],
+    }));
+    setArray(entries, 'obs/label', metadata({ shape: [1], chunks: [1], dtype: '|S1', fill_value: 'AA==' }), { 0: encoder.encode('a') });
+    const { reader } = await openAnnData(entries);
+    assert.deepEqual(await reader.getObsFieldInfo('label'), { dtype: 'string' });
+    assert.deepEqual((await reader.getObsField('label')).values, ['a']);
+  });
 
-  for (const [name, meta] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = arrayLoader('obs/label', meta, {});
-      loader._nObs = 1;
-      await assert.rejects(
-        loader.getObsFieldInfo('label'),
-        /string-array.*exact Zarr object dtype.*VLenUTF8|object dtype.*expected vlen-utf8/i
-      );
-    });
-  }
+  await t.test('object strings without VLenUTF8 are refused when the store opens', async () => {
+    const entries = zarrEntries(storeWith({ nObs: 1 }));
+    setArray(entries, 'obs/label', metadata({ shape: [1], chunks: [1], dtype: '|O', filters: null }));
+    await assert.rejects(
+      openRoot(entries),
+      error => error instanceof ZarrFormatError && /without a string codec/.test(error.message)
+    );
+  });
 
   await t.test('exact VLenUTF8 storage is accepted', async () => {
-    const meta = metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    });
-    const loader = arrayLoader(
-      'obs/label',
-      meta,
-      { 0: vlenUtf8Bytes(['α']) }
-    );
-    loader._nObs = 1;
-    const field = await loader.getObsField('label');
+    const { reader } = await openAnnData(storeWith({ nObs: 1, obs: { label: strings(['α']) } }));
+    const field = await reader.getObsField('label');
     assert.equal(field.dtype, 'string');
     assert.deepEqual(field.values, ['α']);
   });
 });
 
-test('categorical ordered metadata is an own JSON boolean', async t => {
-  const invalidAttrs = [
-    [
-      'missing ordered',
-      {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0'
-      }
-    ],
-    [
-      'string ordered',
-      {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: 'false'
-      }
-    ],
-    [
-      'numeric ordered',
-      {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: 0
-      }
-    ],
-    [
-      'wrong categorical version',
-      {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.1.0',
-        ordered: false
-      }
-    ]
-  ];
+test('categorical ordered is a JSON boolean or the integer 0 or 1', async t => {
+  const withOrdered = attrs => {
+    const entries = zarrEntries(storeWith({ obs: { label: categorical([0, 1], ['a', 'b']) } }));
+    entries.set('obs/label/.zattrs', json(attrs));
+    return entries;
+  };
+  for (const [name, attrs, pattern] of [
+    ['missing ordered', { 'encoding-type': 'categorical', 'encoding-version': '0.2.0' }, /ordered must be a boolean attribute/],
+    ['string ordered', { 'encoding-type': 'categorical', 'encoding-version': '0.2.0', ordered: 'false' }, /ordered must be a boolean attribute/],
+    ['an integer other than 0 or 1', { 'encoding-type': 'categorical', 'encoding-version': '0.2.0', ordered: 2 }, /ordered must be a boolean attribute/],
+    ['wrong categorical version', { 'encoding-type': 'categorical', 'encoding-version': '0.1.0', ordered: false }, /encoding-version must be exactly '0\.2\.0'/],
+  ]) {
+    await t.test(`${name} is refused when the store opens`, async () => {
+      await assert.rejects(openAnnData(withOrdered(attrs)), pattern);
+    });
+  }
 
-  for (const [name, attrs] of invalidAttrs) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      loader._files = new Map();
-      setCurrentGroup(loader._files, 'obs/label', attrs);
-      loader._nObs = 1;
-      await assert.rejects(
-        loader.getObsFieldInfo('label'),
-        /ordered.*own boolean|encoding-version.*0\.2\.0/i
-      );
+  for (const [stored, ordered] of [[false, false], [true, true], [0, false], [1, true]]) {
+    await t.test(`ordered ${JSON.stringify(stored)} reads as ${ordered}`, async () => {
+      const { reader } = await openAnnData(withOrdered({
+        'encoding-type': 'categorical', 'encoding-version': '0.2.0', ordered: stored,
+      }));
+      assert.equal((await reader.getObsFieldInfo('label')).ordered, ordered);
+      assert.equal((await reader.getObsField('label')).ordered, ordered);
     });
   }
 });
 
-test('group-valued AnnData elements require exact Zarr v2 group ownership', async t => {
-  const representations = [
-    {
-      name: 'categorical',
-      path: 'obs/label',
-      makeLoader() {
-        const loader = new ZarrLoader();
-        loader._files = new Map();
-        setCurrentGroup(loader._files, 'obs/label', {
-          'encoding-type': 'categorical',
-          'encoding-version': '0.2.0',
-          ordered: false
-        });
-        loader._nObs = 1;
-        return loader;
-      },
-      read: loader => loader.getObsFieldInfo('label')
-    },
-    {
-      name: 'nullable',
-      path: 'obs/count',
-      makeLoader() {
-        const loader = new ZarrLoader();
-        loader._files = new Map();
-        setCurrentGroup(loader._files, 'obs/count', {
-          'encoding-type': 'nullable-integer',
-          'encoding-version': '0.1.0'
-        });
-        loader._nObs = 1;
-        return loader;
-      },
-      read: loader => loader.getObsFieldInfo('count')
-    },
-    {
-      name: 'sparse',
-      path: 'X',
-      makeLoader: () => sparseLoader(),
-      read: loader => loader._readSparseMetadataContract('X')
-    }
-  ];
-  const invalidMarkers = [
-    ['missing', (files, path) => files.delete(path)],
-    [
-      'malformed',
-      (files, path) => files.set(path, memoryFile('{')),
-    ],
-    [
-      'non-v2',
-      (files, path) => files.set(
-        path,
-        memoryFile('{"zarr_format":3}')
-      ),
-    ]
-  ];
-
-  for (const representation of representations) {
-    for (const [markerName, mutationFactory] of invalidMarkers) {
-      await t.test(
-        `${representation.name} ${markerName} marker`,
-        async () => {
-          const loader = representation.makeLoader();
-          const markerPath = `${representation.path}/.zgroup`;
-          mutationFactory(loader._files, markerPath);
-          await assert.rejects(
-            representation.read(loader),
-            /\.zgroup.*(required|valid JSON|zarr_format.*2)/i
-          );
-        }
-      );
+test('a group marker that is not Zarr v2 JSON is refused when the store opens', async t => {
+  for (const path of ['obs/label', 'obs/count', 'X']) {
+    const tree = sparseStore();
+    tree.children.obs = stringFrame(['cell-0', 'cell-1'], {
+      label: categorical([0, 1], ['a', 'b']),
+      count: nullable('nullable-integer', new BigInt64Array([1n, 2n]), [0, 0]),
+    });
+    for (const [name, bytes, pattern] of [
+      ['malformed', json('{'), /\.zgroup is not valid JSON/],
+      ['non-v2', json('{"zarr_format":3}'), /\.zgroup' must declare "zarr_format": 2/],
+    ]) {
+      await t.test(`${path} ${name} marker`, async () => {
+        const entries = zarrEntries(tree);
+        entries.set(`${path}/.zgroup`, bytes);
+        await assert.rejects(openRoot(entries), error => error instanceof ZarrFormatError && pattern.test(error.message));
+      });
     }
   }
-});
-
-function embeddingLoader({
-  key = 'X_umap_2d',
-  shape = [2, 2],
-  chunks = shape.map(dimension => Math.max(1, dimension)),
-  dtype = '<f4',
-  values = [0, 0, 2, 4],
-  nObs = 2,
-  extraArrays = []
-} = {}) {
-  const loader = new ZarrLoader();
-  const files = new Map([
-    ['.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'anndata',
-      'encoding-version': '0.1.0'
-    }))],
-    ['obsm/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obsm/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'dict',
-      'encoding-version': '0.1.0',
-    }))],
-    [`obsm/${key}/.zarray`, memoryFile(JSON.stringify(metadata({
-      shape,
-      chunks,
-      dtype
-    })))],
-    [
-      `obsm/${key}/.zattrs`,
-      memoryFile(JSON.stringify(currentArrayAttrs({ dtype })))
-    ],
-    [`obsm/${key}/0.0`, memoryFile(littleEndianBytes(values, 'setFloat32', 4))]
-  ]);
-
-  for (const array of extraArrays) {
-    const arrayChunks = array.chunks ??
-      array.shape.map(dimension => Math.max(1, dimension));
-    files.set(
-      `obsm/${array.key}/.zarray`,
-      memoryFile(JSON.stringify(metadata({
-        shape: array.shape,
-        chunks: arrayChunks,
-        dtype: array.dtype ?? '<f4'
-      })))
-    );
-    setCurrentArrayAttrs(
-      files,
-      `obsm/${array.key}`,
-      { dtype: array.dtype ?? '<f4' }
-    );
-    if (array.values) {
-      files.set(
-        `obsm/${array.key}/0.0`,
-        memoryFile(littleEndianBytes(array.values, 'setFloat32', 4))
-      );
-    }
-  }
-
-  loader._files = files;
-  loader._rootName = 'fixture.zarr';
-  loader._nObs = nObs;
-  return loader;
-}
-
-function completeZarrStoreFiles({ embeddingValues, geneValues }) {
-  const loader = denseStructureLoader();
-  const files = new Map(loader._files);
-  files.set(
-    'X/0.0',
-    memoryFile(littleEndianBytes(geneValues, 'setFloat32', 4))
-  );
-  setCurrentMapping(files, 'obsm');
-  files.set(
-    'obsm/X_umap_2d/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '<f4'
-    })))
-  );
-  setCurrentArrayAttrs(
-    files,
-    'obsm/X_umap_2d',
-    { dtype: '<f4' }
-  );
-  files.set(
-    'obsm/X_umap_2d/0.0',
-    memoryFile(littleEndianBytes(embeddingValues, 'setFloat32', 4))
-  );
-  return files;
-}
-
-test('Zarr X=None does not advertise gene-expression fields', async () => {
-  const withX = new ZarrLoader();
-  withX._files = completeZarrStoreFiles({
-    embeddingValues: [0, 0, 1, 1],
-    geneValues: [1, 2, 3, 4]
-  });
-  assert.equal(withX.hasExpressionMatrix, true);
-
-  const files = completeZarrStoreFiles({
-    embeddingValues: [0, 0, 1, 1],
-    geneValues: [1, 2, 3, 4]
-  });
-  files.delete('X/.zarray');
-  files.delete('X/.zattrs');
-  files.delete('X/0.0');
-
-  const loader = new ZarrLoader();
-  await loader.openFileMap(files, 'x-none.zarr');
-
-  assert.equal(loader.hasExpressionMatrix, false);
-  assert.equal(loader.nVars, 2);
-  assert.deepEqual(loader.varNames, ['A', 'B']);
-
-  const adapter = new BaseAnnDataAdapter(loader);
-  await adapter.initialize();
-  assert.deepEqual((await adapter.getVarManifest()).fields, []);
-  await assert.rejects(
-    adapter.getGeneValues('var/0.values.f32'),
-    /no expression matrix; gene expression is unavailable/i
-  );
-  await assert.rejects(
-    loader.getMatrixColumn('X', 0),
-    /no X expression matrix/i
-  );
 });
 
 test('rejects directory selections that omit required Zarr v2 metadata', async () => {
-  const chunk = memoryFile(Uint8Array.from([1, 2, 3, 4]));
   const fileList = [{
-    ...chunk,
     name: '0.0',
     webkitRelativePath: 'incomplete.zarr/X/0.0',
-    size: 4
+    size: 4,
+    text: async () => '',
+    arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
   }];
-  const loader = new ZarrLoader();
   const notifications = getNotificationCenter();
   const notificationMethods = [
+    'info',
     'startDownload',
     'updateDownload',
     'completeDownload',
@@ -956,25 +581,24 @@ test('rejects directory selections that omit required Zarr v2 metadata', async (
   const originals = new Map(
     notificationMethods.map(name => [name, notifications[name]])
   );
-  notifications.startDownload = () => 'download';
-  notifications.updateDownload = () => {};
-  notifications.completeDownload = () => {};
-  notifications.failDownload = () => {};
-  notifications.dismissDownload = () => {};
+  for (const name of notificationMethods) notifications[name] = () => 'download';
 
+  const source = new AnnDataFileSource();
   try {
-    const { files, rootName } = zarrModule.zarrStoreFromFileList(fileList);
     await assert.rejects(
-      loader.openFileMap(files, rootName),
+      source.loadFolder(fileList
+    ),
       error => {
-        assert.match(error.message, /browser.*omit|required.*metadata/i);
+        assert.match(error.message, /zarr\.json, \.zgroup, \.zarray or \.zmetadata/);
+        // A browser folder picker may leave out the metadata files; the
+        // person is told to open the store as a Zarr ZIP archive instead.
         assert.match(error.message, /Zarr ZIP/i);
         return true;
       }
     );
-    assert.equal(loader.isOpen, false);
+    assert.equal(await source.isAvailable(), false);
   } finally {
-    loader.close();
+    source.clear();
     for (const [name, method] of originals) {
       notifications[name] = method;
     }
@@ -982,293 +606,175 @@ test('rejects directory selections that omit required Zarr v2 metadata', async (
 });
 
 test('reads AnnData default Blosc MEMCPY chunks and reverses VLenUTF8 filters', async () => {
-  const loader = arrayLoader(
-    'obs/cell_type/categories',
-    metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '|O',
-      compressor: {
-        id: 'blosc',
-        cname: 'lz4',
-        clevel: 5,
-        shuffle: 1,
-        blocksize: 0
-      },
-      filters: [{ id: 'vlen-utf8' }]
-    }),
-    {
-      // Emitted by AnnData 0.11.4 / Zarr 2.18.3 / numcodecs 0.13.1.
-      // The Blosc frame has MEMCPYED set and contains a VLenUTF8 payload.
-      0: bytesFromHex(CANONICAL_VLEN_MEMCPY_HEX)
-    }
-  );
-
-  const { data } = await loader._readArray('obs/cell_type/categories');
-  assert.deepEqual(data, ['A', 'B', 'C']);
+  // Emitted by AnnData 0.11.4 / Zarr 2.18.3 / numcodecs 0.13.1.
+  // The Blosc frame has MEMCPYED set and contains a VLenUTF8 payload.
+  const values = await readArray('obs/cell_type/categories', metadata({
+    shape: [3],
+    chunks: [3],
+    dtype: '|O',
+    compressor: bloscLz4Metadata(),
+    filters: [{ id: 'vlen-utf8' }]
+  }), { 0: bytesFromHex(CANONICAL_VLEN_MEMCPY_HEX) });
+  assert.deepEqual(values, ['A', 'B', 'C']);
 });
 
 test('decodes a canonical mixed raw/LZ4 Blosc block and reverses byte shuffle', async () => {
-  const loader = arrayLoader(
-    'values',
-    metadata({
-      shape: [256],
-      chunks: [256],
-      compressor: {
-        id: 'blosc',
-        cname: 'lz4',
-        clevel: 5,
-        shuffle: 1,
-        blocksize: 0
-      }
-    }),
-    {
-      // numcodecs 0.13.1 encoding of np.arange(256, dtype=np.int32).
-      // SHA-256: 4bce9824199d121d940c7b73ccdb322c44067a242e3971098b828f3af9b22af3
-      0: bytesFromBase64(CANONICAL_SPLIT_BLOSC_BASE64)
-    }
-  );
-
-  const { data } = await loader._readArray('values');
-  assert.deepEqual(Array.from(data), Array.from({ length: 256 }, (_, index) => index));
+  // numcodecs 0.13.1 encoding of np.arange(256, dtype=np.int32).
+  // SHA-256: 4bce9824199d121d940c7b73ccdb322c44067a242e3971098b828f3af9b22af3
+  const values = await readArray('values', metadata({
+    shape: [256],
+    chunks: [256],
+    compressor: bloscLz4Metadata()
+  }), { 0: bytesFromBase64(CANONICAL_SPLIT_BLOSC_BASE64) });
+  assert.deepEqual(Array.from(values), Array.from({ length: 256 }, (_, index) => index));
 });
 
 test('preserves canonical endian-neutral signed and unsigned one-byte dtypes', async () => {
-  const signed = arrayLoader(
-    'signed',
-    metadata({ shape: [5], chunks: [5], dtype: '|i1' }),
-    { 0: bytesFromHex('ff0001027f') }
-  );
-  const unsigned = arrayLoader(
-    'unsigned',
-    metadata({ shape: [5], chunks: [5], dtype: '|u1' }),
-    { 0: bytesFromHex('000102faff') }
-  );
-
   assert.deepEqual(
-    Array.from((await signed._readArray('signed')).data),
+    Array.from(await readArray('signed', metadata({ shape: [5], chunks: [5], dtype: '|i1' }), { 0: bytesFromHex('ff0001027f') })),
     [-1, 0, 1, 2, 127]
   );
   assert.deepEqual(
-    Array.from((await unsigned._readArray('unsigned')).data),
+    Array.from(await readArray('unsigned', metadata({ shape: [5], chunks: [5], dtype: '|u1' }), { 0: bytesFromHex('000102faff') })),
     [0, 1, 2, 250, 255]
   );
 });
 
 test('uses full declared chunk strides for overhanging Fortran-order edge chunks', async () => {
-  const loader = arrayLoader(
-    'obsm/X_fortran',
-    metadata({
-      shape: [5, 3],
-      chunks: [3, 2],
-      dtype: '<f4',
-      order: 'F',
-      dimension_separator: '.'
-    }),
-    {
-      '0.0': bytesFromHex('0000803f000080400000e040000000400000a04000000041'),
-      '0.1': bytesFromHex('000040400000c04000001041000000000000000000000000'),
-      '1.0': bytesFromHex('000020410000504100000000000030410000604100000000'),
-      '1.1': bytesFromHex('000040410000704100000000000000000000000000000000')
-    }
-  );
-
-  assert.deepEqual(
-    Array.from((await loader._readArray('obsm/X_fortran')).data),
-    Array.from({ length: 15 }, (_, index) => index + 1)
-  );
+  const values = await readArray('obsm/X_fortran', metadata({
+    shape: [5, 3],
+    chunks: [3, 2],
+    dtype: '<f4',
+    order: 'F',
+    dimension_separator: '.'
+  }), {
+    '0.0': bytesFromHex('0000803f000080400000e040000000400000a04000000041'),
+    '0.1': bytesFromHex('000040400000c04000001041000000000000000000000000'),
+    '1.0': bytesFromHex('000020410000504100000000000030410000604100000000'),
+    '1.1': bytesFromHex('000040410000704100000000000000000000000000000000')
+  });
+  assert.deepEqual(Array.from(values), Array.from({ length: 15 }, (_, index) => index + 1));
 });
 
 test('honors slash-separated multidimensional chunk keys', async () => {
-  const loader = arrayLoader(
-    'obsm/X_slash',
-    metadata({
-      shape: [5, 2],
-      chunks: [3, 1],
-      dtype: '<i2',
-      dimension_separator: '/'
-    }),
-    {
-      '0/0': bytesFromHex('650067006900'),
-      '0/1': bytesFromHex('660068006a00'),
-      '1/0': bytesFromHex('6b006d000000'),
-      '1/1': bytesFromHex('6c006e000000')
-    }
-  );
-
-  assert.deepEqual(
-    Array.from((await loader._readArray('obsm/X_slash')).data),
-    Array.from({ length: 10 }, (_, index) => index + 101)
-  );
+  const values = await readArray('obsm/X_slash', metadata({
+    shape: [5, 2],
+    chunks: [3, 1],
+    dtype: '<i2',
+    dimension_separator: '/'
+  }), {
+    '0/0': bytesFromHex('650067006900'),
+    '0/1': bytesFromHex('660068006a00'),
+    '1/0': bytesFromHex('6b006d000000'),
+    '1/1': bytesFromHex('6c006e000000')
+  });
+  assert.deepEqual(Array.from(values), Array.from({ length: 10 }, (_, index) => index + 101));
 });
 
 test('materializes declared fill values for absent chunks', async () => {
-  const loader = arrayLoader(
-    'obsm/X_missing_fill',
-    metadata({
-      shape: [5, 2],
-      chunks: [3, 1],
-      dtype: '<i2',
-      fill_value: 7,
-      dimension_separator: '.'
-    }),
-    {
-      '0.0': bytesFromHex('0b000c000d00')
-    }
-  );
-
-  assert.deepEqual(
-    Array.from((await loader._readArray('obsm/X_missing_fill')).data),
-    [11, 7, 12, 7, 13, 7, 7, 7, 7, 7]
-  );
+  const values = await readArray('obsm/X_missing_fill', metadata({
+    shape: [5, 2],
+    chunks: [3, 1],
+    dtype: '<i2',
+    fill_value: 7,
+    dimension_separator: '.'
+  }), { '0.0': bytesFromHex('0b000c000d00') });
+  assert.deepEqual(Array.from(values), [11, 7, 12, 7, 13, 7, 7, 7, 7, 7]);
 });
 
 test('rejects unsupported dtypes and filters instead of returning plausible corruption', async () => {
-  const unsupportedDtype = arrayLoader(
-    'complex',
-    metadata({ dtype: '<c8' }),
-    { 0: bytesFromHex('0000000000000000') }
-  );
-  const unsupportedFilter = arrayLoader(
-    'filtered',
-    metadata({ filters: [{ id: 'delta' }] }),
-    { 0: bytesFromHex('01000000') }
-  );
+  // A complex number is not an AnnData column value: refused by the reader
+  // before any value is read.
+  const entries = zarrEntries(storeWith({ nObs: 1 }));
+  entries.set('obs/.zattrs', json({
+    'encoding-type': 'dataframe', 'encoding-version': '0.2.0', _index: '_index', 'column-order': ['complex'],
+  }));
+  setArray(entries, 'obs/complex', metadata({ dtype: '<c8' }), { 0: bytesFromHex('0000000000000000') });
+  const opening = openAnnData(entries);
+  await assert.rejects(opening, /Observation dataframe column 'complex' uses an unsupported element type/);
 
   await assert.rejects(
-    unsupportedDtype._readArray('complex'),
-    /unsupported.*dtype/i
+    readArray('filtered', metadata({ filters: [{ id: 'delta' }] }), { 0: bytesFromHex('01000000') }),
+    error => error instanceof ZarrUnsupportedError && /'delta'/.test(error.message)
   );
+  // A fixed-string size past the safe integers is malformed metadata, named
+  // as such, not a crash.
   await assert.rejects(
-    unsupportedFilter._readArray('filtered'),
-    /unsupported.*filter/i
-  );
-  assert.throws(
-    () => zarrCodecs.validateZarrArrayMetadata(metadata({
-      dtype: '|S9007199254740993'
-    })),
-    /fixed string.*too large/i
+    readArray('labels', metadata({ dtype: '|S9007199254740993' })),
+    error => (error instanceof ZarrFormatError || error instanceof ZarrUnsupportedError) && /\/labels/.test(error.message)
   );
 });
 
-test('rejects Blosc metadata/header contradictions before returning values', async t => {
-  await t.test('container version', async () => {
+test('Blosc frames are read by their own header, as c-blosc reads them', async t => {
+  // The frame header, not the array metadata, says how a frame was written;
+  // only a format this reader does not know is refused.
+  await t.test('container version 1 is read; a newer one is refused', async () => {
     const frame = bytesFromBase64(CANONICAL_SPLIT_BLOSC_BASE64);
     frame[0] = 1;
-    const loader = arrayLoader(
-      'values',
-      metadata({
-        shape: [256],
-        chunks: [256],
-        compressor: bloscLz4Metadata()
-      }),
-      { 0: frame }
+    const values = await readArray('values', metadata({ shape: [256], chunks: [256], compressor: bloscLz4Metadata() }), { 0: frame });
+    assert.deepEqual(Array.from(values), Array.from({ length: 256 }, (_, index) => index));
+    frame[0] = 3;
+    await assert.rejects(
+      readArray('values', metadata({ shape: [256], chunks: [256], compressor: bloscLz4Metadata() }), { 0: frame }),
+      error => error instanceof ZarrUnsupportedError
     );
-    await assert.rejects(loader._readArray('values'), /Blosc.*version/i);
   });
 
-  await t.test('inner LZ4 version', async () => {
+  await t.test('an unknown inner LZ4 stream version is refused', async () => {
     const frame = bytesFromBase64(CANONICAL_SPLIT_BLOSC_BASE64);
     frame[1] = 2;
-    const loader = arrayLoader(
-      'values',
-      metadata({
-        shape: [256],
-        chunks: [256],
-        compressor: bloscLz4Metadata()
-      }),
-      { 0: frame }
+    await assert.rejects(
+      readArray('values', metadata({ shape: [256], chunks: [256], compressor: bloscLz4Metadata() }), { 0: frame }),
+      /Blosc lz4 stream format 2/
     );
-    await assert.rejects(loader._readArray('values'), /LZ4.*version/i);
   });
 
-  await t.test('codec format even for MEMCPY frames', async () => {
+  await t.test('a MEMCPY frame is copied whatever codec its header names', async () => {
     const frame = bytesFromHex(CANONICAL_VLEN_MEMCPY_HEX);
     frame[2] = (frame[2] & 0x1f) | (4 << 5);
-    const loader = arrayLoader(
-      'labels',
-      metadata({
-        shape: [3],
-        chunks: [3],
-        dtype: '|O',
-        compressor: bloscLz4Metadata(),
-        filters: [{ id: 'vlen-utf8' }]
-      }),
-      { 0: frame }
-    );
-    await assert.rejects(loader._readArray('labels'), /Blosc.*codec.*format/i);
+    const values = await readArray('labels', metadata({
+      shape: [3], chunks: [3], dtype: '|O', compressor: bloscLz4Metadata(), filters: [{ id: 'vlen-utf8' }],
+    }), { 0: frame });
+    assert.deepEqual(values, ['A', 'B', 'C']);
   });
 
-  await t.test('shuffle mode', async () => {
-    const loader = arrayLoader(
-      'labels',
-      metadata({
-        shape: [3],
-        chunks: [3],
-        dtype: '|O',
-        compressor: bloscLz4Metadata({ shuffle: 0 }),
-        filters: [{ id: 'vlen-utf8' }]
-      }),
-      { 0: bytesFromHex(CANONICAL_VLEN_MEMCPY_HEX) }
-    );
-    await assert.rejects(loader._readArray('labels'), /Blosc.*shuffle/i);
-  });
-
-  await t.test('numeric typesize', async () => {
-    const frame = bytesFromHex(
-      '02013301040000000400000014000000' +
-      '01000000'
-    );
-    const loader = arrayLoader(
-      'values',
-      metadata({
-        shape: [1],
-        chunks: [1],
-        compressor: bloscLz4Metadata()
-      }),
-      { 0: frame }
-    );
-    await assert.rejects(loader._readArray('values'), /Blosc.*typesize/i);
+  await t.test('shuffle and typesize come from the frame, not the metadata', async () => {
+    const labels = await readArray('labels', metadata({
+      shape: [3], chunks: [3], dtype: '|O', compressor: bloscLz4Metadata({ shuffle: 0 }), filters: [{ id: 'vlen-utf8' }],
+    }), { 0: bytesFromHex(CANONICAL_VLEN_MEMCPY_HEX) });
+    assert.deepEqual(labels, ['A', 'B', 'C']);
+    const values = await readArray('values', metadata({ shape: [1], chunks: [1], compressor: bloscLz4Metadata() }), {
+      0: bytesFromHex('02013301040000000400000014000000' + '01000000'),
+    });
+    assert.deepEqual(Array.from(values), [1]);
   });
 });
 
 test('treats Blosc metadata blocksize as an encoder hint, not a frame invariant', async () => {
-  const loader = arrayLoader(
-    'values',
-    metadata({
-      shape: [2500],
-      chunks: [2500],
-      compressor: bloscLz4Metadata({ blocksize: 1024 })
-    }),
-    { 0: bytesFromBase64(CANONICAL_BLOCKSIZE_HINT_BLOSC_BASE64) }
-  );
-
-  const { data } = await loader._readArray('values');
-  assert.equal(data.length, 2500);
-  assert.ok(data.every(value => value === 0));
+  const values = await readArray('values', metadata({
+    shape: [2500],
+    chunks: [2500],
+    compressor: bloscLz4Metadata({ blocksize: 1024 })
+  }), { 0: bytesFromBase64(CANONICAL_BLOCKSIZE_HINT_BLOSC_BASE64) });
+  assert.equal(values.length, 2500);
+  assert.ok(values.every(value => value === 0));
 });
 
 test('rejects an LZ4 stream that omits the required final literal sequence', () => {
   assert.throws(
-    () => decodeLz4Block(bytesFromHex('10410100'), 5),
+    () => lz4DecodeBlockInto(bytesFromHex('10410100'), new Uint8Array(5)),
     /final literal/i
   );
 });
 
 test('decodes a real multi-block Blosc chunk with a final partial unsplit block', async () => {
-  const loader = arrayLoader(
-    'values',
-    metadata({
-      shape: [70000],
-      chunks: [70000],
-      compressor: bloscLz4Metadata()
-    }),
-    { 0: bytesFromBase64(CANONICAL_MULTIBLOCK_BLOSC_BASE64) }
-  );
-
-  const { data } = await loader._readArray('values');
-  assert.equal(data.length, 70000);
-  assert.ok(data.every(value => value === 7));
+  const values = await readArray('values', metadata({
+    shape: [70000],
+    chunks: [70000],
+    compressor: bloscLz4Metadata()
+  }), { 0: bytesFromBase64(CANONICAL_MULTIBLOCK_BLOSC_BASE64) });
+  assert.equal(values.length, 70000);
+  assert.ok(values.every(value => value === 7));
 });
 
 test('accepts non-monotonic logical block offsets from parallel Blosc writers', async () => {
@@ -1279,40 +785,29 @@ test('accepts non-monotonic logical block offsets from parallel Blosc writers', 
     offsets.getUint32(16, true) > offsets.getUint32(20, true),
     'logical block offsets must exercise physical order independent of logical order'
   );
-
-  const loader = arrayLoader(
-    'values',
-    metadata({
-      shape: [70000],
-      chunks: [70000],
-      compressor: bloscLz4Metadata()
-    }),
-    { 0: reordered }
-  );
-  const { data } = await loader._readArray('values');
-  assert.equal(data.length, 70000);
-  assert.ok(data.every(value => value === 7));
+  const values = await readArray('values', metadata({
+    shape: [70000],
+    chunks: [70000],
+    compressor: bloscLz4Metadata()
+  }), { 0: reordered });
+  assert.equal(values.length, 70000);
+  assert.ok(values.every(value => value === 7));
 });
 
 test('public observation APIs preserve signed bytes and classify booleans', async () => {
-  const signed = arrayLoader(
-    'obs/signed',
-    metadata({ shape: [5], chunks: [5], dtype: '|i1' }),
-    { 0: bytesFromHex('ff0001027f') }
-  );
-  const bool = arrayLoader(
-    'obs/flag',
-    metadata({ shape: [3], chunks: [3], dtype: '|b1' }),
-    { 0: bytesFromHex('000101') }
-  );
-  signed._nObs = 5;
-  bool._nObs = 3;
-
+  const { reader: signed } = await openAnnData(storeWith({
+    nObs: 5,
+    obs: { signed: array(Int8Array.from([-1, 0, 1, 2, 127]), { dtype: '|i1' }) },
+  }));
   assert.deepEqual(await signed.getObsFieldInfo('signed'), { dtype: 'int' });
   const signedField = await signed.getObsField('signed');
   assert.equal(signedField.dtype, 'int');
   assert.deepEqual(Array.from(signedField.values), [-1, 0, 1, 2, 127]);
 
+  const { reader: bool } = await openAnnData(storeWith({
+    nObs: 3,
+    obs: { flag: array([false, true, true], { dtype: '|b1' }) },
+  }));
   assert.deepEqual(await bool.getObsFieldInfo('flag'), { dtype: 'bool' });
   assert.deepEqual(await bool.getObsField('flag'), {
     dtype: 'bool',
@@ -1321,446 +816,181 @@ test('public observation APIs preserve signed bytes and classify booleans', asyn
 });
 
 test('rejects invalid boolean bytes and malformed fixed-string UTF-8', async () => {
-  const bool = arrayLoader(
-    'obs/flag',
-    metadata({ shape: [2], chunks: [2], dtype: '|b1' }),
-    { 0: bytesFromHex('0002') }
-  );
-  bool._nObs = 2;
-  await assert.rejects(
-    bool.getObsField('flag'),
-    /boolean.*0 or 1/i
-  );
+  const entries = zarrEntries(storeWith({ nObs: 2, obs: { flag: array([false, true], { dtype: '|b1' }) } }));
+  entries.set('obs/flag/0', bytesFromHex('0002'));
+  const { reader } = await openAnnData(entries);
+  await assert.rejects(reader.getObsField('flag'), /boolean/i);
 
-  const text = arrayLoader(
-    'labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|S1',
-      fill_value: 'AA=='
-    }),
-    { 0: bytesFromHex('ff') }
-  );
   await assert.rejects(
-    text._readArray('labels'),
-    /fixed-string.*UTF-8/i
+    readArray('labels', metadata({ shape: [1], chunks: [1], dtype: '|S1', fill_value: 'AA==' }), { 0: bytesFromHex('ff') }),
+    /not valid UTF-8/
   );
 });
 
 test('preserves embedded NULs in fixed-width strings while trimming padding', async () => {
-  const bytes = arrayLoader(
-    'byte_labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|S4',
-      fill_value: 'AAAAAA=='
+  assert.deepEqual(
+    await readArray('byte_labels', metadata({ shape: [1], chunks: [1], dtype: '|S4', fill_value: 'AAAAAA==' }), {
+      0: Uint8Array.from([0x41, 0x00, 0x42, 0x00]),
     }),
-    { 0: Uint8Array.from([0x41, 0x00, 0x42, 0x00]) }
+    ['A\u0000B']
   );
-  assert.deepEqual((await bytes._readArray('byte_labels')).data, ['A\u0000B']);
-
   const unicodeBytes = new Uint8Array(16);
   const unicodeView = new DataView(unicodeBytes.buffer);
   unicodeView.setUint32(0, 0x41, true);
   unicodeView.setUint32(4, 0x00, true);
   unicodeView.setUint32(8, 0x42, true);
-  const unicode = arrayLoader(
-    'unicode_labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<U4',
-      fill_value: ''
-    }),
-    { 0: unicodeBytes }
+  assert.deepEqual(
+    await readArray('unicode_labels', metadata({ shape: [1], chunks: [1], dtype: '<U4', fill_value: '' }), { 0: unicodeBytes }),
+    ['A\u0000B']
   );
-  assert.deepEqual((await unicode._readArray('unicode_labels')).data, ['A\u0000B']);
 });
 
-test('rejects categorical codes outside missing-or-category bounds', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/cell_type/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/cell_type/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/cell_type/categories/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    ['obs/cell_type/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'string-array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/cell_type/categories/0', memoryFile(vlenUtf8Bytes(['A', 'B']))],
-    ['obs/cell_type/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|i1'
-    })))],
-    ['obs/cell_type/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/cell_type/codes/0', memoryFile(Uint8Array.from([0, 2]))]
-  ]);
-  loader._nObs = 2;
+// ---------------------------------------------------------------------------
+// Categorical columns.
+// ---------------------------------------------------------------------------
 
+test('rejects categorical codes outside missing-or-category bounds', async () => {
+  const { reader } = await openAnnData(storeWith({
+    obs: { cell_type: categorical([0, 2], ['A', 'B']) },
+  }));
   await assert.rejects(
-    loader.getObsField('cell_type'),
+    reader.getObsField('cell_type'),
     /categorical code.*bounds/i
   );
 });
 
 test('requires a signed-integer dtype for categorical codes', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/cell_type/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/cell_type/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/cell_type/categories/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    ['obs/cell_type/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'string-array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/cell_type/categories/0', memoryFile(vlenUtf8Bytes(['A', 'B']))],
-    ['obs/cell_type/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '<f4'
-    })))],
-    ['obs/cell_type/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/cell_type/codes/0', memoryFile(
-      littleEndianBytes([0, 1], 'setFloat32', 4)
-    )]
-  ]);
-  loader._nObs = 2;
-
+  const tree = storeWith({ obs: { cell_type: categorical(new Float32Array([0, 1]), ['A', 'B'], { codesDtype: '<f4' }) } });
   await assert.rejects(
-    loader.getObsFieldInfo('cell_type'),
-    /categorical codes.*signed integer dtype/i
-  );
-  await assert.rejects(
-    loader.getObsField('cell_type'),
+    openAnnData(tree),
     /categorical codes.*signed integer dtype/i
   );
 });
 
 test('rejects oversized category dictionaries before code or label payloads', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/group/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/group/codes/.zarray', memoryFile('{}')],
-    ['obs/group/categories/.zarray', memoryFile('{}')]
-  ]);
-  loader._nObs = 1;
-  loader._readAttrs = async path => path === 'obs/group'
-    ? {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: false
-      }
-    : {
-        'encoding-type': 'array',
-        'encoding-version': '0.2.0'
-      };
-  loader._readArrayMeta = async path => metadata(
-    path.endsWith('/codes')
-      ? {
-          shape: [1],
-          chunks: [1],
-          dtype: '|i1'
-        }
-      : {
-          shape: [4_294_967_296],
-          chunks: [1_048_576],
-          dtype: '<i4'
-        }
+  const entries = zarrEntries(storeWith({ nObs: 1, obs: { group: categorical([0], array(new Int32Array([0]), { dtype: '<i4' })) } }));
+  // Metadata of 2^32 categories: no chunk is written, and none may be read.
+  setArray(entries, 'obs/group/categories', metadata({ shape: [4_294_967_296], chunks: [1_048_576], dtype: '<i4' }));
+  const { root, fetched } = await openRoot(entries);
+  await assert.rejects(
+    new AnnDataReader().open(root, { format: ZARR_FORMAT, name: 'oversized.zarr' }),
+    /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
   );
-  const payloadPaths = [];
-  loader._readArray = async path => {
-    payloadPaths.push(path);
-    throw new Error(`categorical payload '${path}' touched before category-count preflight`);
-  };
-
-  for (const read of [
-    () => loader.getObsFieldInfo('group'),
-    () => loader.getObsField('group')
-  ]) {
-    await assert.rejects(
-      read(),
-      /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
-    );
-  }
-  assert.deepEqual(payloadPaths, []);
+  assert.deepEqual(chunksOf(fetched, 'obs/group/categories'), []);
+  assert.deepEqual(chunksOf(fetched, 'obs/group/codes'), []);
 });
 
 test('reuses the validated categorical dictionary between info and field loads', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/group/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/group/codes/.zarray', memoryFile('{}')],
-    ['obs/group/categories/.zarray', memoryFile('{}')]
-  ]);
-  loader._nObs = 2;
-  loader._readAttrs = async path => path === 'obs/group'
-    ? {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: false
-      }
-    : {
-        'encoding-type': path.endsWith('/categories')
-          ? 'string-array'
-          : 'array',
-        'encoding-version': '0.2.0'
-      };
-  loader._readArrayMeta = async path => metadata(
-    path.endsWith('/codes')
-      ? {
-          shape: [2],
-          chunks: [2],
-          dtype: '|i1'
-        }
-      : {
-          shape: [2],
-          chunks: [2],
-          dtype: '|O',
-          filters: [{ id: 'vlen-utf8' }]
-        }
-  );
-  const payloadPaths = [];
-  loader._readArray = async path => {
-    payloadPaths.push(path);
-    if (path.endsWith('/categories')) {
-      return {
-        data: ['A', 'B'],
-        shape: [2],
-        dtype: '|O'
-      };
-    }
-    return {
-      data: Int8Array.from([0, 1]),
-      shape: [2],
-      dtype: '|i1'
-    };
-  };
-
-  const info = await loader.getObsFieldInfo('group');
-  const field = await loader.getObsField('group');
-
-  assert.equal(
-    payloadPaths.filter(path => path.endsWith('/categories')).length,
-    1
-  );
+  const { reader, reads } = await openAnnData(storeWith({
+    obs: { group: categorical([0, 1], ['A', 'B']) },
+  }));
+  const info = await reader.getObsFieldInfo('group');
+  const field = await reader.getObsField('group');
+  assert.equal(readsOf(reads, 'obs/group/categories').length, 1);
   assert.strictEqual(field.categories, info.categories);
   assert.deepEqual(Array.from(field.codes), [0, 1]);
 });
 
 test('Zarr dataset metadata counts categorical fields without label payloads', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/label/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/label/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|i1'
-    })))],
-    ['obs/label/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/categories/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    ['obs/label/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'string-array',
-      'encoding-version': '0.2.0'
-    }))]
-  ]);
-  loader._rootName = 'metadata-only.zarr';
-  loader._nObs = 1;
-  loader._obsKeys = ['label'];
-  const probes = obsmProbes(1, { X_umap_2d: 2 });
-  loader.probeMapping = async () => probes;
-  loader.hasConnectivities = async () => false;
-  let categoryReads = 0;
-  loader._readCategoricalCategories = async () => {
-    categoryReads++;
-    throw new Error('metadata category payload sentinel');
-  };
-
-  const dataset = await loader.getDatasetMetadata();
+  const { reader, reads } = await openAnnData(storeWith({
+    nObs: 1,
+    obs: { label: categorical([0], ['A']) },
+  }), { name: 'metadata-only.zarr' });
+  const dataset = await reader.getDatasetMetadata();
   assert.equal(dataset.stats.n_categorical_fields, 1);
-  assert.strictEqual(dataset.probes, probes);
+  assert.deepEqual(dataset.probes, await reader.probeMapping());
   assert.equal(Object.hasOwn(dataset, 'embeddings'), false);
-  assert.equal(categoryReads, 0);
+  assert.deepEqual(readsOf(reads, 'obs/label/categories'), []);
+  assert.deepEqual(readsOf(reads, 'obs/label/codes'), []);
+});
+
+test('opening reads no category dictionary: a 21,751-category column is read with its first load', async () => {
+  // A barcode stored as a categorical, one category per cell, as GEO files
+  // often hold: its dictionary is megabytes the first view never needs.
+  const nObs = 21_751;
+  const barcodes = Array.from({ length: nObs }, (_, index) => `BARCODE-${index}`);
+  const { reader, reads } = await openAnnData(storeWith({
+    nObs,
+    genes: ['A'],
+    obs: {
+      BARCODE: categorical(Int32Array.from({ length: nObs }, (_, index) => index), barcodes, { codesDtype: '<i4' }),
+      group: categorical(Int8Array.from({ length: nObs }, (_, index) => index % 2), ['a', 'b']),
+    },
+  }), { name: 'barcodes.zarr' });
+  const adapter = new BaseAnnDataAdapter(asWorkerLoader(reader));
+  // Everything the first view waits for: the file's structure, its field
+  // lists, the embedding it draws, and the dataset's identity.
+  await adapter.initialize();
+  const identity = await adapter.finalizeDirectIdentity({
+    id: 'barcodes',
+    name: 'barcodes',
+    preferFileName: false,
+    description: '',
+    source: { name: 'Zarr store' },
+  });
+  assert.deepEqual(readsOf(reads, 'obs/BARCODE/categories'), []);
+  assert.deepEqual(readsOf(reads, 'obs/group/categories'), []);
+  assert.ok(readsOf(reads, 'obsm/X_umap_2d').length > 0, 'the first view\'s embedding was read');
+  // How many categories each has is metadata, known without reading them.
+  assert.deepEqual(
+    identity.obs_fields.filter(field => field.kind === 'category'),
+    [
+      { key: 'BARCODE', kind: 'category', n_categories: nObs },
+      { key: 'group', kind: 'category', n_categories: 2 },
+    ]
+  );
+
+  const field = await adapter.getObsFieldData('BARCODE');
+  assert.ok(readsOf(reads, 'obs/BARCODE/categories').length > 0);
+  assert.equal(field.categories.length, nObs);
+  assert.equal(field.categories[21_750], 'BARCODE-21750');
+  assert.equal(field.dtype, 'uint16');
+  assert.deepEqual(readsOf(reads, 'obs/group/categories'), [], 'only the field loaded');
 });
 
 test('Zarr adapter reuses retained categories after loader cache clearing', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/label/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: true
-    }))],
-    ['obs/label/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|i1'
-    })))],
-    ['obs/label/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/categories/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    ['obs/label/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'string-array',
-      'encoding-version': '0.2.0'
-    }))]
-  ]);
-  loader._rootName = 'retained-categories.zarr';
-  // Two cells: one cell has no coordinate variation to plot.
-  loader._nObs = 2;
-  loader._obsKeys = ['label'];
-  stubPlottableObsm(loader, 2);
-  let categoryReads = 0;
-  loader._readArray = async path => {
-    if (path.endsWith('/categories')) {
-      categoryReads++;
-      return { data: ['A'], shape: [1], dtype: '|O' };
-    }
-    return {
-      data: Int8Array.from([0, 0]),
-      shape: [2],
-      dtype: '|i1'
-    };
-  };
-
-  const adapter = new BaseAnnDataAdapter(loader);
+  const { reader, reads } = await openAnnData(storeWith({
+    obs: { label: categorical([0, 0], ['A'], { ordered: true }) },
+  }), { name: 'retained-categories.zarr' });
+  const adapter = new BaseAnnDataAdapter(asWorkerLoader(reader));
   await adapter.initialize();
+  // Opening reads no category dictionary; the field's first load does.
+  assert.equal(readsOf(reads, 'obs/label/categories').length, 0);
+  assert.equal(adapter._obsFieldsMetadata[0].ordered, true);
+  await adapter.getObsFieldData('label');
   const canonicalCategories =
     adapter._obsFieldsMetadata[0].categories;
-  assert.equal(categoryReads, 1);
-  assert.equal(adapter._obsFieldsMetadata[0].ordered, true);
+  assert.equal(readsOf(reads, 'obs/label/categories').length, 1);
 
   adapter.clearCaches();
-  loader.clearCache();
+  reader.clearCache();
   const field = await adapter.getObsFieldData('label');
 
   assert.strictEqual(field.categories, canonicalCategories);
   assert.equal(field.ordered, true);
-  assert.equal(categoryReads, 1);
-  assert.equal(loader._cache.has('obs:label'), false);
-  assert.equal(loader._cache.has('obs_info:label'), false);
+  assert.equal(readsOf(reads, 'obs/label/categories').length, 1);
+  assert.equal(reader._cache.has('obs:label'), false);
+  assert.equal(reader._cache.has('obs_info:label'), false);
 });
 
 test('preserves numeric and boolean AnnData categorical categories', async t => {
   const cases = [
-    {
-      name: 'numeric',
-      dtype: '<f4',
-      bytes: littleEndianBytes([1.5, 2.25], 'setFloat32', 4),
-      expected: [1.5, 2.25]
-    },
-    {
-      name: 'int64 numeric',
-      dtype: '<i8',
-      bytes: littleEndianBytes([-4n, 9n], 'setBigInt64', 8),
-      expected: [-4, 9]
-    },
-    {
-      name: 'boolean',
-      dtype: '|b1',
-      bytes: Uint8Array.from([0, 1]),
-      expected: [false, true]
-    }
+    { name: 'numeric', categories: array(new Float32Array([1.5, 2.25]), { dtype: '<f4' }), expected: [1.5, 2.25] },
+    { name: 'int64 numeric', categories: array(new BigInt64Array([-4n, 9n]), { dtype: '<i8' }), expected: [-4, 9] },
+    { name: 'boolean', categories: array([false, true], { dtype: '|b1' }), expected: [false, true] },
   ];
 
   for (const categoryCase of cases) {
     await t.test(categoryCase.name, async () => {
-      const loader = new ZarrLoader();
-      loader._files = new Map([
-        ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-        ['obs/group/.zattrs', memoryFile(JSON.stringify({
-          'encoding-type': 'categorical',
-          'encoding-version': '0.2.0',
-          ordered: false
-        }))],
-        ['obs/group/categories/.zarray', memoryFile(JSON.stringify(metadata({
-          shape: [2],
-          chunks: [2],
-          dtype: categoryCase.dtype
-        })))],
-        ['obs/group/categories/.zattrs', memoryFile(JSON.stringify({
-          'encoding-type': 'array',
-          'encoding-version': '0.2.0'
-        }))],
-        ['obs/group/categories/0', memoryFile(categoryCase.bytes)],
-        ['obs/group/codes/.zarray', memoryFile(JSON.stringify(metadata({
-          shape: [3],
-          chunks: [3],
-          dtype: '|i1'
-        })))],
-        ['obs/group/codes/.zattrs', memoryFile(JSON.stringify({
-          'encoding-type': 'array',
-          'encoding-version': '0.2.0'
-        }))],
-        ['obs/group/codes/0', memoryFile(Uint8Array.from([0, 1, 255]))]
-      ]);
-      loader._nObs = 3;
-
+      const { reader } = await openAnnData(storeWith({
+        nObs: 3,
+        obs: { group: categorical([0, 1, -1], categoryCase.categories) },
+      }));
       assert.deepEqual(
-        (await loader.getObsFieldInfo('group')).categories,
+        (await reader.getObsFieldInfo('group')).categories,
         categoryCase.expected
       );
-      const field = await loader.getObsField('group');
+      const field = await reader.getObsField('group');
       assert.deepEqual(field.categories, categoryCase.expected);
       assert.deepEqual(Array.from(field.codes), [0, 1, -1]);
       assert.deepEqual(field.values, [
@@ -1774,106 +1004,39 @@ test('preserves numeric and boolean AnnData categorical categories', async t => 
 
 test('Zarr rejects duplicate categorical labels under exact primitive semantics', async t => {
   const cases = [
-    {
-      name: 'string',
-      dtype: '|O',
-      fillValue: 0,
-      filters: [{ id: 'vlen-utf8' }],
-      bytes: vlenUtf8Bytes(['A', 'A'])
-    },
-    {
-      name: 'number',
-      dtype: '<f4',
-      fillValue: 0,
-      bytes: littleEndianBytes([7, 7], 'setFloat32', 4)
-    },
-    {
-      name: 'boolean',
-      dtype: '|b1',
-      fillValue: false,
-      bytes: Uint8Array.from([0, 0])
-    }
+    { name: 'string', categories: strings(['A', 'A']) },
+    { name: 'number', categories: array(new Float32Array([7, 7]), { dtype: '<f4' }) },
+    { name: 'boolean', categories: array([false, false], { dtype: '|b1' }) },
   ];
 
   for (const categoryCase of cases) {
     await t.test(categoryCase.name, async () => {
-      const loader = new ZarrLoader();
-      loader._files = new Map([
-        ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-        ['obs/group/.zattrs', memoryFile(JSON.stringify({
-          'encoding-type': 'categorical',
-          'encoding-version': '0.2.0',
-          ordered: false
-        }))],
-        ['obs/group/categories/.zarray', memoryFile(JSON.stringify(metadata({
-          shape: [2],
-          chunks: [2],
-          dtype: categoryCase.dtype,
-          fill_value: categoryCase.fillValue,
-          filters: categoryCase.filters ?? null
-        })))],
-        ['obs/group/categories/.zattrs', memoryFile(JSON.stringify(
-          currentArrayAttrs({ dtype: categoryCase.dtype })
-        ))],
-        ['obs/group/categories/0', memoryFile(categoryCase.bytes)],
-        ['obs/group/codes/.zarray', memoryFile(JSON.stringify(metadata({
-          shape: [1],
-          chunks: [1],
-          dtype: '|i1'
-        })))],
-        ['obs/group/codes/.zattrs', memoryFile(JSON.stringify(
-          currentArrayAttrs({ dtype: '|i1' })
-        ))],
-        ['obs/group/codes/0', memoryFile(Uint8Array.from([0]))]
-      ]);
-      loader._nObs = 1;
-
+      const { reader } = await openAnnData(storeWith({
+        nObs: 1,
+        obs: { group: categorical([0], categoryCase.categories) },
+      }));
       await assert.rejects(
-        loader.getObsFieldInfo('group'),
+        reader.getObsFieldInfo('group'),
         /categorical categories.*group.*duplicate.*label/i
       );
-      assert.equal(loader._cache.has('obs_info:group'), false);
+      assert.equal(reader._cache.has('obs_info:group'), false);
     });
   }
 });
 
 test('rejects malformed boolean categorical categories', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/group/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/group/categories/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|b1'
-    })))],
-    ['obs/group/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/group/categories/0', memoryFile(Uint8Array.from([2]))],
-    ['obs/group/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|i1'
-    })))],
-    ['obs/group/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/group/codes/0', memoryFile(Uint8Array.from([0]))]
-  ]);
-  loader._nObs = 1;
-
-  await assert.rejects(
-    loader.getObsField('group'),
-    /boolean.*0 or 1/i
-  );
+  const entries = zarrEntries(storeWith({
+    nObs: 1,
+    obs: { group: categorical([0], array([false], { dtype: '|b1' })) },
+  }));
+  entries.set('obs/group/categories/0', Uint8Array.from([2]));
+  const { reader } = await openAnnData(entries);
+  await assert.rejects(reader.getObsField('group'), /boolean/i);
 });
+
+// ---------------------------------------------------------------------------
+// Fill values.
+// ---------------------------------------------------------------------------
 
 test('rejects out-of-range integer fill values instead of TypedArray wraparound', async t => {
   const cases = [
@@ -1885,173 +1048,110 @@ test('rejects out-of-range integer fill values instead of TypedArray wraparound'
 
   for (const [name, dtype, fillValue] of cases) {
     await t.test(name, async () => {
-      const loader = arrayLoader(
-        'values',
-        metadata({
-          shape: [1],
-          chunks: [1],
-          dtype,
-          fill_value: fillValue
-        }),
-        {}
+      await assert.rejects(
+        readArray('values', metadata({ shape: [1], chunks: [1], dtype, fill_value: fillValue })),
+        /fill_value.*(range|valid)/i
       );
-      await assert.rejects(loader._readArray('values'), /fill_value.*range/i);
     });
   }
 });
 
-test('rejects lossy int64 fill metadata parsed beyond JSON safe integers', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['values/.zarray', memoryFile(
+test('reads int64 fill metadata beyond JSON safe integers exactly', async () => {
+  const entries = new Map([
+    ['.zgroup', json({ zarr_format: 2 })],
+    ['values/.zarray', json(
       '{"zarr_format":2,"shape":[1],"chunks":[1],"dtype":"<i8",' +
       '"compressor":null,"fill_value":9007199254740993,"filters":null,"order":"C"}'
     )],
-    ['values/.zattrs', memoryFile('{}')]
   ]);
+  const { opened } = await openRoot(entries);
+  assert.deepEqual(Array.from(await opened.get('values').read()), [9007199254740993n]);
+});
 
+test('rejects finite Float32 fill overflow while preserving explicit infinity', async () => {
   await assert.rejects(
-    loader._readArray('values'),
-    /fill_value.*safe integer/i
+    readArray('values', metadata({ dtype: '<f4', fill_value: 1e308 })),
+    /fill_value.*float32 range/i
+  );
+  assert.deepEqual(
+    Array.from(await readArray('values', metadata({ dtype: '<f4', fill_value: 'Infinity' }))),
+    [Number.POSITIVE_INFINITY]
   );
 });
 
 test('decodes canonical short Base64 fixed-byte-string fills', async () => {
   for (const [fillValue, expected] of [['', ''], ['YQ==', 'a']]) {
-    const loader = arrayLoader(
-      'labels',
-      metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|S3',
-        fill_value: fillValue
-      }),
-      {}
+    assert.deepEqual(
+      await readArray('labels', metadata({ shape: [1], chunks: [1], dtype: '|S3', fill_value: fillValue })),
+      [expected]
     );
-    assert.deepEqual((await loader._readArray('labels')).data, [expected]);
   }
-
-  const oversized = arrayLoader(
-    'labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|S3',
-      fill_value: 'YWJjZA=='
-    }),
-    {}
-  );
   await assert.rejects(
-    oversized._readArray('labels'),
-    /Base64 fill_value size/i
+    readArray('labels', metadata({ shape: [1], chunks: [1], dtype: '|S3', fill_value: 'YWJjZA==' })),
+    /fill_value holds more bytes than one element/
   );
 });
 
 test('truncates fixed-Unicode fills by code point to the declared width', async () => {
-  const loader = arrayLoader(
-    'labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<U1',
-      fill_value: '😀B'
-    }),
-    {}
+  assert.deepEqual(
+    await readArray('labels', metadata({ shape: [1], chunks: [1], dtype: '<U1', fill_value: '😀B' })),
+    ['😀']
   );
-
-  assert.deepEqual((await loader._readArray('labels')).data, ['😀']);
-
-  const padded = arrayLoader(
-    'padded_labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<U3',
-      fill_value: 'A\u0000'
-    }),
-    {}
+  assert.deepEqual(
+    await readArray('padded_labels', metadata({ shape: [1], chunks: [1], dtype: '<U3', fill_value: 'A\u0000' })),
+    ['A']
   );
-  assert.deepEqual((await padded._readArray('padded_labels')).data, ['A']);
 });
 
 test('rejects unpaired surrogates in fixed-Unicode fill metadata', async () => {
-  const invalid = arrayLoader(
-    'invalid_labels',
-    metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<U1',
-      fill_value: '\ud800'
-    }),
-    {}
-  );
   await assert.rejects(
-    invalid._readArray('invalid_labels'),
-    /invalid Unicode fill_value/i
+    readArray('invalid_labels', metadata({ shape: [1], chunks: [1], dtype: '<U1', fill_value: '\ud800' })),
+    /invalid code point/
   );
 });
 
 test('VLen item counts are bounded by their payload, and chunks by their declared shape alone', async t => {
   assert.throws(
-    () => decodeVLenUtf8(bytesFromHex('ffffff7f'), 0x7fffffff),
-    /item count exceeds payload bounds/i
+    () => vlenDecode(bytesFromHex('ffffff7f'), 0x7fffffff, 'labels'),
+    /truncated/i
   );
 
-  await t.test('no array size, chunk count or chunk size is refused for being large', () => {
+  await t.test('no array size, chunk count or chunk size is refused for being large', async () => {
     for (const meta of [
       metadata({ shape: [600_000_000], chunks: [1], dtype: '|u1' }),
       metadata({ shape: [134_217_728], chunks: [16_777_216], dtype: '<f4' }),
-      metadata({ shape: [40_000_000], chunks: [8_000_000], dtype: '|S8' }),
+      metadata({ shape: [40_000_000], chunks: [8_000_000], dtype: '|S8', fill_value: '' }),
       metadata({ shape: [100_001], chunks: [1] }),
       metadata({ shape: [1], chunks: [16_777_217], dtype: '<i4' }),
     ]) {
-      assert.doesNotThrow(() => zarrCodecs.validateZarrArrayMetadata(meta));
+      const { opened } = await openRoot(new Map([
+        ['.zgroup', json({ zarr_format: 2 })],
+        ['a/.zarray', json(meta)],
+      ]));
+      assert.deepEqual(opened.get('a').shape, meta.shape);
     }
-    assert.equal(zarrCodecs.validateZarrMaterialization, undefined);
-    assert.equal(zarrCodecs.MAX_ZARR_CHUNK_BYTES, undefined);
-  });
-
-  await t.test('a fixed-width chunk decodes to exactly its declared size', async () => {
-    const meta = metadata({ shape: [4], chunks: [4], dtype: '<i4', compressor: null });
-    await assert.rejects(
-      zarrCodecs.decodeZarrChunk(new Uint8Array(12), meta, getZarrDtypeInfo('<i4'), 4),
-      /decoded 12 bytes; expected 16/i
-    );
   });
 
   await t.test('a compressed string chunk is bounded by its codec, not a constant', async () => {
     const { gzipSync } = await import('node:zlib');
-    const payload = new Uint8Array(4 + 4 + 3);
-    const view = new DataView(payload.buffer);
-    view.setUint32(0, 1, true);
-    view.setUint32(4, 3, true);
-    payload.set([0x61, 0x62, 0x63], 8);
-    const decoded = await zarrCodecs.decodeZarrChunk(
-      gzipSync(payload),
-      metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|O',
-        filters: [{ id: 'vlen-utf8' }],
-        compressor: { id: 'gzip', level: 1 },
-      }),
-      getZarrDtypeInfo('|O'),
-      1
-    );
-    assert.deepEqual(decoded, ['abc']);
+    const values = await readArray('labels', metadata({
+      shape: [1],
+      chunks: [1],
+      dtype: '|O',
+      filters: [{ id: 'vlen-utf8' }],
+      compressor: { id: 'gzip', level: 1 },
+    }), { 0: new Uint8Array(gzipSync(vlenUtf8Bytes(['abc']))) });
+    assert.deepEqual(values, ['abc']);
   });
 });
 
-test('validates fill metadata in an allocation-free array plan', () => {
-  assert.equal(typeof zarrModule.prepareZarrArrayAllocation, 'function');
+test('validates fill metadata before any value is allocated', async () => {
   for (const [dtype, fillValue] of [['|u1', -1], ['|S1', 'not Base64']]) {
-    assert.throws(
-      () => zarrModule.prepareZarrArrayAllocation(metadata({
-        shape: [60_000_000],
-        chunks: [600],
-        dtype,
-        fill_value: fillValue
-      })),
+    await assert.rejects(
+      openRoot(new Map([
+        ['.zgroup', json({ zarr_format: 2 })],
+        ['a/.zarray', json(metadata({ shape: [60_000_000], chunks: [600], dtype, fill_value: fillValue }))],
+      ])),
       /fill_value/i
     );
   }
@@ -2059,296 +1159,197 @@ test('validates fill metadata in an allocation-free array plan', () => {
 
 test('bounds extended LZ4 lengths against remaining output during parsing', () => {
   assert.throws(
-    () => decodeLz4Block(
+    () => lz4DecodeBlockInto(
       Uint8Array.from([0xf0, ...new Array(20).fill(0xff), 0x00]),
-      10
+      new Uint8Array(10)
     ),
-    /length exceeds output/i
+    /exceeds/i
   );
 });
 
 test('supports overlapping LZ4 matches followed by a final literal sequence', () => {
-  assert.deepEqual(
-    Array.from(decodeLz4Block(bytesFromHex('106101001058'), 6)),
-    [97, 97, 97, 97, 97, 88]
-  );
+  const out = new Uint8Array(6);
+  lz4DecodeBlockInto(bytesFromHex('106101001058'), out);
+  assert.deepEqual(Array.from(out), [97, 97, 97, 97, 97, 88]);
 });
 
-test('converts safe dense int64 gene expression and rejects lossy values', async () => {
-  const safe = arrayLoader(
-    'X',
-    metadata({ shape: [2, 1], chunks: [2, 1], dtype: '<i8' }),
-    {
-      '0.0': littleEndianBytes([1n, 2n], 'setBigInt64', 8)
-    }
-  );
-  safe._nObs = 2;
-  safe._nVars = 1;
-  assert.deepEqual(Array.from(await readXColumn(safe, 0, { sparse: false })), [1, 2]);
+// ---------------------------------------------------------------------------
+// Expression matrices.
+// ---------------------------------------------------------------------------
 
-  const unsafe = arrayLoader(
-    'X',
-    metadata({ shape: [1, 1], chunks: [1, 1], dtype: '<i8' }),
-    {
-      '0.0': littleEndianBytes([9007199254740992n], 'setBigInt64', 8)
-    }
-  );
-  unsafe._nObs = 1;
-  unsafe._nVars = 1;
-  await assert.rejects(
-    readXColumn(unsafe, 0, { sparse: false }),
-    /dense X.*safe numeric range/i
-  );
+test('converts dense int64 gene expression to the nearest float32, beyond 2^53 too', async () => {
+  const { reader: safe } = await openAnnData(storeWith({
+    nObs: 2,
+    genes: ['A'],
+    X: dense(new BigInt64Array([1n, 2n]), [2, 1], { dtype: '<i8' }),
+  }));
+  assert.deepEqual(Array.from(await safe.getMatrixColumn('X', 0)), [1, 2]);
+
+  const { reader: wide } = await openAnnData(storeWith({
+    nObs: 2,
+    genes: ['A'],
+    X: dense(new BigInt64Array([9007199254740993n, -(2n ** 63n)]), [2, 1], { dtype: '<i8' }),
+  }));
+  assert.deepEqual(Array.from(await wide.getMatrixColumn('X', 0)), [Math.fround(2 ** 53), Math.fround(-(2 ** 63))]);
 });
 
-function streamedDenseStripLoader() {
-  // Float32 output beyond the full-matrix cache, so genes stream by strip:
-  // two chunk rows of one 700-column strip hold genes 0-699.
+/**
+ * A 4-cell x 20-gene uint8 X in chunks of 2 cells x 4 genes: genes 0-3 are
+ * one strip of two chunks. Each value is 10 * cell + gene % 10.
+ */
+function stripTree() {
   const nRows = 4;
-  const nCols = 35_000_000;
-  const chunk = rowOffset => Uint8Array.from(
-    { length: 2 * 700 },
-    (unused, index) => (rowOffset + Math.floor(index / 700)) * 10 + (index % 700) % 10
-  );
-  const loader = arrayLoader(
-    'X',
-    metadata({
-      shape: [nRows, nCols],
-      chunks: [2, 700],
-      dtype: '|u1'
-    }),
-    { '0.0': chunk(0), '1.0': chunk(2) }
-  );
-  loader._nObs = nRows;
-  loader._nVars = nCols;
-  const chunkReads = [];
-  const readChunkFile = loader._readChunkFile.bind(loader);
-  loader._readChunkFile = path => {
-    chunkReads.push(path);
-    return readChunkFile(path);
-  };
-  loader._readArray = async () => {
-    throw new Error('full dense cache must not be materialized');
-  };
-  return { chunkReads, loader };
+  const nCols = 20;
+  return storeWith({
+    nObs: nRows,
+    genes: Array.from({ length: nCols }, (_, i) => `g${i}`),
+    X: dense(
+      Uint8Array.from({ length: nRows * nCols }, (_, i) => Math.floor(i / nCols) * 10 + (i % nCols) % 10),
+      [nRows, nCols],
+      { dtype: '|u1', chunks: [2, 4] }
+    ),
+  });
 }
 
 test('genes of one dense chunk strip decode each chunk once', async () => {
-  const { chunkReads, loader } = streamedDenseStripLoader();
+  const { reader, fetched, opened } = await openAnnData(stripTree());
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [0, 10, 20, 30]);
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 1)), [1, 11, 21, 31]);
+  assert.deepEqual(chunksOf(fetched, 'X'), ['X/0.0', 'X/1.0']);
+  assert.ok(opened.stats().cachedChunkBytes >= 2 * 2 * 4);
 
-  assert.deepEqual(
-    Array.from(await loader.getMatrixColumn('X', 0)),
-    [0, 10, 20, 30]
-  );
-  assert.deepEqual(
-    Array.from(await loader.getMatrixColumn('X', 1)),
-    [1, 11, 21, 31]
-  );
-  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0']);
-  assert.equal(loader._decodedXBlocks.retainedBytes, 2 * 2 * 700);
-
-  // Concurrent genes of the same strip share the retained chunks too.
-  loader._decodedXBlocks.clear();
-  chunkReads.length = 0;
+  // Concurrent genes of the same strip share one fetch of each chunk.
+  const fresh = await openAnnData(stripTree());
   const [geneA, geneC] = await Promise.all([
-    loader.getMatrixColumn('X', 0),
-    loader.getMatrixColumn('X', 2)
+    fresh.reader.getMatrixColumn('X', 0),
+    fresh.reader.getMatrixColumn('X', 2),
   ]);
   assert.deepEqual(Array.from(geneA), [0, 10, 20, 30]);
   assert.deepEqual(Array.from(geneC), [2, 12, 22, 32]);
-  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0']);
+  assert.deepEqual(chunksOf(fresh.fetched, 'X').sort(), ['X/0.0', 'X/1.0']);
 });
 
 test('a failed dense chunk decode is not retained for the next gene', async () => {
-  const { chunkReads, loader } = streamedDenseStripLoader();
-  const readChunkFile = loader._readChunkFile;
   let failNext = true;
-  loader._readChunkFile = path => {
-    if (failNext && path === 'X/1.0') {
-      failNext = false;
-      chunkReads.push(path);
-      return Promise.reject(new Error('chunk read failed'));
-    }
-    return readChunkFile(path);
-  };
-  await assert.rejects(loader.getMatrixColumn('X', 0), /chunk read failed/);
-  assert.deepEqual(
-    Array.from(await loader.getMatrixColumn('X', 0)),
-    [0, 10, 20, 30]
-  );
-  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0', 'X/1.0']);
+  const attempts = [];
+  const { reader } = await openAnnData(stripTree(), {
+    onChunk(key) {
+      if (!key.startsWith('X/')) return;
+      attempts.push(key);
+      if (failNext && key === 'X/1.0') {
+        failNext = false;
+        throw new Error('chunk read failed');
+      }
+    },
+  });
+  await assert.rejects(reader.getMatrixColumn('X', 0), /chunk read failed/);
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [0, 10, 20, 30]);
+  assert.equal(attempts.filter(key => key === 'X/1.0').length, 2);
 });
 
-test('decoded dense chunks are released when the dataset is cleared or closed', async () => {
-  const { loader } = streamedDenseStripLoader();
-  await loader.getMatrixColumn('X', 0);
-  assert.ok(loader._decodedXBlocks.retainedBytes > 0);
-  loader.clearCache();
-  assert.equal(loader._decodedXBlocks.retainedBytes, 0);
-
-  const { loader: closing } = streamedDenseStripLoader();
-  await closing.getMatrixColumn('X', 0);
-  closing.close();
-  assert.equal(closing._decodedXBlocks.retainedBytes, 0);
-  assert.equal(closing._decodedXBlocks.size, 0);
+test('decoded dense chunks are released when the dataset is closed', async () => {
+  const { reader, opened } = await openAnnData(stripTree());
+  await reader.getMatrixColumn('X', 0);
+  assert.ok(opened.stats().cachedChunkBytes > 0);
+  reader.close();
+  assert.equal(opened.stats().cachedChunkBytes, 0);
 });
 
 test('sums duplicate sparse coordinates in direct CSC and converted CSR columns', async t => {
   for (const format of ['csc', 'csr']) {
     await t.test(format, async () => {
-      const loader = sparseLoader({
+      const { reader } = await openAnnData(sparseStore({
         format,
         shape: [2, 1],
-        data: [2, 3],
-        indices: [0, 0],
-        indptr: format === 'csc' ? [0, 2] : [0, 2, 2]
-      });
-      loader._nObs = 2;
-      loader._nVars = 1;
-      assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [5, 0]);
+        data: new Float32Array([2, 3]),
+        indices: new Int32Array([0, 0]),
+        indptr: new Int32Array(format === 'csc' ? [0, 2] : [0, 2, 2]),
+      }));
+      assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [5, 0]);
     });
   }
 });
 
-test('rejects finite duplicate sums that overflow Float32 sparse output', async () => {
-  const directCsc = sparseLoader({
+test('a duplicate sum beyond the float32 range becomes an infinity, as numpy converts it', async () => {
+  const { reader } = await openAnnData(sparseStore({
     format: 'csc',
     shape: [1, 1],
-    data: [3.4e38, 3.4e38],
-    indices: [0, 0],
-    indptr: [0, 2]
-  });
-  directCsc._nObs = 1;
-  directCsc._nVars = 1;
-  await assert.rejects(
-    readXColumn(directCsc, 0, { sparse: true }),
-    /sparse X column.*Float32 range/i
-  );
-
-  assert.throws(
-    () => getSparseColumn({
-      colIndptr: new Int32Array([0, 2]),
-      rowIndices: new Int32Array([0, 0]),
-      colData: new Float32Array([3.4e38, 3.4e38])
-    }, 0, 1),
-    /sparse column.*Float32 range/i
-  );
-
-  assert.deepEqual(
-    Array.from(getSparseColumn({
-      colIndptr: new Int32Array([0, 2]),
-      rowIndices: new Int32Array([0, 0]),
-      colData: new Float32Array([Number.POSITIVE_INFINITY, 1])
-    }, 0, 1)),
-    [Number.POSITIVE_INFINITY]
-  );
+    data: new Float32Array([3.4e38, 3.4e38]),
+    indices: new Int32Array([0, 0]),
+    indptr: new Int32Array([0, 2]),
+  }));
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [Number.POSITIVE_INFINITY]);
 });
 
 test('rejects out-of-range sparse columns instead of returning plausible zeros', async t => {
   for (const format of ['csc', 'csr']) {
     await t.test(format, async () => {
-      const loader = sparseLoader({
+      const { reader } = await openAnnData(sparseStore({
         format,
         shape: [2, 2],
-        data: [1],
-        indices: [0],
-        indptr: [0, 1, 1]
-      });
-      loader._nObs = 2;
-      loader._nVars = 2;
+        data: new Float32Array([1]),
+        indices: new Int32Array([0]),
+        indptr: new Int32Array([0, 1, 1]),
+      }));
       await assert.rejects(
-        readXColumn(loader, 2, { sparse: true }),
+        reader.getMatrixColumn('X', 2),
         /X has no gene column 2/i
       );
     });
   }
 });
 
-test('a sparse coordinate outside its shape is corruption, never a dropped value', () => {
+test('a sparse coordinate outside its shape is corruption, never a dropped value', async t => {
   // Skipping an out-of-range coordinate publishes 0.0 for that cell, and 0.0 in
   // an expression vector reads as a genuine non-detection. The reader must
   // refuse the matrix instead of quietly inventing a measurement.
-  assert.throws(
-    () => buildCscFromCsr({
+  await t.test('a CSC row index', async () => {
+    const { reader } = await openAnnData(sparseStore({
+      format: 'csc',
+      shape: [2, 1],
       data: new Float32Array([1, 2]),
-      indices: new Int32Array([0, 5]),
-      indptr: new Int32Array([0, 1, 2]),
-      shape: [2, 2]
-    }),
-    /column index 5 at entry 1 is outside its 2-column shape/i
-  );
-
-  assert.throws(
-    () => buildCscFromCsr({
-      data: new Float32Array([1, 2]),
-      indices: new Int32Array([0, -1]),
-      indptr: new Int32Array([0, 1, 2]),
-      shape: [2, 2]
-    }),
-    /column index -1 .* outside its 2-column shape/i
-  );
-
-  assert.throws(
-    () => getSparseColumn({
-      colIndptr: new Int32Array([0, 2]),
-      rowIndices: new Int32Array([0, 7]),
-      colData: new Float32Array([1, 2])
-    }, 0, 2),
-    /row index 7 at entry 1 is outside its 2-row shape/i
-  );
+      indices: new Int32Array([0, 7]),
+      indptr: new Int32Array([0, 2]),
+    }));
+    await assert.rejects(reader.getMatrixColumn('X', 0), /row index 7 at entry 1 is outside its 2-row shape/i);
+  });
+  for (const bad of [5, -1]) {
+    await t.test(`a CSR column index ${bad}`, async () => {
+      const { reader } = await openAnnData(sparseStore({
+        format: 'csr',
+        shape: [2, 2],
+        data: new Float32Array([1, 2]),
+        indices: new Int32Array([0, bad]),
+        indptr: new Int32Array([0, 1, 2]),
+      }));
+      await assert.rejects(reader.getMatrixColumn('X', 0), new RegExp(`${bad}.*outside`, 'i'));
+      await assert.rejects(reader.getMatrixRows('X', [1]), new RegExp(`${bad}.*outside`, 'i'));
+    });
+  }
 });
 
-test('a sparse matrix must agree with its own declared shape', () => {
-  assert.throws(
-    () => buildCscFromCsr({
-      data: new Float32Array([1, 2]),
-      indices: new Int32Array([0]),
-      indptr: new Int32Array([0, 1, 2]),
-      shape: [2, 2]
-    }),
-    /declares 2 values but 1 indices/i
-  );
-
-  assert.throws(
-    () => buildCscFromCsr({
-      data: new Float32Array([1, 2]),
-      indices: new Int32Array([0, 1]),
-      indptr: new Int32Array([0, 1]),
-      shape: [2, 2]
-    }),
-    /2 rows requires 3 row pointers/i
-  );
-
-  assert.throws(
-    () => buildCscFromCsr({
-      data: new Float32Array([1, 2]),
-      indices: new Int32Array([0, 1]),
-      indptr: new Int32Array([0, 1, 1]),
-      shape: [2, 2]
-    }),
-    /row pointers end at 1, which is not its 2 stored values/i
-  );
+test('a sparse matrix must agree with its own declared shape', async t => {
+  const cases = [
+    ['more values than indices', { data: new Float32Array([1, 2]), indices: new Int32Array([0]), indptr: new Int32Array([0, 1, 2]) }],
+    ['too few row pointers', { data: new Float32Array([1, 2]), indices: new Int32Array([0, 1]), indptr: new Int32Array([0, 1]) }],
+    ['pointers ending before the values', { data: new Float32Array([1, 2]), indices: new Int32Array([0, 1]), indptr: new Int32Array([0, 1, 1]) }],
+  ];
+  for (const [name, arrays] of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(async () => {
+        const { reader } = await openAnnData(sparseStore({ format: 'csr', shape: [2, 2], ...arrays }));
+        await reader.getMatrixColumn('X', 0);
+        await reader.getMatrixRows('X', [0, 1]);
+      }, /sparse X/i);
+    });
+  }
 });
 
-test('rejects a shared sparse column before allocating its output', () => {
-  assert.throws(
-    () => getSparseColumn({
-      colIndptr: new Int32Array([0]),
-      rowIndices: new Int32Array(0),
-      colData: new Float32Array(0)
-    }, 0, Number.MAX_SAFE_INTEGER),
-    /sparse column index.*out of bounds/i
-  );
-});
-
-test('rejects finite values that overflow during Float32 conversion', async () => {
-  const embedding = arrayLoader(
-    'obsm/X_umap',
-    metadata({ shape: [1, 1], chunks: [1, 1], dtype: '<f8' }),
-    { '0.0': littleEndianBytes([1e308], 'setFloat64', 8) }
-  );
-  setCurrentMapping(embedding._files, 'obsm');
-  embedding._nObs = 1;
+test('an embedding value float32 cannot hold is refused; a gene value becomes an infinity', async () => {
+  const { reader: embedding } = await openAnnData(storeWith({
+    nObs: 1,
+    obsm: mapping({ X_umap: dense(new Float64Array([1e308]), [1, 1], { dtype: '<f8' }) }),
+  }));
   // The column read returns the stored value; the adapter's load-time check
   // refuses it before any Float32 coordinate is produced.
   assert.deepEqual(
@@ -2363,81 +1364,35 @@ test('rejects finite values that overflow during Float32 conversion', async () =
   );
   assert.equal(adapter._embeddingCache.size, 0);
 
-  const denseFill = arrayLoader(
-    'X',
-    metadata({
-      shape: [1, 70_000_000],
-      chunks: [1, 700],
-      dtype: '<f8',
-      fill_value: 1e308
-    }),
-    {}
-  );
-  denseFill._nObs = 1;
-  denseFill._nVars = 70_000_000;
-  await assert.rejects(
-    readXColumn(denseFill, 0, { sparse: false }),
-    /dense X.*Float32 range/i
-  );
-
-  const sparse = sparseLoader({
-    data: [1e308],
-    dataDtype: '<f8',
-    dataBytes: littleEndianBytes([1e308], 'setFloat64', 8),
-    indices: [0],
-    indptr: [0, 1, 1]
+  // A dense X of absent chunks whose fill value overflows Float32.
+  const entries = zarrEntries(storeWith({ nObs: 1, genes: ['A'], X: dense(new Float64Array([0]), [1, 1], { dtype: '<f8' }) }));
+  setArray(entries, 'X', metadata({ shape: [1, 70_000], chunks: [1, 700], dtype: '<f8', fill_value: 1e308 }));
+  setArray(entries, 'var/_index', metadata({ shape: [70_000], chunks: [70_000], dtype: '|O', fill_value: null, filters: [{ id: 'vlen-utf8' }] }), {
+    0: vlenUtf8Bytes(Array.from({ length: 70_000 }, (_, i) => `g${i}`)),
   });
-  await assert.rejects(
-    sparse._readSparseMatrix('X', 'float32'),
-    /sparse data.*Float32 range/i
-  );
-});
+  // Gene values beyond the float32 range become infinities, as numpy
+  // converts them; only coordinates are refused.
+  const { reader: denseFill } = await openAnnData(entries);
+  assert.deepEqual(Array.from(await denseFill.getMatrixColumn('X', 0)), [Number.POSITIVE_INFINITY]);
 
-test('rejects every non-finite embedding component before caching', async t => {
-  for (const [name, value] of [
-    ['NaN', Number.NaN],
-    ['positive infinity', Number.POSITIVE_INFINITY],
-    ['negative infinity', Number.NEGATIVE_INFINITY]
-  ]) {
-    await t.test(name, async () => {
-      const loader = embeddingLoader({
-        shape: [2, 2],
-        chunks: [2, 2],
-        values: [0, 0, value, 1],
-        nObs: 2
-      });
-      const adapter = await adapterWithDescribedObsm(loader);
-      const error = await adapter
-        .getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] })
-        .then(() => null, rejection => rejection);
-      assert.ok(error instanceof EmbeddingLoadError);
-      assert.equal(
-        error.message,
-        `Embedding 'X_umap_2d' cannot be plotted: ${
-          name === 'NaN' ? 'NaN' : value > 0 ? 'Infinity' : '-Infinity'
-        } at cell 1.`
-      );
-      assert.equal(adapter._embeddingCache.size, 0);
-      assert.equal(adapter._normInfo.size, 0);
-    });
-  }
+  const { root } = await openRoot(zarrEntries(sparseStore({
+    data: new Float64Array([1e308]),
+    dataDtype: '<f8',
+    indices: new Int32Array([0]),
+    indptr: new Int32Array([0, 1, 1]),
+  })));
+  const sparse = await readSparseMatrix(root.get('X'), ZARR_FORMAT, 'Sparse X', 'float32');
+  assert.deepEqual(Array.from(sparse.data), [Number.POSITIVE_INFINITY]);
 });
 
 /**
  * A 3-cell x 4-column obsm array in 2 x 2 chunks whose value is
  * 10 * row + column, in C or Fortran chunk order.
  */
-function chunkedObsmLoader({ order = 'C', fill_value = 0, absent = [] } = {}) {
+function chunkedObsmEntries({ order = 'C', fill_value = 0, absent = [] } = {}) {
   const nRows = 3;
   const width = 4;
   const [chunkRows, chunkCols] = [2, 2];
-  const meta = metadata({
-    shape: [nRows, width],
-    chunks: [chunkRows, chunkCols],
-    dtype: '<f4',
-    order,
-    fill_value,
-  });
   const chunkFiles = {};
   for (let chunkRow = 0; chunkRow < 2; chunkRow++) {
     for (let chunkColumn = 0; chunkColumn < 2; chunkColumn++) {
@@ -2455,27 +1410,26 @@ function chunkedObsmLoader({ order = 'C', fill_value = 0, absent = [] } = {}) {
       chunkFiles[key] = littleEndianBytes(values, 'setFloat32', 4);
     }
   }
-  const loader = arrayLoader('obsm/X_pca', meta, chunkFiles);
-  setCurrentMapping(loader._files, 'obsm');
-  loader._nObs = nRows;
-  const chunkReads = [];
-  const readChunkFile = loader._readChunkFile.bind(loader);
-  loader._readChunkFile = path => {
-    chunkReads.push(path);
-    return readChunkFile(path);
-  };
-  return { loader, chunkReads };
+  const entries = zarrEntries(storeWith({ nObs: nRows }));
+  setArray(entries, 'obsm/X_pca', metadata({
+    shape: [nRows, width],
+    chunks: [chunkRows, chunkCols],
+    dtype: '<f4',
+    order,
+    fill_value,
+  }), chunkFiles);
+  return entries;
 }
 
 test('Zarr obsm column reads decode only the chunks that hold a selected column', async t => {
   for (const order of ['C', 'F']) {
     await t.test(`${order} order, columns in two chunk columns`, async () => {
-      const { loader, chunkReads } = chunkedObsmLoader({ order });
+      const { reader, fetched } = await openAnnData(chunkedObsmEntries({ order }));
       assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_pca', [3, 0])),
+        Array.from(await reader.readObsmColumns('X_pca', [3, 0])),
         [3, 0, 13, 10, 23, 20]
       );
-      assert.deepEqual(chunkReads.sort(), [
+      assert.deepEqual(chunksOf(fetched, 'obsm/X_pca').sort(), [
         'obsm/X_pca/0.0',
         'obsm/X_pca/0.1',
         'obsm/X_pca/1.0',
@@ -2484,91 +1438,67 @@ test('Zarr obsm column reads decode only the chunks that hold a selected column'
     });
 
     await t.test(`${order} order, columns in one chunk column`, async () => {
-      const { loader, chunkReads } = chunkedObsmLoader({ order });
+      const { reader, fetched } = await openAnnData(chunkedObsmEntries({ order }));
       assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_pca', [2, 3])),
+        Array.from(await reader.readObsmColumns('X_pca', [2, 3])),
         [2, 3, 12, 13, 22, 23]
       );
-      assert.deepEqual(chunkReads.sort(), ['obsm/X_pca/0.1', 'obsm/X_pca/1.1']);
+      assert.deepEqual(chunksOf(fetched, 'obsm/X_pca').sort(), ['obsm/X_pca/0.1', 'obsm/X_pca/1.1']);
     });
   }
 
   await t.test('an absent chunk reads as its fill value', async () => {
-    const { loader } = chunkedObsmLoader({ fill_value: 5, absent: ['1.1'] });
+    const { reader } = await openAnnData(chunkedObsmEntries({ fill_value: 5, absent: ['1.1'] }));
     assert.deepEqual(
-      Array.from(await loader.readObsmColumns('X_pca', [1, 3])),
+      Array.from(await reader.readObsmColumns('X_pca', [1, 3])),
       [1, 3, 11, 13, 21, 5]
     );
   });
 
   await t.test('an absent chunk with no fill value is refused', async () => {
-    const { loader } = chunkedObsmLoader({ fill_value: null, absent: ['1.1'] });
+    const { reader } = await openAnnData(chunkedObsmEntries({ fill_value: null, absent: ['1.1'] }));
     await assert.rejects(
-      loader.readObsmColumns('X_pca', [1, 3]),
-      /obsm\['X_pca'\] has an absent chunk while fill_value is null/
+      reader.readObsmColumns('X_pca', [1, 3]),
+      /The Zarr array '\/obsm\/X_pca' has an absent chunk while its fill_value is null/
     );
   });
 });
 
 test('Zarr mapping probes describe every element from metadata, with the catalog reasons', async () => {
-  const files = new Map();
-  const json = value => memoryFile(JSON.stringify(value));
-  const denseArray = (path, shape, dtype = '<f4', extra = {}) => {
-    const meta = metadata({ shape, chunks: shape.map(size => Math.max(1, size)), dtype, ...extra });
-    files.set(`${path}/.zarray`, json(meta));
-    setCurrentArrayAttrs(files, path, meta);
-  };
-  const sparse = (path, shape, nnz, dtype = '<f4') => {
-    setCurrentGroup(files, path, {
-      'encoding-type': 'csr_matrix',
-      'encoding-version': '0.1.0',
-      shape,
-    });
-    files.set(`${path}/data/.zarray`, json(metadata({ shape: [nnz], chunks: [Math.max(1, nnz)], dtype })));
-  };
-  const dataframe = (path, rows, columnOrder = []) => {
-    setCurrentGroup(files, path, {
-      'encoding-type': 'dataframe',
-      'encoding-version': '0.2.0',
-      _index: '_index',
-      'column-order': columnOrder,
-    });
-    denseArray(`${path}/_index`, [rows], '|O', { filters: [{ id: 'vlen-utf8' }] });
-  };
+  const zeros = (shape, Type = Float32Array) => new Type(shape.reduce((a, b) => a * b, 1));
+  const tree = annData({
+    X: dense(zeros([3, 1]), [3, 1]),
+    obs: stringFrame(['c0', 'c1', 'c2']),
+    var: stringFrame(['gene'], {
+      gene_symbols: strings(['G']),
+      score: array(new Float32Array([1])),
+    }),
+    obsm: mapping({
+      X_umap: dense(zeros([3, 2]), [3, 2]),
+      X_sparse: sparse({ shape: [3, 5], data: new Float32Array(4), indices: new Int32Array(4), indptr: new Int32Array([0, 4, 4, 4]) }),
+      X_df: stringFrame(['c0', 'c1', 'c2']),
+      pseudotime: array(new Int32Array(3), { dtype: '<i4' }),
+      labels: strings(['a', 'b', 'c']),
+      flags: dense(new Array(6).fill(false), [3, 2], { dtype: '|b1' }),
+    }),
+    obsp: mapping({
+      connectivities: sparse({ shape: [3, 3], data: new Float32Array([1, 1]), indices: new Int32Array([1, 0]), indptr: new Int32Array([0, 1, 2, 2]) }),
+      distances: dense(zeros([3, 2]), [3, 2]),
+    }),
+    layers: mapping({
+      counts: sparse({ shape: [3, 1], data: new Int32Array([1]), dataDtype: '<i4', indices: new Int32Array([0]), indptr: new Int32Array([0, 1, 1, 1]) }),
+      wide: dense(zeros([3, 2]), [3, 2]),
+    }),
+    raw: group({
+      X: sparse({ shape: [3, 4], data: new Float32Array(0), indices: new Int32Array(0), indptr: new Int32Array(4) }),
+      var: stringFrame(['a', 'b', 'c', 'd']),
+    }),
+  });
+  const { reader, fetched } = await openAnnData(tree, { name: 'probes.zarr' });
+  const before = fetched.length;
 
-  denseArray('X', [3, 1]);
-  dataframe('var', 1, ['gene_symbols', 'score']);
-  denseArray('var/gene_symbols', [1], '|O', { filters: [{ id: 'vlen-utf8' }] });
-  denseArray('var/score', [1]);
-  setCurrentMapping(files, 'obsm');
-  denseArray('obsm/X_umap', [3, 2]);
-  sparse('obsm/X_sparse', [3, 5], 4);
-  dataframe('obsm/X_df', 3);
-  denseArray('obsm/pseudotime', [3], '<i4');
-  denseArray('obsm/labels', [3], '|O', { filters: [{ id: 'vlen-utf8' }] });
-  denseArray('obsm/flags', [3, 2], '|b1');
-  setCurrentMapping(files, 'obsp');
-  sparse('obsp/connectivities', [3, 3], 2);
-  denseArray('obsp/distances', [3, 2]);
-  setCurrentMapping(files, 'layers');
-  sparse('layers/counts', [3, 1], 1, '<i4');
-  denseArray('layers/wide', [3, 2]);
-  sparse('raw/X', [3, 4], 0);
-  dataframe('raw/var', 4);
-
-  const loader = new ZarrLoader();
-  loader._files = files;
-  loader._rootName = 'probes.zarr';
-  loader._nObs = 3;
-  loader._nVars = 1;
-  let chunkReads = 0;
-  loader._readChunkFile = async () => {
-    chunkReads++;
-    throw new Error('probes must not read chunks');
-  };
-
-  const described = describeAnnDataProbes(await loader.probeMapping());
-  assert.equal(chunkReads, 0);
+  const described = describeAnnDataProbes(await reader.probeMapping());
+  assert.equal(fetched.length, before, 'probes read no chunk');
   // A Zarr store lists its children in code-point order.
   assert.deepEqual(
     described.obsm.map(({ key, storage, shape, dtype, usable, reason }) =>
@@ -2612,79 +1542,35 @@ test('Zarr mapping probes describe every element from metadata, with the catalog
   });
 });
 
-test('Zarr obsm column reads return fresh arrays the loader does not retain', async () => {
-  const loader = embeddingLoader();
-  const first = await loader.readObsmColumns('X_umap_2d', [0, 1]);
-  const second = await loader.readObsmColumns('X_umap_2d', [0, 1]);
-  assert.ok(first instanceof Float64Array);
-  assert.deepEqual(Array.from(first), [0, 0, 2, 4]);
-  assert.notStrictEqual(first, second);
-  first[0] = 99;
-  assert.equal(second[0], 0);
-  assert.equal(loader._cache.size, 0);
-});
+// ---------------------------------------------------------------------------
+// Sparse matrix structure.
+// ---------------------------------------------------------------------------
 
-test('Zarr adapter loads an embedding whose raw plus normalized peak exceeds its cache budget', async () => {
-  const loader = embeddingLoader();
-  // 16 bytes hold the normalized Float32 result, not the Float64 read alive
-  // while it is produced: the budget is a policy, so it still loads.
-  const adapter = await adapterWithDescribedObsm(loader, {
-    cacheBudgetBytes: 16
-  });
-  const embedding = await adapter.getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] });
-  assert.ok(embedding instanceof Float32Array);
-  assert.equal(adapter._coordinateReservedOutputBytes, 0n);
-});
-
-test('rejects finite Float32 fill overflow while preserving explicit infinity', async () => {
-  const finiteOverflow = arrayLoader(
-    'values',
-    metadata({ dtype: '<f4', fill_value: 1e308 }),
-    {}
-  );
-  await assert.rejects(
-    finiteOverflow._readArray('values'),
-    /fill_value.*Float32 range/i
-  );
-
-  const explicitInfinity = arrayLoader(
-    'values',
-    metadata({ dtype: '<f4', fill_value: 'Infinity' }),
-    {}
-  );
-  assert.deepEqual(
-    Array.from((await explicitInfinity._readArray('values')).data),
-    [Number.POSITIVE_INFINITY]
-  );
-});
-
-test('sparse components are checked for kind and length, never for size', () => {
-  assert.equal(typeof zarrModule.validateSparseArrayContract, 'function');
-
+test('sparse components are checked for kind and length, never for size', async () => {
+  const floatIndices = await openRoot(zarrEntries(group({
+    X: sparse({ shape: [2, 3], data: new Float32Array([1, 2]), indices: new Float32Array([0, 2]), indicesDtype: '<f4', indptr: new Int32Array([0, 1, 2]) }),
+  })));
   assert.throws(
-    () => zarrModule.validateSparseArrayContract({
-      format: 'csr',
-      shape: [2, 3],
-      dataMeta: metadata({ shape: [2], chunks: [2], dtype: '<f4' }),
-      indicesMeta: metadata({ shape: [2], chunks: [2], dtype: '<f4' }),
-      indptrMeta: metadata({ shape: [3], chunks: [3], dtype: '<i4' })
-    }),
+    () => sparseContract(floatIndices.root.get('X'), ZARR_FORMAT, 'Sparse X'),
     /indices.*integer dtype/i
   );
 
-  assert.doesNotThrow(
-    () => zarrModule.validateSparseArrayContract({
-      format: 'csr',
-      shape: [50_000_000, 50_000_000],
-      dataMeta: metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<f4' }),
-      indicesMeta: metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<i4' }),
-      indptrMeta: metadata({ shape: [50_000_001], chunks: [1_000_000], dtype: '<i8' })
-    })
-  );
+  // 50 million cells and 500 million values, described by metadata alone.
+  const entries = new Map([
+    ['.zgroup', json({ zarr_format: 2 })],
+    ['X/.zgroup', json({ zarr_format: 2 })],
+    ['X/.zattrs', json({ 'encoding-type': 'csr_matrix', 'encoding-version': '0.1.0', shape: [50_000_000, 50_000_000] })],
+    ['X/data/.zarray', json(metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<f4' }))],
+    ['X/indices/.zarray', json(metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<i4' }))],
+    ['X/indptr/.zarray', json(metadata({ shape: [50_000_001], chunks: [1_000_000], dtype: '<i8' }))],
+  ]);
+  const { root } = await openRoot(entries);
+  assert.deepEqual(sparseContract(root.get('X'), ZARR_FORMAT, 'Sparse X').shape, [50_000_000, 50_000_000]);
 });
 
 test('validates sparse matrix structure before narrowing or conversion', async t => {
-  const valid = await sparseLoader()._readSparseMatrix('X', 'float32');
+  const sparseX = async options => (await openRoot(zarrEntries(sparseStore(options)))).root.get('X');
+  const valid = await readSparseMatrix(await sparseX({}), ZARR_FORMAT, 'Sparse X', 'float32');
   assert.deepEqual({
     format: valid.format,
     shape: valid.shape,
@@ -2702,60 +1588,55 @@ test('validates sparse matrix structure before narrowing or conversion', async t
   const cases = [
     [
       'data/indices length mismatch',
-      sparseLoader({ data: [1], indices: [0, 2] }),
+      { data: new Float32Array([1]), indices: new Int32Array([0, 2]) },
       /data.*indices.*length/i
     ],
     [
       'indptr axis length',
-      sparseLoader({ indptr: [0, 2] }),
+      { indptr: new Int32Array([0, 2]) },
       /indptr.*length/i
     ],
     [
       'indptr starts away from zero',
-      sparseLoader({ indptr: [1, 1, 2] }),
+      { indptr: new Int32Array([1, 1, 2]) },
       /indptr.*start.*zero/i
     ],
     [
       'indptr decreases',
-      sparseLoader({ indptr: [0, 2, 1] }),
+      { indptr: new Int32Array([0, 2, 1]) },
       /indptr.*monotonic/i
     ],
     [
       'indptr does not end at nnz',
-      sparseLoader({ indptr: [0, 1, 1] }),
+      { indptr: new Int32Array([0, 1, 1]) },
       /indptr.*last.*non-zero/i
     ],
     [
       'index outside the opposite axis',
-      sparseLoader({ indices: [0, 3] }),
+      { indices: new Int32Array([0, 3]) },
       /sparse.*index.*bounds/i
     ],
     [
-      '64-bit index cannot be narrowed',
-      sparseLoader({
-        indices: [0],
-        data: [1],
-        indptr: [0, 1, 1],
+      '64-bit index outside the opposite axis is refused, never narrowed',
+      {
+        data: new Float32Array([1]),
+        indices: new BigInt64Array([2147483648n]),
         indicesDtype: '<i8',
-        indicesBytes: littleEndianBytes([2147483648n], 'setBigInt64', 8)
-      }),
-      /sparse.*index.*Int32 range/i
+        indptr: new Int32Array([0, 1, 1]),
+      },
+      /sparse X index 2147483648 is outside axis bounds/i
     ],
     [
       'floating-point index dtype',
-      sparseLoader({
-        indices: [0, 2],
-        indicesDtype: '<f4',
-        indicesBytes: littleEndianBytes([0, 2], 'setFloat32', 4)
-      }),
+      { indices: new Float32Array([0, 2]), indicesDtype: '<f4' },
       /indices.*integer dtype/i
     ]
   ];
 
-  for (const [name, loader, expectedError] of cases) {
+  for (const [name, options, expectedError] of cases) {
     await t.test(name, async () => {
       await assert.rejects(
-        loader._readSparseMatrix('X', 'float32'),
+        async () => readSparseMatrix(await sparseX(options), ZARR_FORMAT, 'Sparse X', 'float32'),
         expectedError
       );
     });
@@ -2763,728 +1644,420 @@ test('validates sparse matrix structure before narrowing or conversion', async t
 });
 
 test('requires unambiguous standard sparse format and shape metadata', async () => {
-  const missingFormat = sparseLoader();
-  missingFormat._files.set(
-    'X/.zattrs',
-    memoryFile(JSON.stringify({ shape: [2, 3] }))
-  );
+  const missingFormat = zarrEntries(sparseStore());
+  missingFormat.set('X/.zattrs', json({ shape: [2, 3] }));
   await assert.rejects(
-    missingFormat._readSparseMatrix('X', 'float32'),
+    openAnnData(missingFormat),
     /sparse.*encoding-type.*required/i
   );
 
-  const missingShape = sparseLoader();
-  missingShape._files.set(
-    'X/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'csr_matrix',
-      'encoding-version': '0.1.0'
-    }))
-  );
+  const missingShape = zarrEntries(sparseStore());
+  missingShape.set('X/.zattrs', json({
+    'encoding-type': 'csr_matrix',
+    'encoding-version': '0.1.0'
+  }));
   await assert.rejects(
-    missingShape._readSparseMatrix('X', 'float32'),
+    openAnnData(missingShape),
     /sparse.*shape.*required/i
   );
 });
 
 test('validates sparse component metadata while opening the AnnData structure', async () => {
-  const mismatchedComponents = sparseLoader({
-    data: [1],
-    indices: [0, 2]
-  });
   await assert.rejects(
-    mismatchedComponents._readStructure(),
+    openAnnData(sparseStore({ data: new Float32Array([1]), indices: new Int32Array([0, 2]) })),
     /data.*indices.*length/i
   );
 
-  const unsupportedEncoding = sparseLoader();
-  unsupportedEncoding._files.set(
-    'X/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'mystery_matrix',
-      'encoding-version': '0.1.0',
-      shape: [2, 3]
-    }))
-  );
+  const unsupportedEncoding = zarrEntries(sparseStore());
+  unsupportedEncoding.set('X/.zattrs', json({
+    'encoding-type': 'mystery_matrix',
+    'encoding-version': '0.1.0',
+    shape: [2, 3]
+  }));
   await assert.rejects(
-    unsupportedEncoding._readStructure(),
+    openAnnData(unsupportedEncoding),
     /sparse.*encoding-type.*required/i
   );
 });
 
+// ---------------------------------------------------------------------------
+// The AnnData structure.
+// ---------------------------------------------------------------------------
+
 test('rejects X dimensions that disagree with obs or var, including zero axes', async t => {
+  const structure = ({ xShape = [2, 2], obsCount = 2, varNames = ['A', 'B'] }) => annData({
+    X: dense(new Float32Array(xShape[0] * xShape[1]), xShape),
+    obs: stringFrame(Array.from({ length: obsCount }, (_, i) => `cell-${i}`)),
+    var: stringFrame(varNames),
+  });
   const cases = [
-    ['obs shorter', { obsCount: 1 }, /X.*obs.*dimension/i],
-    ['obs longer', { obsCount: 3 }, /X.*obs.*dimension/i],
-    ['var shorter', { varNames: ['A'] }, /X.*var.*dimension/i],
-    ['var longer', { varNames: ['A', 'B', 'C'] }, /X.*var.*dimension/i],
+    ['obs shorter', { obsCount: 1 }, /Observation index length 1 does not match 2/],
+    ['obs longer', { obsCount: 3 }, /Observation index length 3 does not match 2/],
+    ['var shorter', { varNames: ['A'] }, /Variable index length 1 does not match 2/],
+    ['var longer', { varNames: ['A', 'B', 'C'] }, /Variable index length 3 does not match 2/],
     [
       'zero-cell X is known rather than missing',
       { xShape: [0, 2], obsCount: 1 },
-      /X.*obs.*dimension/i
+      /Observation index length 1 does not match 0/
     ],
     [
       'zero-gene X is known rather than missing',
       { xShape: [2, 0], varNames: ['A'] },
-      /X.*var.*dimension/i
+      /Variable index length 1 does not match 0/
     ]
   ];
 
   for (const [name, overrides, expectedError] of cases) {
     await t.test(name, async () => {
-      await assert.rejects(
-        denseStructureLoader(overrides)._readStructure(),
-        expectedError
-      );
+      await assert.rejects(openAnnData(structure(overrides)), expectedError);
     });
   }
 });
 
-test('keeps duplicate var names as stored for the adapter to make unique', async () => {
-  // The loader no longer refuses a repeated var name: the adapter makes the
-  // gene list unique with the data-mapping rule (`makeUniqueNames`), so each
-  // name still selects exactly one column by position.
-  const loader = denseStructureLoader({ varNames: ['A', 'A'] });
-  await loader._readStructure();
-  assert.equal(loader.nVars, 2);
-  assert.deepEqual(loader.varNames, ['A', 'A']);
-  const names = await loader.readVarNames('X', null);
-  assert.deepEqual([...names.index], ['A', 'A']);
-  assert.deepEqual([...names.values], ['A', 'A']);
-});
+/** Open a working store, then try a replacement that must fail and leave the working data in place. */
+async function assertReplacementRefused(mutate, expectedError, { columnOrder = null } = {}) {
+  const { reader } = await openAnnData(completeTree({
+    embeddingValues: [0, 0, 2, 4],
+    geneValues: [1, 2, 3, 4]
+  }), { name: 'working.zarr' });
+
+  const replacement = completeZarrStoreFiles({
+    embeddingValues: [10, 20, 30, 40],
+    geneValues: [5, 6, 7, 8]
+  });
+  if (columnOrder !== null) {
+    replacement.set(`${columnOrder.frame}/.zattrs`, json({
+      'encoding-type': 'dataframe',
+      'encoding-version': '0.2.0',
+      _index: '_index',
+      'column-order': columnOrder.columns,
+    }));
+  }
+  mutate(replacement);
+
+  await assert.rejects(
+    (async () => {
+      const { root } = await openRoot(replacement, { name: 'invalid-replacement.zarr' });
+      await reader.open(root, { format: ZARR_FORMAT, name: 'invalid-replacement.zarr' });
+    })(),
+    expectedError
+  );
+  assert.equal(reader._name, 'working.zarr');
+  assert.deepEqual(
+    Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])),
+    [0, 0, 2, 4]
+  );
+  assert.deepEqual(
+    Array.from(await geneColumnByName(reader, 'A')),
+    [1, 3]
+  );
+}
 
 test('requires canonical AnnData Zarr root identity without replacing working data', async t => {
   const invalidCases = [
     [
-      'missing root group metadata',
-      files => files.delete('.zgroup'),
-      /AnnData Zarr root.*\.zgroup.*required/i
-    ],
-    [
       'malformed root group metadata',
-      files => files.set('.zgroup', memoryFile('{')),
-      /AnnData Zarr root.*\.zgroup.*valid JSON/i
+      files => files.set('.zgroup', json('{')),
+      /\.zgroup is not valid JSON/i
     ],
     [
       'non-v2 root group metadata',
-      files => files.set(
-        '.zgroup',
-        memoryFile('{"zarr_format":3}')
-      ),
-      /AnnData Zarr root.*\.zgroup.*zarr_format.*2/i
-    ],
-    [
-      'missing root attributes',
-      files => files.delete('.zattrs'),
-      /AnnData Zarr root.*\.zattrs.*required/i
-    ],
-    [
-      'missing AnnData encoding identity',
-      files => files.set('.zattrs', memoryFile('{}')),
-      /AnnData Zarr root.*encoding-type.*exactly.*anndata/i
+      files => files.set('.zgroup', json('{"zarr_format":3}')),
+      /\.zgroup' must declare "zarr_format": 2/i
     ],
     [
       'lookalike encoding identity',
-      files => files.set(
-        '.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'not-anndata',
-          'encoding-version': '0.1.0'
-        }))
-      ),
+      files => files.set('.zattrs', json({
+        'encoding-type': 'not-anndata',
+        'encoding-version': '0.1.0'
+      })),
       /AnnData Zarr root.*encoding-type.*exactly.*anndata/i
     ],
     [
       'missing AnnData encoding version',
-      files => files.set(
-        '.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'anndata'
-        }))
-      ),
+      files => files.set('.zattrs', json({ 'encoding-type': 'anndata' })),
       /AnnData Zarr root.*encoding-version.*exactly.*0\.1\.0/i
     ],
     [
       'unsupported AnnData encoding version',
-      files => files.set(
-        '.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'anndata',
-          'encoding-version': '0.2.0'
-        }))
-      ),
+      files => files.set('.zattrs', json({
+        'encoding-type': 'anndata',
+        'encoding-version': '0.2.0'
+      })),
       /AnnData Zarr root.*encoding-version.*exactly.*0\.1\.0/i
     ]
   ];
 
   for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4]
-        }),
-        'working.zarr'
-      );
-
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8]
-      });
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-replacement.zarr'),
-        expectedError
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-      assert.deepEqual(
-        Array.from(await geneColumnByName(loader, 'A')),
-        [1, 3]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expectedError));
   }
 });
 
 test('requires exact AnnData mapping identity before enumerating obsm', async t => {
   const invalidCases = [
     [
-      'missing obsm group metadata',
-      files => files.delete('obsm/.zgroup'),
-      /obsm.*\.zgroup.*required/i,
-    ],
-    [
       'malformed obsm group metadata',
-      files => files.set('obsm/.zgroup', memoryFile('{')),
-      /obsm.*\.zgroup.*valid JSON/i,
+      files => files.set('obsm/.zgroup', json('{')),
+      /obsm\/\.zgroup is not valid JSON/i,
     ],
     [
       'non-v2 obsm group metadata',
-      files => files.set(
-        'obsm/.zgroup',
-        memoryFile('{"zarr_format":3}')
-      ),
-      /obsm.*\.zgroup.*zarr_format.*2/i,
+      files => files.set('obsm/.zgroup', json('{"zarr_format":3}')),
+      /obsm\/\.zgroup' must declare "zarr_format": 2/i,
     ],
     [
       'missing obsm attributes',
       files => files.delete('obsm/.zattrs'),
-      /obsm.*\.zattrs.*required|obsm.*mapping.*required/i,
+      /AnnData Zarr obsm mapping encoding-type must be exactly 'dict'/,
     ],
     [
       'wrong obsm encoding type',
-      files => files.set(
-        'obsm/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'mapping',
-          'encoding-version': '0.1.0',
-        }))
-      ),
+      files => files.set('obsm/.zattrs', json({
+        'encoding-type': 'mapping',
+        'encoding-version': '0.1.0',
+      })),
       /obsm.*encoding-type.*dict/i,
     ],
     [
       'wrong obsm encoding version',
-      files => files.set(
-        'obsm/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dict',
-          'encoding-version': '9.9.9',
-        }))
-      ),
+      files => files.set('obsm/.zattrs', json({
+        'encoding-type': 'dict',
+        'encoding-version': '9.9.9',
+      })),
       /obsm.*encoding-version.*0\.1\.0/i,
     ],
   ];
 
   for (const [name, mutate, expected] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4],
-        }),
-        'working.zarr'
-      );
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8],
-      });
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-obsm.zarr'),
-        expected
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expected));
   }
 });
 
 test('requires the canonical AnnData obs dataframe contract without replacing working data', async t => {
+  const frameAttrs = (overrides = {}) => ({
+    'encoding-type': 'dataframe',
+    'encoding-version': '0.2.0',
+    _index: '_index',
+    'column-order': [],
+    ...overrides,
+  });
   const invalidCases = [
     [
-      'missing obs group metadata',
-      files => files.delete('obs/.zgroup'),
-      /AnnData obs.*\.zgroup.*required/i
-    ],
-    [
       'malformed obs group metadata',
-      files => files.set('obs/.zgroup', memoryFile('{')),
-      /AnnData obs.*\.zgroup.*valid JSON/i
+      files => files.set('obs/.zgroup', json('{')),
+      /obs\/\.zgroup is not valid JSON/i
     ],
     [
       'non-v2 obs group metadata',
-      files => files.set(
-        'obs/.zgroup',
-        memoryFile('{"zarr_format":3}')
-      ),
-      /AnnData obs.*\.zgroup.*zarr_format.*2/i
+      files => files.set('obs/.zgroup', json('{"zarr_format":3}')),
+      /obs\/\.zgroup' must declare "zarr_format": 2/i
     ],
     [
       'missing obs attributes',
       files => files.delete('obs/.zattrs'),
-      /AnnData obs.*\.zattrs.*required/i
+      /AnnData Zarr obs encoding-type must be exactly 'dataframe'/
     ],
     [
       'missing dataframe encoding identity',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-version': '0.2.0',
-          _index: '_index',
-          'column-order': []
-        }))
-      ),
-      /AnnData obs.*encoding-type.*exactly.*dataframe/i
+      files => files.set('obs/.zattrs', json({
+        'encoding-version': '0.2.0',
+        _index: '_index',
+        'column-order': []
+      })),
+      /AnnData Zarr obs.*encoding-type.*exactly.*dataframe/i
     ],
     [
       'unsupported dataframe encoding identity',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalObsDataframeAttrs(),
-          'encoding-type': 'not-dataframe'
-        }))
-      ),
-      /AnnData obs.*encoding-type.*exactly.*dataframe/i
+      files => files.set('obs/.zattrs', json(frameAttrs({ 'encoding-type': 'not-dataframe' }))),
+      /AnnData Zarr obs.*encoding-type.*exactly.*dataframe/i
     ],
     [
       'missing dataframe encoding version',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dataframe',
-          _index: '_index',
-          'column-order': []
-        }))
-      ),
-      /AnnData obs.*encoding-version.*exactly.*0\.2\.0/i
+      files => files.set('obs/.zattrs', json({
+        'encoding-type': 'dataframe',
+        _index: '_index',
+        'column-order': []
+      })),
+      /AnnData Zarr obs.*encoding-version.*exactly.*0\.2\.0/i
     ],
     [
       'unsupported dataframe encoding version',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalObsDataframeAttrs(),
-          'encoding-version': '0.3.0'
-        }))
-      ),
-      /AnnData obs.*encoding-version.*exactly.*0\.2\.0/i
+      files => files.set('obs/.zattrs', json(frameAttrs({ 'encoding-version': '0.3.0' }))),
+      /AnnData Zarr obs.*encoding-version.*exactly.*0\.2\.0/i
     ],
     [
       'missing dataframe index declaration',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dataframe',
-          'encoding-version': '0.2.0',
-          'column-order': []
-        }))
-      ),
-      /AnnData obs.*_index.*non-empty string/i
+      files => files.set('obs/.zattrs', json({
+        'encoding-type': 'dataframe',
+        'encoding-version': '0.2.0',
+        'column-order': []
+      })),
+      /AnnData Zarr obs.*_index.*non-empty string/i
     ],
     [
       'invalid dataframe index declaration',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalObsDataframeAttrs(),
-          _index: 7
-        }))
-      ),
-      /AnnData obs.*_index.*non-empty string/i
+      files => files.set('obs/.zattrs', json(frameAttrs({ _index: 7 }))),
+      /AnnData Zarr obs.*_index.*non-empty string/i
     ],
     [
       'duplicate column-order member',
       files => {
-        files.set(
-          'obs/.zattrs',
-          memoryFile(JSON.stringify(canonicalObsDataframeAttrs({
-            'column-order': ['score', 'score']
-          })))
-        );
-        files.set(
-          'obs/score/.zarray',
-          memoryFile(JSON.stringify(metadata({
-            shape: [2],
-            chunks: [2],
-            dtype: '<f4'
-          })))
-        );
+        files.set('obs/.zattrs', json(frameAttrs({ 'column-order': ['score', 'score'] })));
+        setArray(files, 'obs/score', metadata({ shape: [2], chunks: [2], dtype: '<f4' }));
       },
-      /AnnData obs.*column-order.*unique/i
-    ],
-    [
-      'dataframe index repeated as an observation field',
-      files => files.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify(canonicalObsDataframeAttrs({
-          'column-order': ['_index']
-        })))
-      ),
-      /AnnData obs.*column-order.*index|index.*observation.*field/i
+      /AnnData Zarr obs column-order contains duplicate column 'score'/
     ],
     [
       'unversioned primitive dataframe index',
-      files => files.set(
-        'obs/_index/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'string-array'
-        }))
-      ),
-      /AnnData obs index.*encoding-version.*0\.2\.0/i
+      files => files.set('obs/_index/.zattrs', json({ 'encoding-type': 'string-array' })),
+      /Observation index encoding-version must be exactly '0\.2\.0'/
     ]
   ];
 
   for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4]
-        }),
-        'working.zarr'
-      );
-
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8]
-      });
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-obs-dataframe.zarr'),
-        expectedError
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-      assert.deepEqual(
-        Array.from(await geneColumnByName(loader, 'A')),
-        [1, 3]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expectedError));
   }
 });
 
 test('validates every observation column declared by column-order before adoption', async t => {
   await t.test('valid primitive column is accepted', async () => {
-    const files = completeZarrStoreFiles({
-      embeddingValues: [0, 0, 2, 4],
-      geneValues: [1, 2, 3, 4]
-    });
-    files.set(
-      'obs/.zattrs',
-      memoryFile(JSON.stringify(canonicalObsDataframeAttrs({
-        'column-order': ['score']
-      })))
-    );
-    files.set(
-      'obs/score/.zarray',
-      memoryFile(JSON.stringify(metadata({
-        shape: [2],
-        chunks: [2],
-        dtype: '<f4'
-      })))
-    );
-    setCurrentArrayAttrs(files, 'obs/score', { dtype: '<f4' });
-
-    const loader = new ZarrLoader();
-    await loader.openFileMap(files, 'valid-observation.zarr');
-    assert.deepEqual(loader.obsKeys, ['score']);
+    const { reader } = await openAnnData(storeWith({ obs: { score: array(new Float32Array([1, 2])) } }));
+    assert.deepEqual(reader.obsKeys, ['score']);
   });
 
   const invalidCases = [
     [
       'missing declared column',
       () => {},
-      /declared observation column.*missing.*missing|missing.*declared observation column/i
+      /AnnData Zarr obs declared column 'missing' was not found/
     ],
     [
       'unsupported declared column representation',
       files => {
-        files.set(
-          'obs/missing/.zgroup',
-          memoryFile('{"zarr_format":2}')
-        );
-        files.set(
-          'obs/missing/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'unsupported-column',
-            'encoding-version': '0.1.0'
-          }))
-        );
+        files.set('obs/missing/.zgroup', json({ zarr_format: 2 }));
+        files.set('obs/missing/.zattrs', json({
+          'encoding-type': 'unsupported-column',
+          'encoding-version': '0.1.0'
+        }));
       },
-      /declared observation column.*missing.*unsupported/i
+      /Observation dataframe column 'missing' uses unsupported encoding 'unsupported-column'/
     ],
     [
       'incomplete supported categorical column',
       files => {
-        files.set(
-          'obs/missing/.zgroup',
-          memoryFile('{"zarr_format":2}')
-        );
-        files.set(
-          'obs/missing/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'categorical',
-            'encoding-version': '0.2.0',
-            ordered: false
-          }))
-        );
+        files.set('obs/missing/.zgroup', json({ zarr_format: 2 }));
+        files.set('obs/missing/.zattrs', json({
+          'encoding-type': 'categorical',
+          'encoding-version': '0.2.0',
+          ordered: false
+        }));
       },
-      /declared observation column.*missing.*invalid.*codes.*\.zarray/i
+      /Categorical field 'missing' must contain codes and categories/
     ],
     [
       'categorical children cannot imply a missing parent encoding',
       files => {
-        files.set(
-          'obs/missing/.zgroup',
-          memoryFile('{"zarr_format":2}')
-        );
-        files.set(
-          'obs/missing/codes/.zarray',
-          memoryFile(JSON.stringify(metadata({
-            shape: [2],
-            chunks: [2],
-            dtype: '|i1'
-          })))
-        );
-        files.set(
-          'obs/missing/codes/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'array',
-            'encoding-version': '0.2.0'
-          }))
-        );
-        files.set(
-          'obs/missing/categories/.zarray',
-          memoryFile(JSON.stringify(metadata({
-            shape: [1],
-            chunks: [1],
-            dtype: '|O',
-            filters: [{ id: 'vlen-utf8' }]
-          })))
-        );
-        files.set(
-          'obs/missing/categories/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'string-array',
-            'encoding-version': '0.2.0'
-          }))
-        );
+        files.set('obs/missing/.zgroup', json({ zarr_format: 2 }));
+        setArray(files, 'obs/missing/codes', metadata({ shape: [2], chunks: [2], dtype: '|i1' }));
+        setArray(files, 'obs/missing/categories', metadata({
+          shape: [1], chunks: [1], dtype: '|O', fill_value: null, filters: [{ id: 'vlen-utf8' }],
+        }));
       },
-      /declared observation column.*missing.*encoding-type/i
+      /Observation dataframe column 'missing' uses unsupported encoding 'unknown'/
     ]
   ];
 
   for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4]
-        }),
-        'working.zarr'
-      );
-
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8]
-      });
-      replacement.set(
-        'obs/.zattrs',
-        memoryFile(JSON.stringify(canonicalObsDataframeAttrs({
-          'column-order': ['missing']
-        })))
-      );
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-observation.zarr'),
-        expectedError
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-      assert.deepEqual(
-        Array.from(await geneColumnByName(loader, 'A')),
-        [1, 3]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expectedError, {
+      columnOrder: { frame: 'obs', columns: ['missing'] },
+    }));
   }
 });
 
 test('requires the canonical AnnData var dataframe contract without replacing working data', async t => {
+  const frameAttrs = (overrides = {}) => ({
+    'encoding-type': 'dataframe',
+    'encoding-version': '0.2.0',
+    _index: '_index',
+    'column-order': [],
+    ...overrides,
+  });
   const invalidCases = [
     [
-      'missing var group metadata',
-      files => files.delete('var/.zgroup'),
-      /AnnData var.*\.zgroup.*required/i
-    ],
-    [
       'malformed var group metadata',
-      files => files.set('var/.zgroup', memoryFile('{')),
-      /AnnData var.*\.zgroup.*valid JSON/i
+      files => files.set('var/.zgroup', json('{')),
+      /var\/\.zgroup is not valid JSON/i
     ],
     [
       'non-v2 var group metadata',
-      files => files.set(
-        'var/.zgroup',
-        memoryFile('{"zarr_format":3}')
-      ),
-      /AnnData var.*\.zgroup.*zarr_format.*2/i
+      files => files.set('var/.zgroup', json('{"zarr_format":3}')),
+      /var\/\.zgroup' must declare "zarr_format": 2/i
     ],
     [
       'missing var attributes',
       files => files.delete('var/.zattrs'),
-      /AnnData var.*\.zattrs.*required/i
+      /AnnData Zarr var encoding-type must be exactly 'dataframe'/
     ],
     [
       'missing dataframe encoding identity',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-version': '0.2.0',
-          _index: '_index',
-          'column-order': []
-        }))
-      ),
-      /AnnData var.*encoding-type.*exactly.*dataframe/i
+      files => files.set('var/.zattrs', json({
+        'encoding-version': '0.2.0',
+        _index: '_index',
+        'column-order': []
+      })),
+      /AnnData Zarr var.*encoding-type.*exactly.*dataframe/i
     ],
     [
       'unsupported dataframe encoding identity',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalVarDataframeAttrs(),
-          'encoding-type': 'not-dataframe'
-        }))
-      ),
-      /AnnData var.*encoding-type.*exactly.*dataframe/i
+      files => files.set('var/.zattrs', json(frameAttrs({ 'encoding-type': 'not-dataframe' }))),
+      /AnnData Zarr var.*encoding-type.*exactly.*dataframe/i
     ],
     [
       'missing dataframe encoding version',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dataframe',
-          _index: '_index',
-          'column-order': []
-        }))
-      ),
-      /AnnData var.*encoding-version.*exactly.*0\.2\.0/i
+      files => files.set('var/.zattrs', json({
+        'encoding-type': 'dataframe',
+        _index: '_index',
+        'column-order': []
+      })),
+      /AnnData Zarr var.*encoding-version.*exactly.*0\.2\.0/i
     ],
     [
       'unsupported dataframe encoding version',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalVarDataframeAttrs(),
-          'encoding-version': '0.3.0'
-        }))
-      ),
-      /AnnData var.*encoding-version.*exactly.*0\.2\.0/i
+      files => files.set('var/.zattrs', json(frameAttrs({ 'encoding-version': '0.3.0' }))),
+      /AnnData Zarr var.*encoding-version.*exactly.*0\.2\.0/i
     ],
     [
       'missing dataframe index declaration',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dataframe',
-          'encoding-version': '0.2.0',
-          'column-order': []
-        }))
-      ),
-      /AnnData var.*_index.*non-empty string/i
+      files => files.set('var/.zattrs', json({
+        'encoding-type': 'dataframe',
+        'encoding-version': '0.2.0',
+        'column-order': []
+      })),
+      /AnnData Zarr var.*_index.*non-empty string/i
     ],
     [
       'invalid dataframe index declaration',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          ...canonicalVarDataframeAttrs(),
-          _index: 7
-        }))
-      ),
-      /AnnData var.*_index.*non-empty string/i
+      files => files.set('var/.zattrs', json(frameAttrs({ _index: 7 }))),
+      /AnnData Zarr var.*_index.*non-empty string/i
     ],
     [
       'missing column-order declaration',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dataframe',
-          'encoding-version': '0.2.0',
-          _index: '_index'
-        }))
-      ),
-      /AnnData var.*column-order.*array/i
+      files => files.set('var/.zattrs', json({
+        'encoding-type': 'dataframe',
+        'encoding-version': '0.2.0',
+        _index: '_index'
+      })),
+      /AnnData Zarr var column-order must be an array of non-empty strings/
     ],
     [
       'invalid column-order member',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify(canonicalVarDataframeAttrs({
-          'column-order': ['score', 7]
-        })))
-      ),
-      /Every AnnData var.*column-order.*non-empty string/i
+      files => files.set('var/.zattrs', json(frameAttrs({ 'column-order': ['score', 7] }))),
+      /AnnData Zarr var column-order must be an array of non-empty strings/
     ],
     [
       'duplicate column-order member',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify(canonicalVarDataframeAttrs({
-          'column-order': ['score', 'score']
-        })))
-      ),
-      /AnnData var.*column-order.*unique/i
-    ],
-    [
-      'dataframe index repeated as a variable field',
-      files => files.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify(canonicalVarDataframeAttrs({
-          'column-order': ['_index']
-        })))
-      ),
-      /AnnData var.*column-order.*index|index.*variable.*field/i
+      files => files.set('var/.zattrs', json(frameAttrs({ 'column-order': ['score', 'score'] }))),
+      /AnnData Zarr var column-order contains duplicate column 'score'/
     ],
     [
       'missing declared index node',
@@ -3493,170 +2066,63 @@ test('requires the canonical AnnData var dataframe contract without replacing wo
         files.delete('var/_index/.zattrs');
         files.delete('var/_index/0');
       },
-      /AnnData var index.*missing/i
+      /AnnData Zarr var index child '_index' was not found/
     ]
   ];
 
   for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4]
-        }),
-        'working.zarr'
-      );
-
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8]
-      });
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-var-dataframe.zarr'),
-        expectedError
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-      assert.deepEqual(
-        Array.from(await geneColumnByName(loader, 'A')),
-        [1, 3]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expectedError));
   }
 });
 
 test('validates every variable column declared by column-order before adoption', async t => {
   await t.test('valid primitive column is accepted', async () => {
-    const files = completeZarrStoreFiles({
-      embeddingValues: [0, 0, 2, 4],
-      geneValues: [1, 2, 3, 4]
-    });
-    files.set(
-      'var/.zattrs',
-      memoryFile(JSON.stringify(canonicalVarDataframeAttrs({
-        'column-order': ['score']
-      })))
-    );
-    files.set(
-      'var/score/.zarray',
-      memoryFile(JSON.stringify(metadata({
-        shape: [2],
-        chunks: [2],
-        dtype: '<f4'
-      })))
-    );
-    setCurrentArrayAttrs(files, 'var/score', { dtype: '<f4' });
-
-    const loader = new ZarrLoader();
-    await loader.openFileMap(files, 'valid-variable.zarr');
-    assert.deepEqual(loader.varNames, ['A', 'B']);
+    const tree = storeWith();
+    tree.children.var = stringFrame(['A', 'B'], { score: array(new Float32Array([1, 2])) });
+    const { reader } = await openAnnData(tree);
+    assert.deepEqual(reader.varNames, ['A', 'B']);
   });
 
   const invalidCases = [
     [
       'missing declared column',
       () => {},
-      /declared variable column.*missing.*missing|missing.*declared variable column/i
+      /AnnData Zarr var declared column 'missing' was not found/
     ],
     [
       'unsupported declared column representation',
       files => {
-        files.set(
-          'var/missing/.zgroup',
-          memoryFile('{"zarr_format":2}')
-        );
-        files.set(
-          'var/missing/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'unsupported-column',
-            'encoding-version': '0.1.0'
-          }))
-        );
+        files.set('var/missing/.zgroup', json({ zarr_format: 2 }));
+        files.set('var/missing/.zattrs', json({
+          'encoding-type': 'unsupported-column',
+          'encoding-version': '0.1.0'
+        }));
       },
-      /declared variable column.*missing.*unsupported/i
+      /Variable dataframe column 'missing' uses unsupported encoding 'unsupported-column'/
     ],
     [
       'incomplete supported categorical column',
       files => {
-        files.set(
-          'var/missing/.zgroup',
-          memoryFile('{"zarr_format":2}')
-        );
-        files.set(
-          'var/missing/.zattrs',
-          memoryFile(JSON.stringify({
-            'encoding-type': 'categorical',
-            'encoding-version': '0.2.0',
-            ordered: false
-          }))
-        );
+        files.set('var/missing/.zgroup', json({ zarr_format: 2 }));
+        files.set('var/missing/.zattrs', json({
+          'encoding-type': 'categorical',
+          'encoding-version': '0.2.0',
+          ordered: false
+        }));
       },
-      /declared variable column.*missing.*invalid.*codes.*\.zarray/i
+      /Categorical field 'missing' must contain codes and categories/
     ],
     [
       'variable-axis length mismatch',
-      files => {
-        files.set(
-          'var/missing/.zarray',
-          memoryFile(JSON.stringify(metadata({
-            shape: [1],
-            chunks: [1],
-            dtype: '<f4'
-          })))
-        );
-        setCurrentArrayAttrs(
-          files,
-          'var/missing',
-          { dtype: '<f4' }
-        );
-      },
-      /declared variable column.*missing.*invalid.*length.*2 variables/i
+      files => setArray(files, 'var/missing', metadata({ shape: [1], chunks: [1], dtype: '<f4' })),
+      /Variable dataframe column 'missing' length 1 does not match 2/
     ]
   ];
 
   for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, async () => {
-      const loader = new ZarrLoader();
-      await loader.openFileMap(
-        completeZarrStoreFiles({
-          embeddingValues: [0, 0, 2, 4],
-          geneValues: [1, 2, 3, 4]
-        }),
-        'working.zarr'
-      );
-
-      const replacement = completeZarrStoreFiles({
-        embeddingValues: [10, 20, 30, 40],
-        geneValues: [5, 6, 7, 8]
-      });
-      replacement.set(
-        'var/.zattrs',
-        memoryFile(JSON.stringify(canonicalVarDataframeAttrs({
-          'column-order': ['missing']
-        })))
-      );
-      mutate(replacement);
-
-      await assert.rejects(
-        loader.openFileMap(replacement, 'invalid-variable.zarr'),
-        expectedError
-      );
-      assert.equal(loader._rootName, 'working.zarr');
-      assert.deepEqual(
-        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
-        [0, 0, 2, 4]
-      );
-      assert.deepEqual(
-        Array.from(await geneColumnByName(loader, 'A')),
-        [1, 3]
-      );
-    });
+    await t.test(name, () => assertReplacementRefused(mutate, expectedError, {
+      columnOrder: { frame: 'var', columns: ['missing'] },
+    }));
   }
 });
 
@@ -3665,17 +2131,16 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
   const originalWarning = notifications.info;
   notifications.info = () => 'warning';
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    await source.loadFromFileList(
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [0, 0, 1, 1],
           geneValues: [1, 0, 2, 0]
         }),
         'working.zarr'
-      ),
-      { showProgress: false }
+      )
     );
     const workingAdapter = source.getAdapter();
 
@@ -3683,56 +2148,30 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
       embeddingValues: [9, 9, 10, 10],
       geneValues: [9, 0, 10, 0]
     });
-    missingVar.set(
-      'X/.zarray',
-      memoryFile(JSON.stringify(metadata({
-        shape: [1, 1],
-        chunks: [1, 1],
-        dtype: '<f4'
-      })))
-    );
-    missingVar.set(
-      'X/0.0',
-      memoryFile(littleEndianBytes([9], 'setFloat32', 4))
-    );
-    missingVar.set(
-      'obs/_index/.zarray',
-      memoryFile(JSON.stringify(metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|O',
-        filters: [{ id: 'vlen-utf8' }]
-      })))
-    );
-    missingVar.set(
-      'obs/_index/0',
-      memoryFile(vlenUtf8Bytes(['cell-0']))
-    );
-    missingVar.set(
-      'obsm/X_umap_2d/.zarray',
-      memoryFile(JSON.stringify(metadata({
-        shape: [1, 2],
-        chunks: [1, 2],
-        dtype: '<f4'
-      })))
-    );
-    missingVar.set(
-      'obsm/X_umap_2d/0.0',
-      memoryFile(littleEndianBytes([9, 10], 'setFloat32', 4))
-    );
+    missingVar.set('X/.zarray', json(metadata({ shape: [1, 1], chunks: [1, 1], dtype: '<f4' })));
+    missingVar.set('X/0.0', littleEndianBytes([9], 'setFloat32', 4));
+    missingVar.set('obs/_index/.zarray', json(metadata({
+      shape: [1],
+      chunks: [1],
+      dtype: '|O',
+      filters: [{ id: 'vlen-utf8' }]
+    })));
+    missingVar.set('obs/_index/0', vlenUtf8Bytes(['cell-0']));
+    missingVar.set('obsm/X_umap_2d/.zarray', json(metadata({ shape: [1, 2], chunks: [1, 2], dtype: '<f4' })));
+    missingVar.set('obsm/X_umap_2d/0.0', littleEndianBytes([9, 10], 'setFloat32', 4));
     missingVar.delete('var/.zgroup');
     missingVar.delete('var/.zattrs');
     missingVar.delete('var/_index/.zarray');
+    missingVar.delete('var/_index/.zattrs');
     missingVar.delete('var/_index/0');
 
     await assert.rejects(
-      source.loadFromFileList(
-        fileListFromMap(missingVar, 'missing-var.zarr'),
-        { showProgress: false }
-      ),
-      /AnnData var.*required/i
+      source.loadFolder(
+        fileListFromMap(missingVar, 'missing-var.zarr')
+    ),
+      /var.*(required|must be exactly 'dataframe')/i
     );
-    assert.equal(source.dirname, 'working.zarr');
+    assert.equal(source.filename, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),
@@ -3740,7 +2179,7 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
     );
     assert.deepEqual(
       Array.from(
-        await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+        (await source.getAdapter().getEmbeddingPayload('obsm/0/0-1', 2)).positions
       ),
       [-1, -1, 1, 1]
     );
@@ -3751,202 +2190,129 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
 });
 
 test('Zarr opening supports official nullable-string dataframe indices', async t => {
+  const withIndices = (obsIndex, varIndex) => annData({
+    X: dense(new Float32Array(4), [2, 2]),
+    obs: dataFrame({ _index: obsIndex }, { columnOrder: [] }),
+    var: dataFrame({ _index: varIndex }, { columnOrder: [] }),
+  });
+  const names = values => nullable('nullable-string-array', values, new Uint8Array(values.length));
+
   await t.test('valid observation and variable indices are accepted', async () => {
-    const loader = denseStructureLoader();
-    setNullableStringIndex(loader, 'obs', ['cell-a', 'cell-b']);
-    setNullableStringIndex(loader, 'var', ['gene-a', 'gene-b']);
-
-    await loader._readStructure();
-
-    assert.equal(loader.nObs, 2);
-    assert.equal(loader.nVars, 2);
-    assert.deepEqual(loader.varNames, ['gene-a', 'gene-b']);
+    const { reader } = await openAnnData(withIndices(names(['cell-a', 'cell-b']), names(['gene-a', 'gene-b'])));
+    assert.equal(reader.nObs, 2);
+    assert.equal(reader.nVars, 2);
+    assert.deepEqual(reader.varNames, ['gene-a', 'gene-b']);
   });
 
   await t.test('missing observation names are rejected', async () => {
-    const loader = denseStructureLoader();
-    setNullableStringIndex(
-      loader,
-      'obs',
-      ['cell-a', 'ignored'],
-      new Uint8Array([0, 1])
-    );
-    setNullableStringIndex(loader, 'var', ['gene-a', 'gene-b']);
-
     await assert.rejects(
-      loader._readStructure(),
-      /obs.*index.*missing|missing.*obs.*index/i
+      openAnnData(withIndices(
+        nullable('nullable-string-array', ['cell-a', 'ignored'], [0, 1]),
+        names(['gene-a', 'gene-b'])
+      )),
+      /Observation index cannot contain missing names/
     );
   });
 
   await t.test('nullable indices require string values', async () => {
-    const loader = denseStructureLoader();
-    setNullableStringIndex(
-      loader,
-      'obs',
-      new Int32Array([1, 2]),
-      new Uint8Array([0, 0]),
-      '<i4'
-    );
-    setNullableStringIndex(loader, 'var', ['gene-a', 'gene-b']);
-
     await assert.rejects(
-      loader._readStructure(),
-      /obs.*index.*string|string.*obs.*index/i
+      openAnnData(withIndices(
+        nullable('nullable-string-array', new Int32Array([1, 2]), [0, 0], { valuesDtype: '<i4' }),
+        names(['gene-a', 'gene-b'])
+      )),
+      /Nullable values for 'Observation index' declares string-array but does not use a string dtype|Observation index.*string/
     );
   });
 
   await t.test('nullable index lengths remain axis-aligned', async () => {
-    const loader = denseStructureLoader();
-    setNullableStringIndex(loader, 'obs', ['only-one']);
-    setNullableStringIndex(loader, 'var', ['gene-a', 'gene-b']);
-
     await assert.rejects(
-      loader._readStructure(),
-      /X.*obs.*dimension|obs.*index.*length/i
+      openAnnData(withIndices(names(['only-one']), names(['gene-a', 'gene-b']))),
+      /Nullable values for 'Observation index' length 1 does not match 2/
     );
   });
 });
 
 test('requires every observation field to be one-dimensional and cell-aligned', async t => {
   await t.test('ordinary field length', async () => {
-    const loader = arrayLoader(
-      'obs/batch',
-      metadata({ shape: [1], chunks: [1], dtype: '<i4' }),
-      { 0: littleEndianBytes([7], 'setInt32', 4) }
-    );
-    loader._nObs = 2;
     await assert.rejects(
-      loader.getObsField('batch'),
-      /observation field.*batch.*length.*2/i
+      openAnnData(storeWith({ obs: { batch: array(new Int32Array([7]), { dtype: '<i4' }) } })),
+      /Observation dataframe column 'batch' length 1 does not match 2/
     );
   });
 
   await t.test('ordinary field rank', async () => {
-    const loader = arrayLoader(
-      'obs/batch',
-      metadata({ shape: [2, 1], chunks: [2, 1], dtype: '<i4' }),
-      { '0.0': littleEndianBytes([7, 8], 'setInt32', 4) }
-    );
-    loader._nObs = 2;
     await assert.rejects(
-      loader.getObsField('batch'),
-      /observation field.*batch.*one-dimensional/i
+      openAnnData(storeWith({ obs: { batch: dense(new Int32Array([7, 8]), [2, 1], { dtype: '<i4' }) } })),
+      /Observation dataframe column 'batch' must have exactly 1 dimension/
     );
   });
 
   await t.test('categorical codes metadata', async () => {
-    const loader = new ZarrLoader();
-    loader._nObs = 2;
-    loader._files = new Map([
-      ['obs/batch/.zgroup', memoryFile('{"zarr_format":2}')],
-      ['obs/batch/.zattrs', memoryFile(JSON.stringify({
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: false
-      }))],
-      ['obs/batch/categories/.zarray', memoryFile(JSON.stringify(metadata({
-        shape: [2],
-        chunks: [2],
-        dtype: '|O',
-        filters: [{ id: 'vlen-utf8' }]
-      })))],
-      ['obs/batch/categories/.zattrs', memoryFile(JSON.stringify({
-        'encoding-type': 'string-array',
-        'encoding-version': '0.2.0'
-      }))],
-      ['obs/batch/categories/0', memoryFile(vlenUtf8Bytes(['A', 'B']))],
-      ['obs/batch/codes/.zarray', memoryFile(JSON.stringify(metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|i1'
-      })))],
-      ['obs/batch/codes/.zattrs', memoryFile(JSON.stringify({
-        'encoding-type': 'array',
-        'encoding-version': '0.2.0'
-      }))],
-      ['obs/batch/codes/0', memoryFile(Uint8Array.from([0]))]
-    ]);
     await assert.rejects(
-      loader.getObsFieldInfo('batch'),
-      /categorical codes.*length.*2/i
-    );
-    await assert.rejects(
-      loader.getObsField('batch'),
-      /categorical codes.*length.*2/i
+      openAnnData(storeWith({ obs: { batch: categorical([0], ['A', 'B']) } })),
+      /Categorical codes for 'batch' length 1 does not match 2/
     );
   });
 });
 
 test('normalizes continuous int64 and Float64 obs through the public adapter seam', async t => {
-  function adapterFor(loader, key) {
-    const adapter = new BaseAnnDataAdapter(loader);
+  async function adapterFor(values, dtype, key) {
+    const { reader } = await openAnnData(storeWith({
+      nObs: values.length,
+      obs: { [key]: array(values, { dtype }) },
+    }));
+    const adapter = new BaseAnnDataAdapter(reader);
     adapter._obsFieldsMetadata = [{ key, kind: 'continuous' }];
     return adapter;
   }
 
   await t.test('safe signed int64', async () => {
-    const loader = arrayLoader(
-      'obs/count',
-      metadata({ shape: [2], chunks: [2], dtype: '<i8' }),
-      { 0: littleEndianBytes([1n, 2n], 'setBigInt64', 8) }
-    );
-    loader._nObs = 2;
-    const field = await adapterFor(loader, 'count').getObsFieldData('count');
+    const adapter = await adapterFor(new BigInt64Array([1n, 2n]), '<i8', 'count');
+    const field = await adapter.getObsFieldData('count');
     assert.equal(field.kind, 'continuous');
     assert.deepEqual(Array.from(new Float32Array(field.data)), [1, 2]);
   });
 
-  await t.test('unsafe signed int64', async () => {
-    const loader = arrayLoader(
-      'obs/count',
-      metadata({ shape: [1], chunks: [1], dtype: '<i8' }),
-      { 0: littleEndianBytes([9_007_199_254_740_992n], 'setBigInt64', 8) }
-    );
-    loader._nObs = 1;
-    await assert.rejects(
-      adapterFor(loader, 'count').getObsFieldData('count'),
-      /observation field.*count.*safe numeric range/i
-    );
+  await t.test('int64 beyond 2^53 reads as the nearest float32', async () => {
+    const adapter = await adapterFor(new BigInt64Array([9_007_199_254_740_993n, 2n ** 63n - 1n]), '<i8', 'count');
+    const field = await adapter.getObsFieldData('count');
+    assert.deepEqual(Array.from(new Float32Array(field.data)), [Math.fround(2 ** 53), Math.fround(2 ** 63)]);
   });
 
-  await t.test('finite Float64 overflow', async () => {
-    const loader = arrayLoader(
-      'obs/score',
-      metadata({ shape: [1], chunks: [1], dtype: '<f8' }),
-      { 0: littleEndianBytes([1e308], 'setFloat64', 8) }
-    );
-    loader._nObs = 1;
-    await assert.rejects(
-      adapterFor(loader, 'score').getObsFieldData('score'),
-      /observation field.*score.*Float32 range/i
-    );
+  await t.test('a Float64 value beyond float32 becomes an infinity, as numpy converts it', async () => {
+    const adapter = await adapterFor(new Float64Array([1e308, 2.5]), '<f8', 'score');
+    const field = await adapter.getObsFieldData('score');
+    assert.deepEqual(Array.from(new Float32Array(field.data)), [Number.POSITIVE_INFINITY, 2.5]);
   });
 });
 
+// ---------------------------------------------------------------------------
+// Neighbour graphs.
+// ---------------------------------------------------------------------------
+
 test('propagates malformed connectivity and enforces obs-aligned square shape', async t => {
   await t.test('loader corruption', async () => {
-    const loader = connectivityLoader({
+    const { reader } = await openAnnData(connectivityStore(sparse({
       shape: [2, 2],
-      data: [1],
-      indices: [0, 1],
-      indptr: [0, 1, 1]
-    });
+      data: new Float32Array([1]),
+      indices: new Int32Array([0, 1]),
+      indptr: new Int32Array([0, 1, 1]),
+    })));
     await assert.rejects(
-      loader.getConnectivities('connectivities'),
+      reader.getConnectivities('connectivities'),
       /data.*indices.*length/i
     );
   });
 
   await t.test('shape mismatch', async () => {
-    const loader = connectivityLoader({
+    const { reader } = await openAnnData(connectivityStore(sparse({
       shape: [3, 3],
-      data: [1],
-      indices: [1],
-      indptr: [0, 1, 1, 1]
-    }, 2);
+      data: new Float32Array([1]),
+      indices: new Int32Array([1]),
+      indptr: new Int32Array([0, 1, 1, 1]),
+    }), 2));
     await assert.rejects(
-      loader.getConnectivities('connectivities'),
+      reader.getConnectivities('connectivities'),
       /connectivity.*shape.*3.*2 cells/i
     );
   });
@@ -3955,9 +2321,9 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
     const adapter = new BaseAnnDataAdapter({
       nObs: 2,
       async getConnectivityEdges() {
-      return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
-    },
-    async readConnectivityMatrix() {
+        return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
+      },
+      async readConnectivityMatrix() {
         throw new Error('malformed connectivity payload');
       }
     });
@@ -3988,15 +2354,14 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
   try {
     for (const substituteKey of ['X_pca', 'X_tsne', 'X_phate']) {
       await t.test(substituteKey, async () => {
-        const source = new ZarrDataSource();
+        const source = new AnnDataFileSource();
         try {
-          const identity = await source.loadFromFileList(
+          const identity = await source.loadFolder(
             fileListFromMap(
               renamedEmbeddingStore(substituteKey),
               `${substituteKey.slice(2)}-only.zarr`
-            ),
-            { showProgress: false }
-          );
+            )
+    );
           const candidates = source.getAdapter().getMappingCandidates();
           assert.deepEqual(candidates.guessed, ['embeddings.2d']);
           assert.deepEqual(candidates.defaults.embeddings.defaults['2d'], {
@@ -4009,7 +2374,7 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
           assert.deepEqual(identity.embeddings.defaults, { '2d': substituteKey });
           assert.deepEqual(
             Array.from(
-              await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+              (await source.getAdapter().getEmbeddingPayload('obsm/0/0-1', 2)).positions
             ),
             [-1, -1, 1, 1]
           );
@@ -4020,18 +2385,17 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
     }
 
     await t.test('a file with nothing plottable is refused and the working source kept', async () => {
-      const source = new ZarrDataSource();
+      const source = new AnnDataFileSource();
       try {
-        await source.loadFromFileList(
+        await source.loadFolder(
           fileListFromMap(
             completeZarrStoreFiles({
               embeddingValues: [0, 0, 1, 1],
               geneValues: [1, 0, 2, 0]
             }),
             'working.zarr'
-          ),
-          { showProgress: false }
-        );
+          )
+    );
         const workingAdapter = source.getAdapter();
         const constant = completeZarrStoreFiles({
           embeddingValues: [3, 3, 3, 3],
@@ -4041,18 +2405,18 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
           constant.set(`obsm/X_spatial/${file}`, constant.get(`obsm/X_umap_2d/${file}`));
           constant.delete(`obsm/X_umap_2d/${file}`);
         }
-        const error = await source.loadFromFileList(
-          fileListFromMap(constant, 'constant.zarr'),
-          { showProgress: false }
-        ).then(() => null, rejection => rejection);
+        const error = await source.loadFolder(
+          fileListFromMap(constant, 'constant.zarr')
+    ).then(() => null, rejection => rejection);
         assert.equal(error?.code, 'NO_PLOTTABLE_EMBEDDING');
         assert.equal(
           error.message,
           'Cellucid found nothing to plot. It needs an obsm array with one ' +
           'row per cell (2) and at least one numeric column. obsm holds: ' +
-          'X_spatial (2 × 2, no coordinate variation).'
+          'X_spatial (2 × 2, no coordinate variation).' +
+          ' Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again.'
         );
-        assert.equal(source.dirname, 'working.zarr');
+        assert.equal(source.filename, 'working.zarr');
         assert.equal(source.getAdapter(), workingAdapter);
       } finally {
         source.clear();
@@ -4063,15 +2427,25 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
   }
 });
 
+/** A store whose obsm holds the given 2-cell arrays (`{key: [shape, values]}`). */
+function obsmStore(arrays, nObs = 2) {
+  return storeWith({
+    nObs,
+    obsm: mapping(Object.fromEntries(Object.entries(arrays).map(([key, [shape, values, options]]) =>
+      [key, dense(Float32Array.from(values), shape, options)]))),
+  });
+}
+
 test('Zarr slots follow the default rule, and a plain X_umap by width', async t => {
-  async function initialized(loader) {
-    const adapter = new BaseAnnDataAdapter(loader);
+  async function initialized(tree) {
+    const { reader } = await openAnnData(tree);
+    const adapter = new BaseAnnDataAdapter(reader);
     await adapter.initialize();
     return adapter;
   }
 
   await t.test('an unsuffixed X_umap array is read at its own column count', async () => {
-    const adapter = await initialized(embeddingLoader({ key: 'X_umap' }));
+    const adapter = await initialized(obsmStore({ X_umap: [[2, 2], [0, 0, 2, 4]] }));
     assert.deepEqual(adapter._slots, {
       '1d': null,
       '2d': { key: 'X_umap', columns: [0, 1] },
@@ -4081,37 +2455,26 @@ test('Zarr slots follow the default rule, and a plain X_umap by width', async t 
   });
 
   await t.test('an unsuffixed X_umap of a width no dimension has is best-guessed at its first columns', async () => {
-    const adapter = await initialized(embeddingLoader({
-      key: 'X_umap',
-      shape: [2, 10],
-      values: Array.from({ length: 20 }, (_, index) => index),
+    const adapter = await initialized(obsmStore({
+      X_umap: [[2, 10], Array.from({ length: 20 }, (_, index) => index)],
     }));
     assert.deepEqual(adapter._slots['2d'], { key: 'X_umap', columns: [0, 1] });
     assert.deepEqual(adapter.getMappingCandidates().guessed, ['embeddings.2d']);
   });
 
   await t.test('dimension-suffixed keys alone fill their slots', async () => {
-    const adapter = await initialized(embeddingLoader({
-      extraArrays: [{
-        key: 'X_umap',
-        shape: [2, 2],
-        values: [4, 4, 5, 5],
-      }],
+    const adapter = await initialized(obsmStore({
+      X_umap_2d: [[2, 2], [0, 0, 2, 4]],
+      X_umap: [[2, 2], [4, 4, 5, 5]],
     }));
     assert.deepEqual(adapter._slots['2d'], { key: 'X_umap_2d', columns: [0, 1] });
   });
 
   await t.test('a malformed suffixed key cannot be skipped for another dimension', async () => {
     await assert.rejects(
-      initialized(embeddingLoader({
-        key: 'X_umap_2d',
-        shape: [2, 3],
-        values: [0, 0, 0, 1, 1, 1],
-        extraArrays: [{
-          key: 'X_umap_3d',
-          shape: [2, 3],
-          values: [2, 2, 2, 3, 3, 3],
-        }],
+      initialized(obsmStore({
+        X_umap_2d: [[2, 3], [0, 0, 0, 1, 1, 1]],
+        X_umap_3d: [[2, 3], [2, 2, 2, 3, 3, 3]],
       })),
       /Embedding 'X_umap_2d' must have exactly 2 columns; got 3/
     );
@@ -4122,90 +2485,70 @@ test('centralizes the numeric, rank, width, and observation-axis embedding contr
   const cases = [
     [
       'zero columns',
-      embeddingLoader({ key: 'X_umap', shape: [2, 0], chunks: [2, 1] }),
+      storeWith({ obsm: mapping({ X_umap: dense(new Float32Array(0), [2, 0], { chunks: [2, 1] }) }) }),
       'has no columns',
       /reads distinct columns/i
     ],
     [
       'wrong row count',
-      embeddingLoader({
-        key: 'X_umap',
-        shape: [1, 2],
-        chunks: [1, 2],
-        values: [0, 1]
-      }),
-      'has 1 rows, the dataset has 2 cells',
-      /obsm\['X_umap'\] has 1 rows but the dataset has 2 cells/
+      obsmStore({ X_umap: [[1, 2], [0, 1]] }),
+      'has 1 row, the dataset has 2 cells',
+      /obsm\['X_umap'\] has 1 row but the dataset has 2 cells/
     ],
     [
       'nonnumeric dtype',
-      embeddingLoader({
-        key: 'X_umap',
-        shape: [2, 2],
-        dtype: '|S1'
-      }),
+      storeWith({ obsm: mapping({ X_umap: array(['a', 'b', 'c', 'd'], { dtype: '|S1', shape: [2, 2] }) }) }),
       'not a numeric array',
-      /obsm\['X_umap'\].*encoding-type.*array|numeric dtype/i
+      /obsm\['X_umap'\] holds text, not numbers/
     ],
     [
       // A boolean is not a coordinate; the H5AD reader refuses the same
       // content, so the Zarr reader must too.
       'boolean dtype',
-      embeddingLoader({
-        key: 'X_umap',
-        shape: [2, 2],
-        dtype: '|b1',
-        values: [0, 1, 1, 0]
-      }),
+      storeWith({ obsm: mapping({ X_umap: array([false, true, true, false], { dtype: '|b1', shape: [2, 2] }) }) }),
       'not a numeric array',
       /obsm\['X_umap'\] must use a numeric dtype/
     ]
   ];
 
-  for (const [name, loader, listedReason, readError] of cases) {
+  for (const [name, tree, listedReason, readError] of cases) {
     await t.test(name, async () => {
-      const [entry] = describeAnnDataProbes(await loader.probeMapping()).obsm;
+      const { reader } = await openAnnData(tree);
+      const [entry] = describeAnnDataProbes(await reader.probeMapping()).obsm;
       assert.equal(entry.usable, false);
       assert.equal(entry.reason, listedReason);
-      await assert.rejects(loader.readObsmColumns('X_umap', [0, 1]), readError);
+      await assert.rejects(reader.readObsmColumns('X_umap', [0, 1]), readError);
     });
   }
 
   await t.test('a one-dimensional array is one usable column', async () => {
-    const loader = arrayLoader(
-      'obsm/pseudotime',
-      metadata({ shape: [2], chunks: [2], dtype: '<f4' }),
-      { 0: littleEndianBytes([3, 7], 'setFloat32', 4) }
-    );
-    setCurrentMapping(loader._files, 'obsm');
-    loader._nObs = 2;
-    const [entry] = describeAnnDataProbes(await loader.probeMapping()).obsm;
+    const { reader } = await openAnnData(storeWith({
+      obsm: mapping({ pseudotime: array(new Float32Array([3, 7])) }),
+    }));
+    const [entry] = describeAnnDataProbes(await reader.probeMapping()).obsm;
     assert.deepEqual(
       [entry.key, entry.shape, entry.usable],
       ['pseudotime', [2], true]
     );
     assert.deepEqual(
-      Array.from(await loader.readObsmColumns('pseudotime', [0])),
+      Array.from(await reader.readObsmColumns('pseudotime', [0])),
       [3, 7]
     );
   });
 });
 
 test('a dimension-suffixed vector field with the wrong cell axis is listed unusable and never bound', async () => {
-  const loader = embeddingLoader({
-    extraArrays: [{
-      key: 'velocity_umap_2d',
-      shape: [1, 2],
-      values: [1, 2]
-    }]
-  });
-  const adapter = new BaseAnnDataAdapter(loader);
+  const { reader } = await openAnnData(obsmStore({
+    X_umap_2d: [[2, 2], [0, 0, 2, 4]],
+    velocity_umap_2d: [[1, 2], [1, 2]],
+  }));
+  const adapter = new BaseAnnDataAdapter(reader);
   await adapter.initialize();
   assert.equal(adapter._vectorBindings.size, 0);
   const entry = adapter.getMappingCandidates().obsm
     .find(item => item.key === 'velocity_umap_2d');
   assert.equal(entry.usable, false);
-  assert.equal(entry.reason, 'has 1 rows, the dataset has 2 cells');
+  assert.equal(entry.reason, 'has 1 row, the dataset has 2 cells');
   assert.deepEqual(adapter.getMappingCandidates().defaults.vectorFields, []);
 });
 
@@ -4217,8 +2560,8 @@ test('extracts exact symmetric CSC connectivity and rejects duplicate coordinate
     indptr: Int32Array.from([0, 1, 2]),
     indices: Int32Array.from([1, 0])
   }, 2);
-  assert.deepEqual(Array.from(csc.sources), [0]);
-  assert.deepEqual(Array.from(csc.destinations), [1]);
+  assert.deepEqual(Array.from(edgeListOf(csc).sources), [0]);
+  assert.deepEqual(Array.from(edgeListOf(csc).destinations), [1]);
 
   assert.throws(
     () => extractConnectivityEdges({
@@ -4233,263 +2576,163 @@ test('extracts exact symmetric CSC connectivity and rejects duplicate coordinate
 });
 
 test('Zarr connectivity requires exact obsp mapping identity', async t => {
-  const invalidCases = [
-    [
-      'missing group marker',
-      files => files.delete('obsp/.zgroup'),
-      /obsp.*\.zgroup.*required/i
-    ],
-    [
-      'malformed group marker',
-      files => files.set('obsp/.zgroup', memoryFile('{')),
-      /obsp.*\.zgroup.*valid JSON/i
-    ],
-    [
-      'non-v2 group marker',
-      files => files.set(
-        'obsp/.zgroup',
-        memoryFile('{"zarr_format":3}')
-      ),
-      /obsp.*\.zgroup.*zarr_format.*2/i
-    ],
-    [
-      'missing mapping attributes',
-      files => files.delete('obsp/.zattrs'),
-      /obsp.*\.zattrs.*required/i
-    ],
+  const graph = () => zarrEntries(connectivityStore(sparse({
+    shape: [2, 2],
+    data: new Float32Array([1, 1]),
+    indices: new Int32Array([1, 0]),
+    indptr: new Int32Array([0, 1, 2]),
+  })));
+  const storeRefusals = [
+    ['malformed group marker', files => files.set('obsp/.zgroup', json('{')), /obsp\/\.zgroup is not valid JSON/i],
+    ['non-v2 group marker', files => files.set('obsp/.zgroup', json('{"zarr_format":3}')), /obsp\/\.zgroup' must declare "zarr_format": 2/i],
+  ];
+  for (const [name, mutate, expected] of storeRefusals) {
+    await t.test(name, async () => {
+      const entries = graph();
+      mutate(entries);
+      await assert.rejects(openRoot(entries), expected);
+    });
+  }
+
+  const readerRefusals = [
+    ['missing mapping attributes', files => files.delete('obsp/.zattrs'), /AnnData Zarr obsp mapping encoding-type must be exactly 'dict'/],
     [
       'wrong mapping type',
-      files => files.set(
-        'obsp/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'mapping',
-          'encoding-version': '0.1.0'
-        }))
-      ),
+      files => files.set('obsp/.zattrs', json({ 'encoding-type': 'mapping', 'encoding-version': '0.1.0' })),
       /obsp.*encoding-type.*dict/i
     ],
     [
       'wrong mapping version',
-      files => files.set(
-        'obsp/.zattrs',
-        memoryFile(JSON.stringify({
-          'encoding-type': 'dict',
-          'encoding-version': '9.9.9'
-        }))
-      ),
+      files => files.set('obsp/.zattrs', json({ 'encoding-type': 'dict', 'encoding-version': '9.9.9' })),
       /obsp.*encoding-version.*0\.1\.0/i
     ]
   ];
-
-  for (const [name, mutate, expected] of invalidCases) {
+  for (const [name, mutate, expected] of readerRefusals) {
     await t.test(name, async () => {
-      const loader = connectivityLoader({ shape: [2, 2] }, 2);
-      mutate(loader._files);
-      await assert.rejects(loader.hasConnectivities('connectivities'), expected);
+      const entries = graph();
+      mutate(entries);
+      const { reader } = await openAnnData(entries);
+      await assert.rejects(reader.hasConnectivities('connectivities'), expected);
     });
   }
 });
 
 test('keeps sparse connectivity payloads lazy while reporting metadata presence', async () => {
-  const loader = embeddingLoader();
-  setCurrentMapping(loader._files, 'obsp');
-  loader._files.set(
-    'obsp/connectivities/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'csr_matrix',
-      'encoding-version': '0.1.0',
-      shape: [2, 2]
-    }))
-  );
-  loader._files.set('obsp/connectivities/.zgroup', memoryFile('{"zarr_format":2}'));
-  loader._readSparseMetadataContract = async () => ({
-    format: 'csr',
+  const { reader, fetched } = await openAnnData(connectivityStore(sparse({
     shape: [2, 2],
-    dataMeta: metadata({ shape: [1], chunks: [1], dtype: '<f4' })
-  });
-  loader._readSparseMatrix = async () => {
-    throw new Error('connectivity payload must remain lazy');
-  };
-
-  const dataset = await loader.getDatasetMetadata();
+    data: new Float32Array([1, 1]),
+    indices: new Int32Array([1, 0]),
+    indptr: new Int32Array([0, 1, 2]),
+  })));
+  const dataset = await reader.getDatasetMetadata();
   assert.equal(dataset.stats.has_connectivity, true);
+  assert.deepEqual(fetched.filter(key => key.startsWith('obsp/')), []);
 });
 
 test('supports bounded dense AnnData connectivity arrays without sparse misclassification', async () => {
-  const loader = embeddingLoader();
-  setCurrentMapping(loader._files, 'obsp');
-  loader._files.set(
-    'obsp/connectivities/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))
-  );
-  loader._files.set(
-    'obsp/connectivities/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '<f4'
-    })))
-  );
-  loader._files.set(
-    'obsp/connectivities/0.0',
-    memoryFile(littleEndianBytes([0, 1, 1, 0], 'setFloat32', 4))
-  );
-
-  const adapter = new BaseAnnDataAdapter(loader);
+  const { reader } = await openAnnData(connectivityStore(dense(new Float32Array([0, 1, 1, 0]), [2, 2])));
+  const adapter = new BaseAnnDataAdapter(reader);
   await adapter.initialize();
   assert.equal(adapter.getMetadata().stats.has_connectivity, true);
   const edges = await adapter.getConnectivityEdges();
   assert.equal(edges.nEdges, 1);
-  assert.deepEqual(Array.from(edges.sources), [0]);
-  assert.deepEqual(Array.from(edges.destinations), [1]);
-  assert.deepEqual(Array.from(edges.weights), [1]);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), [0]);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1]);
+  assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([1]));
 });
 
 test('rejects mixed dense and sparse connectivity representations', async () => {
-  const loader = embeddingLoader();
-  setCurrentMapping(loader._files, 'obsp');
-  loader._files.set(
-    'obsp/connectivities/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))
-  );
-  loader._files.set(
-    'obsp/connectivities/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '<f4'
-    })))
-  );
-  loader._files.set(
-    'obsp/connectivities/.zgroup',
-    memoryFile('{"zarr_format":2}')
-  );
-
+  const entries = zarrEntries(connectivityStore(dense(new Float32Array([0, 1, 1, 0]), [2, 2])));
+  entries.set('obsp/connectivities/.zgroup', json({ zarr_format: 2 }));
   await assert.rejects(
-    loader.hasConnectivities('connectivities'),
-    /exactly one dense or sparse representation/i
+    openRoot(entries),
+    /is both an array \(\.zarray\) and a group \(\.zgroup\)/
   );
-});
-
-test('Zarr preserves exact sparse connectivity weights through extraction', async () => {
-  const weighted = 1 + (2 ** -30);
-  const loader = connectivityLoader({
-    shape: [2, 2],
-    data: [weighted, weighted],
-    dataDtype: '<f8',
-    dataBytes: littleEndianBytes(
-      [weighted, weighted],
-      'setFloat64',
-      8
-    ),
-    indices: [1, 0],
-    indptr: [0, 1, 2],
-  }, 2);
-  const result = await loader.getConnectivities('connectivities');
-  assert.equal(result.data instanceof Float64Array, true);
-  assert.equal(result.data[0], weighted);
-  const edges = extractConnectivityEdges(result, 2);
-  assert.deepEqual(Array.from(edges.weights), [weighted]);
 });
 
 test('preserves an explicitly present empty connectivity matrix', async () => {
-  const connLoader = connectivityLoader({
+  const { reader } = await openAnnData(connectivityStore(sparse({
     shape: [2, 2],
-    data: [],
-    indices: [],
-    indptr: [0, 0, 0]
-  });
-  const embedding = embeddingLoader();
-  for (const [path, file] of embedding._files) {
-    connLoader._files.set(path, file);
-  }
-  connLoader._rootName = 'empty-connectivity.zarr';
-
-  const adapter = new BaseAnnDataAdapter(connLoader);
+    data: new Float32Array(0),
+    indices: new Int32Array(0),
+    indptr: new Int32Array([0, 0, 0]),
+  })), { name: 'empty-connectivity.zarr' });
+  const adapter = new BaseAnnDataAdapter(reader);
   await adapter.initialize();
   assert.equal(adapter.getMetadata().stats.has_connectivity, true);
   const edges = await adapter.getConnectivityEdges();
   assert.equal(edges.nCells, 2);
   assert.equal(edges.nEdges, 0);
   assert.equal(edges.maxNeighbors, 0);
-  assert.deepEqual(Array.from(edges.sources), []);
-  assert.deepEqual(Array.from(edges.destinations), []);
-  assert.deepEqual(Array.from(edges.weights), []);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), []);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), []);
+  assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([]));
 });
 
+// ---------------------------------------------------------------------------
+// Lifecycle: failed reads, replacement, superseded work.
+// ---------------------------------------------------------------------------
+
+/** A 2-cell, 1-gene CSC X whose column is [4, 0]. */
+function cscStore() {
+  return storeWith({
+    nObs: 2,
+    genes: ['A'],
+    X: sparse({ format: 'csc', shape: [2, 1], data: new Float32Array([4]), indices: new Int32Array([0]), indptr: new Int32Array([0, 1]) }),
+  });
+}
+
 test('a later sparse X caller starts clean after an earlier rejected invocation', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([['.zattrs', memoryFile('{}')]]);
-  loader._nObs = 2;
-  loader._nVars = 1;
-  let calls = 0;
-  loader._openMatrixColumns = async () => {
-    calls++;
-    if (calls === 1) throw new Error('transient sparse read failure');
-    return { column: () => Float32Array.from([4, 0]) };
-  };
+  let failures = 0;
+  const { reader, reads } = await openAnnData(cscStore(), {
+    onChunk(key) {
+      if (key === 'X/indptr/0' && failures === 0) {
+        failures++;
+        throw new Error('transient sparse read failure');
+      }
+    },
+  });
 
   await assert.rejects(
-    readXColumn(loader, 0, { sparse: true }),
+    reader.getMatrixColumn('X', 0),
     /transient sparse read failure/i
   );
-  assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [4, 0]);
-  assert.equal(calls, 2);
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [4, 0]);
+  assert.equal(readsOf(reads, 'X/indptr').length, 2);
 });
 
 test('opens and replaces Zarr stores transactionally without stale caches', async () => {
-  const loader = new ZarrLoader();
   const malformed = new Map([
-    ['.zgroup', memoryFile('{"zarr_format":2}')],
-    ['.zattrs', memoryFile('{')]
+    ['.zgroup', json({ zarr_format: 2 })],
+    ['.zattrs', json('{')]
   ]);
+  const reader = new AnnDataReader();
+  const openInto = async (entries, name) => {
+    const { root } = await openRoot(entries, { name });
+    await reader.open(root, { format: ZARR_FORMAT, name });
+  };
 
-  assert.equal(typeof loader.openFileMap, 'function');
-  await assert.rejects(
-    loader.openFileMap(malformed, 'malformed.zarr'),
-    /JSON|property name|expected/i
-  );
-  assert.equal(loader.isOpen, false);
+  await assert.rejects(openInto(malformed, 'malformed.zarr'), /not valid JSON/i);
+  assert.equal(reader.isOpen, false);
 
-  await loader.openFileMap(
-    completeZarrStoreFiles({
-      embeddingValues: [0, 0, 2, 4],
-      geneValues: [1, 2, 3, 4]
-    }),
-    'first.zarr'
-  );
-  assert.deepEqual(Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])), [0, 0, 2, 4]);
-  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [1, 3]);
+  await openInto(completeZarrStoreFiles({ embeddingValues: [0, 0, 2, 4], geneValues: [1, 2, 3, 4] }), 'first.zarr');
+  assert.deepEqual(Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])), [0, 0, 2, 4]);
+  assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [1, 3]);
 
-  await loader.openFileMap(
-    completeZarrStoreFiles({
-      embeddingValues: [10, 20, 30, 40],
-      geneValues: [5, 6, 7, 8]
-    }),
-    'second.zarr'
-  );
+  await openInto(completeZarrStoreFiles({ embeddingValues: [10, 20, 30, 40], geneValues: [5, 6, 7, 8] }), 'second.zarr');
   assert.deepEqual(
-    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
+    Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])),
     [10, 20, 30, 40]
   );
-  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [5, 7]);
+  assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [5, 7]);
 
-  await assert.rejects(
-    loader.openFileMap(malformed, 'replacement.zarr'),
-    /JSON|property name|expected/i
-  );
-  assert.equal(loader.isOpen, true);
+  await assert.rejects(openInto(malformed, 'replacement.zarr'), /not valid JSON/i);
+  assert.equal(reader.isOpen, true);
   assert.deepEqual(
-    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
+    Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])),
     [10, 20, 30, 40]
   );
-  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [5, 7]);
+  assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [5, 7]);
 });
 
 test('a categorical dictionary past 65,535 categories is served with uint32 codes', async () => {
@@ -4500,7 +2743,8 @@ test('a categorical dictionary past 65,535 categories is served with uint32 code
       return {
         dtype: 'categorical',
         categories,
-        codes: Int32Array.from([65_535, -1])
+        // As the reader worker narrows them (`narrowCategoricalCodes`).
+        codes: Uint32Array.from([65_535, 0xffffffff])
       };
     }
   });
@@ -4510,7 +2754,7 @@ test('a categorical dictionary past 65,535 categories is served with uint32 code
     categories
   }];
 
-  assert.doesNotThrow(() => adapter.getObsManifest());
+  assert.doesNotThrow(() => adapter.getObsFields());
   const payload = await adapter.getObsFieldData('large_category');
   assert.equal(payload.dtype, 'uint32');
   assert.equal(payload.missingValue, 4_294_967_295);
@@ -4518,130 +2762,25 @@ test('a categorical dictionary past 65,535 categories is served with uint32 code
 });
 
 test('loads standard nullable integer and boolean observation groups with missing values', async () => {
-  const loader = embeddingLoader({
+  const { reader } = await openAnnData(storeWith({
     nObs: 3,
-    shape: [3, 2],
-    values: [0, 0, 1, 1, 2, 2]
-  });
-  loader._obsKeys = [
-    'nullable_count',
-    'nullable_flag',
-    'nullable_label'
-  ];
-  setCurrentGroup(loader._files, 'obs/nullable_count', {
-    'encoding-type': 'nullable-integer',
-    'encoding-version': '0.1.0'
-  });
-  loader._files.set(
-    'obs/nullable_count/values/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '<i8'
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    'obs/nullable_count/values',
-    { dtype: '<i8' }
-  );
-  loader._files.set(
-    'obs/nullable_count/values/0',
-    memoryFile(littleEndianBytes([1n, 0n, 3n], 'setBigInt64', 8))
-  );
-  loader._files.set(
-    'obs/nullable_count/mask/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '|b1'
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    'obs/nullable_count/mask',
-    { dtype: '|b1' }
-  );
-  loader._files.set(
-    'obs/nullable_count/mask/0',
-    memoryFile(Uint8Array.from([0, 1, 0]))
-  );
-  setCurrentGroup(loader._files, 'obs/nullable_flag', {
-    'encoding-type': 'nullable-boolean',
-    'encoding-version': '0.1.0'
-  });
-  for (const child of ['values', 'mask']) {
-    loader._files.set(
-      `obs/nullable_flag/${child}/.zarray`,
-      memoryFile(JSON.stringify(metadata({
-        shape: [3],
-        chunks: [3],
-        dtype: '|b1'
-      })))
-    );
-    setCurrentArrayAttrs(
-      loader._files,
-      `obs/nullable_flag/${child}`,
-      { dtype: '|b1' }
-    );
-  }
-  loader._files.set(
-    'obs/nullable_flag/values/0',
-    memoryFile(Uint8Array.from([1, 0, 0]))
-  );
-  loader._files.set(
-    'obs/nullable_flag/mask/0',
-    memoryFile(Uint8Array.from([0, 1, 0]))
-  );
-  setCurrentGroup(loader._files, 'obs/nullable_label', {
-    'encoding-type': 'nullable-string-array',
-    'encoding-version': '0.1.0'
-  });
-  loader._files.set(
-    'obs/nullable_label/values/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '|O',
-      filters: [{ id: 'vlen-utf8' }]
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    'obs/nullable_label/values',
-    { dtype: '|O' }
-  );
-  loader._files.set(
-    'obs/nullable_label/values/0',
-    memoryFile(vlenUtf8Bytes(['A', 'ignored', 'C']))
-  );
-  loader._files.set(
-    'obs/nullable_label/mask/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '|b1'
-    })))
-  );
-  setCurrentArrayAttrs(
-    loader._files,
-    'obs/nullable_label/mask',
-    { dtype: '|b1' }
-  );
-  loader._files.set(
-    'obs/nullable_label/mask/0',
-    memoryFile(Uint8Array.from([0, 1, 0]))
-  );
-  loader._nObs = 3;
+    obs: {
+      nullable_count: nullable('nullable-integer', new BigInt64Array([1n, 0n, 3n]), [0, 1, 0]),
+      nullable_flag: nullable('nullable-boolean', [true, false, false], [0, 1, 0]),
+      nullable_label: nullable('nullable-string-array', ['A', 'ignored', 'C'], [0, 1, 0]),
+    },
+  }));
 
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(reader);
   await adapter.initialize();
   assert.deepEqual(
     adapter.getMetadata().obs_fields,
     [
       { key: 'nullable_count', kind: 'continuous', n_categories: undefined },
-      { key: 'nullable_flag', kind: 'category', n_categories: 2 },
-      { key: 'nullable_label', kind: 'category', n_categories: 2 }
+      // Boolean and string columns: their categories are found when they
+      // are first loaded, so opening reads none of their values.
+      { key: 'nullable_flag', kind: 'category', n_categories: null },
+      { key: 'nullable_label', kind: 'category', n_categories: null }
     ]
   );
 
@@ -4661,11 +2800,44 @@ test('loads standard nullable integer and boolean observation groups with missin
   assert.deepEqual(Array.from(new Uint8Array(label.data)), [0, 255, 1]);
 });
 
+test('opening reads no value of a string column, however many distinct labels it has; loading it finds them', async () => {
+  // A per-cell unique column (a barcode, CELLxGENE's observation_joinid) is
+  // read only when it is used.
+  const nObs = 5000;
+  const ids = Array.from({ length: nObs }, (_, cell) => `cell-${cell}`);
+  const { reader, fetched } = await openAnnData(storeWith({
+    nObs,
+    obs: {
+      observation_joinid: strings(ids),
+      flag: nullable('nullable-boolean', Array.from({ length: nObs }, (_, cell) => cell % 2 === 0), new Array(nObs).fill(0)),
+    },
+  }));
+  const adapter = new BaseAnnDataAdapter(reader);
+  await adapter.initialize();
+  assert.deepEqual(fetched.filter(key => key.startsWith('obs/observation_joinid/') || key.startsWith('obs/flag/')), [],
+    'opening fetched no chunk of either column');
+  assert.deepEqual(
+    adapter.getObsFields().fields.filter(field => field.kind === 'category').map(field => [field.key, field.categories, field.codesDtype, field.codesMissingValue]),
+    [['observation_joinid', null, null, null], ['flag', null, null, null]]
+  );
+
+  const joinid = await adapter.getObsFieldData('observation_joinid');
+  assert.ok(fetched.some(key => key.startsWith('obs/observation_joinid/')), 'loading reads it');
+  assert.equal(joinid.categories.length, nObs);
+  assert.equal(joinid.dtype, 'uint16', 'its code width follows the categories found');
+  const codes = new Uint16Array(joinid.data);
+  assert.equal(joinid.categories[codes[1234]], 'cell-1234');
+
+  const flag = await adapter.getObsFieldData('flag');
+  assert.deepEqual(flag.categories, [false, true]);
+  assert.deepEqual(Array.from(new Uint8Array(flag.data).subarray(0, 3)), [1, 0, 1]);
+});
+
 test('connectivity extraction refuses no graph for its size', () => {
   // The only limit on a graph is the memory the engine grants when the
   // arrays are allocated; a large graph is never refused by a fixed cap.
   const source = readFileSync(
-    new URL('../assets/js/data/sparse-utils.js', import.meta.url),
+    new URL('../assets/js/data/connectivity-edges.js', import.meta.url),
     'utf8'
   );
   assert.doesNotMatch(source, /MAX_CONNECTIVITY_WORKING_BYTES|working set exceeds|browser limit/i);
@@ -4677,54 +2849,39 @@ test('connectivity extraction refuses no graph for its size', () => {
     indptr: Int32Array.from([0, 1, 3, 4]),
     indices: Int32Array.from([1, 0, 2, 1]),
   }, 3);
-  assert.deepEqual(Array.from(edges.sources), [0, 1]);
-  assert.deepEqual(Array.from(edges.destinations), [1, 2]);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), [0, 1]);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1, 2]);
 });
 
 test('does not publish an invalidated in-flight sparse matrix into replacement state', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([['.zattrs', memoryFile('{}')]]);
-  loader._nObs = 1;
-  loader._nVars = 1;
-  let resolveOld;
-  let calls = 0;
-  const oldRead = new Promise(resolve => {
-    resolveOld = resolve;
-  });
-  loader._openMatrixColumns = async () => {
-    calls++;
-    if (calls === 1) return oldRead;
-    return { column: () => Float32Array.from([9]) };
-  };
+  const hold = holdFirst('X/indptr/0');
+  const { reader, reads } = await openAnnData(cscStore(), { onChunk: hold.onChunk });
 
-  const oldColumn = readXColumn(loader, 0, { sparse: true });
-  const staleAssertion = assert.rejects(
-    oldColumn,
-    /dataset.*(changed|superseded)|superseded.*dataset/i
-  );
-  await new Promise(resolve => setTimeout(resolve, 0));
-  const staleState = loader._matrix;
-  loader.clearCache();
-  assert.equal(loader._matrix, null, 'clearing releases the resident matrix');
-  resolveOld({ column: () => Float32Array.from([7]) });
+  const oldColumn = reader.getMatrixColumn('X', 0);
+  const staleAssertion = assert.rejects(oldColumn, SUPERSEDED);
+  await hold.started;
+  const staleState = reader._matrices.get('X');
+  reader.clearCache();
+  assert.equal(reader._matrices.size, 0, 'clearing releases the resident matrices');
+  hold.release();
 
   await staleAssertion;
   assert.equal(staleState.columns, null, 'the stale load is not published');
-  assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [9]);
-  assert.notStrictEqual(loader._matrix, staleState);
-  assert.equal(calls, 2);
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 0)), [4, 0]);
+  assert.notStrictEqual(reader._matrices.get('X'), staleState);
+  // A CSC matrix's pointers are read once, as the dataset opens: they are
+  // the file's, so a cleared cache reads them no second time.
+  assert.equal(readsOf(reads, 'X/indptr').length, 1);
 });
 
 // Both writers store every continuous value as Float32 and round integers
 // above 2^24 to the nearest Float32, so a file read directly reads the same.
 test('integer observation values round to Float32 exactly as the writers export them', async () => {
-  const loader = arrayLoader(
-    'obs/count',
-    metadata({ shape: [1], chunks: [1], dtype: '<i8' }),
-    { 0: littleEndianBytes([16_777_217n], 'setBigInt64', 8) }
-  );
-  loader._nObs = 1;
-  const adapter = new BaseAnnDataAdapter(loader);
+  const { reader } = await openAnnData(storeWith({
+    nObs: 1,
+    obs: { count: array(new BigInt64Array([16_777_217n]), { dtype: '<i8' }) },
+  }));
+  const adapter = new BaseAnnDataAdapter(reader);
   adapter._obsFieldsMetadata = [{ key: 'count', kind: 'continuous' }];
 
   const field = await adapter.getObsFieldData('count');
@@ -4746,346 +2903,123 @@ test('rejects duplicate connectivity coordinates instead of summing them', () =>
 });
 
 test('rejects async results from a superseded Zarr dataset generation', async t => {
-  const supersededPattern = /dataset.*(changed|superseded)|superseded.*dataset/i;
-
   await t.test('dense gene load and outer gene cache', async () => {
-    const loader = new ZarrLoader();
-    const oldStore = completeZarrStoreFiles({
-      embeddingValues: [1, 2, 3, 4],
-      geneValues: [7, 0, 8, 0]
+    const hold = holdFirst('X/0.0');
+    const reader = new AnnDataReader();
+    await openAnnData(completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [7, 0, 8, 0] }), {
+      reader, name: 'old-dense.zarr', onChunk: hold.onChunk,
     });
-    const delayed = deferredMemoryFile(
-      littleEndianBytes([7, 0, 8, 0], 'setFloat32', 4)
-    );
-    oldStore.set('X/0.0', delayed.file);
-    await loader.openFileMap(oldStore, 'old-dense.zarr');
 
-    const staleRequest = geneColumnByName(loader, 'A');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await delayed.started;
-    await loader.openFileMap(
-      completeZarrStoreFiles({
-        embeddingValues: [9, 10, 11, 12],
-        geneValues: [9, 0, 10, 0]
-      }),
-      'new-dense.zarr'
-    );
-    delayed.release();
+    const staleAssertion = assert.rejects(geneColumnByName(reader, 'A'), SUPERSEDED);
+    await hold.started;
+    await openAnnData(completeTree({ embeddingValues: [9, 10, 11, 12], geneValues: [9, 0, 10, 0] }), {
+      reader, name: 'new-dense.zarr',
+    });
+    hold.release();
 
     await staleAssertion;
-    assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9, 10]);
+    assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [9, 10]);
   });
 
   await t.test('embedding cache', async () => {
-    const loader = new ZarrLoader();
-    const oldStore = completeZarrStoreFiles({
-      embeddingValues: [1, 2, 3, 4],
-      geneValues: [1, 0, 2, 0]
+    const hold = holdFirst('obsm/X_umap_2d/0.0');
+    const reader = new AnnDataReader();
+    await openAnnData(completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }), {
+      reader, name: 'old-embedding.zarr', onChunk: hold.onChunk,
     });
-    const delayed = deferredMemoryFile(
-      littleEndianBytes([1, 2, 3, 4], 'setFloat32', 4)
-    );
-    oldStore.set('obsm/X_umap_2d/0.0', delayed.file);
-    await loader.openFileMap(oldStore, 'old-embedding.zarr');
 
-    const staleRequest = loader.readObsmColumns('X_umap_2d', [0, 1]);
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await delayed.started;
-    await loader.openFileMap(
-      completeZarrStoreFiles({
-        embeddingValues: [9, 10, 11, 12],
-        geneValues: [9, 0, 10, 0]
-      }),
-      'new-embedding.zarr'
-    );
-    delayed.release();
+    const staleAssertion = assert.rejects(reader.readObsmColumns('X_umap_2d', [0, 1]), SUPERSEDED);
+    await hold.started;
+    await openAnnData(completeTree({ embeddingValues: [9, 10, 11, 12], geneValues: [9, 0, 10, 0] }), {
+      reader, name: 'new-embedding.zarr',
+    });
+    hold.release();
 
     await staleAssertion;
     assert.deepEqual(
-      Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
+      Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])),
       [9, 10, 11, 12]
     );
   });
 
   await t.test('sparse outer gene cache', async () => {
-    const loader = new ZarrLoader();
-    loader._files = new Map([['.zattrs', memoryFile('{}')]]);
-    loader._rootName = 'old-sparse.zarr';
-    loader._nObs = 1;
-    loader._nVars = 1;
-    loader._varNames = ['A'];
-    stubXElement(loader, { sparse: true, nVars: 1 });
+    const hold = holdFirst('X/indptr/0');
+    const { reader, reads } = await openAnnData(cscStore(), { name: 'old-sparse.zarr', onChunk: hold.onChunk });
 
-    let markStarted;
-    let releaseOld;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const oldRead = new Promise(resolve => {
-      releaseOld = resolve;
-    });
-    let calls = 0;
-    loader._openMatrixColumns = async () => {
-      calls++;
-      if (calls === 1) {
-        markStarted();
-        return oldRead;
-      }
-      return { column: () => Float32Array.from([9]) };
-    };
-
-    const staleRequest = geneColumnByName(loader, 'A');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await started;
-    loader.clearCache();
-    releaseOld({ column: () => Float32Array.from([7]) });
+    const staleAssertion = assert.rejects(geneColumnByName(reader, 'A'), SUPERSEDED);
+    await hold.started;
+    reader.clearCache();
+    hold.release();
 
     await staleAssertion;
-    assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9]);
-    assert.equal(calls, 2);
+    assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [4, 0]);
+    assert.equal(readsOf(reads, 'X/indptr').length, 1, 'the pointers read as the dataset opened serve the next gene');
   });
 
   await t.test('observation metadata cache', async () => {
-    const loader = new ZarrLoader();
-    loader._files = new Map([['obs/label/.zarray', memoryFile('{}')]]);
-    loader._nObs = 1;
+    const hold = holdFirst('obs/label/categories/0');
+    const { reader } = await openAnnData(storeWith({
+      nObs: 1,
+      obs: { label: categorical([0], ['A']) },
+    }), { onChunk: hold.onChunk });
 
-    let markStarted;
-    let releaseOld;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const oldMeta = new Promise(resolve => {
-      releaseOld = resolve;
-    });
-    let calls = 0;
-    loader._readArrayMeta = async () => {
-      calls++;
-      if (calls === 1) {
-        markStarted();
-        return oldMeta;
-      }
-      return metadata({
-        shape: [1],
-        chunks: [1],
-        dtype: '|O',
-        filters: [{ id: 'vlen-utf8' }]
-      });
-    };
-    loader._readAttrs = async () => ({
-      'encoding-type': calls <= 1 ? 'array' : 'string-array',
-      'encoding-version': '0.2.0'
-    });
-
-    const staleRequest = loader.getObsFieldInfo('label');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await started;
-    loader.clearCache();
-    releaseOld(metadata({ shape: [1], chunks: [1], dtype: '<f4' }));
+    const staleAssertion = assert.rejects(reader.getObsFieldInfo('label'), SUPERSEDED);
+    await hold.started;
+    reader.clearCache();
+    hold.release();
 
     await staleAssertion;
-    assert.deepEqual(await loader.getObsFieldInfo('label'), { dtype: 'string' });
+    assert.deepEqual(await reader.getObsFieldInfo('label'), { dtype: 'categorical', categories: ['A'], ordered: false, colors: null });
   });
 
   await t.test('observation value cache', async () => {
-    const loader = new ZarrLoader();
-    loader._files = new Map([['obs/value/.zarray', memoryFile('{}')]]);
-    loader._nObs = 1;
-    loader._readAttrs = async () => ({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    });
-    loader._readArrayMeta = async () => metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<f4'
-    });
+    const hold = holdFirst('obs/value/0');
+    const { reader } = await openAnnData(storeWith({
+      nObs: 1,
+      obs: { value: array(new Float32Array([9])) },
+    }), { onChunk: hold.onChunk });
 
-    let markStarted;
-    let releaseOld;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const oldArray = new Promise(resolve => {
-      releaseOld = resolve;
-    });
-    let calls = 0;
-    loader._readArray = async () => {
-      calls++;
-      if (calls === 1) {
-        markStarted();
-        return oldArray;
-      }
-      return {
-        data: Float32Array.from([9]),
-        dtype: '<f4',
-        shape: [1]
-      };
-    };
-
-    const staleRequest = loader.getObsField('value');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await started;
-    loader.clearCache();
-    releaseOld({
-      data: Float32Array.from([1]),
-      dtype: '<f4',
-      shape: [1]
-    });
+    const staleAssertion = assert.rejects(reader.getObsField('value'), SUPERSEDED);
+    await hold.started;
+    reader.clearCache();
+    hold.release();
 
     await staleAssertion;
-    assert.deepEqual(
-      Array.from((await loader.getObsField('value')).values),
-      [9]
-    );
-  });
-
-  await t.test('connectivity metadata cache', async () => {
-    const loader = new ZarrLoader();
-    loader._files = new Map([
-      ['obsp/connectivities/.zarray', memoryFile('{}')],
-      ['obsp/connectivities/.zattrs', memoryFile(JSON.stringify({
-        'encoding-type': 'array',
-        'encoding-version': '0.2.0'
-      }))]
-    ]);
-    setCurrentMapping(loader._files, 'obsp');
-    loader._nObs = 1;
-
-    let markStarted;
-    let releaseOld;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const oldMeta = new Promise(resolve => {
-      releaseOld = resolve;
-    });
-    loader._readArrayMeta = async () => {
-      markStarted();
-      return oldMeta;
-    };
-
-    const staleRequest = loader.hasConnectivities('connectivities');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await started;
-    loader._files = new Map([['.zattrs', memoryFile('{}')]]);
-    loader.clearCache();
-    releaseOld(metadata({
-      shape: [1, 1],
-      chunks: [1, 1],
-      dtype: '<f4'
-    }));
-
-    await staleAssertion;
-    assert.equal(await loader.hasConnectivities('connectivities'), false);
+    assert.deepEqual(Array.from((await reader.getObsField('value')).values), [9]);
   });
 
   await t.test('connectivity payload cache', async () => {
-    const loader = new ZarrLoader();
-    loader._files = new Map([
-      ['obsp/connectivities/.zarray', memoryFile('{}')],
-      ['obsp/connectivities/.zattrs', memoryFile(JSON.stringify({
-        'encoding-type': 'array',
-        'encoding-version': '0.2.0'
-      }))]
-    ]);
-    setCurrentMapping(loader._files, 'obsp');
-    loader._nObs = 1;
-    loader._readArrayMeta = async () => metadata({
-      shape: [1, 1],
-      chunks: [1, 1],
-      dtype: '<f4'
+    const hold = holdFirst('obsp/connectivities/0.0');
+    const { reader } = await openAnnData(connectivityStore(dense(new Float32Array([0, 1, 1, 0]), [2, 2])), {
+      onChunk: hold.onChunk,
     });
 
-    let markStarted;
-    let releaseOld;
-    const started = new Promise(resolve => {
-      markStarted = resolve;
-    });
-    const oldArray = new Promise(resolve => {
-      releaseOld = resolve;
-    });
-    loader._readArray = async () => {
-      markStarted();
-      return oldArray;
-    };
-
-    const staleRequest = loader.getConnectivities('connectivities');
-    const staleAssertion = assert.rejects(staleRequest, supersededPattern);
-    await started;
-    loader._files = new Map([['.zattrs', memoryFile('{}')]]);
-    loader.clearCache();
-    releaseOld({
-      data: Float32Array.from([1]),
-      shape: [1, 1]
-    });
+    const staleAssertion = assert.rejects(reader.getConnectivities('connectivities'), SUPERSEDED);
+    await hold.started;
+    reader.clearCache();
+    hold.release();
 
     await staleAssertion;
-    assert.equal(await loader.getConnectivities('connectivities'), null);
+    assert.deepEqual(Array.from((await reader.getConnectivities('connectivities')).data), [0, 1, 1, 0]);
   });
 });
 
 test('reads official categorical v0.2 layouts with nullable-string categories', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/label/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/label/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [3],
-      chunks: [3],
-      dtype: '|i1'
-    })))],
-    ['obs/label/codes/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/codes/0', memoryFile(Uint8Array.from([0, 255, 1]))],
-    ['obs/label/categories/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-string-array',
-      'encoding-version': '0.1.0'
-    }))],
-    ['obs/label/categories/values/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|O',
-      fill_value: 0,
-      filters: [{ id: 'vlen-utf8' }]
-    })))],
-    ['obs/label/categories/values/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'string-array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/categories/values/0', memoryFile(vlenUtf8Bytes(['A', 'C']))],
-    ['obs/label/categories/mask/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: '|b1',
-      fill_value: false
-    })))],
-    ['obs/label/categories/mask/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/label/categories/mask/0', memoryFile(Uint8Array.from([0, 0]))]
-  ]);
-  loader._rootName = 'nullable-categories.zarr';
-  loader._nObs = 3;
-  loader._nVars = 0;
-  loader._obsKeys = ['label'];
-  stubPlottableObsm(loader, 3);
+  const { reader } = await openAnnData(storeWith({
+    nObs: 3,
+    obs: {
+      label: categorical([0, -1, 1], nullable('nullable-string-array', ['A', 'C'], [0, 0])),
+    },
+  }), { name: 'nullable-categories.zarr' });
 
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(asWorkerLoader(reader));
   await adapter.initialize();
 
-  const categorical = adapter.getObsManifest()._categoricalFields[0];
-  assert.equal(categorical[0], 0);
-  assert.equal(categorical[1], 'label');
-  assert.deepEqual(categorical[2], ['A', 'C']);
+  const categoricalField = adapter.getObsFields().fields.filter(field => field.kind === 'category')[0];
+  assert.equal(categoricalField.fieldIndex, 0);
+  assert.equal(categoricalField.key, 'label');
+  // Its categories are read with the field, not when the store opens.
+  assert.equal(categoricalField.categories, null);
   const field = await adapter.getObsFieldData('label');
   assert.equal(field.kind, 'category');
   assert.deepEqual(field.categories, ['A', 'C']);
@@ -5093,177 +3027,46 @@ test('reads official categorical v0.2 layouts with nullable-string categories', 
 });
 
 test('accepts a small Blosc-compressed nullable string working set', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    [
-      'obs/label/categories/.zgroup',
-      memoryFile('{"zarr_format":2}')
-    ],
-    ['obs/label/categories/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-string-array',
-      'encoding-version': '0.1.0'
-    }))]
-  ]);
-  loader._readAttrs = async path =>
-    path === 'obs/label/categories'
-      ? {
-          'encoding-type': 'nullable-string-array',
-          'encoding-version': '0.1.0'
-        }
-      : {
-          'encoding-type': path.endsWith('/values')
-            ? 'string-array'
-            : 'array',
-          'encoding-version': '0.2.0'
-        };
-  loader._readArrayMeta = async path => metadata({
-    shape: [2],
-    chunks: [2],
-    dtype: path.endsWith('/mask') ? '|b1' : '|O',
-    fill_value: path.endsWith('/mask') ? false : 0,
-    compressor: {
-      id: 'blosc',
-      cname: 'lz4',
-      clevel: 5,
-      shuffle: 1,
-      blocksize: 0
-    },
-    filters: path.endsWith('/mask') ? null : [{ id: 'vlen-utf8' }]
-  });
-
-  await loader._readNullableObsContract(
-    'obs/label/categories',
-    "label' categories",
-    'nullable-string-array',
-    null
-  );
-});
-
-test('reads nullable values and masks without overlapping decoder peaks', async () => {
-  const loader = new ZarrLoader();
-  loader._nObs = 2;
-  loader._files = new Map([
-    ['obs/label/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-string-array',
-      'encoding-version': '0.1.0'
-    }))]
-  ]);
-  loader._readNullableObsContract = async () => ({
-    valuesInfo: { category: 'object' }
-  });
-
-  let releaseValues;
-  let markValuesStarted;
-  const valuesStarted = new Promise(resolve => {
-    markValuesStarted = resolve;
-  });
-  const valuesReleased = new Promise(resolve => {
-    releaseValues = resolve;
-  });
-  let valuesActive = false;
-  let maskStartedWhileValuesActive = false;
-  loader._readArray = async path => {
-    if (path.endsWith('/values')) {
-      valuesActive = true;
-      markValuesStarted();
-      await valuesReleased;
-      valuesActive = false;
-      return { data: ['A', 'B'] };
-    }
-    if (path.endsWith('/mask')) {
-      maskStartedWhileValuesActive = valuesActive;
-      return { data: Uint8Array.from([0, 1]) };
-    }
-    throw new Error(`Unexpected nullable path '${path}'`);
-  };
-
-  const request = loader.getObsField('label');
-  await valuesStarted;
-  await Promise.resolve();
-  const overlapped = maskStartedWhileValuesActive;
-  releaseValues();
-  const field = await request;
-
-  assert.equal(overlapped, false);
-  assert.deepEqual(field.values, ['A', null]);
+  const entries = zarrEntries(group({
+    categories: nullable('nullable-string-array', ['A', 'B'], [0, 0]),
+  }));
+  for (const child of ['values', 'mask']) {
+    const isMask = child === 'mask';
+    entries.set(`categories/${child}/.zarray`, json(metadata({
+      shape: [2],
+      chunks: [2],
+      dtype: isMask ? '|b1' : '|O',
+      fill_value: isMask ? false : 0,
+      compressor: bloscLz4Metadata(),
+      filters: isMask ? null : [{ id: 'vlen-utf8' }],
+    })));
+  }
+  const { root } = await openRoot(entries);
+  const contract = nullableContract(root.get('categories'), "label' categories", 'nullable-string-array', ZARR_FORMAT, null);
+  assert.equal(contract.valuesLength, 2);
+  assert.equal(contract.valuesKind, 'string');
 });
 
 test('ignores semantically irrelevant masked nullable integer backing values', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/count/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/count/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-integer',
-      'encoding-version': '0.1.0'
-    }))],
-    ['obs/count/values/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '<u8'
-    })))],
-    ['obs/count/values/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    [
-      'obs/count/values/0',
-      memoryFile(littleEndianBytes([18_446_744_073_709_551_615n], 'setBigUint64', 8))
-    ],
-    ['obs/count/mask/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
-      dtype: '|b1',
-      fill_value: false
-    })))],
-    ['obs/count/mask/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0'
-    }))],
-    ['obs/count/mask/0', memoryFile(Uint8Array.from([1]))]
-  ]);
-  loader._nObs = 1;
-
-  const field = await loader.getObsField('count');
+  const { reader } = await openAnnData(storeWith({
+    nObs: 1,
+    obs: {
+      count: nullable('nullable-integer', new BigUint64Array([18_446_744_073_709_551_615n]), [1], { valuesDtype: '<u8' }),
+    },
+  }));
+  const field = await reader.getObsField('count');
   assert.equal(field.dtype, 'uint');
   assert.equal(field.values.length, 1);
   assert.equal(Number.isNaN(field.values[0]), true);
 });
 
 test('decodes portable IEEE-754 float16 values in both endian orders', async () => {
-  const expectedFinite = [
-    0,
-    -0,
-    1,
-    -2,
-    65_504,
-    5.960464477539063e-8
-  ];
-  const little = arrayLoader(
-    'half',
-    metadata({
-      shape: [9],
-      chunks: [9],
-      dtype: '<f2'
-    }),
-    {
-      0: bytesFromHex('00000080003c00c0ff7b0100007c00fc007e')
-    }
-  );
-  const big = arrayLoader(
-    'half',
-    metadata({
-      shape: [9],
-      chunks: [9],
-      dtype: '>f2'
-    }),
-    {
-      0: bytesFromHex('000080003c00c0007bff00017c00fc007e00')
-    }
-  );
-
-  for (const loader of [little, big]) {
-    const { data } = await loader._readArray('half');
+  const expectedFinite = [0, -0, 1, -2, 65_504, 5.960464477539063e-8];
+  for (const [dtype, hex] of [
+    ['<f2', '00000080003c00c0ff7b0100007c00fc007e'],
+    ['>f2', '000080003c00c0007bff00017c00fc007e00'],
+  ]) {
+    const data = await readArray('half', metadata({ shape: [9], chunks: [9], dtype }), { 0: bytesFromHex(hex) });
     for (let index = 0; index < expectedFinite.length; index++) {
       assert.equal(Object.is(data[index], expectedFinite[index]), true);
     }
@@ -5278,131 +3081,83 @@ test('opens official-writer float16 X and embedding through public methods', asy
     embeddingValues: [0, 0, 1, 1],
     geneValues: [1, 2, 3, 4]
   });
-  files.set(
-    'X/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '<f2'
-    })))
-  );
-  files.set('X/0.0', memoryFile(bytesFromHex('003c004000420044')));
-  files.set(
-    'obsm/X_umap_2d/.zarray',
-    memoryFile(JSON.stringify(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '<f2'
-    })))
-  );
-  files.set(
-    'obsm/X_umap_2d/0.0',
-    memoryFile(bytesFromHex('00000000003c003c'))
-  );
+  setArray(files, 'X', metadata({ shape: [2, 2], chunks: [2, 2], dtype: '<f2' }), { '0.0': bytesFromHex('003c004000420044') });
+  setArray(files, 'obsm/X_umap_2d', metadata({ shape: [2, 2], chunks: [2, 2], dtype: '<f2' }), { '0.0': bytesFromHex('00000000003c003c') });
 
-  const loader = new ZarrLoader();
-  await loader.openFileMap(files, 'float16-writer.zarr');
-  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [1, 3]);
+  const { reader } = await openAnnData(files, { name: 'float16-writer.zarr' });
+  assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [1, 3]);
   assert.deepEqual(
-    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
+    Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])),
     [0, 0, 1, 1]
   );
 });
 
 test('keeps the latest concurrent Zarr open request', async () => {
-  const firstStore = completeZarrStoreFiles({
-    embeddingValues: [1, 2, 3, 4],
-    geneValues: [1, 0, 2, 0]
-  });
-  let markStarted;
-  let releaseFirst;
-  const firstStarted = new Promise(resolve => {
-    markStarted = resolve;
-  });
-  const firstReleased = new Promise(resolve => {
-    releaseFirst = resolve;
-  });
-  firstStore.set('.zattrs', {
-    async text() {
-      markStarted();
-      await firstReleased;
-      return JSON.stringify({
-        'encoding-type': 'anndata',
-        'encoding-version': '0.1.0'
-      });
-    },
-    async arrayBuffer() {
-      throw new Error('root metadata must be read as text');
-    }
-  });
-
-  const loader = new ZarrLoader();
-  const firstRequest = loader.openFileMap(firstStore, 'first-slow.zarr');
+  // The first open is still reading its var index when the second is asked for.
+  const hold = holdFirst('var/_index/0');
+  const reader = new AnnDataReader();
+  const firstRequest = openAnnData(
+    completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }),
+    { reader, name: 'first-slow.zarr', onChunk: hold.onChunk }
+  );
   const firstAssertion = assert.rejects(
     firstRequest,
     /open request.*superseded|superseded.*open request/i
   );
-  await firstStarted;
-  await loader.openFileMap(
-    completeZarrStoreFiles({
-      embeddingValues: [9, 10, 11, 12],
-      geneValues: [9, 0, 10, 0]
-    }),
-    'second-fast.zarr'
+  await hold.started;
+  await openAnnData(
+    completeTree({ embeddingValues: [9, 10, 11, 12], geneValues: [9, 0, 10, 0] }),
+    { reader, name: 'second-fast.zarr' }
   );
-  releaseFirst();
+  hold.release();
 
   await firstAssertion;
-  assert.equal(loader._rootName, 'second-fast.zarr');
-  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9, 10]);
+  assert.equal(reader._name, 'second-fast.zarr');
+  assert.deepEqual(Array.from(await geneColumnByName(reader, 'A')), [9, 10]);
 });
 
 test('the Zarr reader publishes no notifications and a newer store supersedes an older one', async t => {
   const events = captureDownloadNotifications(t);
-  const createStore = values => completeZarrStoreFiles({
+  const createStore = values => completeTree({
     embeddingValues: values,
     geneValues: [1, 0, 2, 0],
   });
 
-  const direct = new ZarrLoader();
-  await direct.openFileMap(createStore([0, 0, 1, 1]), 'direct.zarr');
+  await openAnnData(createStore([0, 0, 1, 1]), { name: 'direct.zarr' });
   assert.deepEqual(events, [], 'the reader runs in a worker; the data source owns notifications');
 
-  const firstStore = createStore([1, 2, 3, 4]);
-  let markStarted;
-  let releaseFirst;
-  const firstStarted = new Promise(resolve => {
-    markStarted = resolve;
-  });
-  const firstReleased = new Promise(resolve => {
-    releaseFirst = resolve;
-  });
-  firstStore.set('.zattrs', {
-    async text() {
-      markStarted();
-      await firstReleased;
-      return JSON.stringify({
-        'encoding-type': 'anndata',
-        'encoding-version': '0.1.0',
-      });
-    },
-    async arrayBuffer() {
-      throw new Error('root metadata must be read as text');
-    },
-  });
-
-  const overlapping = new ZarrLoader();
-  const older = overlapping.openFileMap(firstStore, 'older.zarr');
+  const hold = holdFirst('var/_index/0');
+  const overlapping = new AnnDataReader();
+  const older = openAnnData(createStore([1, 2, 3, 4]), { reader: overlapping, name: 'older.zarr', onChunk: hold.onChunk });
   const olderAssertion = assert.rejects(older, /superseded/i);
-  await firstStarted;
-  await overlapping.openFileMap(createStore([9, 10, 11, 12]), 'newer.zarr');
-  releaseFirst();
+  await hold.started;
+  await openAnnData(createStore([9, 10, 11, 12]), { reader: overlapping, name: 'newer.zarr' });
+  hold.release();
   await olderAssertion;
-  assert.equal(overlapping._rootName, 'newer.zarr');
+  assert.equal(overlapping._name, 'newer.zarr');
   assert.deepEqual(events, []);
 });
 
-test('keeps the latest concurrent ZarrDataSource selection', async () => {
+/** A `.zattrs` file for the root whose bytes arrive only when released. */
+function slowRootAttributes(markStarted, released) {
+  const slowRoot = encoder.encode(JSON.stringify({
+    'encoding-type': 'anndata',
+    'encoding-version': '0.1.0'
+  }));
+  const slowBytes = async () => {
+    markStarted();
+    await released;
+    return slowRoot.slice().buffer;
+  };
+  return {
+    size: slowRoot.length,
+    slice: () => ({ arrayBuffer: slowBytes }),
+    arrayBuffer: slowBytes,
+    text: async () => new TextDecoder().decode(await slowBytes()),
+  };
+}
+
+test('keeps the latest concurrent AnnDataFileSource selection', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
     'info',
@@ -5426,39 +3181,23 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
     embeddingValues: [1, 2, 3, 4],
     geneValues: [1, 0, 2, 0]
   });
-  let markStarted;
-  let releaseFirst;
-  const firstStarted = new Promise(resolve => {
-    markStarted = resolve;
-  });
-  const firstReleased = new Promise(resolve => {
-    releaseFirst = resolve;
-  });
-  firstStore.set('.zattrs', {
-    async text() {
-      markStarted();
-      await firstReleased;
-      return JSON.stringify({
-        'encoding-type': 'anndata',
-        'encoding-version': '0.1.0'
-      });
-    },
-    async arrayBuffer() {
-      throw new Error('root metadata must be read as text');
-    }
-  });
+  const started = deferred();
+  const released = deferred();
+  // The root metadata arrives only when released: the first open is still
+  // reading it when the second is asked for.
+  firstStore.set('.zattrs', slowRootAttributes(started.resolve, released.promise));
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    const firstRequest = source.loadFromFileList(
+    const firstRequest = source.loadFolder(
       fileListFromMap(firstStore, 'first-slow.zarr')
     );
     const firstAssertion = assert.rejects(
       firstRequest,
-      /Zarr.*(load|selection).*superseded|superseded.*Zarr/i
+      /load request was superseded by a newer selection/i
     );
-    await firstStarted;
-    await source.loadFromFileList(
+    await started.promise;
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [9, 10, 11, 12],
@@ -5467,16 +3206,16 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
         'second-fast.zarr'
       )
     );
-    releaseFirst();
+    released.resolve();
 
     await firstAssertion;
-    assert.equal(source.dirname, 'second-fast.zarr');
+    assert.equal(source.filename, 'second-fast.zarr');
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),
       [9, 10]
     );
   } finally {
-    releaseFirst();
+    released.resolve();
     source.clear();
     for (const [name, method] of originals) {
       notifications[name] = method;
@@ -5484,102 +3223,30 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
   }
 });
 
-test('Zarr direct-load warning is published only after successful adoption', async t => {
-  captureDownloadNotifications(t);
-  const notifications = getNotificationCenter();
-  const originalWarning = notifications.info;
-  const warnings = [];
-  notifications.info = (...args) => {
-    warnings.push(args);
-    return `warning-${warnings.length}`;
-  };
-  t.after(() => {
-    notifications.info = originalWarning;
-  });
-
-  const source = new ZarrDataSource();
-  t.after(() => source.clear());
-  await assert.rejects(
-    source.loadFromFileList(
-      fileListFromMap(
-        new Map([
-          ['.zgroup', memoryFile('{"zarr_format":2}')],
-        ]),
-        'broken.zarr'
-      ),
-      { showProgress: false }
-    ),
-    /root.*zattrs|required/i
-  );
-  assert.equal(warnings.length, 0);
-
-  await source.loadFromFileList(
-    fileListFromMap(
-      completeZarrStoreFiles({
-        embeddingValues: [0, 0, 1, 1],
-        geneValues: [1, 0, 2, 0],
-      }),
-      'working.zarr'
-    ),
-    { showProgress: false }
-  );
-  assert.equal(warnings.length, 0);
-
-  await source.loadFromFileList(
-    fileListFromMap(
-      completeZarrStoreFiles({
-        embeddingValues: [2, 2, 3, 3],
-        geneValues: [3, 0, 4, 0],
-      }),
-      'visible-warning.zarr'
-    ),
-    { showProgress: true }
-  );
-  assert.equal(warnings.length, 1);
-});
-
-test('ZarrDataSource owns one terminal event across overlapping candidates', async t => {
-  const notifications = getNotificationCenter();
-  const originalWarning = notifications.info;
-  notifications.info = () => {};
-  t.after(() => {
-    notifications.info = originalWarning;
-  });
-  const events = captureDownloadNotifications(t);
+test('a superseded Zarr candidate leaves the opening to the newer one, which ends it opened', async t => {
+  const progress = getOpeningProgress();
+  const states = [];
+  t.after(progress.subscribe(snapshot => {
+    if (snapshot !== null) states.push(`${snapshot.id}:${snapshot.state}`);
+  }));
   const firstStore = completeZarrStoreFiles({
     embeddingValues: [1, 2, 3, 4],
     geneValues: [1, 0, 2, 0]
   });
-  let markStarted;
-  let releaseFirst;
-  const firstStarted = new Promise(resolve => {
-    markStarted = resolve;
-  });
-  const firstReleased = new Promise(resolve => {
-    releaseFirst = resolve;
-  });
-  firstStore.set('.zattrs', {
-    async text() {
-      markStarted();
-      await firstReleased;
-      return JSON.stringify({
-        'encoding-type': 'anndata',
-        'encoding-version': '0.1.0'
-      });
-    },
-    async arrayBuffer() {
-      throw new Error('root metadata must be read as text');
-    }
-  });
+  const started = deferred();
+  const released = deferred();
+  // The root metadata arrives only when released: the first open is still
+  // reading it when the second is asked for.
+  firstStore.set('.zattrs', slowRootAttributes(started.resolve, released.promise));
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  const older = source.loadFromFileList(
+  const older = source.loadFolder(
     fileListFromMap(firstStore, 'older.zarr')
   );
   const olderAssertion = assert.rejects(older, /superseded/i);
-  await firstStarted;
-  const newer = await source.loadFromFileList(
+  await started.promise;
+  const newer = await source.loadFolder(
     fileListFromMap(
       completeZarrStoreFiles({
         embeddingValues: [9, 10, 11, 12],
@@ -5588,24 +3255,19 @@ test('ZarrDataSource owns one terminal event across overlapping candidates', asy
       'newer.zarr'
     )
   );
-  releaseFirst();
+  released.resolve();
   await olderAssertion;
 
   assert.equal(newer.id, 'zarr_newer');
-  assert.deepEqual(
-    events
-      .filter(event => event.kind !== 'update')
-      .map(event => event.kind),
-    ['start', 'start', 'complete', 'dismiss']
-  );
-  const completedId = events.find(event => event.kind === 'complete').id;
-  const newerStart = events.find(
-    event => event.kind === 'start' && /newer\.zarr/.test(event.name)
-  );
-  assert.equal(completedId, newerStart.id);
+  // One opening on screen for both: the newer joined it, and the older's
+  // supersession neither failed nor ended it.
+  const ids = new Set(states.map(state => state.split(':')[0]));
+  assert.equal(ids.size, 1);
+  assert.equal(states.filter(state => !state.endsWith(':running')).length, 1);
+  assert.match(states.at(-1), /:done$/);
 });
 
-test('ZarrDataSource preserves a working source when required embedding bytes are corrupt', async () => {
+test('AnnDataFileSource preserves a working source when required embedding bytes are corrupt', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
     'info',
@@ -5623,9 +3285,9 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
   notifications.completeDownload = () => {};
   notifications.failDownload = () => {};
 
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   try {
-    await source.loadFromFileList(
+    await source.loadFolder(
       fileListFromMap(
         completeZarrStoreFiles({
           embeddingValues: [0, 0, 1, 1],
@@ -5639,18 +3301,15 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
       embeddingValues: [9, 9, 10, 10],
       geneValues: [9, 0, 10, 0]
     });
-    corrupt.set(
-      'obsm/X_umap_2d/0.0',
-      memoryFile(Uint8Array.from([0xff]))
-    );
+    corrupt.set('obsm/X_umap_2d/0.0', Uint8Array.from([0xff]));
 
     await assert.rejects(
-      source.loadFromFileList(
+      source.loadFolder(
         fileListFromMap(corrupt, 'corrupt-embedding.zarr')
       ),
-      /embedding|chunk|byte length|payload/i
+      /embedding|chunk|byte length|payload|decodes to/i
     );
-    assert.equal(source.dirname, 'working.zarr');
+    assert.equal(source.filename, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
       Array.from(await sourceGeneValuesByName(source, 'A')),
@@ -5658,7 +3317,7 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
     );
     assert.deepEqual(
       Array.from(
-        await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+        (await source.getAdapter().getEmbeddingPayload('obsm/0/0-1', 2)).positions
       ),
       [-1, -1, 1, 1]
     );
@@ -5673,68 +3332,34 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
 test('duplicate integer sparse coordinates sum in Float32', async t => {
   for (const format of ['csc', 'csr']) {
     await t.test(format.toUpperCase(), async () => {
-      const loader = sparseLoader({
+      const { reader } = await openAnnData(sparseStore({
         format,
         shape: [1, 1],
-        data: [16_777_216, 1],
+        data: new Int32Array([16_777_216, 1]),
         dataDtype: '<i4',
-        dataBytes: littleEndianBytes(
-          [16_777_216, 1],
-          'setInt32',
-          4
-        ),
-        indices: [0, 0],
-        indptr: [0, 2]
-      });
-      loader._nObs = 1;
-      loader._nVars = 1;
-      const column = await readXColumn(loader, 0, { sparse: true });
+        indices: new Int32Array([0, 0]),
+        indptr: new Int32Array([0, 2]),
+      }));
+      const column = await reader.getMatrixColumn('X', 0);
       assert.deepEqual(Array.from(column), [Math.fround(16_777_216 + 1)]);
     });
   }
 });
 
 test('Zarr observation dtype metadata cannot be replaced by value inference', async () => {
-  const loader = arrayLoader(
-    'obs/score',
-    metadata({
-      shape: [2],
-      chunks: [2],
-      dtype: 'not-a-zarr-dtype',
-    }),
-    { 0: littleEndianBytes([1, 2], 'setFloat32', 4) }
-  );
-  loader._files.set(
-    'obs/score/.zattrs',
-    memoryFile(JSON.stringify({
-      'encoding-type': 'array',
-      'encoding-version': '0.2.0',
-    }))
-  );
-  loader._nObs = 2;
-  loader._obsKeys = ['score'];
-
-  await assert.rejects(
-    loader.getObsField('score'),
-    /dtype|unsupported/i
-  );
+  const entries = zarrEntries(storeWith({ obs: { score: array(new Float32Array([1, 2])) } }));
+  setArray(entries, 'obs/score', metadata({ shape: [2], chunks: [2], dtype: 'not-a-zarr-dtype' }), {
+    0: littleEndianBytes([1, 2], 'setFloat32', 4),
+  }, { 'encoding-type': 'array', 'encoding-version': '0.2.0' });
+  await assert.rejects(openRoot(entries), /'not-a-zarr-dtype' is not a NumPy type/);
 });
 
 test('Zarr and H5AD share one value-kind contract for dense X and booleans', async () => {
-  const { validateDenseColumnContract } = zarrModule;
-  assert.throws(
-    () => validateDenseColumnContract(metadata({
-      shape: [2, 2],
-      chunks: [2, 2],
-      dtype: '|b1',
-    })),
-    /Dense X has unsupported dtype: \|b1/
-  );
-  assert.doesNotThrow(() => validateDenseColumnContract(metadata({
-    shape: [2, 2],
-    chunks: [2, 2],
-    dtype: '<f4',
-  })));
+  // A boolean matrix (a mask, a detection call) reads as 0 and 1.
+  const { reader: mask } = await openAnnData(storeWith({ X: dense([false, true, true, false], [2, 2], { dtype: '|b1' }) }));
+  assert.deepEqual(Array.from(await mask.getMatrixColumn('X', 0)), [0, 1]);
+  const { reader } = await openAnnData(storeWith({ X: dense(new Float32Array([1, 2, 3, 4]), [2, 2]) }));
+  assert.deepEqual(Array.from(await reader.getMatrixColumn('X', 1)), [2, 4]);
 
   const { decodeAnnDataBoolean } = await import(
     '../assets/js/data/anndata-value-kinds.js'
@@ -5748,15 +3373,43 @@ test('Zarr and H5AD share one value-kind contract for dense X and booleans', asy
 });
 
 test('Zarr does not keep the raw connectivity matrix once it is read', async () => {
-  const loader = connectivityLoader({
+  const { reader } = await openAnnData(connectivityStore(sparse({
     shape: [2, 2],
-    data: [1, 1],
-    indices: [1, 0],
-    indptr: [0, 1, 2],
-  }, 2);
-  const first = await loader.getConnectivities('connectivities');
+    data: new Float32Array([1, 1]),
+    indices: new Int32Array([1, 0]),
+    indptr: new Int32Array([0, 1, 2]),
+  })));
+  const first = await reader.getConnectivities('connectivities');
   assert.equal(first.indices.length, 2);
-  for (const [key, value] of loader._cache) {
+  for (const [key, value] of reader._cache) {
     assert.notStrictEqual(value, first, `cache entry "${key}" retains the raw matrix`);
   }
+});
+
+test('a Zarr store names itself by uns["title"], as AnnData writes it', async () => {
+  const scalarString = text => array([text], {
+    dtype: '|O',
+    shape: [],
+    chunks: [],
+    attrs: { 'encoding-type': 'string', 'encoding-version': '0.2.0' },
+  });
+  const titleOf = async (uns, mutate = () => {}) => {
+    const entries = zarrEntries(storeWith({ extra: { uns: mapping(uns) } }));
+    mutate(entries);
+    const { reader } = await openAnnData(entries);
+    return (await reader.getDatasetMetadata()).title;
+  };
+  assert.equal(await titleOf({ title: scalarString('  Synthetic islands — 2D ') }), 'Synthetic islands — 2D');
+
+  // No title, a blank one, or one that is not a scalar string is no title,
+  // and never stops the store from opening.
+  assert.equal(await titleOf({ subtitle: scalarString('not the title') }), null);
+  assert.equal(await titleOf({ title: scalarString('   ') }), null);
+  // A one-element string array (R writers, anndata 0.6) is a title; a longer list is not.
+  assert.equal(await titleOf({ title: strings(['in an array']) }), 'in an array');
+  assert.equal(await titleOf({ title: strings(['a', 'list']) }), null);
+  assert.equal(
+    await titleOf({ title: scalarString('corrupt') }, entries => entries.set('uns/title/0', new Uint8Array([1, 2, 3]))),
+    null
+  );
 });

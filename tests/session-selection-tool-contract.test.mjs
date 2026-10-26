@@ -337,7 +337,7 @@ test('a restore naming a button the group does not have is refused', () => {
           mode: 'lasso',
         },
       }),
-      /exact keys/i,
+      /must contain exactly/i,
       'a pressed-group record is closed, like every other control record',
     );
   } finally {
@@ -356,7 +356,7 @@ function makeModeOwner(buttons) {
     inProgress: false,
     stepCount: 0,
     candidateCount: 0,
-    candidates: [],
+    candidates: new Uint32Array(0),
   });
   const viewer = {
     cancelAnnotationSelection() { viewerCalls.push('cancelAnnotation'); },

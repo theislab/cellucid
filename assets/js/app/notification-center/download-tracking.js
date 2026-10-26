@@ -13,7 +13,8 @@
  */
 
 import { NotificationType } from './constants.js';
-import { formatBytes, formatDuration } from './formatters.js';
+import { isPlainRecord } from '../../utils/exact-record.js';
+import { formatBytes, formatDuration } from '../../utils/format-units.js';
 
 function requireNonEmptyString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -38,14 +39,6 @@ function requireTracker(owner, id) {
   return tracker;
 }
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
 export const downloadTrackingMethods = {
   /**
    * Start tracking a download.
@@ -60,7 +53,7 @@ export const downloadTrackingMethods = {
       requireByteCount(totalBytes, 'Download totalBytes');
     }
     if (
-      !isPlainObject(options) ||
+      !isPlainRecord(options) ||
       Object.keys(options).some(key => key !== 'onCancel')
     ) {
       throw new TypeError(

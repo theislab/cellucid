@@ -1,0 +1,88 @@
+{
+ "fixtures": [
+  {
+   "path": "mudata-0.2.4/citeseq-subset.h5mu",
+   "expected": "mudata-0.2.4/citeseq-subset.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.2.4/citeseq-subset.zarr.zip",
+   "expected": "mudata-0.2.4/citeseq-subset.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.2.4/citeseq.h5mu",
+   "expected": "mudata-0.2.4/citeseq.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.2.4/citeseq.zarr.zip",
+   "expected": "mudata-0.2.4/citeseq.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.3.2/citeseq-subset.h5mu",
+   "expected": "mudata-0.3.2/citeseq-subset.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.3.2/citeseq-subset.zarr.zip",
+   "expected": "mudata-0.3.2/citeseq-subset.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.3.2/citeseq.h5mu",
+   "expected": "mudata-0.3.2/citeseq.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.3.2/citeseq.zarr.zip",
+   "expected": "mudata-0.3.2/citeseq.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.4.1/citeseq-subset.h5mu",
+   "expected": "mudata-0.4.1/citeseq-subset.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.4.1/citeseq-subset.zarr.zip",
+   "expected": "mudata-0.4.1/citeseq-subset.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.4.1/citeseq.h5mu",
+   "expected": "mudata-0.4.1/citeseq.h5mu.expected.json",
+   "layout": "file",
+   "format": "h5mu",
+   "refusal": null
+  },
+  {
+   "path": "mudata-0.4.1/citeseq.zarr.zip",
+   "expected": "mudata-0.4.1/citeseq.zarr.expected.json",
+   "layout": "zip",
+   "format": "mudata-zarr",
+   "refusal": null
+  }
+ ]
+}

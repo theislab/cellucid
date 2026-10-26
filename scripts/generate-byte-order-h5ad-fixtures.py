@@ -2,7 +2,7 @@
 
 The two files carry byte-identical *values* and differ only in the NumPy
 byte-order prefix of every numeric datatype on disk. They pin the guarantee
-that the browser HDF5 reader (h5wasm) converts stored data to the host byte
+that the browser HDF5 reader (``assets/js/formats/hdf5``) converts stored data to the host byte
 order, so a big-endian ``.h5ad`` opened in Cellucid yields the same numbers as
 its little-endian twin.
 

@@ -2,8 +2,8 @@
  * @fileoverview Application entry point.
  *
  * Orchestrates:
- * - Dataset + data source selection (URL params, local prepared exports, remote/GitHub/Jupyter sources)
- * - Data loading (points, manifests, connectivity)
+ * - Dataset + data source selection (URL params, local AnnData files, sample and linked catalogs, remote/viewer host sources)
+ * - Data loading (points, fields, connectivity)
  * - Initialization wiring (Viewer, DataState, UI coordinator, state serializer, analysis module)
  *
  * Performance note:
@@ -29,7 +29,7 @@ import {
 import {
   classifyAdvertisedDatasetStateRestoreError,
   restoreCurrentDatasetState
-} from './session/dataset-state-manifest.js';
+} from './session/catalog-default-session.js';
 import {
   createDatasetRuntimeRetirementOwner,
   createLatestDatasetPublicationContinuationOwner,
@@ -42,64 +42,73 @@ import {
 import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
+import { showReadProgress } from './read-progress-notifications.js';
+import { showOpeningProgress } from './opening-progress-view.js';
+import { showSourceSignIn } from './source-sign-in-view.js';
+import { beginOpening } from '../data/opening-progress.js';
 import {
-  loadObsManifest,
   createObsFieldLoader,
-  loadVarManifest,
   createVarFieldLoader,
-  loadConnectivityManifest,
+  varLoaderMappingOf,
   loadEdges,
-  loadDatasetIdentity,
+  loadDatasetGeneration,
   loadMappingCandidates,
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
 import {
-  MAPPING_CANDIDATES_PATH,
-  resolveAnnDataMapping,
-  resolveExportDataMapping
+  MAPPING_CANDIDATES_ROUTE,
+  resolveAnnDataMapping
 } from '../data/dataset-mapping.js';
 import {
   createDimensionManager,
   createInMemoryDimensionManager
 } from '../data/dimension-manager.js';
 import { syntheticRepresentations } from './ui/modules/benchmark/representations.js';
+import { describeOpeningFailure } from './ui/modules/dataset-connections.js';
 import { createMappingLayoutProvider } from './state/managers/mapping-manager.js';
 import { createVectorFieldManager, resolveVectorFields } from '../data/vector-field-manager.js';
-import {
-  loadDatasetGeneration
-} from '../data/dataset-generation-contract.js';
-import {
-  createCandidateAnnDataBinding,
-  isAnnDataUrl
-} from '../data/anndata-provider.js';
+import { createCandidateAnnDataBinding } from '../data/anndata-provider.js';
 import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
 } from '../data/dataset-lifecycle-errors.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
+import { getTransferLog } from '../data/transfer-log.js';
+import { getReadActivityLog } from '../data/read-activity-log.js';
+import { sweepAbandonedIndexes } from '../data/column-store-placement.js';
+import { sweepAbandonedTranscodes } from '../data/anndata/transcode/space.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { createRemoteDataSource } from '../data/remote-source.js';
 import {
-  createJupyterBridgeDataSource,
-  getJupyterConfig,
-  uploadJupyterSessionBundle
-} from '../data/jupyter-source.js';
+  createViewerHostBridgeDataSource,
+  getViewerHostConfig
+} from '../data/viewer-host-source.js';
 import {
-  createJupyterCommandHandlers
-} from './jupyter-command-handler.js';
+  createViewerHostCommandHandlers
+} from './viewer-host-command-handler.js';
 import {
-  createJupyterHealthMonitor,
-  createJupyterPointerDelivery
-} from './jupyter-pointer-delivery.js';
+  createViewerHostPointerDelivery
+} from './viewer-host-pointer-delivery.js';
 // benchmark module is lazy-loaded when needed
-import { DataSourceErrorCode, fetchSampleArtifact } from '../data/data-source.js';
+import {
+  DataSourceError,
+  DataSourceErrorCode,
+  fetchCatalogFile,
+  isExplainedFailure
+} from '../data/data-source.js';
 import { formatCompactCount as formatNumber } from './ui/components/display-format.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
 import { getGitHubAuthSession } from './community-annotations/github-auth.js';
-import { initKeyboardShortcuts, initWelcomeModal, showWelcomeModal } from './ui/onboarding/index.js';
+import {
+  hideWelcomeModal,
+  initKeyboardShortcuts,
+  initWelcomeModal,
+  isWelcomeModalVisible,
+  showWelcomeModal
+} from './ui/onboarding/index.js';
 import { publishWebBuildVersion } from './ui/core/build-version.js';
 import { retireDeferredControls } from './ui/core/deferred-control-readiness.js';
 import { DATA_LOAD_METHODS } from './data-load-methods.js';
@@ -122,6 +131,15 @@ import {
   prepareUrlForDatasetSelection,
   prepareUrlForDataSource
 } from './url-state.js';
+import { yieldToMacrotask } from '../utils/yield-macrotask.js';
+import { PLACES } from './ui/place-names.js';
+import { loadAppCode } from './app-code.js';
+import { formatCountOf, countNoun } from '../utils/format-units.js';
+
+// The whole static graph has loaded, linked and run: the code-load watch
+// (ui/core/code-load-watch.js) reads an uncaught error before this mark as
+// the graph failing to run.
+document.documentElement.dataset.codeStarted = 'true';
 
 debug.log('Starting…');
 
@@ -153,23 +171,30 @@ function formatBenchmarkGpuMemory(rendererStats, pointCount) {
     : `~${estimatedGpuMemoryMB.toFixed(1)} MB (estimate)`;
 }
 
-// Default export base URL (will be updated by DataSourceManager)
-let EXPORT_BASE_URL = '';
+// The base URL of the dataset shown (`anndata://<id>/`):
+// the data loaders address its parts under it.
+let DATASET_BASE_URL = '';
 
-// Helper to get URLs based on current dataset
-function getObsManifestUrl(baseUrl) { return `${baseUrl}obs_manifest.json`; }
-function getVarManifestUrl(baseUrl) { return `${baseUrl}var_manifest.json`; }
-function getConnectivityManifestUrl(baseUrl) { return `${baseUrl}connectivity_manifest.json`; }
-function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.json`; }
+// The parts of a dataset, as the data loaders address them under its base.
+function getObsUrl(baseUrl) { return `${baseUrl}obs`; }
+function getGeneListUrl(baseUrl) { return `${baseUrl}var`; }
+function getConnectivityUrl(baseUrl) { return `${baseUrl}obsp`; }
 
 // Requested before anything else so it loads in parallel with startup. It is
 // never awaited: calls made before it arrives are queued, so it never blocks
 // or breaks startup.
 void analytics.load();
+// A closed or crashed tab's spilled gene-column index (OPFS) is removed now,
+// not only when this tab first spills one of its own; so are the stores a
+// closed tab read single-stream files into (R objects, MatrixMarket folders).
+void sweepAbandonedIndexes();
+void sweepAbandonedTranscodes();
 
 (async function bootstrap() {
   let statsEl = null;
   let destroyApplication = null;
+  // The opening of the startup dataset, shown from the first moment.
+  let startupOpening = null;
   // Every startup await on the network runs through this owner: it publishes
   // `data-startup-phase` and bounds request/response steps with a deadline.
   const startup = createStartupPhaseOwner({
@@ -181,16 +206,16 @@ void analytics.load();
     publishWebBuildVersion();
 
     const urlParams = new URLSearchParams(window.location.search);
-    const jupyterConfig = getJupyterConfig();
+    const viewerHostConfig = getViewerHostConfig();
     const {
       remoteUrlParam,
-      githubPathParam,
+      dataLinkParam,
       sourceParam,
       requestedDataset,
       isAnndataMode,
-      inJupyter,
+      inViewerHost,
       shouldShowWelcome
-    } = resolveStartupUrlIntent(urlParams, jupyterConfig);
+    } = resolveStartupUrlIntent(urlParams, viewerHostConfig);
 
     const canvas = document.getElementById('glcanvas');
     const labelLayer = document.getElementById('label-layer');
@@ -201,6 +226,12 @@ void analytics.load();
     const renderModeSelect = document.getElementById('render-mode');
 
     setDockableAccordions(initDockableAccordions({ sidebar }));
+
+    // The notification center is created before the first yield below, so
+    // it is on the page by DOMContentLoaded and whatever fails or reports
+    // from here on has somewhere to be announced.
+    const notifications = getNotificationCenter();
+    notifications.init();
 
     // The renderer and benchmark controls are wired at the far end of this
     // bootstrap, past every await below. They are painted and offered long
@@ -237,6 +268,11 @@ void analytics.load();
     if (shouldShowWelcome) {
       showWelcomeModal();
     }
+    // The startup work before the first network wait ran as one task of
+    // ~90 ms (module evaluation, the WebGL programs, the interface). It
+    // yields to the event loop between its stages, so the page paints and
+    // answers input between them.
+    await yieldToMacrotask();
 
     // Connectivity controls
     const connectivityControls = document.getElementById('connectivity-controls');
@@ -253,6 +289,9 @@ void analytics.load();
     let ui = null;
     let sidebarLayout = null;
     let comparisonModule = null;
+    // The owner of every dataset change (`createLatestDatasetReloadCoordinator`),
+    // once it exists.
+    let datasetReloadCoordinator = null;
     let applicationRetired = false;
     let stopPerfMonitoring = () => {};
 
@@ -267,6 +306,7 @@ void analytics.load();
       viewTitleLayer
     });
     debug.log('[Main] Viewer created successfully');
+    await yieldToMacrotask();
 
     // Expose viewer globally for dev tools (benchmark, debugging)
     window._cellucidViewer = viewer;
@@ -285,6 +325,12 @@ void analytics.load();
         );
       },
       getOperations: () => [
+        // The dataset change in flight is stopped first, so the owners
+        // below wait only for work that has been told to stop: a read that
+        // never answers cannot hold the teardown.
+        ...(datasetReloadCoordinator === null
+          ? []
+          : [() => datasetReloadCoordinator.retire()]),
         () => stopPerfMonitoring(),
         ...(comparisonModule === null
           ? []
@@ -333,9 +379,64 @@ void analytics.load();
     // benchmarkReporter will be created lazily when benchmark report is requested
     let benchmarkReporter = null;
 
-    // Initialize notification center early
-    const notifications = getNotificationCenter();
-    notifications.init();
+    // Long reads of an AnnData file say how much is left while they run.
+    showReadProgress({ notifications });
+    // Every opening is shown from its first moment: over the empty viewer
+    // while no dataset is shown, as a notification with Cancel otherwise.
+    showOpeningProgress({ hasDataset: () => state.pointCount > 0, notifications });
+    // A Google Drive or OneDrive file waiting on a sign-in says so, with its button.
+    showSourceSignIn({ notifications });
+    // The startup dataset is being opened from now on: the layers that
+    // resolve and read it join this opening, which ends once its first view
+    // is drawn (or startup chose none).
+    startupOpening = beginOpening({
+      title: dataLinkParam
+        ?? (remoteUrlParam !== null ? `the datasets at ${remoteUrlParam}` : null)
+        ?? (inViewerHost ? "the notebook's dataset" : null)
+        ?? requestedDataset
+        ?? 'the sample dataset',
+      step: 'Starting Cellucid'
+    });
+    // Data the address names (`?data=`, `?remote=`, `?dataset=`) that does
+    // not open leaves Cellucid running without it: the startup opening fails
+    // over the empty viewer with one plain sentence, the failure's message
+    // under Details, Try again, and Open without this link, which drops those
+    // parameters from the address. Only a failure of the app itself is the
+    // startup failure screen.
+    let startupDataFailed = false;
+    // The address parameters that name a startup dataset of each source.
+    const STARTUP_LAUNCH_PARAMETERS = Object.freeze({
+      link: ['data', 'dataset'],
+      remote: ['remote', 'dataset'],
+      'local-demo': ['sampleCatalog', 'dataset']
+    });
+    function failStartupData(error, summary, launchParameters) {
+      startupDataFailed = true;
+      console.error('[Main] The data the address names did not open:', error);
+      // What the address asked for comes first; onboarding would cover it.
+      if (isWelcomeModalVisible()) hideWelcomeModal();
+      analytics.trackStartupFailure({ phase: startup.phase, error });
+      const withoutLink = launchParameters.some(name => urlParams.has(name));
+      // The reason itself is said; a refusal trying again cannot change
+      // (a file without an embedding, a folder without datasets.json) leads
+      // with opening Cellucid without the link.
+      const { summary: said, settled } = describeOpeningFailure(summary, error, { withoutLink });
+      const tryAgain = { label: 'Try again', run: () => window.location.reload() };
+      const actions = [tryAgain];
+      if (withoutLink) {
+        const openWithout = {
+          label: 'Open without this link',
+          run: () => {
+            const address = new URL(window.location.href);
+            for (const name of launchParameters) address.searchParams.delete(name);
+            window.history.replaceState(window.history.state, '', address);
+          }
+        };
+        if (settled) actions.unshift(openWithout);
+        else actions.push(openWithout);
+      }
+      startupOpening.fail(error, { summary: said, actions });
+    }
 
     // Construct the optional GitHub annotation session inside the startup
     // boundary so storage/configuration failures cannot leave a blank page.
@@ -370,7 +471,7 @@ void analytics.load();
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
-    const datasetReloadCoordinator = createLatestDatasetReloadCoordinator(
+    datasetReloadCoordinator = createLatestDatasetReloadCoordinator(
       () => {
         const source = dataSourceManager.activeSource;
         if (source === null) {
@@ -429,7 +530,7 @@ void analytics.load();
     // Helper functions for onboarding callbacks (defined early, used later)
     let toggleSidebarVisibility = null;
     let cycleRepresentation = null;
-    let clearAllHighlights = null;
+    let clearActivePageHighlights = null;
     let setNavigationMode = null;
 
     // Initialize keyboard shortcuts after exact startup onboarding policy is set.
@@ -448,7 +549,7 @@ void analytics.load();
         }
       },
       onClearHighlights: () => {
-        if (clearAllHighlights) clearAllHighlights();
+        if (clearActivePageHighlights) clearActivePageHighlights();
       },
       onSetNavigationMode: (mode) => {
         if (setNavigationMode) setNavigationMode(mode);
@@ -463,37 +564,36 @@ void analytics.load();
     const remoteSource = createRemoteDataSource();
     dataSourceManager.registerSource('remote', remoteSource);
 
-    // Check if running in Jupyter context
-    let jupyterSource = null;
-    if (inJupyter) {
-      debug.log('[Main] Detected Jupyter context, initializing bridge...');
-      jupyterSource = createJupyterBridgeDataSource(jupyterConfig);
-      dataSourceManager.registerSource('jupyter', jupyterSource);
+    // Check if a viewer host (Python, Jupyter or R) opened this page
+    let viewerHostSource = null;
+    if (inViewerHost) {
+      debug.log('[Main] Detected a viewer host, initializing the viewer channel...');
+      viewerHostSource = createViewerHostBridgeDataSource(viewerHostConfig);
+      dataSourceManager.registerSource('jupyter', viewerHostSource);
 
-      const jupyterInitialized = await startup.step(
+      const viewerHostInitialized = await startup.step(
         'health',
-        'the Jupyter Python server',
-        () => jupyterSource.initialize()
+        "the viewer's host",
+        () => viewerHostSource.initialize()
       );
-      if (jupyterInitialized !== true) {
+      if (viewerHostInitialized !== true) {
         throw new Error(
-          'Jupyter context must initialize one authenticated Python server'
+          'Viewer host context must initialize one authenticated Python server'
         );
       }
-      debug.log('[Main] Jupyter bridge initialized successfully');
+      debug.log('[Main] viewer channel initialized successfully');
 
-      if (jupyterConfig === null) {
+      if (viewerHostConfig === null) {
         throw new Error(
-          'Initialized Jupyter mode requires its authenticated configuration'
+          'Initialized viewer host mode requires its authenticated configuration'
         );
       }
 
       // Freeze support: keep the last fully rendered view when Python stops.
-      let jupyterFrozen = false;
-      let jupyterPointerDelivery = null;
-      let jupyterHealthMonitor = null;
-      let retireJupyterPointerInputs = () => {};
-      const reportJupyterConsoleError = (...args) => {
+      let viewerHostFrozen = false;
+      let viewerHostPointerDelivery = null;
+      let retireViewerHostPointerInputs = () => {};
+      const reportViewerHostConsoleError = (...args) => {
         try {
           console.error(...args);
         } catch {
@@ -501,11 +601,11 @@ void analytics.load();
           // or turn a listener path into a thrown failure.
         }
       };
-      const freezeJupyterView = () => {
-        if (jupyterFrozen) return false;
+      const freezeViewerHostView = () => {
+        if (viewerHostFrozen) return false;
         // Publish the terminal fence before any fallible observer, renderer,
         // timer, or DOM work.
-        jupyterFrozen = true;
+        viewerHostFrozen = true;
         const failures = [];
         const attempt = operation => {
           try {
@@ -514,17 +614,16 @@ void analytics.load();
             failures.push(error);
           }
         };
-        attempt(() => retireJupyterPointerInputs());
-        attempt(() => jupyterPointerDelivery?.freeze());
-        attempt(() => jupyterHealthMonitor?.freeze());
+        attempt(() => retireViewerHostPointerInputs());
+        attempt(() => viewerHostPointerDelivery?.freeze());
         attempt(() => viewer.pause());
         attempt(() => {
           let overlay = document.getElementById(
-            'cellucid-jupyter-freeze-overlay'
+            'cellucid-viewer-host-freeze-overlay'
           );
           if (overlay === null) {
             overlay = document.createElement('div');
-            overlay.id = 'cellucid-jupyter-freeze-overlay';
+            overlay.id = 'cellucid-viewer-host-freeze-overlay';
             overlay.style.position = 'fixed';
             overlay.style.inset = '0';
             overlay.style.zIndex = '999999';
@@ -536,78 +635,75 @@ void analytics.load();
           overlay.style.display = 'block';
         });
         for (const failure of failures) {
-          reportJupyterConsoleError(
-            '[Main] Jupyter freeze cleanup failed:',
+          reportViewerHostConsoleError(
+            '[Main] Viewer host freeze cleanup failed:',
             failure
           );
         }
         return true;
       };
 
-      jupyterSource.onMessage(message => {
+      viewerHostSource.onMessage(message => {
         if (message.type === 'freeze') {
-          freezeJupyterView();
+          freezeViewerHostView();
         }
       });
 
-      jupyterHealthMonitor = createJupyterHealthMonitor({
-        checkHealth: () => jupyterSource.checkHealth(),
-        onFailure: error => {
-          freezeJupyterView();
-          reportJupyterConsoleError(
-            '[Main] Jupyter server health contract failed; freezing view:',
-            error
+      // The viewer channel ends when the host stops this viewer (or stops
+      // altogether), when the viewer was opened again in another page, or
+      // when the host cannot be reached any more. The host closing the
+      // channel is the signal; nothing is polled.
+      viewerHostSource.onChannelEnd(end => {
+        if (end.kind === 'closed') return;
+        freezeViewerHostView();
+        try {
+          const replaced = end.kind === 'replaced';
+          notifications[replaced ? 'info' : 'error'](end.message, {
+            category: 'connectivity',
+            title: replaced
+              ? 'Viewer opened elsewhere'
+              : end.kind === 'stopped'
+                ? 'Viewer stopped'
+                : 'Viewer disconnected',
+            duration: 0
+          });
+        } catch (notificationError) {
+          reportViewerHostConsoleError(
+            '[Main] Viewer host disconnect notification failed:',
+            notificationError
           );
-          try {
-            notifications.error(
-              'The Python server stopped or returned an invalid health response. ' +
-              'The last complete view has been frozen.',
-              {
-                category: 'connectivity',
-                title: 'Jupyter server disconnected',
-                duration: 0
-              }
-            );
-          } catch (notificationError) {
-            reportJupyterConsoleError(
-              '[Main] Jupyter disconnect notification failed:',
-              notificationError
-            );
-          }
-        },
-        intervalMs: 3000,
+        }
       });
-      jupyterHealthMonitor.start();
 
       if (
         typeof viewer.pickCellRecordAtScreen !== 'function'
       ) {
         throw new TypeError(
-          'Jupyter pointer hooks require exact per-view picking records'
+          'Viewer host pointer hooks require exact per-view picking records'
         );
       }
 
       let lastHoverAt = 0;
       const HOVER_THROTTLE_MS = 50;
-      const reportJupyterPointerError = (error, channel) => {
-        reportJupyterConsoleError(
-          `[Main] Jupyter ${channel} pointer delivery failed:`,
+      const reportViewerHostPointerError = (error, channel) => {
+        reportViewerHostConsoleError(
+          `[Main] Viewer host ${channel} pointer delivery failed:`,
           error
         );
       };
-      jupyterPointerDelivery = createJupyterPointerDelivery({
+      viewerHostPointerDelivery = createViewerHostPointerDelivery({
         notifyHover: (cellIndex, position) =>
-          jupyterSource.notifyHover(cellIndex, position),
+          viewerHostSource.notifyHover(cellIndex, position),
         notifyClick: (cellIndex, modifiers) =>
-          jupyterSource.notifyClick(cellIndex, modifiers),
-        reportError: reportJupyterPointerError,
+          viewerHostSource.notifyClick(cellIndex, modifiers),
+        reportError: reportViewerHostPointerError,
       });
-      const retireJupyterView = event => {
+      const retireViewerHostView = event => {
         if (event.persisted === true) return;
-        window.removeEventListener('pagehide', retireJupyterView);
-        freezeJupyterView();
+        window.removeEventListener('pagehide', retireViewerHostView);
+        freezeViewerHostView();
       };
-      window.addEventListener('pagehide', retireJupyterView);
+      window.addEventListener('pagehide', retireViewerHostView);
 
       let pendingHoverClientX = 0;
       let pendingHoverClientY = 0;
@@ -619,20 +715,20 @@ void analytics.load();
           hoverSampleTimer = null;
         }
       };
-      retireJupyterPointerInputs = () => {
+      retireViewerHostPointerInputs = () => {
         hasPendingHoverPoint = false;
         clearHoverSampleTimer();
       };
-      const sampleLatestJupyterHover = () => {
+      const sampleLatestViewerHostHover = () => {
         hoverSampleTimer = null;
         try {
-          if (jupyterFrozen || !hasPendingHoverPoint) return;
+          if (viewerHostFrozen || !hasPendingHoverPoint) return;
           const now = performance.now();
           const remaining =
             HOVER_THROTTLE_MS - (now - lastHoverAt);
           if (remaining > 0) {
             hoverSampleTimer = setTimeout(
-              sampleLatestJupyterHover,
+              sampleLatestViewerHostHover,
               remaining
             );
             return;
@@ -659,7 +755,7 @@ void analytics.load();
             )
           ) {
             throw new TypeError(
-              'Jupyter cell picking must return null or one exact frozen per-view record'
+              'Viewer host cell picking must return null or one exact frozen per-view record'
             );
           }
           if (pickRecord !== null) {
@@ -671,13 +767,13 @@ void analytics.load();
               !Number.isFinite(activePosition.z)
             ) {
               throw new TypeError(
-                'Jupyter hover requires one complete finite XYZ position'
+                'Viewer host hover requires one complete finite XYZ position'
               );
             }
           }
-          jupyterPointerDelivery.requestHover(pickRecord);
+          viewerHostPointerDelivery.requestHover(pickRecord);
         } catch (error) {
-          reportJupyterPointerError(error, 'hover');
+          reportViewerHostPointerError(error, 'hover');
         }
       };
 
@@ -686,25 +782,25 @@ void analytics.load();
         pendingHoverClientY = event.clientY;
         hasPendingHoverPoint = true;
         if (hoverSampleTimer === null) {
-          sampleLatestJupyterHover();
+          sampleLatestViewerHostHover();
         }
       });
 
       canvas.addEventListener('mouseleave', () => {
         try {
-          if (!jupyterFrozen) {
+          if (!viewerHostFrozen) {
             hasPendingHoverPoint = false;
             clearHoverSampleTimer();
-            jupyterPointerDelivery.requestHover(null);
+            viewerHostPointerDelivery.requestHover(null);
           }
         } catch (error) {
-          reportJupyterPointerError(error, 'hover');
+          reportViewerHostPointerError(error, 'hover');
         }
       });
 
       canvas.addEventListener('click', event => {
         try {
-          if (jupyterFrozen) return;
+          if (viewerHostFrozen) return;
           const pickRecord = viewer.pickCellRecordAtScreen(
             event.clientX,
             event.clientY
@@ -720,85 +816,84 @@ void analytics.load();
             )
           ) {
             throw new TypeError(
-              'Jupyter cell picking must return null or one exact frozen per-view record'
+              'Viewer host cell picking must return null or one exact frozen per-view record'
             );
           }
           if (pickRecord === null) return;
-          jupyterPointerDelivery.requestClick({
+          viewerHostPointerDelivery.requestClick({
             cellIndex: pickRecord.cellIndex,
             button: event.button,
             shift: event.shiftKey,
             ctrl: event.ctrlKey || event.metaKey,
           });
         } catch (error) {
-          reportJupyterPointerError(error, 'click');
+          reportViewerHostPointerError(error, 'click');
         }
       });
 
-      const jupyterDatasets = await startup.step(
+      const viewerHostDatasets = await startup.step(
         'catalog',
-        'the Jupyter dataset catalog',
-        () => jupyterSource.listDatasets()
+        "the viewer host's dataset",
+        () => viewerHostSource.listDatasets()
       );
-      const jupyterDatasetId = selectIntentDatasetId(
-        jupyterDatasets,
+      const viewerHostDatasetId = selectIntentDatasetId(
+        viewerHostDatasets,
         requestedDataset,
-        'The authenticated Python server'
+        "The viewer's host"
       );
       selectStartupDataset(
         'jupyter',
-        jupyterDatasetId,
-        DATA_LOAD_METHODS.JUPYTER_AUTO
+        viewerHostDatasetId,
+        DATA_LOAD_METHODS.VIEWER_HOST_AUTO
       );
     }
 
-    // An explicit remote URL is a terminal source request.
+    // An explicit remote URL: a server that cannot be reached, or that does
+    // not hold the requested dataset, leaves Cellucid running without it.
     if (remoteUrlParam !== null) {
       debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
-      await startup.step(
-        'health',
-        remoteUrlParam,
-        () => remoteSource.connect({ url: remoteUrlParam })
-      );
-      if (remoteSource.isConnected() !== true) {
-        throw new Error(
-          'The requested remote source did not publish a connected state.'
+      try {
+        await startup.step(
+          'health',
+          remoteUrlParam,
+          () => remoteSource.connect({ url: remoteUrlParam })
+        );
+        if (remoteSource.isConnected() !== true) {
+          throw new Error(
+            'The requested remote source did not publish a connected state.'
+          );
+        }
+        const remoteDatasets = await startup.step(
+          'catalog',
+          remoteUrlParam,
+          () => remoteSource.listDatasets()
+        );
+        const remoteDatasetId = selectIntentDatasetId(
+          remoteDatasets,
+          requestedDataset,
+          'The requested remote source'
+        );
+        selectStartupDataset(
+          'remote',
+          remoteDatasetId,
+          DATA_LOAD_METHODS.REMOTE_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'Cellucid could not open the server this link points to.',
+          ['remote', 'dataset']
         );
       }
-      const remoteDatasets = await startup.step(
-        'catalog',
-        remoteUrlParam,
-        () => remoteSource.listDatasets()
-      );
-      const remoteDatasetId = selectIntentDatasetId(
-        remoteDatasets,
-        requestedDataset,
-        'The requested remote source'
-      );
-      if (isAnndataMode) {
-        debug.log(
-          '[Main] AnnData mode detected - loading directly from AnnData'
-        );
-        notifications.warning(
-          'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
-          'For better performance, use prepare() to create optimized binary files.',
-          { duration: 12000 }
-        );
-      }
-      selectStartupDataset(
-        'remote',
-        remoteDatasetId,
-        DATA_LOAD_METHODS.REMOTE_URL_PARAM
-      );
     }
 
     // Auto-connect to a same-origin Cellucid server when the web app is being
     // served by the Python package itself (CLI/Python server mode).
     //
     // Without this, the app may auto-load the demo dataset and ignore the
-    // server-hosted dataset, especially when demo exports are configured.
+    // server-hosted dataset, especially when a sample catalog is configured.
     if (
-      !inJupyter &&
+      !inViewerHost &&
       remoteUrlParam === null &&
       (sourceParam === null || sourceParam === 'remote')
     ) {
@@ -876,13 +971,6 @@ void analytics.load();
               requestedDataset,
               'The same-origin Cellucid source'
             );
-            if (isAnndataMode) {
-              notifications.warning(
-                'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
-                'For better performance, use prepare() to create optimized binary files.',
-                { duration: 12000 }
-              );
-            }
             if (remoteDatasetId === null) {
               notifications.info(
                 `Connected to ${datasets.length} server datasets. Choose one ` +
@@ -910,16 +998,16 @@ void analytics.load();
       'catalog',
       'the dataset source registry',
       () => dataSourceManager.initialize({
-        // Jupyter mode owns one authenticated Python dataset source, so it
+        // Viewer host mode owns one authenticated dataset source, so it
         // does not register the unrelated sample catalog.
-        registerDemoCatalog: !inJupyter
+        registerDemoCatalog: !inViewerHost
       })
     );
 
     const useDefaultDemo =
-      !inJupyter
+      !inViewerHost
       && remoteUrlParam === null
-      && githubPathParam === null
+      && dataLinkParam === null
       && requestedDataset === null
       && (sourceParam === null || sourceParam === 'local-demo')
       && startupSelection === null;
@@ -935,7 +1023,7 @@ void analytics.load();
         );
       }
       const sampleCatalog =
-        localDemoSource.manifestUrl ?? 'the sample catalog';
+        localDemoSource.catalogUrl ?? 'the sample catalog';
       let demoCatalogAvailable = false;
       try {
         demoCatalogAvailable = await startup.step(
@@ -970,61 +1058,95 @@ void analytics.load();
       }
     }
 
-    // Check for GitHub repository path in query parameters
-    // Must be after initialize() since github-repo source is registered there
-    if (githubPathParam !== null) {
-      debug.log(`[Main] GitHub path from param: ${githubPathParam}`);
-      const githubSource = dataSourceManager.getSource('github-repo');
-      if (githubSource === null) {
+    // A data link in the query (?data=): GitHub, CELLxGENE, GEO, any web
+    // address. Must be after initialize(), which registers the link source.
+    let linkConnection = null;
+    if (dataLinkParam !== null) {
+      debug.log(`[Main] Data link from param: ${dataLinkParam}`);
+      const linkSource = dataSourceManager.getSource('link');
+      if (linkSource === null) {
         throw new Error(
-          'Explicit GitHub startup requires the registered GitHub source.'
+          'Data link startup requires the registered link source.'
         );
       }
-      const githubConnection = await startup.step(
-        'catalog',
-        githubPathParam,
-        () => githubSource.connect(githubPathParam)
-      );
+      // Opening a linked file reads as much of it as the first view needs,
+      // which grows with the file: the step stalls only when no byte arrives
+      // for a whole deadline, as the Transfers log records them; while it
+      // waits on the person (a sign-in, Google's file picker), the clock
+      // stands still (`startup-phase.js`).
+      try {
+        linkConnection = await startup.step(
+          'catalog',
+          dataLinkParam,
+          () => linkSource.connect(dataLinkParam),
+          {
+            progress: onProgress => getTransferLog().subscribe(onProgress),
+            doing: 'opening the data link'
+          }
+        );
+      } catch (error) {
+        // Cancelled while it opened: Cellucid starts without a dataset, as it
+        // does when the link did not open.
+        if (!startupOpening.cancelled) {
+          failStartupData(
+            error,
+            'Cellucid could not read the data this link points to.',
+            ['data', 'dataset']
+          );
+        }
+      }
+    }
+    if (linkConnection !== null) {
       if (
-        githubConnection === null ||
-        typeof githubConnection !== 'object' ||
-        Array.isArray(githubConnection) ||
-        !Object.hasOwn(githubConnection, 'datasets')
+        typeof linkConnection !== 'object' ||
+        Array.isArray(linkConnection) ||
+        !Object.hasOwn(linkConnection, 'datasets')
       ) {
         throw new TypeError(
-          'GitHub source connection must publish its dataset inventory.'
+          'Link source connection must publish its dataset inventory.'
         );
       }
-      const githubDatasetId = selectIntentDatasetId(
-        githubConnection.datasets,
-        requestedDataset,
-        'The requested GitHub repository'
-      );
-      selectStartupDataset(
-        'github-repo',
-        githubDatasetId,
-        DATA_LOAD_METHODS.GITHUB_URL_PARAM
-      );
+      // Without `dataset=`, a link opens on the dataset its catalog names as
+      // its default, as the sample catalog does.
+      try {
+        const linkDatasetId = selectIntentDatasetId(
+          linkConnection.datasets,
+          requestedDataset ?? linkConnection.defaultDatasetId,
+          'The requested data link'
+        );
+        selectStartupDataset(
+          'link',
+          linkDatasetId,
+          DATA_LOAD_METHODS.DATA_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'This link does not hold the dataset it names.',
+          ['data', 'dataset']
+        );
+      }
 
-      const githubRepoInput =
-        document.getElementById('github-repo-url');
-      if (!(githubRepoInput instanceof HTMLInputElement)) {
+      const dataLinkInput = document.getElementById('data-address');
+      if (!(dataLinkInput instanceof HTMLInputElement)) {
         throw new Error(
-          'GitHub startup requires the repository input control.'
+          'Data link startup requires the address bar.'
         );
       }
-      githubRepoInput.value = githubPathParam;
+      dataLinkInput.value = linkConnection.locator;
     }
 
     // Check URL parameters for dataset selection
-    // Only process if we haven't already connected via remote/jupyter/github
+    // Only process if we haven't already connected via remote/jupyter/a link
     const requestedSource = sourceParam === null
       ? 'local-demo'
       : sourceParam;
     const currentSourceType = startupSelection?.sourceType ?? null;
-    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || currentSourceType === 'github-repo';
+    // A link names its own dataset (`dataset=` picks one of its catalog's),
+    // also when its opening was cancelled.
+    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || dataLinkParam !== null;
 
-    if (requestedDataset !== null && !skipUrlDataset) {
+    if (requestedDataset !== null && !skipUrlDataset && !startupDataFailed) {
       const targetSource = dataSourceManager.getSource(requestedSource);
       if (targetSource === null) {
         throw new Error(
@@ -1037,26 +1159,34 @@ void analytics.load();
         );
       }
       const requestedCatalog = `the ${requestedSource} dataset catalog`;
-      const requestedExists = await startup.step(
-        'catalog',
-        requestedCatalog,
-        () => targetSource.hasDataset(requestedDataset)
-      );
-      if (!requestedExists) {
-        throw new Error(
-          `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
+      try {
+        const requestedExists = await startup.step(
+          'catalog',
+          requestedCatalog,
+          () => targetSource.hasDataset(requestedDataset)
+        );
+        if (!requestedExists) {
+          throw new Error(
+            `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
+          );
+        }
+        selectStartupDataset(
+          requestedSource,
+          requestedDataset,
+          DATA_LOAD_METHODS.DATASET_URL_PARAM
+        );
+      } catch (error) {
+        failStartupData(
+          error,
+          'The dataset this link names could not be found.',
+          ['dataset']
         );
       }
-      selectStartupDataset(
-        requestedSource,
-        requestedDataset,
-        DATA_LOAD_METHODS.DATASET_URL_PARAM
-      );
     }
 
     // The live manager is replaced only when a complete dataset generation and
     // its default position payload have been staged successfully.
-    let dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
+    let dimensionManager = createDimensionManager({ baseUrl: DATASET_BASE_URL });
     let activeRuntimeStage = null;
     const runtimeRetirementOwner =
       createDatasetRuntimeRetirementOwner();
@@ -1087,6 +1217,25 @@ void analytics.load();
       activeDatasetPublication = publication;
       ui?.publishCellPresence(publicationHasCells(publication));
       return publication;
+    }
+
+    // The dimension manager each publication replaced, retired once that
+    // publication's interface has settled. It is kept beside the publication,
+    // not in it: a publication lives as long as its dataset is shown, and
+    // anything of the replaced dataset it held (its stage held every
+    // position) stayed in memory as long.
+    const replacedDimensionManagers = new WeakMap();
+
+    function publishDatasetReplacement(stage, previousDimensionManager) {
+      const publication = publishRuntimeContinuation({ stage });
+      replacedDimensionManagers.set(publication, previousDimensionManager);
+      return publication;
+    }
+
+    function retireReplacedDimensionManager(publication) {
+      const replaced = replacedDimensionManagers.get(publication);
+      replacedDimensionManagers.delete(publication);
+      if (replaced !== undefined) runtimeRetirementOwner.retire(replaced);
     }
 
     function requireRestorablePublication(expectedPublication) {
@@ -1139,31 +1288,41 @@ void analytics.load();
       }
     }
 
+    // Everything that shows or acts on the shown cells outside the live
+    // scene: kept views, the in-progress selection, open field interactions,
+    // and the connectivity edges. Each goes before the replacement touches
+    // DataState or the viewer. Kept views go first, so the live view is the
+    // focused one when the rest retire. The viewer drops its edge graph when
+    // new points are loaded, so an edge owner retired any later still answers
+    // the replacement's first visibility notification and asks the viewer
+    // about a graph it no longer has.
+    function retireDatasetInteractions() {
+      retireKeptViews();
+      retireInProgressHighlightSelection();
+      ui?.prepareDatasetReplacement?.();
+      connectivityRuntimeOwner.prepareDatasetReplacement();
+    }
+
     function publishEmptyDatasetRuntime({
-      clearViews,
       restorationPublication = null
-    }) {
+    } = {}) {
       if (
-        typeof clearViews !== 'boolean' ||
-        (
-          restorationPublication !== null &&
-          typeof restorationPublication !== 'object'
-        )
+        restorationPublication !== null &&
+        typeof restorationPublication !== 'object'
       ) {
         throw new TypeError(
-          'Empty dataset runtime publication requires boolean clearViews and an optional restoration publication.'
+          'Empty dataset runtime publication takes an optional restoration publication.'
         );
       }
       if (restorationPublication !== null) {
         requireRestorablePublication(restorationPublication);
       }
-      retireInProgressHighlightSelection();
-      ui?.prepareDatasetReplacement?.();
-      EXPORT_BASE_URL = '';
+      retireDatasetInteractions();
+      DATASET_BASE_URL = '';
       dimensionManager = createDimensionManager({ baseUrl: '' });
       obs = null;
-      connectivityManifest = null;
-      connectivityManifestUrl = null;
+      connectivitySummary = null;
+      connectivityUrl = null;
       positions = null;
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(null);
@@ -1173,12 +1332,8 @@ void analytics.load();
       state.publishDatasetMapping({ mapping: null, candidates: null, origin: null });
       state.initScene(new Float32Array(), { fields: [], count: 0 });
       state.clearActiveField();
-      state.clearAllHighlights();
-      if (clearViews) {
-        state.clearSnapshotViews();
-        viewer.clearSnapshotViews();
-        viewer.updateHighlight(new Uint8Array());
-      }
+      state.clearActivePageHighlights();
+      viewer.updateHighlight(new Uint8Array());
       if (statsEl) statsEl.textContent = 'No dataset selected';
       activeRuntimeStage = null;
       return restorationPublication !== null
@@ -1188,6 +1343,44 @@ void analytics.load();
 
     // A reload is bounded by its own transaction signal and publishes no
     // startup phase; only the startup load runs under the startup owner.
+    /**
+     * Evidence that a dataset's reads are alive (a startup step's
+     * `progress`): bytes or requests counted, or bytes of a request still
+     * under way arriving, as the Transfers log hears them. A request being
+     * made again after a failure is not progress: nothing arrived.
+     */
+    const datasetReadProgress = onProgress => {
+      const arrivals = entries => entries
+        .map(entry => `${entry.key}:${entry.bytes}:${entry.requests}:${entry.lastArrivalAt}`)
+        .join('|');
+      let seen = arrivals(getTransferLog().entries());
+      return getTransferLog().subscribe(entries => {
+        const now = arrivals(entries);
+        if (now === seen) return;
+        seen = now;
+        onProgress();
+      });
+    };
+
+    /**
+     * The reads still open, as the read activity log names them, and the
+     * request being made again after a failure, naming its URL; null when
+     * nothing is open.
+     */
+    function openDatasetReads() {
+      const open = getReadActivityLog().entries()
+        .filter(activity => activity.status === 'running')
+        .map(activity => activity.label);
+      const failing = getTransferLog().entries()
+        .filter(entry => entry.status === 'active' && entry.retrying !== null)
+        .map(entry => entry.retrying);
+      const parts = [
+        ...(open.length === 0 ? [] : [open.join('; ')]),
+        ...(failing.length === 0 ? [] : [`last failure: ${failing.join('; ')}`]),
+      ];
+      return parts.length === 0 ? null : parts.join(' (') + (parts.length > 1 ? ')' : '');
+    }
+
     const RELOAD_STAGE_PHASES = Object.freeze({
       enter() {},
       step: (_phase, _target, operation) => operation(null)
@@ -1196,6 +1389,50 @@ void analytics.load();
       commit() {},
       rollback() {}
     });
+
+    /**
+     * `work`'s outcome, or `signal`'s reason as soon as it aborts. A value
+     * `work` produces after that is handed to `discard`, so nothing staged
+     * for a superseded change is left behind.
+     *
+     * @template T
+     * @param {Promise<T>} work
+     * @param {AbortSignal} signal
+     * @param {(value: T) => void} discard
+     * @returns {Promise<T>}
+     */
+    function untilSuperseded(work, signal, discard) {
+      const discardLate = () => {
+        work.then(value => {
+          try {
+            discard(value);
+          } catch (error) {
+            console.error('[Main] A superseded dataset stage could not be discarded:', error);
+          }
+        }, () => {});
+      };
+      if (signal.aborted) {
+        discardLate();
+        return Promise.reject(signal.reason);
+      }
+      return new Promise((resolve, reject) => {
+        const onSuperseded = () => {
+          discardLate();
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', onSuperseded, { once: true });
+        work.then(
+          value => {
+            signal.removeEventListener('abort', onSuperseded);
+            resolve(value);
+          },
+          error => {
+            signal.removeEventListener('abort', onSuperseded);
+            reject(error);
+          }
+        );
+      });
+    }
 
     function requireDatasetChangeTransaction(transaction) {
       if (
@@ -1215,52 +1452,22 @@ void analytics.load();
 
     /**
      * The data mapping one staged generation is shown with, the AnnData
-     * candidate catalog it was resolved from, and whether it was guessed. A
-     * prepared export states its mapping in its own metadata; an AnnData
-     * dataset -- a file opened in the browser, or one a Python server serves
-     * -- states it in its catalog, because its graph and expression matrix
-     * are not visible in the identity.
-     *
-     * `datasetSource` is the source the staged dataset comes from. It is never
-     * the source currently on screen: while a newer choice stages, the shown
-     * dataset's source may be disconnected or of another kind entirely.
+     * candidate catalog it was resolved from, and whether it was guessed.
+     * Every dataset is an AnnData file -- read in the browser, whether opened
+     * here, from a link or a catalog, or served by Python -- and states its
+     * mapping in its candidate catalog, because its graph and expression
+     * matrix are not visible in the identity.
      */
     async function resolveStagedDataMapping({
       baseUrl,
       candidateAnnDataBinding,
-      datasetSource,
       generation,
-      signal,
-      stagedSource
+      signal
     }) {
-      const readInBrowser = isAnnDataUrl(baseUrl);
-      const served = !readInBrowser &&
-        typeof datasetSource.servesAnnData === 'function' &&
-        datasetSource.servesAnnData() === true;
-      if (!readInBrowser && !served) {
-        return Object.freeze({
-          mapping: resolveExportDataMapping(
-            generation.identity,
-            generation.varManifest
-          ),
-          candidates: null,
-          origin: 'default'
-        });
-      }
-      let candidates;
-      try {
-        candidates = await loadMappingCandidates(
-          `${baseUrl}${MAPPING_CANDIDATES_PATH}`,
-          { candidateAnnDataBinding, signal, stagedSource }
-        );
-      } catch (error) {
-        if (signal.aborted || readInBrowser) throw error;
-        throw new Error(
-          'This Cellucid server cannot report which AnnData arrays it serves ' +
-          `(${error?.message || error}). Update it with pip install -U cellucid.`,
-          { cause: error }
-        );
-      }
+      const candidates = await loadMappingCandidates(
+        `${baseUrl}${MAPPING_CANDIDATES_ROUTE}`,
+        { candidateAnnDataBinding, signal }
+      );
       return Object.freeze({
         mapping: resolveAnnDataMapping(candidates, generation.identity),
         candidates,
@@ -1276,9 +1483,7 @@ void analytics.load();
       datasetSource,
       expectedIdentityId,
       phases,
-      showProgress,
-      signal,
-      stagedSource
+      signal
     }) {
       if (
         typeof baseUrl !== 'string' ||
@@ -1309,111 +1514,78 @@ void analytics.load();
       }
       const candidateDimensionManager = createDimensionManager({
         baseUrl,
-        candidateAnnDataBinding,
-        stagedSource
+        candidateAnnDataBinding
       });
 
       try {
         const generation = await phases.step(
-          'identity',
-          getDatasetIdentityUrl(baseUrl),
-          stepSignal => loadDatasetGeneration({
+          'dataset',
+          baseUrl,
+          stepSignal => loadDatasetGeneration(baseUrl, {
+            candidateAnnDataBinding,
             expectedIdentityId,
             signal: stepSignal === null
               ? signal
-              : AbortSignal.any([signal, stepSignal]),
-            loadIdentity: generationSignal =>
-              loadDatasetIdentity(
-                getDatasetIdentityUrl(baseUrl),
-                {
-                  candidateAnnDataBinding,
-                  signal: generationSignal,
-                  stagedSource
-                }
-              ),
-            loadObsManifest: generationSignal =>
-              loadObsManifest(
-                getObsManifestUrl(baseUrl),
-                {
-                  candidateAnnDataBinding,
-                  signal: generationSignal,
-                  stagedSource
-                }
-              ),
-            loadVarManifest: generationSignal =>
-              loadVarManifest(
-                getVarManifestUrl(baseUrl),
-                {
-                  candidateAnnDataBinding,
-                  signal: generationSignal,
-                  stagedSource
-                }
-              ),
-            loadConnectivityManifest: generationSignal =>
-              loadConnectivityManifest(
-                getConnectivityManifestUrl(baseUrl),
-                {
-                  candidateAnnDataBinding,
-                  signal: generationSignal,
-                  stagedSource
-                }
-              ),
-          })
+              : AbortSignal.any([signal, stepSignal])
+          }),
+          { progress: datasetReadProgress, pending: openDatasetReads }
         );
         const mapping = await resolveStagedDataMapping({
           baseUrl,
           candidateAnnDataBinding,
-          datasetSource,
           generation,
-          signal,
-          stagedSource
+          signal
         });
         phases.enter('positions');
         const embeddingsMetadata = getEmbeddingsMetadata(generation.identity);
         candidateDimensionManager.initFromMetadata(embeddingsMetadata);
-        // An AnnData source -- a file read in the browser, or an object a
-        // Python server serves (`_cellucid/mapping/embeddings/...`) -- can
-        // plot any obsm array on request, so the embeddings its mapping turns
-        // on beyond the identity's are registered as layouts by reference.
-        if (mapping.candidates !== null) {
-          candidateDimensionManager.setLayoutProvider(
-            createMappingLayoutProvider(mapping.candidates)
-          );
-        }
-        // loadDatasetGeneration has already proved this count against
-        // obs_manifest.json, var_manifest.json, and connectivity_manifest.json,
-        // so it is the dataset's exact cell axis. publishCellCount enforces the
-        // ordering rule this used to state in prose: it must follow
-        // initFromMetadata, which clears the cache and zeroes the axis.
+        // An AnnData file can plot any obsm array on request
+        // (`obsm/{i}/{cols}`), so the embeddings its mapping
+        // turns on beyond the identity's are registered as layouts by
+        // reference.
+        candidateDimensionManager.setLayoutProvider(
+          createMappingLayoutProvider(mapping.candidates)
+        );
+        // loadDatasetGeneration has already proved this count against the obs
+        // and var field lists and the graph summary, so it is the dataset's
+        // exact cell axis. publishCellCount must follow initFromMetadata,
+        // which clears the cache and zeroes the axis.
         candidateDimensionManager.publishCellCount(generation.identity.stats.n_cells);
         const positionStage = await stageDatasetPositionPayload({
           generation,
           dimensionManager: candidateDimensionManager,
-          showProgress,
           signal
         });
 
-        // Every obs and var payload is one value per cell, and the generation
-        // contract has already proved both manifests declare exactly
-        // stats.n_cells points. Passing that count turns each field fetch into
-        // an exact-length transport check.
+        // Every obs and var field is one value per cell, and the generation
+        // has already proved both field lists declare exactly stats.n_cells
+        // points: each field read is checked against that count.
         const fieldLoader = createObsFieldLoader(
-          getObsManifestUrl(baseUrl),
-          { pointCount: generation.obsManifest.n_points }
+          getObsUrl(baseUrl),
+          {
+            pointCount: generation.obsFields.n_points,
+            outlierMinPoints: generation.obsFields.outlier_min_points,
+            storedOutlierLatentKey: generation.obsFields.stored_outlier_latent_key,
+          }
         );
-        const varFieldLoader = generation.varManifest
+        const varFieldLoader = generation.geneList
           ? createVarFieldLoader(
-              getVarManifestUrl(baseUrl),
-              { pointCount: generation.varManifest.n_points }
+              getGeneListUrl(baseUrl),
+              {
+                pointCount: generation.geneList.n_points,
+                // How its genes' values are transformed and which are highly
+                // variable, as the mapping it opens with says.
+                mapping: varLoaderMappingOf(mapping.mapping),
+              }
             )
           : null;
         const vectorFieldManager = createVectorFieldManager({
           baseUrl,
           vectorFields: resolveVectorFields({
-            identity: generation.identity,
             mapping: mapping.mapping,
             candidates: mapping.candidates,
-            dimensionManager: candidateDimensionManager
+            dimensionManager: candidateDimensionManager,
+            defaultField: generation.identity.vector_field_default ?? null
           }),
           dimensionManager: candidateDimensionManager
         });
@@ -1445,17 +1617,16 @@ void analytics.load();
     }
 
     let obs = null;
-    let connectivityManifest = null;
-    // Where the graph in use is read from: the dataset's own
-    // connectivity_manifest.json, or a mapped graph's under
-    // _cellucid/mapping/knn/{p}/ once the data mapping names another one.
-    let connectivityManifestUrl = null;
+    let connectivitySummary = null;
+    // Where the graph in use is read from: the dataset's own (`obsp`), or a
+    // mapped graph's (`obsp/{p}`) once the data mapping names another one.
+    let connectivityUrl = null;
     let positions = null;
     const connectivityRuntimeOwner = initializeConnectivityControls();
     // A data-mapping transaction reads the chosen arrays under the open
     // dataset's base and publishes a new neighbour graph through its owner.
     state.setMappingRuntime({
-      getBaseUrl: () => EXPORT_BASE_URL,
+      getBaseUrl: () => DATASET_BASE_URL,
       // The vector fields one mapping uses, for the dataset that is shown.
       createVectorFieldManager: mapping => {
         if (activeRuntimeStage === null) {
@@ -1463,12 +1634,12 @@ void analytics.load();
         }
         const dimensionManager = state.getDimensionManager();
         return createVectorFieldManager({
-          baseUrl: EXPORT_BASE_URL,
+          baseUrl: DATASET_BASE_URL,
           vectorFields: resolveVectorFields({
-            identity: activeRuntimeStage.generation.identity,
             mapping,
             candidates: state.getMappingCandidates(),
-            dimensionManager
+            dimensionManager,
+            defaultField: activeRuntimeStage.generation.identity.vector_field_default ?? null
           }),
           dimensionManager
         });
@@ -1522,43 +1693,37 @@ void analytics.load();
         requireRestorablePublication(restorationPublication);
       }
       const previousDimensionManager = dimensionManager;
-      const previousRuntimeStage = activeRuntimeStage;
 
       // This function is intentionally synchronous. The reload transaction is
       // checked immediately before this sole publication call, so no newer
       // selection can interleave with the dataset-owned state replacement.
-      retireInProgressHighlightSelection();
-      ui?.prepareDatasetReplacement?.();
-      EXPORT_BASE_URL = stage.baseUrl;
+      retireDatasetInteractions();
+      DATASET_BASE_URL = stage.baseUrl;
       dimensionManager = stage.dimensionManager;
-      obs = stage.generation.obsManifest;
+      obs = stage.generation.obsFields;
       positions = stage.positions;
-      connectivityManifest = stage.generation.connectivityManifest;
-      connectivityManifestUrl = connectivityManifest === null
+      connectivitySummary = stage.generation.connectivitySummary;
+      connectivityUrl = connectivitySummary === null
         ? null
-        : getConnectivityManifestUrl(stage.baseUrl);
+        : getConnectivityUrl(stage.baseUrl);
 
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(stage.fieldLoader);
       state.setVarFieldLoader(stage.varFieldLoader);
-      // A dataset without genes publishes no var manifest; it still has a var
+      // A dataset without genes publishes no gene list; it still has a var
       // inventory, an empty one, so everything that reads it (session
       // capture, filters, user-defined fields) treats it like any dataset.
-      state.initVarData(stage.generation.varManifest ?? { fields: [] });
+      state.initVarData(stage.generation.geneList ?? { fields: [] });
       state.initScene(positions, obs);
       state.clearActiveField();
-      state.clearAllHighlights();
+      state.clearActivePageHighlights();
       state.setVectorFieldManager(stage.vectorFieldManager);
       state.publishDatasetMapping(stage.mapping);
       activeRuntimeStage = stage;
 
       return restorationPublication !== null
         ? requireRestorablePublication(restorationPublication)
-        : publishRuntimeContinuation({
-            previousDimensionManager,
-            previousRuntimeStage,
-            stage
-          });
+        : publishDatasetReplacement(stage, previousDimensionManager);
     }
 
     function commitSyntheticRuntimeStage(
@@ -1588,9 +1753,7 @@ void analytics.load();
         requireRestorablePublication(restorationPublication);
       }
       const previousDimensionManager = dimensionManager;
-      const previousRuntimeStage = activeRuntimeStage;
-      retireInProgressHighlightSelection();
-      ui?.prepareDatasetReplacement?.();
+      retireDatasetInteractions();
       state.initSyntheticScene({
         positions: stage.positions,
         colors: stage.colors,
@@ -1609,31 +1772,31 @@ void analytics.load();
         stage.positions.length / stage.dimensionLevel,
         stage.dimensionLevel
       );
-      EXPORT_BASE_URL = '';
+      DATASET_BASE_URL = '';
       dimensionManager = stage.dimensionManager;
       obs = state.obsData;
       positions = stage.positions;
-      connectivityManifest = null;
-      connectivityManifestUrl = null;
+      connectivitySummary = null;
+      connectivityUrl = null;
       activeRuntimeStage = stage;
       return restorationPublication !== null
         ? requireRestorablePublication(restorationPublication)
-        : publishRuntimeContinuation({
-            previousDimensionManager,
-            previousRuntimeStage,
-            stage
-          });
+        : publishDatasetReplacement(stage, previousDimensionManager);
     }
 
-    function restoreRuntimeStage(stage, restorationPublication) {
-      if (stage?.runtimeKind === 'synthetic') {
-        return commitSyntheticRuntimeStage(stage, {
-          restorationPublication
-        });
+    // A failed publication puts back the runtime that was shown, empty or
+    // not. Its connectivity edges were retired with the attempt (they are
+    // read again when edges are next turned on), so the controls are
+    // republished for the restored graph.
+    function restorePreviousRuntime(stage, restorationPublication) {
+      if (stage === null) {
+        publishEmptyDatasetRuntime({ restorationPublication });
+      } else if (stage.runtimeKind === 'synthetic') {
+        commitSyntheticRuntimeStage(stage, { restorationPublication });
+      } else {
+        commitDatasetRuntimeStage(stage, { restorationPublication });
       }
-      return commitDatasetRuntimeStage(stage, {
-        restorationPublication
-      });
+      connectivityRuntimeOwner.synchronizeDatasetPublication();
     }
 
     function assertCurrentDatasetPublication(publication) {
@@ -1658,8 +1821,13 @@ void analytics.load();
       }
     }
 
-    function retirePublishedDatasetSnapshotViews(publication) {
-      assertCurrentDatasetPublication(publication);
+    // Kept views show the shown dataset's cells: their GPU buffers and their
+    // DataState contexts are sized and indexed by it, and the renderer will
+    // not replace its live points with another count while any is published.
+    // They go first, before the replacement touches anything else. A failed
+    // replacement cannot give them back either way: restoring the previous
+    // dataset republishes its scene, which starts with the live view alone.
+    function retireKeptViews() {
       const hadSnapshots = viewer.hasSnapshots();
       if (typeof hadSnapshots !== 'boolean') {
         throw new TypeError(
@@ -1668,18 +1836,14 @@ void analytics.load();
       }
       const retirementFailures = [];
       if (hadSnapshots) {
-        // Kept views own the previous dataset's GPU buffers and DataState
-        // contexts. Retire them only after scientific publication succeeds so
-        // a failed runtime commit can still restore the complete prior scene.
         try {
           viewer.clearSnapshotViews();
         } catch (error) {
           retirementFailures.push(error);
         }
       }
-      // State may already have reset itself during dataset publication, but
-      // clear its secondary inventory independently of renderer cleanup so a
-      // prior partial failure cannot preserve a stale active-view identity.
+      // Clear the state's own inventory whatever the renderer did, so a prior
+      // partial failure cannot preserve a stale active-view identity.
       try {
         state.clearSnapshotViews();
       } catch (error) {
@@ -1699,7 +1863,7 @@ void analytics.load();
       ) {
         retirementFailures.push(
           new Error(
-            'Published dataset view retirement did not restore the visible live view.'
+            'Kept-view retirement did not restore the visible live view.'
           )
         );
       }
@@ -1709,7 +1873,7 @@ void analytics.load();
       if (retirementFailures.length > 1) {
         throw new AggregateError(
           retirementFailures,
-          'Published dataset kept-view retirement was incomplete.'
+          'Kept-view retirement was incomplete.'
         );
       }
     }
@@ -1730,16 +1894,11 @@ void analytics.load();
       return await settlePublishedDatasetUi({
         synchronize: async () => {
           assertCurrentDatasetPublication(publication);
-          // The scientific runtime is already committed. Retire kept views
-          // before the first await so an animation frame can never combine
-          // the new live dataset with snapshot buffers from its predecessor.
-          retirePublishedDatasetSnapshotViews(publication);
           try {
             await ui?.settleFieldInteractions?.();
           } finally {
             assertCurrentDatasetPublication(publication);
           }
-          connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           if (window._comparisonModule) {
             try {
@@ -1751,30 +1910,29 @@ void analytics.load();
             }
           }
           debug.log(
-            `[Main] Published dataset identity ` +
-            `v${publication.stage.generation.identity.version}`
+            `[Main] Published dataset "${publication.stage.generation.identity.id}"`
           );
-          if (publication.stage.generation.varManifest) {
+          if (publication.stage.generation.geneList) {
             debug.log(
-              `Loaded var manifest with ` +
-              `${publication.stage.generation.varManifest.fields.length} genes.`
+              `Loaded a gene list of ` +
+              `${formatCountOf(publication.stage.generation.geneList.fields.length, 'gene')}.`
             );
           }
-          if (publication.stage.generation.connectivityManifest) {
-            debug.log(
-              `Loaded connectivity manifest with ` +
-              `${publication.stage.generation.connectivityManifest.n_edges.toLocaleString()} edges.`
-            );
+          const publishedGraph = publication.stage.generation.connectivitySummary;
+          if (publishedGraph) {
+            debug.log(publishedGraph.n_edges === null
+              ? 'Loaded the neighbour graph summary; its edges are counted when they are read.'
+              : `Loaded a neighbour graph of ${formatCountOf(publishedGraph.n_edges, 'edge')}.`);
           }
           ui.refreshDatasetUI(activeMetadata);
           // The notebook learns the mapping each dataset opens with.
-          if (jupyterSource !== null && state.getDataMapping() !== null) {
-            void jupyterSource.notifyDataMapping({
+          if (viewerHostSource !== null && state.getDataMapping() !== null) {
+            void viewerHostSource.notifyDataMapping({
               origin: state.getDataMappingOrigin(),
               requestId: null,
               mapping: state.getDataMapping()
             }).catch(error => {
-              console.error('[Main] Jupyter data-mapping report failed:', error);
+              console.error('[Main] Viewer host data-mapping report failed:', error);
             });
           }
           // The cell count is the one thing a sensible opening point size
@@ -1787,9 +1945,7 @@ void analytics.load();
           );
         },
         finalize: () => {
-          runtimeRetirementOwner.retire(
-            publication.previousDimensionManager
-          );
+          retireReplacedDimensionManager(publication);
         },
         reportFailure: error => {
           if (publication.isCurrent() !== true) return;
@@ -1818,11 +1974,11 @@ void analytics.load();
     // one ordinary dataset change (see the end of this bootstrap), so every
     // data control is live while it loads and can replace it.
     const unusedDimensionManager = dimensionManager;
-    publishEmptyDatasetRuntime({ clearViews: false });
+    publishEmptyDatasetRuntime();
     runtimeRetirementOwner.retire(unusedDimensionManager);
 
     // Stage one exact manager/source/runtime/URL generation before publishing
-    // any of it. This also activates not-yet-registered Remote/GitHub
+    // any of it. This also activates not-yet-registered Remote/link
     // connection candidates without replacing the prior transport early.
     //
     // `transaction` is the dataset-change transaction the caller began when
@@ -1831,8 +1987,12 @@ void analytics.load();
     // already owned by it. `startup` marks the one load the bootstrap starts:
     // its network awaits run as deadline-bound startup steps, its progress is
     // shown, it does not rewrite the address the page was opened with, and a
-    // failure that no newer choice superseded is the terminal startup failure.
-    async function reloadActiveDatasetInPlace(selection) {
+    // failure that no newer choice superseded is startup's to explain.
+    //
+    // `step` names each wait that is not a read of the dataset (reads name
+    // themselves in the opening), so an opening that stalls says which one
+    // it is in (`data/opening-progress.js`).
+    async function reloadActiveDatasetInPlace(selection, { step = () => {} } = {}) {
       const activationKeys = [
         'datasetId',
         'loadMethod',
@@ -1902,39 +2062,46 @@ void analytics.load();
       let urlPublication = null;
 
       try {
+        // A newer dataset change ends this step at once: a catalog dataset
+        // being opened for it stops (the stage's signal), a served store
+        // finishes opening, and startup must not wait out its deadline behind
+        // a choice the user already replaced. A stage that lands later is
+        // discarded.
+        // Opening reads the dataset's metadata, field lists and the embedding
+        // its first view draws; every request of it bounds itself, so the
+        // step stalls only when nothing at all arrives for a whole deadline,
+        // and then names the reads still open.
         selectionStage = await stagePhases.step(
-          'identity',
-          `the ${sourceType} dataset "${datasetId}"`,
-          () => dataSourceManager.stageDatasetSelection(
-            sourceType,
-            datasetId,
-            { loadMethod, source }
-          )
+          'dataset',
+          `the host of dataset "${datasetId}"`,
+          () => untilSuperseded(
+            dataSourceManager.stageDatasetSelection(
+              sourceType,
+              datasetId,
+              { loadMethod, source, signal: reloadTransaction.signal }
+            ),
+            reloadTransaction.signal,
+            stage => dataSourceManager.discardDatasetSelection(stage)
+          ),
+          { progress: datasetReadProgress, pending: openDatasetReads }
         );
         reloadTransaction.assertCurrent();
         // The address the page was opened with already names the startup
-        // selection (or names nothing, for the catalog default).
-        urlPublication = isStartupLoad
+        // selection (or names nothing, for the catalog default), except a
+        // link's: `?data=` then names it in its provider's form (a pasted
+        // Drive link as `gdrive:<id>`), as opening it from the bar does.
+        urlPublication = isStartupLoad && sourceType !== 'link'
           ? UNCHANGED_URL_PUBLICATION
           : prepareUrlForDatasetSelection({
               datasetId,
               source,
               sourceType
             });
-        const candidateAnnDataBinding =
-          isAnnDataUrl(selectionStage.baseUrl)
-            ? createCandidateAnnDataBinding(
-                selectionStage.baseUrl,
-                source
-              )
-            : null;
-        const stagedSource =
-          candidateAnnDataBinding === null &&
-          dataSourceManager.isCustomProtocolUrl(
-            selectionStage.baseUrl
-          )
-            ? source
-            : null;
+        const candidateAnnDataBinding = createCandidateAnnDataBinding(
+          selectionStage.baseUrl,
+          source ?? dataSourceManager.getSource(sourceType)
+        );
+        step('Preparing the first view');
         runtimeStage = await stageDatasetRuntime({
           baseUrl: selectionStage.baseUrl,
           candidateAnnDataBinding,
@@ -1942,15 +2109,45 @@ void analytics.load();
           datasetSource: source ?? dataSourceManager.getSource(sourceType),
           expectedIdentityId: selectionStage.identityId,
           phases: stagePhases,
-          showProgress: isStartupLoad,
-          signal: reloadTransaction.signal,
-          stagedSource
+          signal: reloadTransaction.signal
         });
         reloadTransaction.assertCurrent();
+        step("Stopping the previous dataset's saved-state restore");
         await cancelPublishedDatasetStateAndWait();
         reloadTransaction.assertCurrent();
+        // The dataset's GPU stores are allocated here, in a task of their
+        // own, once the GPU has done the work queued before (startup's
+        // programs, the frames drawn so far; waited for between tasks): the
+        // publication below then reads nothing back, and a dataset the
+        // device cannot hold is refused before anything is replaced.
+        step('Waiting for the GPU to finish the frames already queued');
+        await viewer.whenGpuIdle();
+        reloadTransaction.assertCurrent();
+        // The layout the live view opens on (`setDimensionManager`), whose
+        // positions the stage holds.
+        const stagedLayout = runtimeStage.dimensionManager.getDefaultLayoutKey();
+        const stagedDimension = stagedLayout === null
+          ? 0
+          : runtimeStage.dimensionManager.getLayout(stagedLayout).dimension;
+        const stagedPointCount = stagedDimension === 0
+          ? 0
+          : runtimeStage.positions.length / stagedDimension;
+        // Positions that are not whole cells are refused by the publication
+        // itself, with its own message.
+        if (Number.isSafeInteger(stagedPointCount) && stagedPointCount > 0) {
+          step('Allocating the GPU memory for the cells');
+          viewer.prepareDataStores(stagedPointCount, stagedDimension);
+          // The publication runs in a task of its own.
+          await yieldToMacrotask();
+          reloadTransaction.assertCurrent();
+        }
       } catch (err) {
         const stagingErrors = [err];
+        try {
+          viewer.releasePreparedDataStores();
+        } catch (releaseError) {
+          stagingErrors.push(releaseError);
+        }
         if (runtimeStage !== null) {
           try {
             runtimeRetirementOwner.retire(
@@ -1978,8 +2175,8 @@ void analytics.load();
           transaction: reloadTransaction,
           cancel: () => dataLoad.cancel(),
           reportFailure: failure => {
-            // A failed startup load is logged once, by the terminal startup
-            // failure it becomes.
+            // A failed startup load is logged once, by the startup that
+            // explains it (its failed opening, or the startup failure).
             if (!isStartupLoad) {
               console.error(
                 '[Main] Failed to reload dataset in-place:',
@@ -2056,17 +2253,7 @@ void analytics.load();
       } catch (runtimeError) {
         let restorationError = null;
         try {
-          if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({
-              clearViews: false,
-              restorationPublication: previousPublication
-            });
-          } else {
-            restoreRuntimeStage(
-              previousRuntimeStage,
-              previousPublication
-            );
-          }
+          restorePreviousRuntime(previousRuntimeStage, previousPublication);
         } catch (error) {
           restorationError = error;
         }
@@ -2125,6 +2312,7 @@ void analytics.load();
       } catch (error) {
         managerListenerError = error;
       }
+      step('Drawing the first view');
       const synchronizationOutcome = await synchronizePublishedDatasetUi(
         selectionStage.metadata,
         publication
@@ -2207,7 +2395,11 @@ void analytics.load();
             datasetId,
             metadata: selectionStage.metadata,
             stateStatus: stateOutcome.status,
-            mapping: state.getMappingAnalytics()
+            mapping: state.getMappingAnalytics(),
+            // The input format it was read as (a server or catalog names
+            // only where; the reader found what).
+            dataFormat: getDataSourceManager().getSource(sourceType)
+              ?.getAnnDataSource?.(datasetId)?.describeStorage?.()?.format ?? null
           })
         });
       debug.log(
@@ -2216,6 +2408,54 @@ void analytics.load();
       );
       return synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
+    }
+
+    /**
+     * A dataset change, shown from its first moment by the opening progress
+     * (`data/opening-progress.js`; the layers that read the dataset join
+     * it): Cancel stops the change, and the dataset on screen stays. A
+     * failure is explained by the dataset controls (or, at startup, by
+     * startup), so the opening only lets go of it.
+     */
+    async function reloadActiveDatasetShown(selection) {
+      const opening = beginOpening({
+        title: selection.datasetId,
+        step: 'Opening the dataset',
+        onCancel: () => selection.transaction.cancel()
+      });
+      // Named as the dataset list names it, once that is read.
+      const source = selection.source ?? dataSourceManager.getSource(selection.sourceType);
+      Promise.resolve(source?.listDatasets?.())
+        .then(datasets => {
+          const name = datasets?.find?.(dataset => dataset.id === selection.datasetId)?.name;
+          if (typeof name === 'string') opening.rename(name);
+        })
+        .catch(() => {});
+      // A newer choice replaces this change at once: the opening is left to
+      // it (and so is the startup opening, when this change was startup's)
+      // even while this change's own reads are still unwinding, which a
+      // read that never answers would otherwise hold on screen.
+      // (A malformed selection is refused by the reload itself.)
+      const signal = selection?.transaction?.signal ?? null;
+      const letGo = () => {
+        opening.dismiss();
+        if (selection.startup === true) startupOpening?.dismiss();
+      };
+      if (signal?.aborted) letGo();
+      else signal?.addEventListener('abort', letGo, { once: true });
+      try {
+        const ready = await reloadActiveDatasetInPlace(selection, {
+          step: text => opening.step(text)
+        });
+        if (ready === true) opening.end();
+        else opening.dismiss();
+        return ready;
+      } catch (error) {
+        opening.dismiss();
+        throw error;
+      } finally {
+        signal?.removeEventListener('abort', letGo);
+      }
     }
 
     async function clearActiveDatasetInPlace(reloadTransaction) {
@@ -2243,7 +2483,7 @@ void analytics.load();
       let emptyPublication = null;
       try {
         emptyPublication =
-          publishEmptyDatasetRuntime({ clearViews: true });
+          publishEmptyDatasetRuntime();
       } catch (runtimeError) {
         const rollbackErrors = [runtimeError];
         const rejectedEmptyDimensionManager =
@@ -2251,17 +2491,7 @@ void analytics.load();
             ? null
             : dimensionManager;
         try {
-          if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({
-              clearViews: false,
-              restorationPublication: previousPublication
-            });
-          } else {
-            restoreRuntimeStage(
-              previousRuntimeStage,
-              previousPublication
-            );
-          }
+          restorePreviousRuntime(previousRuntimeStage, previousPublication);
         } catch (error) {
           rollbackErrors.push(error);
         }
@@ -2309,7 +2539,6 @@ void analytics.load();
           } finally {
             assertCurrentDatasetPublication(emptyPublication);
           }
-          connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           if (window._comparisonModule) {
             try {
@@ -2511,7 +2740,7 @@ void analytics.load();
         try {
           const restored = await restoreCurrentDatasetState({
             dataSourceManager,
-            fetchArtifact: fetchSampleArtifact,
+            fetchArtifact: fetchCatalogFile,
             getPublicationRevision: () => datasetPublicationGeneration,
             refreshUi: ui.refreshUiAfterStateLoad,
             requestStep,
@@ -2538,12 +2767,12 @@ void analytics.load();
             error
           );
           notifications.error(
-            `The dataset is loaded, but its published sample view could not ` +
-            `be applied: ${message}`,
+            'The dataset is open, but its published sample view could not be applied.',
             {
               category: 'data',
               duration: 0,
-              title: 'Sample view unavailable'
+              title: 'Sample view unavailable',
+              details: message
             }
           );
           return {
@@ -2566,23 +2795,14 @@ void analytics.load();
     }
 
     // -----------------------------------------------------------------------
-    // Jupyter "no-download" session bundle capture (viewer → Python)
+    // Session capture for the host ("no download"): the bundle goes to the
+    // host on the viewer channel.
     // -----------------------------------------------------------------------
-    if (jupyterSource) {
-      if (jupyterConfig === null) {
-        throw new Error(
-          'Jupyter session upload requires the exact authenticated configuration'
-        );
-      }
-      jupyterSource.onMessage(async message => {
+    if (viewerHostSource) {
+      viewerHostSource.onMessage(async message => {
         if (message.type !== 'requestSessionBundle') return;
-        await uploadJupyterSessionBundle({
-          config: jupyterConfig,
-          message,
-          createSessionBundle: () =>
-            sessionSerializer.createSessionBundle(),
-          fetchImpl: fetch
-        });
+        const bundle = await sessionSerializer.createSessionBundle();
+        viewerHostSource.sendSessionBundle(message.requestId, bundle);
       });
     }
 
@@ -2594,53 +2814,59 @@ void analytics.load();
         rebuildSmokeDensity
       },
       clearActiveDataset: clearActiveDatasetInPlace,
-      reloadActiveDataset: reloadActiveDatasetInPlace,
+      reloadActiveDataset: reloadActiveDatasetShown,
       datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
       dataSourceManager,
-      jupyterSource
+      viewerHostSource
     });
     window._cellucidUi = ui;
     // Every runtime publication so far reached no UI.
     ui.publishCellPresence(publicationHasCells(activeDatasetPublication));
 
-    if (jupyterSource !== null) {
-      const jupyterCommandHandlers = createJupyterCommandHandlers({
+    if (viewerHostSource !== null) {
+      const viewerHostCommandHandlers = createViewerHostCommandHandlers({
         state,
         viewer,
         refreshUi: ui.refreshUiAfterStateLoad,
-        reportDataMapping: report => jupyterSource.notifyDataMapping(report)
+        reportDataMapping: report => viewerHostSource.notifyDataMapping(report)
       });
       // Every mapping change reaches the notebook, except an answer to its
       // own setDataMapping, which the command handler sends with the request
       // id it names.
       state.on('mapping:changed', ({ mapping, origin }) => {
         if (origin === 'notebook') return;
-        void jupyterSource.notifyDataMapping({
+        void viewerHostSource.notifyDataMapping({
           origin,
           requestId: null,
           mapping
         }).catch(error => {
-          console.error('[Main] Jupyter data-mapping report failed:', error);
+          console.error('[Main] Viewer host data-mapping report failed:', error);
         });
       });
-      jupyterSource.onHighlight(
-        jupyterCommandHandlers.handleHighlight
+      viewerHostSource.onHighlight(
+        viewerHostCommandHandlers.handleHighlight
       );
-      jupyterSource.onMessage(
-        jupyterCommandHandlers.handleMessage
+      viewerHostSource.onMessage(
+        viewerHostCommandHandlers.handleMessage
       );
+      // Every handler is in place: commands the host sent while the dataset
+      // opened run now, in order.
+      viewerHostSource.acceptCommands();
     }
 
-    // Allow session serializer to capture/restore cinematic camera state.
+    // Allow session serializer to capture/restore cinematic camera state and
+    // the figure-export settings.
     sessionSerializer.setCinematicCameraRef(ui.cinematicCamera);
+    sessionSerializer.setFigureExportRef(ui.figureExport);
 
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');
     if (pageAnalysisSection) {
       comparisonModule = createComparisonModule({
         state,
-        container: pageAnalysisSection
+        container: pageAnalysisSection,
+        colorByGene: ui.colorByGene
       });
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
@@ -2654,20 +2880,21 @@ void analytics.load();
 
     // Setup connectivity controls
     // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
-    // The handlers check if connectivityManifest is available before doing anything
+    // The handlers check if connectivitySummary is available before doing anything
     function initializeConnectivityControls() {
       // Show connectivity controls if data is available at bootstrap
-      if (connectivityManifest !== null && connectivityControls) {
+      if (connectivitySummary !== null && connectivityControls) {
         connectivityControls.hidden = false;
       }
 
-      // Use getter to always get current edge count (supports dynamic manifest updates)
+      // The current graph's edge count. A graph read straight from a file is
+      // counted when its edges are read: until then its summary has none,
+      // and the count is the published edges'.
+      let publishedEdgeCount = null;
       const getTotalEdges = () =>
-        connectivityManifest === null ? 0 : connectivityManifest.n_edges;
-      // Retain the exact endpoints for KNN publication. Which edges a pane
-      // shows, and how many are visible, belongs to the viewer's edge layer.
-      let edgeSources = null;
-      let edgeDestinations = null;
+        connectivitySummary === null
+          ? 0
+          : connectivitySummary.n_edges ?? publishedEdgeCount ?? 0;
 
       // UI statistics describe only the active pane, while every pane owns its
       // own selection of shown edges inside the viewer.
@@ -2744,8 +2971,8 @@ void analytics.load();
 
         if (
           !(transparency instanceof Uint8Array) ||
-          connectivityManifest === null ||
-          transparency.length !== connectivityManifest.n_cells
+          connectivitySummary === null ||
+          transparency.length !== connectivitySummary.n_cells
         ) {
           throw new TypeError(
             'Connectivity filtering requires one exact Uint8 visibility ' +
@@ -2780,12 +3007,21 @@ void analytics.load();
       }
 
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
-      let currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, getTotalEdges());  // User's desired edge count (stable)
+      // The number of edges the person asked to see, or null until they move
+      // the slider. The default is applied against the graph's edge count
+      // when it is used, not when the dataset is published: a graph read
+      // from a file has no count until its edges are read, and a default
+      // fixed at publication was min(default, 0) -- edges on, none shown.
+      let userEdgeLimit = null;
+      const currentEdgeLimit = () => Math.min(
+        userEdgeLimit ?? CONNECTIVITY_DEFAULT_VISIBLE_TARGET,
+        getTotalEdges()
+      );
 
       /**
        * Update slider range based on visible edges.
        * - Slider max = visible edges (dynamic)
-       * - User's preference (currentEdgeLimit) stays stable
+       * - User's preference (currentEdgeLimit()) stays stable
        * - Slider value = min(preference, visible) to show what's achievable
        */
       function updateSliderRange(visibleEdges) {
@@ -2809,11 +3045,11 @@ void analytics.load();
         connectivityLimitInput.min = minVal;
 
         // Slider shows achievable value, but preference stays unchanged
-        const achievable = Math.min(currentEdgeLimit, maxEdges);
+        const achievable = Math.min(currentEdgeLimit(), maxEdges);
         connectivityLimitInput.value = Math.max(minVal, achievable);
 
         if (connectivityLimitDisplay) {
-          connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
+          connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit());
         }
       }
 
@@ -2836,10 +3072,8 @@ void analytics.load();
       function applyEdgeLodLimit() {
         const activeViewId = state.getActiveViewId();
         // One stable user target: every pane shows the first
-        // `currentEdgeLimit` of its own visible edges.
-        viewer.setEdgeVisibleTarget(
-          Math.min(currentEdgeLimit, getTotalEdges())
-        );
+        // `currentEdgeLimit()` of its own visible edges.
+        viewer.setEdgeVisibleTarget(currentEdgeLimit());
         const acceptedStats =
           viewer.getEdgeSelectionStatsForView(activeViewId);
         if (acceptedStats === null || acceptedStats.current !== true) {
@@ -2872,7 +3106,7 @@ void analytics.load();
 
       // Initial slider setup and info display
       updateSliderRange(actualVisibleEdges);
-      updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+      updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit(), actualVisibleEdges));
 
       // Edge loading state
       let edgesLoaded = false;
@@ -2900,9 +3134,9 @@ void analytics.load();
       }
 
       function captureConnectivityLoadOwner() {
-        if (connectivityManifest === null) {
+        if (connectivitySummary === null) {
           throw new Error(
-            'Connectivity edge loading requires a published connectivity manifest.'
+            'Connectivity edge loading requires a published neighbour graph.'
           );
         }
 
@@ -2915,7 +3149,7 @@ void analytics.load();
           sourceType === null ||
           datasetId === null ||
           identityId === null ||
-          managerBaseUrl !== EXPORT_BASE_URL
+          managerBaseUrl !== DATASET_BASE_URL
         ) {
           throw createConnectivitySupersededError();
         }
@@ -2923,9 +3157,9 @@ void analytics.load();
         return {
           controller: new AbortController(),
           publicationGeneration: datasetPublicationGeneration,
-          manifest: connectivityManifest,
-          manifestUrl: connectivityManifestUrl,
-          exportBaseUrl: EXPORT_BASE_URL,
+          summary: connectivitySummary,
+          url: connectivityUrl,
+          datasetBaseUrl: DATASET_BASE_URL,
           sourceType,
           datasetId,
           identityId,
@@ -2941,9 +3175,9 @@ void analytics.load();
           owner !== edgeLoadOwner ||
           owner.controller.signal.aborted ||
           owner.publicationGeneration !== datasetPublicationGeneration ||
-          owner.manifest !== connectivityManifest ||
-          owner.manifestUrl !== connectivityManifestUrl ||
-          owner.exportBaseUrl !== EXPORT_BASE_URL ||
+          owner.summary !== connectivitySummary ||
+          owner.url !== connectivityUrl ||
+          owner.datasetBaseUrl !== DATASET_BASE_URL ||
           owner.sourceType !== dataSourceManager.getCurrentSourceType() ||
           owner.datasetId !== dataSourceManager.getCurrentDatasetId() ||
           owner.identityId !== dataSourceManager.getCurrentIdentityId() ||
@@ -2973,11 +3207,10 @@ void analytics.load();
         knnLoadPromise = null;
         edgesLoaded = false;
         loadedEdgeData = null;
-        edgeSources = null;
-        edgeDestinations = null;
+        publishedEdgeCount = null;
         activeConnectivityStatsViewId = null;
         actualVisibleEdges = 0;
-        currentEdgeLimit = 0;
+        userEdgeLimit = null;
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -2996,7 +3229,7 @@ void analytics.load();
 
       function synchronizeDatasetPublication() {
         actualVisibleEdges = getTotalEdges();
-        currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, getTotalEdges());
+        userEdgeLimit = null;
         if (connectivityCheckbox) {
           connectivityCheckbox.checked = false;
           connectivityCheckbox.disabled = false;
@@ -3005,31 +3238,21 @@ void analytics.load();
           connectivitySliders.hidden = true;
         }
         updateSliderRange(actualVisibleEdges);
-        updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+        updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit(), actualVisibleEdges));
         if (connectivityControls) {
-          connectivityControls.hidden = connectivityManifest === null;
+          connectivityControls.hidden = connectivitySummary === null;
         }
       }
 
       function publishConnectivityEdges(owner, edgeData) {
         assertCurrentConnectivityLoadOwner(owner);
-        // The loader result is a private, unpublished generation: the viewer
-        // keeps its endpoints as they are (the shown order is computed, not
-        // stored) and reads the Float64 weights once.
-        const renderEdgeData = Object.freeze({
-          destinations: edgeData.destinations,
-          nCells: edgeData.nCells,
-          nEdges: edgeData.nEdges,
-          sources: edgeData.sources,
-          weights: edgeData.weights,
-        });
-        assertCurrentConnectivityLoadOwner(owner);
-
-        edgeSources = renderEdgeData.sources;
-        edgeDestinations = renderEdgeData.destinations;
+        publishedEdgeCount = edgeData.nEdges;
+        // The viewer keeps the payload's arrays as they are (the shown order
+        // is computed, not stored): endpoints, strengths and, for the k-NN
+        // tool, the adjacency the reader worker built.
         if (
           viewer.setupEdgesV2(
-            renderEdgeData
+            edgeData
           ) !== true
         ) {
           throw new Error(
@@ -3105,21 +3328,14 @@ void analytics.load();
         updateSliderRange(actualVisibleEdges);
         applyEdgeLodLimit();
 
-        // Float64 weights are needed only for the strength normalization
-        // above. The retained lifecycle/KNN owner aliases the endpoints as
-        // loaded and lets the 8-byte-per-edge weight generation be collected
-        // immediately after this publication returns.
-        const publishedEdgeData = Object.freeze({
-          destinations: edgeDestinations,
-          nCells: edgeData.nCells,
-          nEdges: edgeData.nEdges,
-          sources: edgeSources,
-        });
+        // The lifecycle and k-NN owner is the payload itself (no copy).
+        const publishedEdgeData = edgeData;
         loadedEdgeData = publishedEdgeData;
         edgesLoaded = true;
+        ui.showLoadedConnectivityEdges(edgeData.nEdges);
         debug.log(
           `[Main] Connectivity generation published: ` +
-          `${edgeData.nEdges} edges, ${edgeData.nCells} cells, ` +
+          `${formatCountOf(edgeData.nEdges, 'edge')}, ${formatCountOf(edgeData.nCells, 'cell')}, ` +
           `${actualVisibleEdges} visible.`
         );
         return publishedEdgeData;
@@ -3131,11 +3347,10 @@ void analytics.load();
         viewer.clearKnnEdges();
         edgesLoaded = false;
         loadedEdgeData = null;
-        edgeSources = null;
-        edgeDestinations = null;
+        publishedEdgeCount = null;
         activeConnectivityStatsViewId = null;
         actualVisibleEdges = getTotalEdges();
-        currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, actualVisibleEdges);
+        userEdgeLimit = null;
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -3145,7 +3360,7 @@ void analytics.load();
         updateSliderRange(actualVisibleEdges);
         updateConnectivityInfo(
           actualVisibleEdges,
-          Math.min(currentEdgeLimit, actualVisibleEdges)
+          Math.min(currentEdgeLimit(), actualVisibleEdges)
         );
       }
 
@@ -3168,8 +3383,8 @@ void analytics.load();
         owner.promise = (async () => {
           try {
             const edgeData = await loadEdges(
-              owner.manifestUrl,
-              owner.manifest,
+              owner.url,
+              owner.summary,
               { signal: owner.controller.signal }
             );
             assertCurrentConnectivityLoadOwner(owner);
@@ -3203,14 +3418,14 @@ void analytics.load();
           const show = connectivityCheckbox.checked;
           const toggleGeneration = ++connectivityToggleGeneration;
 
-          // Check if connectivity manifest is available
-          if (connectivityManifest === null) {
-            console.warn('[Main] Connectivity checkbox toggled but no manifest available');
+          // Check if a neighbour graph is available
+          if (connectivitySummary === null) {
+            console.warn('[Main] Connectivity checkbox toggled but no neighbour graph available');
             connectivityCheckbox.checked = false;
             return;
           }
 
-          // Load edge data on first toggle (or after manifest was reloaded)
+          // Load edge data on first toggle (or after the graph was replaced)
           if (show && !edgesLoaded) {
             const connNotifId = notifications.loading('Loading connectivity data', { category: 'connectivity' });
             try {
@@ -3225,7 +3440,7 @@ void analytics.load();
                 notifications.dismiss(connNotifId);
                 return;
               }
-              notifications.complete(connNotifId, `Loaded ${edgeData.nEdges.toLocaleString()} edges`);
+              notifications.complete(connNotifId, `Loaded ${formatCountOf(edgeData.nEdges, 'edge')}`);
 
             } catch (err) {
               if (
@@ -3566,9 +3781,9 @@ void analytics.load();
               'Connectivity edge limit controls require exact integer bounds.'
             );
           }
-          currentEdgeLimit = clamp(requested, min, max);
-          connectivityLimitInput.value = currentEdgeLimit;
-          connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
+          userEdgeLimit = clamp(requested, min, max);
+          connectivityLimitInput.value = userEdgeLimit;
+          connectivityLimitDisplay.textContent = formatEdgeCount(userEdgeLimit);
 
           // Apply LOD limit using accurate visible edge calculation
           applyEdgeLodLimit();
@@ -3588,13 +3803,13 @@ void analytics.load();
       // Set up KNN edge load callback - triggers when KNN mode needs edges
       // This loads edges on-demand when user first tries to use KNN drag
       viewer.setKnnEdgeLoadCallback(() => {
-        if (connectivityManifest === null) {
+        if (connectivitySummary === null) {
           const graphGeneration =
             `${datasetPublicationGeneration}:${connectivityGraphGeneration}`;
           if (announcedMissingConnectivityGeneration !== graphGeneration) {
             announcedMissingConnectivityGeneration = graphGeneration;
             console.warn(
-              '[Main] KNN mode requested but no connectivity manifest available'
+              '[Main] KNN mode requested but no neighbour graph available'
             );
             notifications.warning(
               'No neighbor graph available for this dataset',
@@ -3630,10 +3845,7 @@ void analytics.load();
               return;
             }
             if (
-              viewer.loadKnnEdges(
-                edgeData.sources,
-                edgeData.destinations
-              ) !== true
+              viewer.loadKnnEdges(edgeData) !== true
             ) {
               throw new Error(
                 'The viewer rejected an exact KNN connectivity payload.'
@@ -3642,7 +3854,7 @@ void analytics.load();
             notifications.complete(
               knnNotifId,
               `Neighbor graph ready ` +
-              `(${edgeData.nEdges.toLocaleString()} edges)`
+              `(${formatCountOf(edgeData.nEdges, 'edge')})`
             );
           } catch (err) {
             if (
@@ -3669,37 +3881,39 @@ void analytics.load();
       });
 
       /**
-       * The neighbour graph in use: its manifest (null for none) and where it
-       * is read from.
+       * The neighbour graph in use: its summary (null for none), where it is
+       * read from, and its edge count (a graph read straight from a file is
+       * counted once its edges are read; null until then).
        */
       function getConnectivityGraph() {
         return Object.freeze({
-          manifest: connectivityManifest,
-          manifestUrl: connectivityManifestUrl
+          summary: connectivitySummary,
+          url: connectivityUrl,
+          edges: connectivitySummary === null ? null : (connectivitySummary.n_edges ?? publishedEdgeCount)
         });
       }
 
       /**
        * Replace the neighbour graph in use, as one step of a data-mapping
        * transaction: the edges and the KNN tool's graph are released, the
-       * new manifest is published, and the edges are drawn again from the new
+       * new summary is published, and the edges are drawn again from the new
        * graph if they were shown. Applying the previous graph rolls it back.
        *
-       * @param {{manifest: Object|null, manifestUrl: string|null}} graph
+       * @param {{summary: Object|null, url: string|null}} graph
        */
-      function replaceConnectivityGraph({ manifest, manifestUrl }) {
-        if ((manifest === null) !== (manifestUrl === null)) {
+      function replaceConnectivityGraph({ summary, url }) {
+        if ((summary === null) !== (url === null)) {
           throw new TypeError(
-            'A neighbour graph is a manifest with its URL, or neither.'
+            'A neighbour graph is a summary with its URL, or neither.'
           );
         }
         const wasShown = connectivityCheckbox?.checked === true;
         prepareDatasetReplacement();
-        connectivityManifest = manifest;
-        connectivityManifestUrl = manifestUrl;
+        connectivitySummary = summary;
+        connectivityUrl = url;
         connectivityGraphGeneration++;
         synchronizeDatasetPublication();
-        if (wasShown && manifest !== null && connectivityCheckbox) {
+        if (wasShown && summary !== null && connectivityCheckbox) {
           connectivityCheckbox.checked = true;
           connectivityCheckbox.dispatchEvent(new Event('change'));
         }
@@ -3770,7 +3984,7 @@ void analytics.load();
         return benchmarkHarnessModuleLoadTask;
       }
 
-      const loadTask = import('./ui/modules/benchmark/index.js').then(
+      const loadTask = loadAppCode(() => import('./ui/modules/benchmark/index.js')).then(
         harnessModule => {
           if (applicationRetired) return null;
           // The configuration-matrix harness is the only thing that can sweep
@@ -3824,11 +4038,11 @@ void analytics.load();
 
       const loadTask = (async () => {
         try {
-          const [generationModule, generationContract, trackerModule] = await Promise.all([
+          const [generationModule, generationContract, trackerModule] = await loadAppCode(() => Promise.all([
             import('./ui/modules/benchmark/generation.js'),
             import('./ui/modules/benchmark/generation-contract.js'),
             import('./ui/modules/benchmark/performance-tracker.js')
-          ]);
+          ]));
           if (applicationRetired) return false;
           generateSyntheticDataOffThread =
             generationModule.generateSyntheticDataOffThread;
@@ -3865,7 +4079,7 @@ void analytics.load();
         return benchmarkSupportModuleLoadTask;
       }
 
-      const loadTask = import('../dev/benchmark.js').then(
+      const loadTask = loadAppCode(() => import('../dev/benchmark.js')).then(
         module => {
           if (applicationRetired) return null;
           benchmarkSupportModule = module;
@@ -4116,7 +4330,7 @@ void analytics.load();
         );
         try {
           notifications.error(
-            `Performance benchmark panel was not changed: ` +
+            `${PLACES.benchmark.name} panel was not changed: ` +
             `${exactError.message}`,
             {
               category: 'rendering',
@@ -4254,7 +4468,7 @@ void analytics.load();
         return false;
       }
 
-      debug.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
+      debug.log(`Running benchmark: ${formatNumber(pointCount)} ${countNoun(pointCount, 'point')} (${pattern})`);
 
       // Show notification for benchmark data generation
       const benchNotifId = notifications.startDataGeneration(pattern, pointCount);
@@ -4401,17 +4615,7 @@ void analytics.load();
       } catch (error) {
         const publicationErrors = [error];
         try {
-          if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({
-              clearViews: false,
-              restorationPublication: previousPublication
-            });
-          } else {
-            restoreRuntimeStage(
-              previousRuntimeStage,
-              previousPublication
-            );
-          }
+          restorePreviousRuntime(previousRuntimeStage, previousPublication);
         } catch (restorationError) {
           publicationErrors.push(restorationError);
         }
@@ -4444,7 +4648,6 @@ void analytics.load();
           } finally {
             assertCurrentDatasetPublication(syntheticPublication);
           }
-          connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           // A synthetic scene has no data mapping; the panel says so.
           ui?.refreshDataMapping?.();
@@ -4459,9 +4662,7 @@ void analytics.load();
           }
         },
         finalize: () => {
-          runtimeRetirementOwner.retire(
-            syntheticPublication.previousDimensionManager
-          );
+          retireReplacedDimensionManager(syntheticPublication);
         },
         reportFailure: error => {
           if (syntheticPublication.isCurrent() !== true) return;
@@ -4525,7 +4726,7 @@ void analytics.load();
       activateBenchmarkingPanel({ resetTracker: true });
 
       debug.log(
-        `Benchmark loaded: ${formatNumber(pointCount)} points, ` +
+        `Benchmark loaded: ${formatNumber(pointCount)} ${countNoun(pointCount, 'point')}, ` +
         `~${gpuMemEstimateMB.toFixed(1)}MB estimated GPU memory ` +
         `(gen: ${genTime}ms)`
       );
@@ -4960,9 +5161,9 @@ void analytics.load();
       void ui?.cycleRepresentation?.(dim);
     };
 
-    clearAllHighlights = () => {
-      if (state.clearAllHighlights) {
-        state.clearAllHighlights();
+    clearActivePageHighlights = () => {
+      if (state.clearActivePageHighlights) {
+        state.clearActivePageHighlights();
       }
     };
 
@@ -4980,18 +5181,41 @@ void analytics.load();
     // loads as one ordinary dataset change: its progress is the data
     // controls' own, and any dataset choice the user makes while it loads —
     // a sample, None, a file, a connection, the benchmark — supersedes it.
-    // Only a failure that no newer choice superseded ends startup.
+    // A dataset that does not open leaves Cellucid running without it (its
+    // opening says why); any other failure no newer choice superseded ends
+    // startup.
     let startupOutcome = 'none';
-    if (startupSelection !== null) {
-      startupOutcome = await ui.loadStartupDataset(startupSelection);
-      // Jupyter: Python is told the viewer is ready only once its own
+    // Cancelled while startup resolved it: Cellucid starts without it.
+    if (startupSelection !== null && !startupOpening.cancelled) {
+      try {
+        startupOutcome = await ui.loadStartupDataset(startupSelection);
+      } catch (error) {
+        // Data that did not open, or stopped arriving before its first view;
+        // a stall after it (the published default view) is still terminal.
+        const dataFailed = error instanceof DataSourceError
+          || isExplainedFailure(error)
+          || (error?.code === STARTUP_STALL_CODE
+            && (error.phase === 'dataset' || error.phase === 'positions'));
+        if (!dataFailed) throw error;
+        startupOutcome = 'failed';
+        const launchParameters =
+          STARTUP_LAUNCH_PARAMETERS[startupSelection.sourceType] ?? [];
+        failStartupData(
+          error,
+          launchParameters.some(name => urlParams.has(name))
+            ? 'Cellucid could not read the dataset this link opens.'
+            : 'Cellucid could not read the dataset it was opening.',
+          launchParameters
+        );
+      }
+      // A viewer host: it is told the viewer is ready only once its own
       // dataset is on screen. A dataset the user chose instead in this
       // viewer is not the one Python's indices describe.
-      if (jupyterSource !== null && startupOutcome === 'ready') {
+      if (viewerHostSource !== null && startupOutcome === 'ready') {
         await startup.step(
           'ui',
-          'the Jupyter Python server',
-          () => jupyterSource.notifyReady({
+          "the viewer's host",
+          () => viewerHostSource.notifyReady({
             nCells: state.pointCount,
             dimensions: state.getDimensionLevel()
           })
@@ -4999,6 +5223,9 @@ void analytics.load();
       }
     }
     startup.enter('ready');
+    // Opened, or startup showed none: a failure was said where it happened.
+    if (startupOutcome === 'ready') startupOpening.end();
+    else startupOpening.dismiss();
     analytics.trackAppReady({
       viewer,
       hasDataset: startupOutcome === 'ready'
@@ -5006,6 +5233,7 @@ void analytics.load();
   } catch (thrown) {
     const startupError = normalizeStartupError(thrown);
     startup.retire(startupError);
+    startupOpening?.fail(startupError);
     console.error('[Main] Terminal startup failure:', startupError);
     if (destroyApplication !== null) {
       void destroyApplication().catch(error => {

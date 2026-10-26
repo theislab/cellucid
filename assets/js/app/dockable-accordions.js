@@ -5,15 +5,13 @@ import { clampFloatingPosition, clearOfOpenHeaders } from './dockable-accordions
 import { StyleManager } from '../utils/style-manager.js';
 import { isFiniteNumber } from './utils/number-utils.js';
 import { createAccordionInteractions } from './dockable-accordions/interactions.js';
+import { createSheetLayout } from './dockable-accordions/sheets.js';
 import { announceKeyboardMove } from './ui/keyboard-move.js';
 
 const DRAG_THRESHOLD_PX = 6;
 const DETACH_DISTANCE_PX = 30;     // Distance from sidebar right edge to detach
 const DOCK_HIT_PADDING_PX = 20;
 const FLOAT_MIN_WIDTH_PX = 220;
-const FLOAT_MIN_HEIGHT_PX = 100;
-const FLOAT_MAX_HEIGHT_PX = 500;
-const FLOAT_MAX_SCALE = 2;
 
 /**
  * The layer a floating panel takes when there is nothing above it.
@@ -187,6 +185,9 @@ export function initDockableAccordions({ sidebar } = {}) {
 
   const floatingRoot = ensureFloatingRoot();
   const stateByDetails = new Map();
+  // The phone layout of the panels registered as sheets; built with the
+  // first of them, so a page without any never watches the viewport for it.
+  let sheets = null;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // State management
@@ -200,10 +201,18 @@ export function initDockableAccordions({ sidebar } = {}) {
       dockable: true,
       controller: null,
       widthConstraints: null,
+      minHeight: 0,
       suppressNextClick: false,
       baseFloatSize: null,
       floatLeft: 0,
       floatTop: 0,
+      // The box a maximized panel goes back to; null when not maximized.
+      restoreRect: null,
+      readoutTimer: null,
+      // The caller's observer of a size the user chose (resize, fit, maximize).
+      onGeometryChange: null,
+      // Whether the panel becomes a bottom sheet on a phone.
+      sheet: false,
     };
     stateByDetails.set(details, state);
     return state;
@@ -243,6 +252,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     const current = readLayer(frame);
     if (current !== null && current > highest) return;
     StyleManager.setLayer(frame, highest + 1);
+    sheets?.refresh();
   }
 
   function panelTitle(summary) {
@@ -388,17 +398,20 @@ export function initDockableAccordions({ sidebar } = {}) {
     // Viewport constraints
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
+    // The limits are the content's and the viewport's: no panel is held
+    // narrower or shorter than it has to be. The least height is the header
+    // and the content's first row.
+    const headerHeight = summary ? summary.offsetHeight : 40;
+    const contentScrollHeight = content ? content.scrollHeight : 0;
+    const firstRowHeight = interactions.firstControlHeight(details);
     const minWidth = isFiniteNumber(constraints?.minWidth) ? constraints.minWidth : FLOAT_MIN_WIDTH_PX;
-    const maxWidth = isFiniteNumber(constraints?.maxWidth) ? constraints.maxWidth : Infinity;
-    const minHeight = isFiniteNumber(constraints?.minHeight) ? constraints.minHeight : FLOAT_MIN_HEIGHT_PX;
-    const maxHeight = isFiniteNumber(constraints?.maxHeight) ? constraints.maxHeight : FLOAT_MAX_HEIGHT_PX;
+    const minHeight = Math.max(
+      isFiniteNumber(constraints?.minHeight) ? constraints.minHeight : 0,
+      headerHeight + firstRowHeight + 2
+    );
 
     const viewportMaxWidth = Math.max(minWidth, viewportWidth - 16);
     const viewportMaxHeight = Math.max(minHeight, viewportHeight - 16);
-
-    // Measure dimensions
-    const headerHeight = summary ? summary.offsetHeight : 40;
-    const contentScrollHeight = content ? content.scrollHeight : 0;
 
     const requestedWidth = isFiniteNumber(preferredSize?.width)
       ? preferredSize.width
@@ -417,14 +430,8 @@ export function initDockableAccordions({ sidebar } = {}) {
       : viewportMaxWidth;
 
     // Calculate panel dimensions
-    const initialWidth = Math.min(
-      Math.max(minWidth, requestedWidth),
-      Math.min(maxWidth, widthLimit)
-    );
-    let initialHeight = Math.min(
-      Math.max(minHeight, requestedHeight),
-      Math.min(maxHeight, viewportMaxHeight)
-    );
+    const initialWidth = Math.min(Math.max(minWidth, requestedWidth), widthLimit);
+    let initialHeight = Math.min(Math.max(minHeight, requestedHeight), viewportMaxHeight);
 
     // Clamp position through the one owner, so tearing off, dragging and a
     // viewport resize cannot disagree about where a panel may sit.
@@ -455,8 +462,6 @@ export function initDockableAccordions({ sidebar } = {}) {
     } else {
       ({ x: clampedLeft, y: clampedTop } = clampFloatingPosition(placement));
     }
-    const contentMaxHeight = Math.max(0, initialHeight - headerHeight - 12);
-
     // Store position
     state.floatLeft = clampedLeft;
     state.floatTop = clampedTop;
@@ -477,6 +482,7 @@ export function initDockableAccordions({ sidebar } = {}) {
 
     // Apply floating styles
     frame.classList.add('accordion-floating');
+    StyleManager.setVariable(frame, '--floating-header-height', `${headerHeight}px`);
     StyleManager.setPosition(frame, {
       x: clampedLeft,
       y: clampedTop,
@@ -484,32 +490,27 @@ export function initDockableAccordions({ sidebar } = {}) {
       height: Math.round(initialHeight),
     });
     raiseToTop(frame);
-    StyleManager.setVariable(frame, '--floating-content-max-height', `${contentMaxHeight}px`);
-
-    // Set content scroll containment
-    if (content) {
-      if (contentScrollHeight > contentMaxHeight) {
-        content.classList.add('has-overflow');
-      }
-    }
 
     // Move to floating root
     floatingRoot.appendChild(frame);
     details.open = true;
 
     state.baseFloatSize = { width: initialWidth, height: initialHeight };
-    state.widthConstraints = {
-      min: minWidth,
-      max: isFiniteNumber(constraints?.maxWidth) ? constraints.maxWidth : (initialWidth * FLOAT_MAX_SCALE)
-    };
+    state.widthConstraints = { min: minWidth };
+    state.minHeight = isFiniteNumber(constraints?.minHeight) ? constraints.minHeight : 0;
+    state.restoreRect = null;
+    interactions.syncMaximized(details);
 
     // Trigger lift animation
     playFrameAnimation(frame, 'floating-enter');
 
     interactions.syncResizeHandles(details, {
       left: clampedLeft,
-      width: Math.round(initialWidth)
+      top: clampedTop,
+      width: Math.round(initialWidth),
+      height: Math.round(initialHeight)
     });
+    sheets?.refresh();
 
     if (hasDockHome) {
       // Hide placeholder after layout settles
@@ -542,14 +543,8 @@ export function initDockableAccordions({ sidebar } = {}) {
     const state = getState(details);
     if (!state.dockable) return;
 
-    // Reset content styles
-    const content = details.querySelector('.accordion-content');
-    if (content) {
-      content.style.maxHeight = '';
-      content.style.overflowY = '';
-      content.style.overflowX = '';
-      content.classList.remove('has-overflow');
-    }
+    state.restoreRect = null;
+    interactions.syncMaximized(details);
 
     // The placeholder *is* the slot: it is the only thing that knows where in
     // the sidebar this panel belongs, so it is asked directly rather than
@@ -572,7 +567,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     frame.classList.remove('accordion-floating', 'dragging');
     StyleManager.clearPosition(frame);
     StyleManager.removeVariable(frame, '--z-layer');
-    StyleManager.removeVariable(frame, '--floating-content-max-height');
+    StyleManager.removeVariable(frame, '--floating-header-height');
 
     // Trigger settle animation
     playFrameAnimation(frame, 'dock-settle');
@@ -581,7 +576,6 @@ export function initDockableAccordions({ sidebar } = {}) {
   const interactions = createAccordionInteractions({
     sidebar,
     StyleManager,
-    isFiniteNumber,
     getState,
     panelFrame,
     isFloating,
@@ -592,8 +586,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       DRAG_THRESHOLD_PX,
       DETACH_DISTANCE_PX,
       DOCK_HIT_PADDING_PX,
-      FLOAT_MIN_WIDTH_PX,
-      FLOAT_MAX_SCALE
+      FLOAT_MIN_WIDTH_PX
     }
   });
 
@@ -605,11 +598,14 @@ export function initDockableAccordions({ sidebar } = {}) {
    * Make a panel dockable, floatable and draggable.
    *
    * `options.actions` are the caller's own header controls (an analysis
-   * window's copy and close buttons), placed in the frame's header action bar
-   * beside the summary. They stay with the frame for its lifetime.
+   * window's copy, maximize and close buttons), placed in the frame's header
+   * action bar beside the summary. They stay with the frame for its lifetime.
+   * `options.onGeometryChange({width, height})` hears every size the user
+   * chooses — a resize, a fit, a maximize. `options.sheet` makes the panel a
+   * bottom sheet on a phone (`dockable-accordions/sheets.js`).
    *
    * @param {HTMLElement} details
-   * @param {{ dockable?: boolean, actions?: Element[] }} [options]
+   * @param {{ dockable?: boolean, actions?: Element[], onGeometryChange?: Function, sheet?: boolean }} [options]
    */
   function register(details, options = {}) {
     if (!(details instanceof HTMLElement)) return;
@@ -624,6 +620,11 @@ export function initDockableAccordions({ sidebar } = {}) {
 
     const state = getState(details);
     state.dockable = options.dockable !== false;
+    if (options.onGeometryChange !== undefined && typeof options.onGeometryChange !== 'function') {
+      throw new TypeError('A panel geometry observer must be a function.');
+    }
+    state.onGeometryChange = options.onGeometryChange ?? null;
+    state.sheet = options.sheet === true;
 
     // One controller per registration owns every listener and every element
     // this module attaches to the panel, so `unregister()` is a real teardown
@@ -660,10 +661,32 @@ export function initDockableAccordions({ sidebar } = {}) {
       // Drag handlers - both check state to determine which behavior to use
       interactions.setupDockedDrag(summary, details, signal);
       interactions.setupFloatingDrag(summary, details, signal);
+
+      // Alt+Arrow moves a floating panel; a double-click on its header
+      // maximizes it or gives it back its size. The two clicks of a
+      // double-click toggle the panel closed and open again, so it ends as
+      // it began.
+      summary.addEventListener('keydown', (e) => {
+        interactions.moveByKeyboard(details, e);
+      }, { signal });
+      summary.addEventListener('dblclick', (e) => {
+        if (!isFloating(details)) return;
+        e.preventDefault();
+        interactions.toggleMaximize(details);
+      }, { signal });
     }
 
     syncPanelWindowButtons(summary, details, actions);
     interactions.ensureResizeHandles(details, state.controller.signal);
+    if (state.sheet) {
+      sheets ??= createSheetLayout({
+        floatingRoot,
+        StyleManager,
+        panelFrame,
+        raiseToTop
+      });
+      sheets.adopt(details, state.controller.signal);
+    }
   }
 
   function unregister(details) {
@@ -682,6 +705,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       try { removePanelWindowButtons(actions); } catch {}
     }
     stateByDetails.delete(details);
+    if (state.sheet) sheets?.release(details);
   }
 
   sidebar.querySelectorAll('details.accordion-section').forEach((details) => {
@@ -770,6 +794,12 @@ export function initDockableAccordions({ sidebar } = {}) {
     register,
     unregister,
     panelFrame,
-    floatingRoot
+    floatingRoot,
+    /**
+     * Maximize a floating panel or give it back its size.
+     * @param {HTMLElement} details
+     * @returns {boolean} Whether it is maximized now.
+     */
+    toggleMaximize: details => interactions.toggleMaximize(details)
   };
 }

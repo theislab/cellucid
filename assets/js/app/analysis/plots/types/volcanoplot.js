@@ -10,12 +10,14 @@
  * Refactored to use BasePlot utilities for consistency.
  */
 
+import { fitToSize } from '../size-fit.js';
 import { PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from '../plot-factory.js';
 import { PLOTLY_2D_SCATTER_TRACE_TYPE } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber } from '../../shared/number-utils.js';
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { POINT_LAYER } from '../point-layer.js';
 
 /**
  * Precomputed, columnar volcano-plot data for a single DE result set.
@@ -687,6 +689,9 @@ function buildVolcanoFigure(deResults, options, viewport) {
     text: safeGenes,
     customdata: selectedPValues,
     meta: { cellucid: 'volcano', version: 3 },
+    // One image of every gene's marker instead of one SVG path per gene
+    // (point-layer.js); hover reads the same points.
+    _cellucidPointLayer: POINT_LAYER,
     marker: {
       // Encode categories as numeric codes to avoid allocating large color-string arrays.
       color: codes,
@@ -922,7 +927,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
 
 const volcanoPlotDefinition = {
   id: 'volcanoplot',
-  name: 'Volcano Plot',
+  name: 'Volcano plot',
   description: 'Differential expression visualization showing fold change vs significance',
   supportedTypes: ['differential'],
   supportedLayouts: ['single'],
@@ -938,35 +943,10 @@ const volcanoPlotDefinition = {
     highlightGenes: [] // Specific genes to always label
   },
 
+  // The significance and fold-change thresholds and the labels are the
+  // analysis's options (Differential expression's Filters and Labels), drawn
+  // in the expanded view by the analysis, not here.
   optionSchema: {
-    pValueThreshold: {
-      type: 'select',
-      label: 'p-value threshold',
-      options: [
-        { value: 0.001, label: '0.001' },
-        { value: 0.01, label: '0.01' },
-        { value: 0.05, label: '0.05' },
-        { value: 0.1, label: '0.1' }
-      ]
-    },
-    foldChangeThreshold: {
-      type: 'range',
-      label: 'log2 FC threshold',
-      min: 0,
-      max: 3,
-      step: 0.25
-    },
-    useAdjustedPValue: {
-      type: 'checkbox',
-      label: 'Use FDR-adjusted p-values'
-    },
-    labelTopN: {
-      type: 'range',
-      label: 'Maximum gene labels',
-      min: 0,
-      max: 50,
-      step: 5
-    },
     pointSize: {
       type: 'range',
       label: 'Point size',
@@ -1000,7 +980,9 @@ const volcanoPlotDefinition = {
     const viewport = requireVolcanoViewport(container);
     const Plotly = await createMinimalPlotly();
     const figure = buildVolcanoFigure(deResults, options, viewport);
-    return await Plotly.newPlot(container, figure.traces, figure.layout, figure.config);
+    const plot = await Plotly.newPlot(container, figure.traces, figure.layout, figure.config);
+    // Its bands are laid out for this size, and again for each new one.
+    return fitToSize(plot, () => this.update(plot, deResults, options));
   },
 
   /**
@@ -1027,6 +1009,7 @@ const volcanoPlotDefinition = {
     if (typeof Plotly.react !== 'function') {
       throw new TypeError('Volcano plot update requires Plotly.react');
     }
+    fitToSize(figure, () => this.update(figure, deResults, options));
 
     return await Plotly.react(
       figure,

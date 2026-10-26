@@ -37,13 +37,13 @@ import { expect, test } from './helpers/test.mjs';
 
 import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=session-round-trip-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=session-round-trip-ci';
 
 /**
  * Every chunk of one saved session, decoded.
@@ -172,7 +172,7 @@ test('a saved session restores to the exact state it recorded', async (
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   // ---------------------------------------------------------------------
@@ -209,7 +209,7 @@ test('a saved session restores to the exact state it recorded', async (
     const third = state.addHighlightDirect({
       type: 'lasso',
       label: 'Hand drawn region',
-      cellIndices: [3, 11, 12, 40, 41, 42, 97],
+      cellIndices: Uint32Array.of(3, 11, 12, 40, 41, 42, 97),
     });
     state.setHighlightPageColor(page2.id, '#ff8800');
     state.renameHighlightPage(page2.id, 'Region of interest');
@@ -239,12 +239,30 @@ test('a saved session restores to the exact state it recorded', async (
   await page.locator('#point-size').fill('31');
   await page.locator('#point-size').dispatchEvent('input');
   await page.locator('#background-select').selectOption('black');
+  // The app theme travels with a session (the antialiasing preference, a
+  // device capability, does not).
+  await page.locator('#theme-select').selectOption('dark');
   await setControl(page, 'hp-lod-enabled', false);
   await setControl(page, 'hp-lod-force', '5');
   await setControl(page, 'hp-frustum-culling', false);
   await setControl(page, 'toggle-centroid-labels', true);
   await setControl(page, 'smoke-density', '71');
   await expect(page.locator('#hp-lod-force')).toHaveValue('5');
+
+  // Figure-export settings: the panel is outside the generic control
+  // inventory, so its own record is what the session carries.
+  const figureDefaults = await page.evaluate(() => {
+    const panel = window._cellucidUi.figureExport;
+    const defaults = panel.exportSessionSettings();
+    panel.importSessionSettings({
+      ...defaults,
+      width: 1234,
+      height: 777,
+      xLabel: 'UMAP one',
+      dpi: 600,
+    });
+    return defaults;
+  });
 
   // A kept view, so multiview is inside the comparison.
   await page.locator('#split-keep-view-btn').click();
@@ -261,6 +279,17 @@ test('a saved session restores to the exact state it recorded', async (
     'the session must carry one membership chunk per highlight group — this is '
       + 'the path no published preset exercises',
   ).toHaveLength(3);
+  expect(savedCore.uiControls['theme-select']).toEqual({
+    type: 'select',
+    value: 'dark',
+  });
+  expect(Object.hasOwn(savedCore.uiControls, 'hp-antialias')).toBe(false);
+  expect(saved.payloads.get('ui/figure-export')).toMatchObject({
+    width: 1234,
+    height: 777,
+    xLabel: 'UMAP one',
+    dpi: 600,
+  });
   expect(savedCore.uiControls['highlight-mode']).toEqual({
     type: 'pressed-group',
     pressedId: 'highlight-mode-lasso',
@@ -278,11 +307,16 @@ test('a saved session restores to the exact state it recorded', async (
   await setControl(page, 'hp-lod-enabled', true);
   await setControl(page, 'hp-frustum-culling', true);
   await page.locator('#background-select').selectOption('white');
+  await page.locator('#theme-select').selectOption('light');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.evaluate(defaults => {
+    window._cellucidUi.figureExport.importSessionSettings(defaults);
+  }, figureDefaults);
   await setControl(page, 'toggle-centroid-labels', false);
   await setControl(page, 'smoke-density', '20');
   await page.evaluate(() => {
     const state = window._cellucidState;
-    state.clearAllHighlights();
+    state.clearActivePageHighlights();
     for (const highlightPage of [...state.highlightPages].slice(1)) {
       state.deleteHighlightPage(highlightPage.id);
     }
@@ -309,6 +343,12 @@ test('a saved session restores to the exact state it recorded', async (
     .toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#categorical-field option:checked'))
     .toHaveText('cell_type');
+  // The restored theme goes through the same owner as a choice made by hand:
+  // the page shows it and the stored preference agrees.
+  await expect(page.locator('#theme-select')).toHaveValue('dark');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  expect(await page.evaluate(() => localStorage.getItem('cellucid_theme')))
+    .toBe('dark');
 
   const restoredPath = await saveSession(
     page,
@@ -384,7 +424,7 @@ test('a session saved while a view is coloured by a continuous field loads back'
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   await expect(page.locator('#legend input[type="range"]').first()).toBeAttached();
   const sessionPath = await saveSession(page, testInfo, 'continuous-legend.cellucid-session');
@@ -392,7 +432,7 @@ test('a session saved while a view is coloured by a continuous field loads back'
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await loadSession(page, sessionPath);
   await expect.poll(() => page.evaluate(() => {
     const state = window._cellucidState;

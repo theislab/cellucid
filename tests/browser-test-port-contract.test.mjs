@@ -19,7 +19,7 @@
  *
  * Moving the servers was only half the fix (CEL-0128). About a hundred absolute
  * URLs in `tests/browser/` still spelled the two ports out, most of them
- * percent-encoded inside the `exportsBaseUrl` query parameter that tells the
+ * percent-encoded inside the `sampleCatalog` query parameter that tells the
  * application where to fetch its fixtures. A moved run then served the page at
  * the new address and asked it for fixtures at the old one, so an overridden
  * port failed the suite instead of relieving the collision. The specs derive
@@ -34,6 +34,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  BROWSER_TEST_APP_HOST_VARIABLE,
   BROWSER_TEST_HOST,
   BROWSER_TEST_PORT_VARIABLE,
   BROWSER_TEST_SAMPLE_PORT_VARIABLE,
@@ -86,6 +87,7 @@ test('the default addresses are the ones that were literals', () => {
   const ports = resolveBrowserTestPorts({});
   assert.deepEqual({ ...ports }, {
     host: '127.0.0.1',
+    appHost: '127.0.0.1',
     port: 4173,
     samplePort: 4174,
     origin: 'http://127.0.0.1:4173',
@@ -116,6 +118,23 @@ test('one override moves both servers, and the sample port moves alone', () => {
   });
   assert.equal(split.port, 4183);
   assert.equal(split.samplePort, 4199);
+});
+
+test('the app can be opened under a .localhost name, as a deployed site, from the same server', () => {
+  const deployed = resolveBrowserTestPorts({
+    [BROWSER_TEST_APP_HOST_VARIABLE]: 'deployed.localhost',
+  });
+  assert.equal(deployed.host, '127.0.0.1');
+  assert.equal(deployed.appHost, 'deployed.localhost');
+  assert.equal(deployed.origin, 'http://deployed.localhost:4173');
+  assert.equal(deployed.sampleOrigin, 'http://127.0.0.1:4174');
+  for (const value of ['example.com', 'localhost', 'a.b.localhost', '-x.localhost', 'X.localhost']) {
+    assert.throws(
+      () => resolveBrowserTestPorts({ [BROWSER_TEST_APP_HOST_VARIABLE]: value }),
+      new RegExp(BROWSER_TEST_APP_HOST_VARIABLE),
+      `${JSON.stringify(value)} must be refused by name`
+    );
+  }
 });
 
 test('an unusable address is named rather than accepted', () => {
@@ -245,19 +264,19 @@ test('the origins helper derives what the specs import', async () => {
   assert.equal(origins.APP_ORIGIN, origin);
   assert.equal(origins.SAMPLE_ORIGIN, sampleOrigin);
   assert.equal(
-    origins.EXPORTS_BASE_URL,
-    `${origin}/tests/browser/fixtures/exports/`
+    origins.SAMPLE_CATALOG_URL,
+    `${origin}/tests/browser/fixtures/catalog/`
   );
 
   // The encoded form is produced by encoding the resolved URL, so moving the
   // port cannot corrupt the escape sequences around it.
   assert.equal(
-    origins.ENCODED_EXPORTS_BASE_URL,
-    encodeURIComponent(origins.EXPORTS_BASE_URL)
+    origins.ENCODED_SAMPLE_CATALOG_URL,
+    encodeURIComponent(origins.SAMPLE_CATALOG_URL)
   );
   assert.equal(
-    origins.encodedAppUrl('/tests/browser/fixtures/exports/'),
-    origins.ENCODED_EXPORTS_BASE_URL
+    origins.encodedAppUrl('/tests/browser/fixtures/catalog/'),
+    origins.ENCODED_SAMPLE_CATALOG_URL
   );
   assert.equal(origins.appUrl('/_cellucid/health'), `${origin}/_cellucid/health`);
   assert.equal(origins.sampleUrl('/datasets.json'), `${sampleOrigin}/datasets.json`);

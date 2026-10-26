@@ -21,6 +21,7 @@ import {
   validateEvent,
   validateUserProperties,
 } from '../../assets/js/analytics/schema.js';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const PRODUCTION_ORIGIN = 'https://www.cellucid.com';
 const fixturesDirectory = path.join(
@@ -34,8 +35,8 @@ const SECOND = 'Synthetic branching development — 3D';
 function sessionUrl(origin) {
   const url = new URL('/', origin);
   url.searchParams.set(
-    'exportsBaseUrl',
-    `${origin}/tests/browser/fixtures/demo-custom-exports/`,
+    'sampleCatalog',
+    `${origin}/tests/browser/fixtures/demo-catalog/`,
   );
   url.searchParams.set('dataset', 'synthetic-cell-types-2d');
   return url.toString();
@@ -96,7 +97,7 @@ async function hidePage(page) {
   });
 }
 
-async function runSession(page, origin, waitFor, { localFiles = true } = {}) {
+async function runSession(page, origin, waitFor) {
   await page.goto(sessionUrl(origin), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(FIRST);
@@ -111,13 +112,12 @@ async function runSession(page, origin, waitFor, { localFiles = true } = {}) {
     .selectOption('dataset:local-demo:synthetic-development-3d');
   await expect(page.locator('#dataset-name')).toHaveText(SECOND);
   await waitFor('data_load', 'success');
-  if (!localFiles) return;
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(h5adFixturePath);
+  await chooseFiles(page.locator('#user-data-file-input'), h5adFixturePath);
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
 
   const whole = await readFile(h5adFixturePath);
-  await page.locator('#user-data-h5ad-input').setInputFiles({
+  await chooseFiles(page.locator('#user-data-file-input'), {
     name: 'AML_relapse_donor7-private.h5ad',
     mimeType: 'application/octet-stream',
     buffer: whole.subarray(0, Math.floor(whole.length / 3)),
@@ -131,18 +131,17 @@ test('a production session sends exactly the declared events', async ({
   page,
   context,
 }) => {
+  // Every dataset is read in the AnnData reader worker, and Firefox does not
+  // route the requests a worker makes, so under the routed production
+  // hostname nothing would open. The local-origin test below runs the same
+  // session on Firefox.
+  test.skip(browserName === 'firefox', 'Firefox does not route requests made by the AnnData reader worker');
   const google = await routeProduction(context);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
-  // A direct .h5ad is read in a dedicated worker, and Firefox does not route
-  // the requests a worker makes, so under the production hostname its script
-  // would be fetched from the real www.cellucid.com. Firefox runs the session
-  // without the two local-file loads; the local-origin test below covers them.
-  const localFiles = browserName !== 'firefox';
-
   await runSession(page, PRODUCTION_ORIGIN, (name, outcome) => (
     waitForEvent(page, name, outcome)
-  ), { localFiles });
+  ));
   await hidePage(page);
   // Every metric is reported once, on the first hide; a second hide is inert.
   await hidePage(page);
@@ -181,16 +180,12 @@ test('a production session sends exactly the declared events', async ({
     ['feature_used', 'highlight_tool', 'lasso'],
     ['feature_used', 'highlight_page', 'add'],
     ['data_load', 'dataset-dropdown', 'success'],
-    ...(localFiles
-      ? [
-          ['data_load', 'local-user-h5ad', 'success'],
-          ['data_load', 'local-user-h5ad', 'failure'],
-        ]
-      : []),
+    ['data_load', 'local-user-file', 'success'],
+    ['data_load', 'local-user-file', 'failure'],
   ]);
   const [startupLoad, , , , switchLoad, localLoad, failedLoad] = appEvents
     .map(entry => entry[2]);
-  // A catalog chosen with ?exportsBaseUrl= is not the public sample catalog.
+  // A catalog chosen with ?sampleCatalog= is not the public sample catalog.
   expect(startupLoad.dataset_id).toBeUndefined();
   expect(startupLoad).toMatchObject({
     source_type: 'local-demo',
@@ -200,13 +195,11 @@ test('a production session sends exactly the declared events', async ({
     state_restore: 'none',
   });
   expect(switchLoad).toMatchObject({ dimensions: '3', has_vector_field: 1 });
-  if (localFiles) {
-    expect(localLoad).toMatchObject({ source_type: 'local-user', field_count: 2 });
-    // A file that never parsed has no shape to describe, only its error class.
-    expect(failedLoad).toMatchObject({ source_type: 'local-user' });
-    expect(typeof failedLoad.error_name).toBe('string');
-    expect(failedLoad.cell_bucket).toBeUndefined();
-  }
+  expect(localLoad).toMatchObject({ source_type: 'local-user', field_count: 2 });
+  // A file that never parsed has no shape to describe, only its error class.
+  expect(failedLoad).toMatchObject({ source_type: 'local-user' });
+  expect(typeof failedLoad.error_name).toBe('string');
+  expect(failedLoad.cell_bucket).toBeUndefined();
 
   const metrics = events
     .filter(([, name]) => name === 'web_vital')
@@ -221,7 +214,7 @@ test('a production session sends exactly the declared events', async ({
   const sent = JSON.stringify(dataLayer);
   for (const fragment of [
     'AML_relapse', 'donor7', 'current-ui-smoke', 'Synthetic', 'synthetic-',
-    'exportsBaseUrl', 'tests/browser', '.h5ad', 'cell_type',
+    'sampleCatalog', 'tests/browser', '.h5ad', 'cell_type',
   ]) {
     expect(sent, fragment).not.toContain(fragment);
   }

@@ -225,7 +225,8 @@ const viewportInit = await read('assets/js/app/ui/core/viewport-init.js');
 
 test('the iOS viewport bootstrap runs in the head, before the stylesheet', () => {
   const head = indexHtml.slice(0, indexHtml.indexOf('</head>'));
-  const script = head.indexOf('<script src="assets/js/app/ui/core/viewport-init.js"></script>');
+  // Its URL names its bytes (index.html, CELLUCID_MODULE_VERSIONS).
+  const script = head.search(/<script src="assets\/js\/app\/ui\/core\/viewport-init\.js\?v=[0-9a-f]{12}"><\/script>/);
   const theme = head.indexOf('assets/js/app/ui/core/theme-init.js');
   const stylesheet = head.indexOf('<link rel="stylesheet" href="assets/css/main.css"');
   assert.ok(script > -1, 'viewport-init.js is loaded from the head');

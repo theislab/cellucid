@@ -9,16 +9,14 @@
 
 import { getNotificationCenter } from '../notification-center.js';
 import { getDockableAccordions } from '../dockable-accordions-registry.js';
+import { hasFilterState } from '../state-serializer/filters.js';
 import {
-  assertExactKeys,
   assertNonEmptyString,
   assertNullableString,
-  assertPlainRecord,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from './schema-contract.js';
 import {
-  ANNDATA_KIND,
   compareEmbeddingRefs,
   validateDataMapping,
   validateEmbeddingRef
@@ -32,6 +30,9 @@ import {
   UNCHANGEABLE_GROUP_CLAUSE,
 } from '../../data/dataset-mapping.js';
 import { MappingLoadError } from '../../data/data-mapping-candidates.js';
+import { sameJson } from '../utils/same-json.js';
+import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
+import { formatCountOf, countNoun } from '../../utils/format-units.js';
 
 const PARTICIPANT_KEYS = ['value', 'prepare', 'commit', 'rollback'];
 const PRESENTATION_PARTICIPANT_KEYS = [...PARTICIPANT_KEYS, 'stage'];
@@ -48,7 +49,7 @@ function assertRestoreParticipant(participant, context) {
     && typeof participant === 'object'
     && Object.hasOwn(participant, 'stage')
   );
-  assertExactKeys(
+  requireExactKeys(
     participant,
     presentation ? PRESENTATION_PARTICIPANT_KEYS : PARTICIPANT_KEYS,
     context
@@ -362,7 +363,7 @@ export function getSessionRestoreSnapshot(ctx, chunkId) {
 
 function assertRestoreTransaction(value) {
   if (value === null) return value;
-  assertExactKeys(
+  requireExactKeys(
     value,
     ['register', 'get', 'commit', 'rollback'],
     'Session restore transaction'
@@ -395,7 +396,7 @@ function assertRestoreTransaction(value) {
  * @returns {object}
  */
 export function buildSessionContext(base, options) {
-  assertExactKeys(
+  requireExactKeys(
     base,
     [
       'state',
@@ -404,11 +405,12 @@ export function buildSessionContext(base, options) {
       'dataSourceManager',
       'comparisonModule',
       'analysisWindowManager',
-      'cinematicCamera'
+      'cinematicCamera',
+      'figureExport'
     ],
     'Session context base'
   );
-  assertExactKeys(
+  requireExactKeys(
     options,
     ['abortSignal', 'restoreTransaction'],
     'Session context options'
@@ -453,6 +455,7 @@ export function buildSessionContext(base, options) {
     comparisonModule: base.comparisonModule,
     analysisWindowManager: base.analysisWindowManager,
     cinematicCamera: base.cinematicCamera,
+    figureExport: base.figureExport,
     notifications: getNotificationCenter(),
     abortSignal: options.abortSignal,
     restoreTransaction
@@ -460,48 +463,139 @@ export function buildSessionContext(base, options) {
 }
 
 /**
- * Keys a `.cellucid-session` file written before cell-order identity existed.
- * Such a file records selections as raw dataset row indices with nothing that
- * ties those rows to cell content, so it can never be verified.
+ * The dataset fields a session uses: every observation field and gene that a
+ * view shows or filters on, or that a highlight group is bound to, by the key
+ * the dataset gives it (a field renamed in the session is listed by its
+ * original key). Fields the session creates itself are not listed. Recorded as
+ * the manifest's `requires`, so a dataset missing any of them is refused before
+ * anything is applied, naming every missing key at once.
+ *
+ * @param {object} state
+ * @returns {{obs: string[], var: string[]}}
  */
-const CELL_ORDER_UNVERIFIABLE_KEYS = Object.freeze([
-  'sourceType',
-  'datasetId',
-  'cellCount',
-  'varCount'
-]);
+export function collectRequiredFields(state) {
+  const obs = new Set();
+  const vars = new Set();
+  const datasetKey = field => field._originalKey ?? field.key;
+  const add = (set, field) => {
+    if (
+      field === null
+      || typeof field !== 'object'
+      || field._isUserDefined === true
+      || field._isDeleted === true
+    ) {
+      return;
+    }
+    set.add(datasetKey(field));
+  };
+  const visit = ({ obsData, varData, activeFieldSource, activeFieldIndex, activeVarFieldIndex }) => {
+    const obsFields = Array.isArray(obsData?.fields) ? obsData.fields : [];
+    const varFields = Array.isArray(varData?.fields) ? varData.fields : [];
+    for (const field of obsFields) if (hasFilterState(field)) add(obs, field);
+    for (const field of varFields) if (hasFilterState(field)) add(vars, field);
+    if (activeFieldSource === 'obs') add(obs, obsFields[activeFieldIndex] ?? null);
+    if (activeFieldSource === 'var') add(vars, varFields[activeVarFieldIndex] ?? null);
+  };
+  // The focused view's state is the top level; every other view's is parked
+  // in its context.
+  visit(state);
+  const activeViewId = state.getActiveViewId();
+  if (state.viewContexts instanceof Map) {
+    for (const [viewId, context] of state.viewContexts) {
+      if (viewId !== activeViewId) visit(context);
+    }
+  }
+  for (const page of state.getHighlightPages?.() ?? []) {
+    for (const group of page.highlightedGroups ?? []) {
+      if (typeof group.fieldKey !== 'string') continue;
+      const fields = group.fieldSource === 'var' ? state.varData?.fields : state.obsData?.fields;
+      add(group.fieldSource === 'var' ? vars : obs, fields?.[group.fieldIndex] ?? null);
+    }
+  }
+  return { obs: [...obs].sort(), var: [...vars].sort() };
+}
 
+/**
+ * Validate a manifest's `requires` record (untrusted input).
+ * @param {unknown} value
+ * @param {string} context
+ * @returns {{obs: string[], var: string[]}}
+ */
+export function assertSessionRequires(value, context) {
+  requireExactKeys(value, ['obs', 'var'], context);
+  for (const source of ['obs', 'var']) {
+    const keys = value[source];
+    if (!Array.isArray(keys)) {
+      throw new TypeError(`${context} ${source} must be an array of field keys.`);
+    }
+    for (let index = 0; index < keys.length; index++) {
+      assertNonEmptyString(keys[index], `${context} ${source}[${index}]`);
+      if (index > 0 && !(keys[index - 1] < keys[index])) {
+        throw new TypeError(`${context} ${source} must be sorted and without duplicates.`);
+      }
+    }
+  }
+  return value;
+}
+
+function quoteKeys(keys) {
+  return keys.map(key => `"${key}"`).join(', ');
+}
+
+/**
+ * The refusal naming every field a session uses that the open dataset lacks,
+ * or null when it has them all.
+ *
+ * @param {object} state
+ * @param {{obs: string[], var: string[]}} requires
+ * @returns {string|null}
+ */
+export function describeMissingRequiredFields(state, requires) {
+  const keysOf = data => new Set(
+    (Array.isArray(data?.fields) ? data.fields : [])
+      .filter(field => field?._isUserDefined !== true)
+      .map(field => field._originalKey ?? field.key)
+  );
+  const obsKeys = keysOf(state.obsData);
+  const varKeys = keysOf(state.varData);
+  const missingObs = requires.obs.filter(key => !obsKeys.has(key));
+  const missingVar = requires.var.filter(key => !varKeys.has(key));
+  if (missingObs.length === 0 && missingVar.length === 0) return null;
+  const parts = [];
+  if (missingObs.length > 0) {
+    parts.push(`the observation ${countNoun(missingObs.length, 'field')} ${quoteKeys(missingObs)}`);
+  }
+  if (missingVar.length > 0) {
+    parts.push(`the ${countNoun(missingVar.length, 'gene')} ${quoteKeys(missingVar)}`);
+  }
+  return (
+    `This session uses ${parts.join(' and ')}, which the dataset that is open `
+    + 'now does not have. The session was not opened. Open the dataset the '
+    + 'session was saved on, then load the session again.'
+  );
+}
+
+/**
+ * The dataset a session belongs to, whatever it was opened from: its identity
+ * id (the id its file states in `uns['cellucid']['id']`, else the one its
+ * source gives it), its
+ * counts, the digest of its cell order, and its data mapping. The cell-order
+ * digest is what proves two copies hold their cells in the same order, so a
+ * session saved on one host applies to the same dataset opened from another.
+ */
 const DATASET_FINGERPRINT_KEYS = Object.freeze([
-  ...CELL_ORDER_UNVERIFIABLE_KEYS,
+  'datasetId',
+  'name',
+  'cellCount',
+  'varCount',
   'cellOrder',
   'dataMapping'
 ]);
 
 /**
- * Surfaced verbatim to the user by the session controls, for a file whose
- * fingerprint records a cell order but no data mapping.
- */
-export const SESSION_WITHOUT_DATA_MAPPING_MESSAGE =
-  'This session file was saved by an earlier Cellucid release, before sessions '
-  + 'recorded which stored embeddings and arrays a dataset is shown with, and '
-  + 'that release read an export format this one no longer opens. The session '
-  + 'was not opened. Re-create the view on the current dataset and save a new '
-  + 'session file.';
-
-/**
- * Surfaced verbatim to the user by the session controls.
- */
-export const SESSION_WITHOUT_CELL_IDENTITY_MESSAGE =
-  'This session file was saved before Cellucid started recording which cells a '
-  + 'selection contains, so there is no way to confirm that its selections '
-  + 'still mark the same cells in the dataset that is open now. The session was '
-  + 'not opened. Re-create the selections on this dataset and save a new '
-  + 'session file.';
-
-/**
  * Digest of every cell coordinate in dataset row order.
  *
- * The fingerprint scalars (source, dataset id, cell count, gene count) are all
+ * The fingerprint scalars (dataset id, cell count, gene count) are all
  * preserved when a dataset is re-exported at the same id from re-sorted input,
  * so they cannot tell one row order from another. Positions are the only
  * per-cell payload the viewer always holds in memory, and a re-ordered export
@@ -556,7 +650,7 @@ export function digestCellOrder(positions, dimension = 3) {
     || positions.length % dimension !== 0
   ) {
     throw new TypeError(
-      `Cell-order digest requires a Float32Array with ${dimension} values per cell.`
+      `Cell-order digest requires a Float32Array with ${formatCountOf(dimension, 'value')} per cell.`
     );
   }
   const memoized = CELL_ORDER_DIGESTS.get(positions);
@@ -616,8 +710,8 @@ export function digestCellOrder(positions, dimension = 3) {
   return digest;
 }
 
-function assertCellOrder(value, kind, context) {
-  assertExactKeys(value, ['embedding', 'dimension', 'digest'], context);
+function assertCellOrder(value, context) {
+  requireExactKeys(value, ['embedding', 'dimension', 'digest'], context);
   const dimension = assertSafeInteger(
     value.dimension,
     `${context} dimension`,
@@ -631,8 +725,7 @@ function assertCellOrder(value, kind, context) {
   }
   try {
     validateEmbeddingRef(value.embedding, {
-      kind,
-      dimension: kind === ANNDATA_KIND ? dimension : null,
+      dimension,
       label: `${context} embedding`,
     });
   } catch (error) {
@@ -641,47 +734,21 @@ function assertCellOrder(value, kind, context) {
   return value;
 }
 
-function hasExactKeySet(value, keys) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-  ) {
-    return false;
-  }
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  return (
-    actual.length === expected.length
-    && actual.every((key, index) => key === expected[index])
-  );
-}
-
-function isPreMappingRecord(value) {
-  return hasExactKeySet(value, [...CELL_ORDER_UNVERIFIABLE_KEYS, 'cellOrder']);
-}
-
 /**
  * Validate one complete dataset fingerprint record from untrusted input.
  *
- * A record written by an earlier release — before cell-order identity, or
- * before data mappings — is refused with the message the user is shown; a
- * record that is malformed in any other way is a schema violation.
+ * A file without the session signature never reaches this check: it is
+ * refused first (`bundle/format.js`). A record that is malformed
+ * in any way is a schema violation.
  *
  * @param {any} value
  * @param {string} context
  * @returns {object}
  */
 export function assertDatasetFingerprint(value, context) {
-  if (hasExactKeySet(value, CELL_ORDER_UNVERIFIABLE_KEYS)) {
-    throw new RangeError(SESSION_WITHOUT_CELL_IDENTITY_MESSAGE);
-  }
-  if (isPreMappingRecord(value)) {
-    throw new RangeError(SESSION_WITHOUT_DATA_MAPPING_MESSAGE);
-  }
-  assertExactKeys(value, DATASET_FINGERPRINT_KEYS, context);
-  assertNullableString(value.sourceType, `${context} sourceType`);
+  requireExactKeys(value, DATASET_FINGERPRINT_KEYS, context);
   assertNullableString(value.datasetId, `${context} datasetId`);
+  assertNullableString(value.name, `${context} name`);
   assertSafeInteger(value.cellCount, `${context} cellCount`);
   assertSafeInteger(value.varCount, `${context} varCount`);
   let mapping;
@@ -695,7 +762,7 @@ export function assertDatasetFingerprint(value, context) {
   if (JSON.stringify(mapping) !== JSON.stringify(value.dataMapping)) {
     throw new TypeError(`${context} dataMapping must be in canonical form.`);
   }
-  assertCellOrder(value.cellOrder, mapping.kind, `${context} cellOrder`);
+  assertCellOrder(value.cellOrder, `${context} cellOrder`);
   return value;
 }
 
@@ -712,24 +779,27 @@ function requireCurrentDataMapping(state) {
 }
 
 function currentFingerprintScalars(ctx) {
-  assertPlainRecord(ctx, 'Session context');
+  requirePlainRecord(ctx, 'Session context');
   if (ctx.state === null || typeof ctx.state !== 'object') {
     throw new TypeError('Dataset fingerprint requires the current DataState.');
   }
   const manager = ctx.dataSourceManager;
-  let sourceType = null;
   let datasetId = null;
+  let name = null;
   if (manager !== null) {
-    requireMethod(manager, 'getCurrentSourceType', 'Dataset fingerprint manager');
-    requireMethod(manager, 'getCurrentDatasetId', 'Dataset fingerprint manager');
-    sourceType = assertNullableString(
-      manager.getCurrentSourceType(),
-      'Dataset fingerprint sourceType'
-    );
+    // The identity id, not the route's own id: a local copy of a published
+    // dataset is the same dataset (`local-user:<id>` is only the route's key).
+    requireMethod(manager, 'getCurrentIdentityId', 'Dataset fingerprint manager');
     datasetId = assertNullableString(
-      manager.getCurrentDatasetId(),
+      manager.getCurrentIdentityId(),
       'Dataset fingerprint datasetId'
     );
+    // The name the dataset gives itself, for the messages that ask the person
+    // to open it; it is not part of the identity.
+    const metadataName = manager.getCurrentMetadata?.()?.name;
+    name = typeof metadataName === 'string' && metadataName.trim() !== ''
+      ? metadataName.trim()
+      : null;
   }
   const cellCount = assertSafeInteger(
     ctx.state.pointCount,
@@ -754,24 +824,23 @@ function currentFingerprintScalars(ctx) {
     sourceVarFieldCount,
     'Dataset fingerprint varCount'
   );
-  return { sourceType, datasetId, cellCount, varCount };
+  return { datasetId, name, cellCount, varCount };
 }
 
 /**
  * Create the exact current dataset fingerprint.
  *
- * All six fields are mandatory; source identity may be explicitly null only
+ * All five fields are mandatory; the dataset id may be explicitly null only
  * when no data-source manager owns the loaded state. The cell-order digest is
  * taken over the layout the live view shows, and `cellOrder.embedding` names
  * that layout under the dataset's data mapping.
  *
  * @param {object} ctx
  * @returns {{
- *   sourceType: string|null,
  *   datasetId: string|null,
  *   cellCount: number,
  *   varCount: number,
- *   cellOrder: { embedding: {key: string, columns: number[]|null}, dimension: number, digest: string },
+ *   cellOrder: { embedding: {key: string, columns: number[]}, dimension: number, digest: string },
  *   dataMapping: object
  * }}
  */
@@ -802,11 +871,7 @@ export function getDatasetFingerprint(ctx) {
     'getViewLayoutKey',
     'Dataset fingerprint DataState'
   ).call(state, 'live');
-  const embedding = layoutEmbeddingRef(
-    state.dimensionManager,
-    layoutKey,
-    dataMapping.kind
-  );
+  const embedding = layoutEmbeddingRef(state.dimensionManager, layoutKey);
   return {
     ...scalars,
     cellOrder: Object.freeze({
@@ -818,9 +883,6 @@ export function getDatasetFingerprint(ctx) {
   };
 }
 
-function sameJson(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
 
 /**
  * Compare two dataset fingerprints.
@@ -832,8 +894,7 @@ export function datasetFingerprintMatches(a, b) {
   assertDatasetFingerprint(a, 'Saved dataset fingerprint');
   assertDatasetFingerprint(b, 'Current dataset fingerprint');
   return (
-    a.sourceType === b.sourceType
-    && a.datasetId === b.datasetId
+    a.datasetId === b.datasetId
     && a.cellCount === b.cellCount
     && a.varCount === b.varCount
     && sameJson(a.cellOrder.embedding, b.cellOrder.embedding)
@@ -844,23 +905,21 @@ export function datasetFingerprintMatches(a, b) {
 }
 
 /**
- * Name one side of an identity mismatch the way the person reading it would.
+ * Name one side of an identity mismatch the way the person reading it would,
+ * never as a bare `null`.
  *
- * Both fields are nullable, and either can be the one that differs, so this
- * says whichever is available rather than interpolating a bare `null` or
- * printing the same id on both sides of a sentence about a difference.
- *
- * @param {{sourceType: string|null, datasetId: string|null}} fingerprint
+ * @param {{datasetId: string|null}} fingerprint
  * @returns {string}
  */
 function describeDatasetIdentity(fingerprint) {
-  if (typeof fingerprint.datasetId === 'string' && fingerprint.datasetId !== '') {
-    return `"${fingerprint.datasetId}"`;
-  }
-  if (typeof fingerprint.sourceType === 'string' && fingerprint.sourceType !== '') {
-    return `a dataset opened from ${fingerprint.sourceType}`;
-  }
-  return 'a dataset that recorded no source';
+  const hasId = typeof fingerprint.datasetId === 'string' && fingerprint.datasetId !== '';
+  const hasName = typeof fingerprint.name === 'string'
+    && fingerprint.name !== ''
+    && fingerprint.name !== fingerprint.datasetId;
+  if (hasId && hasName) return `"${fingerprint.name}" (id "${fingerprint.datasetId}")`;
+  if (hasId) return `"${fingerprint.datasetId}"`;
+  if (hasName) return `"${fingerprint.name}"`;
+  return 'a dataset that recorded no id';
 }
 
 /**
@@ -876,7 +935,7 @@ function describeDatasetIdentity(fingerprint) {
  * @param {object} saved - A canonical DataMapping.
  * @param {object} current - A canonical DataMapping.
  * @param {{
- *   describeEmbeddingRefusal: (ref: {key: string, columns: number[]|null}) => string|null,
+ *   describeEmbeddingRefusal: (ref: {key: string, columns: number[]}) => string|null,
  *   describeChoiceRefusal: (group: string, value: unknown) => string|null
  * }} readers - Why the open dataset cannot show one embedding, or use one
  *   value of one group, as a clause such as "this dataset does not have" (or
@@ -894,13 +953,6 @@ export function describeDataMappingMismatch(saved, current, readers) {
   }
   const { describeEmbeddingRefusal, describeChoiceRefusal } = readers;
   if (sameJson(saved, current)) return null;
-  if (saved.kind !== current.kind) {
-    return (
-      `This session was saved on ${saved.kind === 'export' ? 'a prepared export' : 'an AnnData file'}, `
-      + `and ${current.kind === 'export' ? 'a prepared export' : 'an AnnData file'} is open now. `
-      + 'Open the dataset the session was saved on, then load the session again.'
-    );
-  }
   for (const was of saved.embeddings.enabled) {
     if (current.embeddings.enabled.some(ref => compareEmbeddingRefs(ref, was) === 0)) continue;
     const refusal = describeEmbeddingRefusal(was);
@@ -911,7 +963,8 @@ export function describeDataMappingMismatch(saved, current, readers) {
       + ' Open the dataset version the session was saved on, then load the session again.'
     );
   }
-  for (const group of ['knn', 'geneNames', 'expression', 'latent', 'vectorFields']) {
+  // A multimodal dataset's expression groups are its modality's: the modality first.
+  for (const group of ['knn', 'modality', 'geneNames', 'expression', 'log1p', 'highlyVariable', 'latent', 'vectorFields']) {
     if (sameJson(saved[group], current[group])) continue;
     const refusal = describeChoiceRefusal(group, saved[group]);
     if (refusal === null) continue;
@@ -942,9 +995,8 @@ export function describeDataMappingMismatch(saved, current, readers) {
  *
  * - The counts are conclusive, and they are also the evidence the first message
  *   quotes, so that message is reserved for the case where they actually
- *   differ. Two copies of one dataset opened through different sources agree on
- *   every count, so the identity fields get their own sentence, which names the
- *   identities instead.
+ *   differ. Two datasets that agree on every count but not on their id get
+ *   their own sentence, which names the ids instead.
  *
  * @param {any} saved
  * @param {object} current - The current scalars.
@@ -957,30 +1009,22 @@ function describeDatasetIdentityMismatch(saved, current) {
   ) {
     return (
       'This session was saved on a different dataset than the one that is open '
-      + `now (${saved.cellCount.toLocaleString('en-US')} cells and `
-      + `${saved.varCount.toLocaleString('en-US')} genes when it was saved, `
-      + `${current.cellCount.toLocaleString('en-US')} cells and `
-      + `${current.varCount.toLocaleString('en-US')} genes now). Open the `
+      + `now (${formatCountOf(saved.cellCount, 'cell')} and `
+      + `${formatCountOf(saved.varCount, 'gene')} when it was saved, `
+      + `${formatCountOf(current.cellCount, 'cell')} and `
+      + `${formatCountOf(current.varCount, 'gene')} now). Open the `
       + 'dataset the session was saved on, then load the session again.'
     );
   }
   // The counts are the evidence in the message above, so it can only be used
-  // where they differ. A session captured on the same data through a different
-  // source — the common one is a preset captured against a locally served copy
-  // of a dataset the catalog also publishes — reaches here with every count
-  // equal, and printing the same two numbers twice as proof of a difference
-  // reads as a bug in the check rather than a fact about the file.
-  if (
-    saved.sourceType !== current.sourceType
-    || saved.datasetId !== current.datasetId
-  ) {
+  // where they differ; two datasets with equal counts are told apart by id.
+  if (saved.datasetId !== current.datasetId) {
     return (
-      'This session was saved on a different copy of this dataset. It has the '
-      + `same ${saved.cellCount.toLocaleString('en-US')} cells and `
-      + `${saved.varCount.toLocaleString('en-US')} genes, but it was saved on `
+      'This session was saved on a different dataset. It has the same '
+      + `${formatCountOf(saved.cellCount, 'cell')} and `
+      + `${formatCountOf(saved.varCount, 'gene')}, but it was saved on `
       + `${describeDatasetIdentity(saved)} and `
-      + `${describeDatasetIdentity(current)} is open now, so Cellucid cannot `
-      + 'confirm the two hold their cells in the same order. Open the dataset '
+      + `${describeDatasetIdentity(current)} is open now. Open the dataset `
       + 'the session was saved on, then load the session again.'
     );
   }
@@ -1031,17 +1075,14 @@ export async function verifySessionFingerprint(ctx, saved) {
     );
   }
   const dataMapping = requireCurrentDataMapping(ctx.state);
-  // On an AnnData file the gene count is that of the var axis the saved
-  // mapping names (raw.X has its own), read from metadata: a session saved on
-  // raw restores onto a file that opened on X. A prepared export has one gene
-  // axis, whatever names it shows.
-  const varCount = saved.dataMapping.kind === ANNDATA_KIND && dataMapping.kind === ANNDATA_KIND
-    ? requireMethod(
-        ctx.state,
-        'describeMappingVarCount',
-        'Session restore DataState'
-      ).call(ctx.state, saved.dataMapping)
-    : scalars.varCount;
+  // The gene count is that of the var axis the saved mapping names (raw.X
+  // has its own), read from metadata: a session saved on raw restores onto a
+  // file that opened on X.
+  const varCount = requireMethod(
+    ctx.state,
+    'describeMappingVarCount',
+    'Session restore DataState'
+  ).call(ctx.state, saved.dataMapping);
   const current = { ...scalars, varCount, dataMapping };
   const identity = describeDatasetIdentityMismatch(saved, current);
   if (identity !== null) return identity;
@@ -1055,11 +1096,16 @@ export async function verifySessionFingerprint(ctx, saved) {
           'describeEmbeddingRefusal',
           'Session restore DataState'
         ).bind(ctx.state),
-        describeChoiceRefusal: requireMethod(
+        // Expression choices are those of the session's modality.
+        describeChoiceRefusal: (group, value) => requireMethod(
+          ctx.state,
+          'withMappingModality',
+          'Session restore DataState'
+        ).call(ctx.state, saved.dataMapping.modality ?? null, () => requireMethod(
           ctx.state,
           'describeMappingChoiceRefusal',
           'Session restore DataState'
-        ).bind(ctx.state),
+        ).call(ctx.state, group, value)),
       }
     );
     if (mapping !== null) return mapping;
@@ -1069,7 +1115,6 @@ export async function verifySessionFingerprint(ctx, saved) {
   const layoutKey = resolveEmbeddingRefLayout(
     dimensionManager,
     saved.cellOrder.embedding,
-    saved.dataMapping.kind,
     saved.cellOrder.dimension,
     'Saved cell-order embedding'
   );
@@ -1084,9 +1129,7 @@ export async function verifySessionFingerprint(ctx, saved) {
   const release = dimensionManager.pinLayout(layoutKey);
   let digest;
   try {
-    const positions = await dimensionManager.getPositions(layoutKey, {
-      showProgress: false
-    });
+    const positions = await dimensionManager.getPositions(layoutKey);
     digest = digestCellOrder(positions, saved.cellOrder.dimension);
   } catch (error) {
     if (!(error instanceof MappingLoadError)) throw error;

@@ -220,7 +220,7 @@ export function computeAnnotationGestureCells(options) {
  *
  * @param {object} options
  * @param {CellSet|null} options.candidates
- * @param {number[]} options.cellIndices
+ * @param {Uint32Array} options.cellIndices - The gesture's cell list.
  * @param {'intersect'|'union'|'subtract'} options.mode
  * @param {string} options.fieldKind
  * @param {number} options.cellCount - Cells in the dataset.
@@ -233,14 +233,8 @@ export function combineAnnotationCandidates(options) {
       'Annotation candidate combine requires a CellSet or null.'
     );
   }
-  if (!Array.isArray(cellIndices)) {
-    throw new TypeError(
-      'Annotation candidate combine requires an array of cell indices.'
-    );
-  }
-
   // Candidates are a CellSet: a JS Set refuses more than 2^24 cells.
-  const incoming = CellSet.from(cellIndices, candidates?.cellCount ?? cellCount);
+  const incoming = CellSet.fromCellList(cellIndices, candidates?.cellCount ?? cellCount);
   if (fieldKind === 'category') {
     if (mode === 'intersect') {
       return { candidates: incoming, effectiveMode: 'replace' };

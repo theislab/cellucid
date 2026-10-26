@@ -38,8 +38,9 @@ const violinInputCache = new WeakMap();
  * sort into one linear pass.
  *
  * @param {Object[]} pageData
+ * @param {AbortSignal|null} [signal] - Cancels the worker tasks
  */
-async function ensureViolinInputs(pageData) {
+async function ensureViolinInputs(pageData, signal = null) {
   const work = [];
   for (const pd of pageData) {
     if (violinInputCache.has(pd.values) || pd.values.length < WORKER_MIN_VALUES) continue;
@@ -53,7 +54,7 @@ async function ensureViolinInputs(pageData) {
   const slice = (values, from, to, includeSorted) => manager.execute(
     OperationType.COMPUTE_VIOLIN_DENSITY,
     { values, from, to, includeSorted },
-    { transfer: false }
+    { transfer: false, signal }
   );
   await Promise.all(work.map(async ({ key, values }) => {
     // The first call plans the violin and hands back the page's finite values
@@ -84,7 +85,7 @@ async function ensureViolinInputs(pageData) {
 
 const violinplotDefinition = {
   id: 'violinplot',
-  name: 'Violin Plot',
+  name: 'Violin plot',
   description: 'Compare value distributions with density visualization',
   supportedTypes: ['continuous'],
   supportedLayouts: ['side-by-side', 'grouped', 'overlay'],
@@ -112,7 +113,7 @@ const violinplotDefinition = {
     },
     side: {
       type: 'select',
-      label: 'Violin Side',
+      label: 'Violin side',
       options: [
         { value: 'both', label: 'Both sides' },
         { value: 'positive', label: 'Right only' },
@@ -139,7 +140,7 @@ const violinplotDefinition = {
     },
     markerSize: {
       type: 'range',
-      label: 'Point Size',
+      label: 'Point size',
       min: 2,
       max: 10,
       step: 1,
@@ -176,8 +177,12 @@ const violinplotDefinition = {
     return layout;
   },
 
-  async render(pageData, options, container, layoutEngine) {
-    await ensureViolinInputs(pageData);
+  /**
+   * `run.signal` (the detailed analysis's job) cancels the worker tasks the
+   * plot computes its statistics with; nothing partial is kept.
+   */
+  async render(pageData, options, container, layoutEngine, run = {}) {
+    await ensureViolinInputs(pageData, run.signal ?? null);
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 

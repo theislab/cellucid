@@ -4,7 +4,7 @@ import { resolveBrowserTestPorts } from './scripts/browser-test-ports.mjs';
 
 // The server this config launches reads the same environment, so both halves of
 // a run agree on the address without the port appearing twice.
-const { origin, port } = resolveBrowserTestPorts();
+const { host, origin, port } = resolveBrowserTestPorts();
 
 const firefoxWebGLPreferences = Object.freeze({
   'webgl.disabled': false,
@@ -78,7 +78,9 @@ export default defineConfig({
   ],
   webServer: {
     command: 'node scripts/serve-browser-tests.mjs',
-    url: `${origin}/`,
+    // The address the server binds, which Node resolves too (`origin` may be
+    // a `.localhost` name only browsers resolve to it).
+    url: `http://${host}:${port}/`,
     // A second run must not adopt the first run's server: that server is torn
     // down when its own run ends, which would strand the adopter mid-suite.
     // Refusing here reports the collision instead of blocking on the address.

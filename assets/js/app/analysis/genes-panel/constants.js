@@ -1,126 +1,57 @@
 /**
- * Genes Panel Constants
+ * Marker genes constants: the heatmap's display defaults, the messages a run
+ * can end with, the progress phases, and the shapes of a result.
  *
- * Shared constants, default configurations, and JSDoc type definitions
- * for the marker genes panel feature.
- *
- * Design Principles:
- * - All configurable values in one place for easy tuning
- * - Type definitions provide IDE support and documentation
- * - Error messages centralized for consistent UX
+ * The analysis options (groups, test, filters, ranking) are declared in
+ * `options/marker-options.js`; nothing here duplicates them. A run sizes
+ * itself (`shared/run-tuner.js`): there is no batch, memory or parallelism
+ * setting.
  *
  * @module genes-panel/constants
  */
 
 // =============================================================================
-// DEFAULT CONFIGURATION
+// DISPLAY DEFAULTS (the expanded view's heatmap)
 // =============================================================================
 
-/**
- * Default analysis settings
- */
-export const DEFAULTS = {
-  // Analysis parameters
-  topNPerGroup: 10,
-  method: 'wilcox',
-  minCells: 10,
-  pValueThreshold: 0.05,
-  foldChangeThreshold: 1.0,
-  useAdjustedPValue: true,
-
-  // Visualization parameters
+export const DEFAULTS = Object.freeze({
+  /** Heatmap value transform. */
   transform: 'zscore',
   colorscale: 'RdBu',
   showValues: false,
-
-  // Clustering parameters
+  /** Heatmap clustering (the expanded view's plot options). */
   distance: 'correlation',
   linkage: 'average',
   clusterRows: true,
   clusterCols: true,
-
-  // Performance parameters
-  batchSize: 100,
-  memoryBudgetMB: 512,
-  // Must agree with PerformanceConfig.batch.networkConcurrency; see the
-  // measurement recorded there for why twelve.
-  networkConcurrency: 12,
-  progressInterval: 100, // Emit partial results every N genes
-
-  // Cache parameters
-  cacheMaxCategories: 3, // Hot cache: number of categories to keep in memory
-  cacheMaxAgeDays: 7,    // Warm cache: IndexedDB TTL
-  cacheVersion: 1        // Increment to invalidate old caches
-};
+});
 
 // =============================================================================
-// OPTION SCHEMAS (for UI rendering)
+// MESSAGES
 // =============================================================================
 
 /**
- * Distance metric options for clustering
- */
-export const DISTANCE_OPTIONS = [
-  { value: 'correlation', label: 'Correlation', selected: true },
-  { value: 'euclidean', label: 'Euclidean' },
-  { value: 'cosine', label: 'Cosine' }
-];
-
-/**
- * Linkage method options for hierarchical clustering
- */
-export const LINKAGE_OPTIONS = [
-  { value: 'average', label: 'Average', selected: true },
-  { value: 'complete', label: 'Complete' },
-  { value: 'single', label: 'Single' }
-];
-
-/**
- * Display mode options
- */
-export const MODE_OPTIONS = [
-  { value: 'ranked', label: 'Ranked Genes' },
-  { value: 'clustered', label: 'Clustered' },
-  { value: 'custom', label: 'Custom Genes' }
-];
-
-// =============================================================================
-// ERROR MESSAGES
-// =============================================================================
-
-/**
- * User-facing error messages with recovery hints.
+ * Messages a run can end with. An entry that contains a `{placeholder}` is a
+ * template, and it reaches a user only through `formatError`, which refuses
+ * to leave a placeholder unfilled
+ * (`tests/genes-panel-error-message-substitution.test.mjs`).
  *
- * An entry that contains a `{placeholder}` is a template, and it reaches a user
- * only through `formatError`, which refuses to leave a placeholder unfilled.
- * Throwing such an entry directly would put the literal `{placeholder}` text in
- * front of the user, so `tests/genes-panel-error-message-substitution.test.mjs`
- * rejects any reference to a templated entry outside a `formatError` call.
+ * A small group is never an error (it is skipped, pooled or flagged:
+ * `options/marker-options.js`), and neither is a filter that leaves no gene
+ * (the result says so and offers to relax the filters).
  */
 export const ERROR_MESSAGES = {
   NO_CATEGORICAL_OBS:
     'No categorical observation fields found. Upload data with cell type or cluster annotations.',
 
-  TOO_FEW_CELLS:
-    'Group "{name}" has only {n} cells. Minimum required: {min}.',
-
   TOO_FEW_GROUPS:
-    'At least 2 groups required for marker analysis. Found: {n}.',
+    'At least 2 groups with cells are needed to compare. Found: {n}.',
 
   NO_GENES_AVAILABLE:
     'This dataset publishes no gene expression fields, so no gene panel can be built. Load a dataset that includes gene expression.',
 
-  GENE_NOT_FOUND:
-    'Gene "{symbol}" not found in dataset. Check spelling or try another gene.',
-
-  EMPTY_RESULTS:
-    'No significant markers found with current thresholds. Try relaxing p-value ({pValue}) or fold change ({fc}) cutoffs.',
-
-  CANCELLED:
-    'Analysis cancelled by user.',
-
-  MEMORY_PRESSURE:
-    'Low memory detected. The analysis cannot continue within the configured memory budget.'
+  NO_GENES_TO_TEST:
+    'The gene filters leave no gene to test. Clear Exclude genes or Only genes in.'
 };
 
 /**
@@ -129,10 +60,6 @@ export const ERROR_MESSAGES = {
  * @param {string} template - Message template from ERROR_MESSAGES
  * @param {Object} vars - Variables to substitute
  * @returns {string} Formatted message
- *
- * @example
- * formatError(ERROR_MESSAGES.TOO_FEW_CELLS, { name: 'T cells', n: 5, min: 10 })
- * // 'Group "T cells" has only 5 cells. Minimum required: 10.'
  */
 export function formatError(template, vars = {}) {
   if (typeof template !== 'string' || template.length === 0) {
@@ -154,82 +81,49 @@ export function formatError(template, vars = {}) {
 }
 
 // =============================================================================
-// PHASE NAMES (for progress tracking)
+// PHASE NAMES (job steps)
 // =============================================================================
 
 export const ANALYSIS_PHASES = {
-  INIT: 'Initializing',
-  DISCOVERY: 'Discovering markers',
-  MATRIX: 'Building expression matrix',
+  INIT: 'Preparing groups',
+  DISCOVERY: 'Testing genes',
+  CORRECTION: 'Correcting for multiple testing',
   CLUSTERING: 'Clustering',
-  RENDER: 'Rendering results'
+  RENDER: 'Drawing the result'
 };
 
 // =============================================================================
-// CACHE KEY PREFIXES
-// =============================================================================
-
-export const CACHE_KEYS = {
-  MARKERS: 'markers',
-  MATRIX: 'matrix',
-  CLUSTERING: 'clustering'
-};
-
-// =============================================================================
-// JSDoc TYPE DEFINITIONS
+// RESULT SHAPES
 // =============================================================================
 
 /**
- * @typedef {Object} GenesPanelConfig
- * @property {string} obsCategory - Observation field name (e.g., 'cell_type')
- * @property {'ranked'|'clustered'|'custom'} mode - Display mode
- * @property {string[]} [customGenes] - For custom mode only
- * @property {number} [topNPerGroup=10] - Top markers per group
- * @property {'wilcox'|'ttest'} [method='wilcox'] - Statistical method
- * @property {number} [minCells=10] - Minimum cells per group
- * @property {number} [pValueThreshold=0.05] - Significance cutoff
- * @property {number} [foldChangeThreshold=1.0] - |log2FC| cutoff
- * @property {boolean} [useAdjustedPValue=true] - Use FDR-corrected p-values
- * @property {'none'|'zscore'|'log1p'} [transform='zscore'] - Heatmap transform
- * @property {'RdBu'|'Viridis'|'Blues'|'YlOrRd'|'Greens'} [colorscale='RdBu']
- * @property {'correlation'|'euclidean'|'cosine'} [distance='correlation']
- * @property {'average'|'complete'|'single'} [linkage='average']
- * @property {boolean} [clusterRows=true]
- * @property {boolean} [clusterCols=true]
- * @property {Object} [batchConfig] - Performance tuning
+ * @typedef {Object} MarkerGroup
+ * @property {string} groupId - `category-code:<code>`, or `pooled:small`
+ * @property {string|number|boolean} groupName - Exact categorical label
+ * @property {number} cellCount - Cells in scope
+ * @property {string} color
+ * @property {boolean} tested - Tested against its reference
+ * @property {boolean} small - Fewer cells than the minimum
+ * @property {'skipped'|'pooled'|null} smallFate - What the small-group policy did
  */
 
 /**
- * @typedef {Object} MarkerGeneResult
- * @property {string} gene - Gene symbol
- * @property {string} groupId - Group identifier
- * @property {number} rank - Rank within group (1 = best)
- * @property {number} pValue - Raw p-value
- * @property {number|null} adjustedPValue - BH-corrected p-value
- * @property {number} log2FoldChange - Log2 fold change vs rest
- * @property {number} meanInGroup - Mean expression in group
- * @property {number} meanOutGroup - Mean expression outside group
- * @property {number} percentInGroup - % cells expressing in group
- * @property {number} percentOutGroup - % cells expressing outside
- */
-
-/**
- * @typedef {Object} GroupMarkers
- * @property {string} groupId - Group identifier
- * @property {string|number|boolean} groupName - Exact categorical display label
- * @property {number} cellCount - Number of cells in group
- * @property {string} color - Group color for display
- * @property {MarkerGeneResult[]} markers - Sorted by rank ascending
- */
-
-/**
- * @typedef {Object} MarkersByCategory
- * @property {string} obsCategory - Observation field analyzed
- * @property {'wilcox'|'ttest'} method - Method used
- * @property {number} computedAt - Timestamp
- * @property {number} computeDuration - Duration in ms
- * @property {number} geneCount - Total genes tested
- * @property {Record<string, GroupMarkers>} groups - Results per group
+ * The full statistics of a marker run: every tested gene for every group,
+ * so filters, ranking and the number shown are re-applied without testing
+ * again (`marker-selection.js`).
+ *
+ * @typedef {Object} MarkerStatistics
+ * @property {string[]} genes - The genes tested, in dataset order
+ * @property {MarkerGroup[]} groups
+ * @property {Float64Array[]} pValuesByGroup - NaN where untested
+ * @property {Float64Array[]} adjustedPValuesByGroup
+ * @property {Float32Array[]} scoresByGroup - Rank-sum z or Welch t
+ * @property {Float32Array[]} log2FoldChangeByGroup
+ * @property {Float32Array[]} meanInGroupByGroup
+ * @property {Float32Array[]} pctInByGroup - % of the group's cells non-zero
+ * @property {Float32Array[]} pctRefByGroup - % of the reference's cells non-zero
+ * @property {Float32Array[]} aurocByGroup - NaN for t-tests
+ * @property {number[]} genesTestedByGroup - The multiple-testing family size
  */
 
 /**
@@ -239,6 +133,7 @@ export const CACHE_KEYS = {
  * @property {(string|number|boolean)[]} groupNames - Exact categorical display labels
  * @property {string[]} groupColors - Column colors
  * @property {Float32Array} values - Row-major flattened matrix
+ * @property {Float32Array|null} rawValues - The means before the transform
  * @property {number} nRows - Number of rows
  * @property {number} nCols - Number of columns
  * @property {'none'|'zscore'|'log1p'} transform - Applied transform
@@ -252,32 +147,4 @@ export const CACHE_KEYS = {
  * @property {Object|null} colDendrogram - Tree structure for columns
  * @property {'correlation'|'euclidean'|'cosine'} distance - Metric used
  * @property {'average'|'complete'|'single'} linkage - Linkage used
- */
-
-/**
- * @typedef {Object} GenesPanelResult
- * @property {MarkersByCategory} markers - Discovered markers
- * @property {ExpressionMatrix} matrix - Expression matrix
- * @property {ClusteringResult|null} clustering - Clustering (if mode=clustered)
- * @property {Object} metadata - Additional info (timing, settings)
- */
-
-/**
- * @typedef {Object} GroupSpec
- * @property {string} groupId - Unique group identifier
- * @property {string|number|boolean} groupName - Exact categorical display label
- * @property {number[]|Uint32Array} cellIndices - Explicit cell indices
- * @property {number[]|Uint32Array} [excludedCellIndices] - For rest-of groups
- * @property {string} [color] - Group color
- * @property {number} [cellCount] - Number of cells
- */
-
-/**
- * @typedef {Object} ProgressUpdate
- * @property {string} phase - Current phase name
- * @property {number} progress - 0-100 percentage
- * @property {number} loaded - Items processed
- * @property {number} total - Total items
- * @property {string} [message] - Status message
- * @property {number} [eta] - Estimated seconds remaining
  */

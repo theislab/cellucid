@@ -58,7 +58,7 @@ test('the shared render pipeline routes empty trace sets to the empty state', as
   );
   assert.match(
     selector,
-    /definition\.buildLayout\(pageData, options, layoutEngine\)/,
+    /definition\.buildLayout\(pageData, options, layoutEngine, viewport\)/,
     'a non-empty trace set must still use the plot type layout',
   );
 });

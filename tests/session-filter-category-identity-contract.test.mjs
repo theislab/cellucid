@@ -236,3 +236,30 @@ test('restoring a filter over many categories reads the inventory once', () => {
     `restore read the ${count}-category inventory ${reads.count} times`,
   );
 });
+
+test('a filter on a column whose categories are found on load resolves its names once the restore loaded it', async () => {
+  const session = savedSession();
+  // A direct AnnData string column: no categories until it is loaded.
+  const loading = createHarness(['B cell', 'T cell', 'Monocyte']);
+  loading.cellType.categories = null;
+  loading.cellType.codes = undefined;
+  let loads = 0;
+  loading.state.ensureFieldLoaded = async () => {
+    loads++;
+    loading.cellType.categories = ['Monocyte', 'T cell', 'B cell'];
+    loading.cellType.codes = Uint8Array.from([2, 1, 0, 2, 1, 0]);
+  };
+  await loading.serializer.restoreFilters(session, { signal: null });
+  assert.equal(loads, 1);
+  assert.equal(loading.cellType._categoryVisible[1], false, 'T cell, at its loaded position');
+  assert.equal(loading.cellType._categoryVisible[0], true);
+  assert.deepEqual(loading.cellType._categoryColors[0], [0.1, 0.2, 0.3], 'Monocyte, at its loaded position');
+
+  // A saved name the loaded column does not have is refused then.
+  const missing = createHarness(['B cell']);
+  missing.cellType.categories = null;
+  missing.state.ensureFieldLoaded = async () => {
+    missing.cellType.categories = ['B cell'];
+  };
+  await assert.rejects(missing.serializer.restoreFilters(session, { signal: null }), /no longer has/);
+});

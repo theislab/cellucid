@@ -25,8 +25,6 @@ import {
 } from '../../components/controls.js';
 
 const AXES = Object.freeze(['x', 'y', 'z']);
-// The facts each box was last drawn from (see `renderFactRows`).
-const drawnFacts = new WeakMap();
 
 function element(ownerDocument, tag, className, text) {
   const node = ownerDocument.createElement(tag);
@@ -64,19 +62,20 @@ export function buildDataMappingPanel(ownerDocument, { expanded, onToggle, group
   rows.id = 'data-mapping-embeddings';
   rows.setAttribute('role', 'group');
   rows.setAttribute('aria-label', 'Embeddings this dataset can show');
+  // Arrays that are off and wider than a 3D layout (a PCA, a wide latent
+  // space), or that cannot be drawn, are listed last, collapsed: a wide one
+  // can be shown at any 1 to 3 of its columns, but is rarely what a view is
+  // for.
+  const more = createDisclosure({
+    title: 'Other arrays',
+    expanded: false,
+    className: 'disclosure-inline data-mapping-more',
+  });
+  more.root.id = 'data-mapping-more';
+  const moreTitle = more.header.querySelector('.disclosure-title');
   disclosure.content.appendChild(rows);
 
-  const fixed = createDisclosure({
-    title: 'Read from file',
-    description: '—',
-    tip: 'data-mapping-fixed',
-    expanded: false,
-  });
-  fixed.root.id = 'data-mapping-fixed';
-  const fixedDescription = fixed.header.querySelector('.disclosure-desc');
-  const facts = element(ownerDocument, 'div', 'control-box dataset-info data-mapping-facts');
-  fixed.content.appendChild(facts);
-  list.append(disclosure.root, ...groupSections, fixed.root);
+  list.append(disclosure.root, ...groupSections);
 
   const status = createStatusLine();
   status.root.classList.add('data-mapping-status');
@@ -97,9 +96,7 @@ export function buildDataMappingPanel(ownerDocument, { expanded, onToggle, group
     emptyState,
     body,
     rows,
-    fixedDescription,
-    fixed,
-    facts,
+    more: { root: more.root, content: more.content, title: moreTitle, setExpanded: more.setExpanded },
     status,
     revert,
     apply,
@@ -171,7 +168,7 @@ function fillColumnOptions(ownerDocument, select, width) {
  *     enabled: boolean, isDefault: boolean, usable: boolean,
  *     reason: string|null, busy: boolean, lockedReason: string|null,
  *     columns: {width: number, selected: number[]}|null, removable: boolean,
- *     guessed: boolean, open: boolean,
+ *     guessed: boolean, open: boolean, widthNote: string|null,
  *     add: {key: string, name: string}|null
  *   }
  */
@@ -190,6 +187,7 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
   let reason = null;
   let isDefault = null;
   let guessed = null;
+  let widthNote = null;
   let remove = null;
   let editor = null;
   if (!usable) {
@@ -217,7 +215,10 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
     isDefault.type = 'button';
     isDefault.dataset.analyticsId = 'data-mapping:default';
     guessed = element(ownerDocument, 'span', 'data-mapping-tag', 'guessed');
-    meta.append(isDefault, guessed);
+    // How wide a wide array is, under its name: it is not an embedding at a
+    // glance. The name keeps the whole first line.
+    widthNote = element(ownerDocument, 'span', 'data-mapping-width');
+    meta.append(isDefault, guessed, widthNote);
   }
   root.append(main, meta);
 
@@ -311,7 +312,9 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
         ? `New ${row.dimension}D views show ${row.name}.`
         : `Show ${row.name} when a view switches to ${row.dimension}D.`;
     guessed.hidden = !row.guessed;
-    meta.hidden = isDefault.hidden && guessed.hidden;
+    widthNote.hidden = row.widthNote === null;
+    setText(widthNote, row.widthNote ?? '');
+    meta.hidden = isDefault.hidden && guessed.hidden && widthNote.hidden;
 
     if (editor === null) return;
     const width = row.columns.width;
@@ -368,23 +371,4 @@ export function syncChildren(parent, nodes) {
   }
 }
 
-/**
- * Replace the read-only facts with one row per name and value.
- *
- * @param {HTMLElement} box
- * @param {Array<{label: string, value: string}>} rows
- */
-export function renderFactRows(box, rows) {
-  const facts = JSON.stringify(rows);
-  if (drawnFacts.get(box) === facts) return;
-  drawnFacts.set(box, facts);
-  const ownerDocument = box.ownerDocument;
-  box.replaceChildren(...rows.map(({ label, value }) => {
-    const row = element(ownerDocument, 'div', 'dataset-info-row');
-    const name = element(ownerDocument, 'span', 'dataset-info-label', label);
-    const text = element(ownerDocument, 'span', 'dataset-info-value', value);
-    text.title = value;
-    row.append(name, text);
-    return row;
-  }));
-}
+

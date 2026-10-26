@@ -13,13 +13,17 @@
 
 import {
   requireDomElement,
-  requireExactKeys,
   requireHighlightGroup,
   requireMethods,
-  requireSafeInteger
+  requireSafeInteger,
 } from './exact-contract.js';
-import { createListItem } from '../../components/controls.js';
-import { formatCount } from '../../components/display-format.js';
+import {
+  captureListItemFocus,
+  createListItem,
+  restoreListItemFocus
+} from '../../components/controls.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 function requireDomElementList(elements, label, methods = []) {
   if (!Array.isArray(elements) || elements.length === 0) {
@@ -47,7 +51,7 @@ export function initHighlightSummaryUI(options) {
     state,
     'Highlight summary state',
     [
-      'clearAllHighlights',
+      'clearActivePageHighlights',
       'getHighlightedCellCount',
       'getHighlightedGroups',
       'getTotalHighlightedCellCount',
@@ -185,15 +189,21 @@ export function initHighlightSummaryUI(options) {
     if (totalCount === 0) {
       countText = 'No cells highlighted';
     } else if (visibleCount === totalCount) {
-      countText = `${formatCount(totalCount)} cells highlighted`;
+      countText = `${formatCountOf(totalCount, 'cell')} highlighted`;
     } else {
       countText = `${formatCount(visibleCount)} of ${formatCount(totalCount)} highlighted cells visible`;
     }
     for (const countEl of highlightCountEls) {
       if (countEl.textContent !== countText) countEl.textContent = countText;
     }
+    // Clear hides itself once nothing is highlighted: the focus it had
+    // moves to the list, not to the page.
+    const clearHadFocus = clearButtons.some(button => button === document.activeElement);
     for (const clearButton of clearButtons) {
       clearButton.hidden = groups.length === 0;
+    }
+    if (clearHadFocus && groups.length === 0) {
+      restoreListItemFocus(highlightedGroupsEl, { id: null, kind: null, position: -1 }, 'highlightId');
     }
 
     // The rows change only when a group is added, removed, renamed or
@@ -204,6 +214,7 @@ export function initHighlightSummaryUI(options) {
     if (groupsKey === renderedGroupsKey) return;
     renderedGroupsKey = groupsKey;
 
+    const focused = captureListItemFocus(highlightedGroupsEl, 'highlightId');
     const rows = groups.map((group) => {
       const { root } = createListItem({
         text: `${group.label} (${formatCount(group.cellCount)})`,
@@ -216,11 +227,12 @@ export function initHighlightSummaryUI(options) {
       return root;
     });
     highlightedGroupsEl.replaceChildren(...rows);
+    restoreListItemFocus(highlightedGroupsEl, focused, 'highlightId');
   }
 
   for (const clearButton of clearButtons) {
     listen(clearButton, 'click', () => {
-      state.clearAllHighlights();
+      state.clearActivePageHighlights();
     });
   }
 

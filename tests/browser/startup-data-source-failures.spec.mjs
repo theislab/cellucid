@@ -9,20 +9,22 @@
  * switch used to surface a raw browser string in a toast that faded away,
  * leaving nothing behind to read or to act on.
  */
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const fixturesDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
 );
-const GOOD_EXPORTS = `${ORIGIN}/tests/browser/fixtures/demo-custom-exports/`;
-const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-exports/`;
-const NOTICE = '.dataset-info[role="status"]';
+const GOOD_CATALOG = `${ORIGIN}/tests/browser/fixtures/demo-catalog/`;
+const BROKEN = `${ORIGIN}/tests/browser/fixtures/broken-catalogs/`;
+const NOTICE = '#dataset-notice';
 const NOTICE_BUTTON = `${NOTICE} button`;
 
 const GOOD_DATASET = Object.freeze({
@@ -36,9 +38,9 @@ const OTHER_DATASET = Object.freeze({
   cells: 96,
 });
 
-function exportsUrl(baseUrl, datasetId) {
+function catalogUrl(baseUrl, datasetId) {
   const url = new URL('/', ORIGIN);
-  url.searchParams.set('exportsBaseUrl', baseUrl);
+  url.searchParams.set('sampleCatalog', baseUrl);
   if (datasetId !== null) url.searchParams.set('dataset', datasetId);
   return url.toString();
 }
@@ -48,7 +50,7 @@ function optionValue(datasetId) {
 }
 
 async function noticeText(page) {
-  return page.locator(`${NOTICE} > div`).first().innerText();
+  return page.locator(`${NOTICE} .dataset-notice-message`).first().innerText();
 }
 
 /* ------------------------------------------------------------------ *
@@ -62,21 +64,21 @@ async function noticeText(page) {
 const CATALOG_FAILURES = Object.freeze([
   Object.freeze({
     label: 'wrong-address',
-    base: `${ORIGIN}/tests/browser/fixtures/no-such-export-tree/`,
+    base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
     status: null,
     expect: /nothing is published at that address/,
     forbid: /Check your network/,
   }),
   Object.freeze({
     label: 'permission-denied',
-    base: GOOD_EXPORTS,
+    base: GOOD_CATALOG,
     status: 403,
     expect: /the server refused access/,
     forbid: /Check your network/,
   }),
   Object.freeze({
     label: 'server-error',
-    base: GOOD_EXPORTS,
+    base: GOOD_CATALOG,
     status: 500,
     expect: /the server reported a problem of its own/,
     forbid: /Check your network/,
@@ -85,7 +87,7 @@ const CATALOG_FAILURES = Object.freeze([
     // A body that is not a dataset list and a dropped connection arrive at the
     // UI as the same error, so they honestly share one sentence naming both.
     label: 'not-a-dataset-list',
-    base: `${BROKEN}wrong-format-catalog/`,
+    base: `${BROKEN}truncated-catalog/`,
     status: null,
     expect: /may not hold Cellucid data/,
     forbid: /not found|refused access/,
@@ -106,7 +108,7 @@ for (const failure of CATALOG_FAILURES) {
             body: 'no',
           }));
       }
-      await page.goto(exportsUrl(failure.base, null), {
+      await page.goto(catalogUrl(failure.base, null), {
         waitUntil: 'domcontentloaded',
       });
       await dismissWelcome(page);
@@ -147,7 +149,7 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   page,
   context,
 }, testInfo) => {
-  await page.goto(exportsUrl(GOOD_EXPORTS, GOOD_DATASET.id), {
+  await page.goto(catalogUrl(GOOD_CATALOG, GOOD_DATASET.id), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -196,10 +198,46 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   await expect(notice).toBeHidden();
 });
 
-test('a damaged dataset payload leads with the dataset, not the file', async ({
+/**
+ * A catalog whose datasets all describe themselves, but one of which is
+ * damaged where only opening it reads: one byte of its embedding is flipped,
+ * so its ZIP entry no longer matches its checksum.
+ */
+async function serveDamagedCatalog(page, base) {
+  const demo = id => readFileSync(path.join(fixturesDirectory, 'demo-catalog', `${id}.zarr.zip`));
+  const damaged = Buffer.from(demo(GOOD_DATASET.id));
+  const embedding = zipEntryData(damaged, `${GOOD_DATASET.id}.zarr/obsm/X_islands/0.0`);
+  damaged[embedding.offset + embedding.length - 1] ^= 0xff;
+  const files = new Map([
+    [`${GOOD_DATASET.id}.zarr.zip`, damaged],
+    [`${OTHER_DATASET.id}.zarr.zip`, demo(OTHER_DATASET.id)],
+  ]);
+  await page.route(`${base}**`, route => {
+    const name = new URL(route.request().url()).pathname.split('/').pop();
+    if (name === 'datasets.json') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          schema: 2,
+          default: OTHER_DATASET.id,
+          datasets: [...files.keys()].map(file => ({
+            id: file.replace(/\.zarr\.zip$/, ''),
+            path: file,
+          })),
+        }),
+      });
+    }
+    return fulfillFile(route, files.get(name));
+  });
+}
+
+test('a damaged dataset leads with the dataset, not the file', async ({
   page,
 }, testInfo) => {
-  await page.goto(exportsUrl(`${BROKEN}mixed-corrupt-payload/`, null), {
+  const base = `${ORIGIN}/tests/browser/fixtures/damaged-catalog/`;
+  await serveDamagedCatalog(page, base);
+  await page.goto(catalogUrl(base, null), {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
@@ -217,16 +255,15 @@ test('a damaged dataset payload leads with the dataset, not the file', async ({
   expect(message).toMatch(
     new RegExp(`^"${GOOD_DATASET.name}" could not be opened`),
   );
-  expect(message).not.toMatch(/https?:|gzip|Payload/);
+  expect(message).not.toMatch(/https?:/);
   expect(message).toContain(`"${OTHER_DATASET.name}" is still open.`);
 
   // The session survives, and other data still loads from the same controls.
   await expect(page.locator('#dataset-name')).toHaveText(OTHER_DATASET.name);
-  await chooseDirectory(
-    page.locator('#user-data-file-input'),
-    path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
+  await chooseFiles(page.locator('#user-data-file-input'), 
+    path.join(fixturesDirectory, 'current-ui-smoke.h5ad'),
   );
-  await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
+  await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   // Loading a dataset successfully retires the failure it replaced.
   await expect(page.locator(NOTICE)).toBeHidden();
 });

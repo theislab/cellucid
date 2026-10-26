@@ -1,0 +1,10 @@
+{
+  "schema": 2,
+  "default": "forms-h5ad",
+  "datasets": [
+    {
+      "id": "forms-h5ad",
+      "path": "forms-h5ad.h5ad"
+    }
+  ]
+}

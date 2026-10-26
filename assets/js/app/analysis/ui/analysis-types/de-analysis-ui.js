@@ -1,793 +1,636 @@
 /**
- * Differential Expression Analysis UI Component
+ * Differential expression: every gene compared between two groups of cells.
  *
- * Provides differential expression analysis functionality:
- * - Two-page comparison
- * - Gene selection (top N or all)
- * - Statistical method selection
- * - Volcano plot visualization
- * - DE gene table
+ * The form is the DE options schema's (`options/de-options.js`): Compare
+ * (pages, or categories of a field), Group A and Group B with a swap, Run;
+ * cells, test, filters and labels under More options. Groups are resolved
+ * to cells here (a "rest of" page, categories, within a scope), then tested
+ * (`MultiVariableAnalysis.differentialExpression`). A group smaller than
+ * the minimum runs and is flagged low n; overlapping groups disable Run with
+ * the reason. Filters and labels re-draw the volcano without testing again.
  *
- * Extends FormBasedAnalysisUI for form + results pattern.
+ * @module analysis-types/de-analysis-ui
  */
 
-import { formatCount } from '../../../ui/components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import {
-  createPerformanceSettings,
-  createSelectField,
-  getPerformanceFormValues
-} from '../../shared/dom-utils.js';
-import {
-  deResultsToCSV,
-  downloadCSV
-} from '../../shared/analysis-utils.js';
-// Note: the sidebar shows only the volcano plot. Summary statistics and the DE
-// gene table are rendered from HTML templates in the expanded modal view
-// (_renderModalStats, _renderModalAnnotations), which is the only DE result view.
-import { createPageComparisonSelector } from '../components/index.js';
+import { downloadCSV } from '../../shared/analysis-utils.js';
+import { toCSVCell } from '../../compute/csv-export.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
-import { ProgressTracker } from '../../shared/progress-tracker.js';
+import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
+import { DE_DISPLAY_KEYS, DE_OPTIONS } from '../../options/de-options.js';
+import { defineOptions } from '../../options/option-schema.js';
+import { renderOptionsForm } from '../../options/render-options-form.js';
+import { GenesPanelController, categoryOptionId } from '../../genes-panel/genes-panel-controller.js';
+import { countGeneFamilies } from '../../shared/gene-sets.js';
+import { pseudobulkUnits } from '../../stats/pseudobulk.js';
+import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetGenes
+} from '../../shared/analysis-result-session.js';
 
-/**
- * Differential Expression Analysis UI Component
- * @extends FormBasedAnalysisUI
- */
+/** The Wilcoxon p-value conventions as the form names them. */
+const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
+  DE_OPTIONS.entry('pConvention').choices.map(choice => [choice.value, choice.label])
+));
+
+const METHOD_NAMES = Object.freeze({
+  wilcox: 'Wilcoxon',
+  ttest: 't-test',
+  ttest_overestim_var: 't-test (overestimated variance)',
+  pseudobulk: 'Pseudobulk t-test'
+});
+
+/** The volcano's filters and labels, for the expanded view. */
+const DISPLAY_OPTIONS = defineOptions({
+  id: 'differentialDisplay',
+  groups: [],
+  options: DE_OPTIONS.entries
+    .filter(entry => DE_DISPLAY_KEYS.includes(entry.key))
+    .map(entry => ({ ...entry, group: 'essentials' }))
+});
+
 export class DEAnalysisUI extends FormBasedAnalysisUI {
-  // ===========================================================================
-  // Required Abstract Method Implementations
-  // ===========================================================================
-
-  /**
-   * Get page requirements for differential expression
-   * @static
-   * @returns {{ minPages: number, maxPages: number, description: string, geneExpression: true }}
-   */
   static getRequirements() {
     return {
-      // DE has its own internal page comparison selector; don't block rendering
-      // when the global page selection is empty.
+      // DE chooses its own two groups.
       minPages: 0,
-      maxPages: null, // Allow any number of pages; user selects which 2 to compare
+      maxPages: null,
       description: 'Select pages to compare',
       geneExpression: true
     };
   }
 
-  /**
-   * @param {Object} options
-   */
   constructor(options) {
     super(options);
-
     this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-de-analysis-plot` : 'de-analysis-plot';
-
-    // Track which two pages are selected for comparison
-    this._comparisonPages = [];
-
-    /**
-     * Modal-only UI state: how many DE genes to show in the annotations table.
-     * @type {'top5'|'top10'|'top20'|'top100'|'all'}
-     * @private
-     */
-    this._modalGeneListMode = 'top5';
-
-
-    // Bind handlers
-    this._handleComparisonChange = this._handleComparisonChange.bind(this);
-
-    /** @type {ProgressTracker|null} */
-    this._progressTracker = null;
+    /** Category groups of the fields A/B and Within read (by field). */
+    this._fieldGroups = new Map();
+    /** Fields whose categories could not be read, with the error. */
+    this._fieldGroupFailures = new Map();
+    /** The last `_resolveGroups` answer and what it was resolved from. */
+    this._resolvedGroups = null;
+    /** The last replicates blocker and the groups and samples it counted. */
+    this._replicateBlocker = null;
+    this._pendingFields = new Set();
+    this._helper = null;
+    this._familyCounts = null;
   }
 
-  /**
-   * Handle page comparison selection change
-   * @param {string[]} pageIds - Selected page IDs [pageA, pageB]
-   */
-  _handleComparisonChange(pageIds) {
-    if (!Array.isArray(pageIds) || pageIds.length !== 2) {
-      throw new TypeError(
-        'Differential expression requires exactly two comparison page IDs'
-      );
-    }
-    if (
-      pageIds.some(
-        pageId => typeof pageId !== 'string' || pageId.length === 0
-      )
-    ) {
-      throw new TypeError(
-        'Differential expression comparison page IDs must be non-empty strings'
-      );
-    }
-    if (pageIds[0] === pageIds[1]) {
-      throw new TypeError(
-        'Differential expression comparison pages must be different'
-      );
-    }
-    for (const pageId of pageIds) {
-      if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
-        throw new RangeError(
-          `Differential expression page "${pageId}" has zero cells and cannot be selected`
-        );
-      }
-    }
-    this._comparisonPages = [...pageIds];
-    this._handleFormInputIntent();
-  }
-
-  /**
-   * Get the analysis title
-   * @returns {string}
-   */
   _getTitle() {
     return 'Differential expression';
   }
 
-  /**
-   * Get CSS class prefix
-   * @returns {string}
-   */
   _getClassName() {
     return 'de-analysis';
   }
 
-  /**
-   * Get loading notification message
-   * @returns {string}
-   */
-  _getLoadingMessage() {
-    return 'Running differential expression...';
+  _getSuccessMessage(result) {
+    const summary = result?.data?.summary;
+    if (!summary) return 'Differential expression complete';
+    const significant = this._significantCount(result.data.results, this._options);
+    const low = summary.lowN.length > 0 ? ` (low n: ${summary.lowN.join(', ')})` : '';
+    return `Differential expression: ${formatCount(significant)} significant genes${low}`;
   }
 
-  /**
-   * Get success notification message
-   * @returns {string}
-   */
-  _getSuccessMessage() {
-    return 'Differential expression complete';
+  // ===========================================================================
+  // Options
+  // ===========================================================================
+
+  _getOptionsSchema() {
+    return DE_OPTIONS;
   }
 
-  /**
-   * Get run button text
-   * @returns {string}
-   */
-  _getRunButtonText() {
-    return 'Run differential expression';
+  _helperController() {
+    this._helper ??= new GenesPanelController({ dataLayer: this.dataLayer });
+    return this._helper;
   }
 
-  /**
-   * Render form-specific controls
-   * @param {HTMLElement} wrapper - Form wrapper element
-   */
-  _renderFormControls(wrapper) {
-    // Get available pages
+  _pageChoices() {
     const pages = this.dataLayer.getPages();
-    const availablePages = pages.filter(p => this._selectedPages.includes(p.id));
+    return expandPagesWithDerived(pages, { includeRestOf: true })
+      .filter(page => this.dataLayer.getCellCountForPageId(page.id) > 0)
+      .map(page => ({ id: page.id, name: page.name }));
+  }
 
-    // Page comparison selector (handles 2+ pages elegantly)
-    const pageSelector = createPageComparisonSelector({
-      pages: availablePages.length > 0 ? availablePages : pages,
-      selectedIds: this._comparisonPages,
-      onChange: this._handleComparisonChange,
-      getCellCountForPageId: pageId =>
-        this.dataLayer.getCellCountForPageId(pageId)
-    });
-    wrapper.appendChild(pageSelector);
-
-    // Method selector
-    wrapper.appendChild(createSelectField({
-      label: 'Statistical method',
-      name: 'method',
-      tip: 'analysis-test-method',
-      options: [
-        { value: 'wilcox', label: 'Wilcoxon', selected: true },
-        { value: 'ttest', label: 't-test' }
-      ]
-    }).root);
-
-    // Note: Significance and fold change thresholds are now in the results view
-    // where they can be adjusted dynamically after analysis
-
-    // === Performance Settings Section (shared with Genes Panel) ===
-    const perfSettings = createPerformanceSettings({
-      dataLayer: this.dataLayer,
-      className: 'de-performance-settings',
-      collapsed: true
-    });
-    wrapper.appendChild(perfSettings);
+  _groupsOfField(field) {
+    if (!field) return [];
+    const described = this._fieldGroups.get(field);
+    if (described !== undefined) return described.groups;
+    // A field whose categories could not be read is not read again on every
+    // redraw (each posted its error): Run says why until the field changes.
+    if (!this._pendingFields.has(field) && !this._fieldGroupFailures.has(field)) {
+      this._pendingFields.add(field);
+      void this._helperController().describeGroups(field, null).then(value => {
+        this._pendingFields.delete(field);
+        if (this._isDestroyed) return;
+        this._fieldGroups.set(field, value);
+        this._refreshOptionsContext();
+      }, error => {
+        this._pendingFields.delete(field);
+        if (this._isDestroyed) return;
+        this._fieldGroupFailures.set(field, error);
+        this._notifications.error(`Differential expression groups: ${error.message}`, { category: 'analysis' });
+        this._refreshOptionsContext();
+      });
+    }
+    return [];
   }
 
   /**
-   * Extract form values
-   * @returns {Object}
+   * A changed option is the user's next try: the fields whose categories
+   * could not be read are read again when next asked for.
+   * @override
    */
-  _getFormValues() {
-    const form = this._formContainer.querySelector('.analysis-form');
-    const perfValues = getPerformanceFormValues(form);
+  _handleOptionsChanged(key) {
+    this._fieldGroupFailures.clear();
+    super._handleOptionsChanged(key);
+  }
 
+  /** Why Run waits for `field`'s categories: read failed, or still reading. @private */
+  _fieldGroupsBlocker(field) {
+    const failure = this._fieldGroupFailures.get(field);
+    return failure === undefined
+      ? 'Reading the categories…'
+      : `The categories of ${field} could not be read: ${failure.message}`;
+  }
+
+  _getOptionsContext() {
+    const genes = this.dataLayer.getAvailableVariables('gene_expression');
+    if (this._familyCounts?.of !== genes) {
+      this._familyCounts = { of: genes, counts: countGeneFamilies(genes.map(gene => gene.key)) };
+    }
     return {
-      ...perfValues,
-      method: form.querySelector('[name="method"]').value
+      pages: this._pageChoices(),
+      categoricalFields: this.dataLayer.getAvailableVariables('categorical_obs')
+        .filter(variable => (variable.categoryCount ?? variable.categories?.length ?? 2) >= 2)
+        .map(variable => ({ key: variable.key })),
+      groupsFor: (entry, record) => this._groupsOfField(entry.key === 'withinCategories' ? record.withinField : record.field)
+        .map(group => ({ id: group.optionId, name: String(group.groupName), count: group.count, color: group.color })),
+      minCellsFor: () => null,
+      geneFamilyCounts: this._familyCounts.counts,
+      hasHighlyVariable: this._highlyVariableAvailable(),
+      expressionMatrices: this.dataLayer.getExpressionMatrices()
     };
   }
 
-  _validateForm(formValues) {
-    if (this._comparisonPages.length !== 2) {
-      return {
-        valid: false,
-        error: 'Select two non-empty cell groups to run differential expression'
-      };
+  _isDisplayOption(key) {
+    return DE_DISPLAY_KEYS.includes(key);
+  }
+
+  _getRunNoun() {
+    return 'differential expression';
+  }
+
+  /** The cells "Within" keeps (null: every cell), or null when not ready. */
+  _withinMask(options) {
+    if (options.within === 'all') return null;
+    if (options.within === 'category') {
+      const described = this._fieldGroups.get(options.withinField);
+      if (described === undefined) return undefined;
+      const keep = options.withinCategories.mode === 'all'
+        ? null
+        : new Set(options.withinCategories.ids);
+      const allowed = new Uint8Array(described.categories.length);
+      described.categories.forEach((label, code) => {
+        if (keep === null || keep.has(categoryOptionId(label))) allowed[code] = 1;
+      });
+      const mask = new Uint8Array(described.codes.length);
+      for (let cell = 0; cell < mask.length; cell++) {
+        const code = described.codes[cell];
+        mask[cell] = code < allowed.length ? allowed[code] : 0;
+      }
+      return mask;
     }
-    if (formValues.method !== 'wilcox' && formValues.method !== 'ttest') {
-      return {
-        valid: false,
-        error: 'Select a supported differential expression method'
-      };
-    }
-    return { valid: true };
+    return this._helperController().scopeOf(options.within);
   }
 
   /**
-   * Run the differential expression analysis
-   * @param {Object} formValues - Form values
-   * @returns {Promise<Object>} Analysis result
+   * The two groups' cells, or the reason they cannot be compared.
+   *
+   * Resolving is a pass over every cell, and Run's state asks for it on every
+   * option, highlight and page change: the answer is kept while the options
+   * that choose the groups, the highlights and the fields they read are the
+   * same.
    */
-  async _runAnalysisImpl(formValues, requestId, progressTracker) {
-    if (
-      !Array.isArray(this._comparisonPages) ||
-      this._comparisonPages.length !== 2
-    ) {
-      throw new Error(
-        'Differential expression requires two selected comparison pages'
-      );
+  _resolveGroups(options) {
+    const key = JSON.stringify([
+      options.compare, options.pageA, options.pageB, options.field,
+      options.categoriesA, options.categoriesB,
+      options.within, options.withinField, options.withinCategories,
+      this._highlightRevision,
+      options.within === 'visible' ? this._visibleCellsDigest() : null,
+    ]);
+    // What the fields it reads hold: their categories, or why they have none.
+    const field = this._fieldGroups.get(options.field) ?? this._fieldGroupFailures.get(options.field);
+    const withinField = this._fieldGroups.get(options.withinField) ?? this._fieldGroupFailures.get(options.withinField);
+    const kept = this._resolvedGroups;
+    if (kept !== null && kept.key === key && kept.field === field && kept.withinField === withinField) {
+      return kept.resolved;
     }
-    const [pageA, pageB] = this._comparisonPages;
-    if (formValues.method !== 'wilcox' && formValues.method !== 'ttest') {
-      throw new TypeError(
-        'Differential expression method must be wilcox or ttest'
-      );
-    }
-    if (
-      formValues.batchConfig === null ||
-      typeof formValues.batchConfig !== 'object' ||
-      Array.isArray(formValues.batchConfig)
-    ) {
-      throw new TypeError(
-        'Differential expression batchConfig must be an object'
-      );
-    }
+    const resolved = this._resolveGroupsNow(options);
+    this._resolvedGroups = { key, field, withinField, resolved };
+    return resolved;
+  }
 
-    // Run differential expression with optimized batch loading
-    const deResults = await this.multiVariableAnalysis.differentialExpression({
-      pageA,
-      pageB,
-      geneList: null, // Always test all genes; results are sorted so "top genes" naturally surface.
-      method: formValues.method,
-      parallelism: formValues.parallelism,
-      batchConfig: formValues.batchConfig,
-      onProgress: (progress) => {
-        if (this._isCurrentAnalysisRequest(requestId)) {
-          this._updateProgress(progress, progressTracker);
+  /** @private */
+  _resolveGroupsNow(options) {
+    const within = this._withinMask(options);
+    if (within === undefined) {
+      this._groupsOfField(options.withinField);
+      return { reason: this._fieldGroupsBlocker(options.withinField) };
+    }
+    let a;
+    let b;
+    if (options.compare === 'pages') {
+      if (!options.pageA || !options.pageB) return { reason: 'Choose two pages' };
+      if (options.pageA === options.pageB) return { reason: 'Group A and Group B are the same page' };
+      const mva = this.multiVariableAnalysis;
+      a = mva.pageGroup(options.pageA, within);
+      b = mva.pageGroup(options.pageB, within);
+    } else {
+      const described = this._fieldGroups.get(options.field);
+      if (described === undefined) {
+        this._groupsOfField(options.field);
+        return { reason: this._fieldGroupsBlocker(options.field) };
+      }
+      const idsA = new Set(options.categoriesA.mode === 'all' ? described.groups.map(g => g.optionId) : options.categoriesA.ids);
+      const idsB = new Set(options.categoriesB.mode === 'all' ? described.groups.map(g => g.optionId) : options.categoriesB.ids);
+      if (idsA.size === 0 || idsB.size === 0) return { reason: 'Choose categories for Group A and Group B' };
+      const shared = [...idsA].filter(id => idsB.has(id));
+      if (shared.length > 0) return { reason: `A category is in both groups: ${shared.join(', ')}` };
+      const codesOf = ids => {
+        const keep = new Uint8Array(described.categories.length);
+        described.categories.forEach((label, code) => { if (ids.has(categoryOptionId(label))) keep[code] = 1; });
+        return keep;
+      };
+      const keepA = codesOf(idsA);
+      const keepB = codesOf(idsB);
+      const { codes } = described;
+      // One pass into a typed list as long as the cells, then the group's
+      // part of it copied out.
+      const cellsOf = keep => {
+        const out = new Uint32Array(codes.length);
+        const limit = keep.length;
+        let count = 0;
+        if (within === null) {
+          for (let cell = 0; cell < codes.length; cell++) {
+            const code = codes[cell];
+            if (code < limit && keep[code] === 1) out[count++] = cell;
+          }
+        } else {
+          for (let cell = 0; cell < codes.length; cell++) {
+            const code = codes[cell];
+            if (code < limit && keep[code] === 1 && within[cell] !== 0) out[count++] = cell;
+          }
         }
-      },
-      isCurrent: () => this._isCurrentAnalysisRequest(requestId),
-      registerInvalidationCleanup: cleanup =>
-        this._registerAnalysisInvalidationCleanup(requestId, cleanup)
-    });
-    if (
-      deResults === null ||
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return null;
+        return out.slice(0, count);
+      };
+      const nameOf = ids => [...ids].join(' + ');
+      a = { name: nameOf(idsA), cells: cellsOf(keepA) };
+      b = { name: nameOf(idsB), cells: cellsOf(keepB) };
     }
+    let overlap = 0;
+    for (let i = 0, j = 0; i < a.cells.length && j < b.cells.length;) {
+      if (a.cells[i] === b.cells[j]) { overlap++; i++; j++; } else if (a.cells[i] < b.cells[j]) i++; else j++;
+    }
+    if (overlap > 0) return { reason: `The groups share ${formatCountOf(overlap, 'cell')}` };
+    if (a.cells.length < 2 || b.cells.length < 2) return { reason: 'Each group needs at least 2 cells' };
+    return { a, b };
+  }
 
-    // Use default thresholds - these can be adjusted dynamically in the results view
+  _getRunBlocker(options) {
+    const resolved = this._resolveGroups(options);
+    if (resolved.reason) return resolved.reason;
+    if (options.replicates === '') return null;
+    const replicates = this._replicatesOf(options);
+    if (replicates === null) {
+      return this._fieldGroupFailures.has(options.replicates)
+        ? this._fieldGroupsBlocker(options.replicates)
+        : 'Reading the samples…';
+    }
+    // Counting the samples is a pass over every cell: kept for these groups
+    // and this sample field.
+    const kept = this._replicateBlocker;
+    if (kept?.resolved === resolved && kept.codes === replicates.codes) return kept.blocker;
+    const units = pseudobulkUnits(resolved.a.cells, resolved.b.cells, replicates.codes, replicates.missingCode, this.dataLayer.state.pointCount);
+    const blocker = units.unitsA < 2 || units.unitsB < 2
+      ? `Each group needs cells in at least 2 samples of ${options.replicates}`
+      : null;
+    this._replicateBlocker = { resolved, codes: replicates.codes, blocker };
+    return blocker;
+  }
+
+  /** The sample field of a pseudobulk run, or null while it is read. */
+  _replicatesOf(options) {
+    this._groupsOfField(options.replicates);
+    const described = this._fieldGroups.get(options.replicates);
+    if (described === undefined) return null;
+    return { name: options.replicates, codes: described.codes, missingCode: missingCategoryCode(described.codes) };
+  }
+
+  /** A swap beside Group A and Group B. */
+  _decorateOptionsForm(form) {
+    const essentials = form.essentials;
+    const swap = document.createElement('button');
+    swap.type = 'button';
+    swap.className = 'analysis-link-btn de-swap';
+    swap.textContent = 'Swap A and B';
+    swap.addEventListener('click', () => {
+      const options = this._options;
+      this._setOptions(options.compare === 'pages'
+        ? { ...options, pageA: options.pageB, pageB: options.pageA }
+        : { ...options, categoriesA: options.categoriesB, categoriesB: options.categoriesA });
+    });
+    essentials.appendChild(swap);
+  }
+
+  // ===========================================================================
+  // Run
+  // ===========================================================================
+
+  async _runAnalysisImpl(options, requestId, job) {
+    const resolved = this._resolveGroups(options);
+    if (resolved.reason) throw new Error(resolved.reason);
+    const helper = this._helperController();
+    const genes = await helper.genesToTest(options);
+    const deResults = await this.multiVariableAnalysis.differentialExpression({
+      groupA: resolved.a,
+      groupB: resolved.b,
+      geneList: genes,
+      method: options.method,
+      pConvention: options.method === 'wilcox' ? options.pConvention : 'exact',
+      correction: options.correction,
+      foldChange: helper.foldChangeOf(options.foldChange, options.matrix),
+      matrix: options.matrix,
+      replicates: options.replicates === '' ? null : this._replicatesOf(options),
+      minCells: options.minCells,
+      job,
+      isCurrent: () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: cleanup => this._registerAnalysisInvalidationCleanup(requestId, cleanup)
+    });
+    if (deResults === null || !this._isCurrentAnalysisRequest(requestId)) return null;
+    return this._buildResult(deResults, options);
+  }
+
+  /** The drawn result: the volcano over the genes passing the % filter. */
+  _buildResult(deResults, options) {
+    const drawn = options.minPct > 0
+      ? {
+          ...deResults,
+          results: deResults.results.filter(row => Math.max(row.pctA ?? 0, row.pctB ?? 0) >= options.minPct)
+        }
+      : deResults;
     return {
       type: 'differential',
       plotType: 'volcanoplot',
-      data: deResults,
+      data: drawn,
+      full: deResults,
       options: {
-        pValueThreshold: 0.05,
-        foldChangeThreshold: 1.0,
+        pValueThreshold: options.maxAdjP,
+        foldChangeThreshold: options.minLog2FC,
         useAdjustedPValue: true,
-        labelTopN: 15
+        labelTopN: options.labels
       },
       title: 'Differential expression',
-      subtitle: `${deResults.metadata.pageAName} vs ${deResults.metadata.pageBName}`
+      subtitle: `${deResults.summary.groupAName} vs ${deResults.summary.groupBName}`
     };
   }
 
-  /**
-   * Override _runAnalysis to use the same progress bar UX as Marker Analysis.
-   * @override
-   */
-  async _runAnalysis() {
-    if (this._isDestroyed) return;
-
-    const formValues = structuredClone(this._getFormValues());
-    const validation = this._validateForm(formValues);
-    if (!validation.valid) {
-      this._invalidateAnalysisRequest();
-      this._notifications.error(validation.error || 'Invalid form values');
-      return;
-    }
-
-    const requestId = this._startAnalysisRequest();
-    if (requestId === null) return;
-
-    const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
-    const originalText = runBtn?.textContent;
-    let buttonRestored = false;
-    const restoreButton = () => {
-      if (!runBtn || buttonRestored) return;
-      runBtn.disabled = false;
-      runBtn.textContent = originalText;
-      buttonRestored = true;
-    };
-    if (runBtn) {
-      runBtn.disabled = true;
-      runBtn.textContent = 'Running...';
-    }
-    const progressTracker = new ProgressTracker({
-      totalItems: 1,
-      phases: ['Loading & Computing', 'Multiple Testing Correction'],
-      title: 'Differential expression',
-      category: 'calculation',
-      showNotification: true
-    });
-    this._progressTracker = progressTracker;
-    progressTracker.start();
-    let progressSettled = false;
-    this._registerAnalysisInvalidationCleanup(requestId, () => {
-      if (!progressSettled) {
-        progressTracker.cancel();
-        progressSettled = true;
-      }
-      if (this._progressTracker === progressTracker) {
-        this._progressTracker = null;
-      }
-      restoreButton();
-    });
-
-    try {
-      const result = await this._runAnalysisImpl(
-        formValues,
-        requestId,
-        progressTracker
-      );
-      if (!result || !this._isCurrentAnalysisRequest(requestId)) return;
-
-      await this._showResult(result, requestId);
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-
-      await this._publishAnalysisResult(result, requestId);
-      progressTracker.complete('Differential expression complete');
-      progressSettled = true;
-
-      if (this.onResultChange) this.onResultChange(result);
-    } catch (error) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[DEAnalysisUI] Analysis error:', error);
-      progressTracker.fail(`Analysis failed: ${error.message}`);
-      progressSettled = true;
-    } finally {
-      if (this._isCurrentAnalysisRequest(requestId)) {
-        if (this._progressTracker === progressTracker) {
-          this._progressTracker = null;
-        }
-      }
-      this._finishAnalysisRequest(requestId);
-      if (!this._isLoading) restoreButton();
-    }
+  _rebuildForDisplay(options) {
+    const full = this._lastResult?.full;
+    return full ? this._buildResult(full, options) : null;
   }
 
-  /**
-   * Keep the DE ProgressTracker in sync with MultiVariableAnalysis progress emissions.
-   * @private
-   * @param {{ phase: string, progress: number, loaded: number, total: number, message: string }} progress
-   */
-  _updateProgress(progress, progressTracker = this._progressTracker) {
-    if (!progressTracker) return;
-    if (!progress || typeof progress !== 'object' || Array.isArray(progress)) {
-      throw new TypeError('Differential expression progress must be an object');
+  _significantCount(results, options) {
+    let count = 0;
+    for (const row of results ?? []) {
+      const p = row.adjustedPValue;
+      if (!isFiniteNumber(p) || !isFiniteNumber(row.log2FoldChange)) continue;
+      if (p <= options.maxAdjP && Math.abs(row.log2FoldChange) >= options.minLog2FC &&
+          Math.max(row.pctA ?? 0, row.pctB ?? 0) >= options.minPct) count++;
     }
-    const { phase, progress: percent, loaded, total, message } = progress;
-    if (typeof phase !== 'string' || phase.length === 0) {
-      throw new TypeError('Differential expression progress phase must be non-empty text');
-    }
-    if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-      throw new RangeError('Differential expression progress percent must be between 0 and 100');
-    }
-    if (!Number.isSafeInteger(total) || total < 1) {
-      throw new RangeError('Differential expression progress total must be a positive integer');
-    }
-    if (!Number.isSafeInteger(loaded) || loaded < 0 || loaded > total) {
-      throw new RangeError('Differential expression progress loaded must be within total');
-    }
-    if (typeof message !== 'string' || message.length === 0) {
-      throw new TypeError('Differential expression progress message must be non-empty text');
-    }
-    progressTracker.setPhase(phase);
-    progressTracker.setTotalItems(total);
-    progressTracker.setCompletedItems(loaded);
-    progressTracker.setMessage(message);
+    return count;
   }
 
   // ===========================================================================
-  // Custom Result Rendering
+  // Result view
   // ===========================================================================
 
-  /**
-   * Show analysis result with DE-specific visualization
-   * Only shows volcano plot and expand button in sidebar.
-   * Summary statistics and DE genes table are shown only in expanded modal view.
-   * @param {Object} result - Analysis result
-   */
   async _showResult(result, requestId) {
-    // Note: Summary statistics and Top DE genes table are NOT shown in sidebar
-    // They are only displayed in the expanded modal view (_renderModalStats and _renderModalAnnotations)
-    return this._renderPreviewPlot({
+    const rendered = await this._renderPreviewPlot({
       result,
       requestId,
       containerId: this._plotContainerIdBase,
       expandable: true
     });
+    if (rendered !== null && this._isCurrentAnalysisRequest(requestId)) {
+      const container = this._resultContainer;
+      container.querySelector(':scope > .analysis-result-header')?.remove();
+      const summary = result.full.summary;
+      const header = document.createElement('div');
+      header.className = 'analysis-result-header';
+      const line = document.createElement('p');
+      line.className = 'analysis-result-line';
+      line.textContent = [
+        `${summary.groupAName} (${formatCount(summary.groupASize)}) vs ${summary.groupBName} (${formatCount(summary.groupBSize)})`,
+        METHOD_NAMES[summary.method],
+        `${formatCountOf(summary.genesTested, 'gene')}`,
+        ...(summary.matrix === 'mapped' ? [] : [summary.matrixLabel])
+      ].join(' · ');
+      header.appendChild(line);
+      if (summary.lowN.length > 0) {
+        const chip = document.createElement('span');
+        chip.className = 'analysis-chip analysis-chip-warning';
+        chip.textContent = 'low n';
+        chip.title = `Fewer than ${formatCountOf(summary.minCells, 'cell')}: ${summary.lowN.join(', ')}`;
+        const chips = document.createElement('div');
+        chips.className = 'analysis-result-chips';
+        chips.appendChild(chip);
+        header.appendChild(chips);
+      }
+      container.prepend(header);
+    }
+    return rendered;
   }
 
-  // ===========================================================================
-  // Modal Rendering - Overrides from FormBasedAnalysisUI
-  // ===========================================================================
+  _renderModalOptions(container) {
+    super._renderModalOptions(container);
+    if (this._options === null) return;
+    const form = renderOptionsForm({
+      schema: DISPLAY_OPTIONS,
+      value: Object.fromEntries(DE_DISPLAY_KEYS.map(key => [key, this._options[key]])),
+      context: {},
+      onChange: (record, key) => {
+        this._options = { ...this._options, ...record };
+        this._optionsForm?.setValue(this._options);
+        this._handleOptionsChanged(key);
+      }
+    });
+    container.prepend(form.root);
+  }
 
-  /**
-   * Render DE statistics in modal
-   * Statistics are dynamically calculated based on current threshold settings
-   * @param {HTMLElement} container - Modal stats container
-   */
   _renderModalStats(container) {
     const result = this._lastResult;
-    const results = result?.data?.results;
-    const summary = result?.data?.summary;
-    const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
-
-    if (!results || results.length === 0) {
+    const summary = result?.full?.summary;
+    if (!summary) {
       container.innerHTML = '<p class="empty-state">Statistics not available</p>';
       return;
     }
-    if (
-      summary === null ||
-      typeof summary !== 'object' ||
-      Array.isArray(summary) ||
-      !Number.isSafeInteger(summary.genesTested) ||
-      !Number.isSafeInteger(summary.genesUntestable) ||
-      !Number.isSafeInteger(summary.minCells)
-    ) {
-      throw new TypeError(
-        'Differential-expression summary must report genesTested, genesUntestable and minCells'
-      );
-    }
-
-    const {
-      pValueThreshold = 0.05,
-      foldChangeThreshold = 1.0,
-      useAdjustedPValue = true
-    } = options;
-
-    // Calculate dynamic statistics based on current thresholds
-    let upregulated = 0;
-    let downregulated = 0;
-
-    for (const row of results) {
-      const pVal = useAdjustedPValue ? row.adjustedPValue : row.pValue;
-      if (!isFiniteNumber(pVal) || !isFiniteNumber(row.log2FoldChange)) continue;
-
-      const isSignificant = pVal <= pValueThreshold && Math.abs(row.log2FoldChange) >= foldChangeThreshold;
-      if (isSignificant) {
-        if (row.log2FoldChange > 0) {
-          upregulated++;
-        } else {
-          downregulated++;
-        }
+    const options = this._options;
+    let up = 0;
+    let down = 0;
+    for (const row of result.data.results) {
+      const p = row.adjustedPValue;
+      if (!isFiniteNumber(p) || !isFiniteNumber(row.log2FoldChange)) continue;
+      if (p <= options.maxAdjP && Math.abs(row.log2FoldChange) >= options.minLog2FC) {
+        if (row.log2FoldChange > 0) up++;
+        else down++;
       }
     }
-
-    const significantTotal = upregulated + downregulated;
-    const pLabel = useAdjustedPValue ? 'FDR' : 'p';
-
-    // "Genes tested" must be the multiple-testing denominator, not the panel
-    // size: genes that failed the min-cell check carry no p-value and were
-    // never part of the corrected family. Both the denominator and the skipped
-    // remainder are shown, so the reported FDR can be reconstructed from the
-    // counts in this table alone.
-    container.innerHTML = `
-      <table class="analysis-stats-table de-modal-stats">
-        <tr>
-          <td>Genes tested (FDR denominator)</td>
-          <td><strong>${formatCount(summary.genesTested)}</strong></td>
-        </tr>
-        <tr>
-          <td title="Genes skipped before testing: one of the two groups had fewer than ${summary.minCells} cells with a measured value for that gene, so no p-value exists and the gene is not part of the FDR correction.">Not tested (&lt; ${formatCount(summary.minCells)} cells with a value)</td>
-          <td><strong>${formatCount(summary.genesUntestable)}</strong></td>
-        </tr>
-        <tr>
-          <td>Significant (${pLabel} ≤ ${pValueThreshold}, |log₂FC| ≥ ${foldChangeThreshold})</td>
-          <td class="significant"><strong>${formatCount(significantTotal)}</strong></td>
-        </tr>
-        <tr>
-          <td>Upregulated</td>
-          <td class="up"><strong>${formatCount(upregulated)}</strong></td>
-        </tr>
-        <tr>
-          <td>Downregulated</td>
-          <td class="down"><strong>${formatCount(downregulated)}</strong></td>
-        </tr>
-      </table>
-    `;
+    const rows = [
+      ['Genes tested', formatCount(summary.genesTested)],
+      [
+        summary.replicates === null ? 'Not tested (fewer than 2 cells with a value)' : 'Not tested (fewer than 2 samples with a value)',
+        formatCount(summary.genesUntestable)
+      ],
+      ...(summary.replicates === null ? [] : [[
+        'Replicates',
+        `${summary.replicates.field}: ${formatCount(summary.replicates.samplesA)} vs ${formatCountOf(summary.replicates.samplesB, 'sample')}`
+      ]]),
+      [`Significant (adj p ≤ ${options.maxAdjP}, |log2FC| ≥ ${options.minLog2FC})`, formatCount(up + down)],
+      ['Up in A', formatCount(up)],
+      ['Down in A', formatCount(down)],
+      ...(summary.method === 'wilcox' ? [['p-values', P_CONVENTION_NAMES[summary.pConvention]]] : []),
+      ['Multiple testing', summary.correction === 'bh' ? 'Benjamini–Hochberg' : 'Bonferroni'],
+      ['Expression matrix', summary.matrixLabel],
+      ['Fold change', summary.foldChange.mode === 'log1p' ? 'Undo log1p' : 'As stored']
+    ];
+    const table = document.createElement('table');
+    table.className = 'analysis-stats-table de-modal-stats';
+    for (const [label, value] of rows) {
+      const tr = document.createElement('tr');
+      const a = document.createElement('td');
+      a.textContent = label;
+      const b = document.createElement('td');
+      b.textContent = value;
+      tr.append(a, b);
+      table.appendChild(tr);
+    }
+    container.replaceChildren(table);
   }
 
-  /**
-   * Render DE statistical annotations in modal
-   * @param {HTMLElement} container - Modal annotations container
-   */
   _renderModalAnnotations(container) {
     const result = this._lastResult;
-    const results = result?.data?.results;
-    const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
-
-    if (!results || results.length === 0) {
-      container.innerHTML = '<p class="empty-state">No significant genes found</p>';
-      return;
-    }
-
-    const {
-      pValueThreshold = 0.05,
-      foldChangeThreshold = 1.0,
-      useAdjustedPValue = true
-    } = options;
-
-    const geneListMode = this._modalGeneListMode || 'top5';
-    const maxRows = geneListMode === 'all'
-      ? Infinity
-      : (geneListMode === 'top100' ? 100
-        : geneListMode === 'top20' ? 20
-          : geneListMode === 'top10' ? 10
-            : 5);
-
-    const getPValue = (row) => {
-      if (!row) return null;
-      const raw = useAdjustedPValue ? row.adjustedPValue : row.pValue;
-      return isFiniteNumber(raw) ? raw : null;
-    };
-
-    const passesThresholds = (row) => {
-      const p = getPValue(row);
-      if (p === null) return false;
-      if (p > pValueThreshold) return false;
-
-      const fc = row?.log2FoldChange;
-      if (!isFiniteNumber(fc)) return false;
-      return Math.abs(fc) >= foldChangeThreshold;
-    };
-
-    /** @type {Array<any>} */
-    const significantGenes = [];
-    for (const row of results) {
-      if (passesThresholds(row)) {
-        significantGenes.push(row);
-      }
-    }
-
-    significantGenes.sort((a, b) => Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange));
-    const genesToShow = Number.isFinite(maxRows) ? significantGenes.slice(0, maxRows) : significantGenes;
-
-    if (genesToShow.length === 0) {
-      container.innerHTML = `
-        <p class="empty-state">
-          No genes passed the current thresholds (p ≤ ${pValueThreshold}, |log2FC| ≥ ${foldChangeThreshold}).
-        </p>
-      `;
-      return;
-    }
-
+    const results = result?.data?.results ?? [];
+    const options = this._options;
+    const significant = results
+      .filter(row => isFiniteNumber(row.adjustedPValue) && row.adjustedPValue <= options.maxAdjP &&
+        isFiniteNumber(row.log2FoldChange) && Math.abs(row.log2FoldChange) >= options.minLog2FC)
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
     container.innerHTML = '';
-
-    const headerRow = document.createElement('div');
-    headerRow.className = 'de-modal-genes-header';
-
-    const title = document.createElement('h5');
-    title.textContent = 'Top differentially expressed genes';
-    headerRow.appendChild(title);
-
-    const select = document.createElement('select');
-    select.className = 'obs-select';
-    select.setAttribute('aria-label', 'Genes to list');
-    select.innerHTML = `
-      <option value="top5">Top 5</option>
-      <option value="top10">Top 10</option>
-      <option value="top20">Top 20</option>
-      <option value="top100">Top 100</option>
-      <option value="all">All</option>
-    `;
-    select.value = geneListMode;
-    select.addEventListener('change', () => {
-      const value = select.value;
-      this._modalGeneListMode = (value === 'all' || value === 'top5' || value === 'top10' || value === 'top20' || value === 'top100')
-        ? value
-        : 'top5';
-      this._renderModalAnnotations(container);
-    });
-    headerRow.appendChild(select);
-
-    container.appendChild(headerRow);
-
+    if (significant.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'empty-state';
+      empty.textContent = `No genes pass the filters (adj p ≤ ${options.maxAdjP}, |log2FC| ≥ ${options.minLog2FC}).`;
+      container.appendChild(empty);
+      return;
+    }
     const table = document.createElement('table');
     table.className = 'de-genes-table modal-de-genes';
-
-    const thead = document.createElement('thead');
-    const headRow = document.createElement('tr');
-    const thGene = document.createElement('th');
-    thGene.textContent = 'Gene';
-    const thFc = document.createElement('th');
-    thFc.textContent = 'Log2 FC';
-    const thP = document.createElement('th');
-    thP.textContent = useAdjustedPValue ? 'Adj. P-value' : 'P-value';
-    headRow.appendChild(thGene);
-    headRow.appendChild(thFc);
-    headRow.appendChild(thP);
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-
+    table.innerHTML = '<thead><tr><th>Gene</th><th>Score</th><th>log2FC</th><th>adj p</th><th>% A</th><th>% B</th></tr></thead>';
     const tbody = document.createElement('tbody');
     table.appendChild(tbody);
     container.appendChild(table);
-
-    const formatPValueCell = (p) => {
-      if (p === null) return 'N/A';
-      if (p === 0) return '0';
-      if (p < 0.001) return '<0.001';
-      return p.toFixed(4);
-    };
-
-    const createRowEl = (row) => {
+    const fixed = (value, digits) => (isFiniteNumber(value) ? value.toFixed(digits) : '—');
+    this._renderTableRows(tbody, significant, row => {
       const tr = document.createElement('tr');
-      tr.className = row?.log2FoldChange > 0 ? 'up' : 'down';
-
-      const tdGene = document.createElement('td');
-      tdGene.className = 'gene-name';
-      tdGene.textContent = String(row?.gene ?? '');
-      tr.appendChild(tdGene);
-
-      const tdFc = document.createElement('td');
-      tdFc.textContent = isFiniteNumber(row?.log2FoldChange) ? row.log2FoldChange.toFixed(3) : 'N/A';
-      tr.appendChild(tdFc);
-
-      const tdP = document.createElement('td');
-      tdP.textContent = formatPValueCell(getPValue(row));
-      tr.appendChild(tdP);
-
+      tr.className = row.log2FoldChange > 0 ? 'up' : 'down';
+      const name = document.createElement('td');
+      name.appendChild(this._createGeneButton(row.gene));
+      tr.appendChild(name);
+      for (const text of [
+        fixed(row.score, 2),
+        fixed(row.log2FoldChange, 2),
+        isFiniteNumber(row.adjustedPValue) ? row.adjustedPValue.toExponential(2) : '—',
+        fixed(row.pctA, 0),
+        fixed(row.pctB, 0)
+      ]) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
       return tr;
-    };
-
-    this._renderTableRows(tbody, genesToShow, createRowEl, {
-      chunked: geneListMode === 'all' && genesToShow.length > 500
-    });
+    }, { chunked: significant.length > 500 });
   }
 
-  /**
-   * Export DE results as CSV from modal
-   */
+  /** Every gene: scanpy's column names, the two groups' fractions and AUROC. */
   _exportModalCSV() {
-    this._exportResultsCSV();
+    const full = this._lastResult?.full;
+    if (!full) return;
+    const lines = ['names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b'];
+    for (const row of full.results) {
+      lines.push([
+        toCSVCell(row.gene),
+        toCSVCell(row.score),
+        toCSVCell(row.log2FoldChange),
+        toCSVCell(row.pValue),
+        toCSVCell(row.adjustedPValue),
+        toCSVCell(Number.isFinite(row.pctA) ? row.pctA / 100 : NaN),
+        toCSVCell(Number.isFinite(row.pctB) ? row.pctB / 100 : NaN),
+        toCSVCell(row.auroc),
+        toCSVCell(row.meanA),
+        toCSVCell(row.meanB),
+        row.nA,
+        row.nB
+      ].join(','));
+    }
+    downloadCSV(lines.join('\n'), 'differential_expression', this._notifications);
   }
 
   // ===========================================================================
-  // Export Functions
+  // Sessions
   // ===========================================================================
 
-  /**
-   * Export plot as PNG
-   */
-  async _exportPlotPNG() {
-    const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
-    if (!plotEl) return;
-
-    await this._exportPNG(plotEl, {
-      filename: 'differential_expression',
-      width: 1200,
-      height: 800
-    });
+  exportResult() {
+    const full = this._lastResult?.full;
+    if (!full) return null;
+    const { tuning: _tuning, ...metadata } = full.metadata;
+    return createResultEnvelope('differential', { ...full, metadata });
   }
 
-  /**
-   * Export results as CSV (DE-specific format)
-   */
-  _exportResultsCSV() {
-    if (!this._lastResult?.data?.results) return;
-
-    const csv = deResultsToCSV(this._lastResult.data.results);
-    downloadCSV(csv, 'differential_expression', this._notifications);
-  }
-
-  exportSettings() {
-    const base = super.exportSettings();
-    return {
-      ...base,
-      comparisonPages: [...this._comparisonPages],
-      modalGeneListMode: this._modalGeneListMode
-    };
-  }
-
-  importSettings(settings) {
-    const base = this._requireExactFormSettings(
-      settings,
-      [
-        'comparisonPages',
-        'formControls',
-        'modalGeneListMode',
-        'selectedPages'
-      ]
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
+    }
+    const full = readResultEnvelope(envelope, 'differential');
+    if (
+      !Array.isArray(full?.results) || typeof full.summary !== 'object' || full.summary === null ||
+      typeof full.summary.matrix !== 'string' || typeof full.summary.matrixLabel !== 'string' ||
+      full.summary.replicates === undefined
+    ) {
+      throw new TypeError('A differential expression result must hold its gene table, summary and expression matrix');
+    }
+    await requireDatasetGenes(
+      this.dataLayer, full.results.map(row => row?.gene), 'The differential expression result', full.summary.matrix
     );
-    if (
-      !Array.isArray(settings.comparisonPages) ||
-      (settings.comparisonPages.length !== 0 &&
-        settings.comparisonPages.length !== 2)
-    ) {
-      throw new TypeError(
-        'Differential expression comparisonPages must contain zero or two page IDs'
-      );
-    }
-    const selectedPageIds = new Set(base.selectedPages);
-    const seenComparisonPageIds = new Set();
-    for (const pageId of settings.comparisonPages) {
-      if (typeof pageId !== 'string' || pageId.length === 0) {
-        throw new TypeError(
-          'Differential expression comparison page IDs must be non-empty strings'
-        );
-      }
-      if (!selectedPageIds.has(pageId)) {
-        throw new Error(
-          `Differential expression comparison page "${pageId}" is not selected`
-        );
-      }
-      if (seenComparisonPageIds.has(pageId)) {
-        throw new TypeError(
-          `Differential expression comparison page "${pageId}" is duplicated`
-        );
-      }
-      seenComparisonPageIds.add(pageId);
-    }
-    const geneListModes = new Set([
-      'all',
-      'top5',
-      'top10',
-      'top20',
-      'top100'
-    ]);
-    if (!geneListModes.has(settings.modalGeneListMode)) {
-      throw new TypeError(
-        'Differential expression modalGeneListMode is unsupported'
-      );
-    }
-    if (
-      base.formControls.method?.type !== 'value' ||
-      (
-        base.formControls.method.value !== 'ttest' &&
-        base.formControls.method.value !== 'wilcox'
-      )
-    ) {
-      throw new TypeError(
-        'Differential expression method control is unsupported'
-      );
-    }
+    await this._restoreAnalysisResult(this._buildResult(full, this._requireOptions()));
+  }
 
-    this._comparisonPages = [...settings.comparisonPages];
-    this._modalGeneListMode = settings.modalGeneListMode;
-    this._applyFormSettings(base);
+  destroy() {
+    const helper = this._helper;
+    this._helper = null;
+    if (helper !== null) this._registerFormDestroyTask(helper.close());
+    return super.destroy();
   }
 }
 
 /**
- * Factory function to create DE analysis UI
+ * Factory function to create the DE analysis UI
  * @param {Object} options
  * @returns {DEAnalysisUI}
  */
@@ -796,3 +639,4 @@ export function createDEAnalysisUI(options) {
   ui.init(options.container);
   return ui;
 }
+

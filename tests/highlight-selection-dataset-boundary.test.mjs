@@ -89,15 +89,13 @@ test(
       ],
       [
         'function commitSyntheticRuntimeStage',
-        'function restoreRuntimeStage',
+        'function restorePreviousRuntime',
         'state.initSyntheticScene('
       ]
     ];
     for (const [startNeedle, endNeedle, sceneNeedle] of commits) {
       const commit = sliceSource(mainSource, startNeedle, endNeedle);
-      const retireIndex = commit.indexOf(
-        'retireInProgressHighlightSelection();'
-      );
+      const retireIndex = commit.indexOf('retireDatasetInteractions();');
       const sceneIndex = commit.indexOf(sceneNeedle);
       assert.ok(
         retireIndex >= 0,
@@ -247,6 +245,8 @@ function withDocument(documentStub, callback) {
  */
 function createUnifiedCandidateViewer() {
   const callbacks = new Map();
+  // The renderer publishes cell lists: ascending Uint32Arrays.
+  const asCellList = cells => Uint32Array.from(cells).sort();
   const viewer = {
     _unifiedCandidateSet: null,
     _unifiedStepCount: 0,
@@ -276,7 +276,7 @@ function createUnifiedCandidateViewer() {
       callbacks.get('lassoStep')({
         step: viewer._unifiedStepCount,
         candidateCount: viewer._unifiedCandidateSet.size,
-        candidates: [...viewer._unifiedCandidateSet],
+        candidates: asCellList(viewer._unifiedCandidateSet),
         mode
       });
     },
@@ -286,7 +286,7 @@ function createUnifiedCandidateViewer() {
         viewer._unifiedCandidateSet !== null
         && viewer._unifiedCandidateSet.size > 0
       ) {
-        const finalIndices = [...viewer._unifiedCandidateSet];
+        const finalIndices = asCellList(viewer._unifiedCandidateSet);
         callbacks.get('lasso')({
           type: 'lasso',
           cellIndices: finalIndices,
@@ -304,7 +304,7 @@ function createUnifiedCandidateViewer() {
       callbacks.get('lassoStep')({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     },
@@ -314,7 +314,7 @@ function createUnifiedCandidateViewer() {
       callbacks.get('proximityStep')({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     },
@@ -324,7 +324,7 @@ function createUnifiedCandidateViewer() {
       callbacks.get('knnStep')({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     },
@@ -350,8 +350,8 @@ function createUnifiedCandidateViewer() {
           ? 0
           : viewer._unifiedCandidateSet.size,
         candidates: viewer._unifiedCandidateSet === null
-          ? []
-          : [...viewer._unifiedCandidateSet]
+          ? new Uint32Array(0)
+          : asCellList(viewer._unifiedCandidateSet)
       };
     },
     getViewTransparency() {
@@ -430,7 +430,7 @@ function createHighlightStateStub(pointCount) {
         type,
         label,
         enabled: true,
-        cellIndices: [...cellIndices],
+        cellIndices: cellIndices.slice(),
         cellCount: cellIndices.length
       };
       this.savedGroups.push(group);
@@ -446,10 +446,10 @@ function createHighlightStateStub(pointCount) {
       return 'live';
     },
     getCellIndicesForCategory() {
-      return [];
+      return new Uint32Array(0);
     },
     getCellIndicesForRange() {
-      return [];
+      return new Uint32Array(0);
     },
     getFieldForView() {
       return null;
@@ -492,7 +492,7 @@ function runCrossDatasetLasso(retirements) {
     const tools = initHighlightSelectionTools({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       dom: { ...createSelectModeDom(), modeButtons: buttons, modeDescription },
       renderHighlightSummary() {},
       renderHighlightPages() {}
@@ -502,7 +502,7 @@ function runCrossDatasetLasso(retirements) {
     viewer.completeLassoGesture([...DATASET_A_CANDIDATES], 'intersect');
     assert.deepEqual(state.previewIndices, [...DATASET_A_CANDIDATES]);
     assert.deepEqual(
-      tools.selectionState.lastLassoCandidates,
+      [...tools.selectionState.lastLassoCandidates],
       [...DATASET_A_CANDIDATES]
     );
 
@@ -525,7 +525,7 @@ test(
     // dataset-A rows, every survivor is inside dataset B's bounds, and a
     // highlight group nobody selected is saved without a single rejection.
     assert.equal(state.savedGroups.length, 1);
-    assert.deepEqual(state.savedGroups[0].cellIndices, [1, 2, 3]);
+    assert.deepEqual([...state.savedGroups[0].cellIndices], [1, 2, 3]);
     assert.equal(state.savedGroups[0].label, 'Lasso (2 views) (3 cells)');
   }
 );
@@ -552,7 +552,7 @@ test(
 
     assert.equal(state.savedGroups.length, 1);
     assert.deepEqual(
-      state.savedGroups[0].cellIndices,
+      [...state.savedGroups[0].cellIndices],
       [...DATASET_B_CANDIDATES],
       'the saved group must be exactly the cells lassoed on dataset B'
     );
@@ -577,11 +577,11 @@ test(
       initLassoSelection({
         state,
         viewer,
-        jupyterSource: null,
+        viewerHostSource: null,
         selectionState: createHighlightSelectionState(),
         ui: { modeDescriptionEl: modeDescription }
       });
-      viewer.restoreUnifiedState([1, 2, 90_000], 1);
+      viewer.restoreUnifiedState(Uint32Array.of(1, 2, 90_000), 1);
       assert.throws(
         () => viewer.confirmLassoSelection(),
         /lasso selection cellIndices must be inside the current dataset/i
@@ -617,11 +617,11 @@ test(
       initLassoSelection({
         state,
         viewer,
-        jupyterSource: null,
+        viewerHostSource: null,
         selectionState: createHighlightSelectionState(),
         ui: { modeDescriptionEl: modeDescription }
       });
-      viewer.restoreUnifiedState([1, 2, 3], 1);
+      viewer.restoreUnifiedState(Uint32Array.of(1, 2, 3), 1);
       assert.throws(
         () => viewer.confirmLassoSelection(),
         /saved lasso highlight group cellIndices must be exactly the completed selection/i
@@ -636,12 +636,12 @@ test(
 
 test('cell index contracts are bounded by the current dataset', () => {
   assert.throws(
-    () => requireCellIndices([0, 1], 'Candidates', { allowEmpty: false }),
+    () => requireCellIndices(Uint32Array.of(0, 1), 'Candidates', { allowEmpty: false }),
     /Candidates point count must be a safe integer of at least 0/
   );
   assert.throws(
     () => requireCellIndices(
-      [0, 5],
+      Uint32Array.of(0, 5),
       'Candidates',
       { allowEmpty: false, pointCount: 5 }
     ),
@@ -649,14 +649,14 @@ test('cell index contracts are bounded by the current dataset', () => {
   );
   assert.deepEqual(
     requireCellIndices(
-      [0, 4],
+      Uint32Array.of(0, 4),
       'Candidates',
       { allowEmpty: false, pointCount: 5 }
     ),
-    [0, 4]
+    Uint32Array.of(0, 4)
   );
   assert.throws(
-    () => requireCellIndices([0], 'Candidates', {
+    () => requireCellIndices(Uint32Array.of(0), 'Candidates', {
       allowEmpty: true,
       pointCount: 0
     }),
@@ -666,7 +666,7 @@ test('cell index contracts are bounded by the current dataset', () => {
   assert.throws(
     () => requireCompletedSelectionEvent({
       type: 'lasso',
-      cellIndices: [0, 7],
+      cellIndices: Uint32Array.of(0, 7),
       cellCount: 2,
       steps: 1
     }, 'lasso', 5),
@@ -677,7 +677,7 @@ test('cell index contracts are bounded by the current dataset', () => {
     () => requireSelectionStepEvent({
       step: 1,
       candidateCount: 1,
-      candidates: [9],
+      candidates: Uint32Array.of(9),
       mode: 'intersect'
     }, 'lasso', 5),
     /lasso step candidates must be inside the current dataset of 5 cells/
@@ -688,7 +688,7 @@ test('cell index contracts are bounded by the current dataset', () => {
       inProgress: true,
       stepCount: 1,
       candidateCount: 1,
-      candidates: [9]
+      candidates: Uint32Array.of(9)
     }, 5),
     /Unified highlight selection candidates must be inside the current dataset/
   );
@@ -722,7 +722,7 @@ test('cell index contracts are bounded by the current dataset', () => {
       type: 'lasso',
       label: 'Lasso',
       enabled: true,
-      cellIndices: [0, 9],
+      cellIndices: Uint32Array.of(0, 9),
       cellCount: 2
     }, 'Highlight group', 5),
     /Highlight group cellIndices must be inside the current dataset of 5 cells/
@@ -738,33 +738,33 @@ test(
       type: 'lasso',
       label: 'Lasso (3 cells)',
       enabled: true,
-      cellIndices: [1, 2, 3],
+      cellIndices: Uint32Array.of(1, 2, 3),
       cellCount: 3
     };
     assert.equal(
-      requireSavedHighlightGroup(savedGroup, 'lasso', [3, 1, 2], label, 5),
+      requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 3), label, 5),
       savedGroup
     );
     assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', [1, 2, 4], label, 5),
+      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 4), label, 5),
       /cellIndices must be exactly the completed selection/
     );
     assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', [1, 2], label, 5),
+      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2), label, 5),
       /cellCount must match the completed selection/
     );
     assert.throws(
       () => requireSavedHighlightGroup(
         savedGroup,
         'lasso',
-        [1, 2, 3, 4],
+        Uint32Array.of(1, 2, 3, 4),
         label,
         5
       ),
       /cellCount must match the completed selection/
     );
     assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', [1, 2, 3], label, 3),
+      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 3), label, 3),
       /cellIndices must be inside the current dataset of 3 cells/
     );
   }

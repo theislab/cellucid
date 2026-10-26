@@ -20,6 +20,7 @@ import {
   buildHierarchicalOrder,
   lodPrefixCounts,
 } from './draw-order.js';
+import { formatCountOf, formatCount } from '../../utils/format-units.js';
 
 
 /**
@@ -121,7 +122,7 @@ export class SpatialIndex {
       )
     ) {
       throw new TypeError(
-        `SpatialIndex colors must be null or an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
+        `SpatialIndex colors must be null or an RGBA Uint8Array with exactly ${formatCountOf(pointCount * 4, 'byte')}.`
       );
     }
 
@@ -178,7 +179,7 @@ export class SpatialIndex {
         (this._buildLOD ? !banded : prebuiltOrder.bandCount !== 1)
       ) {
         throw new TypeError(
-          `SpatialIndex prebuiltOrder must be the ${this._buildLOD ? 'LOD-banded' : 'one-band'} draw order of these ${pointCount} points.`
+          `SpatialIndex prebuiltOrder must be the ${this._buildLOD ? 'LOD-banded' : 'one-band'} draw order of these ${formatCountOf(pointCount, 'point')}.`
         );
       }
       this._publishDrawOrder(prebuiltOrder);
@@ -284,9 +285,9 @@ export class SpatialIndex {
     const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
     const treeName = treeNames[this.dimensionLevel] || 'Octree';
     console.log(`[${treeName}] Generated ${levels.length} LOD levels (dim=${this.dimensionLevel}):`,
-      levels.map(l => `${l.pointCount.toLocaleString()} pts`).join(', '),
+      levels.map(l => `${formatCount(l.pointCount)} pts`).join(', '),
       `| adaptive floor: level ${adaptiveMinimumLevel} `
-      + `(${levels[adaptiveMinimumLevel].pointCount.toLocaleString()} pts)`);
+      + `(${formatCount(levels[adaptiveMinimumLevel].pointCount)} pts)`);
 
     return levels;
   }
@@ -511,7 +512,7 @@ export class SpatialIndex {
         const originalId = hierarchy[compactRank];
         if (originalId >= this.pointCount) {
           throw new RangeError(
-            `SpatialIndex LOD ${lodLevel} contains source ID ${originalId} outside ${this.pointCount} points.`
+            `SpatialIndex LOD ${lodLevel} contains source ID ${originalId} outside ${formatCountOf(this.pointCount, 'point')}.`
           );
         }
         if (
@@ -549,7 +550,7 @@ export class SpatialIndex {
       const originalId = hierarchy[compactRank];
       if (originalId >= this.pointCount) {
         throw new RangeError(
-          `SpatialIndex LOD hierarchy tail contains source ID ${originalId} outside ${this.pointCount} points.`
+          `SpatialIndex LOD hierarchy tail contains source ID ${originalId} outside ${formatCountOf(this.pointCount, 'point')}.`
         );
       }
       if (
@@ -953,7 +954,7 @@ export class SpatialIndex {
         customPositions.length !== this.positions.length)
     ) {
       throw new TypeError(
-        `SpatialIndex customPositions must be null or a Float32Array with exactly ${this.positions.length} values.`
+        `SpatialIndex customPositions must be null or a Float32Array with exactly ${formatCountOf(this.positions.length, 'value')}.`
       );
     }
 

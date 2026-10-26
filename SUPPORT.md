@@ -13,7 +13,7 @@ Thanks for using Cellucid.
 
 Please don’t share private data (including patient-derived data) in public
 issues or logs. Prefer minimal synthetic examples, anonymized screenshots, or
-small reproducible exports.
+small reproducible AnnData files.
 
 ## Code of Conduct
 

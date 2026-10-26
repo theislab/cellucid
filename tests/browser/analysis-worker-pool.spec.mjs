@@ -1,5 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('analysis worker pool initializes and computes the exact result', async ({ page }) => {
@@ -19,12 +19,12 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=analysis-worker-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=analysis-worker-ci`,
     { waitUntil: 'domcontentloaded' }
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const proof = await page.evaluate(async () => {
@@ -63,14 +63,23 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
     slope: 2,
     intercept: 0
   });
-  expect(proof.stats).toEqual({
+  // Each task type's measured queue and run times (the run tuner reads them).
+  const { taskTiming, ...stats } = proof.stats;
+  expect(Object.keys(taskTiming)).toEqual(['COMPUTE_CORRELATION']);
+  expect(taskTiming.COMPUTE_CORRELATION.count).toBe(1);
+  expect(taskTiming.COMPUTE_CORRELATION.queueMs).toBeGreaterThanOrEqual(0);
+  expect(taskTiming.COMPUTE_CORRELATION.runMs).toBeGreaterThanOrEqual(0);
+  expect(stats).toEqual({
     poolSize: 1,
     state: 'ready',
     failure: null,
     busyWorkers: 0,
     idleWorkers: 1,
     pendingRequests: 0,
-    queuedTasks: 0
+    queuedTasks: 0,
+    // No task was cancelled, so no worker was replaced.
+    replacedWorkers: 0,
+    lastReplacementMs: null
   });
   expect(browserErrors).toEqual([]);
 });

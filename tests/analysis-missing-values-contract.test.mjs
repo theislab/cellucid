@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { adoptCategoryCounts, categoryCounts } from '../assets/js/app/analysis/shared/category-counts.js';
 
 import {
   DataLayer,
@@ -46,7 +47,11 @@ test('uint8 categorical codes publish their own missing code as a missing value'
     codes: Uint8Array.of(0, 255, 1, 0),
     loaded: true,
   }, 'categorical_obs');
-  assert.deepEqual(page.values, ['A', null, 'B', 'A']);
+  assert.ok(page.values instanceof Uint8Array);
+  assert.deepEqual(Array.from(page.values), [0, 255, 1, 0]);
+  assert.equal(page.missingCode, 255);
+  assert.deepEqual(page.categories, ['A', 'B']);
+  assert.deepEqual([...categoryCounts(page.values)], [['A', 2], [null, 1], ['B', 1]]);
 });
 
 test('categorical codes reach whole-field analysis consumers at their own width', async () => {
@@ -77,23 +82,41 @@ test('continuous NaN is published as missing instead of failing the page', async
   assert.ok(Number.isNaN(page.values[1]));
 });
 
+/** Uint8 codes over `labels` (255 missing) with their counts adopted, as the data layer publishes them. */
+function codedPage(codes, labels = ['T', 'B']) {
+  const values = Uint8Array.from(codes);
+  const counts = new Map();
+  for (const code of values) {
+    const label = code === 255 ? null : labels[code];
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  adoptCategoryCounts(values, counts);
+  return values;
+}
+
 test('categorical statistics drop missing cells as the docs describe', () => {
   const pages = excludeMissingCategoricalValues([
     {
       pageId: 'p1',
       pageName: 'P1',
-      values: [...Array(40).fill('T'), ...Array(20).fill('B'), null],
+      values: codedPage([...Array(40).fill(0), ...Array(20).fill(1), 255]),
+      categories: ['T', 'B'],
+      missingCode: 255,
       cellIndices: Uint32Array.from({ length: 61 }, (_, index) => index),
       cellCount: 61,
     },
     {
       pageId: 'p2',
       pageName: 'P2',
-      values: [...Array(20).fill('T'), ...Array(40).fill('B')],
+      values: codedPage([...Array(20).fill(0), ...Array(40).fill(1)]),
+      categories: ['T', 'B'],
+      missingCode: 255,
       cellIndices: Uint32Array.from({ length: 60 }, (_, index) => 100 + index),
       cellCount: 60,
     },
   ]);
+  assert.ok(pages[0].values instanceof Uint8Array);
+  assert.deepEqual([...categoryCounts(pages[0].values)], [['T', 40], ['B', 20]]);
   assert.equal(pages[0].values.length, 60);
   assert.equal(pages[0].cellCount, 60);
   assert.equal(pages[0].cellIndices.length, 60);
@@ -109,7 +132,9 @@ test('excluding missing categorical values keeps a page without missing cells as
   const page = {
     pageId: 'p1',
     pageName: 'P1',
-    values: ['a', 'b'],
+    values: codedPage([0, 1], ['a', 'b']),
+    categories: ['a', 'b'],
+    missingCode: 255,
     cellIndices: Uint32Array.of(3, 4),
     cellCount: 2,
   };

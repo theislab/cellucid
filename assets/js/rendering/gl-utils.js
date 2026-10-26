@@ -1,13 +1,14 @@
+import { formatCountOf } from '../utils/format-units.js';
 // WebGL helpers for shader/program creation and data normalization.
-function asError(value, fallbackMessage) {
-  return value instanceof Error ? value : new Error(fallbackMessage);
+function asError(value, defaultMessage) {
+  return value instanceof Error ? value : new Error(defaultMessage);
 }
 
-function attemptCleanup(failures, cleanup, fallbackMessage) {
+function attemptCleanup(failures, cleanup, defaultMessage) {
   try {
     cleanup();
   } catch (error) {
-    failures.push(asError(error, fallbackMessage));
+    failures.push(asError(error, defaultMessage));
   }
 }
 
@@ -135,6 +136,79 @@ function createLinkedProgram(
       'WebGL program creation and rollback failed.'
     );
   }
+}
+
+/**
+ * Delete a program without leaving it current.
+ *
+ * WebGL keeps a deleted program current until another one is used, and
+ * `getParameter(CURRENT_PROGRAM)` keeps returning it. Every owner that saves
+ * the current program and restores it afterwards (a transform-feedback
+ * permute, a noise batch, a density build) would then pass a deleted object
+ * to `useProgram`, which raises INVALID_OPERATION (0x502); nothing reads it
+ * there, so the next owner to read the error queue -- a dataset load's
+ * renderer -- fails with it as its own. `CURRENT_PROGRAM` is answered by the
+ * page (no GPU round trip).
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {WebGLProgram|null} program
+ */
+export function deleteProgramReleasingUse(gl, program) {
+  if (program === null) return;
+  if (gl.getParameter(gl.CURRENT_PROGRAM) === program) gl.useProgram(null);
+  gl.deleteProgram(program);
+}
+
+/**
+ * Textures deleted through `deleteTextureTracked`. Chrome's page-side record
+ * of each unit's bindings can outlive a deletion: a texture bound to
+ * TEXTURE_3D or TEXTURE_2D_ARRAY on a unit is not cleared from that unit when
+ * the unit is beyond the last one it counts as holding a 2D or cube-map
+ * texture, so `getParameter(TEXTURE_BINDING_3D)` keeps returning the deleted
+ * texture (measured: bind a 3D texture on unit 4, bind null to TEXTURE_2D on
+ * unit 4, delete it -- unit 4 still reports it). An owner that saved that
+ * binding and restores it passes a deleted object to `bindTexture`:
+ * INVALID_OPERATION (0x502), read by whichever owner reads the error queue
+ * next (a dataset switch's renderer load).
+ */
+const DELETED_TEXTURES = new WeakSet();
+
+/**
+ * Delete a texture and remember it, so no saved binding of it is restored
+ * (`restorableTexture`). Every texture the renderers own is deleted here.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {WebGLTexture|null} texture
+ */
+export function deleteTextureTracked(gl, texture) {
+  if (texture === null || texture === undefined) return;
+  gl.deleteTexture(texture);
+  DELETED_TEXTURES.add(texture);
+}
+
+/**
+ * A saved texture binding, safe to restore: null when the texture has been
+ * deleted since it was saved (or was already deleted and still reported).
+ *
+ * @param {WebGLTexture|null} texture
+ * @returns {WebGLTexture|null}
+ */
+export function restorableTexture(texture) {
+  return texture !== null && DELETED_TEXTURES.has(texture) ? null : texture;
+}
+
+/**
+ * Delete one GL object by its deletion method's name, through the owners
+ * above for programs and textures.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {string} deleteMethod - e.g. 'deleteBuffer'
+ * @param {object} object
+ */
+export function deleteGlObject(gl, deleteMethod, object) {
+  if (deleteMethod === 'deleteProgram') deleteProgramReleasingUse(gl, object);
+  else if (deleteMethod === 'deleteTexture') deleteTextureTracked(gl, object);
+  else gl[deleteMethod](object);
 }
 
 export function createProgram(gl, vsSource, fsSource) {
@@ -552,7 +626,7 @@ export function normalizePositions(positions, dimension = 3) {
   }
   if (positions.length % dimension !== 0) {
     throw new RangeError(
-      `normalizePositions received ${positions.length} values, which is not a whole number of ${dimension}-component points.`
+      `normalizePositions received ${formatCountOf(positions.length, 'value')}, which is not a whole number of ${dimension}-component points.`
     );
   }
   const min = [Infinity, Infinity, Infinity];

@@ -333,7 +333,7 @@ test(
     const quick = Object.create(QuickInsights.prototype);
     quick._destroyPromise = null;
     quick._currentRequestId = 0;
-    quick._abortController = null;
+    quick._job = null;
     quick._debounceTimer = null;
     quick._cache = new Map();
     quick._fieldPickers = { categorical: null, continuous: null };
@@ -468,12 +468,12 @@ for (const [label, UIClass] of [
   ['GeneSignatureUI', GeneSignatureUI],
 ]) {
   test(
-    `${label} hide-result waits for its current plot owner before clearing the result DOM`,
+    `${label} discarding its result waits for its current plot owner before clearing the result DOM`,
     async () => {
       const retirement = deferred();
       const candidate = { isConnected: true };
       const resultContainer = createConnectedContainer(candidate);
-      resultContainer.classList = { add() {} };
+      resultContainer.classList = { add() {}, remove() {} };
       resultContainer.querySelector = selector => (
         selector === '.analysis-preview-plot' ? candidate : null
       );
@@ -488,8 +488,11 @@ for (const [label, UIClass] of [
       owner._resultContainer = resultContainer;
       owner._lastResult = {};
       owner._currentPageData = {};
+      owner._optionRenderRevision = 0;
+      owner._jobStatus = null;
+      owner._modal = null;
 
-      const hiding = owner._hideResult();
+      const hiding = owner._discardFormResult();
       const connectedBeforeRetirement = candidate.isConnected;
       retirement.resolve();
       await Promise.resolve(hiding);

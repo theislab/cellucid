@@ -2,9 +2,10 @@ import { copyFile, rm, stat, truncate } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -34,20 +35,20 @@ test('an H5AD file far above the former 512 MiB ceiling opens from the file pick
 
   try {
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=browser-ci`,
+      `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=browser-ci`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await openCollapsedPanels(page);
-    await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
-    await page.locator('#user-data-h5ad-input').setInputFiles(oversizedPath);
+    await chooseFiles(page.locator('#user-data-file-input'), oversizedPath);
 
     await expect(page.locator('#dataset-name')).toHaveText('oversized');
     await expect(page.locator('#dataset-cells')).toHaveText('120');
     await expect(page.locator('#dataset-genes')).toHaveText('6');
     await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-    await expect(page.locator('body')).not.toContainText(/512 MiB|use the Cellucid server or prepared format/);
+    await expect(page.locator('body')).not.toContainText(/512 MiB/);
     expect(browserErrors).toEqual([]);
   } finally {
     await rm(oversizedPath, { force: true });

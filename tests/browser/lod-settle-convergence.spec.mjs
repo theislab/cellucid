@@ -13,13 +13,14 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=lod-settle-convergence-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=lod-settle-convergence-ci';
 // Large enough that the spatial index builds a deep ladder of reduced levels.
 const POINT_COUNT = 60_000;
 
@@ -30,15 +31,7 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await page.locator('#benchmark-section > summary').click();
-  await page.locator('#benchmark-count').fill(String(POINT_COUNT));
-  await page.locator('#benchmark-pattern').selectOption('atlas');
-  await page.locator('#benchmark-run').click();
-  await expect
-    .poll(() => page.evaluate(() => window._cellucidState.pointCount), {
-      timeout: 120_000,
-    })
-    .toBe(POINT_COUNT);
+  await loadSyntheticDataset(page, { pointCount: POINT_COUNT, pattern: 'atlas' });
 
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;

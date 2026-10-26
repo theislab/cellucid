@@ -29,6 +29,7 @@ import {
   parseExactJson,
 } from './wire-contract.js';
 import { isExactOrcidId } from './profile-identifiers.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const STORAGE_VERSION = 1;
 
@@ -113,7 +114,7 @@ function assertStringLength(text, maxLen, fieldName = 'value') {
   // limit; the annotation file's byte cap bounds it.
   if (maxLen !== null && Array.from(text).length > maxLen) {
     throw new Error(
-      `[CommunityAnnotationSession] ${fieldName} must be at most ${maxLen} characters`
+      `[CommunityAnnotationSession] ${fieldName} must be at most ${formatCountOf(maxLen, 'character')}`
     );
   }
   return text;
@@ -974,7 +975,7 @@ function assertLocalProfile(value, scopeUserId) {
       Array.from(profile[field]).length > limit
     ) {
       throw new Error(
-        `$ local state.profile.${field}: must be a string of at most ${limit} characters`
+        `$ local state.profile.${field}: must be a string of at most ${formatCountOf(limit, 'character')}`
       );
     }
     if (profile[field] && (!/\S/.test(profile[field]) || /^\s|\s$/.test(profile[field]))) {

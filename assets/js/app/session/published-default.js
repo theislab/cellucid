@@ -3,14 +3,13 @@
  *
  * A Save State and a published `default.cellucid-session` are not the same
  * document. Save State writes every chunk the registered contributors emit —
- * seven for a session with nothing kept, more once a highlight group, a
- * user-defined field or an analysis artifact exists. `restorePublishedDefaultState()`
- * accepts exactly the five chunks of {@link PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE},
+ * six for a session with nothing kept, more once a highlight group or a
+ * user-defined field exists. `restorePublishedDefaultState()`
+ * accepts exactly the seven chunks of {@link PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE},
  * in that order, and refuses a cinematic chunk by name before anything else.
  *
- * Publishing a preset therefore means dropping `cinematic/camera` and
- * `analysis/cache-inventory` — and the drop is only lossless while both are
- * empty. A recorded camera path dropped from a save is gone: the export format
+ * Publishing a preset therefore means dropping `cinematic/camera` — and the
+ * drop is only lossless while it is empty. A recorded camera path dropped from a save is gone: the export format
  * stores it nowhere else, and the published file that results still loads, so
  * nothing downstream ever notices. That precondition was checked by hand, once
  * (CEL-0248).
@@ -30,10 +29,9 @@
  *   renames the capture, and verifies that it may.
  *
  * The droppable set is derived, not restated: it is
- * {@link CURRENT_GENERIC_STATIC_CHUNK_PROFILES} minus the published five. A
+ * {@link CURRENT_GENERIC_STATIC_CHUNK_PROFILES} minus the published seven. A
  * chunk outside the static profiles entirely — a highlight group's cell
- * membership, a user-defined field's codes, a cached analysis artifact — is user
- * content by construction and is never droppable, so the trim refuses it rather
+ * membership or a user-defined field's codes — is user content by construction and is never droppable, so the trim refuses it rather
  * than deciding whether it looks empty.
  *
  * @module session/published-default
@@ -43,14 +41,12 @@ import { readBundle } from './bundle/reader.js';
 import { writeBundle } from './bundle/writer.js';
 import { gzipDecompress } from './codecs/gzip.js';
 import {
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
-} from './contributors/analysis-artifacts.js';
-import {
   assertArray,
-  assertPlainRecord,
-  assertSafeInteger
+  assertSafeInteger,
 } from './schema-contract.js';
 import { assertDatasetFingerprint } from './session-context.js';
+import { requirePlainRecord } from '../../utils/exact-record.js';
+import { countNoun } from '../../utils/format-units.js';
 
 /**
  * The complete profile a published default may carry, in the accepted order.
@@ -88,12 +84,30 @@ export const PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE = Object.freeze([
     datasetDependent: false
   }),
   Object.freeze({
-    id: 'analysis/windows',
-    contributorId: 'analysis-windows',
+    id: 'ui/figure-export',
+    contributorId: 'figure-export',
     priority: 'eager',
     kind: 'json',
     codec: 'gzip',
+    label: 'Figure export',
+    datasetDependent: false
+  }),
+  Object.freeze({
+    id: 'analysis/windows',
+    contributorId: 'analysis-windows',
+    priority: 'eager',
+    kind: 'binary',
+    codec: 'gzip',
     label: 'Analysis windows',
+    datasetDependent: true
+  }),
+  Object.freeze({
+    id: 'analysis/docked',
+    contributorId: 'analysis-docked',
+    priority: 'eager',
+    kind: 'binary',
+    codec: 'gzip',
+    label: 'Docked analysis',
     datasetDependent: true
   }),
   Object.freeze({
@@ -120,7 +134,6 @@ const CINEMATIC_CAMERA_CHUNK_PROFILE = Object.freeze({
 /** Every singleton chunk a current Save State emits. */
 export const CURRENT_GENERIC_STATIC_CHUNK_PROFILES = Object.freeze([
   ...PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
   CINEMATIC_CAMERA_CHUNK_PROFILE
 ]);
 
@@ -249,7 +262,7 @@ function describeRetainedContent(value, path) {
   }
   if (Array.isArray(value)) {
     if (value.length === 0) return null;
-    return `${path} holds ${value.length} entr${value.length === 1 ? 'y' : 'ies'}`;
+    return `${path} holds ${value.length} ${countNoun(value.length, 'entry', 'entries')}`;
   }
   if (typeof value === 'object') {
     return `${path} is a nested record this publish step cannot prove empty`;
@@ -293,17 +306,6 @@ async function decodeJsonChunkPayload(chunk) {
 }
 
 /**
- * The source type every published default is opened under.
- *
- * A published default is fetched from the generation's own directory, which
- * only an advertised catalog entry has — `assertDatasetStateDescriptor()` in
- * `dataset-state-manifest.js` refuses a descriptor of any other source type. So
- * this is not a default a caller may override: it is the only identity under
- * which the file this step writes is ever read.
- */
-export const PUBLISHED_DEFAULT_SOURCE_TYPE = 'local-demo';
-
-/**
  * The fingerprint fields that describe the data rather than name it.
  *
  * The split is the whole of the rebinding rule below: publishing may rename a
@@ -339,16 +341,11 @@ const DATASET_DESCRIBING_FINGERPRINT_FIELDS = Object.freeze([
 /**
  * Bind a capture's fingerprint to the identity it will be published under.
  *
- * A preset is authored by opening the generation and framing a view, and the
- * natural way to do that is to serve the prepared directory locally. That
- * capture records the identity of the *serve* — `local-user`, and a dataset id
- * the local source made up — while the catalog serves the same bytes as
- * {@link PUBLISHED_DEFAULT_SOURCE_TYPE} under the generation's own id.
- * `datasetFingerprintMatches()` compares both fields, so a preset published with
- * the capture's identity can never match the dataset it ships beside: the file
- * is structurally valid, and the reader refuses it on identity every time the
- * sample is opened. Carrying the capture's identity through was how five
- * shipped presets came to refuse themselves.
+ * A preset is authored by opening the generation and framing a view, often
+ * from a locally served or differently named copy. The published file must
+ * name the generation it ships beside, because `datasetFingerprintMatches()`
+ * compares the dataset id: a preset carrying another id would be structurally
+ * valid and refused every time the sample is opened.
  *
  * Renaming is safe only because the describing fields are *verified*
  * rather than replaced. A mismatch means the capture was taken against
@@ -368,12 +365,6 @@ export function rebindPublishedDefaultFingerprint(captured, published) {
   assertDatasetFingerprint(captured, 'Captured dataset fingerprint');
   assertDatasetFingerprint(published, 'Published dataset fingerprint');
 
-  if (published.sourceType !== PUBLISHED_DEFAULT_SOURCE_TYPE) {
-    throw new TypeError(
-      `A published default is read as ${PUBLISHED_DEFAULT_SOURCE_TYPE}, so it `
-      + `cannot be published as ${JSON.stringify(published.sourceType)}.`
-    );
-  }
   if (typeof published.datasetId !== 'string' || published.datasetId === '') {
     throw new TypeError(
       'A published default must name the generation it ships beside.'
@@ -396,8 +387,8 @@ export function rebindPublishedDefaultFingerprint(captured, published) {
   }
 
   return {
-    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: published.datasetId,
+    name: published.name,
     cellCount: captured.cellCount,
     varCount: captured.varCount,
     cellOrder: {
@@ -451,7 +442,7 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
   /** @type {{ meta: any, bytes: Uint8Array }[]} */
   const chunks = [];
   try {
-    assertPlainRecord(manifest, 'Session manifest');
+    requirePlainRecord(manifest, 'Session manifest');
     assertArray(manifest.chunks, 'Session manifest chunks');
     for await (const chunk of chunkStream) chunks.push(chunk);
   } catch (error) {
@@ -523,6 +514,8 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
         manifest.datasetFingerprint,
         publishedIdentity
       ),
+      source: null,
+      requires: manifest.requires,
       chunks: kept.map(chunk => chunk.meta)
     },
     chunks: kept.map(chunk => chunk.bytes)

@@ -6,17 +6,8 @@
  * principal point sits at the centre of what the pane presents.
  */
 
-function assertPlainObject(value, label) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be one plain object.`);
-  }
-  return value;
-}
+import { requirePlainRecord } from '../utils/exact-record.js';
+
 
 function assertFiniteNumber(value, label) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -34,7 +25,7 @@ function assertFiniteNumber(value, label) {
  * the user closes to reach the plot.
  */
 export function computeLeftOcclusionRatio(options) {
-  const exact = assertPlainObject(options, 'Sidebar occlusion geometry');
+  const exact = requirePlainRecord(options, 'Sidebar occlusion geometry');
   const canvasLeft = assertFiniteNumber(exact.canvasLeft, 'Canvas left');
   const canvasWidth = assertFiniteNumber(exact.canvasWidth, 'Canvas width');
   const sidebarLeft = assertFiniteNumber(exact.sidebarLeft, 'Sidebar left');

@@ -26,12 +26,12 @@
  * No pixel snapshots: every check reads geometry, hit testing and ARIA.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=ui-reachability-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=ui-reachability-ci';
 const WORKER_ORIGIN = 'https://worker.example';
 
 const LAYOUTS = [
@@ -41,7 +41,7 @@ const LAYOUTS = [
   { name: 'phone landscape 844×390', use: { viewport: { width: 844, height: 390 }, hasTouch: true } },
 ];
 
-const ANALYSIS_MODES = ['simple', 'detailed', 'correlation', 'differential', 'signature', 'genesPanel'];
+const ANALYSIS_MODES = ['simple', 'detailed', 'correlation', 'differential', 'signature', 'genesPanel', 'dotplot', 'composition'];
 
 /**
  * Walk the interactive controls under `scope` and return one line per
@@ -200,7 +200,7 @@ async function dismissNotifications(page) {
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await dismissNotifications(page);
@@ -380,7 +380,7 @@ for (const layout of LAYOUTS) {
       await expectReachable(page, '#welcome-modal', `${layout.name} welcome`, 2);
       await page.keyboard.press('Escape');
       await expect(page.locator('#welcome-modal')).toBeHidden();
-      await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+      await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
       await dismissNotifications(page);
 
       await page.evaluate(() => document.getElementById('license-link').click());

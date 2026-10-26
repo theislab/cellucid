@@ -6,7 +6,7 @@
  *
  * A category's original identifier is its **label**, never its position in the
  * inventory. Position is not identity: a session's dataset fingerprint pins the
- * cells and their coordinates, not the obs schema, so the same dataset exported
+ * cells and their coordinates, not the obs schema, so the same dataset written
  * again from the same embedding with one more cell type restores cleanly with
  * every category after the insertion point shifted by one. A registry keyed by
  * position would then move a rename onto its neighbour and colour, label, and
@@ -25,24 +25,13 @@ import { makeFieldId } from '../utils/field-constants.js';
 import { BaseRegistry } from './base-registry.js';
 import { FieldSource } from '../utils/field-constants.js';
 import { StateValidator } from '../utils/state-validator.js';
+import { requirePlainRecord } from '../../utils/exact-record.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
     throw new TypeError('Rename source must be exactly obs or var');
   }
   return source;
-}
-
-function requireRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
-  return value;
 }
 
 /** Primitive-type tags, so `1` and `'1'` are different category identities. */
@@ -97,6 +86,7 @@ export class RenameRegistry extends BaseRegistry {
     } else {
       this._fieldRenames.set(mapKey, displayKey);
     }
+    this._recordEdit(source, originalKey);
   }
 
   getDisplayKey(source, originalKey) {
@@ -120,6 +110,7 @@ export class RenameRegistry extends BaseRegistry {
     StateValidator.validateFieldKey(originalKey);
     const mapKey = makeFieldId(source, originalKey);
     this._fieldRenames.delete(mapKey);
+    this._recordEdit(source, originalKey);
   }
 
   // ---------------------------------------------------------------------------
@@ -143,6 +134,7 @@ export class RenameRegistry extends BaseRegistry {
     } else {
       this._categoryRenames.set(mapKey, displayLabel);
     }
+    this._recordEdit(source, originalFieldKey);
   }
 
   /**
@@ -173,6 +165,7 @@ export class RenameRegistry extends BaseRegistry {
     this._categoryRenames.delete(
       makeCategoryId(source, originalFieldKey, originalLabel)
     );
+    this._recordEdit(source, originalFieldKey);
   }
 
   // ---------------------------------------------------------------------------
@@ -187,7 +180,7 @@ export class RenameRegistry extends BaseRegistry {
   }
 
   fromJSON(data) {
-    requireRecord(data, 'Rename registry payload');
+    requirePlainRecord(data, 'Rename registry payload');
     if (
       Object.keys(data).length !== 2
       || !Object.hasOwn(data, 'fields')
@@ -197,19 +190,34 @@ export class RenameRegistry extends BaseRegistry {
         'Rename registry payload requires exact fields and categories'
       );
     }
-    requireRecord(data.fields, 'Rename registry fields');
-    requireRecord(data.categories, 'Rename registry categories');
+    requirePlainRecord(data.fields, 'Rename registry fields');
+    requirePlainRecord(data.categories, 'Rename registry categories');
     this._fieldRenames = new Map(Object.entries(data.fields));
     this._categoryRenames = new Map(Object.entries(data.categories));
     this._data = this._fieldRenames;
+    this._recordReplacement();
   }
 
   clear() {
     this._fieldRenames.clear();
     this._categoryRenames.clear();
+    this._recordReplacement();
   }
 
   getCounts() {
     return { fields: this._fieldRenames.size, categories: this._categoryRenames.size };
+  }
+
+  /**
+   * Whether any field or category of `source` is renamed.
+   * @param {string} source - 'obs' | 'var'
+   * @returns {boolean}
+   */
+  hasEntriesFor(source) {
+    requireSource(source);
+    const prefix = `${source}:`;
+    for (const key of this._fieldRenames.keys()) if (key.startsWith(prefix)) return true;
+    for (const key of this._categoryRenames.keys()) if (key.startsWith(prefix)) return true;
+    return false;
   }
 }

@@ -679,6 +679,52 @@ export function bindDisclosure({ header, content, expanded = false, onToggle, si
  *   in the accessible names of the checkbox and the remove button.
  * @returns {{ root: HTMLDivElement, checkbox: HTMLInputElement, remove: HTMLButtonElement }}
  */
+/**
+ * The list-item control that has keyboard focus inside `list`, as where it
+ * is (`createListItem` rows carrying their item's id in `dataset[idKey]`):
+ * its item, its kind (checkbox or remove), its row's position. Null when the
+ * focus is elsewhere.
+ *
+ * @param {HTMLElement} list
+ * @param {string} idKey
+ */
+export function captureListItemFocus(list, idKey) {
+  const active = document.activeElement ?? null;
+  if (active === null || active === document.body || !list.contains?.(active)) return null;
+  const row = active.closest?.('.list-item') ?? null;
+  if (row === null) return { id: null, kind: null, position: -1 };
+  return {
+    id: row.dataset[idKey] ?? null,
+    kind: active.classList.contains('list-item-remove') ? '.list-item-remove' : 'input[type="checkbox"]',
+    position: [...list.children].indexOf(row),
+  };
+}
+
+/**
+ * Put the focus back after `list` was rebuilt: on the same control of the
+ * same item, else (the item went) on that control of the row now in its
+ * place, else on the list itself, so a keyboard user is never dropped to
+ * the page.
+ *
+ * @param {HTMLElement} list
+ * @param {ReturnType<typeof captureListItemFocus>} captured
+ * @param {string} idKey
+ */
+export function restoreListItemFocus(list, captured, idKey) {
+  if (captured === null) return;
+  const rows = [...list.querySelectorAll('.list-item')];
+  const row = (captured.id === null ? undefined : rows.find(item => item.dataset[idKey] === captured.id))
+    ?? (captured.position < 0 ? undefined : rows[Math.min(captured.position, rows.length - 1)])
+    ?? null;
+  const target = captured.kind === null ? null : row?.querySelector(captured.kind) ?? null;
+  if (target !== null) {
+    target.focus({ preventScroll: true });
+    return;
+  }
+  if (!list.hasAttribute('tabindex')) list.tabIndex = -1;
+  list.focus({ preventScroll: true });
+}
+
 export function createListItem({ text, enabled, noun }) {
   requireText(text, 'List item text');
   requireText(noun, 'List item noun');
@@ -701,6 +747,8 @@ export function createListItem({ text, enabled, noun }) {
     tone: 'danger',
     className: 'list-item-remove'
   });
+  // Every row has one: each is named for its own item, like its checkbox.
+  remove.setAttribute('aria-label', `Remove ${noun}: ${text}`);
   root.appendChild(checkbox);
   root.appendChild(textEl);
   root.appendChild(remove);

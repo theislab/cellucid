@@ -1,84 +1,28 @@
-import { expect, test } from './helpers/test.mjs';
-import { extname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { expect, test } from './helpers/test.mjs';
 import {
   APP_HOST,
   APP_ORIGIN,
   APP_PORT,
+  SAMPLE_CATALOG_URL,
   appUrl,
-  EXPORTS_BASE_URL,
 } from './helpers/origins.mjs';
+import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
+import { jsonResponse, serveAnnDataServer } from './helpers/anndata-server.mjs';
 
-const FIXTURE_ID = 'current-ui-prepared';
-const FIXTURE_NAME = 'Current UI prepared fixture';
-const FIXTURE_ROOT = fileURLToPath(
-  new URL('./fixtures/exports/current-ui-prepared/', import.meta.url),
+const FIXTURE_ID = 'current-ui';
+const FIXTURE_NAME = 'Current UI fixture';
+const FIXTURE_FILE = fileURLToPath(
+  new URL('./fixtures/catalog/current-ui.h5ad', import.meta.url),
 );
-
-function jsonResponse(route, payload) {
-  return route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    headers: { 'Access-Control-Allow-Origin': '*' },
-    body: JSON.stringify(payload),
-  });
-}
-
-function contentTypeForFixture(path) {
-  if (extname(path) === '.json') return 'application/json';
-  return 'application/octet-stream';
-}
-
-async function installPreparedFixtureRoute(page, requestPrefix) {
-  await page.route(`${requestPrefix}**`, async route => {
-    const requestUrl = route.request().url();
-    if (!requestUrl.startsWith(requestPrefix)) {
-      throw new Error(`Unexpected prepared fixture URL: ${requestUrl}`);
-    }
-    const relativePath = decodeURIComponent(
-      requestUrl.slice(requestPrefix.length),
-    );
-    if (
-      relativePath.length === 0
-      || relativePath.startsWith('/')
-      || relativePath.includes('\\')
-      || relativePath.split('/').some(part => part === '' || part === '..')
-    ) {
-      throw new Error(`Invalid prepared fixture path: ${relativePath}`);
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: contentTypeForFixture(relativePath),
-      headers: { 'Access-Control-Allow-Origin': '*' },
-      path: join(FIXTURE_ROOT, ...relativePath.split('/')),
-    });
-  });
-}
-
-async function installPreparedRemoteServer(page) {
-  await page.route(appUrl('/_cellucid/health'), route =>
-    jsonResponse(route, {
-      status: 'ok',
-      type: 'exported',
-      version: '0.9.1',
-    }));
-  await page.route(appUrl('/_cellucid/info'), route =>
-    jsonResponse(route, {
-      version: '0.9.1',
-      host: APP_HOST,
-      port: APP_PORT,
-      mode: 'standalone',
-    }));
-  await page.route(appUrl('/_cellucid/datasets'), route =>
-    jsonResponse(route, {
-      datasets: [{
-        id: FIXTURE_ID,
-        path: '/remote-fixture/',
-        name: FIXTURE_NAME,
-      }],
-    }));
-  await installPreparedFixtureRoute(page, appUrl('/remote-fixture/'));
-}
+const FIXTURE = Object.freeze({
+  id: FIXTURE_ID,
+  name: FIXTURE_NAME,
+  file: FIXTURE_FILE,
+  cells: 120,
+  genes: 6,
+});
 
 async function installWelcomePaintProbe(page) {
   await page.addInitScript(() => {
@@ -137,7 +81,7 @@ async function expectWelcomeNeverPainted(page) {
   });
 }
 
-async function expectPreparedDatasetWithoutWelcome(page) {
+async function expectDatasetWithoutWelcome(page) {
   await expect(page.locator('#dataset-name')).toHaveText(FIXTURE_NAME);
   await expectWelcomeNeverPainted(page);
 }
@@ -147,15 +91,17 @@ test('an exact remote-server URL startup never shows or paints onboarding', asyn
 }) => {
   const errors = collectBrowserErrors(page);
   await installWelcomePaintProbe(page);
-  await installPreparedRemoteServer(page);
+  await serveAnnDataServer(page, APP_ORIGIN, FIXTURE, {
+    info: { host: APP_HOST, port: APP_PORT },
+  });
 
   const remoteUrl = new URL('/', APP_ORIGIN);
   remoteUrl.searchParams.set('remote', APP_ORIGIN);
   remoteUrl.searchParams.set('dataset', FIXTURE_ID);
-  remoteUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
+  remoteUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  await expectPreparedDatasetWithoutWelcome(page);
+  await expectDatasetWithoutWelcome(page);
   expect(errors).toEqual([]);
 });
 
@@ -164,15 +110,17 @@ test('an exact same-origin remote startup never shows or paints onboarding', asy
 }) => {
   const errors = collectBrowserErrors(page);
   await installWelcomePaintProbe(page);
-  await installPreparedRemoteServer(page);
+  await serveAnnDataServer(page, APP_ORIGIN, FIXTURE, {
+    info: { host: APP_HOST, port: APP_PORT },
+  });
 
   const remoteUrl = new URL('/', APP_ORIGIN);
   remoteUrl.searchParams.set('source', 'remote');
   remoteUrl.searchParams.set('dataset', FIXTURE_ID);
-  remoteUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
+  remoteUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  await expectPreparedDatasetWithoutWelcome(page);
+  await expectDatasetWithoutWelcome(page);
   expect(errors).toEqual([]);
 });
 
@@ -182,74 +130,47 @@ test('an exact GitHub URL startup never shows or paints onboarding', async ({
   const errors = collectBrowserErrors(page);
   await installWelcomePaintProbe(page);
   const rawPrefix =
-    'https://raw.githubusercontent.com/cellucid-tests/data/main/exports/';
+    'https://raw.githubusercontent.com/cellucid-tests/data/HEAD/catalog/';
   await page.route(`${rawPrefix}datasets.json`, route =>
     jsonResponse(route, {
-      version: 1,
+      schema: 2,
       default: FIXTURE_ID,
-      datasets: [{
-        id: FIXTURE_ID,
-        name: FIXTURE_NAME,
-        path: `${FIXTURE_ID}/`,
-        n_cells: 120,
-        n_genes: 6,
-      }],
+      datasets: [{ id: FIXTURE_ID, path: 'current-ui.h5ad' }],
     }));
-  await installPreparedFixtureRoute(
-    page,
-    `${rawPrefix}${FIXTURE_ID}/`,
-  );
+  const bytes = readFileSync(FIXTURE_FILE);
+  await page.route(`${rawPrefix}current-ui.h5ad`, route => fulfillFile(route, bytes));
 
   const githubUrl = new URL('/', APP_ORIGIN);
   githubUrl.searchParams.set(
-    'github',
-    'cellucid-tests/data/exports',
+    'data',
+    'gh:cellucid-tests/data/catalog',
   );
   githubUrl.searchParams.set('dataset', FIXTURE_ID);
-  githubUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
+  githubUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
   await page.goto(githubUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  await expectPreparedDatasetWithoutWelcome(page);
+  await expectDatasetWithoutWelcome(page);
   expect(errors).toEqual([]);
 });
 
-test('an exact authenticated Jupyter URL startup never shows or paints onboarding', async ({
+test('an exact authenticated viewer host URL startup never shows or paints onboarding', async ({
   page,
 }) => {
   const errors = collectBrowserErrors(page);
   await installWelcomePaintProbe(page);
-  await page.route(appUrl('/_cellucid/health'), route =>
-    jsonResponse(route, {
-      status: 'ok',
-      type: 'exported',
-      version: '0.9.1',
-    }));
-  await page.route(appUrl('/_cellucid/datasets'), route =>
-    jsonResponse(route, {
-      datasets: [{
-        id: FIXTURE_ID,
-        path: '/jupyter-fixture/',
-        name: FIXTURE_NAME,
-      }],
-    }));
-  await page.route(appUrl('/_cellucid/events'), route =>
-    jsonResponse(route, { status: 'ok', delivered: true }));
-  // A current notebook server publishes what it accepts on the wire.
-  await page.route(appUrl('/_cellucid/protocol'), route =>
-    jsonResponse(route, { events: ['ready'], commands: [] }));
-  await installPreparedFixtureRoute(page, appUrl('/jupyter-fixture/'));
+  await serveAnnDataServer(page, APP_ORIGIN, FIXTURE, { viewerHost: true });
 
-  const jupyterUrl = new URL('/', APP_ORIGIN);
-  jupyterUrl.searchParams.set('jupyter', 'true');
-  jupyterUrl.searchParams.set('viewerId', 'viewer-1');
-  jupyterUrl.searchParams.set('viewerToken', 'token-1');
-  await page.goto(jupyterUrl.toString(), { waitUntil: 'domcontentloaded' });
+  const viewerHostUrl = new URL('/', APP_ORIGIN);
+  viewerHostUrl.searchParams.set('viewer', 'true');
+  viewerHostUrl.searchParams.set('viewerId', 'viewer-1');
+  viewerHostUrl.searchParams.set('viewerToken', 'token-1');
+  await page.goto(viewerHostUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  await expectPreparedDatasetWithoutWelcome(page);
+  await expectDatasetWithoutWelcome(page);
   expect(errors).toEqual([]);
 });
 
-test('a failed exact remote-server intent keeps onboarding hidden and owns the failure', async ({
+test('a failed exact remote-server intent keeps onboarding hidden and says why', async ({
   page,
 }) => {
   await installWelcomePaintProbe(page);
@@ -264,18 +185,18 @@ test('a failed exact remote-server intent keeps onboarding hidden and owns the f
   remoteUrl.searchParams.set('remote', APP_ORIGIN);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
-  const failure = page.locator('#cellucid-startup-failure');
-  await expect(failure).toBeVisible();
-  await expect(failure).toHaveAttribute('role', 'alert');
-  await expect(failure).toContainText('Cellucid could not start');
-  await expect(failure).toContainText(
+  // A server that does not answer is data that did not open: Cellucid
+  // starts without it, and the failed opening says why with the ways on.
+  const failed = page.locator('.opening-overlay[data-state="failed"]');
+  await expect(failed).toBeVisible();
+  await expect(failed.locator('.opening-title')).toHaveText('The data could not be opened');
+  await expect(failed.locator('.welcome-details-text')).toContainText(
     'Remote health request failed with HTTP 503',
   );
-  await expect(failure).toContainText(
-    'Correct the launch configuration or server response, then reload this page.',
-  );
-  await expect(failure).toHaveCount(1);
-  await expect(page.locator('#dataset-name')).toHaveText('–');
+  await expect(failed.getByRole('button', { name: 'Try again' })).toBeVisible();
+  await expect(failed.getByRole('button', { name: 'Open without this link' })).toBeVisible();
+  await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expectWelcomeNeverPainted(page);
 });
 
@@ -300,6 +221,6 @@ test('a failed exact same-origin AnnData intent keeps onboarding hidden', async 
     'Same-origin Cellucid health request failed with HTTP 503.',
   );
   await expect(failure).toHaveCount(1);
-  await expect(page.locator('#dataset-name')).toHaveText('–');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expectWelcomeNeverPainted(page);
 });

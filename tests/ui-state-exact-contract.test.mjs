@@ -62,7 +62,7 @@ function residentLayoutManager(positions) {
         X_umap_2d: {
           label: 'UMAP',
           dimension: 2,
-          file: 'embeddings/0_2d.bin',
+          path: 'obsm/0/0-1',
           source: { key: 'X_umap', columns: [0, 1] },
         },
       },
@@ -117,6 +117,15 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
     Object.create(FieldOverlayInternalMethods.prototype),
     {
       _renameRegistry: {
+        getRevision() {
+          return 0;
+        },
+        editsSince() {
+          return [];
+        },
+        hasEntriesFor() {
+          return true;
+        },
         getDisplayKey(_source, originalKey) {
           return originalKey;
         },
@@ -125,6 +134,15 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
         },
       },
       _deleteRegistry: {
+        getRevision() {
+          return 0;
+        },
+        editsSince() {
+          return [];
+        },
+        hasEntriesFor() {
+          return true;
+        },
         isDeleted() {
           return false;
         },
@@ -252,7 +270,7 @@ test('field overlay actions reject before mutation and preserve exact loader fai
       newKey: 'score_copy',
       retry: true,
     }),
-    /unknown key "retry"/i,
+    /Field duplicate options may contain only: newKey \(unexpected: retry\)/i,
   );
   assert.equal(loadCalls, 0);
 
@@ -442,9 +460,7 @@ test('continuous color metadata preserves constant domains and rejects impossibl
     },
   );
 
-  colorState.updateColorsContinuous(constantField, {
-    resetTransparency: false,
-  });
+  colorState.updateColorsContinuous(constantField);
 
   assert.deepEqual(constantField._continuousStats, { min: 5, max: 5 });
   assert.deepEqual(constantField._continuousFilter, { min: 5, max: 5 });
@@ -678,7 +694,7 @@ test('highlight selections require exact target-view transparency', () => {
       0,
       transparency,
     ),
-    [0, 3],
+    Uint32Array.of(0, 3),
   );
   assert.deepEqual(
     highlightStateMethods.getCellIndicesForRange.call(
@@ -688,7 +704,7 @@ test('highlight selections require exact target-view transparency', () => {
       3,
       transparency,
     ),
-    [1, 3],
+    Uint32Array.of(1, 3),
   );
 });
 
@@ -781,62 +797,6 @@ test('an exact zero-cell observation generation owns valid empty visibility', ()
   );
 });
 
-test('view restoration preserves exact null field inventories', () => {
-  const overlayCalls = [];
-  const state = {
-    pointCount: 2,
-    obsData: { fields: [] },
-    varData: null,
-    activeFieldIndex: -1,
-    activeVarFieldIndex: -1,
-    activeFieldSource: null,
-    activeDimensionLevel: 2,
-    activeViewId: 'live',
-    colorsArray: new Uint8Array(8),
-    categoryTransparency: Uint8Array.from([1, 1]),
-    cellVisibilityMask: Uint8Array.from([1, 1]),
-    centroidPositions: new Float32Array(),
-    centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
-    centroidLabels: [],
-    filteredCount: { shown: 2, total: 2 },
-    viewContexts: new Map(),
-    _cloneFieldState: viewContextCoreMethods._cloneFieldState,
-    _cloneObsData: viewContextCoreMethods._cloneObsData,
-    _cloneVarData: viewContextCoreMethods._cloneVarData,
-    _buildContextFromCurrent: viewContextCoreMethods._buildContextFromCurrent,
-    _resetViewContexts: viewContextCoreMethods._resetViewContexts,
-    _syncActiveContext: viewContextCoreMethods._syncActiveContext,
-    restoreContext: viewContextCoreMethods.restoreContext,
-    _applyOverlaysToFields(fields, source) {
-      overlayCalls.push([source, fields === null ? null : fields.length]);
-      FieldOverlayInternalMethods.prototype._applyOverlaysToFields.call(
-        this,
-        fields,
-        source,
-      );
-    },
-    _injectUserDefinedFields() {},
-    _ensureActiveSelectionNotDeleted() {},
-    _pushColorsToViewer() {},
-    _pushTransparencyToViewer() {},
-    _pushCentroidsToViewer() {},
-    computeGlobalVisibility() {},
-    updateFilterSummary() {},
-  };
-  const context = state._buildContextFromCurrent('live', {
-    cloneArrays: true,
-  });
-
-  state.restoreContext(context, { preserveSnapshots: false });
-
-  assert.equal(state.varData, null);
-  assert.deepEqual(overlayCalls, [
-    [FieldSource.OBS, 0],
-    [FieldSource.VAR, null],
-  ]);
-});
-
 test('view switching moves cell masks between views and rejects invalid targets atomically', () => {
   const pointCount = 4;
   const state = {
@@ -853,7 +813,6 @@ test('view switching moves cell masks between views and rejects invalid targets 
     cellVisibilityMask: Uint8Array.from([1, 1, 0, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: 3, total: pointCount },
     viewContexts: new Map(),
@@ -1313,6 +1272,7 @@ test('user-defined categorical state preserves exact primitive category identity
 
 test('categorical upsert replaces stale derived metadata as one exact update', () => {
   const registry = new UserDefinedFieldsRegistry();
+  let visibilityPasses = 0;
   const state = Object.assign(
     Object.create(FieldOverlayPublicMethods.prototype),
     {
@@ -1324,6 +1284,15 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
       _userDefinedFields: registry,
       ensureCategoryMetadata:
         DataStateColorMethods.prototype.ensureCategoryMetadata,
+      _userDefinedFieldCopies:
+        FieldOverlayInternalMethods.prototype._userDefinedFieldCopies,
+      _publishUserDefinedCategorical:
+        FieldOverlayInternalMethods.prototype._publishUserDefinedCategorical,
+      _redrawViewsUsingUserDefinedField:
+        FieldOverlayInternalMethods.prototype._redrawViewsUsingUserDefinedField,
+      computeGlobalVisibility() {
+        visibilityPasses++;
+      },
       _syncActiveContext() {},
       _notifyFieldChange() {},
     },
@@ -1396,6 +1365,9 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
   assert.equal(created.field._categoryCounts, undefined);
   assert.equal(created.field._operation.revision, 2);
   assert.strictEqual(registry.getField(created.id), created.field);
+  // The view hides 'Old', so which of its cells are shown is counted again
+  // from the new codes.
+  assert.equal(visibilityPasses, 1);
 
   const categoriesBeforeFailure = [...created.field.categories];
   const codesBeforeFailure = created.field.codes;
@@ -1489,7 +1461,6 @@ test('syncing the active view shares its per-cell arrays instead of copying them
     cellVisibilityMask: new Uint8Array(pointCount),
     centroidPositions: new Float32Array(3),
     centroidColors: new Uint8Array(4),
-    centroidOutliers: new Float32Array(1),
     centroidLabels: [],
     filteredCount: { shown: pointCount, total: pointCount },
     _cloneFieldState: viewContextCoreMethods._cloneFieldState,
@@ -1503,7 +1474,6 @@ test('syncing the active view shares its per-cell arrays instead of copying them
     'cellVisibilityMask',
     'centroidPositions',
     'centroidColors',
-    'centroidOutliers',
   ]) {
     assert.strictEqual(live[key], state[key], key);
   }

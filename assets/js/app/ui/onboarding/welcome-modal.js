@@ -79,6 +79,21 @@ function listWelcomeFocusable() {
   );
 }
 
+/** Whether the dialog holds a control focus can enter, read without layout. */
+function hasWelcomeFocusTarget() {
+  const root = welcomeDialogRoot();
+  if (!root) return false;
+  return Array.from(root.querySelectorAll(FOCUSABLE_SELECTOR)).some(
+    (element) => (
+      element instanceof HTMLElement &&
+      element.tabIndex >= 0 &&
+      element.getAttribute('aria-hidden') !== 'true' &&
+      !('disabled' in element && element.disabled) &&
+      !element.closest('[hidden]')
+    )
+  );
+}
+
 /**
  * Keep Tab inside the dialog. `aria-modal="true"` tells assistive technology
  * the rest of the document is inert, so keyboard focus must not leave either.
@@ -161,7 +176,10 @@ export function showWelcomeModal() {
   if (!welcomeModal) return false;
   captureWelcomeReturnFocus();
   welcomeModal.classList.remove('hidden');
-  if (listWelcomeFocusable().length === 0) {
+  // A structural check, not listWelcomeFocusable(): its getClientRects() on
+  // the dialog just unhidden forced a layout of the whole page inside the
+  // startup task (26 ms of it). Tab, later, measures what is visible.
+  if (!hasWelcomeFocusTarget()) {
     throw new Error(
       'Welcome modal must expose at least one focusable control to receive focus.'
     );

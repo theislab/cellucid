@@ -163,7 +163,7 @@ function createModeViewer() {
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       };
     },
     isKnnEdgesLoaded() {
@@ -205,6 +205,10 @@ function createCategoryHighlightState() {
     getHighlightPages() {
       return this.highlightPages;
     },
+    // The field is held already; a restore that needs its codes asks for it.
+    async ensureFieldLoaded(fieldIndex) {
+      return this.obsData.fields[fieldIndex];
+    },
     getActivePageId() {
       return this.activePageId;
     },
@@ -217,7 +221,7 @@ function createCategoryHighlightState() {
     getTotalHighlightedCellCount() {
       return this.highlightPages[0].highlightedGroups.length;
     },
-    clearAllHighlights() {},
+    clearActivePageHighlights() {},
     removeHighlightGroup() {
       return true;
     },
@@ -300,6 +304,9 @@ test('category highlights preserve primitive identity through save, restore, and
 
   const [metaChunk] = captureHighlightMeta({ state: sourceState });
   const cellChunks = captureHighlightCells({ state: sourceState });
+  // Each group is a whole category, so it is stored relative to that
+  // category: encoding 4 (reference-all), a few bytes whatever its size.
+  assert.deepEqual(cellChunks.map(chunk => chunk.payload[0]), [4, 4, 4, 4, 4]);
   const restoredState = createCategoryHighlightState();
   const restoreTransaction = createSessionRestoreTransaction();
   const restoreContext = {
@@ -556,7 +563,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       };
     },
     getViewTransparency() {
@@ -632,7 +639,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
     const tools = initHighlightSelectionTools({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       dom: {
         ...createSelectModeDom(),
         modeButtons: buttons,
@@ -709,7 +716,6 @@ test('active-view switches invalidate visible-highlight counts for the new trans
     cellVisibilityMask: Uint8Array.from([1, 1, 1, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
-    centroidOutliers: new Float32Array(),
     centroidLabels: [],
     filteredCount: { shown: pointCount, total: pointCount },
     viewContexts: new Map(),
@@ -784,7 +790,7 @@ test('highlight controls reject missing current owners before touching UI state'
         state: {},
         viewer: {},
         dom: {},
-        jupyterSource: null
+        viewerHostSource: null
       }),
       /highlight state.*getActiveField/i
     );
@@ -867,12 +873,12 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     type: 'lasso',
     label: 'Lasso (1 cell)',
     enabled: true,
-    cellIndices: [0],
+    cellIndices: Uint32Array.of(0),
     cellCount: 1
   };
   const state = {
     pointCount: 4,
-    clearAllHighlights() {},
+    clearActivePageHighlights() {},
     getHighlightedCellCount() {
       return 1;
     },
@@ -929,13 +935,13 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
     type: 'lasso',
     label: 'Lasso (1 cell)',
     enabled: true,
-    cellIndices: [0],
+    cellIndices: Uint32Array.of(0),
     cellCount: 1,
     legacySource: 'lasso'
   };
   const state = {
     pointCount: 4,
-    clearAllHighlights() {},
+    clearActivePageHighlights() {},
     getHighlightedCellCount() {
       return 1;
     },
@@ -1007,7 +1013,7 @@ test('selection-tool composition preflights every viewer capability before regis
       () => initHighlightSelectionTools({
         state,
         viewer,
-        jupyterSource: null,
+        viewerHostSource: null,
         dom: {
           ...createSelectModeDom(),
           modeButtons: buttons,
@@ -1134,7 +1140,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
     const { handleLassoStep } = initLassoSelection({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       selectionState,
       ui: {
         modeDescriptionEl: {
@@ -1148,7 +1154,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
       () => handleLassoStep({
         step: 1,
         candidateCount: 1,
-        candidates: [3]
+        candidates: Uint32Array.of(3)
       }),
       /lasso step.*mode/i
     );
@@ -1158,7 +1164,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
     assert.throws(
       () => selectionCallback({
         type: 'lasso',
-        cellIndices: [3],
+        cellIndices: Uint32Array.of(3),
         cellCount: 2,
         steps: 1
       }),
@@ -1169,7 +1175,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
     assert.throws(
       () => selectionCallback({
         type: 'lasso',
-        cellIndices: [3],
+        cellIndices: Uint32Array.of(3),
         cellCount: 1,
         steps: 1
       }),
@@ -1179,7 +1185,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
   });
 });
 
-test('selection destruction drains Jupyter delivery and suppresses late failure UI', async () => {
+test('selection destruction drains viewer host delivery and suppresses late failure UI', async () => {
   let rejectDelivery;
   const delivery = new Promise((_resolve, reject) => {
     rejectDelivery = reject;
@@ -1223,7 +1229,7 @@ test('selection destruction drains Jupyter delivery and suppresses late failure 
       const selection = initLassoSelection({
         state,
         viewer,
-        jupyterSource: {
+        viewerHostSource: {
           notifySelection() {
             return delivery;
           }
@@ -1238,7 +1244,7 @@ test('selection destruction drains Jupyter delivery and suppresses late failure 
       });
       selectionCallback({
         type: 'lasso',
-        cellIndices: [3],
+        cellIndices: Uint32Array.of(3),
         cellCount: 1,
         steps: 1
       });
@@ -1311,13 +1317,13 @@ test('annotation undo republishes the exact candidate state to the unified rende
       return field;
     },
     getCellIndicesForCategory(lookupField, categoryIndex) {
-      return lookupField.codes.reduce((indices, code, cellIndex) => {
+      return Uint32Array.from(lookupField.codes.reduce((indices, code, cellIndex) => {
         if (code === categoryIndex) indices.push(cellIndex);
         return indices;
-      }, []);
+      }, []));
     },
     getCellIndicesForRange() {
-      return [];
+      return new Uint32Array(0);
     },
     getFieldForView() {
       return field;
@@ -1358,7 +1364,7 @@ test('annotation undo republishes the exact candidate state to the unified rende
     const { handleAnnotationStep } = initAnnotationSelection({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       selectionState: createHighlightSelectionState(),
       ui: {
         modeDescriptionEl: {

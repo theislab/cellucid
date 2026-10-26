@@ -3,10 +3,14 @@
  * each cell lies from its category's centre in a latent space (scVI, PCA),
  * as the share of its category at that distance or closer.
  *
- * The rule is `cellucid.prepare_data._centroids._compute_latent_space_quantiles`,
- * which `prepare()` and `cellucid serve` run, bit for bit: for each category
- * with at least `minPoints` cells, over the latent values as stored (float32,
- * widened exactly to float64),
+ * One rule, bit for bit, wherever the quantiles come from: `prepare()` in
+ * Python (`cellucid.prepare_data._outliers`) and `cellucid_prepare()` in R
+ * store them in the file (`uns['cellucid']['outlierQuantiles']`), and the
+ * reader worker computes them here for a file that stores none; all three
+ * are checked against an independent numpy reference
+ * (`scripts/generate-latent-outlier-conformance.py`). For each category
+ * with at least `minPoints` cells, over the latent values as stored
+ * (float32, widened exactly to float64),
  *
  * 1. the centroid is the column sums, accumulated cell by cell in cell order,
  *    divided by the cell count;
@@ -20,14 +24,21 @@
  * Both passes read the cells in order, so the latent space can arrive in row
  * slabs: `LatentOutlierQuantiles` takes the slabs of pass 1 (the centroids)
  * and then of pass 2 (the distances), and holds per cell only the distances
- * of the scored cells, never the latent space. The direct AnnData reader
- * streams it from the file this way in its worker; an array already in
- * memory is one slab.
+ * of the scored cells, never the latent space. The reader worker streams it
+ * from the file this way (`latent-outliers-stream.js`), every field asked for
+ * at once in the same passes; an array already in memory is one slab.
+ *
+ * `categorySizes` says whether a field can have quantiles at all (a category
+ * of at least `minPoints` cells), from its codes alone, and
+ * `storedQuantilesDefect` checks quantiles a file stores against the field's
+ * codes, so quantiles written for other categories (the file's obs was
+ * changed after it was prepared) are never applied.
  *
  * @module data/latent-outliers
  */
 
 import { radixSort64 } from '../app/analysis/compute/math-utils.js';
+import { formatCountOf } from '../utils/format-units.js';
 
 function requireLatentTask({ latent, width }) {
   if (!(latent instanceof Float32Array)) {
@@ -328,4 +339,86 @@ export function computeLatentOutlierQuantiles(task) {
     outliers.addDistanceRows(latent, 0);
   }
   return outliers.finish();
+}
+
+/**
+ * The cell count of every category of a field, and what the rule makes of
+ * them: how many categories have at least `minPoints` cells (only their cells
+ * get quantiles) and the largest category.
+ *
+ * @param {ArrayLike<number>} codes - A code outside `[0, nCategories)` is a missing category
+ * @param {number} nCategories
+ * @param {number} minPoints
+ * @returns {{counts: Int32Array, scored: number, largest: number}}
+ */
+export function categorySizes(codes, nCategories, minPoints) {
+  requireCodesTask({ codes, nCategories, minPoints }, codes?.length);
+  const counts = new Int32Array(nCategories);
+  for (let cell = 0; cell < codes.length; cell++) {
+    const code = codes[cell];
+    if (code >= 0 && code < nCategories) counts[code] += 1;
+  }
+  let scored = 0;
+  let largest = 0;
+  for (let code = 0; code < nCategories; code++) {
+    if (counts[code] >= minPoints) scored += 1;
+    if (counts[code] > largest) largest = counts[code];
+  }
+  return { counts, scored, largest };
+}
+
+/**
+ * Why quantiles a file stores cannot be this field's, or null when they can.
+ * Whatever the latent space, the rule's quantiles of a category of `n` cells
+ * are ranks over `n`: each is `r / n` (as float32) for a whole `r` from 1
+ * to `n`, and exactly `r` of the category's cells have a rank of at most `r`
+ * (ties share the larger rank). Every other cell (a missing code, a category
+ * under `minPoints`) is NaN. Quantiles written for other categories or other
+ * cells — the file's obs changed after it was prepared — fail this, so they
+ * are computed instead.
+ *
+ * @param {Float32Array} quantiles - As stored, NaN where none
+ * @param {ArrayLike<number>} codes
+ * @param {number} nCategories
+ * @param {number} minPoints
+ * @returns {string|null}
+ */
+export function storedQuantilesDefect(quantiles, codes, nCategories, minPoints) {
+  if (!(quantiles instanceof Float32Array)) return 'they are not float32 values';
+  if (quantiles.length !== codes.length) {
+    return `they hold ${formatCountOf(quantiles.length, 'value')} for ${formatCountOf(codes.length, 'cell')}`;
+  }
+  const { counts } = categorySizes(codes, nCategories, minPoints);
+  // How many of each scored category's cells have each rank, ranks 1..n at
+  // offsets[code] + rank - 1.
+  const offsets = new Float64Array(nCategories + 1);
+  for (let code = 0; code < nCategories; code++) {
+    offsets[code + 1] = offsets[code] + (counts[code] >= minPoints ? counts[code] : 0);
+  }
+  const ranks = new Int32Array(offsets[nCategories]);
+  for (let cell = 0; cell < codes.length; cell++) {
+    const code = codes[cell];
+    const quantile = quantiles[cell];
+    const scored = code >= 0 && code < nCategories && counts[code] >= minPoints;
+    if (!scored) {
+      if (quantile === quantile) return `cell ${cell} has a quantile, and its category has none`;
+      continue;
+    }
+    const n = counts[code];
+    const rank = Math.round(quantile * n);
+    if (!(rank >= 1 && rank <= n) || Math.fround(Math.fround(rank) / Math.fround(n)) !== quantile) {
+      return `cell ${cell} has no share of its ${n}-cell category`;
+    }
+    ranks[offsets[code] + rank - 1] += 1;
+  }
+  for (let code = 0; code < nCategories; code++) {
+    if (counts[code] < minPoints) continue;
+    let atMost = 0;
+    for (let rank = 1; rank <= counts[code]; rank++) {
+      const cells = ranks[offsets[code] + rank - 1];
+      atMost += cells;
+      if (cells > 0 && atMost !== rank) return `category ${code} does not rank its cells`;
+    }
+  }
+  return null;
 }

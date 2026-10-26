@@ -16,13 +16,14 @@
 
 import { debug } from '../utils/debug.js';
 import { NotificationType, CategoryIcons } from './notification-center/constants.js';
-import { formatBytes, formatDuration } from './notification-center/formatters.js';
 import { downloadTrackingMethods } from './notification-center/download-tracking.js';
 import { benchmarkNotificationMethods } from './notification-center/benchmark-notifications.js';
 import { escapeHtml } from './utils/dom-utils.js';
 import {
   registerModalDocumentAuxiliary
 } from './ui/components/modal-background-owner.js';
+import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
+import { formatBytes, formatDuration, countNoun } from '../utils/format-units.js';
 
 /** Calculations shorter than this finish without a completion notice. */
 const QUICK_CALCULATION_MS = 250;
@@ -72,6 +73,7 @@ const DEFAULT_DURATIONS_MS = Object.freeze({
 const NOTIFICATION_OPTION_KEYS = new Set([
   'action',
   'category',
+  'details',
   'dismissible',
   'duration',
   'id',
@@ -82,14 +84,6 @@ const NOTIFICATION_OPTION_KEYS = new Set([
   'title',
   'type'
 ]);
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
 
 function requireNonEmptyString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -118,14 +112,7 @@ function requireFiniteRange(value, name, minimum, maximum) {
 }
 
 function assertNotificationOptions(options, { partial = false } = {}) {
-  if (!isPlainObject(options)) {
-    throw new TypeError('Notification options must be a plain object.');
-  }
-  for (const key of Object.keys(options)) {
-    if (!NOTIFICATION_OPTION_KEYS.has(key)) {
-      throw new TypeError(`Unknown notification option "${key}".`);
-    }
-  }
+  requireKeys(options, [], NOTIFICATION_OPTION_KEYS, 'Notification options');
   if (Object.hasOwn(options, 'id')) {
     requireNonEmptyString(options.id, 'Notification id');
   }
@@ -140,7 +127,7 @@ function assertNotificationOptions(options, { partial = false } = {}) {
       );
     }
   }
-  for (const key of ['title', 'message']) {
+  for (const key of ['title', 'message', 'details']) {
     if (Object.hasOwn(options, key) && typeof options[key] !== 'string') {
       throw new TypeError(`Notification ${key} must be a string.`);
     }
@@ -214,7 +201,7 @@ function assertNotificationOptions(options, { partial = false } = {}) {
   if (Object.hasOwn(options, 'action')) {
     const action = options.action;
     if (
-      !isPlainObject(action) ||
+      !isPlainRecord(action) ||
       Object.keys(action).sort().join(',') !== 'label,run' ||
       typeof action.label !== 'string' ||
       action.label.trim().length === 0 ||
@@ -225,6 +212,18 @@ function assertNotificationOptions(options, { partial = false } = {}) {
       );
     }
   }
+}
+
+/**
+ * A notification's details: the technical text behind its message (the raw
+ * error of a failure), folded so the message stays one short sentence.
+ *
+ * @param {string} details
+ * @returns {string}
+ */
+function notificationDetailsHtml(details) {
+  return '<details class="notification-details"><summary>Details</summary>'
+    + `<div class="notification-details-text">${escapeHtml(details)}</div></details>`;
 }
 
 function assertMethodOptions(options, methodName, reservedKeys) {
@@ -319,6 +318,11 @@ class NotificationCenter {
    * scroll end by it, so its last controls can always be scrolled clear of
    * the cards (they let taps through, but a control under a card cannot be
    * seen). Padding only the scroll end moves nothing already on screen.
+   *
+   * The observer reports the first size itself, after the next layout. A
+   * measurement here would force that layout inside startup (~25 ms); and
+   * while the stack is empty it is 0 px, which the stylesheet's default
+   * already is.
    */
   _publishStackBlockSize() {
     const View = document.defaultView;
@@ -336,7 +340,6 @@ class NotificationCenter {
       );
     };
     new View.ResizeObserver(publish).observe(container);
-    publish();
   }
 
   /**
@@ -360,7 +363,8 @@ class NotificationCenter {
       speed = null,
       dismissible = true,
       onCancel = null,
-      action = null
+      action = null,
+      details = ''
     } = options;
 
     const el = document.createElement('div');
@@ -381,6 +385,9 @@ class NotificationCenter {
         ${safeTitle ? `<div class="notification-title">${safeTitle}</div>` : ''}
         ${safeMessage ? `<div class="notification-message">${safeMessage}</div>` : ''}
     `;
+
+    // The technical text behind a short message, folded under it.
+    if (details !== '') html += notificationDetailsHtml(details);
 
     let progressBarWidth = '';
 
@@ -655,6 +662,21 @@ class NotificationCenter {
       msgEl.textContent = options.message;
     }
 
+    if (options.details !== undefined) {
+      element.querySelector('.notification-details')?.remove();
+      if (options.details !== '') {
+        const content = element.querySelector('.notification-content');
+        if (content === null) {
+          throw new Error(`Notification "${id}" has no content element.`);
+        }
+        const holder = document.createElement('div');
+        holder.innerHTML = notificationDetailsHtml(options.details);
+        const message = content.querySelector('.notification-message');
+        if (message === null) content.appendChild(holder.firstElementChild);
+        else message.after(holder.firstElementChild);
+      }
+    }
+
     // A title published with active work names that work in progress
     // ("Downloading", "Processing", "Generating Data"). Once the work settles
     // the title is no longer true, so a terminal transition that names no title
@@ -827,6 +849,7 @@ class NotificationCenter {
       this._overflowElement = null;
       this._overflowParts = null;
       this._overflowExpanded = false;
+      this._overflowListed = 0;
       return;
     }
     if (this._overflowElement === null) {
@@ -852,6 +875,7 @@ class NotificationCenter {
       });
       clear.addEventListener('click', () => {
         this.overflowMessages = [];
+        this._overflowListed = 0;
         this._renderOverflow();
       });
       // The stack is column-reversed: the first child sits at the bottom,
@@ -861,16 +885,22 @@ class NotificationCenter {
       this._overflowParts = { toggle, list };
     }
     const { toggle, list } = this._overflowParts;
-    toggle.textContent = `${this._overflowExpanded ? 'Hide' : 'Show'} ${count} earlier message${count === 1 ? '' : 's'}`;
+    toggle.textContent = `${this._overflowExpanded ? 'Hide' : 'Show'} ${count} earlier ${countNoun(count, 'message')}`;
     toggle.setAttribute('aria-expanded', this._overflowExpanded ? 'true' : 'false');
     list.hidden = !this._overflowExpanded;
     if (!this._overflowExpanded) {
       list.replaceChildren();
+      this._overflowListed = 0;
       return;
     }
+    // The open list is the log of a whole session: a message retired while
+    // it is open adds its own row (newest first, at the top), instead of the
+    // list being rebuilt from every message so far.
+    const listed = this._overflowListed ?? 0;
+    const fresh = listed > 0 && listed <= count && list.childElementCount === listed;
     const fragment = document.createDocumentFragment();
     // Newest first, like the cards above.
-    for (let index = count - 1; index >= 0; index--) {
+    for (let index = count - 1; index >= (fresh ? listed : 0); index--) {
       const record = this.overflowMessages[index];
       const item = document.createElement('div');
       item.className = `notification-overflow-item notification-${record.type}`;
@@ -889,7 +919,9 @@ class NotificationCenter {
       }
       fragment.append(item);
     }
-    list.replaceChildren(fragment);
+    if (fresh) list.prepend(fragment);
+    else list.replaceChildren(fragment);
+    this._overflowListed = count;
   }
 
   /**
@@ -1180,14 +1212,7 @@ class NotificationCenter {
     if (typeof operation !== 'function') {
       throw new TypeError('Notification batch operation must be a function.');
     }
-    if (!isPlainObject(options)) {
-      throw new TypeError('Notification batch options must be a plain object.');
-    }
-    for (const key of Object.keys(options)) {
-      if (key !== 'category' && key !== 'parallel') {
-        throw new TypeError(`Unknown notification batch option "${key}".`);
-      }
-    }
+    requireKeys(options, [], ['category', 'parallel'], 'Notification batch options');
     const { category = 'data', parallel = true } = options;
     requireNonEmptyString(category, 'Notification batch category');
     if (!Object.hasOwn(CategoryIcons, category)) {
@@ -1199,7 +1224,7 @@ class NotificationCenter {
       throw new TypeError('Notification batch parallel must be a boolean.');
     }
     for (const [index, item] of items.entries()) {
-      if (!isPlainObject(item)) {
+      if (!isPlainRecord(item)) {
         throw new TypeError(`Notification batch item ${index} must be a plain object.`);
       }
       requireNonEmptyString(item.name, `Notification batch item ${index} name`);

@@ -1,0 +1,86 @@
+/* components/_jobs.css - The running, cancelled and failed states of a
+   cancellable job in the panel that started it (app/jobs/job-status-view.js). */
+
+.job-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-light);
+  font-family: var(--font-sans);
+}
+
+.job-status[hidden] {
+  display: none;
+}
+
+.job-status-title {
+  margin: 0;
+  font-size: var(--type-body);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.job-status-plan,
+.job-status-detail {
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.job-status-plan {
+  color: var(--color-text-tertiary);
+}
+
+.job-status-plan[hidden],
+.job-progress[hidden],
+.job-status-action[hidden] {
+  display: none;
+}
+
+.job-status[data-tone="muted"] .job-status-title {
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
+.job-status[data-tone="danger"] .job-status-title,
+.job-status[data-tone="danger"] .job-status-detail {
+  color: var(--color-danger-text);
+}
+
+/* A thin bar while a job runs: how far it has come, or indeterminate. */
+.job-progress {
+  position: relative;
+  height: var(--control-slider-track-height);
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+  overflow: hidden;
+}
+
+.job-progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--color-text-primary);
+  border-radius: var(--radius-full);
+  transition: width var(--duration-fast) var(--easing-out);
+}
+
+.job-progress.indeterminate .job-progress-bar {
+  width: 30%;
+  animation: progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+.job-status-action {
+  align-self: flex-start;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job-progress.indeterminate .job-progress-bar {
+    animation: none;
+    width: 100%;
+    opacity: var(--opacity-40);
+  }
+}

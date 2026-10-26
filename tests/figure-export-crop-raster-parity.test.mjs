@@ -155,8 +155,9 @@ test('every framed raster goes through the shared crop plan', async () => {
     readFile(new URL('renderers/png-renderer.js', root), 'utf8'),
     readFile(new URL('renderers/svg-renderer.js', root), 'utf8'),
   ]);
-  assert.equal((pngSource.match(/= planPointRaster\(ctx, plotRect, crop01, renderState\)/g) ?? []).length, 2);
-  assert.equal((pngSource.match(/drawPointRaster\(ctx, webglCanvas, rasterPlan\)/g) ?? []).length, 2);
+  // One prepare step plans every panel's raster; both layouts draw it.
+  assert.equal((pngSource.match(/= planPointRaster\(ctx, plotRect, crop01, renderState, zoomLimit\)/g) ?? []).length, 1);
+  assert.equal((pngSource.match(/drawPointRaster\(ctx, raster, rasterPlan\)/g) ?? []).length, 2);
   assert.match(svgSource, /planCropRaster\(\{/);
   for (const source of [pngSource, svgSource]) {
     assert.match(source, /viewRect01: (rasterPlan\.viewRect01|crop01),/);

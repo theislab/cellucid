@@ -165,7 +165,9 @@ test('a figure draws the look only on the viewer\'s own paper', () => {
 
 test('the scene redraws while a look fades and never for its tints or its bakes alone', async () => {
   const viewer = await read('assets/js/rendering/viewer.js');
-  const sceneWide = viewer.slice(viewer.indexOf('function sceneWideAnimationActive()'));
+  // A look's fade changes the base layer under the highlights, so it is one of
+  // the causes the pulse's kept base is redrawn for (pulse-layer-cache.js).
+  const sceneWide = viewer.slice(viewer.indexOf('function baseLayerAnimationActive()'));
   assert.match(sceneWide.slice(0, sceneWide.indexOf('\n  }\n')), /backdropLooks\.frameCause\(\) !== null/);
   const renderer = await read('assets/js/rendering/backdrops/backdrop-look-renderer.js');
   const frameCause = renderer.slice(renderer.indexOf('function frameCause()'));

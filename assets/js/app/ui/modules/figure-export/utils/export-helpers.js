@@ -1,79 +1,11 @@
 /**
- * @fileoverview Figure export helpers (download + filenames).
+ * @fileoverview Figure export helpers (filenames).
  *
  * Keep these utilities independent of UI and renderer state so both SVG and
  * PNG renderers can reuse them without dragging UI logic into the render path.
  *
  * @module ui/modules/figure-export/utils/export-helpers
  */
-
-import {
-  isFigureExportSignalAborted,
-  throwIfFigureExportAborted,
-} from '../figure-export-contract.js';
-
-/**
- * Encode a canvas while letting teardown settle the export immediately. The
- * browser's native encoder is not cancellable, so a callback that arrives after
- * abort is ignored.
- *
- * @param {{ toBlob: Function }} canvas
- * @param {string} type
- * @param {object} [options]
- * @param {AbortSignal|null} [options.signal]
- * @param {string} [options.failureMessage]
- * @returns {Promise<Blob>}
- */
-export function canvasToBlob(
-  canvas,
-  type,
-  {
-    signal = null,
-    failureMessage = 'Canvas encoding failed.',
-  } = {}
-) {
-  throwIfFigureExportAborted(signal);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      signal?.removeEventListener('abort', onAbort);
-    };
-    const settle = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      callback(value);
-    };
-    const onAbort = () => {
-      try {
-        throwIfFigureExportAborted(signal);
-      } catch (error) {
-        settle(reject, error);
-      }
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (isFigureExportSignalAborted(signal)) {
-      onAbort();
-      return;
-    }
-    try {
-      canvas.toBlob((blob) => {
-        if (settled) return;
-        if (isFigureExportSignalAborted(signal)) {
-          onAbort();
-          return;
-        }
-        if (!(blob instanceof Blob)) {
-          settle(reject, new Error(failureMessage));
-          return;
-        }
-        settle(resolve, blob);
-      }, type);
-    } catch (error) {
-      settle(reject, error);
-    }
-  });
-}
 
 /**
  * @param {unknown} value
@@ -131,69 +63,4 @@ export function buildExportFilename({ datasetName, fieldKey, viewLabel, variant,
 
   const segments = [base, field, view, extra, ts].filter(Boolean);
   return `${segments.join('_')}.${sanitizeFilenamePart(ext).replace(/^\.+/, '')}`;
-}
-
-/**
- * Convert a Blob to a data: URL (for embedding rasters into SVG).
- * @param {Blob} blob
- * @param {object} [options]
- * @param {AbortSignal|null} [options.signal]
- * @returns {Promise<string>}
- */
-export function blobToDataUrl(blob, { signal = null } = {}) {
-  throwIfFigureExportAborted(signal);
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    let settled = false;
-    const cleanup = () => {
-      signal?.removeEventListener('abort', onAbort);
-      reader.onload = null;
-      reader.onerror = null;
-      reader.onabort = null;
-    };
-    const settle = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      callback(value);
-    };
-    const rejectForAbort = () => {
-      try {
-        throwIfFigureExportAborted(signal);
-      } catch (error) {
-        settle(reject, error);
-      }
-    };
-    const onAbort = () => {
-      try {
-        reader.abort();
-      } finally {
-        rejectForAbort();
-      }
-    };
-    reader.onload = () => {
-      if (isFigureExportSignalAborted(signal)) {
-        rejectForAbort();
-        return;
-      }
-      settle(resolve, String(reader.result || ''));
-    };
-    reader.onerror = () => {
-      settle(
-        reject,
-        reader.error || new Error('Failed to read blob')
-      );
-    };
-    reader.onabort = rejectForAbort;
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (isFigureExportSignalAborted(signal)) {
-      onAbort();
-      return;
-    }
-    try {
-      reader.readAsDataURL(blob);
-    } catch (error) {
-      settle(reject, error);
-    }
-  });
 }

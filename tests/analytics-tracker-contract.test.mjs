@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-const CANONICAL_CATALOG = 'https://theislab.github.io/cellucid-datasets/exports-v3/';
+const CANONICAL_CATALOG = 'https://theislab.github.io/cellucid-datasets/anndata/';
 const SENSITIVE = Object.freeze([
   'AML_relapse_donor7', 'patient', 'donor', '/Users/', 'alice', '@',
   'BRCA1', 'secret', '10.1.2.3', 'token',
@@ -34,7 +34,7 @@ function installBrowser({ hostEnabled, metaContent = CANONICAL_CATALOG, search =
       listeners.push({ type, handler, options });
     },
     querySelectorAll: selector => (
-      selector === 'meta[name="cellucid-exports-base-url"]'
+      selector === 'meta[name="cellucid-sample-catalog"]'
         ? [{ getAttribute: () => metaContent }]
         : []
     ),
@@ -68,7 +68,6 @@ function element({ id = '', dataset = {}, parent = null, ...rest } = {}) {
 const LOCAL_METADATA = Object.freeze({
   id: 'local-user:h5ad:h5ad_AML_relapse_donor7',
   name: 'AML_relapse_donor7',
-  cellucid_data_version: '0.9.1',
   stats: {
     n_cells: 48_213,
     n_genes: 31_000,
@@ -82,19 +81,19 @@ const LOCAL_METADATA = Object.freeze({
       X_pca: {
         label: 'X_pca',
         dimension: 2,
-        file: 'embeddings/0_2d.bin',
+        path: 'obsm/0/0-1',
         source: { key: 'X_pca', columns: [0, 1] },
       },
       X_umap: {
         label: 'X_umap',
         dimension: 2,
-        file: 'embeddings/1_2d.bin',
+        path: 'obsm/1/0-1',
         source: { key: 'X_umap', columns: [0, 1] },
       },
       X_umap_3d: {
         label: 'X_umap_3d',
         dimension: 3,
-        file: 'embeddings/2_3d.bin',
+        path: 'obsm/2/0-1-2',
         source: { key: 'X_umap_3d', columns: [0, 1, 2] },
       },
     },
@@ -102,7 +101,7 @@ const LOCAL_METADATA = Object.freeze({
 });
 
 // DATA_CONFIG is computed once, when data-source.js first evaluates, from the
-// page this installs: no `exportsBaseUrl` query, the canonical meta element.
+// page this installs: no `sampleCatalog` query, the canonical meta element.
 installBrowser({ hostEnabled: true });
 const tracker = await import('../assets/js/analytics/tracker.js');
 
@@ -140,6 +139,9 @@ test('a production page sends environment classes, then only declared events', (
     isTrusted: true,
     target: element({ parent: element({ id: 'analysis-header-genesPanel' }) }),
   });
+  // The two analyses added beside it are counted by their own variants.
+  click({ isTrusted: true, target: element({ id: 'analysis-header-dotplot' }) });
+  click({ isTrusted: true, target: element({ id: 'analysis-header-composition' }) });
   // A field select names dataset fields; only the fact of the change counts.
   change({
     isTrusted: true,
@@ -151,6 +153,8 @@ test('a production page sends environment classes, then only declared events', (
   assert.deepEqual(events(calls), [
     { name: 'feature_used', params: { feature: 'legend_highlight' } },
     { name: 'feature_used', params: { feature: 'analysis', variant: 'genes_panel' } },
+    { name: 'feature_used', params: { feature: 'analysis', variant: 'dotplot' } },
+    { name: 'feature_used', params: { feature: 'analysis', variant: 'composition' } },
     { name: 'feature_used', params: { feature: 'color_by_category' } },
     { name: 'feature_used', params: { feature: 'render_mode', variant: 'smoke' } },
   ]);
@@ -161,13 +165,14 @@ test('a production page sends environment classes, then only declared events', (
 test('a local dataset is described by shape only; a public sample keeps its id', () => {
   const { calls, errors } = installBrowser({ hostEnabled: true });
   tracker.trackDataLoad({
-    loadMethod: 'local-user-h5ad',
+    loadMethod: 'local-user-file',
     sourceType: 'local-user',
     outcome: 'success',
     durationMs: 3811.6,
     datasetId: LOCAL_METADATA.id,
     metadata: LOCAL_METADATA,
     stateStatus: 'ready',
+    dataFormat: 'loom',
   });
   tracker.trackDataLoad({
     loadMethod: 'dataset-dropdown',
@@ -182,8 +187,9 @@ test('a local dataset is described by shape only; a public sample keeps its id',
     {
       name: 'data_load',
       params: {
-        load_method: 'local-user-h5ad',
+        load_method: 'local-user-file',
         source_type: 'local-user',
+        data_format: 'loom',
         outcome: 'success',
         duration_ms: 3812,
         duration_bucket: '3-10s',
@@ -193,7 +199,6 @@ test('a local dataset is described by shape only; a public sample keeps its id',
         dimensions: '2+3',
         has_connectivity: 0,
         has_vector_field: 0,
-        data_version: '0.9.1',
         state_restore: 'none',
       },
     },

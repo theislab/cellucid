@@ -1,7 +1,7 @@
 /**
  * @fileoverview Vector field overlay UI controls.
  *
- * Wires the sidebar "Vector Field Overlay" controls to the GPU particle overlay in
+ * Wires the sidebar's Vector field block (Visualization panel) to the GPU particle overlay in
  * the Viewer. This is intentionally lazy:
  * - We do NOT instantiate the overlay until the user enables it.
  * - We do NOT load vector field data until the user enables it (or keeps it on
@@ -952,9 +952,9 @@ export function initVelocityOverlayControls(options) {
       }
       if (destroyed) return error;
       const secondaryFailures = [];
-      const collectFailure = (value, fallbackMessage) => {
+      const collectFailure = (value, defaultMessage) => {
         secondaryFailures.push(
-          value instanceof Error ? value : new Error(fallbackMessage)
+          value instanceof Error ? value : new Error(defaultMessage)
         );
       };
 

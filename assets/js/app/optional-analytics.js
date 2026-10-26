@@ -30,7 +30,7 @@ const QUEUE_LIMIT = 100;
 /**
  * @typedef {Object} DataLoadHandle
  * @property {(result: {datasetId: string|null, metadata: Object|null,
- *   stateStatus: string, mapping: {origin: string, embeddingCandidates: number, enabledRepresentations: number}|null}) => void} succeed
+ *   stateStatus: string, mapping: {origin: string, embeddingCandidates: number, enabledRepresentations: number, vectorFields: number}|null}) => void} succeed
  * @property {(error: unknown, context?: {datasetId?: string|null,
  *   metadata?: Object|null}) => void} fail
  * @property {() => void} cancel - superseded or abandoned: nothing is sent.
@@ -78,7 +78,7 @@ export function createOptionalAnalytics(loadModules) {
       return true;
     };
     const handle = Object.freeze({
-      succeed({ datasetId, metadata, stateStatus, mapping }) {
+      succeed({ datasetId, metadata, stateStatus, mapping, dataFormat = null }) {
         if (!settle()) return;
         const durationMs = performance.now() - startedAt;
         run(({ tracker }) => tracker.trackDataLoad({
@@ -90,6 +90,7 @@ export function createOptionalAnalytics(loadModules) {
           metadata,
           stateStatus,
           mapping,
+          dataFormat,
         }));
       },
       fail(error, {

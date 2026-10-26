@@ -18,6 +18,8 @@
  * @module ui/modules/figure-export/utils/overlay-fidelity
  */
 
+import { PLACES } from '../../../place-names.js';
+
 /** Element id of the control that owns the velocity overlay. */
 export const VELOCITY_OVERLAY_CONTROL_ID = 'velocity-overlay-enabled';
 
@@ -95,8 +97,8 @@ export function buildOverlayFidelityWarnings({
       detail:
         'The velocity vector field is enabled in the viewer, but figure export '
         + 'renders the point layer only, so the exported figure would omit the '
-        + 'flow the active view shows. Turn "Show overlay" off under Vector '
-        + 'Field Overlay before exporting.',
+        + 'flow the active view shows. Turn "Show overlay" off under '
+        + `${PLACES.vectorField.name} before exporting.`,
     });
   }
 

@@ -31,7 +31,7 @@ export type SemanticColorToken =
   | 'color-text-inverse' | 'color-text-disabled' | 'color-text-link' | 'color-text-link-hover'
   | 'color-border-strong' | 'color-border-default' | 'color-border-light'
   | 'color-border-focus' | 'color-border-error'
-  | 'color-border-subtle' | 'color-border-faint'
+  | 'color-border-subtle' | 'color-border-faint' | 'color-border-control'
   | 'color-interactive-primary' | 'color-interactive-primary-hover' | 'color-interactive-primary-active'
   | 'color-interactive-secondary' | 'color-interactive-secondary-hover' | 'color-interactive-secondary-active'
   | 'color-accent' | 'color-accent-strong' | 'color-accent-soft' | 'color-accent-text'
@@ -46,7 +46,7 @@ export type SpacingToken =
   | 'space-5' | 'space-6' | 'space-7' | 'space-8' | 'space-9'
   | 'space-10' | 'space-11' | 'space-12' | 'space-14' | 'space-16'
   | 'space-20' | 'space-24'
-  | 'sidebar-width' | 'sidebar-min-width' | 'sidebar-max-width'
+  | 'sidebar-width'
   | 'sidebar-toggle-width' | 'sidebar-toggle-height'
   | 'header-height' | 'accordion-default-width' | 'accordion-default-height';
 
@@ -58,25 +58,25 @@ export type BreakpointToken =
   | 'breakpoint-xl';
 
 export type TypographyToken =
-  | 'font-sans' | 'font-display' | 'font-mono'
-  | 'font-weight-regular' | 'font-weight-medium' | 'font-weight-semibold' | 'font-weight-bold'
-  | 'text-2xs' | 'text-xs' | 'text-sm' | 'text-md' | 'text-lg' | 'text-xl' | 'text-2xl' | 'text-3xl'
+  | 'font-sans' | 'font-mono'
+  | 'font-weight-regular' | 'font-weight-medium' | 'font-weight-semibold'
+  | 'text-xs' | 'text-sm' | 'text-md' | 'text-lg' | 'text-xl' | 'text-2xl' | 'text-3xl'
   | 'type-title' | 'type-heading' | 'type-body'
   | 'type-label' | 'type-control'
   | 'type-button' | 'type-hint' | 'type-readout' | 'type-compact'
-  | 'tracking-tight' | 'tracking-normal' | 'tracking-wide' | 'tracking-wider'
+  | 'tracking-tight' | 'tracking-normal'
   | 'leading-none' | 'leading-tight' | 'leading-normal' | 'leading-relaxed';
 
 export type BorderToken =
   | 'border-width-1' | 'border-width-2'
-  | 'border-strong' | 'border-default' | 'border-light'
+  | 'border-strong' | 'border-default' | 'border-light' | 'border-control'
   | 'radius-none' | 'radius-sm' | 'radius-md' | 'radius-lg' | 'radius-xl' | 'radius-2xl' | 'radius-full';
 
 export type ShadowToken =
   | 'shadow-rgb'
   | 'shadow-none'
   | 'shadow-xs' | 'shadow-sm' | 'shadow-md' | 'shadow-lg' | 'shadow-xl'
-  | 'shadow-soft-xs' | 'shadow-soft-sm' | 'shadow-soft-md' | 'shadow-soft-lg' | 'shadow-soft-xl';
+  | 'shadow-floating';
 
 export type TransitionToken =
   | 'duration-instant' | 'duration-fast' | 'duration-normal' | 'duration-slow' | 'duration-spin'
@@ -112,6 +112,8 @@ export type ControlToken =
   | 'control-switch-knob-size' | 'control-switch-inset'
   | 'control-slider-track-height' | 'control-slider-thumb-size' | 'control-slider-hit-height'
   | 'control-target-min' | 'control-row-min' | 'control-hit-extend'
+  | 'control-list-row-height'
+  | 'control-panel-summary-padding-y' | 'control-panel-summary-padding-x'
   | 'control-disabled-opacity';
 
 export type ThemeName = 'light' | 'dark';

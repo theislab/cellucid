@@ -13,13 +13,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=annotation-pane-field-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=annotation-pane-field-ci';
 
 // How long a gesture that did land may take to arm its tool before it counts
 // as dropped; see highlight-selection-feedback.spec.mjs.
@@ -45,7 +45,7 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 cells',
@@ -62,6 +62,8 @@ const canvasCursor = page => page.evaluate(
 );
 
 const MODE_DESCRIPTION = '#highlight-mode-description';
+// The active tool's gesture, or what it needs first: the Selection (i)'s first line.
+const TOOL_HINT = '#highlight-tool-hint';
 
 /** Focus as both owners publish it: the viewer's pane and the state's view. */
 const focusOf = page => page.evaluate(() => ({
@@ -70,7 +72,11 @@ const focusOf = page => page.evaluate(() => ({
 }));
 
 const unifiedState = page => page.evaluate(
-  () => window._cellucidViewer.getUnifiedSelectionState(),
+  () => {
+    // The candidates are a cell list (Uint32Array); hand them over as numbers.
+    const state = window._cellucidViewer.getUnifiedSelectionState();
+    return { ...state, candidates: Array.from(state.candidates) };
+  },
 );
 
 const legendRow = (page, name) => page.locator('.legend-item', {
@@ -334,10 +340,10 @@ test('Alt+click in a colored pane selects although the focused view has no field
 
   // One pane on screen has a field, so the panel invites a click rather than
   // asking for a field first.
-  await expect(page.locator(MODE_DESCRIPTION)).toContainText(
+  await expect(page.locator(TOOL_HINT)).toContainText(
     'Alt+click a cell to select',
   );
-  await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
+  await expect(page.locator(TOOL_HINT)).not.toContainText(
     'Color by a field first',
   );
 

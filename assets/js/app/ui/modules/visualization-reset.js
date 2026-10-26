@@ -15,6 +15,7 @@ import {
   POINT_SIZE_SLIDER_MAXIMUM,
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../../../rendering/point-size-scale.js';
+import { requireObjectRecord } from '../../../utils/exact-record.js';
 
 const EXACT_OPTION_KEYS = Object.freeze([
   'cameraControls',
@@ -115,15 +116,8 @@ const CAMERA_CONTROL_METHODS = Object.freeze([
 
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 
-function assertRecord(value, label) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError(`${label} must be an object.`);
-  }
-  return value;
-}
-
 function assertExactOptions(options) {
-  assertRecord(options, 'Visualization reset options');
+  requireObjectRecord(options, 'Visualization reset options');
   const actualKeys = Object.keys(options).sort();
   const hasWrongKeys = (
     actualKeys.length !== EXACT_OPTION_KEYS.length ||
@@ -138,7 +132,7 @@ function assertExactOptions(options) {
 }
 
 function requireValueElements(owner, keys, label) {
-  assertRecord(owner, label);
+  requireObjectRecord(owner, label);
   for (const key of keys) {
     const element = owner[key];
     if (element === null || typeof element !== 'object') {
@@ -160,7 +154,7 @@ function requireDisplayElements(owner, keys, label) {
 }
 
 function requireCheckboxElements(owner, keys, label) {
-  assertRecord(owner, label);
+  requireObjectRecord(owner, label);
   for (const key of keys) {
     const element = owner[key];
     if (element === null || typeof element !== 'object') {
@@ -184,7 +178,7 @@ function requireResetButton(cameraDom) {
 }
 
 function requireMethods(owner, methods, label) {
-  assertRecord(owner, label);
+  requireObjectRecord(owner, label);
   for (const method of methods) {
     if (typeof owner[method] !== 'function') {
       throw new TypeError(`${label} must provide ${method}().`);

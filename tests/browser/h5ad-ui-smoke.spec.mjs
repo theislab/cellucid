@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
+import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
+import { filePickerAccept } from '../../assets/js/data/input-formats.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
+import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import {
   readBundle,
 } from '../../assets/js/app/session/bundle/reader.js';
@@ -13,17 +15,14 @@ import {
 import {
   gzipDecompress,
 } from '../../assets/js/app/session/codecs/gzip.js';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL, appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
-  'core/field-overlays',
-  'core/state',
-  'ui/dockable-layout',
-  'analysis/windows',
-  'highlights/meta',
-]);
+const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
+  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
+);
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -35,14 +34,19 @@ const zarrFixturePath = path.join(
   'fixtures',
   'current-ui-smoke.zarr.zip',
 );
-const preparedFixturePath = path.join(
+// The one Zarr store folder of the browser tests: 48 cells on a 1-D
+// trajectory.
+const zarrFolderFixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
-  'exports',
-  'current-ui-prepared',
+  'forms-catalog',
+  'forms-zarr.zarr',
 );
-const preparedCatalogPath = path.join(
-  path.dirname(preparedFixturePath),
+const FORMS_CATALOG_URL = appUrl('/tests/browser/fixtures/forms-catalog/');
+const catalogPath = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'fixtures',
+  'catalog',
   'datasets.json',
 );
 
@@ -135,6 +139,8 @@ async function createPublishedDefaultBytes(genericBytes) {
   const published = writeBundle({
     manifest: {
       ...manifest,
+      // A published default is applied to the sample it ships beside.
+      source: null,
       chunks: selected.map(chunk => chunk.meta),
     },
     chunks: selected.map(chunk => chunk.bytes),
@@ -179,19 +185,19 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=browser-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=browser-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
 
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await chooseFiles(page.locator('#user-data-file-input'), fixturePath);
 
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
@@ -204,7 +210,7 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   expect(browserErrors).toEqual([]);
 });
 
-test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible controls', async ({ page }, testInfo) => {
+test('replaces Zarr folder, Zarr ZIP, and H5AD datasets through the visible controls', async ({ page, browserName }, testInfo) => {
   const browserErrors = [];
   page.on('console', message => {
     if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
@@ -219,26 +225,24 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=all-local-loaders-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=all-local-loaders-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
 
-  await expect(page.locator('#user-data-file-input')).toHaveAttribute('webkitdirectory', '');
-  await expect(page.locator('#user-data-h5ad-input')).toHaveAttribute('accept', '.h5ad');
-  await expect(page.locator('#user-data-zarr-archive-input')).toHaveAttribute(
-    'accept',
-    '.zarr.zip,.zip,application/zip',
-  );
+  await expect(page.locator('#user-data-folder-input')).toHaveAttribute('webkitdirectory', '');
+  // One file input takes every single-file format; what is picked decides.
+  // The list is the registry's (`input-formats-registry.test.mjs` pins it).
+  await expect(page.locator('#user-data-file-input')).toHaveAttribute('accept', filePickerAccept());
 
-  await page.locator('#user-data-zarr-archive-input').setInputFiles(zarrFixturePath);
+  await chooseFiles(page.locator('#user-data-file-input'), zarrFixturePath);
   // Completion is a four-second production notification. Observe that exact
   // operation boundary before performing independent UI and field work, which
   // can legitimately outlive the notification on a loaded hosted runner.
   await expectUserDataReadyNotification(page);
-  await expectFileInputCleared(page, '#user-data-zarr-archive-input');
+  await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await captureReadableDataset(
@@ -247,9 +251,9 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   );
   await dismissAllNotifications(page);
 
-  await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await chooseFiles(page.locator('#user-data-file-input'), fixturePath);
   await expectUserDataReadyNotification(page);
-  await expectFileInputCleared(page, '#user-data-h5ad-input');
+  await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await captureReadableDataset(
@@ -279,13 +283,13 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
     'true',
   );
 
-  await chooseDirectory(
-    page.locator('#user-data-file-input'),
-    preparedFixturePath,
-  );
-  await expectFileInputCleared(page, '#user-data-file-input');
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
-  await expect(page.locator('#notification-center .notification')).toHaveCount(0);
+  await openZarrFolder(page, browserName, zarrFolderFixturePath);
+  await expectUserDataReadyNotification(page);
+  await expectFileInputCleared(page, '#user-data-folder-input');
+  await expect(page.locator('#dataset-name')).toHaveText('Forms — Zarr folder');
+  await expect(page.locator('#dataset-cells')).toHaveText('48');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 48 cells');
+  await dismissAllNotifications(page);
 
   await captureReadableDataset(
     page,
@@ -312,12 +316,12 @@ test('saves and restores the exact current UI state through one file-input contr
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=session-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
@@ -353,7 +357,7 @@ test('saves and restores the exact current UI state through one file-input contr
   await expect(page.locator('#background-select')).toHaveValue('studio');
   await expect(page.locator('#point-size')).toHaveValue(savedPointSize);
   await expect(page.locator('#visualization-section')).toHaveAttribute('open', '');
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
@@ -375,12 +379,12 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-smoke-replay-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=session-smoke-replay-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -449,12 +453,12 @@ test('session restore catches a real control-owner failure and rolls back', asyn
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-control-owner-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=session-control-owner-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
 
   await page.locator('#cloud-resolution').evaluate(input => {
     input.value = '100';
@@ -515,7 +519,7 @@ test('session restore catches a real control-owner failure and rolls back', asyn
       () => window._cellucidViewer.getCloudResolutionScale(),
     ),
   ).toBe(rollbackScale);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
   expect(pageErrors).toEqual([]);
 });
 
@@ -532,16 +536,16 @@ test(
       browserErrors.push(`page: ${error.stack || error.message}`);
     });
 
+    // The forms catalog's Zarr folder dataset, whose categorical codes are
+    // one key (`obs/stage/codes/0`) that can be held.
     await page.goto(
-      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-field-owner-ci`,
+      `/?sampleCatalog=${encodeURIComponent(FORMS_CATALOG_URL)}&dataset=forms-zarr&acceptance=session-field-owner-ci`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
     await openCollapsedPanels(page);
-    await expectPlanarCurrentDataset(
-      page,
-      'Current UI prepared fixture',
-    );
+    await expect(page.locator('#dataset-name')).toHaveText('Forms — Zarr folder');
+    await expect(page.locator('#dataset-cells')).toHaveText('48');
 
     let releaseCodes;
     const codesGate = new Promise(resolve => {
@@ -549,7 +553,7 @@ test(
     });
     let codesRequests = 0;
     await page.route(
-      '**/tests/browser/fixtures/exports/current-ui-prepared/obs/1.codes.u8',
+      `${FORMS_CATALOG_URL}forms-zarr.zarr/obs/stage/codes/0`,
       async route => {
         codesRequests++;
         await codesGate;
@@ -558,9 +562,9 @@ test(
     );
 
     const field = page.locator('#categorical-field');
-    await field.selectOption({ label: 'cell_type' });
+    await field.selectOption({ label: 'stage' });
     await expect.poll(() => codesRequests).toBe(1);
-    await expect(field.locator('option:checked')).toHaveText('cell_type');
+    await expect(field.locator('option:checked')).toHaveText('stage');
 
     let downloadObserved = false;
     page.once('download', () => {
@@ -581,7 +585,7 @@ test(
     await download.saveAs(sessionPath);
     const coreState = await readCoreStatePayload(sessionPath);
     expect(coreState.activeFields).toEqual({
-      activeFieldKey: 'cell_type',
+      activeFieldKey: 'stage',
       activeFieldSource: 'obs',
     });
     expect(browserErrors).toEqual([]);
@@ -605,11 +609,11 @@ test('an advertised sample applies one verified static state without camera moti
   });
 
   const applicationUrl =
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=published-state-ci`;
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=published-state-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
   await colorByCellType(page);
   await page.locator('#point-size').fill('31');
   await page.locator('#point-size').dispatchEvent('input');
@@ -628,15 +632,16 @@ test('an advertised sample applies one verified static state without camera moti
     .digest('hex');
 
   const catalog = JSON.parse(
-    await readFile(preparedCatalogPath, 'utf8'),
+    await readFile(catalogPath, 'utf8'),
   );
-  catalog.datasets[0].state_manifest = 'state-snapshots.json';
-  catalog.datasets[0].state_sha256 = stateSha256;
-  catalog.datasets[0].state_bytes = stateBytes.byteLength;
-  let manifestRequests = 0;
+  catalog.datasets[0].session = {
+    path: 'current-ui.cellucid-session',
+    bytes: stateBytes.byteLength,
+    sha256: stateSha256,
+  };
   let stateRequests = 0;
   await page.route(
-    '**/tests/browser/fixtures/exports/datasets.json',
+    '**/tests/browser/fixtures/catalog/datasets.json',
     async route => {
       await route.fulfill({
         body: JSON.stringify(catalog),
@@ -646,20 +651,7 @@ test('an advertised sample applies one verified static state without camera moti
     },
   );
   await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json',
-    async route => {
-      manifestRequests++;
-      await route.fulfill({
-        body: JSON.stringify({
-          states: ['default.cellucid-session'],
-        }),
-        contentType: 'application/json',
-        status: 200,
-      });
-    },
-  );
-  await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/default.cellucid-session',
+    '**/tests/browser/fixtures/catalog/current-ui.cellucid-session',
     async route => {
       stateRequests++;
       await route.fulfill({
@@ -673,7 +665,7 @@ test('an advertised sample applies one verified static state without camera moti
   await page.reload({ waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
   await expect(
     page.locator('#categorical-field option:checked'),
   ).toHaveText('cell_type');
@@ -681,7 +673,6 @@ test('an advertised sample applies one verified static state without camera moti
   await expect(page.locator('#cinematic-camera-section')).not
     .toHaveAttribute('open', '');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
-  await expect.poll(() => manifestRequests).toBe(1);
   await expect.poll(() => stateRequests).toBe(1);
   expect(browserErrors).toEqual([]);
 });
@@ -712,11 +703,11 @@ test('a published no-vector sample replaces a prior vector-field select generati
   });
 
   const applicationUrl =
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=vector-state-replacement-ci`;
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=vector-state-replacement-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
 
   const downloadPromise = page.waitForEvent('download');
   await page.locator('#save-state-btn').click();
@@ -733,90 +724,37 @@ test('a published no-vector sample replaces a prior vector-field select generati
     .digest('hex');
 
   const catalog = JSON.parse(
-    await readFile(preparedCatalogPath, 'utf8'),
+    await readFile(catalogPath, 'utf8'),
   );
-  const preparedEntry = {
+  const sessionEntry = {
     ...catalog.datasets[0],
-    state_manifest: 'state-snapshots.json',
-    state_sha256: stateSha256,
-    state_bytes: stateBytes.byteLength,
-  };
-  const vectorEntry = {
-    ...catalog.datasets[0],
-    id: 'current-ui-vector',
-    name: 'Current UI vector fixture',
-    path: 'current-ui-vector/',
-  };
-  catalog.default = vectorEntry.id;
-  catalog.datasets = [vectorEntry, preparedEntry];
-
-  const identity = JSON.parse(
-    await readFile(
-      path.join(preparedFixturePath, 'dataset_identity.json'),
-      'utf8',
-    ),
-  );
-  identity.id = vectorEntry.id;
-  identity.name = vectorEntry.name;
-  identity.vector_fields = {
-    default_field: 'velocity_umap',
-    fields: {
-      velocity_umap: {
-        label: 'velocity_umap',
-        files: {
-          X_umap_2d: 'vectors/0_0.bin',
-        },
-      },
+    session: {
+      path: 'current-ui.cellucid-session',
+      bytes: stateBytes.byteLength,
+      sha256: stateSha256,
     },
   };
+  // The file beside the catalog that the same cells carry a vector field in
+  // (`scripts/generate-browser-catalog-fixtures.py`).
+  const vectorEntry = {
+    id: 'current-ui-vector',
+    path: 'current-ui-vector.h5ad',
+  };
+  catalog.default = vectorEntry.id;
+  catalog.datasets = [vectorEntry, sessionEntry];
 
   await page.route(
-    '**/tests/browser/fixtures/exports/datasets.json',
+    '**/tests/browser/fixtures/catalog/datasets.json',
     route => route.fulfill({
       body: JSON.stringify(catalog),
       contentType: 'application/json',
       status: 200,
     }),
   );
-  await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-vector/dataset_identity.json',
-    route => route.fulfill({
-      body: JSON.stringify(identity),
-      contentType: 'application/json',
-      status: 200,
-    }),
-  );
-  for (const filename of [
-    'obs_manifest.json',
-    'embeddings/0_2d.bin',
-    'var_manifest.json',
-  ]) {
-    await page.route(
-      `**/tests/browser/fixtures/exports/current-ui-vector/${filename}`,
-      route => route.fulfill({
-        path: path.join(preparedFixturePath, filename),
-        status: 200,
-      }),
-    );
-  }
 
-  let manifestRequests = 0;
   let stateRequests = 0;
   await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json',
-    route => {
-      manifestRequests++;
-      return route.fulfill({
-        body: JSON.stringify({
-          states: ['default.cellucid-session'],
-        }),
-        contentType: 'application/json',
-        status: 200,
-      });
-    },
-  );
-  await page.route(
-    '**/tests/browser/fixtures/exports/current-ui-prepared/default.cellucid-session',
+    '**/tests/browser/fixtures/catalog/current-ui.cellucid-session',
     route => {
       stateRequests++;
       return route.fulfill({
@@ -829,24 +767,23 @@ test('a published no-vector sample replaces a prior vector-field select generati
 
   await page.goto(
     applicationUrl.replace(
-      'dataset=current-ui-prepared',
+      'dataset=current-ui',
       'dataset=current-ui-vector',
     ),
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expectPlanarCurrentDataset(page, vectorEntry.name);
-  await expect(page.locator('#velocity-field')).toHaveValue('velocity_umap');
+  await expectPlanarCurrentDataset(page, 'Current UI vector fixture');
+  await expect(page.locator('#velocity-field')).toHaveValue('velocity');
   await expect(page.locator('#velocity-field option')).toHaveCount(1);
 
   await page.locator('#dataset-select').selectOption(
-    'dataset:local-demo:current-ui-prepared',
+    'dataset:local-demo:current-ui',
   );
-  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expectPlanarCurrentDataset(page, 'Current UI fixture');
   await expect(page.locator('#velocity-field')).toHaveValue('');
   await expect(page.locator('#velocity-field option')).toHaveCount(0);
-  await expect.poll(() => manifestRequests).toBe(1);
   await expect.poll(() => stateRequests).toBe(1);
   await expect(page.getByText(
     /published sample view could not be applied|Session UI select option/i,
@@ -873,12 +810,12 @@ test('camera path state round-trips every owned control and commits autoplay', a
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=camera-session-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=camera-session-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#cinematic-camera-section > summary').click();
   await page.locator('#cinematic-save-btn').click();
   await page.locator('#cinematic-save-btn').click();
@@ -1000,12 +937,12 @@ test('viewer controls reject invalid values atomically and persist one exact bac
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-contract-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=viewer-contract-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const outcome = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
@@ -1107,12 +1044,12 @@ test('viewer controls reject invalid values atomically and persist one exact bac
 
 test('viewer owns snapshot atomicity, exact identity, any number of snapshots, and smoke exclusion', async ({ page }) => {
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-snapshot-contract-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=viewer-snapshot-contract-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const outcome = await page.evaluate(() => {
     const viewer = window._cellucidViewer;

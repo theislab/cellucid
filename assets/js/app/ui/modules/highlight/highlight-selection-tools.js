@@ -20,12 +20,12 @@ import {
   pickSelectModeDom,
   requireCallback,
   requireDomElement,
-  requireExactKeys,
-  requireJupyterSource,
+  requireViewerHostSource,
   requireMethods,
   requireModeButtons,
-  SELECT_MODE_DOM_KEYS
+  SELECT_MODE_DOM_KEYS,
 } from './exact-contract.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 const REQUIRED_SELECTION_STATE_METHODS = Object.freeze([
   'addHighlightDirect',
@@ -78,7 +78,7 @@ const REQUIRED_SELECTION_VIEWER_METHODS = Object.freeze([
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
- * @param {any|null} [options.jupyterSource]
+ * @param {any|null} [options.viewerHostSource]
  * @param {object} [options.dom]
  * @param {HTMLElement|HTMLElement[]|null} [options.dom.modeButtons]
  * @param {HTMLElement|null} [options.dom.modeDescription]
@@ -91,7 +91,7 @@ export function initHighlightSelectionTools(options) {
     [
       'state',
       'viewer',
-      'jupyterSource',
+      'viewerHostSource',
       'dom',
       'renderHighlightSummary',
       'renderHighlightPages'
@@ -101,7 +101,7 @@ export function initHighlightSelectionTools(options) {
   const {
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     dom,
     renderHighlightSummary,
     renderHighlightPages
@@ -116,7 +116,7 @@ export function initHighlightSelectionTools(options) {
     'Highlight selection viewer',
     REQUIRED_SELECTION_VIEWER_METHODS
   );
-  requireJupyterSource(jupyterSource);
+  requireViewerHostSource(viewerHostSource);
   requireCallback(renderHighlightSummary, 'Highlight summary renderer');
   requireCallback(renderHighlightPages, 'Highlight pages renderer');
   requireExactKeys(
@@ -151,7 +151,7 @@ export function initHighlightSelectionTools(options) {
   const annotation = initAnnotationSelection({
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     selectionState,
     ui: {
       modeDescriptionEl: ui.modeDescriptionEl,
@@ -162,7 +162,7 @@ export function initHighlightSelectionTools(options) {
   const lasso = initLassoSelection({
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
@@ -170,7 +170,7 @@ export function initHighlightSelectionTools(options) {
   const proximity = initProximitySelection({
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
@@ -178,7 +178,7 @@ export function initHighlightSelectionTools(options) {
   const knn = initKnnSelection({
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });

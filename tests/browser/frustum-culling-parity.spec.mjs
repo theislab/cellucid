@@ -9,13 +9,14 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { pixelParityVerdict } from './helpers/pixel-parity.mjs';
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=frustum-culling-parity-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=frustum-culling-parity-ci';
 // Large enough that the spatial index splits the cloud into many leaves.
 const POINT_COUNT = 60_000;
 
@@ -25,15 +26,7 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
   test.setTimeout(300_000);
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await page.locator('#benchmark-section > summary').click();
-  await page.locator('#benchmark-count').fill(String(POINT_COUNT));
-  await page.locator('#benchmark-pattern').selectOption('atlas');
-  await page.locator('#benchmark-run').click();
-  await expect
-    .poll(() => page.evaluate(() => window._cellucidState.pointCount), {
-      timeout: 120_000,
-    })
-    .toBe(POINT_COUNT);
+  await loadSyntheticDataset(page, { pointCount: POINT_COUNT, pattern: 'atlas' });
 
   const result = await page.evaluate(async pointCount => {
     const viewer = window._cellucidViewer;

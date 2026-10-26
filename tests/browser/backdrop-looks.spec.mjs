@@ -50,7 +50,7 @@ async function openFixture(page) {
     cellCount: 3_000,
   });
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET_ID}`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -374,31 +374,92 @@ async function exportFigure(page, format) {
   return Buffer.concat(chunks);
 }
 
-test('figure export redraws the look under the points', async ({ page }) => {
+/** Distinct colours on a 7-pixel lattice over the middle of a PNG's plot area. */
+function plotAreaColours({ width, height, channels, pixels }) {
+  const values = new Set();
+  for (let y = Math.floor(height * 0.2); y < Math.floor(height * 0.8); y += 7) {
+    for (let x = Math.floor(width * 0.2); x < Math.floor(width * 0.7); x += 7) {
+      const at = (y * width + x) * channels;
+      values.add((pixels[at] << 16) | (pixels[at + 1] << 8) | pixels[at + 2]);
+    }
+  }
+  return values;
+}
+
+/**
+ * The share of the same lattice darker than 192 (mean of R, G and B): on a
+ * white paper the paper and its grid are lighter, the shaded spheres of the
+ * point pass are not. Measured over this fixture's figure: 0.16 (WebKit) and
+ * 0.12 (Chromium). The PNG Linux WebKit wrote while the composed figure
+ * reached the encoder as an ImageBitmap held no point and measured 0, while
+ * its blurred grid passed a count of more than five colours (it had 28).
+ */
+function plotAreaShadedShare({ width, height, channels, pixels }) {
+  let samples = 0;
+  let shaded = 0;
+  for (let y = Math.floor(height * 0.2); y < Math.floor(height * 0.8); y += 7) {
+    for (let x = Math.floor(width * 0.2); x < Math.floor(width * 0.7); x += 7) {
+      const at = (y * width + x) * channels;
+      samples += 1;
+      if (pixels[at] + pixels[at + 1] + pixels[at + 2] < 3 * 192) shaded += 1;
+    }
+  }
+  return shaded / samples;
+}
+
+/** Distinct colours of the look raster an SVG export embeds. */
+function svgLookColours(svg) {
+  const match = svg.match(
+    /<image class="cellucid-backdrop-look" [^>]*href="data:image\/png;base64,([A-Za-z0-9+/=]+)"/,
+  );
+  if (match === null) return null;
+  const look = decodePng(Buffer.from(match[1], 'base64'));
+  const values = new Set();
+  for (let y = 0; y < look.height; y += 7) {
+    for (let x = 0; x < look.width; x += 7) {
+      const at = (y * look.width + x) * look.channels;
+      values.add((look.pixels[at] << 16) | (look.pixels[at + 1] << 8) | look.pixels[at + 2]);
+    }
+  }
+  return values;
+}
+
+test('figure export redraws the look under the points', async ({ page }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await openFixture(page);
   await page.locator('#figure-export-section > summary').click();
   await page.getByRole('button', { name: /^Download\b/ }).click();
+  // Each exported file goes with a failure, so a PNG that lost a layer can be
+  // looked at; the checks below each name the layer they read.
+  const keep = (name, body, contentType) => testInfo.attach(name, { body, contentType });
+  // The point pass on its own, on a plain paper: the plot area holds points.
+  await setControl(page, 'figure-export-background', 'white');
+  const plainPngBytes = await exportFigure(page, 'png');
+  await keep('plain.png', plainPngBytes, 'image/png');
+  expect.soft(
+    plotAreaShadedShare(decodePng(plainPngBytes)),
+    'on white paper: the PNG plot area shows the shaded points',
+  ).toBeGreaterThan(0.05);
+  await setControl(page, 'figure-export-background', 'viewer');
   for (const [look, dimension] of [['nebula', 3], ['atelier', 2], ['abyss-dark', 3]]) {
     await setDimension(page, 'live', dimension);
     await showLook(page, look);
     const svg = (await exportFigure(page, 'svg')).toString('utf8');
+    await keep(`${look}.svg`, Buffer.from(svg, 'utf8'), 'image/svg+xml');
     expect(svg, `${look}: the SVG embeds the look`).toMatch(
       /<image class="cellucid-backdrop-look" [^>]*href="data:image\/png;base64,/,
     );
     // Under the points: the image comes before the first point.
     expect(svg.indexOf('cellucid-backdrop-look')).toBeLessThan(svg.indexOf('<circle'));
-    const png = decodePng(await exportFigure(page, 'png'));
+    // The look raster on its own, as the SVG carries it: it has structure.
+    expect.soft(svgLookColours(svg).size, `${look}: the look raster has structure`).toBeGreaterThan(20);
+    const pngBytes = await exportFigure(page, 'png');
+    await keep(`${look}.png`, pngBytes, 'image/png');
     // The plot area is not the plain surface: the look has structure there.
-    const { width, height, channels, pixels } = png;
-    const values = new Set();
-    for (let y = Math.floor(height * 0.2); y < Math.floor(height * 0.8); y += 7) {
-      for (let x = Math.floor(width * 0.2); x < Math.floor(width * 0.7); x += 7) {
-        const at = (y * width + x) * channels;
-        values.add((pixels[at] << 16) | (pixels[at + 1] << 8) | pixels[at + 2]);
-      }
-    }
-    expect(values.size, `${look}: the PNG plot area shows the look`).toBeGreaterThan(20);
+    expect(
+      plotAreaColours(decodePng(pngBytes)).size,
+      `${look}: the PNG plot area shows the look`,
+    ).toBeGreaterThan(20);
   }
   // On a white paper the figure keeps the paper it was asked for.
   await setControl(page, 'figure-export-background', 'white');

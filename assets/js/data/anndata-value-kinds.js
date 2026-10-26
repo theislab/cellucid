@@ -10,14 +10,14 @@
  */
 
 /**
- * Kinds admitted where values are coordinates or expression levels
- * (embeddings, dense X). A boolean is not a measurement there.
+ * Kinds admitted where values are coordinates (embeddings). A boolean is
+ * not a coordinate.
  */
 const NUMERIC_VALUE_KINDS = new Set(['float', 'int', 'uint']);
 
 /**
- * Kinds admitted for sparse matrix data and connectivity weights, where a
- * boolean adjacency is a 0/1 weight.
+ * Kinds admitted for expression matrices (dense or sparse) and connectivity
+ * weights, where a boolean (a mask, an adjacency) is a 0/1 value.
  */
 const MATRIX_DATA_KINDS = new Set(['float', 'int', 'uint', 'bool']);
 

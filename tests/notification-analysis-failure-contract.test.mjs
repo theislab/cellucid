@@ -10,7 +10,7 @@ import {
   formatBytes,
   formatCompactNumber,
   formatDuration,
-} from '../assets/js/app/notification-center/formatters.js';
+} from '../assets/js/utils/format-units.js';
 
 function createCancelButton() {
   const attributes = new Map();

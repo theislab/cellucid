@@ -9,16 +9,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  formatCells,
-  formatCompactCount,
-  formatCount,
-  formatCountOf,
-  formatDecimal,
-  formatMultiplier,
-  formatPercent,
-  formatWithUnit
-} from '../assets/js/app/ui/components/display-format.js';
+import { formatCompactCount, formatDecimal, formatMultiplier, formatPercent, formatWithUnit } from '../assets/js/app/ui/components/display-format.js';
+import { formatCells, formatCount, formatCountOf } from '../assets/js/utils/format-units.js';
 
 class FakeNode {
   constructor(tagName) {
@@ -182,7 +174,7 @@ test('switches, segments and disclosures carry their state in ARIA', () => {
     ['true', 'false']
   );
 
-  const disclosure = createDisclosure({ title: 'Performance settings', expanded: false });
+  const disclosure = createDisclosure({ title: 'Details', expanded: false });
   assert.equal(disclosure.header.getAttribute('aria-expanded'), 'false');
   assert.equal(disclosure.header.getAttribute('aria-controls'), disclosure.content.id);
   assert.equal(disclosure.content.hidden, true);
@@ -210,7 +202,8 @@ test('checkboxes, list rows and status lines are named and announced', () => {
   const row = createListItem({ text: 'cell_type: 2 of 3', enabled: false, noun: 'filter' });
   assert.equal(row.root.dataset.disabled, 'true');
   assert.equal(row.checkbox.getAttribute('aria-label'), 'Apply filter: cell_type: 2 of 3');
-  assert.equal(row.remove.getAttribute('aria-label'), 'Remove this filter');
+  assert.equal(row.remove.getAttribute('aria-label'), 'Remove filter: cell_type: 2 of 3');
+  assert.equal(row.remove.title, 'Remove this filter');
 
   const status = createStatusLine({ tone: 'danger', text: 'Failed.' });
   assert.equal(status.root.getAttribute('role'), 'status');

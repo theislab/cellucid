@@ -51,8 +51,9 @@ function mulberry32(seed) {
 }
 
 /**
- * Expression-shaped values: zero inflated and quantized to `levels` steps, the
- * shape every prepared export actually has (8-bit quantization, mostly zeros).
+ * Expression-shaped values: zero inflated and limited to `levels` distinct
+ * steps, the shape of count-derived expression (few distinct values, mostly
+ * zeros).
  */
 function quantizedValues(length, seed, { dropout = 0.7, levels = 256 } = {}) {
   const random = mulberry32(seed);
@@ -278,9 +279,11 @@ test('computeRanks equals mid-ranks by definition on both rank strategies', () =
     assert.ok(Object.is(actual[i], expected[i]), `continuous rank ${i}`);
   }
 
-  assert.deepEqual(computeRanks([]), []);
-  assert.deepEqual(computeRanks([5]), [1]);
-  assert.deepEqual(computeRanks([2, 2, 2, 2]), [2.5, 2.5, 2.5, 2.5]);
+  // Ranks are a typed array: no boxed number per value.
+  assert.ok(computeRanks([5]) instanceof Float64Array);
+  assert.deepEqual(Array.from(computeRanks([])), []);
+  assert.deepEqual(Array.from(computeRanks([5])), [1]);
+  assert.deepEqual(Array.from(computeRanks([2, 2, 2, 2])), [2.5, 2.5, 2.5, 2.5]);
 });
 
 test('sample moments equal the two-pass definition and drive Welch unchanged', () => {
@@ -601,28 +604,40 @@ test('signature median scores and their statistics equal the sort-based definiti
   const genes = Array.from({ length: 13 }, (_, g) => `GENE${g}`);
   const random = mulberry32(31);
   const cellIndices = Uint32Array.from({ length: cellCount }, (_, i) => i * 2);
-  const geneData = {};
-  for (const gene of genes) {
+  const pointCount = 2 * cellCount;
+  const pageValues = {};
+  const columns = [];
+  for (const [g, gene] of genes.entries()) {
     const values = quantizedValues(cellCount, Math.floor(random() * 1e9), { levels: 16 });
     // A few missing measurements, so the per-cell sample size varies.
     for (let i = 0; i < cellCount; i += 97) values[i] = NaN;
-    geneData[gene] = {
-      'page-A': { values, cellIndices, pageName: 'Page A', cellCount },
-    };
+    pageValues[gene] = values;
+    const column = new Float32Array(pointCount);
+    cellIndices.forEach((cell, i) => { column[cell] = values[i]; });
+    // Every other gene as its sparse entries.
+    if (g % 2 === 0) {
+      columns.push(column);
+    } else {
+      const indices = [];
+      for (let cell = 0; cell < pointCount; cell++) if (column[cell] !== 0) indices.push(cell);
+      columns.push({
+        length: pointCount,
+        indices: Uint32Array.from(indices),
+        values: Float32Array.from(indices, cell => column[cell]),
+      });
+    }
   }
 
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    getGeneExpressionSubset: async () => geneData,
-    clearBulkGeneCache() {},
+    state: { pointCount },
+    readGeneColumns: async () => columns,
+    getPageCells: pageIds => pageIds.map(pageId => ({ pageId, pageName: 'Page A', cellIndices })),
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  analysis._notifications = {
-    loading: () => 'n', complete() {}, fail() {}, dismiss() {},
-  };
-  const [result] = await analysis.computeSignatureScore({
-    genes,
+  const { sets: [{ pages: [result] }] } = await analysis.computeSignatureScore({
+    geneSets: [{ name: 'S', genes }],
     pageIds: ['page-A'],
     method: 'median',
   });
@@ -630,7 +645,7 @@ test('signature median scores and their statistics equal the sort-based definiti
   const expected = new Float32Array(cellCount);
   for (let cell = 0; cell < cellCount; cell++) {
     const sample = genes
-      .map(gene => geneData[gene]['page-A'].values[cell])
+      .map(gene => pageValues[gene][cell])
       .filter(Number.isFinite)
       .sort((a, b) => a - b);
     const middle = Math.floor(sample.length / 2);

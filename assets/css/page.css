@@ -1,0 +1,20 @@
+/* page.css - Entry point for the standalone pages (404.html, privacy.html,
+   terms.html, accessibility.html, assets/auth/callback.html).
+
+   The same layers, tokens, themes and base as main.css, and of the components
+   only the brand card these pages are built from. The app's panels, controls
+   and viewer styles are not loaded. layouts/_responsive.css comes along for
+   its coarse-pointer type step, so text on a phone is the size it is in the
+   app. Nothing here is page-specific: a rule a page needs goes in the shared
+   module, which the app's own copy of that surface uses too.
+*/
+
+@layer tokens, themes, base, utilities, components, layouts, overrides;
+
+@import 'tokens/_index.css' layer(tokens);
+@import 'themes/_index.css' layer(themes);
+@import 'base/_index.css' layer(base);
+
+@import 'components/_welcome.css' layer(components);
+@import 'layouts/_page.css' layer(layouts);
+@import 'layouts/_responsive.css' layer(layouts);

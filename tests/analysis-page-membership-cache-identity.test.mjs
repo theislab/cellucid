@@ -8,7 +8,7 @@
  * those samples down to `pageId@count`. Replacing almost every cell in a page
  * while keeping its cardinality therefore produced a byte-identical cache key,
  * and Correlation, Detailed Analysis, Quick Insights, Gene Signature, the
- * comparison module and the bulk-gene cache all served results computed over
+ * and the comparison module all served results computed over
  * the previous cell set.
  */
 
@@ -60,7 +60,6 @@ function keysFor(layer, pageIds = ['page_1']) {
       variableKey: 'BRCA1',
       pageIds,
     }),
-    bulkKey: layer._getBulkGeneCacheKey(pageIds),
   };
 }
 
@@ -135,11 +134,6 @@ test('a 100-cell page whose membership is replaced gets a different cache identi
     after.dataKey,
     'replacing 90 of 100 cells must change the analysis data cache key',
   );
-  assert.notEqual(
-    before.bulkKey,
-    after.bulkKey,
-    'replacing 90 of 100 cells must change the bulk-gene cache key',
-  );
 });
 
 test('a 1000-cell page keeps a distinct cache identity when 297 cells are swapped', t => {
@@ -160,7 +154,6 @@ test('a 1000-cell page keeps a distinct cache identity when 297 cells are swappe
   assert.equal(layer.getCellIndicesForPage('page_1').length, 1000);
   assert.notEqual(before.hash, after.hash);
   assert.notEqual(before.dataKey, after.dataKey);
-  assert.notEqual(before.bulkKey, after.bulkKey);
 });
 
 test('a single swapped cell changes the page cache identity', t => {
@@ -182,7 +175,6 @@ test('a single swapped cell changes the page cache identity', t => {
   assert.equal(layer.getCellIndicesForPage('page_1').length, 400);
   assert.notEqual(before.hash, after.hash);
   assert.notEqual(before.dataKey, after.dataKey);
-  assert.notEqual(before.bulkKey, after.bulkKey);
 });
 
 test('disabling one group and enabling a disjoint group of equal size changes the cache identity', t => {
@@ -208,7 +200,6 @@ test('disabling one group and enabling a disjoint group of equal size changes th
   assert.deepEqual(layer.getCellIndicesForPage('page_1'), [7, 8, 9]);
   assert.notEqual(before.hash, after.hash);
   assert.notEqual(before.dataKey, after.dataKey);
-  assert.notEqual(before.bulkKey, after.bulkKey);
 });
 
 test('a derived "rest of" page tracks its base page membership, not just its size', t => {
@@ -257,7 +248,6 @@ test('renaming a page changes its cache identity because results carry the page 
 
   assert.notEqual(before.hash, after.hash);
   assert.notEqual(before.dataKey, after.dataKey);
-  assert.notEqual(before.bulkKey, after.bulkKey);
 });
 
 test('page versions are stable when membership is unchanged', t => {
@@ -284,7 +274,6 @@ test('page versions are stable when membership is unchanged', t => {
     + 'must not invalidate a still-valid cached result',
   );
   assert.equal(first.dataKey, second.dataKey);
-  assert.equal(first.bulkKey, second.bulkKey);
 });
 
 test('page version components stay free of the cache key separators', t => {
@@ -297,9 +286,7 @@ test('page version components stay free of the cache key separators', t => {
     variableKey: 'BRCA1',
     pageIds: ['page_1'],
   });
-  const bulkKey = layer._getBulkGeneCacheKey(['page_1']);
-
-  for (const [label, key] of [['data', dataKey], ['bulk gene', bulkKey]]) {
+  for (const [label, key] of [['data', dataKey]]) {
     const parts = key.split(':');
     assert.equal(
       parts.at(-1).startsWith('v='),
@@ -314,7 +301,7 @@ test('page version components stay free of the cache key separators', t => {
   }
 });
 
-test('invalidatePages evicts both versioned cache families for a changed page', t => {
+test('invalidatePages evicts the versioned data cache entries of a changed page', t => {
   const pages = singleGroupPages([1, 2, 3]);
   const layer = makeLayer(pages);
   t.after(() => layer.destroy());
@@ -324,55 +311,25 @@ test('invalidatePages evicts both versioned cache families for a changed page', 
     variableKey: 'BRCA1',
     pageIds: ['page_1'],
   });
-  const bulkKey = layer._getBulkGeneCacheKey(['page_1']);
-
   layer._dataCache.set(dataKey, ['stale']);
-  layer._setBulkGeneCache(bulkKey, { data: {}, timestamp: Date.now(), geneCount: 0 });
 
   layer.invalidatePages(['page_1']);
 
   assert.equal(layer._dataCache.has(dataKey), false, 'versioned data key must be evicted');
-  assert.equal(layer._bulkGeneCache.has(bulkKey), false, 'versioned bulk key must be evicted');
 });
 
-test('bulk-gene results are not served for a page whose membership changed', async t => {
+test('whole-column computations read the current membership of a page', t => {
   const pages = singleGroupPages([1, 2, 3]);
   const layer = makeLayer(pages);
   t.after(() => layer.destroy());
 
-  const staleKey = layer._getBulkGeneCacheKey(['page_1']);
-  layer._setBulkGeneCache(staleKey, {
-    data: {
-      BRCA1: {
-        page_1: {
-          pageId: 'page_1',
-          pageName: 'Page 1',
-          values: Float32Array.from([1, 2, 3]),
-          cellIndices: Uint32Array.from([1, 2, 3]),
-          cellCount: 3,
-        },
-      },
-    },
-    timestamp: Date.now(),
-    geneCount: 1,
-  });
-
+  const [before] = layer.getPageCells(['page_1']);
+  assert.deepEqual(Array.from(before.cellIndices), [1, 2, 3]);
   // Same cardinality, entirely different cells.
   pages[0].highlightedGroups[0].cellIndices = [400, 500, 600];
-
-  const fetched = [];
-  layer.fetchBulkGeneExpression = async options => {
-    fetched.push(options);
-    return {};
-  };
-
-  await layer.getGeneExpressionSubset(['BRCA1'], ['page_1']);
-
-  assert.equal(
-    fetched.length,
-    1,
-    'the stale-membership bulk entry must not be served; a fresh fetch is required',
-  );
+  const [after] = layer.getPageCells(['page_1']);
+  assert.deepEqual(Array.from(after.cellIndices), [400, 500, 600]);
+  assert.equal(after.pageName, 'Page 1');
 });
 
 /** The membership definition, written out: union of enabled groups, sorted. */
@@ -466,4 +423,32 @@ test('indices outside the dataset are still reported, as before', t => {
   t.after(() => layer.destroy());
   assert.deepEqual(layer.getCellIndicesForPage('page_1'), [1, 2, POINT_COUNT + 3]);
   assert.equal(layer.getCellCountForPageId('page_1'), 3);
+});
+
+test('a page\'s count never copies its cells; its indices are built once, when read', t => {
+  // The page selectors count every page on every highlight change; copying a
+  // 5,000,000-cell selection into an array for that count cost 85 ms of the
+  // change at 10 million cells.
+  const cells = new Uint32Array(200_000);
+  for (let i = 0; i < cells.length; i++) cells[i] = i * 3;
+  const pages = [{
+    id: 'page_1',
+    name: 'Page 1',
+    highlightedGroups: [{ id: 'g', type: 'annotation', label: 'G', enabled: true, cellIndices: cells, cellCount: cells.length }],
+  }];
+  const layer = makeLayer(pages, 1_000_000);
+  const from = Array.from;
+  let copies = 0;
+  t.mock.method(Array, 'from', function counted(...args) {
+    copies++;
+    return Reflect.apply(from, this, args);
+  });
+  assert.equal(layer.getCellCountForPageId('page_1'), cells.length);
+  assert.equal(layer.getCellCountForPageId('page_1'), cells.length);
+  assert.equal(copies, 0, 'counting copies nothing');
+  const indices = layer.getCellIndicesForPage('page_1');
+  assert.equal(copies, 1, 'the first read builds the indices once');
+  assert.deepEqual(indices.slice(0, 3), [0, 3, 6]);
+  layer.getCellIndicesForPage('page_1');
+  assert.equal(copies, 1, 'and keeps them');
 });

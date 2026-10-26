@@ -4,7 +4,7 @@
  * @module ui/category-builder/intersections
  */
 
-import { formatCells } from '../components/display-format.js';
+import { formatCells } from '../../../utils/format-units.js';
 
 /**
  * Produce a default label for an intersection bitmask, e.g. "A & B".

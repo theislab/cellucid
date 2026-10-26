@@ -1,10 +1,5 @@
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
+import { onAbort } from '../formats/io/abort.js';
+import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 
 function isAbortSignal(value) {
   return Boolean(
@@ -42,15 +37,7 @@ export function validateAbortSignalOrNull(signal, label) {
  * @returns {AbortSignal|null}
  */
 export function getMetadataLoadSignal(options, label) {
-  if (!isPlainObject(options)) {
-    throw new TypeError(`${label} options must be an object`);
-  }
-  const unexpected = Object.keys(options).filter(key => key !== 'signal');
-  if (unexpected.length > 0) {
-    throw new TypeError(
-      `${label} options contain unexpected key(s): ${unexpected.join(', ')}`
-    );
-  }
+  requireKeys(options, [], ['signal'], `${label} options`);
   const signal = Object.hasOwn(options, 'signal')
     ? options.signal
     : null;
@@ -160,17 +147,15 @@ export function waitForMetadata(value, signal, label) {
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const cleanup = () => {
-      signal.removeEventListener('abort', onAbort);
-    };
-    const onAbort = () => {
+    let cleanup = () => {};
+    const abort = () => {
       if (settled) return;
       settled = true;
       cleanup();
       reject(createMetadataAbortError(label));
     };
 
-    signal.addEventListener('abort', onAbort, { once: true });
+    cleanup = onAbort(signal, abort);
     Promise.resolve(value).then(
       result => {
         if (settled) return;

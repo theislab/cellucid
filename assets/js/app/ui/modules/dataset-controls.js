@@ -2,10 +2,15 @@
  * @fileoverview Dataset selection and data-source connection UI.
  *
  * Handles:
- * - Dataset dropdown + metadata panel
- * - Local user data (prepared, h5ad, zarr)
- * - Remote server connect/disconnect
- * - GitHub repo connect/disconnect
+ * - The sample dataset dropdown, and the Dataset box (`dataset-card.js`),
+ *   which always describes the dataset that is open, or none
+ * - Local files and folders, a server and links (`dataset-connections.js`)
+ *
+ * The dropdown lists the datasets of one source: a connected catalog that
+ * holds several (named in its label, "Dataset from <host>"), else the
+ * samples. A dataset opened from a file, a single-dataset link or a server is
+ * not a choice there, so while one is open the dropdown shows "—" and the
+ * Dataset box names it. Disconnecting a catalog brings the samples back.
  *
  * This module is UI-only and calls back into the coordinator for dataset-wide
  * refresh hooks (field dropdowns, gene search, dimension options, etc.).
@@ -13,25 +18,38 @@
  * @module ui/modules/dataset-controls
  */
 
-import { validateDatasetIdentity } from '../../../data/data-source.js';
+import {
+  validateDatasetIdentity,
+  validateDatasetSummary
+} from '../../../data/data-source.js';
 import { formatCompactCount } from '../components/display-format.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { debug } from '../../../utils/debug.js';
 import { isDatasetReloadSupersededError } from '../../dataset-reload-outcome.js';
 import {
   classifyDataSourceFailure,
-  dataSourceFailureDetail,
+  dataSourceFailureDetails,
   describeDataSourceFailure,
   initDatasetConnections
 } from './dataset-connections.js';
+import { isPlainRecord, requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { countNoun } from '../../../utils/format-units.js';
 
 export const NONE_DATASET_VALUE = '__none__';
+/** What the dropdown shows while the open dataset is not one of its choices. */
+export const UNLISTED_DATASET_VALUE = '__dataset_unlisted__';
+const UNLISTED_DATASET_LABEL = '—';
+const OPENING_OPTION_SUFFIX = '· opening…';
+const CLOSING_DATASET_LABEL = 'Closing the dataset…';
+const SAMPLE_PICKER_LABEL = 'Sample dataset';
 
 const LOADING_DATASET_VALUE = '__catalog_loading__';
 // Stands in the select for a choice that has no catalog option yet — a file
 // being read, a connection opening its only dataset, the startup selection
 // before the catalog is listed — so the select always shows what is loading.
 const PENDING_DATASET_VALUE = '__dataset_pending__';
+/** Connections: their datasets are offered when they list several. */
+const CONNECTION_SOURCE_TYPES = new Set(['link', 'remote', 'jupyter']);
 const EMPTY_CATALOG_VALUE = '__catalog_empty__';
 const CATALOG_ERROR_VALUE = '__catalog_error__';
 const CATALOG_RETRY_LABEL = 'Try again';
@@ -49,8 +67,10 @@ const CATALOG_TOTAL_FAILURE_MESSAGE =
  * thing wherever the user meets it.
  */
 const SOURCE_DISPLAY_NAMES = {
-  'github-repo': 'GitHub data',
-  jupyter: 'Jupyter data',
+  // A host program's viewer is named after the program once its server says
+  // which (`hostSourceName`); this is the name before it has.
+  jupyter: 'Viewer data',
+  link: 'Linked data',
   'local-demo': 'Sample datasets',
   'local-user': 'Your data',
   remote: 'Remote server data'
@@ -60,6 +80,7 @@ const DATASET_CONTROL_KEYS = [
   'callbacks',
   'clearDataset',
   'dataSourceManager',
+  'datasetCard',
   'datasetChanges',
   'dom',
   'reloadDataset'
@@ -83,27 +104,19 @@ const DATASET_EVENT_KEYS = [
   'sourceType'
 ];
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function requirePlainObject(value, name) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${name} must be a plain object.`);
-  }
-  return value;
-}
-
 function requireNonEmptyString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new TypeError(`${name} must be a non-empty string.`);
   }
   return value;
 }
+
+/** The source type that opens each kind of recorded session source. */
+const RECORDED_SOURCE_TYPES = Object.freeze({
+  sample: 'local-demo',
+  link: 'link',
+  remote: 'remote'
+});
 
 function sourceDisplayName(sourceType) {
   requireNonEmptyString(sourceType, 'Dataset source type');
@@ -115,18 +128,6 @@ function sourceDisplayName(sourceType) {
 function formatSourceList(names) {
   if (names.length === 1) return names[0];
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
-}
-
-function requireExactKeys(value, expectedKeys, name) {
-  requirePlainObject(value, name);
-  const actual = Object.keys(value).sort();
-  const expected = [...expectedKeys].sort();
-  if (
-    actual.length !== expected.length ||
-    actual.some((key, index) => key !== expected[index])
-  ) {
-    throw new TypeError(`${name} must contain exactly: ${expected.join(', ')}.`);
-  }
 }
 
 function requireMethod(owner, methodName, name) {
@@ -151,8 +152,19 @@ function requireElement(element, name, methods = []) {
   return element;
 }
 
+/**
+ * What the dataset list shows about one dataset (`DatasetSummary`): a
+ * catalog's description of a file, or an open dataset's identity.
+ */
+function requireDatasetSummary(summary, sourceType, name) {
+  requirePlainRecord(summary, name);
+  requireNonEmptyString(sourceType, `${name} sourceType`);
+  validateDatasetSummary(summary, sourceType);
+  return summary;
+}
+
 function requireDatasetMetadata(metadata, sourceType, name) {
-  requirePlainObject(metadata, name);
+  requirePlainRecord(metadata, name);
   requireNonEmptyString(sourceType, `${name} sourceType`);
   requireNonEmptyString(metadata.id, `${name} id`);
   validateDatasetIdentity(metadata, metadata.id, sourceType);
@@ -239,7 +251,7 @@ function requireCatalog(catalog) {
       );
     }
     const datasets = record.datasets.map((metadata, datasetIndex) => {
-      requireDatasetMetadata(
+      requireDatasetSummary(
         metadata,
         record.sourceType,
         `Dataset catalog ${record.sourceType}[${datasetIndex}]`
@@ -284,12 +296,13 @@ export function initDatasetControls(options) {
   const {
     dom,
     dataSourceManager,
+    datasetCard,
     datasetChanges,
     clearDataset,
     reloadDataset,
     callbacks
   } = options;
-  requirePlainObject(dom, 'Dataset controls DOM');
+  requirePlainRecord(dom, 'Dataset controls DOM');
   requireExactKeys(callbacks, DATASET_CALLBACK_KEYS, 'Dataset control callbacks');
   for (const callbackName of DATASET_CALLBACK_KEYS) {
     if (typeof callbacks[callbackName] !== 'function') {
@@ -340,43 +353,20 @@ export function initDatasetControls(options) {
     showSessionStatus
   } = callbacks;
 
-  const {
-    select: datasetSelect,
-    info: datasetInfo,
-    nameEl: datasetNameEl,
-    sourceEl: datasetSourceEl,
-    descriptionEl: datasetDescriptionEl,
-    urlEl: datasetUrlEl,
-    cellsEl: datasetCellsEl,
-    genesEl: datasetGenesEl,
-    obsEl: datasetObsEl,
-    connectivityEl: datasetConnectivityEl,
-  } = dom;
+  const { select: datasetSelect } = dom;
   requireElement(datasetSelect, 'Dataset select', [
     'addEventListener',
     'appendChild',
     'replaceChildren'
   ]);
-  requireElement(datasetInfo, 'Dataset info');
-  if (
-    datasetInfo.classList === null ||
-    typeof datasetInfo.classList !== 'object' ||
-    typeof datasetInfo.classList.add !== 'function' ||
-    typeof datasetInfo.classList.remove !== 'function'
-  ) {
-    throw new TypeError('Dataset info must provide classList add/remove.');
-  }
-  for (const [name, element] of Object.entries({
-    datasetCellsEl,
-    datasetConnectivityEl,
-    datasetDescriptionEl,
-    datasetGenesEl,
-    datasetNameEl,
-    datasetObsEl,
-    datasetSourceEl,
-    datasetUrlEl
-  })) {
-    requireElement(element, name);
+  for (const method of [
+    'show',
+    'showLoading',
+    'showNone',
+    'refreshFacts',
+    'showLoadedConnectivityEdges'
+  ]) {
+    requireMethod(datasetCard, method, 'Dataset box');
   }
   const ownerDocument = datasetSelect.ownerDocument;
   if (
@@ -397,13 +387,23 @@ export function initDatasetControls(options) {
   const lifecycleController = new AbortController();
   const activeWork = new Set();
   let noneDatasetOption = null;
+  let unlistedDatasetOption = null;
   let catalogGeneration = 0;
   // The dataset choice these controls are presenting: the newest change the
   // user made here, while it loads. Null once it has settled.
   let activeDatasetSelectionIntent = null;
   let pendingDatasetOption = null;
+  // The catalog option of the dataset being opened: its label says so.
+  let openingDatasetOption = null;
   let datasetConnections = null;
   let catalogRetryInFlight = false;
+  // Whether the samples' files are read for the picker (their names and
+  // cell counts): from the start when no link or server is connected, else
+  // once the person reaches for the picker (`describeListedSamples`).
+  let samplesWanted = false;
+  // The samples the picker lists by their `datasets.json` entries only,
+  // while their files are not read; false once they are described.
+  let samplesListedAsEntries = false;
   // The operation the visible notice offers to repeat, or null when nothing
   // has failed. A notice without one would be an affordance that does nothing.
   let noticeRetry = null;
@@ -512,8 +512,11 @@ export function initDatasetControls(options) {
    */
   function presentPendingSelection() {
     const intent = activeDatasetSelectionIntent;
-    if (destroyed || intent === null || catalogIsPopulating()) return;
+    if (destroyed || intent === null) return;
+    datasetCard.showLoading(intent.pending.label);
+    if (catalogIsPopulating()) return;
     removePendingDatasetOption();
+    retireUnlistedDatasetOption();
     const option = intent.pending.value === null
       ? undefined
       : intent.pending.value === NONE_DATASET_VALUE
@@ -521,16 +524,18 @@ export function initDatasetControls(options) {
         : datasetOptionsByKey.get(intent.pending.value);
     if (option !== undefined) {
       datasetSelect.value = option.value;
+      markOpeningOption(option === noneDatasetOption ? null : option);
     } else {
+      markOpeningOption(null);
       pendingDatasetOption = ownerDocument.createElement('option');
       pendingDatasetOption.value = PENDING_DATASET_VALUE;
       pendingDatasetOption.disabled = true;
-      pendingDatasetOption.textContent = intent.pending.label;
+      // A file, a link or a server being opened is not a choice of the
+      // dropdown: it shows "—", and the Dataset box says what is opening.
+      pendingDatasetOption.textContent = UNLISTED_DATASET_LABEL;
       datasetSelect.appendChild(pendingDatasetOption);
       pendingDatasetOption.selected = true;
     }
-    datasetInfo.classList.remove('error');
-    datasetInfo.classList.add('loading');
   }
 
   /**
@@ -543,12 +548,10 @@ export function initDatasetControls(options) {
     intent.transaction.finish();
     if (destroyed || activeDatasetSelectionIntent !== intent) return;
     activeDatasetSelectionIntent = null;
+    markOpeningOption(null);
     const pendingWasShown = removePendingDatasetOption();
     if (catalogIsPopulating()) return;
-    if (!intent.transaction.isLatest()) {
-      synchronizeDatasetSelectToCurrent();
-      datasetInfo.classList.remove('loading');
-    } else if (pendingWasShown) {
+    if (!intent.transaction.isLatest() || pendingWasShown) {
       synchronizeDatasetSelectToCurrent();
     }
   }
@@ -576,25 +579,272 @@ export function initDatasetControls(options) {
     return noneDatasetOption;
   }
 
+  /**
+   * The sources whose datasets the dropdown offers. It lists one source at a
+   * time: a connected catalog that holds several datasets (a link, a
+   * server), else the samples. A file from this computer, or a connection
+   * that holds one dataset, is never a choice there: the Dataset box names it.
+   */
+  function pickerSourcesOf(records) {
+    const catalogs = records.filter(record =>
+      CONNECTION_SOURCE_TYPES.has(record.sourceType) && record.datasets.length > 1
+    );
+    if (catalogs.length > 0) return catalogs;
+    return records.filter(record =>
+      record.sourceType === 'local-demo' && record.datasets.length > 0
+    );
+  }
+
+  /** Name the dropdown by what it lists: the samples, or a catalog's host. */
+  function labelPicker(sources) {
+    const label = datasetSelect.labels?.[0] ?? null;
+    if (label === null) return;
+    const catalog = sources.find(record => record.sourceType !== 'local-demo');
+    const text = catalog === undefined
+      ? SAMPLE_PICKER_LABEL
+      : `Dataset from ${connectionName(catalog.sourceType)}`;
+    if (label.textContent !== text) label.textContent = text;
+  }
+
+  /**
+   * A source's name: a host program's viewer is named after the program
+   * ("R data", "Viewer host data", "Python data"), any other source as listed.
+   */
+  function hostSourceName(sourceType) {
+    const source = dataSourceManager.getSource(sourceType) ?? null;
+    const host = typeof source?.getHostLabel === 'function' ? source.getHostLabel() : null;
+    return typeof host === 'string' ? `${host} data` : sourceDisplayName(sourceType);
+  }
+
+  /** The host (or name) of one connected source, as the picker names it. */
+  function connectionName(sourceType) {
+    const info = dataSourceManager.getSource(sourceType)?.getConnectionInfo?.() ?? null;
+    const address = info?.baseUrl ?? info?.url ?? info?.locator ?? null;
+    if (typeof address === 'string') {
+      try {
+        return new URL(address).host;
+      } catch {
+        return address;
+      }
+    }
+    return hostSourceName(sourceType).toLowerCase();
+  }
+
+  function ensureUnlistedDatasetOption() {
+    if (unlistedDatasetOption === null) {
+      unlistedDatasetOption = ownerDocument.createElement('option');
+      unlistedDatasetOption.value = UNLISTED_DATASET_VALUE;
+      unlistedDatasetOption.disabled = true;
+      unlistedDatasetOption.textContent = UNLISTED_DATASET_LABEL;
+      datasetSelect.appendChild(unlistedDatasetOption);
+    }
+    return unlistedDatasetOption;
+  }
+
+  function retireUnlistedDatasetOption() {
+    if (unlistedDatasetOption === null) return;
+    unlistedDatasetOption.remove();
+    unlistedDatasetOption = null;
+  }
+
+  /**
+   * Show one open dataset in the dropdown: its own option, or "—" when the
+   * dropdown does not offer it.
+   */
+  function selectDatasetOption(sourceType, datasetId) {
+    const value = datasetSelectionValue(sourceType, datasetId);
+    if (datasetOptionsByKey.has(value)) {
+      retireUnlistedDatasetOption();
+      datasetSelect.value = value;
+      if (datasetSelect.value !== value) {
+        throw new Error(
+          `Dataset select could not represent "${sourceType}/${datasetId}".`
+        );
+      }
+      return;
+    }
+    ensureUnlistedDatasetOption();
+    datasetSelect.value = UNLISTED_DATASET_VALUE;
+    if (datasetSelect.value !== UNLISTED_DATASET_VALUE) {
+      throw new Error(
+        `Dataset select could not represent "${sourceType}/${datasetId}" as unlisted.`
+      );
+    }
+  }
+
   function createDatasetOption(metadata, sourceType) {
-    requireDatasetMetadata(metadata, sourceType, 'Dataset option metadata');
-    const value = datasetSelectionValue(sourceType, metadata.id);
+    requireDatasetSummary(metadata, sourceType, 'Dataset option metadata');
+    return createListedOption(
+      sourceType,
+      metadata.id,
+      metadata.name,
+      datasetOptionLabel(metadata)
+    );
+  }
+
+  /** What the picker says of one described dataset: its name and cell count. */
+  function datasetOptionLabel(metadata) {
+    return `${metadata.name} (${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')})`;
+  }
+
+  /**
+   * One entry of a catalog whose files are not described yet: its id and
+   * the name its path gives it, without counts.
+   */
+  function createCatalogEntryOption(entry, sourceType) {
+    requireExactKeys(entry, ['id', 'name'], 'Dataset catalog entry');
+    requireNonEmptyString(entry.id, 'Dataset catalog entry id');
+    requireNonEmptyString(entry.name, 'Dataset catalog entry name');
+    return createListedOption(sourceType, entry.id, entry.name, entry.name);
+  }
+
+  function createListedOption(sourceType, datasetId, name, label) {
+    const value = datasetSelectionValue(sourceType, datasetId);
     if (datasetOptionsByKey.has(value)) {
       throw new Error(
-        `Dataset option "${sourceType}/${metadata.id}" already exists.`
+        `Dataset option "${sourceType}/${datasetId}" already exists.`
       );
     }
     const option = ownerDocument.createElement('option');
     option.value = value;
     option.dataset.sourceType = sourceType;
-    option.dataset.datasetId = metadata.id;
+    option.dataset.datasetId = datasetId;
     // Kept apart from the label so a failure message can name the dataset
     // without the cell count the dropdown appends.
-    option.dataset.datasetName = metadata.name;
-    option.textContent =
-      `${metadata.name} (${formatCompactCount(metadata.stats.n_cells)} cells)`;
+    option.dataset.datasetName = name;
+    option.dataset.label = label;
+    option.textContent = label;
     datasetOptionsByKey.set(value, option);
     return option;
+  }
+
+  /** Label `option` (or none) as the dataset being opened. */
+  function markOpeningOption(option) {
+    if (openingDatasetOption === option) return;
+    if (openingDatasetOption !== null) {
+      openingDatasetOption.textContent = openingDatasetOption.dataset.label;
+    }
+    openingDatasetOption = option;
+    if (option !== null) {
+      option.textContent = `${option.dataset.label} ${OPENING_OPTION_SUFFIX}`;
+    }
+  }
+
+  /** The select's options are being replaced: forget the ones it held. */
+  function forgetDatasetOptions() {
+    datasetOptionsByKey.clear();
+    noneDatasetOption = null;
+    unlistedDatasetOption = null;
+    openingDatasetOption = null;
+  }
+
+  /** Whether a link or a server is connected (`CONNECTION_SOURCE_TYPES`). */
+  function hasConnection() {
+    for (const sourceType of CONNECTION_SOURCE_TYPES) {
+      if (dataSourceManager.getSource(sourceType)?.isConnected?.() === true) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The samples as `datasets.json` lists them, as one listing record
+   * (`{sourceType, datasets, error}`, the datasets `{id, name}` entries),
+   * or null when the page has no sample catalog.
+   */
+  async function listSampleEntries() {
+    const samples = dataSourceManager.getSource('local-demo');
+    if (typeof samples?.listCatalogEntries !== 'function') return null;
+    try {
+      if (!(await samples.isAvailable())) return null;
+      return { sourceType: 'local-demo', datasets: [...await samples.listCatalogEntries()], error: null };
+    } catch (error) {
+      return { sourceType: 'local-demo', datasets: [], error: errorFromUnknown(error, 'Sample catalog') };
+    }
+  }
+
+  /**
+   * The person reached for the picker while it lists the samples by their
+   * entries: their files are read now, and each option gains its name and
+   * cell count in place (the open list stays open). From now on every
+   * listing describes them.
+   */
+  async function describeListedSamples() {
+    if (samplesWanted) return;
+    samplesWanted = true;
+    if (!samplesListedAsEntries) return;
+    const generation = catalogGeneration;
+    const samples = dataSourceManager.getSource('local-demo');
+    let datasets;
+    try {
+      datasets = await samples.listDatasets();
+    } catch (error) {
+      if (!ownsCatalogGeneration(generation)) return;
+      setCatalogNotice(
+        describeFailedSources([{ sourceType: 'local-demo', datasets: [], error: errorFromUnknown(error, 'Sample catalog') }]),
+        retryCatalog
+      );
+      return;
+    }
+    if (!ownsCatalogGeneration(generation)) return;
+    samplesListedAsEntries = false;
+    for (const metadata of datasets) {
+      requireDatasetSummary(metadata, 'local-demo', 'Dataset option metadata');
+      const option = datasetOptionsByKey.get(datasetSelectionValue('local-demo', metadata.id));
+      if (option === undefined) continue;
+      const label = datasetOptionLabel(metadata);
+      option.dataset.datasetName = metadata.name;
+      option.dataset.label = label;
+      option.textContent = option === openingDatasetOption ? `${label} ${OPENING_OPTION_SUFFIX}` : label;
+    }
+  }
+
+  /**
+   * The sample catalog's files are read for the listing only once the
+   * dataset being opened has its first view, so list the entries
+   * `datasets.json` names meanwhile: the select offers them at once and says
+   * which one is opening. The full listing replaces them when it arrives.
+   */
+  async function presentCatalogEntries(generation) {
+    const samples = dataSourceManager.getSource('local-demo');
+    if (typeof samples?.listCatalogEntries !== 'function') return;
+    let entries;
+    try {
+      entries = await samples.listCatalogEntries();
+      // A connected catalog takes the picker (pickerSourcesOf).
+      for (const sourceType of CONNECTION_SOURCE_TYPES) {
+        const source = dataSourceManager.getSource(sourceType);
+        if (typeof source?.isAvailable === 'function' && await source.isAvailable()) {
+          return;
+        }
+      }
+    } catch {
+      // The full listing reports what failed.
+      return;
+    }
+    if (
+      !ownsCatalogGeneration(generation) ||
+      !catalogIsPopulating() ||
+      !Array.isArray(entries) ||
+      entries.length === 0
+    ) {
+      return;
+    }
+    labelPicker([{ sourceType: 'local-demo', datasets: entries }]);
+    datasetSelect.replaceChildren();
+    forgetDatasetOptions();
+    ensureNoneDatasetOption();
+    for (const entry of entries) {
+      datasetSelect.appendChild(createCatalogEntryOption(entry, 'local-demo'));
+    }
+    const currentId = dataSourceManager.getCurrentDatasetId();
+    const currentSourceType = dataSourceManager.getCurrentSourceType();
+    if (currentId === null) {
+      datasetSelect.value = NONE_DATASET_VALUE;
+    } else {
+      selectDatasetOption(currentSourceType, currentId);
+    }
+    datasetSelect.disabled = false;
+    presentPendingSelection();
   }
 
   // =========================================================================
@@ -617,13 +867,15 @@ export function initDatasetControls(options) {
   // that source's entry, so "Dataset list reloaded" is never shown for a
   // reload that did not happen. An unconfigured source has nothing to
   // refresh and resolves, so it stays silent here too.
-  const catalogNoticeMessageEl = ownerDocument.createElement('div');
+  const catalogNoticeMessageEl = ownerDocument.createElement('p');
+  catalogNoticeMessageEl.classList.add('dataset-notice-message');
   const catalogRetryButton = ownerDocument.createElement('button');
   catalogRetryButton.type = 'button';
-  catalogRetryButton.classList.add('btn', 'mt-1');
+  catalogRetryButton.classList.add('btn', 'btn-compact');
   catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
   const catalogNotice = ownerDocument.createElement('div');
-  catalogNotice.classList.add('dataset-info');
+  catalogNotice.id = 'dataset-notice';
+  catalogNotice.classList.add('dataset-notice');
   catalogNotice.setAttribute('role', 'status');
   catalogNotice.setAttribute('aria-live', 'polite');
   catalogNotice.hidden = true;
@@ -685,7 +937,7 @@ export function initDatasetControls(options) {
     for (const record of failed) {
       const cause = classifyDataSourceFailure(record.error);
       const group = byCause.get(cause);
-      const name = sourceDisplayName(record.sourceType);
+      const name = hostSourceName(record.sourceType);
       if (group === undefined) {
         byCause.set(cause, { error: record.error, names: [name] });
       } else {
@@ -740,94 +992,44 @@ export function initDatasetControls(options) {
 // =========================================================================
 
 /**
- * Update the dataset info display
+ * Show one dataset in the Dataset box, or None.
  * @param {Object|null} metadata - Dataset metadata
  */
 function updateDatasetInfo(metadata, sourceTypeOverride = null) {
-  const resetValues = () => {
-    datasetNameEl.textContent = '—';
-    datasetSourceEl.textContent = '—';
-    datasetDescriptionEl.textContent = '—';
-    datasetDescriptionEl.title = '—';
-    datasetUrlEl.textContent = '—';
-    datasetUrlEl.title = '—';
-    datasetCellsEl.textContent = '–';
-    datasetGenesEl.textContent = '–';
-    datasetObsEl.textContent = '–';
-    datasetConnectivityEl.textContent = '–';
-    datasetInfo.classList.remove('loading', 'error');
-  };
-
   if (metadata === null) {
     if (sourceTypeOverride !== null) {
       throw new TypeError(
         'Dataset sourceTypeOverride must be null for the None state.'
       );
     }
-    resetValues();
+    datasetCard.showNone();
     return;
   }
-
   const sourceType = sourceTypeOverride ??
     dataSourceManager.getCurrentSourceType();
   requireNonEmptyString(sourceType, 'Dataset info source type');
   requireDatasetMetadata(metadata, sourceType, 'Dataset info metadata');
-
-  const stats = metadata.stats;
-  const sourceTypeLabel = sourceType
-    .replace(/[-_]+/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-
-  // An explicitly declared dataset source name owns the display label;
-  // otherwise the registered source type owns it.
-  const sourceLabel = metadata.source === undefined
-    ? sourceTypeLabel
-    : metadata.source.name;
-
-  datasetNameEl.textContent = metadata.name;
-  datasetSourceEl.textContent = sourceLabel;
-  const description = metadata.description.length === 0
-    ? '—'
-    : metadata.description;
-  datasetDescriptionEl.textContent = description;
-  datasetDescriptionEl.title = description;
-  const url = metadata.source?.url ?? '—';
-  datasetUrlEl.textContent = url;
-  datasetUrlEl.title = url;
-  datasetCellsEl.textContent = formatCompactCount(stats.n_cells);
-  datasetGenesEl.textContent = formatCompactCount(stats.n_genes);
-  datasetObsEl.textContent = formatCompactCount(stats.n_obs_fields);
-  showConnectivityEdges(stats.has_connectivity ? stats.n_edges : null);
-  datasetInfo.classList.remove('loading', 'error');
+  datasetCard.show(metadata, sourceType);
 }
 
 /**
- * Show the edge count of the neighbour graph in use, or None.
- * @param {number|null} edges
- */
-function showConnectivityEdges(edges) {
-  datasetConnectivityEl.textContent = edges === null
-    ? 'None'
-    : `${formatCompactCount(edges)} edges`;
-}
-
-/**
- * Show the facts a data-mapping change can alter: the dataset's own facts
- * describe the mapping it opened with, and the neighbour graph and gene list
- * in use are whichever the mapping names now.
+ * The edges of the graph in use were read: an uncounted graph now shows its
+ * count.
  *
- * @param {{connectivityEdges: number|null, genes: number}} facts
+ * @param {number} edges
  */
-function updateMappedDatasetFacts({ connectivityEdges, genes }) {
+function showLoadedConnectivityEdges(edges) {
   assertAlive();
-  if (connectivityEdges !== null && !(Number.isSafeInteger(connectivityEdges) && connectivityEdges >= 0)) {
-    throw new TypeError('Connectivity edge count must be null or a non-negative integer.');
-  }
-  if (!Number.isSafeInteger(genes) || genes < 0) {
-    throw new TypeError('Gene count must be a non-negative integer.');
-  }
-  showConnectivityEdges(connectivityEdges);
-  datasetGenesEl.textContent = formatCompactCount(genes);
+  datasetCard.showLoadedConnectivityEdges(edges);
+}
+
+/**
+ * The data mapping changed what the dataset uses (its neighbour graph, gene
+ * list, latent space or vector fields): the Dataset box says so.
+ */
+function updateMappedDatasetFacts() {
+  assertAlive();
+  datasetCard.refreshFacts();
 }
 
 /**
@@ -862,7 +1064,7 @@ function refreshDatasetUI(metadata) {
  */
 async function populateDatasetDropdown(options = {}) {
   assertAlive();
-  requirePlainObject(options, 'Dataset catalog population options');
+  requirePlainRecord(options, 'Dataset catalog population options');
   const unsupportedOptions = Object.keys(options).filter(
     key => key !== 'refresh'
   );
@@ -886,8 +1088,7 @@ async function populateDatasetDropdown(options = {}) {
   loadingOption.selected = true;
   loadingOption.textContent = 'Loading datasets…';
   datasetSelect.replaceChildren(loadingOption);
-  datasetOptionsByKey.clear();
-  noneDatasetOption = null;
+  forgetDatasetOptions();
   datasetSelect.disabled = true;
   if (refresh) {
     markCatalogNoticeRetrying();
@@ -896,13 +1097,33 @@ async function populateDatasetDropdown(options = {}) {
   }
 
   try {
+    // A link or a server holds the dataset on screen: the samples' files
+    // are read only once the person reaches for the picker (or retries).
+    const deferSamples = !samplesWanted && !refresh &&
+      dataSourceManager.getCurrentSourceType() !== 'local-demo' && hasConnection();
     debug.log('[UI] Calling getAllDatasets...');
-    const allSourceDatasets = requireCatalog(await trackWork(
-      dataSourceManager.getAllDatasets({ refresh })
+    const listing = trackWork(dataSourceManager.getAllDatasets(
+      deferSamples ? { refresh, skip: ['local-demo'] } : { refresh }
     ));
+    if (!deferSamples) {
+      void trackWork(presentCatalogEntries(generation)).catch(error => {
+        console.error('[UI] Listing the catalog entries failed:', error);
+      });
+    }
+    const probed = requireCatalog(await listing);
     if (!ownsCatalogGeneration(generation)) {
       return Object.freeze({ status: 'superseded' });
     }
+    // Deferred, the samples are listed by their entries when the picker
+    // lists them at all (no connected catalog of several datasets).
+    const sampleEntries = deferSamples && pickerSourcesOf(probed).length === 0
+      ? await listSampleEntries()
+      : null;
+    if (!ownsCatalogGeneration(generation)) {
+      return Object.freeze({ status: 'superseded' });
+    }
+    samplesListedAsEntries = sampleEntries !== null && sampleEntries.datasets.length > 0;
+    const allSourceDatasets = sampleEntries === null ? probed : [...probed, sampleEntries];
 
     debug.log('[UI] getAllDatasets returned:', allSourceDatasets);
 
@@ -917,59 +1138,45 @@ async function populateDatasetDropdown(options = {}) {
       if (refresh) showSessionStatus(failureMessage, true);
     }
 
-    // Flatten and collect all datasets with their source type
-    const allDatasets = [];
-    for (const { sourceType, datasets } of allSourceDatasets) {
-      for (const dataset of datasets) {
-        allDatasets.push({ metadata: dataset, sourceType });
-      }
-    }
+    // The sources whose datasets the dropdown offers.
+    const listedSources = pickerSourcesOf(allSourceDatasets);
+    labelPicker(listedSources);
 
     datasetSelect.replaceChildren();
-    datasetOptionsByKey.clear();
-    noneDatasetOption = null;
+    forgetDatasetOptions();
 
     ensureNoneDatasetOption();
 
-    if (allDatasets.length === 0) {
+    if (listedSources.length === 0) {
       const emptyMsg = ownerDocument.createElement('option');
       emptyMsg.value = EMPTY_CATALOG_VALUE;
       emptyMsg.disabled = true;
       emptyMsg.textContent = 'No datasets found';
       datasetSelect.appendChild(emptyMsg);
-      datasetSelect.value = NONE_DATASET_VALUE;
-      datasetSelect.disabled = false;
-      updateDatasetInfo(null);
-      presentPendingSelection();
-      return Object.freeze({ status: 'ready' });
-    }
-
-    // Group by source type if there are multiple sources with data
-    const sourcesWithData = allSourceDatasets.filter(s => s.datasets.length > 0);
-    const useGroups = sourcesWithData.length > 1;
-
-    if (useGroups) {
-      // Create optgroups for each source
-      for (const { sourceType, datasets } of sourcesWithData) {
+    } else if (listedSources.length > 1) {
+      // One group per source when several offer datasets.
+      for (const { sourceType, datasets } of listedSources) {
         const group = ownerDocument.createElement('optgroup');
-        group.label = sourceDisplayName(sourceType);
-
+        group.label = hostSourceName(sourceType);
         for (const dataset of datasets) {
-          const option = createDatasetOption(dataset, sourceType);
-          group.appendChild(option);
+          group.appendChild(createDatasetOption(dataset, sourceType));
         }
-
         datasetSelect.appendChild(group);
       }
+    } else if (listedSources[0] === sampleEntries) {
+      for (const entry of sampleEntries.datasets) {
+        datasetSelect.appendChild(createCatalogEntryOption(entry, 'local-demo'));
+      }
     } else {
-      // Simple flat list
-      for (const { metadata, sourceType } of allDatasets) {
-        const option = createDatasetOption(metadata, sourceType);
-        datasetSelect.appendChild(option);
+      for (const dataset of listedSources[0].datasets) {
+        datasetSelect.appendChild(
+          createDatasetOption(dataset, listedSources[0].sourceType)
+        );
       }
     }
 
-    // Represent the exact active selection; no active dataset maps only to None.
+    // Represent the exact active selection: its option, "—" for an open
+    // dataset the dropdown does not offer, or None.
     const currentId = dataSourceManager.getCurrentDatasetId();
     const currentSourceType = dataSourceManager.getCurrentSourceType();
     const currentMetadata = dataSourceManager.getCurrentMetadata();
@@ -995,26 +1202,12 @@ async function populateDatasetDropdown(options = {}) {
           'Current dataset metadata id must equal the manager dataset id.'
         );
       }
-      const currentCatalogRecord = allDatasets.find(
-        record =>
-          record.sourceType === currentSourceType &&
-          record.metadata.id === currentId
-      );
-      if (currentCatalogRecord === undefined) {
-        throw new Error(
-          `Current dataset "${currentSourceType}/${currentId}" is absent from the active catalog.`
-        );
-      }
-      const currentSelectionValue = datasetSelectionValue(
-        currentSourceType,
-        currentId
-      );
-      datasetSelect.value = currentSelectionValue;
-      if (datasetSelect.value !== currentSelectionValue) {
-        throw new Error(
-          `Dataset select could not represent "${currentSourceType}/${currentId}".`
-        );
-      }
+      // The dataset on screen stays shown when its source could not be
+      // listed this time (a sample file that failed to read, while the
+      // notice above offers the retry), when its source was not asked
+      // (`deferSamples`), or when it was opened while the listing was read:
+      // it is the "—" option until a listing offers it.
+      selectDatasetOption(currentSourceType, currentId);
       updateDatasetInfo(currentMetadata, currentSourceType);
     } else {
       datasetSelect.value = NONE_DATASET_VALUE;
@@ -1037,19 +1230,20 @@ async function populateDatasetDropdown(options = {}) {
     errorOption.value = CATALOG_ERROR_VALUE;
     errorOption.disabled = true;
     errorOption.selected = true;
-    errorOption.textContent =
-      `Failed to load dataset catalog: ${exactError.message}`;
-    errorOption.title = errorOption.textContent;
+    errorOption.textContent = 'Dataset list unavailable';
     datasetSelect.replaceChildren(errorOption);
-    datasetOptionsByKey.clear();
-    noneDatasetOption = null;
+    forgetDatasetOptions();
     datasetSelect.disabled = true;
-    datasetInfo.classList.remove('loading');
-    datasetInfo.classList.add('error');
     // The whole enumeration failed, so the selector is empty and the only way
-    // back used to be a page reload. The notice carries the retry instead.
+    // back used to be a page reload. The notice carries the retry instead;
+    // the notification is one sentence, its raw error under Details.
     setCatalogNotice(CATALOG_TOTAL_FAILURE_MESSAGE, retryCatalog);
-    showSessionStatus(errorOption.textContent, true);
+    debug.error('[UI] The dataset list could not be loaded:', exactError);
+    showSessionStatus(
+      'The dataset list could not be loaded.',
+      true,
+      dataSourceFailureDetails(exactError)
+    );
     return Object.freeze({
       error: exactError,
       status: 'failed'
@@ -1078,28 +1272,28 @@ async function handleDatasetChangeForIntent(
     throw new TypeError('Dataset change startup must be a boolean.');
   }
 
-  // Choosing the dataset already on screen ends whatever load was replacing
-  // it: this intent's transaction has already superseded that load.
+  // Choosing the dataset already on screen from its registered source ends
+  // whatever load was replacing it: this intent's transaction has already
+  // superseded that load. A source the caller hands over (a file just
+  // picked, a connection just made) is a new opening even when its dataset
+  // states the id of the one on screen -- the same file picked again, or a
+  // newer copy of it -- so it is read and shown afresh.
   const currentId = dataSourceManager.getCurrentDatasetId();
   const currentSourceType = dataSourceManager.getCurrentSourceType();
-  if (currentId === datasetId && currentSourceType === sourceType) {
+  if (
+    sourceOverride === null &&
+    currentId === datasetId &&
+    currentSourceType === sourceType
+  ) {
     if (ownsDatasetSelectionIntent(intentOwner)) {
       synchronizeDatasetSelectToCurrent();
-      showSessionStatus('Dataset loaded', false);
     }
     return true;
   }
 
   let datasetReloaded = false;
   try {
-    datasetInfo.classList.remove('error');
-    datasetInfo.classList.add('loading');
-    datasetCellsEl.textContent = '…';
-    datasetGenesEl.textContent = '…';
 
-    // Startup's own progress is the positions notification; a status toast
-    // announcing a switch nobody asked for would be noise.
-    if (!startup) showSessionStatus('Switching dataset...', false);
 
     const source = sourceOverride ?? dataSourceManager.getSource(sourceType);
     if (source === null) {
@@ -1147,10 +1341,12 @@ async function handleDatasetChangeForIntent(
       return true;
     }
     updateDatasetInfo(metadata, sourceType);
-    datasetInfo.classList.remove('loading', 'error');
-    // A dataset is on screen, so no earlier failure is still true.
-    clearCatalogNotice();
-    if (!startup) showSessionStatus('Dataset loaded', false);
+    // A dataset is on screen, so no earlier failure to show one is still
+    // true; a source the list could not read is still missing from it, and
+    // its notice keeps the retry.
+    if (noticeRetry !== retryCatalog) clearCatalogNotice();
+    // How the change went is the opening progress's to say (its outcome
+    // notification): a toast here would say it twice.
     return true;
   } catch (error) {
     if (isDatasetReloadSupersededError(error)) {
@@ -1160,11 +1356,7 @@ async function handleDatasetChangeForIntent(
       return false;
     }
     const exactError = errorFromUnknown(error, 'Dataset switch');
-    datasetInfo.classList.remove('loading');
-    // A startup selection that fails is the terminal startup failure, which
-    // owns the whole explanation.
-    if (startup) throw exactError;
-    datasetInfo.classList.add('error');
+    // The Dataset box goes back to the dataset that is still open, or None.
     const activeMetadata = dataSourceManager.getCurrentMetadata();
     const activeSourceType = dataSourceManager.getCurrentSourceType();
     const activeDatasetId = dataSourceManager.getCurrentDatasetId();
@@ -1179,21 +1371,33 @@ async function handleDatasetChangeForIntent(
         'Active dataset metadata after switch failure'
       );
       updateDatasetInfo(activeMetadata, activeSourceType);
-      datasetInfo.classList.add('error');
+    } else {
+      updateDatasetInfo(null);
+    }
+    // A startup selection that fails is explained by startup (main.js): its
+    // opening says why over the empty viewer, or the startup failure screen
+    // does when the app itself failed. The select goes back to what is open,
+    // unless the listing still under way will.
+    if (startup) {
+      if (!catalogIsPopulating()) synchronizeDatasetSelectToCurrent();
+      throw exactError;
     }
     // The dataset itself arrived and only the address bar could not be
     // rewritten: nothing about the data is wrong, so it keeps its own wording
     // and offers no retry.
     if (datasetReloaded) {
+      debug.error('[UI] The page address could not be updated:', exactError);
       showSessionStatus(
-        `Dataset loaded, but URL state failed: ${exactError.message}`,
-        true
+        'The dataset opened, but the page address could not be updated.',
+        true,
+        dataSourceFailureDetails(exactError)
       );
       return false;
     }
-    debug.error('[UI] Dataset switch failed:', exactError);
+    debug.error(`[UI] Dataset switch failed: ${exactError.message}`, exactError);
+    const name = datasetDisplayName(sourceType, datasetId);
     const explanation = describeDataSourceFailure(
-      `"${datasetDisplayName(sourceType, datasetId)}"`,
+      `"${name}"`,
       'could not be opened',
       exactError
     ) + (
@@ -1203,15 +1407,17 @@ async function handleDatasetChangeForIntent(
     );
     // Persist the explanation next to the selector and offer the same dataset
     // again: a toast that fades leaves nothing behind to act on. The notice is
-    // a permanent fixture of the sidebar, so it carries no raw diagnostic —
-    // the notification and the console keep that.
+    // a permanent fixture of the sidebar, so it carries no raw diagnostic.
     setCatalogNotice(
       explanation,
       () => handleDatasetChange(datasetId, sourceType, loadMethod)
     );
+    // The one notification of the failure: one sentence, with the raw error
+    // under its Details (the console has it too). The opening only lets go.
     showSessionStatus(
-      explanation + dataSourceFailureDetail(exactError),
-      true
+      `Could not open "${name}".`,
+      true,
+      dataSourceFailureDetails(exactError)
     );
     return false;
   }
@@ -1333,9 +1539,6 @@ async function loadStartupDataset(selection) {
  */
 async function handleNoneDatasetSelectionForIntent(intentOwner) {
   try {
-    datasetInfo.classList.remove('error');
-    datasetInfo.classList.add('loading');
-    showSessionStatus('Clearing dataset...', false);
 
     const cleared = await trackWork(clearDataset(intentOwner.transaction));
     if (!ownsDatasetSelectionIntent(intentOwner)) {
@@ -1361,12 +1564,12 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
     }
     refreshDatasetUI(null);
     ensureNoneDatasetOption();
+    retireUnlistedDatasetOption();
     datasetSelect.value = NONE_DATASET_VALUE;
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
       throw new Error('Dataset select could not represent the None state.');
     }
     datasetSelect.disabled = false;
-    datasetInfo.classList.remove('loading', 'error');
     // The user asked for no dataset and got it, so a failed switch they walked
     // away from is no longer something to retry.
     clearCatalogNotice();
@@ -1380,11 +1583,11 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
       return false;
     }
     const exactError = errorFromUnknown(error, 'Dataset clear');
-    datasetInfo.classList.remove('loading');
-    datasetInfo.classList.add('error');
+    debug.error('[UI] The dataset could not be closed:', exactError);
     showSessionStatus(
-      `Failed to clear dataset: ${exactError.message}`,
-      true
+      'The dataset could not be closed.',
+      true,
+      dataSourceFailureDetails(exactError)
     );
     return false;
   }
@@ -1392,7 +1595,7 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
 
 async function handleNoneDatasetSelection() {
   const intent = beginDatasetSelectionIntent({
-    label: 'None',
+    label: CLOSING_DATASET_LABEL,
     value: NONE_DATASET_VALUE
   });
   return await runDatasetSelectionIntent(
@@ -1415,6 +1618,7 @@ function synchronizeDatasetEvent(rawEvent) {
 
   if (event.datasetId === null) {
     ensureNoneDatasetOption();
+    retireUnlistedDatasetOption();
     datasetSelect.value = NONE_DATASET_VALUE;
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
       throw new Error('Dataset select could not represent the None state.');
@@ -1423,22 +1627,11 @@ function synchronizeDatasetEvent(rawEvent) {
     return;
   }
 
-  const selectionValue = datasetSelectionValue(
-    event.sourceType,
-    event.datasetId
-  );
-  let option = datasetOptionsByKey.get(selectionValue);
-  if (option === undefined) {
-    option = createDatasetOption(event.metadata, event.sourceType);
-    datasetSelect.appendChild(option);
+  // A listing in progress selects the dataset itself when it finishes.
+  if (!catalogIsPopulating()) {
+    selectDatasetOption(event.sourceType, event.datasetId);
+    datasetSelect.disabled = false;
   }
-  datasetSelect.value = selectionValue;
-  if (datasetSelect.value !== selectionValue) {
-    throw new Error(
-      `Dataset select could not represent "${event.sourceType}/${event.datasetId}".`
-    );
-  }
-  datasetSelect.disabled = false;
   updateDatasetInfo(event.metadata, event.sourceType);
 }
 
@@ -1470,19 +1663,11 @@ function synchronizeDatasetSelectToCurrent() {
         'Active dataset metadata does not match its selected dataset id.'
       );
     }
-    const value = datasetSelectionValue(
-      activeSourceType,
-      activeDatasetId
-    );
     updateDatasetInfo(activeMetadata, activeSourceType);
-    datasetSelect.value = value;
-    if (datasetSelect.value !== value) {
-      throw new Error(
-        'Dataset select cannot represent the active dataset after reload.'
-      );
-    }
+    selectDatasetOption(activeSourceType, activeDatasetId);
   } else {
     ensureNoneDatasetOption();
+    retireUnlistedDatasetOption();
     updateDatasetInfo(null);
     datasetSelect.value = NONE_DATASET_VALUE;
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
@@ -1496,15 +1681,20 @@ function synchronizeDatasetSelectToCurrent() {
 
 function synchronizeTerminalDatasetSelectionFailure() {
   synchronizeDatasetSelectToCurrent();
-  datasetInfo.classList.add('error');
 }
 
 async function handleDatasetSelectEvent(event) {
   // The option the user picked is already showing, so it is what the select
   // presents while it loads.
+  const pickedValue = datasetSelect.value;
+  const pickedName = datasetSelect.selectedOptions?.[0]?.dataset?.datasetName;
   const intentOwner = beginDatasetSelectionIntent({
-    label: 'Loading…',
-    value: datasetSelect.value
+    label: pickedValue === NONE_DATASET_VALUE
+      ? CLOSING_DATASET_LABEL
+      : typeof pickedName === 'string' && pickedName.length > 0
+        ? `Loading ${pickedName}…`
+        : 'Loading…',
+    value: pickedValue
   });
   return await runDatasetSelectionIntent(
     intentOwner,
@@ -1555,6 +1745,7 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     }
     if (
       selectedValue === LOADING_DATASET_VALUE ||
+      selectedValue === UNLISTED_DATASET_VALUE ||
       selectedValue === EMPTY_CATALOG_VALUE ||
       selectedValue === CATALOG_ERROR_VALUE
     ) {
@@ -1592,7 +1783,6 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
       return;
     }
     if (isDatasetReloadSupersededError(error)) {
-      datasetInfo.classList.remove('loading', 'error');
       synchronizeDatasetSelectToCurrent();
       showSessionStatus(
         'A newer dataset selection is now active.',
@@ -1601,12 +1791,12 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
       return;
     }
     const exactError = errorFromUnknown(error, 'Dataset selection event');
-    datasetInfo.classList.remove('loading');
-    datasetInfo.classList.add('error');
     synchronizeTerminalDatasetSelectionFailure();
+    debug.error('[UI] A dataset choice could not be applied:', exactError);
     showSessionStatus(
-      `Dataset selection failed: ${exactError.message}`,
-      true
+      'That dataset choice could not be applied.',
+      true,
+      dataSourceFailureDetails(exactError)
     );
   }
 }
@@ -1655,6 +1845,20 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     handleDatasetSelectDomEvent,
     { signal: lifecycleController.signal }
   );
+  // Reaching for the picker (pointer, focus, keyboard) is what asks for the
+  // samples' files while a link or a server holds the dataset on screen.
+  for (const type of ['pointerdown', 'focus', 'keydown']) {
+    datasetSelect.addEventListener(
+      type,
+      () => {
+        if (destroyed || samplesWanted) return;
+        void invokeTracked(() => describeListedSamples()).catch(error => {
+          console.error('[UI] Describing the sample datasets failed:', error);
+        });
+      },
+      { signal: lifecycleController.signal }
+    );
+  }
   datasetConnections = initDatasetConnections({
     datasetIntents: Object.freeze({
       activate: (intent, ...args) =>
@@ -1732,17 +1936,59 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     return destroyPromise;
   }
 
+  /**
+   * Open the dataset a session file recorded (see
+   * `session/dataset-source-record.js`): a sample by its id, a data link or a
+   * server through its connection control, then the recorded dataset when
+   * the connection holds several.
+   *
+   * @param {{kind: 'sample'|'link'|'remote', dataset: string,
+   *   locator?: string, url?: string}} record
+   * @returns {Promise<boolean>} Whether that dataset is now open.
+   */
+  async function openDatasetSource(record) {
+    const sourceType = RECORDED_SOURCE_TYPES[record.kind];
+    if (sourceType === undefined) {
+      throw new TypeError(`Unknown recorded dataset source "${record.kind}".`);
+    }
+    const isOpen = () =>
+      dataSourceManager.getCurrentSourceType() === sourceType &&
+      dataSourceManager.getCurrentDatasetId() === record.dataset;
+    try {
+      if (sourceType !== 'local-demo') {
+        const connected = await datasetConnections.openConnection(
+          sourceType,
+          sourceType === 'link' ? record.locator : record.url
+        );
+        if (!connected) return false;
+        if (isOpen()) return true;
+      }
+      const ready = await handleDatasetChange(
+        record.dataset,
+        sourceType,
+        DATA_LOAD_METHODS.SESSION_SOURCE
+      );
+      return ready === true && isOpen();
+    } catch (error) {
+      if (isDatasetReloadSupersededError(error)) return false;
+      throw error;
+    }
+  }
+
   return {
     catalogReady,
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     destroy,
+    openDatasetSource: record =>
+      invokeTracked(() => openDatasetSource(record)),
     loadStartupDataset: selection =>
       invokeTracked(() => loadStartupDataset(selection)),
     populateDatasetDropdown: () =>
       invokeTracked(() => populateDatasetDropdown()),
     refreshDatasetUI,
     updateMappedDatasetFacts,
+    showLoadedConnectivityEdges,
     selectDataset: (...args) =>
       invokeTracked(() => handleDatasetChange(...args))
   };

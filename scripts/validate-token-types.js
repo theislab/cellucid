@@ -143,17 +143,24 @@ function collectTypeTokenNames() {
   return tokenNames;
 }
 
+// A failure sets process.exitCode and returns rather than calling
+// process.exit(): Node can deadlock in process.exit(), joining a V8 background
+// compile thread that waits for a garbage collection only the exiting main
+// thread could run (7 of 60 failing runs hung on Node 26.11; none of 120 with
+// exitCode), and the contract suite waited on such a run for over an hour.
 function main() {
   const defined = collectDefinedTokenNames();
   if (defined.size === 0) {
     console.error('[validate-token-types] No CSS token definitions found.'); // eslint-disable-line no-console
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const typed = collectTypeTokenNames();
   if (typed.size === 0) {
     console.error('[validate-token-types] No token names found in types/design-tokens.d.ts.'); // eslint-disable-line no-console
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const missingInTypes = Array.from(defined).filter((name) => !typed.has(name)).sort();
@@ -169,7 +176,8 @@ function main() {
       console.error(`- Extra in ${path.relative(PROJECT_ROOT, TYPES_FILE)} (${extraInTypes.length}):`); // eslint-disable-line no-console
       for (const name of extraInTypes) console.error(`  - ${name}`); // eslint-disable-line no-console
     }
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   console.log(`[validate-token-types] OK (${defined.size} tokens)`); // eslint-disable-line no-console

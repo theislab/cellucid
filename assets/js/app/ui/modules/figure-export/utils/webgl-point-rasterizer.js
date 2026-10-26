@@ -31,13 +31,22 @@
  * startup; the viewer's own control measures the difference at 18% of pixels at
  * point size 0.75 and 32% with ultra-light square points.
  *
- * CROSS-BROWSER NOTES:
- * - Uses one HTMLCanvasElement WebGL2 backend in every supported browser
- * - preserveDrawingBuffer is enabled for reliable HTMLCanvasElement.toBlob
+ * WHERE IT RUNS:
+ * In the figure-export worker's handler (`figure-export-worker.js`), on
+ * OffscreenCanvas WebGL2 contexts that thread owns. A pass returns its frame
+ * as an ImageBitmap (`transferToImageBitmap`), which the page composites or
+ * the worker encodes. The handler runs in the module worker wherever a worker
+ * can create a WebGL2 context, so packing, upload and drawing never occupy
+ * the page's main thread; where it cannot (WebKitGTK and WPE have no WebGL
+ * in workers, https://bugs.webkit.org/show_bug.cgi?id=209809, nor did Safari
+ * 16.4-16.6, or 17.0-17.1 on macOS Ventura,
+ * https://bugs.webkit.org/show_bug.cgi?id=183720), the same
+ * handler draws on the page (`figure-export-worker-client.js`,
+ * `webgl2RasterAvailable`).
  *
  * ISOLATION:
- * This module is only invoked during export/preview and does not touch the
- * normal render loop. It creates temporary WebGL resources and cleans them up.
+ * This module is only invoked during export and does not touch the normal
+ * render loop. It creates temporary WebGL resources and cleans them up.
  *
  * @module ui/modules/figure-export/utils/webgl-point-rasterizer
  */
@@ -45,6 +54,8 @@
 import {
   configureStraightAlphaBlending,
   createProgram,
+  deleteProgramReleasingUse,
+  deleteTextureTracked,
   drawPointsInSegments,
 } from '../../../../../rendering/gl-utils.js';
 import {
@@ -180,38 +191,17 @@ function buildHighlightOverlayBuffers({
  */
 
 /**
- * Create the single browser canvas backend used for WebGL rasterization.
- * @param {number} width
- * @param {number} height
- * @returns {HTMLCanvasElement}
- */
-function createRasterCanvas() {
-  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-    throw new Error(
-      'Figure-export WebGL2 rasterization requires the browser document canvas backend.'
-    );
-  }
-  const canvas = document.createElement('canvas');
-  // Establish a minimal drawing buffer first so hardware limits can be
-  // checked before attempting the requested export allocation.
-  canvas.width = 1;
-  canvas.height = 1;
-  return canvas;
-}
-
-/**
- * The export's WebGL2 contexts, kept for the page's lifetime and reused by
- * every raster pass: one per antialiasing setting, plus one more for each
- * pass that overlaps another (a canvas is leased from the rasterization that
- * draws it until `releaseWebglRasterCanvas`). Creating and losing a context
- * for every pass made WebKitGTK/WPE abort the web process on a GL call with no
- * current context during the teardown, and costs a context creation and a
+ * The export's WebGL2 contexts, one per antialiasing setting, kept for the
+ * worker's lifetime and reused by every raster pass. A pass is synchronous, so
+ * no two passes ever share a context at once; after each one the canvas
+ * shrinks to one pixel, so an export-sized buffer is not kept. Creating and
+ * losing a context for every pass made WebKitGTK/WPE abort on a GL call with
+ * no current context during the teardown, and costs a context creation and a
  * shader compile per pass everywhere.
  *
- * @type {Array<{canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, antialias: boolean, leased: boolean}>}
+ * @type {Map<boolean, {canvas: OffscreenCanvas, gl: WebGL2RenderingContext}>}
  */
-const rasterContextPool = [];
-const rasterContextOwners = new WeakMap();
+const rasterContexts = new Map();
 
 /**
  * Put a reused context back into the state a new context starts in, for every
@@ -236,35 +226,38 @@ function resetRasterState(gl) {
 }
 
 /**
- * Lease a raster canvas and its context for one pass.
+ * The raster canvas and context for one pass.
  * @param {boolean} antialias
- * @returns {{canvas: HTMLCanvasElement, gl: WebGL2RenderingContext}}
+ * @returns {{canvas: OffscreenCanvas, gl: WebGL2RenderingContext}}
  */
-function leaseRasterContext(antialias) {
-  for (const entry of rasterContextPool) {
-    if (entry.antialias === antialias && !entry.leased && !entry.gl.isContextLost()) {
-      entry.leased = true;
-      resetRasterState(entry.gl);
-      return entry;
-    }
+function acquireRasterContext(antialias) {
+  const existing = rasterContexts.get(antialias);
+  if (existing !== undefined && !existing.gl.isContextLost()) {
+    resetRasterState(existing.gl);
+    return existing;
   }
-  const canvas = createRasterCanvas();
+  if (typeof OffscreenCanvas !== 'function') {
+    throw new Error(
+      'Figure-export WebGL2 rasterization requires OffscreenCanvas.'
+    );
+  }
+  // A minimal drawing buffer first, so hardware limits can be checked before
+  // the requested export allocation is attempted.
+  const canvas = new OffscreenCanvas(1, 1);
   const gl = getWebgl2Context(canvas, antialias);
-  const entry = { canvas, gl, antialias, leased: true };
-  rasterContextPool.push(entry);
-  rasterContextOwners.set(canvas, entry);
+  const entry = { canvas, gl };
+  rasterContexts.set(antialias, entry);
   return entry;
 }
 
 /**
- * @param {HTMLCanvasElement} canvas
+ * @param {OffscreenCanvas} canvas
  * @param {boolean} antialias - the multisampling the viewer's buffer has
  * @returns {WebGL2RenderingContext}
  */
 function getWebgl2Context(canvas, antialias) {
   let gl;
   try {
-    // preserveDrawingBuffer is important for reliable HTMLCanvasElement.toBlob across browsers.
     gl = canvas.getContext('webgl2', {
       alpha: true,
       // Multisampling is a property of the drawing buffer the user is looking
@@ -277,7 +270,9 @@ function getWebgl2Context(canvas, antialias) {
       // Publish that exact ownership to canvas compositing and PNG encoding;
       // declaring the buffer unpremultiplied would apply alpha a second time.
       premultipliedAlpha: true,
-      preserveDrawingBuffer: true,
+      // The frame leaves by `transferToImageBitmap`, which resolves and hands
+      // over the drawing buffer; nothing reads it afterwards.
+      preserveDrawingBuffer: false,
       powerPreference: 'high-performance'
     });
   } catch (error) {
@@ -293,21 +288,25 @@ function getWebgl2Context(canvas, antialias) {
 }
 
 /**
- * Return a raster canvas to the pool after its pixels have been copied: its
- * drawing buffer shrinks to one pixel (an export-sized buffer is not kept)
- * and its context stays for the next pass. Returns whether the canvas was
- * leased; a second release of the same lease returns false.
+ * Whether this thread can draw an export: an OffscreenCanvas with a WebGL2
+ * context. Measured once by the figure-export worker client, which draws on
+ * the page where a worker cannot.
  *
- * @param {HTMLCanvasElement} canvas
  * @returns {boolean}
  */
-export function releaseWebglRasterCanvas(canvas) {
-  const entry = rasterContextOwners.get(canvas);
-  if (entry === undefined || !entry.leased) return false;
-  entry.leased = false;
+export function webgl2RasterAvailable() {
+  try {
+    acquireRasterContext(false);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Shrink a raster canvas after its pass: an export-sized buffer is not kept. */
+function shrinkRasterCanvas(canvas) {
   canvas.width = 1;
   canvas.height = 1;
-  return true;
 }
 
 // Viewer sprites are clamped at this many pixels (HP_VS_*: u_pointSizeMax
@@ -321,24 +320,20 @@ let spriteZoomLimit = null;
  * sprite the viewer can draw still fits this GPU's point-size range
  * (`ALIASED_POINT_SIZE_RANGE`): a 128-pixel viewer sprite drawn larger than
  * the driver allows would be clamped smaller than the view it reproduces.
- * Read once, from a pooled export context.
+ * Read once, from the export context of the thread that draws.
  *
  * @returns {number}
  */
 export function exportSpriteZoomLimit() {
   if (spriteZoomLimit !== null) return spriteZoomLimit;
-  const entry = leaseRasterContext(false);
-  try {
-    const range = entry.gl.getParameter(entry.gl.ALIASED_POINT_SIZE_RANGE);
-    const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
-      ? Number(range[1])
-      : Number.NaN;
-    spriteZoomLimit = Number.isFinite(driverMax) && driverMax > 0
-      ? Math.max(1, driverMax / VIEWER_POINT_SIZE_MAX)
-      : 1;
-  } finally {
-    releaseWebglRasterCanvas(entry.canvas);
-  }
+  const { gl } = acquireRasterContext(false);
+  const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+  const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
+    ? Number(range[1])
+    : Number.NaN;
+  spriteZoomLimit = Number.isFinite(driverMax) && driverMax > 0
+    ? Math.max(1, driverMax / VIEWER_POINT_SIZE_MAX)
+    : 1;
   return spriteZoomLimit;
 }
 
@@ -581,7 +576,8 @@ function packBuffers({
  *   drawn at its own pixels rather than a magnified part of the whole view.
  *   The caller sizes the output to the rectangle's aspect and scales point
  *   sizes by the same zoom. Null draws the whole viewport, letterboxed.
- * @returns {HTMLCanvasElement}
+ * @returns {ImageBitmap} The frame, `outputWidthPx` × `outputHeightPx`, with
+ *   premultiplied alpha; the caller owns it and closes it.
  */
 /**
  * The largest sprite this export may ask the shader to draw.
@@ -760,18 +756,11 @@ export function rasterizePointsWebgl({
   });
   const outW = outputWidthPx;
   const outH = outputHeightPx;
-  const { canvas, gl } = leaseRasterContext(renderState.antialias);
+  const { canvas, gl } = acquireRasterContext(renderState.antialias);
   try {
     configureExactDrawingBuffer(gl, canvas, outW, outH);
   } catch (error) {
-    try {
-      releaseWebglRasterCanvas(canvas);
-    } catch (releaseError) {
-      throw new AggregateError(
-        [error, releaseError],
-        'Figure-export drawing-buffer allocation and context release failed.'
-      );
-    }
+    shrinkRasterCanvas(canvas);
     throw error;
   }
 
@@ -1152,26 +1141,29 @@ export function rasterizePointsWebgl({
   if (overlayColorBuffer) cleanup('overlay-color-buffer deletion', () => gl.deleteBuffer(overlayColorBuffer));
   if (highlightPosBuffer) cleanup('highlight-position-buffer deletion', () => gl.deleteBuffer(highlightPosBuffer));
   if (highlightColorBuffer) cleanup('highlight-color-buffer deletion', () => gl.deleteBuffer(highlightColorBuffer));
-  if (dummyAlphaTex) cleanup('alpha-texture deletion', () => gl.deleteTexture(dummyAlphaTex));
-  if (dummyLodIndexTex) cleanup('LOD-index-texture deletion', () => gl.deleteTexture(dummyLodIndexTex));
-  cleanup('program unbind', () => gl.useProgram(null));
-  if (highlightProgram) cleanup('highlight-program deletion', () => gl.deleteProgram(highlightProgram));
-  if (program) cleanup('point-program deletion', () => gl.deleteProgram(program));
+  if (dummyAlphaTex) cleanup('alpha-texture deletion', () => deleteTextureTracked(gl, dummyAlphaTex));
+  if (dummyLodIndexTex) cleanup('LOD-index-texture deletion', () => deleteTextureTracked(gl, dummyLodIndexTex));
+  if (highlightProgram) cleanup('highlight-program deletion', () => deleteProgramReleasingUse(gl, highlightProgram));
+  if (program) cleanup('point-program deletion', () => deleteProgramReleasingUse(gl, program));
 
   const failures = [
     ...(rasterizationError ? [rasterizationError] : []),
     ...cleanupErrors,
   ];
-  if (failures.length > 0) {
+  let frame = null;
+  if (failures.length === 0) {
     try {
-      releaseWebglRasterCanvas(canvas);
+      // Resolves multisampling and hands the drawing buffer over: the frame
+      // is not copied, and the canvas starts its next pass empty.
+      frame = canvas.transferToImageBitmap();
     } catch (error) {
       failures.push(new Error(
-        `Figure-export WebGL2 context release failed: ${error.message}`,
+        `Figure-export WebGL2 frame transfer failed: ${error.message}`,
         { cause: error }
       ));
     }
   }
+  shrinkRasterCanvas(canvas);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
     throw new AggregateError(
@@ -1179,5 +1171,5 @@ export function rasterizePointsWebgl({
       'Figure-export WebGL2 rasterization and cleanup failed.'
     );
   }
-  return canvas;
+  return frame;
 }

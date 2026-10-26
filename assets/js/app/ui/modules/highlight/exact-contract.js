@@ -1,8 +1,14 @@
-import { CellSet, hasDuplicateCellIndex } from '../../../utils/cell-set.js';
+import {
+  CellSet,
+  cellListsEqual,
+  requireCellList
+} from '../../../utils/cell-set.js';
 import {
   ABANDONED_GESTURE_REASONS,
   ANNOTATION_ABANDONED_GESTURE_REASONS
 } from './mode-copy.js';
+import { isObjectRecord, requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
 
 const SELECTION_MODES = Object.freeze([
   'annotation',
@@ -53,34 +59,8 @@ const FIELD_HIGHLIGHT_GROUP_KEYS = Object.freeze([
   'fieldSource'
 ]);
 
-function isObject(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-export function requirePlainObject(value, label) {
-  if (!isObject(value) || Object.getPrototypeOf(value) !== Object.prototype) {
-    throw new TypeError(`${label} must be a plain object.`);
-  }
-  return value;
-}
-
-export function requireExactKeys(value, keys, label) {
-  requirePlainObject(value, label);
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  if (
-    actual.length !== expected.length
-    || actual.some((key, index) => key !== expected[index])
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly ${expected.join(', ')}.`
-    );
-  }
-  return value;
-}
-
 export function requireMethods(owner, label, methodNames) {
-  if (!isObject(owner)) {
+  if (!isObjectRecord(owner)) {
     throw new TypeError(`${label} must be an object.`);
   }
   for (const methodName of methodNames) {
@@ -92,7 +72,7 @@ export function requireMethods(owner, label, methodNames) {
 }
 
 export function requireDomElement(element, label, methods = []) {
-  if (!isObject(element)) {
+  if (!isObjectRecord(element)) {
     throw new TypeError(`${label} must be a DOM element.`);
   }
   requireMethods(element, label, methods);
@@ -154,41 +134,21 @@ export function requireCellIndex(value, label, pointCount) {
   requirePointCount(pointCount, label);
   if (value >= pointCount) {
     throw new RangeError(
-      `${label} must be inside the current dataset of ${pointCount} cells.`
+      `${label} must be inside the current dataset of ${formatCountOf(pointCount, 'cell')}.`
     );
   }
   return value;
 }
 
+/**
+ * Require a selection's cells as the one currency selections cross module
+ * boundaries in: a cell list (`requireCellList`), checked in one pass.
+ */
 export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
-  if (!Array.isArray(value)) {
-    throw new TypeError(`${label} must be an array.`);
-  }
+  requirePointCount(pointCount, label);
+  requireCellList(value, pointCount, label);
   if (!allowEmpty && value.length === 0) {
     throw new TypeError(`${label} must not be empty.`);
-  }
-  requirePointCount(pointCount, label);
-  for (let index = 0; index < value.length; index++) {
-    if (!Object.hasOwn(value, index)) {
-      throw new TypeError(`${label} must not contain holes.`);
-    }
-    const cellIndex = value[index];
-    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
-      throw new TypeError(
-        `${label} must contain unique non-negative safe integers.`
-      );
-    }
-    if (cellIndex >= pointCount) {
-      throw new RangeError(
-        `${label} must be inside the current dataset of ${pointCount} cells.`
-      );
-    }
-  }
-  // One bit a cell, not a Set: a Set refuses more than 2^24 entries.
-  if (hasDuplicateCellIndex(value, pointCount)) {
-    throw new TypeError(
-      `${label} must contain unique non-negative safe integers.`
-    );
   }
   return value;
 }
@@ -307,7 +267,7 @@ export function requireHighlightSelectionState(value, pointCount) {
 }
 
 export function requireHighlightGroup(value, label, pointCount) {
-  requirePlainObject(value, label);
+  requirePlainRecord(value, label);
   requirePointCount(pointCount, label);
   const { type } = value;
   let keys;
@@ -348,36 +308,9 @@ export function requireHighlightGroup(value, label, pointCount) {
     throw new TypeError(`${label} enabled must be boolean.`);
   }
   requireSafeInteger(value.cellCount, `${label} cellCount`, 1);
-  if (
-    (
-      !Array.isArray(value.cellIndices)
-      && !(value.cellIndices instanceof Uint32Array)
-    )
-    || value.cellIndices.length !== value.cellCount
-  ) {
-    throw new TypeError(
-      `${label} cellIndices must be an Array or Uint32Array matching cellCount.`
-    );
-  }
-  for (const cellIndex of value.cellIndices) {
-    if (
-      !Number.isSafeInteger(cellIndex)
-      || cellIndex < 0
-    ) {
-      throw new TypeError(
-        `${label} cellIndices must contain unique non-negative safe integers.`
-      );
-    }
-    if (cellIndex >= pointCount) {
-      throw new RangeError(
-        `${label} cellIndices must be inside the current dataset of ${pointCount} cells.`
-      );
-    }
-  }
-  if (hasDuplicateCellIndex(value.cellIndices, pointCount)) {
-    throw new TypeError(
-      `${label} cellIndices must contain unique non-negative safe integers.`
-    );
+  requireCellList(value.cellIndices, pointCount, `${label} cellIndices`);
+  if (value.cellIndices.length !== value.cellCount) {
+    throw new TypeError(`${label} cellIndices must match cellCount.`);
   }
   if (type === 'category' || type === 'range') {
     if (
@@ -445,17 +378,13 @@ export function requireSavedHighlightGroup(
       `${label} cellCount must match the completed selection.`
     );
   }
-  // requireHighlightGroup already proved the saved indices are unique and
-  // exactly cellCount long, so an equal length plus containment is set
-  // equality. A permuted, offset, or substituted index set is rejected here
-  // instead of being saved as a selection nobody made.
-  const expectedCellIndexSet = CellSet.from(expectedCellIndices, pointCount);
-  for (const cellIndex of value.cellIndices) {
-    if (!expectedCellIndexSet.has(cellIndex)) {
-      throw new RangeError(
-        `${label} cellIndices must be exactly the completed selection.`
-      );
-    }
+  // Both are cell lists, so equal sets are equal lists. A permuted, offset,
+  // or substituted index set is rejected here instead of being saved as a
+  // selection nobody made.
+  if (!cellListsEqual(value.cellIndices, expectedCellIndices)) {
+    throw new RangeError(
+      `${label} cellIndices must be exactly the completed selection.`
+    );
   }
   return value;
 }
@@ -549,7 +478,7 @@ export function requireSelectionStepEvent(
   pointCount,
   extraKeys = []
 ) {
-  if (isObject(event) && event.cancelled === true) {
+  if (isObjectRecord(event) && event.cancelled === true) {
     return requireCancelledStep(
       event,
       tool,
@@ -557,7 +486,7 @@ export function requireSelectionStepEvent(
       pointCount
     );
   }
-  if (isObject(event) && event.abandoned !== undefined) {
+  if (isObjectRecord(event) && event.abandoned !== undefined) {
     return requireAbandonedStep(event, tool);
   }
   requireExactKeys(
@@ -586,10 +515,10 @@ export function requireSelectionStepEvent(
 }
 
 export function requireAnnotationStepEvent(event, pointCount) {
-  if (isObject(event) && event.cancelled === true) {
+  if (isObjectRecord(event) && event.cancelled === true) {
     return requireCancelledStep(event, 'annotation', false, pointCount);
   }
-  if (isObject(event) && event.abandoned !== undefined) {
+  if (isObjectRecord(event) && event.abandoned !== undefined) {
     return requireAbandonedStep(event, 'annotation');
   }
   requireExactKeys(
@@ -714,7 +643,7 @@ export function requireSelectionPreviewEvent(
 }
 
 export function requireContinuousStatistics(field) {
-  if (!isObject(field) || field.kind !== 'continuous') {
+  if (!isObjectRecord(field) || field.kind !== 'continuous') {
     throw new TypeError('Highlight field must be continuous.');
   }
   const statistics = field._continuousStats;
@@ -842,7 +771,7 @@ export function requireModeButtons(buttons) {
       'Highlight mode button',
       ['addEventListener', 'getAttribute', 'setAttribute']
     );
-    if (!isObject(button.dataset)) {
+    if (!isObjectRecord(button.dataset)) {
       throw new TypeError('Highlight mode button must expose a dataset object.');
     }
     const mode = requireHighlightSelectionMode(button.dataset.mode);
@@ -869,14 +798,14 @@ export function requireModeButtons(buttons) {
   return { buttons, pressedMode };
 }
 
-export function requireJupyterSource(jupyterSource) {
-  if (jupyterSource === null) return null;
+export function requireViewerHostSource(viewerHostSource) {
+  if (viewerHostSource === null) return null;
   requireMethods(
-    jupyterSource,
-    'Highlight Jupyter source',
+    viewerHostSource,
+    'Highlight viewer host source',
     ['notifySelection']
   );
-  return jupyterSource;
+  return viewerHostSource;
 }
 
 /**
@@ -972,7 +901,7 @@ export function requireSelectModeControls(controls, combines) {
       'Select mode combine button',
       ['addEventListener', 'getAttribute', 'setAttribute']
     );
-    if (!isObject(button.dataset) || !combines.includes(button.dataset.combine)) {
+    if (!isObjectRecord(button.dataset) || !combines.includes(button.dataset.combine)) {
       throw new TypeError(
         'Select mode combine button must name one combine in data-combine.'
       );

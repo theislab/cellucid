@@ -6,6 +6,8 @@
  * be replaced by another one.
  */
 
+import { formatCountOf } from '../utils/format-units.js';
+
 function requireSearchParams(searchParams) {
   if (!(searchParams instanceof URLSearchParams)) {
     throw new TypeError(
@@ -76,7 +78,7 @@ export function readExactTrueUrlFlag(searchParams, name) {
   return true;
 }
 
-function requireJupyterConfigEvidence(value) {
+function requireViewerHostConfigEvidence(value) {
   if (value === null) return false;
   if (
     typeof value !== 'object' ||
@@ -88,7 +90,7 @@ function requireJupyterConfigEvidence(value) {
     !Object.hasOwn(value, 'viewerToken')
   ) {
     throw new TypeError(
-      'Startup Jupyter evidence must be null or one exact configuration.'
+      'Startup viewer host evidence must be null or one exact configuration.'
     );
   }
   for (const key of ['serverUrl', 'viewerId', 'viewerToken']) {
@@ -99,7 +101,7 @@ function requireJupyterConfigEvidence(value) {
       /\s/.test(value[key])
     ) {
       throw new TypeError(
-        `Startup Jupyter evidence ${key} must be exact non-whitespace text.`
+        `Startup viewer host evidence ${key} must be exact non-whitespace text.`
       );
     }
   }
@@ -109,34 +111,34 @@ function requireJupyterConfigEvidence(value) {
 /**
  * Resolve the exact startup data-source intent before any onboarding can paint.
  *
- * The Jupyter data source remains the sole owner of its authenticated URL
+ * The viewer host data source remains the sole owner of its authenticated URL
  * parser. Its validated configuration is passed here as evidence rather than
  * reinterpreting query keys heuristically.
  *
  * @param {URLSearchParams} searchParams
- * @param {Object|null} jupyterConfig
+ * @param {Object|null} viewerHostConfig
  * @returns {{
  *   remoteUrlParam: string|null,
- *   githubPathParam: string|null,
+ *   dataLinkParam: string|null,
  *   sourceParam: string|null,
  *   requestedDataset: string|null,
  *   isAnndataMode: boolean,
- *   inJupyter: boolean,
+ *   inViewerHost: boolean,
  *   shouldShowWelcome: boolean
  * }}
  */
-export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
+export function resolveStartupUrlIntent(searchParams, viewerHostConfig) {
   const params = requireSearchParams(searchParams);
   const remoteUrlParam = readOptionalExactUrlParameter(params, 'remote');
-  const githubPathParam = readOptionalExactUrlParameter(params, 'github');
+  const dataLinkParam = readOptionalExactUrlParameter(params, 'data');
   const sourceParam = readOptionalExactUrlParameter(params, 'source');
   const requestedDataset = readOptionalExactUrlParameter(params, 'dataset');
   const isAnndataMode = readExactTrueUrlFlag(params, 'anndata');
-  const inJupyter = requireJupyterConfigEvidence(jupyterConfig);
+  const inViewerHost = requireViewerHostConfigEvidence(viewerHostConfig);
 
-  if (remoteUrlParam !== null && githubPathParam !== null) {
+  if (remoteUrlParam !== null && dataLinkParam !== null) {
     throw new Error(
-      'Startup cannot request both remote and GitHub dataset sources.'
+      'Startup cannot request both a remote server and a data link.'
     );
   }
   if (
@@ -149,12 +151,11 @@ export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
     );
   }
   if (
-    githubPathParam !== null &&
-    sourceParam !== null &&
-    sourceParam !== 'github-repo'
+    dataLinkParam !== null &&
+    sourceParam !== null
   ) {
     throw new Error(
-      'The "github" startup parameter requires source="github-repo".'
+      'The "data" startup parameter names its own source; remove "source".'
     );
   }
   if (
@@ -168,33 +169,33 @@ export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
     );
   }
   if (
-    inJupyter &&
+    inViewerHost &&
     (
       remoteUrlParam !== null ||
-      githubPathParam !== null ||
+      dataLinkParam !== null ||
       (sourceParam !== null && sourceParam !== 'jupyter')
     )
   ) {
     throw new Error(
-      'Jupyter startup cannot be combined with another explicit source.'
+      'Viewer host startup cannot be combined with another explicit source.'
     );
   }
 
   const shouldShowWelcome = !(
-    inJupyter ||
+    inViewerHost ||
     remoteUrlParam !== null ||
-    githubPathParam !== null ||
+    dataLinkParam !== null ||
     sourceParam === 'remote' ||
     isAnndataMode
   );
 
   return Object.freeze({
     remoteUrlParam,
-    githubPathParam,
+    dataLinkParam,
     sourceParam,
     requestedDataset,
     isAnndataMode,
-    inJupyter,
+    inViewerHost,
     shouldShowWelcome
   });
 }
@@ -240,10 +241,7 @@ export function classifySameOriginHealthAdvertisement(payload) {
     return 'static';
   }
 
-  if (
-    payload.status === 'ok' &&
-    (payload.type === 'exported' || payload.type === 'anndata')
-  ) {
+  if (payload.status === 'ok' && payload.type === 'anndata') {
     return 'server';
   }
 
@@ -317,7 +315,7 @@ export function selectIntentDatasetId(
 
   if (ids.length !== 1) {
     throw new Error(
-      `${sourceLabel} declares ${ids.length} datasets; an exact "dataset" ` +
+      `${sourceLabel} declares ${formatCountOf(ids.length, 'dataset')}; an exact "dataset" ` +
       'startup parameter is required.'
     );
   }

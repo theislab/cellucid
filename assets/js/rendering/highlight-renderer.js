@@ -1,11 +1,23 @@
-import { requireCleanWebGLState } from './gl-errors.js';
+import { requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
 import { CellSet } from '../app/utils/cell-set.js';
+import {
+  KnnExpansion,
+  LassoHitTest,
+  ProximityHitTest,
+  requireKnnGraph,
+  SELECTION_SLICE_MS,
+} from './selection-gesture-queries.js';
+import { yieldToMacrotask } from '../utils/yield-macrotask.js';
 import { readPositionXYZ } from './position-layout.js';
 import {
   configureStraightAlphaBlending,
   createProgram,
+  deleteProgramReleasingUse,
+  deleteTextureTracked,
   drawPointsInSegments,
+  restorableTexture,
 } from './gl-utils.js';
+import { glStateOf } from './gl-state-shadow.js';
 import {
   HIGHLIGHT_STYLES_BY_QUALITY,
   HP_VS_HIGHLIGHT,
@@ -14,6 +26,12 @@ import {
   writePointShaderFrame,
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
+import { GpuPermuter } from './high-perf/gpu-permute.js';
+import {
+  allocateLinearTexture,
+  planLinearTextureFor,
+  writeLinearTextureRows,
+} from './linear-texture.js';
 import {
   describeShaderQualities,
   isShaderQuality,
@@ -27,6 +45,7 @@ import {
   resolveSelectionGestureCombine,
   SELECT_MODE_OFF,
 } from './select-mode.js';
+import { formatCountOf } from '../utils/format-units.js';
 
 /**
  * The kind of field one pane is colored by, as the annotation tool reads it.
@@ -134,7 +153,7 @@ function requireHighlightPositions(
     positions.length % dimension !== 0
   ) {
     throw new TypeError(
-      `${label} must be a Float32Array containing ${dimension} values per cell.`
+      `${label} must be a Float32Array containing ${formatCountOf(dimension, 'value')} per cell.`
     );
   }
   return positions.length / dimension;
@@ -146,7 +165,7 @@ function requireHighlightTransparency(transparency, pointCount) {
     transparency.length !== pointCount
   ) {
     throw new TypeError(
-      `Highlight view transparency must be a Uint8Array with exactly ${pointCount} entries.`
+      `Highlight view transparency must be a Uint8Array with exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`
     );
   }
   return transparency;
@@ -346,7 +365,7 @@ function requireHighlightData(highlightData, pointCount = null) {
   }
   if (pointCount !== null && highlightData.length !== pointCount) {
     throw new RangeError(
-      `Highlight data must contain exactly ${pointCount} entries.`
+      `Highlight data must contain exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`
     );
   }
   return highlightData;
@@ -410,8 +429,127 @@ function createHighlightStaging() {
   return {
     colorView: new Uint8Array(buffer),
     posView: new Float32Array(buffer),
+    wordView: new Uint32Array(buffer),
   };
 }
+
+/**
+ * A highlight record's colour word (RGB white, alpha the cell's intensity)
+ * for each intensity byte, built from its bytes so either byte order holds.
+ */
+const HIGHLIGHT_COLOR_WORDS = (() => {
+  const bytes = new Uint8Array(256 * 4);
+  for (let intensity = 0; intensity < 256; intensity++) {
+    bytes[intensity * 4] = 255;
+    bytes[intensity * 4 + 1] = 255;
+    bytes[intensity * 4 + 2] = 255;
+    bytes[intensity * 4 + 3] = intensity;
+  }
+  return new Uint32Array(bytes.buffer);
+})();
+
+/**
+ * Pack the admitted highlighted cells of `candidateIndices[from, ...)` into
+ * the staging block, a record a cell (XYZ, the axes the embedding does not
+ * have written as the zero they are, then the colour word), until the block
+ * is full or the candidates end. The admission test is `rebuildBuffer`'s.
+ * A function of its own so its loop is compiled for itself alone.
+ *
+ * @returns {number} The next candidate; the records written are in
+ *   `packed[0]`.
+ */
+function packHighlightRecords(
+  candidateIndices,
+  from,
+  iterateLodPrefix,
+  highlightData,
+  admissionLevels,
+  activeLodLevel,
+  transparency,
+  positions,
+  dimension,
+  posView,
+  wordView,
+  packed
+) {
+  const capacity = HIGHLIGHT_STAGING_POINTS;
+  const checkAdmission = !iterateLodPrefix && admissionLevels !== null;
+  let slot = 0;
+  let j = from;
+  for (; j < candidateIndices.length && slot < capacity; j++) {
+    const i = candidateIndices[j];
+    if (iterateLodPrefix && highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
+    if (checkAdmission && admissionLevels[i] > activeLodLevel) continue;
+    if (transparency[i] < POINT_VISIBILITY_THRESHOLD) continue;
+    const record = slot * 4;
+    const base = i * dimension;
+    posView[record] = positions[base];
+    posView[record + 1] = dimension > 1 ? positions[base + 1] : 0;
+    posView[record + 2] = dimension > 2 ? positions[base + 2] : 0;
+    wordView[record + 3] = HIGHLIGHT_COLOR_WORDS[highlightData[i]];
+    slot++;
+  }
+  packed[0] = slot;
+  return j;
+}
+
+/** How many of `candidateIndices` `packHighlightRecords` admits. */
+function countHighlightRecords(
+  candidateIndices,
+  iterateLodPrefix,
+  highlightData,
+  admissionLevels,
+  activeLodLevel,
+  transparency
+) {
+  const checkAdmission = !iterateLodPrefix && admissionLevels !== null;
+  let count = 0;
+  for (let j = 0; j < candidateIndices.length; j++) {
+    const i = candidateIndices[j];
+    if (iterateLodPrefix && highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
+    if (checkAdmission && admissionLevels[i] > activeLodLevel) continue;
+    if (transparency[i] < POINT_VISIBILITY_THRESHOLD) continue;
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Bytes a highlight costs drawn from its own records (XYZ and a colour word)
+ * and drawn from the point store (a colour word a slot of the store).
+ */
+const HIGHLIGHT_RECORD_BYTES = 16;
+const HIGHLIGHT_SLOT_BYTES = 4;
+
+/**
+ * How many cells `packHighlightRecords` admits, counted in source order (a
+ * sequential pass): highlighted, shown, and, with a reduced level of detail,
+ * members of the level (`admissionLevels`, or null at full detail).
+ * A function of its own so its loop is compiled for itself alone.
+ */
+function countAdmittedCells(highlightData, transparency, admissionLevels, activeLodLevel) {
+  let count = 0;
+  const n = highlightData.length;
+  if (admissionLevels === null) {
+    for (let i = 0; i < n; i++) {
+      if (highlightData[i] >= MIN_VISIBLE_ALPHA_BYTE && transparency[i] >= POINT_VISIBILITY_THRESHOLD) count++;
+    }
+    return count;
+  }
+  for (let i = 0; i < n; i++) {
+    if (
+      highlightData[i] >= MIN_VISIBLE_ALPHA_BYTE
+      && transparency[i] >= POINT_VISIBILITY_THRESHOLD
+      && admissionLevels[i] <= activeLodLevel
+    ) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/** Records written by the last `packHighlightRecords`. */
+const PACKED_RECORDS = new Int32Array(1);
 
 export class HighlightRenderer {
   constructor(gl, hpRenderer, startTime) {
@@ -484,6 +622,16 @@ export class HighlightRenderer {
     this.highlightRingStyle = 0.0;
     this.highlightAnimated = true;
     this._styleGeneration = 0;
+    // A draw from a point store (`rebuildBuffer`): its slot-word pass and the
+    // highlight bytes as a texture, both made on first use.
+    this._slotWords = null;
+    this._highlightTexture = null;
+    // Off draws every highlight from records of its own: the reference the
+    // draw from a point store is compared with (`setStoreDrawing`).
+    this._storeDrawing = true;
+    // Hands out `drawSerial`s: a view's serial changes whenever what its
+    // highlight pass draws can change (see drawSerial).
+    this._drawSerials = 0;
 
     this.highlightStylesByQuality = HIGHLIGHT_STYLES_BY_QUALITY;
 
@@ -682,6 +830,21 @@ export class HighlightRenderer {
       buffer: null,
       dimensionLevel: 0,
       drawFailure: null,
+      // Vertices the draw submits: the records, or every slot of the point
+      // store the highlight is drawn from (`storeBuffer`, in the order
+      // `storeSlotSources`), most of them rejected.
+      drawCount: 0,
+      storeBuffer: null,
+      storeSlotSources: null,
+      // The view's visibility bytes as a texture, for a draw from the store.
+      visibleTexture: null,
+      // What the VAO's attributes point at: the record buffer, or the store
+      // (of `layoutDimension` components a point).
+      layoutSource: null,
+      layoutDimension: 0,
+      // See drawSerial.
+      drawSerial: 0,
+      drawStyleGeneration: -1,
       failedPublication: null,
       geometryGeneration: 0,
       // Byte length of the accepted GPU data store, tracked separately from
@@ -725,9 +888,12 @@ export class HighlightRenderer {
       );
     }
     for (const viewBuffer of this._viewBuffers.values()) {
+      const visible = viewBuffer.visibleTexture ?? null;
+      if (visible !== null) add(visible.texture, visible.byteLength);
       if (viewBuffer.buffer === null) continue;
       add(viewBuffer.buffer, viewBuffer.gpuByteLength);
     }
+    if (this._highlightTexture) add(this._highlightTexture.texture, this._highlightTexture.byteLength);
   }
 
   _queueViewResourceHandles(buffer, vertexArray) {
@@ -742,6 +908,11 @@ export class HighlightRenderer {
   _detachViewResources(viewBuffer) {
     const buffer = viewBuffer.buffer;
     const vertexArray = viewBuffer.vertexArray;
+    const visible = viewBuffer.visibleTexture ?? null;
+    if (visible !== null) {
+      viewBuffer.visibleTexture = null;
+      deleteTextureTracked(this.gl, visible.texture);
+    }
     // Detach the complete logical pair before either deletion can fail.
     viewBuffer.buffer = null;
     viewBuffer.vertexArray = null;
@@ -812,6 +983,8 @@ export class HighlightRenderer {
     // after a failed geometry/LOD/filter publication would present stale cells.
     viewBuffer.drawFailure = null;
     viewBuffer.pointCount = 0;
+    viewBuffer.drawCount = 0;
+    viewBuffer.drawSerial = ++this._drawSerials;
     this._recomputeTotalHighlightedCount();
   }
 
@@ -838,8 +1011,12 @@ export class HighlightRenderer {
     viewBuffer.highlightGeneration = this._highlightDataVersion;
     viewBuffer.lodMembership = lodMembership;
     viewBuffer.pointCount = 0;
+    viewBuffer.drawCount = 0;
+    viewBuffer.storeBuffer = null;
+    viewBuffer.storeSlotSources = null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration = transparencyGeneration;
+    viewBuffer.drawSerial = ++this._drawSerials;
   }
 
   _publishEmptyViewBuffer(
@@ -915,6 +1092,7 @@ export class HighlightRenderer {
     return (
       viewBuffer === undefined ||
       viewBuffer.published !== true ||
+      this._pointStoreMoved(vid, viewBuffer) ||
       viewBuffer.highlightGeneration !== this._highlightDataVersion ||
       viewBuffer.geometryGeneration !== exactGeometryGeneration ||
       viewBuffer.dimensionLevel !== exactDimensionLevel ||
@@ -1006,7 +1184,7 @@ export class HighlightRenderer {
     if (failures.length > 0) {
       throw new AggregateError(
         failures,
-        `Empty highlight publication across ${pendingPublications.length} views retains ${failures.length} pending GPU retirement failure(s).`
+        `Empty highlight publication across ${formatCountOf(pendingPublications.length, 'view')} retains ${failures.length} pending GPU retirement failure(s).`
       );
     }
     return true;
@@ -1080,33 +1258,48 @@ export class HighlightRenderer {
       ? lodIndices
       : highlightedIndices;
 
-    // Count visible highlighted cells using cached indices
-    // Frustum clipping remains GPU-owned; CPU packing applies only the shared
-    // LOD prefix and the exact point-shader alpha boundary.
-    let count = 0;
-    for (let j = 0; j < candidateIndices.length; j++) {
-      const i = candidateIndices[j];
-      if (
-        iterateLodPrefix &&
-        exactHighlightData[i] < MIN_VISIBLE_ALPHA_BYTE
-      ) continue;
-      if (
-        !iterateLodPrefix &&
-        admissionLevels !== null &&
-        admissionLevels[i] > activeLodLevel
-      ) continue;
-      if (
-        exactTransparency[i] <
-        POINT_VISIBILITY_THRESHOLD
-      ) continue;
-      count++;
-    }
-
     // Get or create per-view buffer entry
     let viewBuffer = this._viewBuffers.get(vid);
     if (!viewBuffer) {
       viewBuffer = this._createViewBufferRecord();
       this._viewBuffers.set(vid, viewBuffer);
+    }
+
+    // Two exact ways to draw the same rings: from records of their own (XYZ
+    // gathered from the source positions, a colour word), in the candidates'
+    // order, or from the view's point store, in the store's order (with a
+    // reduced level of detail the candidates are the level's members in that
+    // very order), with a colour word for each of its slots, written on the GPU
+    // from the highlight and visibility bytes, and the cells not admitted
+    // rejected by the vertex shader. The second is taken when it writes no
+    // more bytes than the first: gathering millions of positions on the CPU
+    // is most of a highlight of every cell (10M: 72 ms, and the store is
+    // cleared by the GPU process before it is written: 54 ms more).
+    const store = this._storeDrawing
+      ? this._slotStoreFor(vid, exactPositions, exactDimensionLevel, exactMembership)
+      : null;
+    const fromStore = store !== null
+      && candidateIndices.length * HIGHLIGHT_RECORD_BYTES >= store.slots * HIGHLIGHT_SLOT_BYTES;
+    let count;
+    if (fromStore) {
+      count = countAdmittedCells(
+        exactHighlightData,
+        exactTransparency,
+        exactMembership === null ? null : admissionLevels,
+        activeLodLevel
+      );
+    } else {
+      // Count visible highlighted cells using cached indices
+      // Frustum clipping remains GPU-owned; CPU packing applies only the shared
+      // LOD prefix and the exact point-shader alpha boundary.
+      count = countHighlightRecords(
+        candidateIndices,
+        iterateLodPrefix,
+        exactHighlightData,
+        admissionLevels,
+        activeLodLevel,
+        exactTransparency
+      );
     }
 
     if (count === 0) {
@@ -1121,8 +1314,8 @@ export class HighlightRenderer {
       return;
     }
 
-    const BYTES_PER_POINT = 16;
-    const byteLength = count * BYTES_PER_POINT;
+    const BYTES_PER_POINT = HIGHLIGHT_RECORD_BYTES;
+    const byteLength = fromStore ? store.slots * HIGHLIGHT_SLOT_BYTES : count * BYTES_PER_POINT;
 
     const hasBuffer = viewBuffer.buffer !== null;
     const hasVertexArray = viewBuffer.vertexArray !== null;
@@ -1135,25 +1328,28 @@ export class HighlightRenderer {
     const isInitialPublication = !hasBuffer;
     // `gl.getError()` is a synchronous round trip to the GPU process that
     // waits for every queued command, including the previous frame's point
-    // draws: the three checks below cost 104 ms of a 199 ms highlight at
-    // 10,000,000 points. They are taken where the failure they detect can
-    // appear -- a first allocation, or one larger than any this buffer has
-    // already been verified to hold, which is where OUT_OF_MEMORY lives -- and
-    // skipped when the same store is re-sized at or below a size WebGL has
-    // already accepted for it. Any failed publication resets the watermark, so
-    // the next one verifies again.
+    // draws: three checks here cost 104 ms of a 199 ms highlight at
+    // 10,000,000 points. One is taken, after the store is sized, where the
+    // failure it detects can appear -- a first allocation, or one larger than
+    // any this buffer has already been verified to hold, which is where
+    // OUT_OF_MEMORY lives -- and none when the same store is re-sized at or
+    // below a size WebGL has already accepted for it. The writes around it
+    // allocate nothing, so only a lost context can refuse them. Any failed
+    // publication resets the watermark, so the next one verifies again.
     const verifyPublication =
       isInitialPublication || byteLength > viewBuffer.verifiedByteLength;
+    // A store drawn from keeps its size when it is large enough: the pass
+    // writes the slots it needs.
+    const resize = !fromStore || isInitialPublication || viewBuffer.gpuByteLength < byteLength;
+    const storeBytes = resize ? byteLength : viewBuffer.gpuByteLength;
     let candidateBuffer = viewBuffer.buffer;
     let candidateVertexArray = viewBuffer.vertexArray;
     let publicationError = null;
     const restorationFailures = [];
-    if (verifyPublication) {
-      requireCleanWebGLState(
-        gl,
-        `Highlight buffer publication for view "${vid}" preflight`
-      );
-    }
+    requireLiveContext(
+      gl,
+      `Highlight buffer publication for view "${vid}" preflight`
+    );
     try {
       if (isInitialPublication) {
         candidateBuffer = gl.createBuffer();
@@ -1180,53 +1376,103 @@ export class HighlightRenderer {
 
       gl.bindVertexArray(candidateVertexArray);
       gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
-      // Size the store first. WebGL 2 leaves the accepted data store untouched
-      // when this call fails, and the size is validated before any chunk is
-      // written into it, so replacement OOM remains retryable without
-      // retaining a second GPU buffer.
-      gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.DYNAMIC_DRAW);
-      if (verifyPublication) {
-        requireCleanWebGLState(
-          gl,
-          `Highlight buffer allocation for view "${vid}"`
+      if (fromStore) {
+        if (resize) {
+          gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.DYNAMIC_DRAW);
+          if (verifyPublication) {
+            requireCleanWebGLState(
+              gl,
+              `Highlight buffer allocation for view "${vid}"`
+            );
+          }
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        gl.bindVertexArray(null);
+        this._slotWordWriter().writeHighlightWords(
+          candidateBuffer,
+          store.slots,
+          store.order,
+          this._highlightByteTexture(exactHighlightData),
+          this._visibleByteTexture(viewBuffer, exactTransparency, exactTransparencyGeneration),
+          MIN_VISIBLE_ALPHA_BYTE
+        );
+        gl.bindVertexArray(candidateVertexArray);
+        gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
+      } else {
+        // Size the store first. WebGL 2 leaves the accepted data store untouched
+        // when this call fails, and the size is validated before any chunk is
+        // written into it, so replacement OOM remains retryable without
+        // retaining a second GPU buffer.
+        gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.DYNAMIC_DRAW);
+        if (verifyPublication) {
+          requireCleanWebGLState(
+            gl,
+            `Highlight buffer allocation for view "${vid}"`
+          );
+        }
+        this._uploadHighlightChunks(
+          candidateIndices,
+          iterateLodPrefix,
+          exactHighlightData,
+          admissionLevels,
+          activeLodLevel,
+          exactTransparency,
+          exactPositions,
+          exactDimensionLevel
         );
       }
-      this._uploadHighlightChunks(
-        candidateIndices,
-        iterateLodPrefix,
-        exactHighlightData,
-        admissionLevels,
-        activeLodLevel,
-        exactTransparency,
-        exactPositions,
-        exactDimensionLevel
+      // The attribute layout of the source drawn from, set when the VAO is
+      // new or its source changed (records, or which store).
+      const layoutSource = fromStore ? store.buffer : candidateBuffer;
+      if (isInitialPublication || viewBuffer.layoutSource !== layoutSource
+        || viewBuffer.layoutDimension !== exactDimensionLevel) {
+        if (fromStore) {
+          // The axes a store does not have read as 0, as records write them.
+          gl.bindBuffer(gl.ARRAY_BUFFER, store.buffer);
+          gl.enableVertexAttribArray(this.attribLocations.position);
+          gl.vertexAttribPointer(
+            this.attribLocations.position,
+            exactDimensionLevel,
+            gl.FLOAT,
+            false,
+            exactDimensionLevel * 4,
+            0
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
+          gl.enableVertexAttribArray(this.attribLocations.color);
+          gl.vertexAttribPointer(
+            this.attribLocations.color,
+            4,
+            gl.UNSIGNED_BYTE,
+            true,
+            HIGHLIGHT_SLOT_BYTES,
+            0
+          );
+        } else {
+          gl.enableVertexAttribArray(this.attribLocations.position);
+          gl.vertexAttribPointer(
+            this.attribLocations.position,
+            3,
+            gl.FLOAT,
+            false,
+            BYTES_PER_POINT,
+            0
+          );
+          gl.enableVertexAttribArray(this.attribLocations.color);
+          gl.vertexAttribPointer(
+            this.attribLocations.color,
+            4,
+            gl.UNSIGNED_BYTE,
+            true,
+            BYTES_PER_POINT,
+            12
+          );
+        }
+      }
+      requireLiveContext(
+        gl,
+        `Highlight buffer publication for view "${vid}"`
       );
-      if (isInitialPublication) {
-        gl.enableVertexAttribArray(this.attribLocations.position);
-        gl.vertexAttribPointer(
-          this.attribLocations.position,
-          3,
-          gl.FLOAT,
-          false,
-          BYTES_PER_POINT,
-          0
-        );
-        gl.enableVertexAttribArray(this.attribLocations.color);
-        gl.vertexAttribPointer(
-          this.attribLocations.color,
-          4,
-          gl.UNSIGNED_BYTE,
-          true,
-          BYTES_PER_POINT,
-          12
-        );
-      }
-      if (verifyPublication) {
-        requireCleanWebGLState(
-          gl,
-          `Highlight buffer publication for view "${vid}"`
-        );
-      }
     } catch (error) {
       publicationError = error;
     } finally {
@@ -1280,15 +1526,21 @@ export class HighlightRenderer {
     // `bufferData` replaced the whole data store, so the accepted allocation is
     // exactly the bytes just uploaded.
     const gpuByteLengthChanged =
-      viewBuffer.gpuByteLength !== byteLength;
-    viewBuffer.gpuByteLength = byteLength;
-    if (verifyPublication) viewBuffer.verifiedByteLength = byteLength;
+      viewBuffer.gpuByteLength !== storeBytes;
+    viewBuffer.gpuByteLength = storeBytes;
+    if (verifyPublication && resize) viewBuffer.verifiedByteLength = byteLength;
     viewBuffer.highlightGeneration = this._highlightDataVersion;
     viewBuffer.lodMembership = exactMembership;
     viewBuffer.pointCount = count;
+    viewBuffer.drawCount = fromStore ? store.slots : count;
+    viewBuffer.layoutSource = fromStore ? store.buffer : viewBuffer.buffer;
+    viewBuffer.layoutDimension = exactDimensionLevel;
+    viewBuffer.storeBuffer = fromStore ? store.buffer : null;
+    viewBuffer.storeSlotSources = fromStore ? store.slotSources : null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration =
       exactTransparencyGeneration;
+    viewBuffer.drawSerial = ++this._drawSerials;
 
     // Recompute total count across all views for UI feedback
     this._recomputeTotalHighlightedCount();
@@ -1315,48 +1567,32 @@ export class HighlightRenderer {
   ) {
     const gl = this.gl;
     this._stagingBuffer ??= createHighlightStaging();
-    const { colorView, posView } = this._stagingBuffer;
-    let slot = 0;
+    const { colorView, posView, wordView } = this._stagingBuffer;
     let writtenBytes = 0;
-    for (let j = 0; j < candidateIndices.length; j++) {
-      const i = candidateIndices[j];
-      if (
-        iterateLodPrefix &&
-        highlightData[i] < MIN_VISIBLE_ALPHA_BYTE
-      ) continue;
-      if (
-        !iterateLodPrefix &&
-        admissionLevels !== null &&
-        admissionLevels[i] > activeLodLevel
-      ) continue;
-      if (
-        transparency[i] <
-        POINT_VISIBILITY_THRESHOLD
-      ) continue;
-
-      // Highlight records stay XYZ + RGBA: the axes the embedding does not
-      // have are written as the zero they are.
-      const posOffset = slot * 4;
-      const colorOffset = slot * 16 + 12;
-      const base = i * dimension;
-      posView[posOffset] = positions[base];
-      posView[posOffset + 1] = dimension > 1 ? positions[base + 1] : 0;
-      posView[posOffset + 2] = dimension > 2 ? positions[base + 2] : 0;
-      colorView[colorOffset] = 255;
-      colorView[colorOffset + 1] = 255;
-      colorView[colorOffset + 2] = 255;
-      colorView[colorOffset + 3] = highlightData[i];
-
-      if (++slot === HIGHLIGHT_STAGING_POINTS) {
-        gl.bufferSubData(gl.ARRAY_BUFFER, writtenBytes, colorView, 0, slot * 16);
-        writtenBytes += slot * 16;
-        slot = 0;
+    let next = 0;
+    while (next < candidateIndices.length) {
+      next = packHighlightRecords(
+        candidateIndices,
+        next,
+        iterateLodPrefix,
+        highlightData,
+        admissionLevels,
+        activeLodLevel,
+        transparency,
+        positions,
+        dimension,
+        posView,
+        wordView,
+        PACKED_RECORDS
+      );
+      const slots = PACKED_RECORDS[0];
+      if (slots > 0) {
+        gl.bufferSubData(gl.ARRAY_BUFFER, writtenBytes, colorView, 0, slots * 16);
+        writtenBytes += slots * 16;
       }
     }
-    if (slot > 0) {
-      gl.bufferSubData(gl.ARRAY_BUFFER, writtenBytes, colorView, 0, slot * 16);
-    }
   }
+
 
   /**
    * Recompute total highlighted count across all views.
@@ -1392,6 +1628,150 @@ export class HighlightRenderer {
    */
   isAnimated() {
     return this._totalHighlightedCount > 0 && this.highlightAnimated === true;
+  }
+
+  /**
+   * A number that changes whenever what this view's highlight pass draws can
+   * change other than by the frame time: its records (published, emptied,
+   * revoked after a failed publication) or the style. Equal serials mean
+   * equal draws at equal times; the antialiased pulse relies on it to know
+   * the rings it drew last frame (pulse-sample-mask.js).
+   */
+  drawSerial(viewId) {
+    const viewBuffer = this._viewBuffers.get(requireHighlightViewId(viewId));
+    if (viewBuffer === undefined) return 0;
+    if (viewBuffer.drawStyleGeneration !== this._styleGeneration) {
+      viewBuffer.drawStyleGeneration = this._styleGeneration;
+      viewBuffer.drawSerial = ++this._drawSerials;
+    }
+    return viewBuffer.drawSerial;
+  }
+
+  /**
+   * Start compiling the pass that writes a point store's slot words, so the
+   * first highlight drawn from a store does not wait for it.
+   */
+  prepareStoreDrawing() {
+    this._slotWordWriter().prewarm(['highlight']);
+  }
+
+  /**
+   * Draw highlights from point stores where that is cheaper (on, the
+   * default), or always from records of their own. Every view republishes.
+   */
+  setStoreDrawing(enabled) {
+    if (typeof enabled !== 'boolean') throw new TypeError('Highlight store drawing must be an exact boolean.');
+    this._storeDrawing = enabled;
+    for (const viewBuffer of this._viewBuffers.values()) viewBuffer.published = false;
+  }
+
+  /** Views whose highlights are drawn from their point store now. */
+  getStoreDrawnViewCount() {
+    let count = 0;
+    for (const viewBuffer of this._viewBuffers.values()) {
+      if ((viewBuffer.storeBuffer ?? null) !== null && viewBuffer.pointCount > 0) count++;
+    }
+    return count;
+  }
+
+  /**
+   * The view's point store, when the highlights can be drawn from it: it
+   * holds exactly `positions` (`dimension` components a point) and, with a
+   * reduced level of detail, the level's members are its first slots, in
+   * their order. `slots` is what the draw submits. Null otherwise.
+   * @private
+   */
+  _slotStoreFor(viewId, positions, dimension, membership) {
+    const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
+    if (store === null || store.positions !== positions || store.dimension !== dimension) return null;
+    if (membership === null) {
+      return {
+        buffer: store.buffer,
+        slotSources: store.slotSources,
+        order: store.order,
+        slots: positions.length / dimension,
+      };
+    }
+    const prefix = membership.indices;
+    const sources = store.slotSources;
+    if (sources === null || prefix.buffer !== sources.buffer || prefix.byteOffset !== sources.byteOffset) {
+      return null;
+    }
+    return { buffer: store.buffer, slotSources: sources, order: store.order, slots: prefix.length };
+  }
+
+  /** The transform-feedback pass that writes slot words (created on first use). @private */
+  _slotWordWriter() {
+    this._slotWords ??= new GpuPermuter(this.gl);
+    return this._slotWords;
+  }
+
+  /**
+   * An R8UI linear texture holding `bytes` (a byte a source point), written
+   * again only when `bytes` or `version` changed. `record` is the texture
+   * kept so far, or null; returns the one now kept.
+   * @private
+   */
+  _byteTexture(record, bytes, version) {
+    const gl = this.gl;
+    if (record !== null && record.bytes === bytes && record.version === version) return record;
+    let texture = record?.texture ?? null;
+    let plan = record?.plan ?? null;
+    const activeTexture = glStateOf(gl).activeTexture;
+    gl.activeTexture(gl.TEXTURE0);
+    const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY);
+    if (texture === null || plan.itemCount !== bytes.length) {
+      if (texture !== null) deleteTextureTracked(gl, texture);
+      texture = gl.createTexture();
+      if (!texture) throw new Error('Highlight byte texture could not be created.');
+      plan = planLinearTextureFor(gl, bytes.length);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      allocateLinearTexture(gl, gl.R8UI, plan);
+    } else {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+    }
+    // A row of bytes is any number of bytes long.
+    const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    try {
+      writeLinearTextureRows(gl, plan, gl.RED_INTEGER, gl.UNSIGNED_BYTE, bytes, 1);
+    } finally {
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(boundTexture));
+      gl.activeTexture(activeTexture);
+    }
+    const kept = { texture, plan, bytes, version, byteLength: plan.texels };
+    if (record?.byteLength !== kept.byteLength) this._publishGpuAllocationChange();
+    return kept;
+  }
+
+  /** The highlight bytes as a texture (`_byteTexture`). @private */
+  _highlightByteTexture(highlightData) {
+    this._highlightTexture = this._byteTexture(this._highlightTexture ?? null, highlightData, this._highlightDataVersion);
+    return this._highlightTexture;
+  }
+
+  /** One view's visibility bytes as a texture (`_byteTexture`). @private */
+  _visibleByteTexture(viewBuffer, transparency, transparencyGeneration) {
+    viewBuffer.visibleTexture = this._byteTexture(viewBuffer.visibleTexture ?? null, transparency, transparencyGeneration);
+    return viewBuffer.visibleTexture;
+  }
+
+  /**
+   * Whether the point store a view's highlights are drawn from is no longer
+   * the one they were written for (another buffer, or the same one re-ordered
+   * in place).
+   * @private
+   */
+  _pointStoreMoved(viewId, viewBuffer) {
+    if ((viewBuffer.storeBuffer ?? null) === null) return false;
+    const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
+    return store === null
+      || store.buffer !== viewBuffer.storeBuffer
+      || store.slotSources !== viewBuffer.storeSlotSources;
   }
 
   /**
@@ -1454,7 +1834,7 @@ export class HighlightRenderer {
     if (includePrograms) {
       for (const program of this._pendingProgramDeletes) {
         try {
-          this.gl.deleteProgram(program);
+          deleteProgramReleasingUse(this.gl, program);
           this._pendingProgramDeletes.delete(program);
         } catch (error) {
           failures.push(
@@ -1483,6 +1863,9 @@ export class HighlightRenderer {
     this._pendingVertexArrayDeletes.clear();
     this._pendingProgramDeletes.clear();
     this.program = null;
+    this._highlightTexture = null;
+    this._slotWords?.abandon();
+    this._slotWords = null;
     this._totalHighlightedCount = 0;
     this._highlightedIndicesCache = null;
     this._highlightDataRef = null;
@@ -1513,6 +1896,10 @@ export class HighlightRenderer {
       this._viewBuffers.clear();
       if (this.program) this._pendingProgramDeletes.add(this.program);
       this.program = null;
+      if (this._highlightTexture) deleteTextureTracked(this.gl, this._highlightTexture.texture);
+      this._highlightTexture = null;
+      this._slotWords?.dispose();
+      this._slotWords = null;
 
       this._totalHighlightedCount = 0;
       this._highlightedIndicesCache = null;
@@ -1594,6 +1981,8 @@ export class HighlightRenderer {
     // Allocated only after an exceptional draw. The exact accepted
     // publication/style/program certificate prevents one deterministic fault
     // from becoming an error and driver-call storm on every animation frame.
+    // The view stops drawing its rings: a different draw.
+    viewBuffer.drawSerial = ++this._drawSerials;
     viewBuffer.drawFailure = {
       buffer: viewBuffer.buffer,
       geometryGeneration: viewBuffer.geometryGeneration,
@@ -1657,7 +2046,7 @@ export class HighlightRenderer {
     }
 
     const vertexArray = viewBuffer.vertexArray;
-    const pointCount = viewBuffer.pointCount;
+    const drawCount = viewBuffer.drawCount;
 
     let drawFailure = null;
     let restorationFailures = null;
@@ -1740,7 +2129,7 @@ export class HighlightRenderer {
       // Attribute layout is immutable for the lifetime of the resource pair;
       // each frame needs one VAO bind instead of reconfiguring two attributes.
       gl.bindVertexArray(vertexArray);
-      drawPointsInSegments(gl, 0, pointCount);
+      drawPointsInSegments(gl, 0, drawCount);
     } catch (error) {
       drawFailure = error;
     } finally {
@@ -1774,7 +2163,10 @@ export class HighlightRenderer {
         `Highlight draw for view "${vid}" could not restore renderer-owned state.`
       );
     }
-    viewBuffer.drawFailure = null;
+    if (viewBuffer.drawFailure !== null) {
+      viewBuffer.drawFailure = null;
+      viewBuffer.drawSerial = ++this._drawSerials;
+    }
   }
 }
 
@@ -2159,105 +2551,6 @@ function clearProximityOverlay({ canvas, lassoCtx }) {
   clearLassoOverlay({ canvas, lassoCtx });
 }
 
-/**
- * Return the exact proximity-selection cell-ID set. With a spatial index the
- * array follows spatial traversal order; callers must treat cell IDs as an
- * unordered selection set (there is no distance/rank meaning in this API).
- */
-export function findCellsInProximity({
-  transparencyArray,
-  centerPos,
-  radius3D,
-  viewPositions,
-  dimensionLevel,
-  spatialIndex = null,
-  queryStats = null
-}) {
-  const positions = viewPositions;
-  const dimension = requireHighlightDimension(dimensionLevel);
-  const pointCount = requireHighlightPositions(
-    positions,
-    dimension,
-    'Proximity-selection view positions'
-  );
-  const alphas = requireHighlightTransparency(
-    transparencyArray,
-    pointCount
-  );
-  if (
-    !Array.isArray(centerPos) ||
-    centerPos.length !== 3 ||
-    !centerPos.every(Number.isFinite)
-  ) {
-    throw new TypeError(
-      'Proximity-selection centerPos must be an array of three finite numbers.'
-    );
-  }
-  if (!Number.isFinite(radius3D) || radius3D < 0) {
-    throw new RangeError(
-      'Proximity-selection radius3D must be a finite non-negative number.'
-    );
-  }
-  if (radius3D === 0) return [];
-  if (
-    spatialIndex !== null &&
-    (
-      typeof spatialIndex !== 'object' ||
-      spatialIndex.pointCount !== pointCount ||
-      spatialIndex.positions !== positions ||
-      spatialIndex.dimensionLevel !== dimension ||
-      typeof spatialIndex.visitRadiusCandidates !== 'function'
-    )
-  ) {
-    throw new TypeError(
-      'Proximity-selection spatialIndex must be null or an exact matching spatial owner.'
-    );
-  }
-  if (
-    queryStats !== null &&
-    (
-      typeof queryStats !== 'object' ||
-      Array.isArray(queryStats)
-    )
-  ) {
-    throw new TypeError('Proximity-selection queryStats must be null or an object.');
-  }
-
-  const selectedIndices = [];
-  const radiusSq = radius3D * radius3D;
-  let examinedPointCount = 0;
-  const evaluatePoint = i => {
-    examinedPointCount++;
-    // Cell is selectable only if visible (not filtered out in this view)
-    // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (!(alphas[i] >= POINT_VISIBILITY_THRESHOLD)) return;
-    const base = i * dimension;
-    const dx = positions[base] - centerPos[0];
-    const dy = (dimension > 1 ? positions[base + 1] : 0) - centerPos[1];
-    const dz = (dimension > 2 ? positions[base + 2] : 0) - centerPos[2];
-    if (dx * dx + dy * dy + dz * dz <= radiusSq) {
-      selectedIndices.push(i);
-    }
-  };
-
-  if (spatialIndex === null) {
-    for (let i = 0; i < pointCount; i++) {
-      evaluatePoint(i);
-    }
-  } else {
-    spatialIndex.visitRadiusCandidates(
-      centerPos,
-      radius3D,
-      evaluatePoint
-    );
-  }
-  if (queryStats !== null) {
-    queryStats.examinedPointCount = examinedPointCount;
-  }
-
-  return selectedIndices;
-}
-
 // HighlightTools encapsulates highlight rendering and interactive tools.
 export class HighlightTools {
   constructor({
@@ -2379,9 +2672,16 @@ export class HighlightTools {
     this.knnCallback = null;
     this.knnPreviewCallback = null;
     this.knnStepCallback = null;
-    this.knnAdjacencyList = null;
+    this.knnGraph = null;
     this.knnEdgesLoaded = false;
     this.knnEdgeLoadCallback = null;
+
+    // The cell query of the gesture in flight (selection-gesture-queries.js),
+    // with what it was built from; rebuilt when any of that changes.
+    this._lassoHitTest = null;
+    this._proximityHitTest = null;
+    this._knnExpansion = null;
+    this._selectionWorkScheduled = false;
 
     this.altKeyDown = false;
     // The on-screen stand-in for a held Alt key; see `select-mode.js`.
@@ -2436,17 +2736,17 @@ export class HighlightTools {
       inProgress: this._unifiedCandidateSet !== null,
       stepCount: this._unifiedStepCount,
       candidateCount: this._unifiedCandidateSet ? this._unifiedCandidateSet.size : 0,
-      candidates: this._unifiedCandidateSet ? this._unifiedCandidateSet.toArray() : []
+      candidates: this._unifiedCandidateSet ? this._unifiedCandidateSet.toUint32Array() : new Uint32Array(0)
     };
   }
 
   /**
    * Confirm unified selection and clear state.
    * @param {Function} [callback] - Optional callback to receive final selection
-   * @returns {number[]} Array of selected cell indices
+   * @returns {Uint32Array} The selected cells, ascending
    */
   confirmUnifiedSelection(callback = null) {
-    const finalIndices = this._unifiedCandidateSet ? this._unifiedCandidateSet.toArray() : [];
+    const finalIndices = this._unifiedCandidateSet ? this._unifiedCandidateSet.toUint32Array() : new Uint32Array(0);
     if (callback && finalIndices.length > 0) {
       callback({
         type: 'unified',
@@ -2470,12 +2770,12 @@ export class HighlightTools {
 
   /**
    * Restore unified selection state.
-   * @param {number[]} candidates - Array of cell indices
+   * @param {Uint32Array} candidates - Cell list (ascending cell indices)
    * @param {number} step - Step count
    */
   restoreUnifiedState(candidates, step) {
     if (candidates && candidates.length > 0) {
-      this._unifiedCandidateSet = CellSet.from(candidates, this.getViewTransparency('live').length);
+      this._unifiedCandidateSet = CellSet.fromCellList(candidates, this.getViewTransparency('live').length);
       this._unifiedStepCount = step;
     } else {
       this._unifiedCandidateSet = null;
@@ -2489,8 +2789,9 @@ export class HighlightTools {
   }
 
   /**
-   * Update highlight data. In multi-view mode, buffers will be rebuilt with
-   * view-specific positions and transparency during the next renderHighlights call.
+   * Update highlight data. In multi-view mode, buffers are rebuilt with
+   * view-specific positions and transparency when each view next draws
+   * (`syncHighlightBufferForLod`, then `drawHighlights`).
    *
    * IMPORTANT: Highlight display respects per-view filtering. Cells that are filtered
    * out in a view will NOT show highlights in that view, even if they're highlighted
@@ -2602,12 +2903,9 @@ export class HighlightTools {
       );
     }
     generations.set(vid, next);
-    // KNN expansion retains visited/frontier sets across pointer movement.
-    // Filtering arrays are intentionally updated in place, so their reference
-    // cannot certify that a cached path is still traversable. This explicit
-    // publication boundary invalidates that cache exactly and avoids both
-    // stale paths and a sampled O(500) fingerprint on every drag step.
-    resetKnnCache();
+    // Filtering arrays are updated in place, so their reference cannot
+    // certify that a gesture's cell query still holds. Each query records the
+    // generation it was built at and is rebuilt when this one differs.
     return next;
   }
 
@@ -2632,7 +2930,7 @@ export class HighlightTools {
       ) {
         lassoRetirementEvent = {
           type: 'lasso-preview',
-          cellIndices: [],
+          cellIndices: new Uint32Array(0),
           cellCount: 0,
           newCellCount: 0,
           mode: this.lassoMode || 'intersect',
@@ -2647,6 +2945,7 @@ export class HighlightTools {
       clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
       this.lassoPath = [];
       this.lassoViewContext = null;
+      this._lassoHitTest = null;
       this._lassoPreviewPublished = false;
       retired = true;
     }
@@ -2663,7 +2962,7 @@ export class HighlightTools {
       ) {
         proximityRetirementEvent = {
           type: 'proximity-preview',
-          cellIndices: [],
+          cellIndices: new Uint32Array(0),
           cellCount: 0,
           newCellCount: 0,
           centerCellIndex:
@@ -2681,6 +2980,7 @@ export class HighlightTools {
       });
       this.proximityCenter = null;
       this.proximityCurrentRadius = 0;
+      this._proximityHitTest = null;
       this._proximityPreviewPublished = false;
       retired = true;
     }
@@ -2706,13 +3006,14 @@ export class HighlightTools {
         this.getSpatialQueryOwner(capturedOwner.viewId, false),
         capturedOwner.viewId
       );
+      // The lasso and proximity queries read the published positions and
+      // transparency; a spatial index finishing its build mid-gesture
+      // changes neither.
       return (
-        currentOwner.positions === capturedOwner.positions &&
         currentOwner.publishedPositions ===
           capturedOwner.publishedPositions &&
         currentOwner.transparency === capturedOwner.transparency &&
-        currentOwner.dimensionLevel === capturedOwner.dimensionLevel &&
-        currentOwner.spatialIndex === capturedOwner.spatialIndex
+        currentOwner.dimensionLevel === capturedOwner.dimensionLevel
       );
     } catch {
       return false;
@@ -2832,22 +3133,6 @@ export class HighlightTools {
     );
   }
 
-  /**
-   * Sync LOD visibility and draw highlights in one call (used by viewer render loop)
-   * @param {Object} drawParams - Draw parameters (includes viewId for per-view LOD)
-   * @param {Float32Array} viewPositions - Exact per-view positions.
-   * @param {Uint8Array} viewTransparency - Exact per-view transparency.
-   */
-  renderHighlights(drawParams, viewPositions, viewTransparency) {
-    this.syncHighlightBufferForLod(
-      viewPositions,
-      drawParams.viewId,
-      viewTransparency,
-      drawParams.dimensionLevel
-    );
-    this.drawHighlights(drawParams);
-  }
-
   setHighlightStyle(options = {}) {
     if (this.highlightRenderer) {
       this.highlightRenderer.setStyle(options);
@@ -2861,6 +3146,11 @@ export class HighlightTools {
   /** Whether the highlights on screen animate; see HighlightRenderer.isAnimated. */
   isHighlightAnimating() {
     return this.highlightRenderer.isAnimated();
+  }
+
+  /** See HighlightRenderer.drawSerial. */
+  highlightDrawSerial(viewId) {
+    return this.highlightRenderer.drawSerial(viewId);
   }
 
   getLassoCtx() {
@@ -3044,7 +3334,7 @@ export class HighlightTools {
 
   confirmLassoSelection() {
     if (this.lassoCandidateSet && this.lassoCandidateSet.size > 0) {
-      const finalIndices = this.lassoCandidateSet.toArray();
+      const finalIndices = this.lassoCandidateSet.toUint32Array();
       if (this.lassoCallback) {
         this.lassoCallback({
           type: 'lasso',
@@ -3070,7 +3360,7 @@ export class HighlightTools {
       this.lassoStepCallback({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     }
@@ -3078,7 +3368,7 @@ export class HighlightTools {
 
   restoreLassoState(candidates, step) {
     if (candidates && candidates.length > 0) {
-      this.lassoCandidateSet = CellSet.from(candidates, this.getViewTransparency('live').length);
+      this.lassoCandidateSet = CellSet.fromCellList(candidates, this.getViewTransparency('live').length);
       this.lassoStepCount = step;
     } else {
       this.lassoCandidateSet = null;
@@ -3142,7 +3432,7 @@ export class HighlightTools {
 
   confirmProximitySelection() {
     if (this.proximityCandidateSet && this.proximityCandidateSet.size > 0) {
-      const finalIndices = this.proximityCandidateSet.toArray();
+      const finalIndices = this.proximityCandidateSet.toUint32Array();
       if (this.proximityCallback) {
         this.proximityCallback({
           type: 'proximity',
@@ -3168,7 +3458,7 @@ export class HighlightTools {
       this.proximityStepCallback({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     }
@@ -3176,7 +3466,7 @@ export class HighlightTools {
 
   restoreProximityState(candidates, step) {
     if (candidates && candidates.length > 0) {
-      this.proximityCandidateSet = CellSet.from(candidates, this.getViewTransparency('live').length);
+      this.proximityCandidateSet = CellSet.fromCellList(candidates, this.getViewTransparency('live').length);
       this.proximityStepCount = step;
     } else {
       this.proximityCandidateSet = null;
@@ -3191,6 +3481,7 @@ export class HighlightTools {
       if (this.isKnnDragging) {
         this.isKnnDragging = false;
         clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+        this._knnExpansion = null;
         this.canvas.classList.remove('knn-dragging');
       }
     } else if (!this.knnEdgesLoaded && this.knnEdgeLoadCallback) {
@@ -3239,26 +3530,24 @@ export class HighlightTools {
     };
   }
 
-  loadKnnEdges(sources, destinations, cellCount) {
-    if (
-      !(sources instanceof Uint32Array) ||
-      !(destinations instanceof Uint32Array)
-    ) {
-      throw new TypeError(
-        'KNN edges require Uint32Array sources and destinations.'
-      );
-    }
-    if (sources.length !== destinations.length) {
+  /**
+   * Load the k-NN tool's graph: the adjacency the reader worker built with
+   * the edges (`ConnectivityEdges` of `data/connectivity-edges.js`), used as it is.
+   *
+   * @param {import('../data/connectivity-edges.js').ConnectivityEdges} graph
+   * @param {number} cellCount - Cells of the published views.
+   * @returns {true}
+   */
+  loadKnnEdges(graph, cellCount) {
+    requireKnnGraph(graph);
+    if (graph.nCells !== cellCount) {
       throw new RangeError(
-        'KNN edge source and destination arrays must have equal length.'
+        `The KNN graph covers ${formatCountOf(graph.nCells, 'cell')}; the views hold ${cellCount}.`
       );
     }
-    resetKnnCache();
-    const start = performance.now();
-    this.knnAdjacencyList = buildKnnAdjacency(sources, destinations, cellCount);
+    this._knnExpansion = null;
+    this.knnGraph = graph;
     this.knnEdgesLoaded = true;
-    const elapsed = performance.now() - start;
-    console.log(`[HighlightTools] KNN adjacency built in ${elapsed.toFixed(1)}ms (${cellCount} cells, ${sources.length} edges)`);
     return true;
   }
 
@@ -3270,14 +3559,13 @@ export class HighlightTools {
     this.canvas.classList.remove('knn-dragging');
     if (hadActiveOverlay) {
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-    } else {
-      resetKnnCache();
     }
+    this._knnExpansion = null;
     this.knnSeedCell = null;
     this.knnCurrentDegree = 0;
     this.knnCandidateSet = null;
     this.knnStepCount = 0;
-    this.knnAdjacencyList = null;
+    this.knnGraph = null;
     this.knnEdgesLoaded = false;
     this.updateSelectionCursor();
   }
@@ -3288,7 +3576,7 @@ export class HighlightTools {
 
   confirmKnnSelection() {
     if (this.knnCandidateSet && this.knnCandidateSet.size > 0) {
-      const finalIndices = this.knnCandidateSet.toArray();
+      const finalIndices = this.knnCandidateSet.toUint32Array();
       if (this.knnCallback) {
         this.knnCallback({
           type: 'knn',
@@ -3309,7 +3597,7 @@ export class HighlightTools {
       this.knnStepCallback({
         step: 0,
         candidateCount: 0,
-        candidates: [],
+        candidates: new Uint32Array(0),
         cancelled: true
       });
     }
@@ -3317,6 +3605,7 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.canvas.classList.remove('knn-dragging');
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this._knnExpansion = null;
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -3325,7 +3614,7 @@ export class HighlightTools {
 
   restoreKnnState(candidates, step) {
     if (candidates && candidates.length > 0) {
-      this.knnCandidateSet = CellSet.from(candidates, this.getViewTransparency('live').length);
+      this.knnCandidateSet = CellSet.fromCellList(candidates, this.getViewTransparency('live').length);
       this.knnStepCount = step;
     } else {
       this.knnCandidateSet = null;
@@ -3449,6 +3738,229 @@ export class HighlightTools {
     return true;
   }
 
+  // === Gesture cell queries ===
+  //
+  // Each drag tool answers its pointer moves from one cell query built for
+  // the gesture (selection-gesture-queries.js). Building it is a pass over
+  // the cells; that pass, like a deep k-NN expansion, runs in slices of
+  // SELECTION_SLICE_MS, the first one in the input event and the rest as
+  // separate tasks, and the preview is published when it completes. A
+  // release finishes whatever is left before committing.
+
+  _transparencyGeneration(viewId) {
+    return this._getTransparencyGenerations().get(viewId) ?? 0;
+  }
+
+  /**
+   * The lasso's hit test for the gesture in flight, holding every vertex of
+   * `lassoPath`; built when missing or when the pane's filtering changed.
+   *
+   * @returns {LassoHitTest}
+   */
+  _lassoQuery() {
+    const context = this.lassoViewContext;
+    const owner = context.spatialOwner;
+    const generation = this._transparencyGeneration(context.viewId);
+    let record = this._lassoHitTest;
+    if (!record || record.owner !== owner || record.generation !== generation) {
+      const viewport = requireHighlightViewport(
+        context.viewport,
+        'Lasso-selection viewport'
+      );
+      const mvpMatrix = this.mat4.create();
+      this.mat4.multiply(
+        mvpMatrix,
+        viewport.projectionMatrix,
+        requireHighlightMatrix(context.viewMatrix, 'Lasso-selection view matrix')
+      );
+      this.mat4.multiply(
+        mvpMatrix,
+        mvpMatrix,
+        requireHighlightMatrix(context.modelMatrix, 'Lasso-selection model matrix')
+      );
+      record = {
+        owner,
+        generation,
+        query: new LassoHitTest({
+          positions: owner.publishedPositions,
+          dimensionLevel: owner.dimensionLevel,
+          transparency: owner.transparency,
+          mvpMatrix,
+          viewport,
+        }),
+      };
+      this._lassoHitTest = record;
+    }
+    const query = record.query;
+    for (let index = query.vertexCount; index < this.lassoPath.length; index++) {
+      query.appendVertex(this.lassoPath[index].x, this.lassoPath[index].y);
+    }
+    return query;
+  }
+
+  /**
+   * The proximity hit test for the gesture in flight, at the current radius;
+   * built when missing or when the pane's filtering changed.
+   *
+   * @returns {ProximityHitTest}
+   */
+  _proximityQuery() {
+    const center = this.proximityCenter;
+    const owner = center.spatialOwner;
+    const generation = this._transparencyGeneration(center.viewId);
+    let record = this._proximityHitTest;
+    if (
+      !record ||
+      record.center !== center ||
+      record.owner !== owner ||
+      record.generation !== generation
+    ) {
+      record = {
+        center,
+        owner,
+        generation,
+        query: new ProximityHitTest({
+          positions: owner.publishedPositions,
+          dimensionLevel: owner.dimensionLevel,
+          transparency: owner.transparency,
+          center: center.worldPos,
+        }),
+      };
+      this._proximityHitTest = record;
+    }
+    record.query.setRadius(this.proximityCurrentRadius);
+    return record.query;
+  }
+
+  /**
+   * The k-NN expansion of the gesture in flight, through the cells its view
+   * draws; built when missing or when the graph or the view's filtering
+   * changed.
+   *
+   * @returns {KnnExpansion}
+   */
+  _knnQuery() {
+    const seed = this.knnSeedCell;
+    const viewId = requireHighlightViewId(seed.viewId, 'KNN-selection viewId');
+    const transparency = this.getViewTransparency(viewId);
+    const generation = this._transparencyGeneration(viewId);
+    const graph = this.knnGraph;
+    const record = this._knnExpansion;
+    if (
+      record &&
+      record.seed === seed &&
+      record.graph === graph &&
+      record.transparency === transparency &&
+      record.generation === generation
+    ) {
+      return record.query;
+    }
+    const query = new KnnExpansion({ graph, seed: seed.cellIndex, transparency });
+    this._knnExpansion = { seed, graph, transparency, generation, query };
+    return query;
+  }
+
+  /** Continue the gesture's pending pass as a separate task. */
+  _scheduleSelectionWork() {
+    if (this._selectionWorkScheduled === true) return;
+    this._selectionWorkScheduled = true;
+    void yieldToMacrotask().then(() => {
+      this._selectionWorkScheduled = false;
+      if (this._disposed !== true) this._advanceSelectionWork();
+    });
+  }
+
+  /**
+   * Run one slice of the pending pass of the gesture in flight; publish its
+   * preview when the pass completes, or schedule the next slice.
+   */
+  _advanceSelectionWork() {
+    const deadline = performance.now() + SELECTION_SLICE_MS;
+    if (this.isLassoing && this.lassoViewContext) {
+      if (!this._spatialQueryOwnerIsCurrent(this.lassoViewContext.spatialOwner)) {
+        this._retireActiveSpatialInteractions(this.lassoViewContext.viewId);
+        return;
+      }
+      const query = this._lassoQuery();
+      if (!query.prepare(deadline)) {
+        this._scheduleSelectionWork();
+      } else if (this.lassoPreviewCallback && this.lassoPath.length >= 3) {
+        this._publishLassoPreview(query);
+      }
+      return;
+    }
+    if (this.isProximityDragging && this.proximityCenter) {
+      if (!this._spatialQueryOwnerIsCurrent(this.proximityCenter.spatialOwner)) {
+        this._retireActiveSpatialInteractions(this.proximityCenter.viewId);
+        return;
+      }
+      const query = this._proximityQuery();
+      if (!query.prepare(deadline)) {
+        this._scheduleSelectionWork();
+      } else if (this.proximityPreviewCallback && this.proximityCurrentRadius > 0) {
+        this._publishProximityPreview(query);
+      }
+      return;
+    }
+    if (this.isKnnDragging && this.knnSeedCell && this.knnGraph && this.knnPreviewCallback) {
+      const query = this._knnQuery();
+      if (!query.expandTo(this.knnCurrentDegree, deadline)) {
+        this._scheduleSelectionWork();
+      } else {
+        this._publishKnnPreview(query);
+      }
+    }
+  }
+
+  _publishLassoPreview(query) {
+    const hits = query.hits();
+    // Combine against the accumulated candidates exactly as the KNN and
+    // proximity previews do: the preview shows what the release would leave
+    // selected, not the polygon's own hits.
+    const mode = this.lassoMode || 'intersect';
+    const combinedIndices = combineCandidatePreview(this.lassoCandidateSet, hits, mode);
+    this._lassoPreviewPublished = true;
+    this.lassoPreviewCallback({
+      type: 'lasso-preview',
+      cellIndices: combinedIndices,
+      cellCount: combinedIndices.length,
+      newCellCount: hits.size,
+      mode: mode,
+      polygon: [...this.lassoPath]
+    });
+  }
+
+  _publishProximityPreview(query) {
+    const hits = query.hits();
+    const mode = this.proximityCenter.mode || 'intersect';
+    const combinedIndices = combineCandidatePreview(this.proximityCandidateSet, hits, mode);
+    this._proximityPreviewPublished = true;
+    this.proximityPreviewCallback({
+      type: 'proximity-preview',
+      cellIndices: combinedIndices,
+      cellCount: combinedIndices.length,
+      newCellCount: hits.size,
+      centerCellIndex: this.proximityCenter.cellIndex,
+      radius: this.proximityCurrentRadius,
+      mode: mode
+    });
+  }
+
+  _publishKnnPreview(query) {
+    const cells = query.cells();
+    const mode = this.knnSeedCell.mode || 'intersect';
+    const combinedIndices = combineCandidatePreview(this.knnCandidateSet, cells, mode);
+    this.knnPreviewCallback({
+      type: 'knn-preview',
+      cellIndices: combinedIndices,
+      cellCount: combinedIndices.length,
+      newCellCount: cells.size,
+      seedCellIndex: this.knnSeedCell.cellIndex,
+      degree: this.knnCurrentDegree,
+      mode: mode
+    });
+  }
+
   // === Event handling ===
   //
   // One press, move, release pipeline serves every pointer. The viewer feeds it
@@ -3478,7 +3990,7 @@ export class HighlightTools {
         'Lasso interaction viewId'
       );
       const spatialOwner = requireSpatialQueryOwner(
-        this.getSpatialQueryOwner(viewId, true),
+        this.getSpatialQueryOwner(viewId, false),
         viewId
       );
       const capturedViewMatrix = this.mat4.create();
@@ -3506,6 +4018,11 @@ export class HighlightTools {
         modelMatrix: capturedModelMatrix,
         spatialOwner
       };
+      // Project the cells while the gesture begins.
+      this._lassoHitTest = null;
+      if (!this._lassoQuery().prepare(performance.now() + SELECTION_SLICE_MS)) {
+        this._scheduleSelectionWork();
+      }
 
       this.canvas.style.cursor = 'crosshair';
       this.canvas.classList.add('lassoing');
@@ -3528,10 +4045,10 @@ export class HighlightTools {
         'Proximity interaction viewId'
       );
       const spatialOwner = requireSpatialQueryOwner(
-        this.getSpatialQueryOwner(viewId, true),
+        this.getSpatialQueryOwner(viewId, false),
         viewId
       );
-      const positions = spatialOwner.positions;
+      const positions = spatialOwner.publishedPositions;
       const capturedViewMatrix = this.mat4.create();
       const sourceViewMatrix = vpInfo.effectiveViewMatrix === null
         ? requireHighlightMatrix(
@@ -3563,12 +4080,12 @@ export class HighlightTools {
       } else if (this.proximityCandidateSet && this.proximityCandidateSet.size > 0) {
         let cx = 0, cy = 0, cz = 0;
         const point = [0, 0, 0];
-        for (const idx of this.proximityCandidateSet) {
+        this.proximityCandidateSet.forEach(idx => {
           readPositionXYZ(positions, positionDimension, idx, point);
           cx += point[0];
           cy += point[1];
           cz += point[2];
-        }
+        });
         const count = this.proximityCandidateSet.size;
         cx /= count; cy /= count; cz /= count;
 
@@ -3625,6 +4142,11 @@ export class HighlightTools {
         this.proximityCurrentRadius = 0;
         this._proximityPreviewPublished = false;
         this.isProximityDragging = true;
+        // Measure the cells' distances while the gesture begins.
+        this._proximityHitTest = null;
+        if (!this._proximityQuery().prepare(performance.now() + SELECTION_SLICE_MS)) {
+          this._scheduleSelectionWork();
+        }
         this.canvas.style.cursor = 'crosshair';
         this.canvas.classList.add('proximity-dragging');
         drawProximityIndicator({
@@ -3669,7 +4191,7 @@ export class HighlightTools {
           viewId: viewId  // Store viewId for multi-dimensional support
         };
         this.knnCurrentDegree = 0;
-        resetKnnCache();
+        this._knnExpansion = null;
         this.isKnnDragging = true;
         this.canvas.style.cursor = 'ns-resize';
         this.canvas.classList.add('knn-dragging');
@@ -3777,35 +4299,11 @@ export class HighlightTools {
         this.lassoPath.push({ x: localX, y: localY });
         drawLasso({ canvas: this.canvas, lassoCtx: this.lassoCtx, lassoPath: this.lassoPath });
 
-        if (this.lassoPreviewCallback && this.lassoPath.length >= 3) {
-          const previewIndices = findCellsInLasso({
-            lassoPath: this.lassoPath,
-            lassoViewContext: this.lassoViewContext,
-            mat4: this.mat4,
-            modelMatrix: this.lassoViewContext.modelMatrix,
-            transparencyArray: spatialOwner.transparency,
-            viewPositions: spatialOwner.positions,
-            dimensionLevel: spatialOwner.dimensionLevel,
-            spatialIndex: spatialOwner.spatialIndex
-          });
-          // Combine against the accumulated candidates exactly as the KNN and
-          // proximity previews do. Publishing the raw polygon hits made the
-          // existing selection disappear for the length of an add or subtract
-          // gesture, and lit the cells being removed rather than the ones that
-          // would remain.
-          const mode = this.lassoMode || 'intersect';
-          let combinedIndices;
-          combinedIndices = combineCandidatePreview(this.lassoCandidateSet, previewIndices, mode);
-
-          this._lassoPreviewPublished = true;
-          this.lassoPreviewCallback({
-            type: 'lasso-preview',
-            cellIndices: combinedIndices,
-            cellCount: combinedIndices.length,
-            newCellCount: previewIndices.length,
-            mode: mode,
-            polygon: [...this.lassoPath]
-          });
+        const query = this._lassoQuery();
+        if (!query.prepare(performance.now() + SELECTION_SLICE_MS)) {
+          this._scheduleSelectionWork();
+        } else if (this.lassoPreviewCallback && this.lassoPath.length >= 3) {
+          this._publishLassoPreview(query);
         }
       }
       return true;
@@ -3841,35 +4339,16 @@ export class HighlightTools {
         modelMatrix: this.proximityCenter.modelMatrix
       });
 
-      if (this.proximityPreviewCallback && this.proximityCurrentRadius > 0) {
-        const newIndices = findCellsInProximity({
-          transparencyArray: spatialOwner.transparency,
-          centerPos: this.proximityCenter.worldPos,
-          radius3D: this.proximityCurrentRadius,
-          viewPositions: spatialOwner.positions,
-          dimensionLevel: spatialOwner.dimensionLevel,
-          spatialIndex: spatialOwner.spatialIndex
-        });
-        const mode = this.proximityCenter.mode || 'intersect';
-
-        let combinedIndices;
-        combinedIndices = combineCandidatePreview(this.proximityCandidateSet, newIndices, mode);
-
-        this._proximityPreviewPublished = true;
-        this.proximityPreviewCallback({
-          type: 'proximity-preview',
-          cellIndices: combinedIndices,
-          cellCount: combinedIndices.length,
-          newCellCount: newIndices.length,
-          centerCellIndex: this.proximityCenter.cellIndex,
-          radius: this.proximityCurrentRadius,
-          mode: mode
-        });
+      const query = this._proximityQuery();
+      if (!query.prepare(performance.now() + SELECTION_SLICE_MS)) {
+        this._scheduleSelectionWork();
+      } else if (this.proximityPreviewCallback && this.proximityCurrentRadius > 0) {
+        this._publishProximityPreview(query);
       }
       return true;
     }
 
-    if (this.isKnnDragging && this.knnSeedCell && this.knnAdjacencyList) {
+    if (this.isKnnDragging && this.knnSeedCell && this.knnGraph) {
       const dx = e.clientX - this.knnSeedCell.screenX;
       const dy = e.clientY - this.knnSeedCell.screenY;
       const pixelDist = Math.sqrt(dx * dx + dy * dy);
@@ -3901,30 +4380,13 @@ export class HighlightTools {
         });
 
         if (this.knnPreviewCallback) {
-          // Use view-specific transparency so each view's filters are respected
-          const viewId = knnViewId;
-          const viewTransparency = this.getViewTransparency(viewId);
-          const { allCells } = findKnnNeighborsUpToDegree(
-            this.knnSeedCell.cellIndex,
-            this.knnCurrentDegree,
-            this.knnAdjacencyList,
-            viewTransparency
-          );
-          const newIndices = allCells.toArray();
-          const mode = this.knnSeedCell.mode || 'intersect';
-
-          let combinedIndices;
-          combinedIndices = combineCandidatePreview(this.knnCandidateSet, newIndices, mode);
-
-          this.knnPreviewCallback({
-            type: 'knn-preview',
-            cellIndices: combinedIndices,
-            cellCount: combinedIndices.length,
-            newCellCount: newIndices.length,
-            seedCellIndex: this.knnSeedCell.cellIndex,
-            degree: this.knnCurrentDegree,
-            mode: mode
-          });
+          // The expansion runs through the cells this view draws.
+          const query = this._knnQuery();
+          if (!query.expandTo(this.knnCurrentDegree, performance.now() + SELECTION_SLICE_MS)) {
+            this._scheduleSelectionWork();
+          } else {
+            this._publishKnnPreview(query);
+          }
         }
       }
       return true;
@@ -3980,6 +4442,7 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.canvas.classList.remove('knn-dragging');
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this._knnExpansion = null;
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -4055,16 +4518,8 @@ export class HighlightTools {
       this.isLassoing = false;
       this.canvas.classList.remove('lassoing');
       if (this.lassoPath.length >= 3) {
-        const selectedIndices = findCellsInLasso({
-          lassoPath: this.lassoPath,
-          lassoViewContext: this.lassoViewContext,
-          mat4: this.mat4,
-          modelMatrix: this.lassoViewContext.modelMatrix,
-          transparencyArray: spatialOwner.transparency,
-          viewPositions: spatialOwner.positions,
-          dimensionLevel: spatialOwner.dimensionLevel,
-          spatialIndex: spatialOwner.spatialIndex
-        });
+        const query = this._lassoQuery();
+        query.prepare(Infinity);
         // Every closed polygon publishes its step, including one that encloses
         // nothing: intersecting a standing selection down to zero is an
         // outcome the user drew on purpose, and a subtract with nothing
@@ -4073,7 +4528,7 @@ export class HighlightTools {
         // standing under a panel still reporting the previous step.
         this.lassoCandidateSet = commitCandidateStep(
           this.lassoCandidateSet,
-          selectedIndices,
+          query.hits(),
           this.lassoMode,
           spatialOwner.transparency.length
         );
@@ -4083,7 +4538,7 @@ export class HighlightTools {
           this.lassoStepCallback({
             step: this.lassoStepCount,
             candidateCount: this.lassoCandidateSet.size,
-            candidates: this.lassoCandidateSet.toArray(),
+            candidates: this.lassoCandidateSet.toUint32Array(),
             mode: this.lassoMode
           });
         }
@@ -4091,6 +4546,7 @@ export class HighlightTools {
       clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
       this.lassoPath = [];
       this.lassoViewContext = null;
+      this._lassoHitTest = null;
       this._lassoPreviewPublished = false;
       this.updateSelectionCursor();
       return true;
@@ -4111,18 +4567,12 @@ export class HighlightTools {
       this.canvas.classList.remove('proximity-dragging');
 
       if (this.proximityCurrentRadius > 0) {
-        const newIndices = findCellsInProximity({
-          transparencyArray: spatialOwner.transparency,
-          centerPos: this.proximityCenter.worldPos,
-          radius3D: this.proximityCurrentRadius,
-          viewPositions: spatialOwner.positions,
-          dimensionLevel: spatialOwner.dimensionLevel,
-          spatialIndex: spatialOwner.spatialIndex
-        });
+        const query = this._proximityQuery();
+        query.prepare(Infinity);
         const mode = this.proximityCenter.mode || 'intersect';
         this.proximityCandidateSet = commitCandidateStep(
           this.proximityCandidateSet,
-          newIndices,
+          query.hits(),
           mode,
           spatialOwner.transparency.length
         );
@@ -4133,7 +4583,7 @@ export class HighlightTools {
             this.proximityStepCallback({
               step: this.proximityStepCount,
               candidateCount: this.proximityCandidateSet.size,
-              candidates: this.proximityCandidateSet.toArray(),
+              candidates: this.proximityCandidateSet.toUint32Array(),
               mode: mode,
               centerCellIndex: this.proximityCenter.cellIndex,
               radius: this.proximityCurrentRadius
@@ -4145,6 +4595,7 @@ export class HighlightTools {
       clearProximityOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
       this.proximityCenter = null;
       this.proximityCurrentRadius = 0;
+      this._proximityHitTest = null;
       this._proximityPreviewPublished = false;
       this.updateSelectionCursor();
       return true;
@@ -4154,20 +4605,12 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.canvas.classList.remove('knn-dragging');
 
-      if (this.knnAdjacencyList && this.knnSeedCell) {
+      if (this.knnGraph && this.knnSeedCell) {
         const mode = this.knnSeedCell.mode || 'intersect';
-        // Use view-specific transparency so each view's filters are respected
-        const viewId = requireHighlightViewId(
-          this.knnSeedCell.viewId,
-          'KNN-selection viewId'
-        );
-        const viewTransparency = this.getViewTransparency(viewId);
-        const { allCells } = findKnnNeighborsUpToDegree(
-          this.knnSeedCell.cellIndex,
-          this.knnCurrentDegree,
-          this.knnAdjacencyList,
-          viewTransparency
-        );
+        // The expansion runs through the cells this view draws.
+        const query = this._knnQuery();
+        query.expandTo(this.knnCurrentDegree, Infinity);
+        const allCells = query.cells();
         // A subtract with nothing selected yet leaves an empty set, exactly
         // as proximity does, so the release still publishes a step the tool
         // can answer instead of vanishing under a wiped drag preview.
@@ -4184,7 +4627,7 @@ export class HighlightTools {
           this.knnStepCallback({
             step: this.knnStepCount,
             candidateCount: this.knnCandidateSet.size,
-            candidates: this.knnCandidateSet.toArray(),
+            candidates: this.knnCandidateSet.toUint32Array(),
             mode: mode,
             seedCellIndex: this.knnSeedCell.cellIndex,
             degree: this.knnCurrentDegree
@@ -4193,6 +4636,7 @@ export class HighlightTools {
       }
 
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this._knnExpansion = null;
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -4317,8 +4761,11 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
-      this.knnAdjacencyList = null;
+      this.knnGraph = null;
       this.knnEdgesLoaded = false;
+      this._lassoHitTest = null;
+      this._proximityHitTest = null;
+      this._knnExpansion = null;
       this.altKeyDown = false;
       this.selectMode = SELECT_MODE_OFF;
 
@@ -4354,7 +4801,6 @@ export class HighlightTools {
       this.hpRenderer = null;
       this.mat4 = null;
       this.vec3 = null;
-      resetKnnCache();
     }
 
     const pending = this._disposeState;
@@ -4479,19 +4925,22 @@ function pixelDistanceToWorldRadius(pixelDist, targetRadius) {
  * mode. Candidates are a CellSet (a JS Set refuses more than 2^24 cells).
  *
  * @param {CellSet|null} candidates
- * @param {number[]} gestureIndices
+ * @param {CellSet} gesture - The gesture's cells; read, never kept.
  * @param {'union'|'subtract'|'intersect'} mode
- * @returns {number[]} Ascending when combined with candidates.
+ * @returns {Uint32Array} The cell list the release would leave selected.
  */
-function combineCandidatePreview(candidates, gestureIndices, mode) {
-  if (candidates === null) return mode === 'subtract' ? [] : gestureIndices;
-  if (candidates.size === 0) return mode === 'union' ? gestureIndices : [];
-  const gesture = CellSet.from(gestureIndices, candidates.cellCount);
+function combineCandidatePreview(candidates, gesture, mode) {
+  if (candidates === null) {
+    return mode === 'subtract' ? new Uint32Array(0) : gesture.toUint32Array();
+  }
+  if (candidates.size === 0) {
+    return mode === 'union' ? gesture.toUint32Array() : new Uint32Array(0);
+  }
   const combined = candidates.clone();
   if (mode === 'union') combined.unionWith(gesture);
   else if (mode === 'subtract') combined.subtract(gesture);
   else combined.intersectWith(gesture);
-  return combined.toArray();
+  return combined.toUint32Array();
 }
 
 /**
@@ -4500,226 +4949,18 @@ function combineCandidatePreview(candidates, gestureIndices, mode) {
  * nothing selected yet leaves an empty set.
  *
  * @param {CellSet|null} candidates
- * @param {Iterable<number>|CellSet} gestureCells
+ * @param {CellSet} gesture - The gesture's cells; read, never kept.
  * @param {'union'|'subtract'|'intersect'} mode
  * @param {number} cellCount
  * @returns {CellSet}
  */
-function commitCandidateStep(candidates, gestureCells, mode, cellCount) {
-  const gesture = gestureCells instanceof CellSet
-    ? gestureCells
-    : CellSet.from(gestureCells, cellCount);
+function commitCandidateStep(candidates, gesture, mode, cellCount) {
   if (candidates === null) {
     return mode === 'subtract' ? new CellSet(cellCount) : gesture.clone();
   }
   if (mode === 'union') return candidates.unionWith(gesture);
   if (mode === 'subtract') return candidates.subtract(gesture);
   return candidates.intersectWith(gesture);
-}
-
-/**
- * The neighbour graph of the KNN tool, as two compressed index ranges a cell
- * over the loaded edge arrays (no per-cell object, no Map: the size is two
- * Uint32Arrays of cellCount + 1 and one of the edge count).
- *
- * Edges arrive strictly ordered by source, then destination (the
- * connectivity contract), so a cell's forward neighbours are already one
- * contiguous range of `destinations`: `forwardOffsets` only indexes it. Its
- * backward neighbours (the cells it is the destination of) are gathered once
- * into `reverseSources`, indexed by `reverseOffsets`.
- *
- * @param {Uint32Array} sources
- * @param {Uint32Array} destinations
- * @param {number} cellCount
- */
-export function buildKnnAdjacency(sources, destinations, cellCount) {
-  if (!Number.isSafeInteger(cellCount) || cellCount <= 0 || cellCount > 0xffff_ffff) {
-    throw new RangeError('KNN adjacency needs a positive uint32 cell count.');
-  }
-  const edgeCount = sources.length;
-  const forwardOffsets = new Uint32Array(cellCount + 1);
-  const reverseOffsets = new Uint32Array(cellCount + 1);
-  let previous = 0;
-  for (let edge = 0; edge < edgeCount; edge++) {
-    const source = sources[edge];
-    const destination = destinations[edge];
-    if (source < previous || source >= destination || destination >= cellCount) {
-      throw new RangeError(
-        `KNN edge ${edge} must be ordered by source and satisfy source < destination < ${cellCount}.`
-      );
-    }
-    previous = source;
-    forwardOffsets[source + 1]++;
-    reverseOffsets[destination + 1]++;
-  }
-  for (let cell = 0; cell < cellCount; cell++) {
-    forwardOffsets[cell + 1] += forwardOffsets[cell];
-    reverseOffsets[cell + 1] += reverseOffsets[cell];
-  }
-  const reverseSources = new Uint32Array(edgeCount);
-  const fill = reverseOffsets.slice(0, cellCount);
-  for (let edge = 0; edge < edgeCount; edge++) {
-    reverseSources[fill[destinations[edge]]++] = sources[edge];
-  }
-  return Object.freeze({
-    cellCount,
-    destinations,
-    forwardOffsets,
-    reverseOffsets,
-    reverseSources,
-  });
-}
-
-let knnDegreesCache = null;
-let knnMaxCachedDegree = -1;
-let knnCachedAlphasRef = null;  // Track alphas reference to invalidate cache on filter change
-
-export function resetKnnCache() {
-  knnDegreesCache = null;
-  knnMaxCachedDegree = -1;
-  knnCachedAlphasRef = null;
-}
-
-export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alphas) {
-  // Note: highlightArray parameter removed - cells must be visible (not filtered out) to be selectable
-  // Seed cell must be visible (not filtered out in this view)
-  const seedVisible =
-    !alphas || alphas[seedCell] >= POINT_VISIBILITY_THRESHOLD;
-  if (!seedVisible) {
-    return { allCells: new CellSet(adjacency?.cellCount ?? 0), byDegree: new Map(), frontier: [] };
-  }
-
-  if (!adjacency || maxDegree < 0) {
-    return {
-      allCells: CellSet.from([seedCell], adjacency?.cellCount ?? seedCell + 1),
-      byDegree: new Map([[0, [seedCell]]]),
-      frontier: [seedCell]
-    };
-  }
-
-  // In-place transparency changes invalidate at the exact
-  // handleTransparencyChange() publication boundary. Reference identity still
-  // prevents a cache from crossing between independent view owners.
-  const alphasMatches = alphas === knnCachedAlphasRef;
-
-  if (knnDegreesCache &&
-      knnDegreesCache.seedCell === seedCell &&
-      alphasMatches &&
-      knnMaxCachedDegree >= 0 &&
-      maxDegree >= knnMaxCachedDegree) {
-
-    if (maxDegree === knnMaxCachedDegree) {
-      return {
-        allCells: knnDegreesCache.visited,
-        byDegree: knnDegreesCache.byDegree,
-        frontier: knnDegreesCache.frontier
-      };
-    }
-
-    let currentFrontier = knnDegreesCache.frontier;
-    const visited = knnDegreesCache.visited;
-    const byDegree = knnDegreesCache.byDegree;
-
-    for (let degree = knnMaxCachedDegree + 1; degree <= maxDegree; degree++) {
-      const nextFrontier = [];
-      const degreeCells = [];
-
-      for (let i = 0; i < currentFrontier.length; i++) {
-        const cell = currentFrontier[i];
-        // Forward then backward neighbours (buildKnnAdjacency).
-        for (let side = 0; side < 2; side++) {
-          const offsets = side === 0 ? adjacency.forwardOffsets : adjacency.reverseOffsets;
-          const targets = side === 0 ? adjacency.destinations : adjacency.reverseSources;
-          const end = offsets[cell + 1];
-          for (let j = offsets[cell]; j < end; j++) {
-            const neighbor = targets[j];
-            if (visited.has(neighbor)) continue;
-            // Neighbor is traversable only if visible (not filtered out in this view)
-            const neighborVisible =
-              !alphas ||
-              alphas[neighbor] >= POINT_VISIBILITY_THRESHOLD;
-            if (!neighborVisible) continue;
-
-            visited.add(neighbor);
-            degreeCells.push(neighbor);
-            nextFrontier.push(neighbor);
-          }
-        }
-      }
-
-      if (degreeCells.length > 0) {
-        byDegree.set(degree, degreeCells);
-      }
-
-      currentFrontier = nextFrontier;
-      knnDegreesCache.frontier = currentFrontier;
-      knnMaxCachedDegree = degree;
-
-      if (nextFrontier.length === 0) break;
-    }
-
-    return { allCells: visited, byDegree, frontier: currentFrontier };
-  }
-
-  // Visited cells as a bitset: a JS Set refuses more than 2^24 entries.
-  const visited = CellSet.from([seedCell], adjacency.cellCount);
-  const byDegree = new Map();
-  byDegree.set(0, [seedCell]);
-
-  knnDegreesCache = {
-    seedCell,
-    visited,
-    byDegree,
-    frontier: [seedCell]
-  };
-  knnMaxCachedDegree = 0;
-  knnCachedAlphasRef = alphas;  // Track which alphas array was used for this cache
-
-  if (maxDegree === 0) {
-    return { allCells: visited, byDegree, frontier: [seedCell] };
-  }
-
-  let currentFrontier = [seedCell];
-
-  for (let degree = 1; degree <= maxDegree; degree++) {
-    const nextFrontier = [];
-    const degreeCells = [];
-
-    for (let i = 0; i < currentFrontier.length; i++) {
-      const cell = currentFrontier[i];
-      // Forward then backward neighbours (buildKnnAdjacency).
-      for (let side = 0; side < 2; side++) {
-        const offsets = side === 0 ? adjacency.forwardOffsets : adjacency.reverseOffsets;
-        const targets = side === 0 ? adjacency.destinations : adjacency.reverseSources;
-        const end = offsets[cell + 1];
-        for (let j = offsets[cell]; j < end; j++) {
-          const neighbor = targets[j];
-          if (visited.has(neighbor)) continue;
-          // Neighbor is traversable only if visible (not filtered out in this view)
-          const neighborVisible =
-            !alphas ||
-            alphas[neighbor] >= POINT_VISIBILITY_THRESHOLD;
-          if (!neighborVisible) continue;
-
-          visited.add(neighbor);
-          degreeCells.push(neighbor);
-          nextFrontier.push(neighbor);
-        }
-      }
-    }
-
-    if (degreeCells.length > 0) {
-      byDegree.set(degree, degreeCells);
-    }
-
-    currentFrontier = nextFrontier;
-    knnDegreesCache.frontier = currentFrontier;
-    knnMaxCachedDegree = degree;
-
-    if (nextFrontier.length === 0) break;
-  }
-
-  return { allCells: visited, byDegree, frontier: currentFrontier };
 }
 
 function pixelDistanceToKnnDegree(pixelDist) {
@@ -4833,7 +5074,6 @@ export function drawKnnIndicator({
 
 function clearKnnOverlay({ canvas, lassoCtx }) {
   clearLassoOverlay({ canvas, lassoCtx });
-  resetKnnCache();
 }
 
 function projectPointToScreen(px, py, pz, mvp, vpWidth, vpHeight) {
@@ -4851,213 +5091,4 @@ function projectPointToScreen(px, py, pz, mvp, vpWidth, vpHeight) {
   const screenX = (ndcX + 1) * 0.5 * vpWidth;
   const screenY = (1 - ndcY) * 0.5 * vpHeight;
   return { x: screenX, y: screenY, depth: ndcZ };
-}
-
-function pointInPolygon(x, y, polygon) {
-  if (!polygon || polygon.length < 3) return false;
-
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i].x, yi = polygon[i].y;
-    const xj = polygon[j].x, yj = polygon[j].y;
-
-    if (((yi > y) !== (yj > y)) &&
-        (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-/**
- * Return the exact lasso-selection cell-ID set. With a spatial index the array
- * follows spatial traversal order; callers must treat cell IDs as an unordered
- * selection set (there is no polygon/rank meaning in this API).
- */
-export function findCellsInLasso({
-  lassoPath,
-  lassoViewContext,
-  mat4,
-  modelMatrix,
-  transparencyArray,
-  viewPositions,
-  dimensionLevel,
-  spatialIndex = null,
-  queryStats = null
-}) {
-  if (!lassoPath || lassoPath.length < 3) return [];
-
-  const positions = viewPositions;
-  const dimension = requireHighlightDimension(dimensionLevel);
-  const pointCount = requireHighlightPositions(
-    positions,
-    dimension,
-    'Lasso-selection view positions'
-  );
-  const alphas = requireHighlightTransparency(
-    transparencyArray,
-    pointCount
-  );
-
-  if (
-    !lassoViewContext ||
-    typeof lassoViewContext !== 'object' ||
-    !lassoViewContext.viewport ||
-    !lassoViewContext.viewMatrix
-  ) {
-    throw new Error('Lasso selection requires its captured per-view render context.');
-  }
-  requireHighlightViewId(
-    lassoViewContext.viewId,
-    'Lasso-selection viewId'
-  );
-  const vp = requireHighlightViewport(
-    lassoViewContext.viewport,
-    'Lasso-selection viewport'
-  );
-  const vpOffsetX = vp.vpOffsetX;
-  const vpOffsetY = vp.vpOffsetY;
-  const vpWidth = vp.vpWidth;
-  const vpHeight = vp.vpHeight;
-  const lassoViewMatrixLocal = requireHighlightMatrix(
-    lassoViewContext.viewMatrix,
-    'Lasso-selection view matrix'
-  );
-  const exactModelMatrix = requireHighlightMatrix(
-    modelMatrix,
-    'Lasso-selection model matrix'
-  );
-  if (
-    spatialIndex !== null &&
-    (
-      typeof spatialIndex !== 'object' ||
-      spatialIndex.pointCount !== pointCount ||
-      spatialIndex.positions !== positions ||
-      spatialIndex.dimensionLevel !== dimension ||
-      typeof spatialIndex.visitProjectedRectCandidates !== 'function'
-    )
-  ) {
-    throw new TypeError(
-      'Lasso-selection spatialIndex must be null or an exact matching spatial owner.'
-    );
-  }
-  if (
-    queryStats !== null &&
-    (
-      typeof queryStats !== 'object' ||
-      Array.isArray(queryStats)
-    )
-  ) {
-    throw new TypeError('Lasso-selection queryStats must be null or an object.');
-  }
-
-  // The pane's presented rectangle in pane-local pixels.
-  const visibleMinX = vp.visibleOffsetX - vpOffsetX;
-  const visibleMinY = vp.visibleOffsetY - vpOffsetY;
-  const visibleMaxX = visibleMinX + vp.visibleWidth;
-  const visibleMaxY = visibleMinY + vp.visibleHeight;
-  const localLassoPath = new Array(lassoPath.length);
-  let minimumScreenX = Infinity;
-  let maximumScreenX = -Infinity;
-  let minimumScreenY = Infinity;
-  let maximumScreenY = -Infinity;
-  for (let index = 0; index < lassoPath.length; index++) {
-    const x = lassoPath[index].x - vpOffsetX;
-    const y = lassoPath[index].y - vpOffsetY;
-    localLassoPath[index] = { x, y };
-    minimumScreenX = Math.min(minimumScreenX, x);
-    maximumScreenX = Math.max(maximumScreenX, x);
-    minimumScreenY = Math.min(minimumScreenY, y);
-    maximumScreenY = Math.max(maximumScreenY, y);
-  }
-  minimumScreenX = Math.max(minimumScreenX, visibleMinX);
-  maximumScreenX = Math.min(maximumScreenX, visibleMaxX);
-  minimumScreenY = Math.max(minimumScreenY, visibleMinY);
-  maximumScreenY = Math.min(maximumScreenY, visibleMaxY);
-  if (minimumScreenX > maximumScreenX || minimumScreenY > maximumScreenY) {
-    if (queryStats !== null) queryStats.examinedPointCount = 0;
-    return [];
-  }
-
-  const vpMvpMatrix = mat4.create();
-  mat4.multiply(vpMvpMatrix, vp.projectionMatrix, lassoViewMatrixLocal);
-  mat4.multiply(vpMvpMatrix, vpMvpMatrix, exactModelMatrix);
-
-  const selectedIndices = [];
-  let examinedPointCount = 0;
-  const evaluatePoint = i => {
-    examinedPointCount++;
-    // Cell is selectable only if visible (not filtered out in this view)
-    // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (!(alphas[i] >= POINT_VISIBILITY_THRESHOLD)) return;
-
-    const base = i * dimension;
-    const px = positions[base];
-    const py = dimension > 1 ? positions[base + 1] : 0;
-    const pz = dimension > 2 ? positions[base + 2] : 0;
-
-    // Keep the exact projectPointToScreen predicate/equations while avoiding
-    // one short-lived object allocation per candidate at 10M+ scale.
-    const clipX =
-      vpMvpMatrix[0] * px +
-      vpMvpMatrix[4] * py +
-      vpMvpMatrix[8] * pz +
-      vpMvpMatrix[12];
-    const clipY =
-      vpMvpMatrix[1] * px +
-      vpMvpMatrix[5] * py +
-      vpMvpMatrix[9] * pz +
-      vpMvpMatrix[13];
-    const clipZ =
-      vpMvpMatrix[2] * px +
-      vpMvpMatrix[6] * py +
-      vpMvpMatrix[10] * pz +
-      vpMvpMatrix[14];
-    const clipW =
-      vpMvpMatrix[3] * px +
-      vpMvpMatrix[7] * py +
-      vpMvpMatrix[11] * pz +
-      vpMvpMatrix[15];
-    if (Math.abs(clipW) < 1e-10) return;
-    const ndcZ = clipZ / clipW;
-    if (ndcZ < -1 || ndcZ > 1) return;
-    const screenX = (clipX / clipW + 1) * 0.5 * vpWidth;
-    const screenY = (1 - clipY / clipW) * 0.5 * vpHeight;
-    // A point the pane does not present (under the sidebar, or projected
-    // past the pane edge into a neighbour's cell) is not on screen there.
-    if (
-      screenX < visibleMinX ||
-      screenX > visibleMaxX ||
-      screenY < visibleMinY ||
-      screenY > visibleMaxY
-    ) {
-      return;
-    }
-
-    if (pointInPolygon(screenX, screenY, localLassoPath)) {
-      selectedIndices.push(i);
-    }
-  };
-
-  if (spatialIndex === null) {
-    for (let i = 0; i < pointCount; i++) {
-      evaluatePoint(i);
-    }
-  } else {
-    spatialIndex.visitProjectedRectCandidates(
-      vpMvpMatrix,
-      {
-        minX: minimumScreenX * 2 / vpWidth - 1,
-        maxX: maximumScreenX * 2 / vpWidth - 1,
-        minY: 1 - maximumScreenY * 2 / vpHeight,
-        maxY: 1 - minimumScreenY * 2 / vpHeight,
-      },
-      evaluatePoint
-    );
-  }
-  if (queryStats !== null) {
-    queryStats.examinedPointCount = examinedPointCount;
-  }
-
-  return selectedIndices;
 }

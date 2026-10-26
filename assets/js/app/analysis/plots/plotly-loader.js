@@ -73,6 +73,7 @@
  */
 
 import { attachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
+import { announceIfUpdated } from '../../app-code.js';
 import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
 
 // Keep Plotly charts in sync with the active CSS theme.
@@ -179,7 +180,9 @@ export function loadPlotly() {
   // Start loading
   plotlyLoadPromise = new Promise((resolve, reject) => {
     const script = document.createElement('script');
-    script.src = 'assets/external/plotly.min.js';
+    // Resolved through the page's import map, so the URL names the bytes
+    // (index.html, CELLUCID_MODULE_VERSIONS).
+    script.src = import.meta.resolve('../../../../external/plotly.min.js');
     script.async = true;
 
     script.onload = () => {
@@ -195,6 +198,7 @@ export function loadPlotly() {
 
     script.onerror = (err) => {
       plotlyLoadPromise = null;
+      void announceIfUpdated();
       console.error('[PlotlyLoader] Failed to load Plotly.js:', err);
       reject(new Error('Failed to load Plotly.js library'));
     };
@@ -203,6 +207,38 @@ export function loadPlotly() {
   });
 
   return plotlyLoadPromise;
+}
+
+/** Longest wait for an idle moment before a prefetch loads anyway (a scheduling choice). */
+const PREFETCH_IDLE_TIMEOUT_MS = 2000;
+
+let prefetchScheduled = false;
+
+/**
+ * Load Plotly ahead of the first plot, at the page's next idle moment.
+ *
+ * Evaluating the library is one long main-thread task (its bundle runs as
+ * one script). An analysis opening is the sign a plot is coming: loading it
+ * then, while the person sets the analysis up, keeps that task out of the
+ * run that draws the first plot, which finds the library loaded (or the same
+ * load under way, `loadPlotly`). A failed prefetch leaves nothing behind:
+ * the plot's own load tries again and reports.
+ */
+export function prefetchPlotly() {
+  if (isPlotlyLoaded() || plotlyLoadPromise !== null || prefetchScheduled) return;
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  prefetchScheduled = true;
+  const start = () => {
+    prefetchScheduled = false;
+    loadPlotly().catch(() => {});
+  };
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(start, { timeout: PREFETCH_IDLE_TIMEOUT_MS });
+  } else {
+    // No idle callback (WebKit): after the frame that shows the opened
+    // analysis has been drawn.
+    window.requestAnimationFrame(() => setTimeout(start, 0));
+  }
 }
 
 /**

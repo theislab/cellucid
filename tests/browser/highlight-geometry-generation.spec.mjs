@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=highlight-geometry-generation-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=highlight-geometry-generation-ci`;
 
 async function installHighlightUploadAudit(page) {
   await page.addInitScript(() => {
@@ -140,7 +140,7 @@ test('highlight upload follows exact same-reference geometry generations', async
     }
   });
   page.on('requestfailed', request => {
-    // A superseded dataset load cancels its in-flight manifest fetches through
+    // A superseded dataset load cancels its in-flight reads through
     // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
     // cancellation rather than a load failure. A genuine failure still surfaces
     // through responseFailures and pageErrors, which are asserted separately.
@@ -153,7 +153,7 @@ test('highlight upload follows exact same-reference geometry generations', async
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const proof = await page.evaluate(async () => {
@@ -405,7 +405,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     }
   });
   page.on('requestfailed', request => {
-    // A superseded dataset load cancels its in-flight manifest fetches through
+    // A superseded dataset load cancels its in-flight reads through
     // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
     // cancellation rather than a load failure. A genuine failure still surfaces
     // through responseFailures and pageErrors, which are asserted separately.
@@ -418,7 +418,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const proof = await page.evaluate(async () => {

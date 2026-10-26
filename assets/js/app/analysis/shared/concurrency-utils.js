@@ -69,3 +69,73 @@ export function createSlicedYield(sliceMs = MAIN_THREAD_SLICE_MS) {
     });
   };
 }
+
+/** One display frame at 60 Hz, in milliseconds. */
+export const FRAME_MS = 1000 / 60;
+
+/**
+ * Coalesce a stream of updates to at most one delivery per frame.
+ *
+ * A long analysis completes thousands of items a second; an update per item
+ * (a progress record, a formatted count, a partial result) costs more on this
+ * thread than the item did, and nobody sees more than one per frame. `push`
+ * takes a function that builds the update, so an update that is replaced
+ * before its frame is never built. The latest one is delivered at once when a
+ * frame has passed since the last delivery, otherwise when it has.
+ *
+ * @template T
+ * @param {(update: T) => void} deliver
+ * @param {number} [intervalMs=FRAME_MS]
+ * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void}} [options]
+ *   `clock`, the time in milliseconds (`performance.now`), and `after`, a
+ *   timer that calls back after `ms` and returns what cancels it
+ *   (`setTimeout`); tests give a virtual clock and its timers
+ * @returns {{push: (build: () => T) => void, flush: () => void, cancel: () => void}}
+ */
+export function createFrameThrottle(deliver, intervalMs = FRAME_MS, {
+  clock = () => performance.now(),
+  after = (ms, callback) => {
+    const timer = setTimeout(callback, ms);
+    return () => clearTimeout(timer);
+  },
+} = {}) {
+  if (typeof deliver !== 'function') {
+    throw new TypeError('deliver must be a function');
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new TypeError('intervalMs must be a positive finite number');
+  }
+  let lastDelivery = -Infinity;
+  /** @type {(() => T)|null} */
+  let pending = null;
+  /** Cancels the timer of the update waiting for its frame (null: none waits). */
+  let cancelTimer = null;
+  const flush = () => {
+    if (cancelTimer !== null) {
+      cancelTimer();
+      cancelTimer = null;
+    }
+    if (pending === null) return;
+    const build = pending;
+    pending = null;
+    lastDelivery = clock();
+    deliver(build());
+  };
+  return {
+    push(build) {
+      pending = build;
+      const elapsed = clock() - lastDelivery;
+      if (elapsed >= intervalMs) {
+        flush();
+      } else if (cancelTimer === null) {
+        cancelTimer = after(intervalMs - elapsed, flush);
+      }
+    },
+    flush,
+    cancel() {
+      cancelTimer?.();
+      cancelTimer = null;
+      pending = null;
+    }
+  };
+}

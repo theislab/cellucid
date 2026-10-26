@@ -430,7 +430,6 @@ test('CAP streaming response overrun cancels the reader', async () => {
           async cancel() {
             cancelled = true;
           },
-          releaseLock() {},
         };
       },
     },
@@ -466,7 +465,6 @@ test('CAP invalid UTF-8 cancels its response reader', async () => {
           async cancel() {
             cancelled = true;
           },
-          releaseLock() {},
         };
       },
     },
@@ -540,7 +538,9 @@ test('CAP preserves invalid UTF-8 when reader cleanup is hostile', async () => {
     )
   );
   assert.equal(cancelAttempts, 1);
-  assert.equal(releaseAttempts, 1);
+  // The reader is dropped, never released: WebKit can deadlock a collection
+  // that starts inside `releaseLock()` (`formats/io/inflate.js`).
+  assert.equal(releaseAttempts, 0);
 });
 
 test('CAP response read failure cancels its active reader', async () => {
@@ -557,7 +557,6 @@ test('CAP response read failure cancels its active reader', async () => {
           async cancel() {
             cancelled = true;
           },
-          releaseLock() {},
         };
       },
     },
@@ -603,7 +602,6 @@ test('CAP owner abort cancels a stalled response reader', async () => {
             async cancel() {
               cancelled = true;
             },
-            releaseLock() {},
           };
         },
       },

@@ -37,7 +37,12 @@ function viewsOf(state) {
   const views = [state];
   if (state.viewContexts instanceof Map) {
     for (const ctx of state.viewContexts.values()) {
-      if (ctx !== null && typeof ctx === 'object') views.push(ctx);
+      if (ctx === null || typeof ctx !== 'object') continue;
+      // The active view's context shares the state's own inventories
+      // (view-context-core.js `_syncActiveContext`); walking them twice would
+      // only repeat the state's answer.
+      if (ctx.obsData === state.obsData && ctx.varData === state.varData) continue;
+      views.push(ctx);
     }
   }
   return views;

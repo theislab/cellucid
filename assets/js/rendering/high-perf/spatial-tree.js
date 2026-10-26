@@ -6,6 +6,8 @@
  * reader that must never block the page.
  */
 
+import { formatCountOf } from '../../utils/format-units.js';
+
 function createIndexArray(count) {
   const indices = new Uint32Array(count);
   for (let i = 0; i < count; i++) indices[i] = i;
@@ -246,26 +248,127 @@ export function requirePrebuiltSpatialTree(tree, pointCount) {
     || tree.root.pointCount !== pointCount
   ) {
     throw new TypeError(
-      `A prebuilt spatial tree must have finite bounds and a root over exactly ${pointCount} points.`
+      `A prebuilt spatial tree must have finite bounds and a root over exactly ${formatCountOf(pointCount, 'point')}.`
     );
   }
 }
 
 /**
- * Every distinct index buffer a tree's leaves own, so the worker can transfer
- * them instead of copying.
+ * The tree as a few typed arrays, for the worker's reply: a structured clone
+ * of the node objects costs about a microsecond a node on the receiving
+ * thread (38,568 nodes of a 10M-point octree: 35 ms in one task), while the
+ * arrays are transferred, not copied. `decodeSpatialTree` rebuilds the same
+ * tree. Call it after the draw order numbered the tree (`leafStart`,
+ * `leafEnd`, `drawUnit`) and after its leaves' ids were packed into one
+ * buffer (`spatial-tree-job.js`).
  *
- * @param {{ root: object }} tree
- * @returns {ArrayBuffer[]}
+ * @param {{bounds: object, root: object}} tree
+ * @param {1|2|3} dimensionLevel
+ * @returns {{encoded: object, transfer: ArrayBuffer[]}}
  */
-export function spatialTreeTransferList(tree) {
-  const buffers = new Set();
+export function encodeSpatialTree(tree, dimensionLevel) {
+  const childCount = 1 << dimensionLevel;
+  const nodes = [];
   const stack = [tree.root];
   while (stack.length > 0) {
     const node = stack.pop();
     if (node === null) continue;
-    if (node.indices) buffers.add(node.indices.buffer);
+    nodes.push(node);
     if (node.children) for (const child of node.children) stack.push(child);
   }
-  return [...buffers];
+  const count = nodes.length;
+  const ids = new Map();
+  for (let id = 0; id < count; id++) ids.set(nodes[id], id);
+  const bounds = new Float64Array(count * 6);
+  const pointCounts = new Float64Array(count);
+  // -1: not numbered (below a draw unit); drawUnit -1/0/1 for absent/false/true.
+  const leafRanges = new Float64Array(count * 2).fill(-1);
+  const drawUnits = new Int8Array(count).fill(-1);
+  // -1 for an empty child slot; a node without children has no slots
+  // (hasChildren 0).
+  const hasChildren = new Uint8Array(count);
+  const children = new Int32Array(count * childCount).fill(-1);
+  const indexStarts = new Float64Array(count).fill(-1);
+  let packed = null;
+  for (let id = 0; id < count; id++) {
+    const node = nodes[id];
+    const b = node.bounds;
+    bounds.set([b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ], id * 6);
+    pointCounts[id] = node.pointCount;
+    if (node.leafStart !== undefined) {
+      leafRanges[id * 2] = node.leafStart;
+      leafRanges[id * 2 + 1] = node.leafEnd;
+    }
+    if (node.drawUnit !== undefined) drawUnits[id] = node.drawUnit ? 1 : 0;
+    if (node.children) {
+      hasChildren[id] = 1;
+      for (let slot = 0; slot < node.children.length; slot++) {
+        const child = node.children[slot];
+        if (child !== null) children[id * childCount + slot] = ids.get(child);
+      }
+    }
+    if (node.indices) {
+      if (packed === null) packed = node.indices.buffer;
+      if (node.indices.buffer !== packed) {
+        throw new Error('A spatial tree to encode must keep every leaf\'s ids in one buffer.');
+      }
+      indexStarts[id] = node.indices.byteOffset / 4;
+    }
+  }
+  const indices = packed === null ? new Uint32Array(0) : new Uint32Array(packed);
+  const encoded = {
+    nodeCount: count, childCount,
+    bounds, pointCounts, leafRanges, drawUnits, hasChildren, children, indexStarts, indices,
+  };
+  const transfer = [bounds, pointCounts, leafRanges, drawUnits, hasChildren, children, indexStarts, indices]
+    .map(array => array.buffer);
+  return { encoded, transfer };
+}
+
+/**
+ * The tree `encodeSpatialTree` encoded: the same nodes, bounds, children,
+ * numbering and leaf ids (views of one buffer).
+ *
+ * @param {ReturnType<typeof encodeSpatialTree>['encoded']} encoded
+ * @returns {{bounds: object, root: object}}
+ */
+export function decodeSpatialTree(encoded) {
+  const {
+    nodeCount, childCount,
+    bounds, pointCounts, leafRanges, drawUnits, hasChildren, children, indexStarts, indices,
+  } = encoded;
+  if (!Number.isSafeInteger(nodeCount) || nodeCount < 1 || !(indices instanceof Uint32Array)) {
+    throw new TypeError('An encoded spatial tree needs at least its root and its leaf ids.');
+  }
+  const nodes = new Array(nodeCount);
+  for (let id = 0; id < nodeCount; id++) {
+    const at = id * 6;
+    const start = indexStarts[id];
+    const count = pointCounts[id];
+    const numbered = leafRanges[id * 2] >= 0;
+    const unit = drawUnits[id];
+    nodes[id] = {
+      bounds: {
+        minX: bounds[at], minY: bounds[at + 1], minZ: bounds[at + 2],
+        maxX: bounds[at + 3], maxY: bounds[at + 4], maxZ: bounds[at + 5],
+      },
+      indices: start >= 0 ? indices.subarray(start, start + count) : null,
+      children: null,
+      pointCount: count,
+      leafStart: numbered ? leafRanges[id * 2] : undefined,
+      drawUnit: unit < 0 ? undefined : unit === 1,
+      leafEnd: numbered ? leafRanges[id * 2 + 1] : undefined,
+    };
+  }
+  for (let id = 0; id < nodeCount; id++) {
+    if (hasChildren[id] !== 1) continue;
+    const list = new Array(childCount);
+    for (let slot = 0; slot < childCount; slot++) {
+      const child = children[id * childCount + slot];
+      list[slot] = child < 0 ? null : nodes[child];
+    }
+    nodes[id].children = list;
+  }
+  const root = nodes[0];
+  return { bounds: root.bounds, root };
 }

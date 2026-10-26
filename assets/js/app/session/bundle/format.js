@@ -2,13 +2,16 @@
  * @fileoverview Session bundle container framing constants.
  *
  * A `.cellucid-session` file is a single binary container:
- *  1) MAGIC bytes (ASCII)
+ *  1) MAGIC bytes (ASCII `CELLUCID_SESSION/2\n`: the format version is part
+ *     of the signature)
  *  2) manifestByteLength (u32 LE)
  *  3) manifest JSON bytes (UTF-8)
  *  4) repeated chunks: [chunkByteLength (u32 LE), chunkBytes...]
  *
  * Current format constraints:
- * - No version, compatibility, or migration fields.
+ * - One format version is read: the one in the signature. Any file that does
+ *   not start with that signature is refused with
+ *   {@link NOT_A_SESSION_FILE_MESSAGE}.
  * - Treat session files as untrusted input: every length is checked against
  *   the bytes the file still holds, and every inflate is bounded by the
  *   chunk's declared `uncompressedBytes`.
@@ -18,11 +21,19 @@
  * @module session/bundle/format
  */
 
-/** Fixed ASCII prelude used to reject non-session files quickly. */
-const SESSION_BUNDLE_MAGIC = 'CELLUCID_SESSION\n';
+/** The session format this release writes and reads. */
+export const SESSION_FORMAT_VERSION = 2;
+
+/** Fixed ASCII prelude: the file kind and its format version. */
+const SESSION_BUNDLE_MAGIC = `CELLUCID_SESSION/${SESSION_FORMAT_VERSION}\n`;
 
 /** @type {Uint8Array} */
 export const SESSION_BUNDLE_MAGIC_BYTES = new TextEncoder().encode(SESSION_BUNDLE_MAGIC);
+
+/** Shown verbatim for a file that does not start with the signature. */
+export const NOT_A_SESSION_FILE_MESSAGE =
+  `This file is not a Cellucid session file of format ${SESSION_FORMAT_VERSION} `
+  + `(it does not start with CELLUCID_SESSION/${SESSION_FORMAT_VERSION}).`;
 
 /** u32 little-endian size in bytes. */
 export const U32_BYTES = 4;

@@ -83,7 +83,7 @@ test('every operation that changes a page\'s cells reaches the builder', () => {
         label: 'Lasso 2',
         cellIndices: Uint32Array.from([3, 4])
       });
-      assert.equal(state.clearAllHighlights(), 1);
+      assert.equal(state.clearActivePageHighlights(), 1);
     }],
     ['create a page', (state) => {
       state.createHighlightPage('Second');

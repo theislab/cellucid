@@ -161,7 +161,7 @@ test('UI restore rejects coercive and open control records', () => {
       () => serializer.restoreUIControls({
         enabled: { type: 'checkbox', checked: false, legacyValue: 0 },
       }),
-      /exact keys/i,
+      /must contain exactly/i,
     );
     assert.equal(enabled.checked, false);
   } finally {

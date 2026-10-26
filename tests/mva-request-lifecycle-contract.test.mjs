@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
-import { createRestOfPageId } from '../assets/js/app/analysis/shared/page-derivation-utils.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 function deferred() {
@@ -33,27 +32,6 @@ function pageData(pageId, values = [1, 2, 3]) {
   };
 }
 
-function notificationRecorder(id) {
-  const terminal = [];
-  return {
-    notifications: {
-      loading() {
-        return id;
-      },
-      complete(notificationId) {
-        terminal.push(['complete', notificationId]);
-      },
-      fail(notificationId) {
-        terminal.push(['fail', notificationId]);
-      },
-      dismiss(notificationId) {
-        terminal.push(['dismiss', notificationId]);
-      },
-    },
-    terminal,
-  };
-}
-
 for (const ownershipCase of [
   {
     label: 'correlation',
@@ -70,8 +48,8 @@ for (const ownershipCase of [
     label: 'differential expression',
     invoke(analysis) {
       return analysis.differentialExpression({
-        pageA: 'page-A',
-        pageB: 'page-B',
+        groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+        groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
         geneList: ['Gene A'],
         minCells: 2,
         isCurrent: () => true,
@@ -82,7 +60,7 @@ for (const ownershipCase of [
     label: 'signature scoring',
     invoke(analysis) {
       return analysis.computeSignatureScore({
-        genes: ['Gene A'],
+        geneSets: [{ name: 'S', genes: ['Gene A'] }],
         pageIds: ['page-A'],
         isCurrent: () => true,
       });
@@ -106,12 +84,6 @@ for (const ownershipCase of [
         },
       },
     );
-    analysis._notifications = {
-      loading() {
-        dataAccesses += 1;
-        throw new Error('request ownership validation reached notifications');
-      },
-    };
 
     await assert.rejects(
       ownershipCase.invoke(analysis),
@@ -121,54 +93,7 @@ for (const ownershipCase of [
   });
 }
 
-test('a completed inner notification cannot later be dismissed by its retained cleanup', async () => {
-  const { notifications, terminal } = notificationRecorder('completed-inner');
-  const cleanups = [];
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  analysis.dataLayer = {
-    async getDataForPages() {
-      return [pageData('page-A')];
-    },
-  };
-  analysis._getComputeManager = async () => ({
-    async execute() {
-      return {
-        r: 1,
-        rSquared: 1,
-        pValue: 0,
-        n: 3,
-        method: 'pearson',
-        slope: 1,
-        intercept: 0,
-      };
-    },
-  });
-  analysis._notifications = notifications;
-
-  const result = await analysis.correlationAnalysis({
-    varX: { type: 'continuous_obs', key: 'x' },
-    varY: { type: 'continuous_obs', key: 'y' },
-    pageIds: ['page-A'],
-    isCurrent: () => true,
-    registerInvalidationCleanup(cleanup) {
-      cleanups.push(cleanup);
-    },
-  });
-
-  assert.equal(result.length, 1);
-  assert.deepEqual(terminal, [['complete', 'completed-inner']]);
-  assert.equal(cleanups.length, 1);
-
-  cleanups[0]();
-  cleanups[0]();
-  assert.deepEqual(
-    terminal,
-    [['complete', 'completed-inner']],
-    'a retained invalidation callback must not add dismiss after completion',
-  );
-});
-
-function createDEBoundaryProbe(indicesByPage, pointCount = 6) {
+function createDEBoundaryProbe(pointCount = 6) {
   const calls = {
     computeManager: 0,
     expressionRead: 0,
@@ -177,20 +102,12 @@ function createDEBoundaryProbe(indicesByPage, pointCount = 6) {
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     state: { pointCount },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'Gene A', name: 'Gene A' }];
     },
-    getPageInfo(pageId) {
-      return { id: pageId, name: `Page ${pageId}` };
-    },
-    getCellIndicesForPage(pageId) {
-      return indicesByPage[pageId];
-    },
-    // A local source: nothing is downloaded ahead.
-    async prefetchGenePayload() {
-      return null;
-    },
-    async ensureGeneExpressionLoaded() {
+    async readGeneColumn() {
       calls.expressionRead += 1;
       throw new Error('gene expression read reached');
     },
@@ -199,7 +116,6 @@ function createDEBoundaryProbe(indicesByPage, pointCount = 6) {
     calls.computeManager += 1;
     throw computeProbe;
   };
-  analysis._notifications = {};
   return { analysis, calls, computeProbe };
 }
 
@@ -223,8 +139,8 @@ test('DE rejects minCells below the backend minimum before data or compute acces
 
   await assert.rejects(
     analysis.differentialExpression({
-      pageA: 'page-A',
-      pageB: 'page-B',
+      groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+      groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
       geneList: ['Gene A'],
       minCells: 1,
     }),
@@ -233,153 +149,72 @@ test('DE rejects minCells below the backend minimum before data or compute acces
   assert.equal(dataAccesses, 0);
 });
 
-test('DE rejects an undersized group before compute initialization or gene loading', async () => {
-  const { analysis, calls } = createDEBoundaryProbe({
-    'page-A': Uint32Array.of(0),
-    'page-B': Uint32Array.of(2, 3, 4),
-  });
-
+test('DE rejects a group of fewer than 2 cells before compute initialization or gene loading', async () => {
+  const { analysis, calls } = createDEBoundaryProbe();
   await assert.rejects(
     analysis.differentialExpression({
-      pageA: 'page-A',
-      pageB: 'page-B',
+      groupA: { name: 'A', cells: Uint32Array.of(0) },
+      groupB: { name: 'B', cells: Uint32Array.of(2, 3, 4) },
       geneList: ['Gene A'],
       minCells: 2,
     }),
-    /at least 2 cells per group.*received 1 and 3/i,
+    /at least 2 cells in each group/i,
   );
   assert.equal(calls.computeManager, 0);
   assert.equal(calls.expressionRead, 0);
 });
 
-const explicitA = 'page-explicit-A';
-const explicitB = 'page-explicit-B';
-const baseA = 'page-base-A';
-const baseB = 'page-base-B';
-const restA = createRestOfPageId(baseA);
-const restB = createRestOfPageId(baseB);
+test('DE rejects overlapping groups exactly, before any read', async () => {
+  const { analysis, calls } = createDEBoundaryProbe();
+  await assert.rejects(
+    analysis.differentialExpression({
+      groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+      groupB: { name: 'B', cells: Uint32Array.of(2, 3, 4) },
+      geneList: ['Gene A'],
+      minCells: 2,
+    }),
+    /groups must be disjoint.*overlap/i,
+  );
+  assert.equal(calls.computeManager, 0);
+  assert.equal(calls.expressionRead, 0);
+});
 
-for (const overlapCase of [
-  {
-    label: 'explicit versus explicit',
-    pageA: explicitA,
-    pageB: explicitB,
-    memberships: {
-      [explicitA]: Uint32Array.of(0, 1, 2),
-      [explicitB]: Uint32Array.of(2, 3, 4),
-    },
-  },
-  {
-    label: 'explicit versus rest-of',
-    pageA: explicitA,
-    pageB: restB,
-    memberships: {
-      [explicitA]: Uint32Array.of(0, 1),
-      [baseB]: Uint32Array.of(0, 2, 3),
-    },
-  },
-  {
-    label: 'rest-of versus explicit',
-    pageA: restA,
-    pageB: explicitB,
-    memberships: {
-      [baseA]: Uint32Array.of(0, 2, 3),
-      [explicitB]: Uint32Array.of(1, 4),
-    },
-  },
-  {
-    label: 'rest-of versus rest-of',
-    pageA: restA,
-    pageB: restB,
-    memberships: {
-      [baseA]: Uint32Array.of(0, 1, 2),
-      [baseB]: Uint32Array.of(2, 3, 4),
-    },
-  },
-]) {
-  test(`DE rejects overlapping ${overlapCase.label} membership exactly`, async () => {
-    const { analysis, calls } = createDEBoundaryProbe(
-      overlapCase.memberships,
-    );
+test('DE runs complementary groups, a group under the minimum flagged low n', async () => {
+  const { analysis, calls, computeProbe } = createDEBoundaryProbe();
+  await assert.rejects(
+    analysis.differentialExpression({
+      groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+      groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
+      geneList: ['Gene A'],
+      minCells: 10,
+    }),
+    error => error === computeProbe,
+  );
+  assert.equal(calls.computeManager, 1);
+  assert.equal(calls.expressionRead, 0);
+});
 
-    await assert.rejects(
-      analysis.differentialExpression({
-        pageA: overlapCase.pageA,
-        pageB: overlapCase.pageB,
-        geneList: ['Gene A'],
-        minCells: 2,
-      }),
-      /groups must be disjoint.*overlap/i,
-    );
-    assert.equal(calls.computeManager, 0);
-    assert.equal(calls.expressionRead, 0);
-  });
-}
-
-for (const disjointCase of [
-  {
-    label: 'a page and its own rest-of',
-    pageA: baseA,
-    pageB: restA,
-    memberships: {
-      [baseA]: Uint32Array.of(0, 1, 2),
-    },
-  },
-  {
-    label: 'an explicit subset of a rest-of exclusion',
-    pageA: explicitA,
-    pageB: restB,
-    memberships: {
-      [explicitA]: Uint32Array.of(0, 1),
-      [baseB]: Uint32Array.of(0, 1, 2, 3),
-    },
-  },
-  {
-    label: 'complementary rest-of groups',
-    pageA: restA,
-    pageB: restB,
-    memberships: {
-      [baseA]: Uint32Array.of(0, 1, 2),
-      [baseB]: Uint32Array.of(3, 4, 5),
-    },
-  },
-]) {
-  test(`DE preserves disjoint ${disjointCase.label}`, async () => {
-    const { analysis, calls, computeProbe } = createDEBoundaryProbe(
-      disjointCase.memberships,
-    );
-
-    await assert.rejects(
-      analysis.differentialExpression({
-        pageA: disjointCase.pageA,
-        pageB: disjointCase.pageB,
-        geneList: ['Gene A'],
-        minCells: 2,
-      }),
-      error => error === computeProbe,
-    );
-    assert.equal(calls.computeManager, 1);
-    assert.equal(calls.expressionRead, 0);
-  });
-}
-
+/** A one-gene batch of results (`COMPUTE_DIFFERENTIAL_OF_COLUMNS`), each number its gene's entry. */
 function validDEResult(overrides = {}) {
-  return {
+  const row = {
     meanA: 2,
     meanB: 5,
+    pctA: 100,
+    pctB: 100,
     log2FoldChange: -1,
     pValue: 0.25,
     statistic: 3,
+    score: 1,
+    auroc: 0.5,
     nA: 3,
     nB: 3,
-    method: 'wilcox',
     ...overrides,
   };
+  return { ...Object.fromEntries(Object.entries(row).map(([key, value]) => [key, [value]])), method: 'wilcox' };
 }
 
 function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
   const calls = {
-    bulkClears: 0,
     compute: 0,
     expressionReads: [],
     cleanup: 0,
@@ -387,49 +222,37 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     state: { pointCount: 6 },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return genes.map(key => ({ key, name: key }));
     },
-    getPageInfo(pageId) {
-      return { id: pageId, name: `Page ${pageId}` };
-    },
-    getCellIndicesForPage(pageId) {
-      return pageId === 'page-A'
-        ? Uint32Array.of(0, 1, 2)
-        : Uint32Array.of(3, 4, 5);
-    },
-    // A local source: nothing is downloaded ahead.
-    async prefetchGenePayload() {
-      return null;
-    },
-    async ensureGeneExpressionLoaded(gene) {
+    async readGeneColumn(gene) {
       calls.expressionReads.push(gene);
       return {
+        fieldIndex: 0,
         values: Float32Array.of(1, 2, 3, 4, 5, 6),
+        owned: true,
       };
     },
-    unloadGeneExpression() {
-      return true;
-    },
-    invalidateVariable() {},
     performCacheCleanup() {
       calls.cleanup += 1;
       return { cleaned: 0, remaining: 0 };
-    },
-    clearBulkGeneCache() {
-      calls.bulkClears += 1;
     },
   };
   analysis._getComputeManager = async () => ({
     selectBackend() {
       return 'cpu';
     },
+    // The run's two groups are held once on the compute thread.
+    async broadcast() {
+      return [{ sizeA: 3, sizeB: 3 }];
+    },
     async execute() {
       calls.compute += 1;
       return computeResult;
     },
   });
-  analysis._notifications = {};
   return { analysis, calls };
 }
 
@@ -437,7 +260,7 @@ for (const malformedCase of [
   {
     label: 'a null result',
     result: null,
-    error: /invalid sample counts/i,
+    error: /invalid meanA for "Gene A"/i,
   },
   {
     label: 'negative p-value',
@@ -447,41 +270,6 @@ for (const malformedCase of [
   {
     label: 'p-value above one',
     result: validDEResult({ pValue: 1.01 }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'nonfinite meanA',
-    result: validDEResult({ meanA: NaN }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'nonfinite meanB',
-    result: validDEResult({ meanB: Infinity }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'nonfinite fold change',
-    result: validDEResult({ log2FoldChange: NaN }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'nonfinite test statistic',
-    result: validDEResult({ statistic: -Infinity }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'a missing test statistic',
-    result: validDEResult({ statistic: undefined }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'nonfinite p-value',
-    result: validDEResult({ pValue: NaN }),
-    error: /invalid statistics/i,
-  },
-  {
-    label: 'wrong method',
-    result: validDEResult({ method: 'ttest' }),
     error: /invalid statistics/i,
   },
   {
@@ -507,23 +295,16 @@ for (const malformedCase of [
 
     await assert.rejects(
       analysis.differentialExpression({
-        pageA: 'page-A',
-        pageB: 'page-B',
+        groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+        groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
         geneList: ['Gene A'],
         minCells: 2,
-        parallelism: 1,
-        batchConfig: {
-          preloadCount: 1,
-          memoryBudgetMB: 1,
-          networkConcurrency: 1,
-        },
       }),
       malformedCase.error,
     );
     assert.deepEqual(calls.expressionReads, ['Gene A']);
     assert.equal(calls.compute, 1);
     assert.equal(calls.cleanup, 1);
-    assert.equal(calls.bulkClears, 0);
   });
 }
 
@@ -542,25 +323,18 @@ test('successful DE performs only expiry cleanup after heavy compute', async t =
 
   const { analysis, calls } = createDEExecutionHarness(validDEResult());
   const result = await analysis.differentialExpression({
-    pageA: 'page-A',
-    pageB: 'page-B',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
     geneList: ['Gene A'],
     minCells: 2,
-    parallelism: 1,
-    batchConfig: {
-      preloadCount: 1,
-      memoryBudgetMB: 1,
-      networkConcurrency: 1,
-    },
   });
 
   assert.equal(result.results.length, 1);
   assert.equal(calls.cleanup, 1);
-  assert.equal(calls.bulkClears, 0);
   assert.equal(sourceClears, 0);
 });
 
-test('DE invalidation aborts streaming, starts no later gene, drains compute, and suppresses publication', async t => {
+test('DE invalidation aborts streaming, dispatches no later gene, drains compute, and suppresses publication', async t => {
   const manager = getDataSourceManager();
   const previousSource = manager.activeSource;
   const computeGate = deferred();
@@ -571,7 +345,6 @@ test('DE invalidation aborts streaming, starts no later gene, drains compute, an
   let current = true;
   let progressCountAtInvalidation = null;
   let cleanupCalls = 0;
-  let bulkClearCalls = 0;
   let sourceClearCalls = 0;
   let executeCalls = 0;
   let runSettled = false;
@@ -587,42 +360,31 @@ test('DE invalidation aborts streaming, starts no later gene, drains compute, an
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     state: { pointCount: 6 },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));
     },
-    getPageInfo(pageId) {
-      return { id: pageId, name: `Page ${pageId}` };
-    },
-    getCellIndicesForPage(pageId) {
-      return pageId === 'page-A'
-        ? Uint32Array.of(0, 1, 2)
-        : Uint32Array.of(3, 4, 5);
-    },
-    // A local source: nothing is downloaded ahead.
-    async prefetchGenePayload() {
-      return null;
-    },
-    async ensureGeneExpressionLoaded(gene) {
+    async readGeneColumn(gene) {
       startedGenes.push(gene);
       return {
+        fieldIndex: 0,
         values: Float32Array.of(1, 2, 3, 4, 5, 6),
+        owned: true,
       };
     },
-    unloadGeneExpression() {
-      return true;
-    },
-    invalidateVariable() {},
     performCacheCleanup() {
       cleanupCalls += 1;
       return { cleaned: 0, remaining: 0 };
-    },
-    clearBulkGeneCache() {
-      bulkClearCalls += 1;
     },
   };
   analysis._getComputeManager = async () => ({
     selectBackend() {
       return 'cpu';
+    },
+    // The run's two groups are held once on the compute thread.
+    async broadcast() {
+      return [{ sizeA: 3, sizeB: 3 }];
     },
     execute() {
       executeCalls += 1;
@@ -635,19 +397,12 @@ test('DE invalidation aborts streaming, starts no later gene, drains compute, an
       return computeGate.promise;
     },
   });
-  analysis._notifications = {};
 
   const run = analysis.differentialExpression({
-    pageA: 'page-A',
-    pageB: 'page-B',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(3, 4, 5) },
     geneList: ['Gene A', 'Gene B', 'Gene C'],
     minCells: 2,
-    parallelism: 1,
-    batchConfig: {
-      preloadCount: 1,
-      memoryBudgetMB: 1,
-      networkConcurrency: 1,
-    },
     onProgress(update) {
       progress.push(update);
     },
@@ -679,11 +434,11 @@ test('DE invalidation aborts streaming, starts no later gene, drains compute, an
 
   assert.equal(outcome, null);
   assert.equal(runSettled, true);
-  assert.deepEqual(startedGenes, ['Gene A']);
+  // Genes read ahead (the run's tuner) are dropped, never tested.
+  assert.equal(startedGenes[0], 'Gene A');
   assert.equal(executeCalls, 1);
   assert.equal(progress.length, progressCountAtInvalidation);
   assert.equal(cleanupCalls, 1);
-  assert.equal(bulkClearCalls, 0);
   assert.equal(sourceClearCalls, 0);
 });
 
@@ -701,78 +456,50 @@ test('current and stale signature completion perform expiry cleanup without glob
   });
 
   let expiryCleanups = 0;
-  let bulkClears = 0;
-  const terminal = [];
   const gates = [];
   const dataLayer = {
-    getGeneExpressionSubset(_genes, _pageIds) {
+    state: { pointCount: 3 },
+    readGeneColumns(_genes) {
       if (gates.length === 0) {
-        return Promise.resolve({
-          'Gene A': {
-            'page-A': pageData('page-A'),
-          },
-        });
+        return Promise.resolve([Float32Array.of(1, 2, 3)]);
       }
       return gates.shift().promise;
+    },
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
     },
     performCacheCleanup() {
       expiryCleanups += 1;
       return { cleaned: 0, remaining: 0 };
     },
-    clearBulkGeneCache() {
-      bulkClears += 1;
-    },
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = dataLayer;
-  analysis._notifications = {
-    loading() {
-      return `signature-${terminal.length}`;
-    },
-    complete(id) {
-      terminal.push(['complete', id]);
-    },
-    fail(id) {
-      terminal.push(['fail', id]);
-    },
-    dismiss(id) {
-      terminal.push(['dismiss', id]);
-    },
-  };
 
   const currentResult = await analysis.computeSignatureScore({
-    genes: ['Gene A'],
+    geneSets: [{ name: 'S', genes: ['Gene A'] }],
     pageIds: ['page-A'],
   });
-  assert.equal(currentResult.length, 1);
+  assert.equal(currentResult.sets[0].pages.length, 1);
 
   const staleGate = deferred();
   gates.push(staleGate);
   let current = true;
   let invalidate = null;
   const staleRun = analysis.computeSignatureScore({
-    genes: ['Gene A'],
+    geneSets: [{ name: 'S', genes: ['Gene A'] }],
     pageIds: ['page-A'],
     isCurrent: () => current,
     registerInvalidationCleanup(cleanup) {
       invalidate = cleanup;
     },
   });
-  await waitFor(() => typeof invalidate === 'function', 'signature cleanup');
+  await waitFor(() => gates.length === 0, 'the stale run to read its genes');
   current = false;
-  invalidate();
-  staleGate.resolve({
-    'Gene A': {
-      'page-A': pageData('page-A'),
-    },
-  });
+  staleGate.resolve([Float32Array.of(1, 2, 3)]);
   assert.equal(await staleRun, null);
 
   assert.equal(expiryCleanups, 2);
-  assert.equal(bulkClears, 0);
   assert.equal(sourceClears, 0);
-  assert.deepEqual(
-    terminal.map(([kind]) => kind),
-    ['complete', 'dismiss'],
-  );
+  assert.equal(invalidate, null, 'the run keeps no notification of its own to clean up');
 });

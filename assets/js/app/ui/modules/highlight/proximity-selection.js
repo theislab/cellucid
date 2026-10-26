@@ -12,13 +12,18 @@ import {
   abandonedGestureNotice,
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
+  idleSelectionNoticeHtml,
   selectionNoticeHtml
 } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { removeStepControls, showStepControls } from './step-controls.js';
 import {
-  deliverSelectionToJupyter,
+  publishToolHint,
+  removeStepControls,
+  showStepControls
+} from './step-controls.js';
+import {
+  deliverSelectionToViewerHost,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
@@ -26,24 +31,24 @@ import {
   requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
-  requireExactKeys,
   requireFiniteNumber,
   requireHighlightSelectionState,
-  requireJupyterSource,
+  requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
   requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
-  requireUnifiedSelectionState
+  requireUnifiedSelectionState,
 } from './exact-contract.js';
-import { formatCount } from '../../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /**
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
- * @param {any|null} [options.jupyterSource]
+ * @param {any|null} [options.viewerHostSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
@@ -52,10 +57,10 @@ import { formatCount } from '../../components/display-format.js';
 export function initProximitySelection(options) {
   requireExactKeys(
     options,
-    ['state', 'viewer', 'jupyterSource', 'selectionState', 'ui'],
+    ['state', 'viewer', 'viewerHostSource', 'selectionState', 'ui'],
     'Proximity selection options'
   );
-  const { state, viewer, jupyterSource, selectionState, ui } = options;
+  const { state, viewer, viewerHostSource, selectionState, ui } = options;
   requireMethods(
     state,
     'Proximity selection state',
@@ -77,7 +82,7 @@ export function initProximitySelection(options) {
       'setProximityStepCallback'
     ]
   );
-  requireJupyterSource(jupyterSource);
+  requireViewerHostSource(viewerHostSource);
   requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'Proximity selection UI');
   const highlightModeDescriptionEl = requireDomElement(
@@ -126,7 +131,7 @@ export function initProximitySelection(options) {
     const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'proximity',
-      label: `Proximity${stepsLabel} (${formatCount(proximityEvent.cellCount)} cells)`,
+      label: `Proximity${stepsLabel} (${formatCountOf(proximityEvent.cellCount, 'cell')})`,
       cellIndices: proximityEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -137,9 +142,9 @@ export function initProximitySelection(options) {
       state.pointCount
     );
 
-    debug.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
-    trackDelivery(deliverSelectionToJupyter({
-      jupyterSource,
+    debug.log(`[UI] Proximity selected ${formatCountOf(proximityEvent.cellCount, 'cell')} from ${proximityEvent.steps} drag(s)`);
+    trackDelivery(deliverSelectionToViewerHost({
+      viewerHostSource,
       cellIndices: proximityEvent.cellIndices,
       source: 'proximity',
       onFailure: error => {
@@ -218,12 +223,14 @@ export function initProximitySelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'proximityHistory', {
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
     selectionState.proximityRedoStack = [];
 
-    selectionState.lastProximityCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastProximityCandidates = stepEvent.candidates;
     selectionState.lastProximityStep = stepEvent.step;
 
     updateProximityUI(stepEvent);
@@ -240,7 +247,7 @@ export function initProximitySelection(options) {
     if (selectionState.proximityHistory.length === 0) return;
 
     selectionState.proximityRedoStack.push({
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
 
@@ -268,7 +275,7 @@ export function initProximitySelection(options) {
     if (selectionState.proximityRedoStack.length === 0) return;
 
     selectionState.proximityHistory.push({
-      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
     });
 
@@ -393,8 +400,8 @@ export function initProximitySelection(options) {
     if (destroyed) return;
     const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML =
-        `${HIGHLIGHT_MODE_COPY.proximity}${noticeHtml}`;
+      publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY.proximity);
+      highlightModeDescriptionEl.innerHTML = idleSelectionNoticeHtml(notice);
       removeStepControls(
         documentOwner,
         'proximity',
@@ -425,7 +432,7 @@ export function initProximitySelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
     showProximityControls(stepEvent.candidateCount, notice);
 
@@ -438,7 +445,7 @@ export function initProximitySelection(options) {
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];
     selectionState.lastProximityCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastProximityStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

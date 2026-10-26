@@ -23,10 +23,13 @@ import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
 import { initHighlightControls } from '../modules/highlight-controls.js';
 import { initFieldSelector } from '../modules/field-selector.js';
+import { FieldSource } from '../../utils/field-constants.js';
 import { initViewControls } from '../modules/view-controls.js';
 import { initRepresentationControls } from '../modules/representation-controls.js';
 import { initDataMappingControls } from '../modules/data-mapping-controls.js';
+import { modalityScope } from '../../../data/data-mapping-candidates.js';
 import { initDatasetControls } from '../modules/dataset-controls.js';
+import { initDatasetCard } from '../modules/dataset-card.js';
 import { initSessionControls } from '../modules/session-controls.js';
 import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
@@ -158,8 +161,8 @@ export function createStableTerminalDestroy({
  */
 const DATA_SOURCE_STATUS_ID = 'data-source-status';
 const DATA_SOURCE_STATUS_READY =
-  'Data sources are ready. Load your own data, a server, or a GitHub '
-  + 'repository below.';
+  'Data sources are ready. Load your own data, a server, or open a '
+  + 'link below.';
 
 /**
  * @param {Document} documentOwner
@@ -211,7 +214,7 @@ function publishDataSourceReadiness(documentOwner) {
  *   dataset change begins its transaction with
  *   (`createLatestDatasetReloadCoordinator`).
  * @param {object|null} [options.sessionSerializer]
- * @param {any|null} [options.jupyterSource]
+ * @param {any|null} [options.viewerHostSource]
  */
 export function initUI({
   state,
@@ -222,7 +225,7 @@ export function initUI({
   reloadActiveDataset = null,
   datasetChanges,
   sessionSerializer = null,
-  jupyterSource = null
+  viewerHostSource = null
 }) {
   debug.log('[UI] initUI');
 
@@ -272,7 +275,16 @@ export function initUI({
     canvas: dom.cellInfo.canvas
   });
 
-  const legend = initLegendRenderer({ state, viewer, dom: dom.display, dataSourceManager });
+  // The outlier filter's "Choose latent space" opens the Data mapping
+  // setting (created below, so it is looked up when clicked).
+  let dataMappingControls = null;
+  const legend = initLegendRenderer({
+    state,
+    viewer,
+    dom: dom.display,
+    dataSourceManager,
+    onChooseLatent: () => dataMappingControls?.reveal({ openSidebar: true, focusGroup: 'latent' }),
+  });
   const filterControls = initFilterControls({
     state,
     viewer,
@@ -289,7 +301,7 @@ export function initUI({
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
   });
-  const highlightControls = initHighlightControls({ state, viewer, dom: dom.highlight, jupyterSource });
+  const highlightControls = initHighlightControls({ state, viewer, dom: dom.highlight, viewerHostSource });
   const communityAnnotationControls = initCommunityAnnotationControls({
     state,
     dom: dom.communityAnnotation,
@@ -305,7 +317,7 @@ export function initUI({
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
   });
-  const dataMappingControls = initDataMappingControls({
+  dataMappingControls = initDataMappingControls({
     state,
     root: dom.dataMapping.root
   });
@@ -369,7 +381,7 @@ export function initUI({
    * `setActiveVarField` and `clearActiveField` all end in
    * `computeGlobalVisibility()` and `setActiveView` ends in
    * `_notifyVisibilityChange()`, so every activation — a click, a published
-   * dataset's advertised state, Load State, a Jupyter command, a switch to a
+   * dataset's advertised state, Load State, a viewer host command, a switch to a
    * kept view — arrives as `visibility:changed`. That is the same signal
    * `highlight-controls.js` follows for the renderer's highlight mode. A
    * dimension change is the other input, because it moves the centroid count.
@@ -397,7 +409,7 @@ export function initUI({
    * Every surface that draws the active field is refreshed here, and only here.
    * A second, partial copy of this list is how the sidebar came to disagree
    * with itself: a state-driven activation (a dataset's advertised starting
-   * state, Load State, a Jupyter command) refreshed the legend and the
+   * state, Load State, a viewer host command) refreshed the legend and the
    * selectors but not the rest, and a switch to a kept view — which restores
    * that view's own active field — refreshed a third, shorter set.
    *
@@ -506,12 +518,60 @@ export function initUI({
     dom: dom.session,
     sessionSerializer,
     datasetChanges,
+    currentDatasetIdentityId: () =>
+      dataSourceManager?.getCurrentIdentityId() ?? null,
+    // The dataset controls are made below; a session is only loaded later.
+    openDatasetSource: record => datasetControls.openDatasetSource(record),
     onAfterLoad: refreshUiAfterStateLoad
   });
   const { showSessionStatus } = sessionControls;
 
+  // The Dataset box describes the open dataset from its identity, where it
+  // is stored, and what its data mapping uses.
+  const datasetCard = initDatasetCard({
+    dom: dom.datasetCard,
+    describeStorage: (sourceType, datasetId) => {
+      const source = dataSourceManager?.getSource(sourceType) ?? null;
+      const annData = typeof source?.getAnnDataSource === 'function'
+        ? source.getAnnDataSource(datasetId)
+        : null;
+      return typeof annData?.describeStorage === 'function'
+        ? annData.describeStorage()
+        : null;
+    },
+    describeHost: sourceType => {
+      const source = dataSourceManager?.getSource(sourceType) ?? null;
+      return typeof source?.getHostLabel === 'function' ? source.getHostLabel() : null;
+    },
+    describeMapping: () => {
+      const mapping = state.getDataMapping();
+      if (mapping === null) return null;
+      const candidates = state.getMappingCandidates();
+      const scope = candidates === null ? null : (modalityScope(candidates, mapping.modality ?? null)?.scope ?? candidates);
+      const shown = state.getRepresentationChoices()
+        .filter(choice => choice.enabled && choice.usable)
+        .map(choice => `${choice.name} ${choice.dimension}D`);
+      return {
+        genes: state.getVarAxisGeneCount(),
+        graph: state.getConnectivityGraphFact(),
+        embeddings: {
+          shown,
+          arrays: candidates === null
+            ? shown.length
+            : candidates.obsm.filter(item => item.usable).length,
+        },
+        // A multimodal dataset's layers and raw are its modality's.
+        modality: mapping.modality ?? null,
+        layers: scope === null ? null : scope.layers.map(layer => layer.key),
+        raw: scope === null ? null : (scope.raw === null ? false : scope.raw.n_vars),
+        latent: mapping.latent,
+        vectorFields: mapping.vectorFields.map(binding => binding.key),
+      };
+    }
+  });
   const datasetControls = initDatasetControls({
     dom: dom.dataset,
+    datasetCard,
     dataSourceManager,
     clearDataset: clearActiveDataset,
     reloadDataset: reloadActiveDataset,
@@ -580,10 +640,12 @@ export function initUI({
     'visibility:changed',
     handleVisibilityChange
   );
-  const handleFieldChanged = () => {
-    fieldSelector.renderFieldSelects?.();
+  // A field change names its source: one obs field's change leaves the gene
+  // list as it is, and one gene's leaves the obs field selects as they are.
+  const handleFieldChanged = ({ source }) => {
+    if (source !== FieldSource.VAR) fieldSelector.renderFieldSelects?.();
     fieldSelector.renderDeletedFieldsSection?.();
-    fieldSelector.initGeneExpressionDropdown?.();
+    if (source !== FieldSource.OBS) fieldSelector.initGeneExpressionDropdown?.();
     fieldSelector.syncFromState?.();
     handleActiveFieldChanged();
     handleVisibilityChange();
@@ -610,10 +672,7 @@ export function initUI({
     'mapping:changed',
     () => {
       viewControls?.renderSplitViewBadges?.();
-      datasetControls.updateMappedDatasetFacts({
-        connectivityEdges: state.getConnectivityEdgeCount(),
-        genes: state.getVarAxisGeneCount(),
-      });
+      datasetControls.updateMappedDatasetFacts();
     }
   );
   // A new gene list (another expression matrix or other gene names) is
@@ -797,6 +856,7 @@ export function initUI({
       () => representationControls.destroy(),
       () => dataMappingControls.destroy(),
       () => datasetControls.destroy(),
+      () => datasetCard.destroy(),
       () => {
         if (typeof figureExportControls.destroy === 'function') {
           return figureExportControls.destroy();
@@ -856,6 +916,7 @@ export function initUI({
 
   return {
     activateField: fieldSelector.activateField,
+    colorByGene: fieldSelector.colorByGene,
     applyRenderMode: renderControls.applyRenderMode,
     applyDatasetRenderDefaults,
     loadStartupDataset: datasetControls.loadStartupDataset,
@@ -864,10 +925,12 @@ export function initUI({
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    showLoadedConnectivityEdges: datasetControls.showLoadedConnectivityEdges,
     refreshDataMapping: dataMappingControls.datasetPublished,
     cycleRepresentation: representationControls.cycle,
     settleFieldInteractions: fieldSelector.settleAllInteractions,
     cinematicCamera,
+    figureExport: figureExportControls,
     publishSnapshotView: publishOwnedSnapshot,
     retireSnapshotView: retireOwnedSnapshot,
     clearSnapshotViews: clearOwnedSnapshots,

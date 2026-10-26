@@ -191,13 +191,16 @@ export function createProjectileSystem({
     }
 
     const dimLevel = getCurrentDimensionLevel();
-    hpRenderer.ensureSpatialIndex(dimLevel);
     const spatialIndex =
       hpRenderer.spatialIndices.get(dimLevel) ?? null;
     if (!spatialIndex) {
-      throw new Error(
-        `Projectile collision spatial index for ${dimLevel}D data was not published.`
-      );
+      // Projectiles start once the tree is installed (viewer
+      // setProjectilesEnabled); a geometry published since has its tree
+      // built off the main thread, and nothing collides until it lands.
+      hpRenderer.buildSpatialIndexInBackground('live').catch(error => {
+        console.warn('[Projectiles] Background spatial index failed:', error);
+      });
+      return [];
     }
 
     if (

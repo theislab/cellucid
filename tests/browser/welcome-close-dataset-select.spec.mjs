@@ -7,12 +7,12 @@
  * "Choose a dataset" opens the Session panel and focuses its heading instead.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 
 const PLAIN_START_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
   '&acceptance=welcome-close-dataset-select';
-const CATALOG_DEFAULT = 'dataset:local-demo:current-ui-prepared';
+const CATALOG_DEFAULT = 'dataset:local-demo:current-ui';
 const DOCS_ORIGIN = 'https://docs.cellucid.com';
 
 function observeProductErrors(page) {
@@ -34,7 +34,7 @@ async function openPlainStart(page) {
 /** The catalog default is open and the dropdown shows it, untouched. */
 async function expectDefaultLoadedAndSelectInactive(page) {
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   const datasetSelect = page.locator('#dataset-select');
   await expect(datasetSelect).toBeEnabled();

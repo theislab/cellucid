@@ -2,9 +2,9 @@
  * The app must accept every field key the writers publish.
  *
  * A field key reaches StateValidator.validateFieldKey() from two directions:
- * the reader types one (rename, user-defined field), and a producer publishes
- * one in obs_manifest.json / var_manifest.json, which requireField() checks on
- * every overlay and rename path. The manifest reader accepts the producer's
+ * the reader types one (rename, user-defined field), and a producer writes one
+ * as an obs column or a gene name, which requireField() checks on every overlay
+ * and rename path. The field list check (data-loaders.js) accepts the producer's
  * key long before those paths run, so a key the writers allow and this
  * validator rejects loads fine and then throws the first time the reader
  * touches the field.
@@ -64,8 +64,8 @@ test('every key the writers publish is accepted', () => {
 });
 
 test('a colon is an ordinary character in a field key', () => {
-  // This is the exact case that used to load and then throw: the manifest
-  // reader accepted the gene, the overlay path rejected it.
+  // The field list check accepts a gene named with a colon; the overlay
+  // path must accept it too.
   assert.equal(StateValidator.validateFieldKey('A:B'), true);
 });
 

@@ -2,33 +2,58 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  canvasToBlob,
-} from '../assets/js/app/ui/modules/figure-export/utils/export-helpers.js';
+  openFigureExportWorkerSession,
+  setFigureExportWorkerFactory,
+  setFigureExportWorkerWebgl2,
+} from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
 import {
   OBJECT_URL_RELEASE_DELAY_MS,
   downloadBlob,
 } from '../assets/js/app/utils/download.js';
 
-test('canvas encoding aborts promptly and ignores its late native callback', async () => {
-  let nativeCallback = null;
-  const canvas = {
-    toBlob(callback, type) {
-      assert.equal(type, 'image/png');
-      nativeCallback = callback;
+test('a worker request aborts promptly and closes its late frame', async () => {
+  const requests = [];
+  const fakeWorker = {
+    onmessage: null,
+    postMessage(message) {
+      requests.push(message);
     },
+    terminate() {},
   };
-  const controller = new AbortController();
-  const pending = canvasToBlob(canvas, 'image/png', {
-    signal: controller.signal,
-    failureMessage: 'fixture encoding failed',
-  });
-  assert.equal(typeof nativeCallback, 'function');
+  const previousImageBitmap = Object.getOwnPropertyDescriptor(globalThis, 'ImageBitmap');
+  class FakeImageBitmap {
+    closed = false;
+    close() {
+      this.closed = true;
+    }
+  }
+  globalThis.ImageBitmap = FakeImageBitmap;
+  setFigureExportWorkerFactory(() => fakeWorker);
+  // A worker that draws: the point pass is its request.
+  setFigureExportWorkerWebgl2(true);
+  try {
+    const controller = new AbortController();
+    const session = openFigureExportWorkerSession({ signal: controller.signal });
+    const pending = session.request('rasterizePoints', {});
+    assert.equal(requests.length, 1);
 
-  controller.abort();
-  await assert.rejects(pending, { name: 'AbortError' });
-  assert.doesNotThrow(() => {
-    nativeCallback(new Blob(['late'], { type: 'image/png' }));
-  });
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+
+    // The worker finishes the pass after the abort: its frame is closed, not
+    // delivered to anyone.
+    const late = new FakeImageBitmap();
+    assert.doesNotThrow(() => {
+      fakeWorker.onmessage({ data: { id: requests[0].id, result: late } });
+    });
+    assert.equal(late.closed, true);
+    session.close();
+    assert.deepEqual(requests.at(-1), { op: 'close', session: requests[0].session });
+  } finally {
+    setFigureExportWorkerFactory(null);
+    if (previousImageBitmap === undefined) delete globalThis.ImageBitmap;
+    else Object.defineProperty(globalThis, 'ImageBitmap', previousImageBitmap);
+  }
 });
 
 test('download abort between append and click cleans every staged browser owner', () => {

@@ -7,35 +7,6 @@
  * @module session/schema-contract
  */
 
-export function assertPlainRecord(value, context) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || (
-      Object.getPrototypeOf(value) !== Object.prototype
-      && Object.getPrototypeOf(value) !== null
-    )
-  ) {
-    throw new TypeError(`${context} must be a plain object.`);
-  }
-  return value;
-}
-
-export function assertExactKeys(record, expectedKeys, context) {
-  assertPlainRecord(record, context);
-  const actual = Object.keys(record).sort();
-  const expected = [...expectedKeys].sort();
-  if (
-    actual.length !== expected.length
-    || actual.some((key, index) => key !== expected[index])
-  ) {
-    throw new TypeError(
-      `${context} must contain the exact keys ${expected.join(', ')}.`,
-    );
-  }
-  return record;
-}
 
 export function assertNonEmptyString(value, context) {
   if (
@@ -144,11 +115,6 @@ export function assertSafeInteger(value, context, { minimum = 0, maximum = Numbe
     );
   }
   return value;
-}
-
-export function assertNullableSafeInteger(value, context, bounds) {
-  if (value === null) return value;
-  return assertSafeInteger(value, context, bounds);
 }
 
 export function assertArray(value, context) {

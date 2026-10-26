@@ -30,7 +30,8 @@
 
 import { parseFiniteNumberInRange } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { formatCount, formatDecimal } from '../components/display-format.js';
+import { formatDecimal } from '../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 import {
   antialiasingInForce,
   resolveAntialiasPreference,
@@ -72,6 +73,8 @@ import {
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   isViewerBackground,
 } from '../../../rendering/viewer-backgrounds.js';
+import { requireExactObjectKeys } from '../../../utils/exact-record.js';
+import { PLACES } from '../place-names.js';
 
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
@@ -139,26 +142,6 @@ const VIEWER_METHODS = Object.freeze([
 /** The forced-LOD slider range, matching `index.html` and the renderer. */
 const FORCED_LOD_MINIMUM = -1;
 const FORCED_LOD_MAXIMUM = 17;
-
-function assertExactKeys(value, expectedKeys, label) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError(`${label} must be one exact object.`);
-  }
-  const actual = Object.keys(value).sort();
-  const expected = [...expectedKeys].sort();
-  if (
-    actual.length !== expected.length
-    || actual.some((key, index) => key !== expected[index])
-  ) {
-    const unexpected = actual.filter(key => !expected.includes(key));
-    const missing = expected.filter(key => !actual.includes(key));
-    const detail = [
-      unexpected.length ? `unexpected ${unexpected.join(', ')}` : '',
-      missing.length ? `missing ${missing.join(', ')}` : ''
-    ].filter(Boolean).join('; ');
-    throw new TypeError(`${label} requires exact keys (${expected.join(', ')}): ${detail}.`);
-  }
-}
 
 function assertMethod(owner, method, label) {
   if (typeof owner[method] !== 'function') {
@@ -367,7 +350,7 @@ function assertSmokeGridSize(value) {
  * @param {{ rebuildSmokeDensity: (gridSize: number) => void }} options.smoke
  */
 export function initRenderControls(options) {
-  assertExactKeys(options, ['viewer', 'dom', 'smoke'], 'Render controls initialization');
+  requireExactObjectKeys(options, ['viewer', 'dom', 'smoke'], 'Render controls initialization');
   const { viewer, dom, smoke } = options;
   if (viewer === null || typeof viewer !== 'object' || Array.isArray(viewer)) {
     throw new TypeError('Render controls require one current viewer object.');
@@ -375,7 +358,7 @@ export function initRenderControls(options) {
   for (const method of VIEWER_METHODS) {
     assertMethod(viewer, method, 'Render controls viewer');
   }
-  assertExactKeys(smoke, ['rebuildSmokeDensity'], 'Render controls smoke owner');
+  requireExactObjectKeys(smoke, ['rebuildSmokeDensity'], 'Render controls smoke owner');
   assertMethod(smoke, 'rebuildSmokeDensity', 'Render controls smoke owner');
   if (dom === null || typeof dom !== 'object' || Array.isArray(dom)) {
     throw new TypeError('Render controls require one current DOM inventory.');
@@ -1117,7 +1100,7 @@ export function initRenderControls(options) {
       ? (
         datasetCellCount === null
           ? 'Chosen automatically from the size of the dataset.'
-          : `Chosen automatically: ${formatCount(datasetCellCount)} cells in ${viewDimension}D.`
+          : `Chosen automatically: ${formatCountOf(datasetCellCount, 'cell')} in ${viewDimension}D.`
       )
       : '';
   }
@@ -1144,7 +1127,7 @@ export function initRenderControls(options) {
         `The stored antialiasing preference `
         + `${JSON.stringify(storedAntialias.discarded)} was not recognized and `
         + 'has been discarded, so antialiasing follows the size of the dataset. '
-        + 'Set it again in Visualization if you wanted it fixed.',
+        + `Set it again in ${PLACES.visualization.name} if you wanted it fixed.`,
         { category: 'rendering', title: 'Antialiasing preference reset' }
       );
     } catch (error) {

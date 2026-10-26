@@ -1,7 +1,7 @@
 /**
  * The mapping groups beside the embeddings (`state/managers/mapping-groups.js`),
- * through the real DataState mapping methods and a stand-in server: a group
- * is staged (its data read and checked) before anything is published, then
+ * through the real DataState mapping methods and a stand-in for the mapping
+ * routes of the dataset base: a group is staged (its data read and checked) before anything is published, then
  * committed in the same transaction as the embeddings, and rolled back with
  * them. A refused choice is marked unusable with its reason and changes
  * nothing.
@@ -18,59 +18,50 @@ import {
 import { createMappingLayoutProvider } from '../assets/js/app/state/managers/mapping-manager.js';
 import { installDataMappingMethods } from './helpers/data-mapping-state.mjs';
 import { mappingProbes } from './helpers/anndata-mapping-mocks.mjs';
+import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 const N_OBS = 4;
-const BASE = 'http://127.0.0.1:65433/served/';
+const DATASET_ID = 'served';
+const BASE = `anndata://${DATASET_ID}/`;
 
 function obspProbe(key, shape = [N_OBS, N_OBS]) {
   return { key, storage: 'csr', shape, dtype: 'float32', numeric: true, nnz: 6 };
 }
 
-function manifest(nEdges) {
-  return {
-    format: 'edge_pairs',
-    n_cells: N_OBS,
-    n_edges: nEdges,
-    max_neighbors: 2,
-    index_bytes: 2,
-    index_dtype: 'uint16',
-    sourcesPath: 'connectivity/edges.src.bin',
-    destinationsPath: 'connectivity/edges.dst.bin',
-    weightsPath: 'connectivity/edges.weights.f64.bin',
-    weight_dtype: 'float64',
-    weight_bytes: 8,
-    compression: null,
-  };
+function summary(nEdges) {
+  return { n_cells: N_OBS, n_edges: nEdges, max_neighbors: 2 };
 }
 
-function jsonResponse(value, status = 200) {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-/** A served dataset: its graphs answer at `knn/{p}/`, `distances` with 422. */
+/**
+ * The open AnnData dataset the mapping routes are read from: its graphs
+ * answer at `obsp/{p}`, and `distances` is refused as the AnnData adapter
+ * refuses a graph that is not symmetric, with a `MappingLoadError`.
+ */
 function installServer(t) {
   const requested = [];
-  const originalFetch = globalThis.fetch;
+  const manager = getDataSourceManager();
+  const previous = { activeSource: manager.activeSource, activeDatasetId: manager.activeDatasetId };
   t.after(() => {
-    globalThis.fetch = originalFetch;
+    manager.activeSource = previous.activeSource;
+    manager.activeDatasetId = previous.activeDatasetId;
   });
-  globalThis.fetch = async url => {
-    const text = String(url);
-    requested.push(text.slice(BASE.length));
-    if (text === `${BASE}_cellucid/mapping/knn/0/connectivity_manifest.json`) return jsonResponse(manifest(5));
-    if (text === `${BASE}_cellucid/mapping/knn/2/connectivity_manifest.json`) return jsonResponse(manifest(3));
-    if (text === `${BASE}_cellucid/mapping/knn/1/connectivity_manifest.json`) {
-      return jsonResponse({
-        error: "obsp['distances'] is not symmetric — choose a connectivities matrix.",
-        key: 'distances',
-        reason: 'not symmetric — choose a connectivities matrix',
-      }, 422);
-    }
-    throw new Error(`unexpected request ${text}`);
+  const adapter = {
+    async getMappedConnectivitySummary(obspIndex) {
+      requested.push(`obsp/${obspIndex}`);
+      if (obspIndex === 0) return summary(5);
+      if (obspIndex === 2) return summary(3);
+      if (obspIndex === 1) {
+        throw new MappingLoadError(
+          'distances',
+          'not symmetric — choose a connectivities matrix',
+          "obsp['distances'] is not symmetric — choose a connectivities matrix."
+        );
+      }
+      throw new Error(`unexpected graph ${obspIndex}`);
+    },
   };
+  manager.activeSource = { getType: () => 'anndata', datasetId: DATASET_ID, getAdapter: () => adapter };
+  manager.activeDatasetId = DATASET_ID;
   return requested;
 }
 
@@ -99,7 +90,7 @@ function makeState({ relayoutFails = false, publishFails = false } = {}) {
     layoutKey: 'X_umap',
     dimension: 2,
     label: 'X_umap',
-    path: 'embeddings/0_2d.bin',
+    path: 'obsm/0/0-1',
     provenance: { key: 'X_umap', columns: [0, 1] },
     origin: 'identity',
   }]);
@@ -107,7 +98,7 @@ function makeState({ relayoutFails = false, publishFails = false } = {}) {
   manager.getPositions = async layoutKey => new Float32Array(N_OBS * manager.getLayout(layoutKey).dimension);
 
   const graphs = [];
-  let graph = { manifest: manifest(5), manifestUrl: `${BASE}connectivity_manifest.json` };
+  let graph = { summary: summary(5), url: `${BASE}obsp` };
   const events = [];
   const state = {
     dimensionManager: manager,
@@ -135,6 +126,8 @@ function makeState({ relayoutFails = false, publishFails = false } = {}) {
       knn: 'connectivities',
       geneNames: 'index',
       expression: 'X',
+      log1p: {},
+      highlyVariable: null,
       latent: null,
       vectorFields: [],
     },
@@ -148,10 +141,12 @@ function makeState({ relayoutFails = false, publishFails = false } = {}) {
       throw new Error('No test here changes the vector fields.');
     },
     resetGeneAnalysis: () => {},
-    getConnectivityGraph: () => graph,
+    // As the app's runtime: a graph's count is its summary's (a graph read
+    // straight from a file is counted once its edges are read).
+    getConnectivityGraph: () => ({ ...graph, edges: graph.summary === null ? null : graph.summary.n_edges }),
     replaceConnectivityGraph(next) {
-      if (publishFails && next.manifest?.n_edges === 3) throw new Error('graph publication failed');
-      graphs.push(next.manifest === null ? null : next.manifest.n_edges);
+      if (publishFails && next.summary?.n_edges === 3) throw new Error('graph publication failed');
+      graphs.push(next.summary === null ? null : next.summary.n_edges);
       graph = next;
     },
   });
@@ -173,7 +168,7 @@ test('the graph menu lists every obsp matrix, with the reason one cannot be used
     { value: 'X_umap', label: 'X_umap · 2 columns', usable: true, reason: null },
     { value: 'X_tsne', label: 'X_tsne · 2 columns', usable: true, reason: null },
   ]);
-  assert.equal(state.getConnectivityEdgeCount(), 5);
+  assert.deepEqual(state.getConnectivityGraphFact(), { edges: 5 });
 });
 
 test('a graph is staged, then published in the mapping transaction', async t => {
@@ -182,11 +177,11 @@ test('a graph is staged, then published in the mapping transaction', async t => 
   const next = { ...state.getDataMapping(), knn: 'scvi_connectivities' };
   assert.equal(state.describeDataMappingRefusal(next), null);
   assert.equal(await state.applyDataMapping(next, { origin: 'user' }), true);
-  assert.deepEqual(requested, ['_cellucid/mapping/knn/2/connectivity_manifest.json']);
+  assert.deepEqual(requested, ['obsp/2']);
   assert.deepEqual(graphs, [3]);
-  assert.equal(currentGraph().manifestUrl, `${BASE}_cellucid/mapping/knn/2/connectivity_manifest.json`);
+  assert.equal(currentGraph().url, `${BASE}obsp/2`);
   assert.equal(state.getDataMapping().knn, 'scvi_connectivities');
-  assert.equal(state.getConnectivityEdgeCount(), 3);
+  assert.deepEqual(state.getConnectivityGraphFact(), { edges: 3 });
   assert.deepEqual(events.filter(([name]) => name === 'mapping:changed').at(-1), ['mapping:changed', {
     mapping: state.getDataMapping(),
     cause: 'apply',
@@ -196,11 +191,11 @@ test('a graph is staged, then published in the mapping transaction', async t => 
   // None removes the graph without reading anything.
   assert.equal(await state.applyDataMapping({ ...next, knn: null }, { origin: 'user' }), true);
   assert.deepEqual(graphs, [3, null]);
-  assert.equal(state.getConnectivityEdgeCount(), null);
+  assert.equal(state.getConnectivityGraphFact(), null);
   assert.equal(requested.length, 1);
 });
 
-test('a graph the server refuses changes nothing and stays unusable with its reason', async t => {
+test('a refused graph changes nothing and stays unusable with its reason', async t => {
   installServer(t);
   const { state, graphs } = makeState();
   const before = state.getDataMapping();
@@ -255,7 +250,7 @@ test('a failed embedding relayout publishes no graph', async t => {
     /relayout failed/
   );
   // The graph was staged (read), never published, and the slot is restored.
-  assert.deepEqual(requested, ['_cellucid/mapping/knn/2/connectivity_manifest.json']);
+  assert.deepEqual(requested, ['obsp/2']);
   assert.deepEqual(graphs, []);
   assert.equal(manager.getDefaultLayout(2), 'X_umap');
   assert.equal(state.getDataMapping(), before);
@@ -295,6 +290,8 @@ test('a file without X opens on raw.X, marked guessed until another matrix is ch
       knn: null,
       geneNames: 'index',
       expression: 'raw',
+      log1p: {},
+      highlyVariable: null,
       latent: null,
       vectorFields: [],
     },
@@ -310,7 +307,7 @@ test('a file without X opens on raw.X, marked guessed until another matrix is ch
 function makeVectorState({ failCommit = false } = {}) {
   const probes = mappingProbes({
     nObs: N_OBS,
-    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap_2d: 2, velocity_pca: 6, drift: 3 },
+    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2, velocity_pca: 6, drift: 3 },
     hasX: true,
   });
   probes.obsp = [obspProbe('connectivities')];
@@ -326,7 +323,7 @@ function makeVectorState({ failCommit = false } = {}) {
     layoutKey: 'X_umap',
     dimension: 2,
     label: 'X_umap',
-    path: 'embeddings/0_2d.bin',
+    path: 'obsm/0/0-1',
     provenance: { key: 'X_umap', columns: [0, 1] },
     origin: 'identity',
   }]);
@@ -351,8 +348,10 @@ function makeVectorState({ failCommit = false } = {}) {
       knn: null,
       geneNames: 'index',
       expression: 'X',
+      log1p: {},
+      highlyVariable: null,
       latent: null,
-      vectorFields: [{ key: 'velocity_umap_2d', embedding: UMAP }],
+      vectorFields: [{ key: 'velocity_umap', embedding: UMAP }],
     },
     candidates,
     origin: 'default',
@@ -365,7 +364,7 @@ function makeVectorState({ failCommit = false } = {}) {
       return manager;
     },
     resetGeneAnalysis: () => {},
-    getConnectivityGraph: () => ({ manifest: null, manifestUrl: null }),
+    getConnectivityGraph: () => ({ summary: null, url: null }),
     replaceConnectivityGraph: () => {},
   });
   return { state, created, published, resets: () => resets };
@@ -381,7 +380,7 @@ test('vector fields: each embedding lists the arrays that fit it, the ones named
     embeddingKey: 'X_umap',
     label: 'X_umap',
     options: [
-      { binding: { key: 'velocity_umap_2d', embedding: umap }, label: 'velocity_umap_2d', usable: true, reason: null, suggested: true },
+      { binding: { key: 'velocity_umap', embedding: umap }, label: 'velocity_umap', usable: true, reason: null, suggested: true },
     ],
   }]);
   // A staged embedding is listed too: velocity_pca is read at its columns.
@@ -390,8 +389,8 @@ test('vector fields: each embedding lists the arrays that fit it, the ones named
     embeddings: { enabled: [pca, umap], defaults: { '1d': null, '2d': pca, '3d': null } },
   };
   assert.deepEqual(state.getVectorBindingChoices(staged).map(entry => [entry.embeddingKey, entry.options.map(option => [option.label, option.suggested])]), [
-    ['X_pca[2,3]', [['velocity_pca', true], ['velocity_umap_2d', false]]],
-    ['X_umap', [['velocity_umap_2d', true]]],
+    ['X_pca[2,3]', [['velocity_pca', true], ['velocity_umap', false]]],
+    ['X_umap', [['velocity_umap', true]]],
   ]);
   // A binding that cannot be drawn is refused by name; drift is 3 wide.
   assert.equal(
@@ -435,4 +434,92 @@ test('vector fields: a new set of bindings replaces the manager in the transacti
     [[], original.vectorFields]
   );
   assert.equal(failing.resets(), 2);
+});
+
+/**
+ * A mapping transaction belongs to the dataset it was asked of. The Data
+ * mapping panel's Apply reads over the network before it publishes anything,
+ * and another dataset can be chosen meanwhile: what the transaction then
+ * publishes, records or restores would land in the dataset that replaced
+ * the one it was asked of (its graph, gene list and refusals).
+ */
+function installGatedServer(t) {
+  const manager = getDataSourceManager();
+  const previous = { activeSource: manager.activeSource, activeDatasetId: manager.activeDatasetId };
+  t.after(() => {
+    manager.activeSource = previous.activeSource;
+    manager.activeDatasetId = previous.activeDatasetId;
+  });
+  const gates = [];
+  const adapter = {
+    getMappedConnectivitySummary(obspIndex) {
+      return new Promise((resolve, reject) => gates.push({ obspIndex, resolve, reject }));
+    },
+  };
+  manager.activeSource = { getType: () => 'anndata', datasetId: DATASET_ID, getAdapter: () => adapter };
+  manager.activeDatasetId = DATASET_ID;
+  return gates;
+}
+
+async function untilGate(gates) {
+  while (gates.length === 0) await new Promise(resolve => setImmediate(resolve));
+  return gates.shift();
+}
+
+test('a graph read that lands after another dataset is published publishes nothing', async t => {
+  const gates = installGatedServer(t);
+  const { state, graphs, events } = makeState();
+  const before = state.getDataMapping();
+  const applying = state.applyDataMapping({ ...before, knn: 'scvi_connectivities' }, { origin: 'user' });
+  const gate = await untilGate(gates);
+  // Another dataset is published while the graph's summary is read.
+  state._datasetGeneration += 1;
+  gate.resolve(summary(3));
+  await assert.rejects(applying, error => error.name === 'AbortError');
+  assert.deepEqual(graphs, []);
+  assert.equal(state.getDataMapping(), before);
+  assert.deepEqual(events.filter(([name]) => name === 'mapping:changed'), []);
+});
+
+test('a graph refusal that lands after another dataset is published is not recorded on it', async t => {
+  const gates = installGatedServer(t);
+  const { state, graphs } = makeState();
+  const before = state.getDataMapping();
+  const applying = state.applyDataMapping({ ...before, knn: 'distances' }, { origin: 'user' });
+  const gate = await untilGate(gates);
+  state._datasetGeneration += 1;
+  gate.reject(new MappingLoadError('distances', 'not symmetric', "obsp['distances'] is not symmetric."));
+  await assert.rejects(applying, error => error.name === 'AbortError');
+  assert.deepEqual(graphs, []);
+  assert.equal(
+    state.getMappingGroupChoices('knn').find(choice => choice.value === 'distances').usable,
+    true
+  );
+});
+
+test('another dataset published during a view move stops the commit without restoring into it', async t => {
+  const gates = installGatedServer(t);
+  const { state, manager, graphs, events } = makeState();
+  const before = state.getDataMapping();
+  const move = state.setViewRepresentation.bind(state);
+  const moved = [];
+  state.setViewRepresentation = async (viewId, layoutKey, options) => {
+    moved.push(layoutKey);
+    await move(viewId, layoutKey, options);
+    // The view moved; then another dataset is published.
+    if (layoutKey === 'X_tsne') state._datasetGeneration += 1;
+  };
+  const applying = state.applyDataMapping(
+    { ...before, embeddings: embeddingsWith(TSNE), knn: 'scvi_connectivities' },
+    { origin: 'user' }
+  );
+  (await untilGate(gates)).resolve(summary(3));
+  await assert.rejects(applying, error => error.name === 'AbortError');
+  // Neither the graph is published nor the move undone: both belong to the
+  // dataset that is gone.
+  assert.deepEqual(graphs, []);
+  assert.deepEqual(moved, ['X_tsne']);
+  assert.equal(manager.getViewLayout('live'), 'X_tsne');
+  assert.equal(state.getDataMapping(), before);
+  assert.deepEqual(events.filter(([name]) => name === 'mapping:changed'), []);
 });

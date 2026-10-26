@@ -340,10 +340,18 @@ test('the wordmark follows the theme instead of pinning a light surface', async 
       `no surface holding ${logo[0]} may pin a theme`,
     );
   }
+  // The sidebar card and the brand card (welcome dialog, standalone pages,
+  // startup failure screen) each invert their own wordmark.
+  const brandCss = await readFile(new URL('../assets/css/components/_welcome.css', import.meta.url), 'utf8');
   assert.match(
     css,
-    /:root\[data-theme="dark"\] \.sidebar-logo,\s*:root\[data-theme="dark"\] \.welcome-logo \{\s*filter: invert\(1\) hue-rotate\(180deg\);/,
-    'the dark theme inverts both wordmarks',
+    /:root\[data-theme="dark"\] \.sidebar-logo \{\s*filter: invert\(1\) hue-rotate\(180deg\);/,
+    'the dark theme inverts the sidebar wordmark',
+  );
+  assert.match(
+    brandCss,
+    /:root\[data-theme="dark"\] \.welcome-logo \{\s*filter: invert\(1\) hue-rotate\(180deg\);/,
+    'the dark theme inverts the brand card wordmark',
   );
   assert.doesNotMatch(
     css,

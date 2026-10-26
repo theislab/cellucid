@@ -17,7 +17,7 @@
  * prefetched: long enough that sweeping across a list starts nothing, short
  * against the time it takes to decide and click.
  */
-export const INTENT_PREFETCH_DWELL_MS = 150;
+const INTENT_PREFETCH_DWELL_MS = 150;
 
 /**
  * @template Key

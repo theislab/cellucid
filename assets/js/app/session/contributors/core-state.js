@@ -8,6 +8,7 @@ import { createUiControlSerializer } from '../../state-serializer/ui-controls.js
 import { reportSmokeUnavailable } from '../../ui/modules/smoke-availability.js';
 import {
   createFilterSerializer,
+  readFieldInventory,
   serializeFiltersForFields,
   validateFiltersForState
 } from '../../state-serializer/filters.js';
@@ -20,25 +21,24 @@ import {
 } from '../../state-serializer/active-fields.js';
 import {
   assertMultiviewState,
+  focusedCameraState,
   restoreMultiview
 } from '../../state-serializer/multiview.js';
 import {
-  assertCameraState,
-  cloneCameraState
+  assertCameraState
 } from '../../../rendering/camera-state-contract.js';
 import {
   assertArray,
   assertBoolean,
-  assertExactKeys,
   assertNonEmptyString,
-  assertPlainRecord,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from '../schema-contract.js';
 import {
   getSessionRestoreSnapshot
 } from '../session-context.js';
 import { requireRepresentationRef } from '../../../data/dimension-manager.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 export const id = 'core-state';
 
@@ -48,13 +48,12 @@ export const id = 'core-state';
  * @param {unknown} ref
  * @returns {{key: string, columns: number[]|null}}
  */
-export function cloneEmbeddingRef(ref) {
+function cloneEmbeddingRef(ref) {
   const exact = requireRepresentationRef(ref);
   return { key: exact.key, columns: exact.columns === null ? null : [...exact.columns] };
 }
 
 const CORE_PAYLOAD_KEYS = [
-  'camera',
   'liveEmbedding',
   'uiControls',
   'filters',
@@ -137,19 +136,6 @@ function serializeContextActiveFields(context, snapshotId) {
   });
 }
 
-function assertSnapshotMeta(meta, snapshotId) {
-  assertExactKeys(meta, ['filtersText'], `Snapshot "${snapshotId}" metadata`);
-  assertArray(meta.filtersText, `Snapshot "${snapshotId}" filter summary`);
-  for (const line of meta.filtersText) {
-    if (typeof line !== 'string') {
-      throw new TypeError(`Snapshot "${snapshotId}" filter summaries must be strings.`);
-    }
-  }
-  return {
-    filtersText: [...meta.filtersText]
-  };
-}
-
 /**
  * The field selection and filters of one view, read from the owner that holds
  * them now.
@@ -190,6 +176,14 @@ function serializeViewFieldState(state, viewId) {
   };
 }
 
+function captureCentroidFlags(viewer, viewId) {
+  const flags = viewer.getCentroidFlags(viewId);
+  return {
+    points: assertBoolean(flags?.points, `View "${viewId}" centroid points flag`),
+    labels: assertBoolean(flags?.labels, `View "${viewId}" centroid labels flag`)
+  };
+}
+
 function serializeMultiviewDescriptors({
   state,
   viewer,
@@ -198,6 +192,7 @@ function serializeMultiviewDescriptors({
   requireMethod(viewer, 'getViewLayout', 'Core-state viewer');
   requireMethod(viewer, 'getSnapshotViews', 'Core-state viewer');
   requireMethod(viewer, 'getViewCameraState', 'Core-state viewer');
+  requireMethod(viewer, 'getCentroidFlags', 'Core-state viewer');
   if (!(state.viewContexts instanceof Map)) {
     throw new TypeError('Core-state capture requires the current viewContexts Map.');
   }
@@ -236,13 +231,6 @@ function serializeMultiviewDescriptors({
     }
     return {
       id: snapshotId,
-      label: assertNonEmptyString(
-        snapshot.label,
-        `Current viewer snapshot "${snapshotId}" label`
-      ),
-      fieldKey,
-      fieldKind,
-      meta: assertSnapshotMeta(snapshot.meta, snapshotId),
       embedding: cloneEmbeddingRef(state.getViewEmbeddingRef(snapshotId)),
       // Every view's own camera; linked views report the shared one.
       cameraState: assertCameraState(
@@ -250,17 +238,21 @@ function serializeMultiviewDescriptors({
         `Snapshot session camera state for "${snapshotId}"`
       ),
       activeFields,
-      filters
+      filters,
+      centroids: captureCentroidFlags(viewer, snapshotId)
     };
   });
 
   const multiview = {
     layout,
     camerasLocked,
-    liveCameraState: assertCameraState(
-      viewer.getViewCameraState('live'),
-      'Live-view session camera state'
-    ),
+    live: {
+      cameraState: assertCameraState(
+        viewer.getViewCameraState('live'),
+        'Live-view session camera state'
+      ),
+      centroids: captureCentroidFlags(viewer, 'live')
+    },
     snapshots
   };
   return assertMultiviewState(state, multiview);
@@ -307,24 +299,20 @@ function getOwners(ctx, operation) {
 }
 
 function assertCorePayload(state, payload) {
-  assertExactKeys(payload, CORE_PAYLOAD_KEYS, 'Core-state payload');
-  assertCameraState(payload.camera, 'Restored session camera state');
+  requireExactKeys(payload, CORE_PAYLOAD_KEYS, 'Core-state payload');
   requireRepresentationRef(payload.liveEmbedding);
-  assertPlainRecord(payload.uiControls, 'Core-state uiControls');
-  validateFiltersForState(state, payload.filters);
-  validateActiveFieldsForState(state, payload.activeFields);
-  assertMultiviewState(state, payload.multiview);
+  requirePlainRecord(payload.uiControls, 'Core-state uiControls');
+  // One inventory read validates every view's fields and filters.
+  const inventory = readFieldInventory(state);
+  validateFiltersForState(state, payload.filters, inventory);
+  validateActiveFieldsForState(state, payload.activeFields, inventory);
+  assertMultiviewState(state, payload.multiview, inventory);
   return payload;
 }
 
 export function capture(ctx) {
   const { state, viewer, sidebar } = getOwners(ctx, 'capture');
-  for (const method of [
-    'getCamerasLocked',
-    'getCameraState'
-  ]) {
-    requireMethod(viewer, method, 'Core-state capture viewer');
-  }
+  requireMethod(viewer, 'getCamerasLocked', 'Core-state capture viewer');
   requireMethod(state, 'getViewEmbeddingRef', 'Core-state capture owner');
   requireMethod(state, 'getActiveViewId', 'Core-state capture owner');
   if (!(state.viewContexts instanceof Map)) {
@@ -334,12 +322,7 @@ export function capture(ctx) {
   assertBoolean(camerasLocked, 'Core-state camerasLocked');
   const ui = createUiControlSerializer({ sidebar });
   const live = serializeViewFieldState(state, 'live');
-  const camera = cloneCameraState(
-    viewer.getCameraState(),
-    'Session camera state'
-  );
   const payload = {
-    camera,
     liveEmbedding: cloneEmbeddingRef(state.getViewEmbeddingRef('live')),
     uiControls: ui.collectUIControls(),
     filters: live.filters,
@@ -457,6 +440,71 @@ function syncDomainControls(state, viewer, dom) {
   dom.planarControls.hidden = camera.navigationMode !== 'planar';
 }
 
+/**
+ * Load, concurrently, every field and gene the views of a session show or
+ * filter on, and every embedding they show; pin those embeddings until the
+ * views are rebuilt. Each load is requested in the same task, so genes reach
+ * the reader as one batched request.
+ *
+ * @param {object} state
+ * @param {object} sessionState - A validated core payload.
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<() => void>} Releases the embedding pins.
+ */
+async function preloadSessionViews(state, sessionState, signal) {
+  const inventory = readFieldInventory(state);
+  const obs = new Set();
+  const vars = new Set();
+  const embeddings = new Map();
+  const views = [
+    {
+      filters: sessionState.filters,
+      activeFields: sessionState.activeFields,
+      embedding: sessionState.liveEmbedding
+    },
+    ...sessionState.multiview.snapshots
+  ];
+  for (const view of views) {
+    for (const fieldId of Object.keys(view.filters)) {
+      const separator = fieldId.indexOf(':');
+      const source = fieldId.slice(0, separator);
+      const key = fieldId.slice(separator + 1);
+      const index = (source === 'obs' ? inventory.obsLookup : inventory.varLookup).get(key);
+      if (index !== undefined) (source === 'obs' ? obs : vars).add(index);
+    }
+    const { activeFieldSource, activeFieldKey } = view.activeFields;
+    if (activeFieldSource !== null) {
+      const index = (activeFieldSource === 'obs' ? inventory.obsLookup : inventory.varLookup)
+        .get(activeFieldKey);
+      if (index !== undefined) (activeFieldSource === 'obs' ? obs : vars).add(index);
+    }
+    embeddings.set(JSON.stringify(view.embedding), view.embedding);
+  }
+
+  const dimensionManager = state.dimensionManager;
+  const releases = [];
+  const loads = [];
+  for (const ref of embeddings.values()) {
+    const layoutKey = dimensionManager.resolveRepresentation(ref);
+    releases.push(dimensionManager.pinLayout(layoutKey));
+    loads.push(dimensionManager.getPositions(layoutKey));
+  }
+  for (const index of obs) loads.push(state.ensureFieldLoaded(index, { signal }));
+  for (const index of vars) loads.push(state.ensureVarFieldLoaded(index, { signal }));
+  const release = () => {
+    for (const releasePin of releases.splice(0)) releasePin();
+  };
+  try {
+    await Promise.all(loads);
+  } catch (error) {
+    // Let every other request settle before the pins go.
+    await Promise.allSettled(loads);
+    release();
+    throw error;
+  }
+  return release;
+}
+
 async function applyCorePayload(ctx, payload, signalOverride) {
   const { state, viewer, sidebar } = getOwners(ctx, 'restore');
   for (const method of [
@@ -477,6 +525,12 @@ async function applyCorePayload(ctx, payload, signalOverride) {
     'getCameraState'
   ]) {
     requireMethod(viewer, method, 'Core-state restore viewer');
+  }
+  for (const method of ['ensureFieldLoaded', 'ensureVarFieldLoaded']) {
+    requireMethod(state, method, 'Core-state restore owner');
+  }
+  for (const method of ['resolveRepresentation', 'pinLayout', 'getPositions']) {
+    requireMethod(state.dimensionManager, method, 'Core-state restore dimension owner');
   }
   const signal = assertAbortSignal(signalOverride);
   const ui = createUiControlSerializer({ sidebar });
@@ -539,43 +593,36 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   if (activeViewResult !== 'live') {
     throw new Error('DataState rejected the live view before core-state restore.');
   }
-  await state.restoreViewEmbedding('live', sessionState.liveEmbedding);
-  if (
-    JSON.stringify(state.getViewEmbeddingRef('live'))
-    !== JSON.stringify(sessionState.liveEmbedding)
-  ) {
-    throw new Error('DataState did not apply the restored live embedding.');
-  }
-  throwIfAborted(signal);
 
-  await filters.restoreFilters(sessionState.filters, { signal });
-  throwIfAborted(signal);
-  await restoreActiveFields(
-    state,
-    sessionState.activeFields,
-    { signal }
-  );
-  throwIfAborted(signal);
-
-  await restoreMultiview({
-    state,
-    viewer,
-    restoreFilters: snapshotFilters => filters.restoreFilters(
-      snapshotFilters,
-      { signal }
-    ),
-    restoreActiveFields: activeFields => restoreActiveFields(
+  // Every field, gene and embedding any view names is requested at once, so
+  // the reader serves them as one batch while the views are rebuilt.
+  const releasePreload = await preloadSessionViews(state, sessionState, signal);
+  try {
+    await restoreMultiview({
       state,
-      activeFields,
-      { signal }
-    ),
-    pushViewerState: () => pushViewerState(state)
-  }, sessionState.multiview);
+      viewer,
+      restoreFilters: viewFilters => filters.restoreFilters(
+        viewFilters,
+        { signal }
+      ),
+      restoreActiveFields: activeFields => restoreActiveFields(
+        state,
+        activeFields,
+        { signal }
+      )
+    }, sessionState.multiview, {
+      embedding: sessionState.liveEmbedding,
+      filters: sessionState.filters,
+      activeFields: sessionState.activeFields
+    });
+  } finally {
+    releasePreload();
+  }
   throwIfAborted(signal);
 
   // The focused view's camera, last: every view already holds its own.
   const sessionCamera = assertCameraState(
-    sessionState.camera,
+    focusedCameraState(sessionState.multiview),
     'Restored session camera state'
   );
   viewer.setNavigationMode(sessionCamera.navigationMode);

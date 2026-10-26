@@ -89,6 +89,8 @@ function createSpawnTextureGl() {
     TEXTURE_WRAP_T: 0x2803,
     UNPACK_ALIGNMENT: 0x0cf5,
     UNSIGNED_INT: 0x1405,
+    R8UI: 0x8232,
+    UNSIGNED_BYTE: 0x1401,
     failTexture: null,
     failOnce: false,
     bindBuffer(target, value) {
@@ -113,7 +115,9 @@ function createSpawnTextureGl() {
       textures.delete(texture);
       if (binding === texture) binding = null;
     },
+    errorReads: 0,
     getError() {
+      this.errorReads++;
       return this.NO_ERROR;
     },
     getParameter(parameter) {
@@ -627,6 +631,14 @@ test('committed non-empty spawn replacement stays ready while old retirement ret
     );
     assert.equal(queue.length, 1);
     assert.doesNotThrow(() => queue.shift()(TIMED_OUT_DEADLINE));
+    // New storage is allocated in one slice and published, after one error
+    // read, in the next; the old generation stays published meanwhile.
+    assert.equal(queue.length, 1);
+    assert.equal(state.ready, false);
+    assert.equal(state.textureInfo.texture, oldSpawnTexture);
+    assert.equal(fixture.gl.errorReads, 0);
+    assert.doesNotThrow(() => queue.shift()(TIMED_OUT_DEADLINE));
+    assert.equal(fixture.gl.errorReads, 1);
 
     assert.equal(overlay.enabled, true);
     assert.equal(state.ready, true);
@@ -657,5 +669,75 @@ test('committed non-empty spawn replacement stays ready while old retirement ret
     assert.equal(overlay._pendingDerivedTextureDeletes.size, 0);
     assert.equal(fixture.deleteCalls.get(oldSpawnTexture), 2);
     assert.equal(fixture.deleteCalls.get(oldVisibilityTexture), 1);
+  });
+});
+
+test('a rebuild whose tables keep their shape rewrites them in place in one slice with no error read', () => {
+  withIdleQueue(queue => {
+    const fixture = createSpawnTextureGl();
+    const state = createSpawnState(3);
+    const visibilityTexture = fixture.gl.createTexture();
+    const spawnTexture = fixture.gl.createTexture();
+    state.visibilityTextureInfo = {
+      components: 1, height: 1, texture: visibilityTexture, width: 1,
+    };
+    state.textureInfo = {
+      components: 1, height: 1, texture: spawnTexture, width: 1,
+    };
+    const overlay = createSpawnOverlay(state);
+    overlay.gl = fixture.gl;
+
+    overlay._ensureSpawnTable(
+      'live',
+      {
+        getLodIndices: () => null,
+        getLodLevel: () => -1,
+        getViewTransparency: () => new Uint8Array([1]),
+      },
+      1,
+    );
+    assert.equal(queue.length, 1);
+    assert.doesNotThrow(() => queue.shift()(TIMED_OUT_DEADLINE));
+
+    assert.equal(queue.length, 0);
+    assert.equal(state.ready, true);
+    assert.equal(state.tableSize, 1);
+    assert.equal(state.textureInfo.texture, spawnTexture);
+    assert.equal(state.visibilityTextureInfo.texture, visibilityTexture);
+    assert.equal(fixture.gl.errorReads, 0);
+    assert.equal(fixture.deleteCalls.size, 0);
+  });
+});
+
+test('a build abandoned between allocation and publication deletes what it allocated', () => {
+  withIdleQueue(queue => {
+    const fixture = createSpawnTextureGl();
+    const state = createSpawnState(5);
+    const overlay = createSpawnOverlay(state);
+    overlay.gl = fixture.gl;
+
+    overlay._ensureSpawnTable(
+      'live',
+      {
+        getLodIndices: () => null,
+        getLodLevel: () => -1,
+        getViewTransparency: () => new Uint8Array([1]),
+      },
+      1,
+    );
+    queue.shift()(TIMED_OUT_DEADLINE);
+    assert.equal(queue.length, 1);
+    const allocated = [...fixture.textures];
+    assert.equal(allocated.length, 2);
+
+    // A newer filter supersedes the build before its publication slice.
+    state.version++;
+    queue.shift()(TIMED_OUT_DEADLINE);
+
+    assert.equal(state.ready, false);
+    for (const texture of allocated) {
+      assert.equal(fixture.textures.has(texture), false);
+    }
+    assert.equal(fixture.gl.errorReads, 0);
   });
 });

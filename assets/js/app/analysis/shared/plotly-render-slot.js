@@ -3,11 +3,13 @@
  *
  * The generic slot owns candidate commit/retirement and export leases. This
  * adapter adds exact Plotly cleanup plus one coalesced responsive-resize owner
- * for the committed child.
+ * for the committed child. A plot laid out for its size lays itself out again
+ * after each resize (`plots/size-fit.js`).
  */
 
 import { loadPlotly, purgePlot } from '../plots/plotly-loader.js';
 import { PlotRenderSlot, readHostLayoutBox } from './plot-render-slot.js';
+import { refitToSize } from '../plots/size-fit.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -330,6 +332,7 @@ export class PlotlyRenderSlot {
           );
         }
         await Plotly.Plots.resize(candidate);
+        await refitToSize(candidate);
         candidate.style.width = '100%';
         candidate.style.height = '100%';
         this._committedMeasurement = measurement;

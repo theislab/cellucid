@@ -248,19 +248,10 @@ function createOwners() {
           cellVisibilityMask: Uint8Array.from([1, 1]),
           centroidPositions: new Float32Array(),
           centroidColors: new Uint8Array(),
-          centroidOutliers: new Float32Array(),
           centroidLabels: [],
           filteredCount: { shown: 2, total: 2 },
         },
       ]]),
-      captureCurrentContext() {
-        return viewContextCoreMethods._cloneViewContext.call(
-          this,
-          this.viewContexts.get('live'),
-          'live',
-          { cloneArrays: true },
-        );
-      },
       clearActiveField() {},
       getAvailableDimensions() {
         return [2, 3];
@@ -277,7 +268,6 @@ function createOwners() {
       getSnapshotPayload() {
         return {
           centroidColors: null,
-          centroidOutliers: null,
           centroidPositions: null,
           colors: Uint8Array.from([21, 22, 23, 255, 31, 32, 33, 255]),
           dimensionLevel: this.dimensionManager.getViewDimension('live'),
@@ -316,18 +306,6 @@ function createOwners() {
         }
         return context.followsDefault === true;
       },
-      restoreContext(context) {
-        this.viewContexts.set(
-          'live',
-          viewContextCoreMethods._cloneViewContext.call(
-            this,
-            context,
-            'live',
-            { cloneArrays: true },
-          ),
-        );
-        this.activeViewId = 'live';
-      },
       // The production `setActiveView` ends in `_notifyVisibilityChange()`
       // (view-context-core.js), which is the signal the UI coordinator turns
       // into the animation frame that renders the badges. Publishing it here is
@@ -364,6 +342,8 @@ function createOwners() {
         owners.viewer.setViewEmbedding('live', { dimension, layoutKey });
         await new Promise(resolve => setTimeout(resolve, 0));
       },
+      beginBatch() {},
+      endBatch() {},
       // The restore entry of the session schema: an embedding reference.
       async restoreViewEmbedding(viewId, ref) {
         assert.equal(ref.columns, null);
@@ -417,6 +397,14 @@ function createOwners() {
     },
     getCamerasLocked() {
       return camerasLocked;
+    },
+    // viewer.js per-view centroid toggles, which a session restores per view.
+    centroidFlags: new Map(),
+    setShowCentroidPoints(show, viewId) {
+      this.centroidFlags.set(viewId, { ...this.centroidFlags.get(viewId), points: show });
+    },
+    setShowCentroidLabels(show, viewId) {
+      this.centroidFlags.set(viewId, { ...this.centroidFlags.get(viewId), labels: show });
     },
     // viewer.js `setViewTitlePrefixes()`: the pane chips' "N · shows" prefix.
     titlePrefixes: new Map(),
@@ -668,17 +656,14 @@ test('a multiview restore raises nothing on the frames it schedules', async t =>
   const saved = {
     camerasLocked: false,
     layout: { activeId: 'snap_1', liveViewHidden: false, mode: 'grid' },
-    liveCameraState: cameraState(),
+    live: { cameraState: cameraState(), centroids: { points: false, labels: false } },
     snapshots: [{
       activeFields: { activeFieldKey: null, activeFieldSource: null },
       cameraState: cameraState(),
+      centroids: { points: false, labels: false },
       embedding: { key: 'X_umap', columns: null },
-      fieldKey: null,
-      fieldKind: null,
       filters: {},
       id: 'snap_1',
-      label: 'All cells',
-      meta: { filtersText: [] },
     }],
   };
 
@@ -691,8 +676,11 @@ test('a multiview restore raises nothing on the frames it schedules', async t =>
     async restoreFilters() {
       await new Promise(resolve => setTimeout(resolve, 0));
     },
-    pushViewerState() {},
-  }, saved);
+  }, saved, {
+    embedding: { key: 'X_umap', columns: null },
+    filters: {},
+    activeFields: { activeFieldKey: null, activeFieldSource: null },
+  });
 
   // Drain any frame the restore's last publication scheduled.
   await new Promise(resolve => setTimeout(resolve, 0));

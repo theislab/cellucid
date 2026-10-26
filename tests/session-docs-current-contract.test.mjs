@@ -18,7 +18,9 @@ test('session maintainer reference describes only the atomic current format', as
   for (const exact of [
     'one current state document',
     'one awaited public operation',
-    'analysis/cache-inventory',
+    'CELLUCID_SESSION/2',
+    'ui/figure-export',
+    'analysis/docked',
     'cinematic/camera',
     'Exactly one codes chunk is required for every categorical overlay field',
     'one compact binary membership chunk per advertised group',
@@ -71,6 +73,11 @@ test('session maintainer reference describes only the atomic current format', as
     'pages/groups appear immediately',
     'dev-phase',
     'Recommended Additions',
+    // Session format 1.
+    'analysis/cache-inventory',
+    'bulk-gene',
+    'carries no version field',
+    'five-chunk',
   ]) {
     assert.doesNotMatch(normalized, new RegExp(
       retired.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&'),

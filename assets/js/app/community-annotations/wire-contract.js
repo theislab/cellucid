@@ -8,10 +8,30 @@
 import { isExactOrcidId } from './profile-identifiers.js';
 
 export const ANNOTATION_CONTRACT_IDS = Object.freeze({
-  user: 'https://cellucid.com/contracts/community-annotation/user-v1.schema.json',
+  user: 'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
   config: 'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
-  merges: 'https://cellucid.com/contracts/community-annotation/merges-v1.schema.json',
+  merges: 'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
 });
+
+/*
+ * Files and dataset views.
+ *
+ * A repository can annotate several datasets, and two datasets can share a
+ * field and a category label ("leiden" / "0"), so everything a contributor
+ * writes is kept per dataset:
+ *
+ * - a user file (version 2) holds the profile once and, under
+ *   `datasets[<datasetId>]`, that dataset's access record, suggestions, votes,
+ *   comments and deletion markers;
+ * - the merges file (version 2) names the dataset of every merge.
+ *
+ * The app works on one dataset at a time, so `github-sync.js` projects each
+ * file onto the open dataset (a *dataset view*: the shape `assertUserDocument`
+ * and `assertMergesDocument` validate) when it pulls, and composes the file
+ * back from the view when it publishes, replacing only that dataset's part
+ * and keeping every other dataset's part byte for byte. Nothing else in the
+ * app reads or writes the file shapes.
+ */
 
 // GitHub's repository Contents API supports its complete JSON/base64 contract
 // only for files whose decoded content is at most 1 MB. Keep this as one shared
@@ -844,4 +864,240 @@ export function assertSchemaIdentity(value, kind, { path = '$' } = {}) {
     reject(child(path, '$id'), `must equal ${JSON.stringify(expectedId)}`);
   }
   return schema;
+}
+
+const USER_FILE_PROFILE_FIELDS = Object.freeze([
+  'login',
+  'displayName',
+  'title',
+  'orcid',
+  'linkedin',
+]);
+
+const USER_SECTION_CONTENT_FIELDS = Object.freeze([
+  'suggestions',
+  'votes',
+  'comments',
+  'deletedSuggestions',
+]);
+
+/**
+ * The dataset view of one section of a user file.
+ *
+ * @param {object} file - A validated user file
+ * @param {string} datasetId
+ * @param {object|null} section
+ * @returns {object}
+ */
+function userViewOf(file, datasetId, section) {
+  const view = {
+    version: 1,
+    username: file.username,
+    githubUserId: file.githubUserId,
+    updatedAt: file.updatedAt,
+  };
+  for (const field of USER_FILE_PROFILE_FIELDS) {
+    if (Object.hasOwn(file, field)) view[field] = file[field];
+  }
+  if (section !== null) {
+    view.datasets = {
+      [datasetId]: {
+        fieldsToAnnotate: [...section.fieldsToAnnotate],
+        lastAccessedAt: section.lastAccessedAt,
+      },
+    };
+  }
+  view.suggestions = structuredClone(section?.suggestions ?? {});
+  view.votes = structuredClone(section?.votes ?? {});
+  if (section !== null && Object.hasOwn(section, 'comments')) {
+    view.comments = structuredClone(section.comments);
+  }
+  if (section !== null && Object.hasOwn(section, 'deletedSuggestions')) {
+    view.deletedSuggestions = structuredClone(section.deletedSuggestions);
+  }
+  return view;
+}
+
+/**
+ * Validate one user file (`annotations/users/ghid_<id>.json`, version 2).
+ *
+ * @param {unknown} value
+ * @param {{path?: string, filename?: string|null}} [options]
+ * @returns {object}
+ */
+export function assertUserFile(value, { path = '$', filename = null } = {}) {
+  const file = assertExactFields(
+    value,
+    path,
+    ['version', 'username', 'githubUserId', 'updatedAt', 'datasets'],
+    USER_FILE_PROFILE_FIELDS
+  );
+  if (file.version !== 2) reject(child(path, 'version'), 'must equal 2');
+  const datasets = assertRecord(file.datasets, child(path, 'datasets'));
+  for (const [datasetId, sectionValue] of Object.entries(datasets)) {
+    assertNonblankString(datasetId, `${child(path, 'datasets')} key`, ANNOTATION_LIMITS.datasetId);
+    const sectionPath = child(child(path, 'datasets'), datasetId);
+    const section = assertExactFields(
+      sectionValue,
+      sectionPath,
+      ['fieldsToAnnotate', 'lastAccessedAt', 'suggestions', 'votes'],
+      ['comments', 'deletedSuggestions']
+    );
+    // Every section is a complete dataset view of its own; validating that
+    // view checks the section with the rules the app applies to it.
+    assertUserDocument(userViewOf(file, datasetId, section), {
+      path: sectionPath,
+      filename,
+    });
+  }
+  if (Object.keys(datasets).length === 0) {
+    // The profile alone still names its owner, which is what the validator
+    // below proves; an empty file is a valid file.
+    assertUserDocument(userViewOf(file, null, null), { path, filename });
+  }
+  return file;
+}
+
+/**
+ * The open dataset's view of one user file: the profile, and that dataset's
+ * suggestions, votes, comments and deletion markers (empty when the
+ * contributor has none for it).
+ *
+ * @param {unknown} value - A user file
+ * @param {string} datasetId
+ * @param {{path?: string, filename?: string|null}} [options]
+ * @returns {object} A dataset view (`assertUserDocument`)
+ */
+export function projectUserFile(value, datasetId, { path = '$', filename = null } = {}) {
+  const file = assertUserFile(value, { path, filename });
+  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
+  const section = Object.hasOwn(file.datasets, datasetId) ? file.datasets[datasetId] : null;
+  return assertUserDocument(userViewOf(file, datasetId, section), { path, filename });
+}
+
+/**
+ * Compose a user file from the open dataset's view: the view replaces that
+ * dataset's section and the profile; every other dataset's section of the
+ * file already published is kept as it is.
+ *
+ * @param {unknown|null} previous - The published file, or null for a new one
+ * @param {string} datasetId
+ * @param {unknown} view - The dataset view to publish
+ * @param {{path?: string, filename?: string|null}} [options]
+ * @returns {object} A user file (`assertUserFile`)
+ */
+export function composeUserFile(previous, datasetId, view, { path = '$', filename = null } = {}) {
+  const prior = previous === null ? null : assertUserFile(previous, { path, filename });
+  const current = assertUserDocument(view, { path, filename });
+  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
+  if (prior !== null && prior.githubUserId !== current.githubUserId) {
+    reject(path, 'must belong to the same contributor as the published file');
+  }
+  const access = current.datasets && Object.hasOwn(current.datasets, datasetId)
+    ? current.datasets[datasetId]
+    : prior !== null && Object.hasOwn(prior.datasets, datasetId)
+      ? prior.datasets[datasetId]
+      : { fieldsToAnnotate: [], lastAccessedAt: current.updatedAt };
+  const section = {
+    fieldsToAnnotate: [...access.fieldsToAnnotate],
+    lastAccessedAt: access.lastAccessedAt,
+  };
+  for (const field of USER_SECTION_CONTENT_FIELDS) {
+    if (Object.hasOwn(current, field)) section[field] = structuredClone(current[field]);
+  }
+  const datasets = {};
+  for (const [id, entry] of Object.entries(prior?.datasets ?? {})) {
+    if (id !== datasetId) datasets[id] = structuredClone(entry);
+  }
+  datasets[datasetId] = section;
+  const file = {
+    version: 2,
+    username: current.username,
+    githubUserId: current.githubUserId,
+    updatedAt: current.updatedAt,
+  };
+  for (const field of USER_FILE_PROFILE_FIELDS) {
+    if (Object.hasOwn(current, field)) file[field] = current[field];
+  }
+  file.datasets = datasets;
+  return assertUserFile(file, { path, filename });
+}
+
+/**
+ * Validate the merges file (`annotations/moderation/merges.json`, version 2):
+ * every merge names its dataset, and the merges of each dataset form a valid
+ * merges view of their own.
+ *
+ * @param {unknown} value
+ * @param {{path?: string}} [options]
+ * @returns {object}
+ */
+export function assertMergesFile(value, { path = '$' } = {}) {
+  const file = assertExactFields(value, path, ['version', 'updatedAt', 'merges']);
+  if (file.version !== 2) reject(child(path, 'version'), 'must equal 2');
+  assertUtcDateTime(file.updatedAt, child(path, 'updatedAt'));
+  const merges = assertArray(file.merges, child(path, 'merges'));
+  const byDataset = new Map();
+  merges.forEach((value, index) => {
+    const mergePath = `${child(path, 'merges')}[${index}]`;
+    const merge = assertRecord(value, mergePath);
+    const datasetId = assertNonblankString(
+      merge.datasetId,
+      child(mergePath, 'datasetId'),
+      ANNOTATION_LIMITS.datasetId
+    );
+    const { datasetId: _datasetId, ...rest } = merge;
+    if (!byDataset.has(datasetId)) byDataset.set(datasetId, []);
+    byDataset.get(datasetId).push(rest);
+  });
+  for (const [datasetId, list] of byDataset) {
+    assertMergesDocument(
+      { version: 1, updatedAt: file.updatedAt, merges: list },
+      { path: `${path} dataset ${JSON.stringify(datasetId)}` }
+    );
+  }
+  return file;
+}
+
+/**
+ * The open dataset's view of the merges file: its merges, without the
+ * dataset name.
+ *
+ * @param {unknown} value
+ * @param {string} datasetId
+ * @param {{path?: string}} [options]
+ * @returns {object} A merges view (`assertMergesDocument`)
+ */
+export function projectMergesFile(value, datasetId, { path = '$' } = {}) {
+  const file = assertMergesFile(value, { path });
+  const merges = file.merges
+    .filter(merge => merge.datasetId === datasetId)
+    .map(({ datasetId: _datasetId, ...merge }) => structuredClone(merge));
+  return assertMergesDocument({ version: 1, updatedAt: file.updatedAt, merges }, { path });
+}
+
+/**
+ * Compose the merges file from the open dataset's view, keeping every other
+ * dataset's merges as published.
+ *
+ * @param {unknown|null} previous
+ * @param {string} datasetId
+ * @param {unknown} view
+ * @param {{path?: string}} [options]
+ * @returns {object} A merges file (`assertMergesFile`)
+ */
+export function composeMergesFile(previous, datasetId, view, { path = '$' } = {}) {
+  const prior = previous === null ? null : assertMergesFile(previous, { path });
+  const current = assertMergesDocument(view, { path });
+  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
+  const merges = [
+    ...(prior?.merges ?? [])
+      .filter(merge => merge.datasetId !== datasetId)
+      .map(merge => structuredClone(merge)),
+    ...current.merges.map(merge => ({ datasetId, ...structuredClone(merge) })),
+  ];
+  return assertMergesFile(
+    { version: 2, updatedAt: current.updatedAt, merges },
+    { path }
+  );
 }

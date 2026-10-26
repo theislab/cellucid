@@ -322,6 +322,8 @@ export class AnalysisUIManager {
     if (entry.ui?.onPageSelectionChange) {
       entry.ui.onPageSelectionChange(this._currentPages);
     }
+    // Changes it recorded while another mode was shown.
+    entry.ui?.onShown?.();
 
     this._activeMode = modeId;
     return true;
@@ -444,13 +446,26 @@ export class AnalysisUIManager {
   }
 
   /**
-   * Notify highlight changed (cells added/removed)
-   * Only notifies the active UI
+   * Notify highlight changed (cells added/removed). The active UI brings
+   * itself up to date now; every other built one records the change
+   * (`noteHiddenChange`) and catches up when it is shown, so a result it
+   * shows is marked stale and its groups are read again.
    */
   onHighlightChanged() {
-    const entry = this._uis.get(this._activeMode);
-    if (entry?.ui?.onHighlightChanged) {
-      entry.ui.onHighlightChanged();
+    this._notifyInputChange('highlight', ui => ui.onHighlightChanged?.());
+  }
+
+  /** Notify that the shown cells changed (a filter), as `onHighlightChanged`. */
+  onCellVisibilityChanged() {
+    this._notifyInputChange('cell-visibility', ui => ui.onCellVisibilityChanged?.());
+  }
+
+  /** @private */
+  _notifyInputChange(kind, notifyActive) {
+    for (const [id, entry] of this._uis) {
+      if (entry.ui === null || entry.ui === undefined) continue;
+      if (id === this._activeMode) notifyActive(entry.ui);
+      else entry.ui.noteHiddenChange?.(kind);
     }
   }
 

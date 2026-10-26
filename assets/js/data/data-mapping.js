@@ -4,22 +4,26 @@
  * A *data mapping* names, for one dataset, the embeddings it can be shown with
  * (any number, of any mix of 1D, 2D and 3D: the *enabled* representations),
  * the default representation of each dimension, the vector fields bound to
- * those embeddings, and -- for an AnnData source -- the neighbour graph, the
- * gene-name set, the expression matrix and the latent space. The same JSON shape is written into session
- * fingerprints, sent over the Jupyter wire and derived from URLs.
+ * those embeddings, the neighbour graph, the gene-name set, the expression
+ * matrix, how each expression matrix is transformed (log1p), the highly
+ * variable genes and the latent space, each named by its key in one AnnData
+ * object.
+ * The same JSON shape is written into session fingerprints and sent over the
+ * viewer channel.
  *
  * This module mirrors `cellucid-python/src/cellucid/data_mapping.py` (and the
  * R package's equivalent) rule for rule. The rules that must agree
  * byte-for-byte across JavaScript, Python and R -- making names unique,
  * ranking best-guess embeddings, validating embedding columns, canonical
- * embedding ids, the default expression and vector bindings, the "nothing to
- * plot" message and DataMapping validation -- are pinned by the shared
+ * embedding ids, the vector-field key rule, the default expression and vector
+ * bindings, the "nothing to plot" message and DataMapping validation -- are
+ * pinned by the shared
  * conformance fixture `tests/fixtures/data-mapping-conformance.json`, and each
  * `DataMappingError.code` is the stable reason that fixture names.
  *
  * Everything here is a pure rule over metadata. The Python functions that
- * read an AnnData object (`build_anndata_candidates`, `describe_obsm`,
- * `obsm_entries`, `resolve_gene_names`, `mapped_var_axis`, `mapped_var_count`,
+ * read an AnnData object (`describe_obsm`, `obsm_entries`,
+ * `resolve_gene_names`, `mapped_var_axis`, `mapped_var_count`,
  * `mapped_expression_matrix`, `require_mapping_matches_anndata`) are not
  * mirrored here: the browser reads AnnData through its own loaders.
  *
@@ -32,60 +36,83 @@
  * frozen shallowly, like the frozen Python dataclasses they mirror.
  */
 
+import { isPlainRecord, requireExactKeys } from '../utils/exact-record.js';
+import { formatCountOf } from '../utils/format-units.js';
+
+
 /** The three dimension slots, in the order every mapping and identity lists them. */
 export const DIMENSION_SLOTS = Object.freeze(['1d', '2d', '3d']);
 
 /**
- * The two kinds of data mapping. Exports fix the KNN graph, the expression
- * matrix and the latent space at prepare time, so those groups exist only on
- * the AnnData kind.
+ * The kind every data mapping declares: Cellucid reads AnnData, and a mapping
+ * names `obsm`, `obsp`, layer and `var` keys of one AnnData object.
  */
-export const EXPORT_KIND = 'export';
 export const ANNDATA_KIND = 'anndata';
 
-const EXPORT_MAPPING_KEYS = Object.freeze([
-  'kind',
-  'embeddings',
-  'geneNames',
-  'vectorFields',
-]);
 const ANNDATA_MAPPING_KEYS = Object.freeze([
   'kind',
   'embeddings',
   'knn',
   'geneNames',
   'expression',
+  'log1p',
+  'highlyVariable',
   'latent',
   'vectorFields',
 ]);
+/**
+ * The one key a mapping holds only for a dataset with several modalities
+ * (feature spaces over the same cells): which one gene names, expression,
+ * its log1p and the highly variable genes are read from. A mapping of a
+ * dataset with one feature space has no `modality` key at all.
+ */
+export const MODALITY_KEY = 'modality';
+const LOG1P_ENTRY_KEYS = Object.freeze(['base']);
 const EMBEDDING_REF_KEYS = Object.freeze(['key', 'columns']);
 const EMBEDDINGS_GROUP_KEYS = Object.freeze(['enabled', 'defaults']);
-const EXPORT_VECTOR_BINDING_KEYS = Object.freeze(['field', 'embedding']);
-const ANNDATA_VECTOR_BINDING_KEYS = Object.freeze(['key', 'embedding']);
+const VECTOR_BINDING_KEYS = Object.freeze(['key', 'embedding']);
 
 /**
- * `sc.tl.umap()` writes `X_umap`; earlier Cellucid releases asked for one key
- * per dimension. Both are the default rule.
+ * `X_umap_1d` .. `X_umap_3d` hold one UMAP per dimension count; they are the
+ * default rule first.
  */
 export const DIMENSIONAL_UMAP_KEYS = Object.freeze([
   'X_umap_1d',
   'X_umap_2d',
   'X_umap_3d',
 ]);
-export const UNSUFFIXED_UMAP_KEY = 'X_umap';
 
 /**
- * The AnnData `obsm` grammar of a per-dimension UMAP vector field. The three
- * dimensional embedding keys match it too (`X_umap_2d` reads as field
- * `X_umap`), so test keys with `isVectorFieldKey`, which excludes them.
- *
- * `[^\n]` rather than `.`: Python's `.` excludes only `\n`, while
- * JavaScript's also excludes `\r`, U+2028 and U+2029.
+ * The conventional names of one UMAP, in the order the default rule takes
+ * them: Scanpy's (`sc.tl.umap()` writes `X_umap`, as does a Seurat object's
+ * `umap` reduction), a SingleCellExperiment's (scater's `runUMAP()` names
+ * its reducedDim `UMAP`), then a Seurat object's weighted-nearest-neighbour
+ * and Azimuth reference UMAPs (`wnn.umap`, `ref.umap`). An R object's
+ * reductions and reducedDims are `obsm['X_<name>']` with the name's case
+ * kept (`anndata/transcode/`, `cellucid_prepare()`).
  */
-export const VECTOR_KEY_PATTERN = /^(?<field>[^\n]+_umap)_(?<dimension>[123])d$/;
+export const UMAP_KEYS = Object.freeze([
+  'X_umap',
+  'X_UMAP',
+  'X_wnn.umap',
+  'X_ref.umap',
+]);
+
+/**
+ * The prefix AnnData names a representation with: `obsm['X_<basis>']` is the
+ * embedding (or latent space) of basis `<basis>`, as `sc.tl.umap()` writes
+ * `X_umap`. A key with this prefix is never a vector field.
+ */
+export const EMBEDDING_KEY_PREFIX = 'X_';
 
 const GENE_NAMES_COLUMN_PREFIX = 'column:';
 const LAYER_PREFIX = 'layer:';
+
+/**
+ * The `var` column `sc.pp.highly_variable_genes` writes, the one Scanpy reads
+ * as its `mask_var` when it is not told another.
+ */
+export const HIGHLY_VARIABLE_COLUMN = 'highly_variable';
 
 /**
  * Best-guess tiers, in the order a name is tested against them. A name is
@@ -168,14 +195,6 @@ function compareIntegerLists(a, b) {
   return a.length - b.length;
 }
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
 function ownValue(object, key) {
   return Object.hasOwn(object, key) ? object[key] : undefined;
 }
@@ -225,20 +244,57 @@ function plural(count, singular, pluralText) {
 }
 
 /**
- * Whether an `obsm` key declares a UMAP vector field.
+ * The vector-field key rule, scVelo's naming convention: an `obsm` key
+ * `<field>_<basis>` is the vector field `<field>` on the embedding
+ * `X_<basis>` (`velocity_umap` on `X_umap`, `velocity_umap_3d` on
+ * `X_umap_3d`, `T_fwd_branches` on `X_branches`).
  *
- * `X_umap_1d`, `X_umap_2d` and `X_umap_3d` are embeddings, not vectors,
- * although they fit the vector grammar.
+ * - A key that starts with `X_` is never a vector field: AnnData names
+ *   representations that way.
+ * - Otherwise every split of the key at one `_` into a non-empty `<field>`
+ *   and a non-empty `<basis>` is tried, and the split whose `X_<basis>` is an
+ *   `obsm` key of the same object wins; when several do, the longest basis
+ *   wins (`velocity_umap_3d` is `velocity` on `X_umap_3d` when both `X_umap_3d`
+ *   and `X_3d` exist). Matching is exact and case-sensitive.
+ * - A key with no such split is an ordinary `obsm` array.
  *
- * @param {unknown} key
- * @returns {boolean}
+ * The rule reads names only. Whether the field is drawn is the binding rule
+ * (`defaultVectorBindings`), which also compares column counts.
+ *
+ * @param {string} key
+ * @param {ReadonlySet<string>} obsmKeys - Every `obsm` key of the object.
+ * @returns {{field: string, basis: string, embeddingKey: string}|null}
  */
-export function isVectorFieldKey(key) {
-  return (
-    typeof key === 'string' &&
-    !DIMENSIONAL_UMAP_KEYS.includes(key) &&
-    VECTOR_KEY_PATTERN.test(key)
-  );
+export function parseVectorFieldKey(key, obsmKeys) {
+  if (typeof key !== 'string' || key.startsWith(EMBEDDING_KEY_PREFIX)) return null;
+  for (let split = key.indexOf('_'); split !== -1; split = key.indexOf('_', split + 1)) {
+    // The first qualifying split from the left has the longest basis.
+    if (split === 0 || split === key.length - 1) continue;
+    const basis = key.slice(split + 1);
+    const embeddingKey = `${EMBEDDING_KEY_PREFIX}${basis}`;
+    if (obsmKeys.has(embeddingKey)) {
+      return { field: key.slice(0, split), basis, embeddingKey };
+    }
+  }
+  return null;
+}
+
+/**
+ * The vector fields among one object's `obsm` keys, by key, in input order
+ * (see `parseVectorFieldKey`).
+ *
+ * @param {Iterable<string>} keys - Every `obsm` key of the object.
+ * @returns {Map<string, {field: string, basis: string, embeddingKey: string}>}
+ */
+export function vectorFieldKeys(keys) {
+  const list = Array.from(keys);
+  const obsmKeys = new Set(list);
+  const fields = new Map();
+  for (const key of list) {
+    const parsed = parseVectorFieldKey(key, obsmKeys);
+    if (parsed !== null) fields.set(key, parsed);
+  }
+  return fields;
 }
 
 // =============================================================================
@@ -487,7 +543,7 @@ export function validateEmbeddingColumns(columns, { dimension, width }) {
   if (width < dimension) {
     throw new DataMappingError(
       'too_narrow',
-      `A ${dimension}D embedding needs at least ${dimension} columns; ` +
+      `A ${dimension}D embedding needs at least ${formatCountOf(dimension, 'column')}; ` +
         `this array has ${width}.`
     );
   }
@@ -497,7 +553,7 @@ export function validateEmbeddingColumns(columns, { dimension, width }) {
   if (columns.length !== dimension) {
     throw new DataMappingError(
       'column_count',
-      `A ${dimension}D embedding reads exactly ${dimension} columns; got ${columns.length}.`
+      `A ${dimension}D embedding reads exactly ${formatCountOf(dimension, 'column')}; got ${columns.length}.`
     );
   }
   const resolved = [];
@@ -526,13 +582,12 @@ export function validateEmbeddingColumns(columns, { dimension, width }) {
 /**
  * Return the id one embedding reference is known by.
  *
- * An export item is known by its own id (`columns` is null). An AnnData
- * `obsm` array is known by its key when it is read whole -- its width equals
- * the number of columns and they are `0 .. d-1` in order -- and otherwise by
- * `key[c0,c1]`. Because `(key, columns)` is unique, so is the id.
+ * An `obsm` array is known by its key when it is read whole -- its width
+ * equals the number of columns and they are `0 .. d-1` in order -- and
+ * otherwise by `key[c0,c1]`. Because `(key, columns)` is unique, so is the id.
  *
  * @param {string} key
- * @param {ReadonlyArray<number>|null} columns
+ * @param {ReadonlyArray<number>} columns
  * @param {{width?: number|null}} [options]
  * @returns {string}
  */
@@ -540,7 +595,9 @@ export function canonicalEmbeddingId(key, columns, { width = null } = {}) {
   if (typeof key !== 'string' || key.length === 0) {
     throw new TypeError('Embedding key must be a non-empty string.');
   }
-  if (columns === null || columns === undefined) return key;
+  if (columns === null || columns === undefined) {
+    throw new TypeError('Embedding columns must be a list.');
+  }
   const resolved = Array.from(columns);
   if (
     width !== null &&
@@ -557,24 +614,13 @@ export function canonicalEmbeddingId(key, columns, { width = null } = {}) {
 // Validation of the DataMapping JSON
 // =============================================================================
 
-function requireExactKeys(value, expected, label) {
-  if (!isPlainObject(value)) {
-    throw new DataMappingError('not_object', `${label} must be an object.`);
-  }
-  const present = Object.keys(value);
-  const missing = expected
-    .filter(key => !Object.hasOwn(value, key))
-    .sort(compareCodePoints);
-  const unknown = present
-    .filter(key => !expected.includes(key))
-    .sort(compareCodePoints);
-  if (missing.length > 0 || unknown.length > 0) {
-    const details = [];
-    if (missing.length > 0) details.push(`missing ${missing.join(', ')}`);
-    if (unknown.length > 0) details.push(`unknown ${unknown.join(', ')}`);
-    throw new DataMappingError('keys', `${label} fields: ${details.join('; ')}.`);
-  }
-  return value;
+// A record check reports with the mapping's own error codes.
+function mappingRecordFailure(message, { reason }) {
+  return new DataMappingError(reason === 'type' ? 'not_object' : 'keys', message);
+}
+
+function requireMappingKeys(value, expected, label) {
+  return requireExactKeys(value, expected, label, mappingRecordFailure);
 }
 
 function requireMappingString(value, label) {
@@ -592,38 +638,23 @@ function optionalMappingString(value, label) {
 /**
  * Validate one `{key, columns}` reference and return a canonical copy.
  *
- * An export reference names an exported embedding id and carries
- * `columns: null`, because the columns were fixed at export. An AnnData
- * reference names an `obsm` key and always lists its 0-based columns.
+ * A reference names an `obsm` key and lists its 0-based columns.
  *
  * @param {unknown} value
- * @param {{kind: 'export'|'anndata', dimension: number|null, label: string}} options
- * @returns {{key: string, columns: number[]|null}}
+ * @param {{dimension?: number|null, label: string}} options
+ * @returns {{key: string, columns: number[]}}
  */
-export function validateEmbeddingRef(value, { kind, dimension = null, label }) {
-  const ref = requireExactKeys(value, EMBEDDING_REF_KEYS, label);
+export function validateEmbeddingRef(value, { dimension = null, label }) {
+  const ref = requireMappingKeys(value, EMBEDDING_REF_KEYS, label);
   const key = requireMappingString(ref.key, `${label}.key`);
   const columns = ref.columns;
-  if (kind === EXPORT_KIND) {
-    if (columns !== null) {
-      throw new DataMappingError(
-        'columns_not_null',
-        `${label}.columns must be null: an exported embedding's columns were ` +
-          'fixed when it was prepared.'
-      );
-    }
-    return { key, columns: null };
-  }
-  if (kind !== ANNDATA_KIND) {
-    throw new RangeError(`Unknown data mapping kind ${describeValue(kind)}.`);
-  }
   if (!Array.isArray(columns)) {
     throw new DataMappingError('columns_not_list', `${label}.columns must be a list.`);
   }
   if (dimension !== null && dimension !== undefined && columns.length !== dimension) {
     throw new DataMappingError(
       'column_count',
-      `${label}.columns must list exactly ${dimension} columns.`
+      `${label}.columns must list exactly ${formatCountOf(dimension, 'column')}.`
     );
   }
   if (columns.length < 1 || columns.length > 3) {
@@ -661,14 +692,17 @@ function validateGeneNames(value, label) {
   );
 }
 
+function isExpressionMatrix(value) {
+  return typeof value === 'string' && (
+    value === 'X' ||
+    value === 'raw' ||
+    (value.startsWith(LAYER_PREFIX) && value.length > LAYER_PREFIX.length)
+  );
+}
+
 function validateExpression(value, label) {
   if (value === null) return null;
-  if (
-    typeof value === 'string' &&
-    (value === 'X' ||
-      value === 'raw' ||
-      (value.startsWith(LAYER_PREFIX) && value.length > LAYER_PREFIX.length))
-  ) {
+  if (isExpressionMatrix(value)) {
     return value;
   }
   throw new DataMappingError(
@@ -678,21 +712,54 @@ function validateExpression(value, label) {
 }
 
 /**
- * Compare two vector bindings in canonical order: by the bound embedding's
- * `key`, then its `columns` (an export's null first, then lists
- * lexicographically), then the binding's field id or `obsm` key.
+ * Validate the `log1p` group: for each expression matrix whose values are
+ * `log1p` of counts (`X`, `raw`, `layer:<name>`), its `{base}` -- null for
+ * the natural logarithm (`sc.pp.log1p`'s default), else the base, a positive
+ * number other than 1. A matrix not listed holds its values as stored. The
+ * result lists the matrices in code-point order.
  */
-function compareBindings(a, b, nameKey) {
+function validateLog1p(value, label) {
+  if (!isPlainRecord(value)) {
+    throw new DataMappingError('log1p', `${label} must be an object of expression matrices.`);
+  }
+  const result = {};
+  for (const matrix of Object.keys(value).sort(compareCodePoints)) {
+    if (!isExpressionMatrix(matrix)) {
+      throw new DataMappingError(
+        'log1p',
+        `${label} keys must be expression matrices: "X", "raw" or "layer:<name>".`
+      );
+    }
+    const entry = requireMappingKeys(value[matrix], LOG1P_ENTRY_KEYS, `${label}.${matrix}`);
+    const base = entry.base;
+    if (base !== null && !(typeof base === 'number' && Number.isFinite(base) && base > 0 && base !== 1)) {
+      throw new DataMappingError(
+        'log1p_base',
+        `${label}.${matrix}.base must be null (base e) or a positive number other than 1.`
+      );
+    }
+    result[matrix] = { base };
+  }
+  return result;
+}
+
+/**
+ * Compare two vector bindings in canonical order: by the bound embedding's
+ * `key`, then its `columns` (lexicographically), then the vector's `obsm` key.
+ */
+function compareBindings(a, b) {
   return (
     compareEmbeddingRefs(a.embedding, b.embedding) ||
-    compareCodePoints(a[nameKey], b[nameKey])
+    compareCodePoints(a.key, b.key)
   );
 }
 
 /**
  * The canonical order of embedding references: by `key` in code-point order,
- * then `columns` -- an export's null first, then lists compared element by
- * element, a shorter prefix first. Zero means the same reference.
+ * then `columns` compared element by element, a shorter prefix first. Zero
+ * means the same reference. The mapper also lists an unusable `obsm` array,
+ * which has no columns to read (`columns: null`); such a reference sorts
+ * before every selection of the same key.
  *
  * @param {{key: string, columns: number[]|null}} left
  * @param {{key: string, columns: number[]|null}} right
@@ -714,8 +781,8 @@ export function compareEmbeddingRefs(left, right) {
  * `defaults` names at most one enabled representation per dimension slot, and
  * at least one in all.
  */
-function validateEmbeddingsGroup(value, kind, label) {
-  const group = requireExactKeys(value, EMBEDDINGS_GROUP_KEYS, label);
+function validateEmbeddingsGroup(value, label) {
+  const group = requireMappingKeys(value, EMBEDDINGS_GROUP_KEYS, label);
   if (!Array.isArray(group.enabled)) {
     throw new DataMappingError('not_list', `${label}.enabled must be a list.`);
   }
@@ -726,7 +793,6 @@ function validateEmbeddingsGroup(value, kind, label) {
     );
   }
   const enabled = group.enabled.map((ref, position) => validateEmbeddingRef(ref, {
-    kind,
     dimension: null,
     label: `${label}.enabled[${position}]`,
   }));
@@ -744,7 +810,7 @@ function validateEmbeddingsGroup(value, kind, label) {
   if (duplicate) {
     throw new DataMappingError('embedding_duplicate', `${label}.enabled repeats an embedding.`);
   }
-  const slots = requireExactKeys(group.defaults, DIMENSION_SLOTS, `${label}.defaults`);
+  const slots = requireMappingKeys(group.defaults, DIMENSION_SLOTS, `${label}.defaults`);
   const defaults = {};
   for (const slot of DIMENSION_SLOTS) {
     const ref = slots[slot];
@@ -753,7 +819,6 @@ function validateEmbeddingsGroup(value, kind, label) {
       continue;
     }
     const valid = validateEmbeddingRef(ref, {
-      kind,
       dimension: slotDimension(slot),
       label: `${label}.defaults.${slot}`,
     });
@@ -776,62 +841,71 @@ function validateEmbeddingsGroup(value, kind, label) {
 
 /**
  * Sort vector bindings into canonical order (see `compareBindings`), in
- * place. `kind` names their field id key: `field` for an export, `key` for
- * an AnnData file.
+ * place.
  *
  * @template T
  * @param {T[]} bindings
- * @param {'export'|'anndata'} kind
  * @returns {T[]} The same array.
  */
-export function sortVectorBindings(bindings, kind) {
-  const nameKey = kind === EXPORT_KIND ? 'field' : 'key';
-  return bindings.sort((a, b) => compareBindings(a, b, nameKey));
+export function sortVectorBindings(bindings) {
+  return bindings.sort(compareBindings);
+}
+
+function validateModality(value, label) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new DataMappingError(
+      'modality',
+      `${label} must name one of the dataset's modalities; a dataset with one feature space has no modality key.`
+    );
+  }
+  return value;
 }
 
 /**
  * Validate one DataMapping and return a canonical deep copy.
  *
- * The mapping is a closed shape per `kind`: an unknown or missing key is a
- * mapping this version does not understand. At least one embedding must be
- * enabled and at least one default named, since a mapping that plots nothing
- * describes no session; every vector binding is bound to an enabled
- * embedding.
+ * The mapping is a closed shape: `kind` is `"anndata"`, and an unknown or
+ * missing key is a mapping this version does not understand. At least one
+ * embedding must be enabled and at least one default named, since a mapping
+ * that plots nothing describes no session; every vector binding is bound to
+ * an enabled embedding.
  *
  * `vectorFields` must already be in canonical order -- by the bound
- * embedding's `key`, then its `columns` (an export's null first), then the
- * field id or `obsm` key -- and must not repeat a binding.
+ * embedding's `key`, then its `columns`, then the vector's `obsm` key -- and
+ * must not repeat a binding.
+ *
+ * `log1p` names, per expression matrix that holds `log1p` values, its base
+ * (`validateLog1p`); `highlyVariable` the boolean `var` column of the mapped
+ * expression matrix's genes that marks the highly variable ones, or null.
+ *
+ * `modality` is present only for a dataset with several modalities (a
+ * non-empty string naming one); `geneNames`, `expression`, `log1p` and
+ * `highlyVariable` are then that modality's.
  *
  * The result is a fresh, plain, JSON-serializable object whose keys are in
- * canonical order: `kind`, `embeddings`, [`knn`], `geneNames`,
- * [`expression`, `latent`], `vectorFields`.
+ * canonical order: `kind`, `embeddings`, `knn`, `modality` (when present),
+ * `geneNames`, `expression`, `log1p`, `highlyVariable`, `latent`,
+ * `vectorFields`.
  *
  * @param {unknown} value
  * @param {{label?: string}} [options]
  * @returns {object}
  */
 export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
-  if (!isPlainObject(value)) {
+  if (!isPlainRecord(value)) {
     throw new DataMappingError('not_object', `${label} must be an object.`);
   }
-  const kind = ownValue(value, 'kind');
-  let expected;
-  let bindingKeys;
-  let nameKey;
-  if (kind === EXPORT_KIND) {
-    expected = EXPORT_MAPPING_KEYS;
-    bindingKeys = EXPORT_VECTOR_BINDING_KEYS;
-    nameKey = 'field';
-  } else if (kind === ANNDATA_KIND) {
-    expected = ANNDATA_MAPPING_KEYS;
-    bindingKeys = ANNDATA_VECTOR_BINDING_KEYS;
-    nameKey = 'key';
-  } else {
-    throw new DataMappingError('kind', `${label}.kind must be "export" or "anndata".`);
+  if (ownValue(value, 'kind') !== ANNDATA_KIND) {
+    throw new DataMappingError('kind', `${label}.kind must be "${ANNDATA_KIND}".`);
   }
-  const mapping = requireExactKeys(value, expected, label);
+  const hasModality = Object.hasOwn(value, MODALITY_KEY);
+  const mapping = requireMappingKeys(
+    value,
+    hasModality ? [...ANNDATA_MAPPING_KEYS, MODALITY_KEY] : ANNDATA_MAPPING_KEYS,
+    label
+  );
 
-  const embeddings = validateEmbeddingsGroup(mapping.embeddings, kind, `${label}.embeddings`);
+  const embeddings = validateEmbeddingsGroup(mapping.embeddings, `${label}.embeddings`);
 
   const rawBindings = mapping.vectorFields;
   if (!Array.isArray(rawBindings)) {
@@ -839,11 +913,10 @@ export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
   }
   const bindings = rawBindings.map((raw, position) => {
     const bindingLabel = `${label}.vectorFields[${position}]`;
-    const binding = requireExactKeys(raw, bindingKeys, bindingLabel);
+    const binding = requireMappingKeys(raw, VECTOR_BINDING_KEYS, bindingLabel);
     return {
-      [nameKey]: requireMappingString(binding[nameKey], `${bindingLabel}.${nameKey}`),
+      key: requireMappingString(binding.key, `${bindingLabel}.key`),
       embedding: validateEmbeddingRef(binding.embedding, {
-        kind,
         dimension: null,
         label: `${bindingLabel}.embedding`,
       }),
@@ -851,12 +924,12 @@ export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
   });
   let duplicate = false;
   for (let position = 1; position < bindings.length; position += 1) {
-    const order = compareBindings(bindings[position - 1], bindings[position], nameKey);
+    const order = compareBindings(bindings[position - 1], bindings[position]);
     if (order > 0) {
       throw new DataMappingError(
         'vector_order',
         `${label}.vectorFields must be sorted by embedding key, embedding columns, ` +
-          `then ${nameKey}.`
+          'then key.'
       );
     }
     if (order === 0) duplicate = true;
@@ -873,48 +946,18 @@ export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
     }
   });
 
-  const canonical = { kind, embeddings };
-  if (kind === ANNDATA_KIND) {
-    canonical.knn = optionalMappingString(mapping.knn, `${label}.knn`);
-  }
-  canonical.geneNames = validateGeneNames(mapping.geneNames, `${label}.geneNames`);
-  if (kind === ANNDATA_KIND) {
-    canonical.expression = validateExpression(mapping.expression, `${label}.expression`);
-    canonical.latent = optionalMappingString(mapping.latent, `${label}.latent`);
-  }
-  canonical.vectorFields = bindings;
-  return canonical;
-}
-
-/**
- * Return the `var` column a `geneNames` value names, or null for the index.
- *
- * @param {string} geneNames
- * @returns {string|null}
- */
-export function geneNamesColumn(geneNames) {
-  if (geneNames === 'index') return null;
-  if (typeof geneNames === 'string' && geneNames.startsWith(GENE_NAMES_COLUMN_PREFIX)) {
-    return geneNames.slice(GENE_NAMES_COLUMN_PREFIX.length);
-  }
-  throw new RangeError(`Invalid geneNames value ${describeValue(geneNames)}.`);
-}
-
-/**
- * Return the layer an `expression` value names, or null when it is not a
- * layer.
- *
- * @param {string} expression
- * @returns {string|null}
- */
-export function expressionLayer(expression) {
-  if (typeof expression !== 'string') {
-    throw new TypeError('expression must be a string.');
-  }
-  if (expression.startsWith(LAYER_PREFIX)) {
-    return expression.slice(LAYER_PREFIX.length);
-  }
-  return null;
+  return {
+    kind: ANNDATA_KIND,
+    embeddings,
+    knn: optionalMappingString(mapping.knn, `${label}.knn`),
+    ...(hasModality ? { modality: validateModality(mapping.modality, `${label}.modality`) } : {}),
+    geneNames: validateGeneNames(mapping.geneNames, `${label}.geneNames`),
+    expression: validateExpression(mapping.expression, `${label}.expression`),
+    log1p: validateLog1p(mapping.log1p, `${label}.log1p`),
+    highlyVariable: optionalMappingString(mapping.highlyVariable, `${label}.highlyVariable`),
+    latent: optionalMappingString(mapping.latent, `${label}.latent`),
+    vectorFields: bindings,
+  };
 }
 
 // =============================================================================
@@ -940,13 +983,14 @@ function emptySlots() {
 }
 
 /**
- * Apply today's default embedding rule and return the filled slots.
+ * Apply the default embedding rule and return the filled slots.
  *
  * If any of `X_umap_1d`, `X_umap_2d` or `X_umap_3d` is present, those keys
- * alone fill their slots, reading columns `0 .. d-1`. Otherwise a bare
- * `X_umap` whose width is 1, 2 or 3 fills the slot of that width. Slots
- * without a default stay null. Presence is all this rule asks: a present key
- * that later fails its load-time check is reported, not skipped.
+ * alone fill their slots, reading columns `0 .. d-1`. Otherwise the first of
+ * `UMAP_KEYS` (`X_umap`, `X_UMAP`, `X_wnn.umap`, `X_ref.umap`) whose width is
+ * 1, 2 or 3 fills the slot of that width. Slots without a default stay null.
+ * Presence is all this rule asks: a present key that later fails its
+ * load-time check is reported, not skipped.
  *
  * @param {Iterable<ObsmEntry>} entries
  * @returns {EmbeddingSlots}
@@ -963,11 +1007,11 @@ export function defaultEmbeddingSlots(entries) {
     }
     return slots;
   }
-  const bare = byKey.get(UNSUFFIXED_UMAP_KEY);
-  if (bare !== undefined && isDimension(bare.width)) {
-    slots[dimensionSlot(bare.width)] = {
-      key: UNSUFFIXED_UMAP_KEY,
-      columns: defaultColumns(bare.width),
+  const single = UMAP_KEYS.map(key => byKey.get(key)).find(entry => entry !== undefined && isDimension(entry.width));
+  if (single !== undefined) {
+    slots[dimensionSlot(single.width)] = {
+      key: single.key,
+      columns: defaultColumns(single.width),
     };
   }
   return slots;
@@ -1018,7 +1062,7 @@ export function bestGuessOrder(keys) {
  * Fill embedding slots when the default rule filled none.
  *
  * Candidates are the usable entries, minus vector-field keys
- * (`<field>_umap_<d>d`) and the latent key. For each of 3D, 2D and 1D the
+ * (`parseVectorFieldKey`) and the latent key. For each of 3D, 2D and 1D the
  * slot takes the best-ranked *narrow* candidate (width 1-3) whose width is
  * exactly that dimension. When no narrow candidate fills any slot, only the
  * 2D slot is filled, from the best-ranked *wide* candidate (width > 3) read
@@ -1034,14 +1078,16 @@ export function bestGuessOrder(keys) {
  * @returns {EmbeddingGuess}
  */
 export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck = null } = {}) {
+  const list = Array.from(entries);
+  const vectorKeys = vectorFieldKeys(list.map(entry => entry.key));
   const widthByKey = new Map();
-  for (const entry of entries) {
+  for (const entry of list) {
     if (
       entry.usable &&
       entry.width !== null &&
       entry.width !== undefined &&
       entry.width >= 1 &&
-      !isVectorFieldKey(entry.key) &&
+      !vectorKeys.has(entry.key) &&
       entry.key !== latentKey
     ) {
       widthByKey.set(entry.key, entry.width);
@@ -1092,7 +1138,7 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
  * Resolve the initial embedding slots: the default rule, else the best guess.
  *
  * When the default rule fills any slot, its slots are the answer and nothing
- * is guessed, so an object carrying `X_umap` or `X_umap_<d>d` resolves
+ * is guessed, so an object carrying `X_umap_<d>d` or a key of `UMAP_KEYS` resolves
  * exactly as it did before the best guess existed. Only when it fills none
  * does `bestGuessEmbeddingSlots` run.
  *
@@ -1114,7 +1160,7 @@ export function resolveEmbeddingSlots(entries, { latentKey = null, loadCheck = n
  *
  * Every filled slot, plus every other usable `obsm` array that is 1 to 3
  * columns wide, read at all of its columns -- minus vector-field keys
- * (`<field>_umap_<d>d`), the latent key and the `rejected` keys (arrays the
+ * (`parseVectorFieldKey`), the latent key and the `rejected` keys (arrays the
  * best guess found unloadable). A wider array is enabled only when it fills a
  * slot; the user can enable other column selections. Enabling reads nothing:
  * an array is read only when a view shows it. The result is in canonical
@@ -1126,6 +1172,8 @@ export function resolveEmbeddingSlots(entries, { latentKey = null, loadCheck = n
  * @returns {Array<{key: string, columns: number[]}>}
  */
 export function defaultEnabledEmbeddings(entries, slots, { latentKey = null, rejected = [] } = {}) {
+  const list = Array.from(entries);
+  const vectorKeys = vectorFieldKeys(list.map(entry => entry.key));
   const skipped = new Set(rejected);
   const refs = [];
   const add = ref => {
@@ -1135,11 +1183,11 @@ export function defaultEnabledEmbeddings(entries, slots, { latentKey = null, rej
     const ref = Object.hasOwn(slots, slot) ? slots[slot] : null;
     if (ref !== null && ref !== undefined) add({ key: ref.key, columns: [...ref.columns] });
   }
-  for (const entry of entries) {
+  for (const entry of list) {
     if (
       entry.usable &&
       isDimension(entry.width) &&
-      !isVectorFieldKey(entry.key) &&
+      !vectorKeys.has(entry.key) &&
       entry.key !== latentKey &&
       !skipped.has(entry.key)
     ) {
@@ -1150,75 +1198,96 @@ export function defaultEnabledEmbeddings(entries, slots, { latentKey = null, rej
 }
 
 /**
- * The data mapping a prepared export is shown with when it opens.
+ * Bind every vector field to the representations of its embedding.
  *
- * Every declared embedding is enabled, in canonical order; the defaults are
- * the identity's `embeddings.defaults`; genes are named by the default
- * gene-name set (`geneNameSource` is its `var` column, null for the index);
- * every declared vector-field file is bound to its embedding. Exports written
- * by the Python and the R package declare embeddings identically, so the same
- * rule holds for both.
+ * A vector-field key `<field>_<basis>` (`parseVectorFieldKey`) is bound to
+ * every enabled representation of `X_<basis>` when both arrays are usable and
+ * have the same number of columns; the vector is then read at the
+ * representation's columns (`velocity_pca` over `X_pca[0,1]`). A vector
+ * named for an embedding of another width, or an unusable one, stays unbound
+ * and can be bound by hand. Every field of one basis is bound (`velocity_umap`
+ * and `T_fwd_umap` both on `X_umap`). The result is in canonical binding
+ * order.
  *
- * @param {{embeddings: {items: Object, defaults: Object}, vector_fields?: Object}} identity
- * @param {{geneNameSource: string|null}} options
- * @returns {Object} A canonical export DataMapping.
+ * @param {Iterable<ObsmEntry>} entries - Every `obsm` entry of the object.
+ * @param {Iterable<SlotRef>} enabled - The enabled representations.
+ * @returns {Array<{key: string, embedding: {key: string, columns: number[]}}>}
  */
-export function exportDataMapping(identity, { geneNameSource }) {
-  const { items, defaults } = identity.embeddings;
+export function defaultVectorBindings(entries, enabled) {
+  const list = Array.from(entries);
+  const refs = Array.from(enabled);
+  const byKey = new Map(list.map(entry => [entry.key, entry]));
+  const usableWidth = key => {
+    const entry = byKey.get(key);
+    return entry !== undefined && entry.usable && entry.width !== null && entry.width !== undefined
+      ? entry.width
+      : null;
+  };
   const bindings = [];
-  for (const [field, entry] of Object.entries(identity.vector_fields?.fields ?? {})) {
-    for (const embeddingId of Object.keys(entry.files)) {
-      bindings.push({ field, embedding: { key: embeddingId, columns: null } });
+  for (const [key, { embeddingKey }] of vectorFieldKeys(list.map(entry => entry.key))) {
+    const width = usableWidth(key);
+    if (width === null || width !== usableWidth(embeddingKey)) continue;
+    for (const ref of refs) {
+      if (ref.key !== embeddingKey) continue;
+      bindings.push({ key, embedding: { key: ref.key, columns: [...ref.columns] } });
     }
   }
-  bindings.sort((a, b) => compareBindings(a, b, 'field'));
-  const slots = {};
-  for (const slot of DIMENSION_SLOTS) {
-    slots[slot] = Object.hasOwn(defaults, slot)
-      ? { key: defaults[slot], columns: null }
-      : null;
-  }
-  return validateDataMapping({
-    kind: EXPORT_KIND,
-    embeddings: {
-      enabled: Object.keys(items)
-        .sort(compareCodePoints)
-        .map(key => ({ key, columns: null })),
-      defaults: slots,
-    },
-    geneNames: geneNameSource === null ? 'index' : `${GENE_NAMES_COLUMN_PREFIX}${geneNameSource}`,
-    vectorFields: bindings,
-  }, { label: 'Export data mapping' });
+  return sortVectorBindings(bindings);
 }
 
 /**
- * Bind `<field>_umap_<d>d` keys by today's rule.
- *
- * A key binds to the slot-`d` embedding only when that slot holds
- * `X_umap_<d>d` or `X_umap`: a UMAP vector drawn over another layout would
- * point the wrong way. The result is in canonical binding order.
- *
- * @param {Iterable<string>} keys
- * @param {Partial<EmbeddingSlots>} slots
- * @returns {Array<{key: string, embedding: {key: string, columns: number[]}}>}
+ * The names a gene-expression modality goes by, lower-cased: MuData's `rna`,
+ * 10x's `Gene Expression`, Seurat's `RNA` and `SCT`.
  */
-export function defaultVectorBindings(keys, slots) {
-  const bindings = [];
-  for (const key of keys) {
-    if (!isVectorFieldKey(key)) continue;
-    const match = VECTOR_KEY_PATTERN.exec(key);
-    const slot = dimensionSlot(Number(match.groups.dimension));
-    const ref = Object.hasOwn(slots, slot) ? slots[slot] : null;
-    if (
-      ref === null ||
-      ref === undefined ||
-      (ref.key !== `X_umap_${slot}` && ref.key !== UNSUFFIXED_UMAP_KEY)
-    ) {
-      continue;
+const GENE_EXPRESSION_MODALITIES = Object.freeze(['rna', 'gex', 'gene expression', 'gene_expression', 'sct']);
+
+/**
+ * The modality a dataset opens with, of its modalities in their stored
+ * order (MuData's `mod-order`): the first whose name is a gene-expression
+ * name (`rna`, `gex`, `gene expression`, `gene_expression`, `sct`, in any
+ * case), else the first. Null when there are none.
+ *
+ * @param {ReadonlyArray<string>} names
+ * @returns {string|null}
+ */
+export function defaultModality(names) {
+  return names.find(name => GENE_EXPRESSION_MODALITIES.includes(name.toLowerCase())) ?? names[0] ?? null;
+}
+
+/**
+ * Check one canonical mapping's `modality` against the modalities of the
+ * dataset it is applied to: a dataset with modalities needs one named, a
+ * dataset with one feature space none, and the name must be one of them.
+ * The reason codes are `modality_missing`, `modality_unexpected` and
+ * `modality_unknown`.
+ *
+ * @param {{modality?: string}} mapping
+ * @param {ReadonlyArray<string>|null} modalities - The dataset's modality
+ *   names, null for a dataset with one feature space
+ */
+export function requireMappingModality(mapping, modalities) {
+  const named = Object.hasOwn(mapping, MODALITY_KEY);
+  if (modalities === null) {
+    if (named) {
+      throw new DataMappingError(
+        'modality_unexpected',
+        `This mapping reads the modality '${mapping.modality}', and this dataset has one feature space.`
+      );
     }
-    bindings.push({ key, embedding: { key: ref.key, columns: [...ref.columns] } });
+    return;
   }
-  return sortVectorBindings(bindings, ANNDATA_KIND);
+  if (!named) {
+    throw new DataMappingError(
+      'modality_missing',
+      `This dataset has several modalities (${modalities.join(', ')}); its mapping must name the one it reads.`
+    );
+  }
+  if (!modalities.includes(mapping.modality)) {
+    throw new DataMappingError(
+      'modality_unknown',
+      `This mapping reads the modality '${mapping.modality}', which this dataset does not have (${modalities.join(', ')}).`
+    );
+  }
 }
 
 /**
@@ -1254,6 +1323,100 @@ export function defaultExpression({ hasX, hasRaw, layers }) {
     }
   }
   return { expression: `${LAYER_PREFIX}${best}`, guessed: true };
+}
+
+/**
+ * Whether one stored dtype holds integers: values a `log1p` never writes.
+ *
+ * @param {string|null|undefined} dtype
+ * @returns {boolean}
+ */
+function isIntegerDtype(dtype) {
+  return typeof dtype === 'string' && /^u?int(8|16|32|64)$/.test(dtype);
+}
+
+/**
+ * Return the default `log1p` group and whether it was guessed, by Scanpy's
+ * convention.
+ *
+ * `sc.pp.log1p` records itself in `uns['log1p']` (with `base`, None for e),
+ * and Scanpy reads that record as saying the data it works on is `log1p`:
+ * `rank_genes_groups` undoes it with that base for `X` or any layer it is
+ * given. So when the file has `uns['log1p']`, `X` and every layer are `log1p`
+ * with its base. `raw` is what `adata.raw = adata` saved, conventionally the
+ * log-normalised matrix: it is `log1p` too, unless it is stored as integers
+ * (counts). Without `uns['log1p']` every matrix is as stored, as the file
+ * states by not recording a transform. The choice is recorded as guessed when
+ * the record was read as applying to matrices: it names none of them.
+ *
+ * @param {{
+ *   log1p: {base: number|null}|null,
+ *   hasX: boolean,
+ *   raw: {dtype: string}|null,
+ *   layers: ReadonlyArray<string>
+ * }} options - `log1p` is `uns['log1p']` as probed; `layers` the usable
+ *   layers' names; `raw` raw.X's dtype, or null without raw.
+ * @returns {{log1p: Record<string, {base: number|null}>, guessed: boolean}}
+ */
+export function defaultLog1p({ log1p, hasX, raw, layers }) {
+  const matrices = [
+    ...(hasX ? ['X'] : []),
+    ...layers.map(name => `${LAYER_PREFIX}${name}`),
+    ...(raw !== null && !isIntegerDtype(raw.dtype) ? ['raw'] : []),
+  ];
+  if (log1p === null) return { log1p: {}, guessed: false };
+  const result = {};
+  for (const matrix of matrices.sort(compareCodePoints)) result[matrix] = { base: log1p.base };
+  return { log1p: result, guessed: matrices.length > 0 };
+}
+
+/**
+ * Whether one `var` column dtype is boolean (numpy `bool`, or anndata's
+ * nullable `boolean`).
+ *
+ * @param {string} dtype
+ * @returns {boolean}
+ */
+export function isBooleanVarDtype(dtype) {
+  return dtype === 'bool' || dtype === 'boolean';
+}
+
+/**
+ * Order the boolean `var` columns that can mark highly variable genes:
+ * `highly_variable` (what `sc.pp.highly_variable_genes` writes) first, then
+ * names that say so (`highly_variable_*`, `hvg`, `*_hvg`), then every other
+ * boolean column, each in code-point order.
+ *
+ * @param {ReadonlyArray<{key: string, dtype: string}>} columns
+ * @returns {string[]}
+ */
+export function highlyVariableCandidates(columns) {
+  const rank = key => {
+    if (key === HIGHLY_VARIABLE_COLUMN) return 0;
+    return /highly_variable|(^|_)hvgs?($|_)/i.test(key) ? 1 : 2;
+  };
+  return columns
+    .filter(column => isBooleanVarDtype(column.dtype))
+    .map(column => column.key)
+    .sort((left, right) => rank(left) - rank(right) || compareCodePoints(left, right));
+}
+
+/**
+ * Return the default highly-variable-genes column and whether it was guessed:
+ * Scanpy's `highly_variable` on the mapped expression matrix's genes when it
+ * is a boolean column there, else null.
+ *
+ * @param {ReadonlyArray<{key: string, dtype: string}>} columns - The var
+ *   columns of the mapped expression matrix's axis (`raw.var` for `raw`).
+ * @returns {{highlyVariable: string|null, guessed: boolean}}
+ */
+export function defaultHighlyVariable(columns) {
+  const found = columns.some(
+    column => column.key === HIGHLY_VARIABLE_COLUMN && isBooleanVarDtype(column.dtype)
+  );
+  return found
+    ? { highlyVariable: HIGHLY_VARIABLE_COLUMN, guessed: true }
+    : { highlyVariable: null, guessed: false };
 }
 
 // =============================================================================
@@ -1296,11 +1459,13 @@ export function describeObsmEntry({ key, storage, shape, defect }) {
  * @param {{key: string, storage: string, usable: boolean, reason: string|null}} item
  * @param {{
  *   latentKey: string|null,
- *   rejected: Readonly<Record<string, string>>|ReadonlyMap<string, string>
- * }} options
+ *   rejected: Readonly<Record<string, string>>|ReadonlyMap<string, string>,
+ *   vectorKeys: {has: (key: string) => boolean}
+ * }} options - `vectorKeys` holds the object's vector-field keys
+ *   (`vectorFieldKeys`).
  * @returns {string|null}
  */
-export function obsmEntryDefect(item, { latentKey = null, rejected }) {
+export function obsmEntryDefect(item, { latentKey = null, rejected, vectorKeys }) {
   const key = item.key;
   if (rejected instanceof Map) {
     if (rejected.has(key)) return rejected.get(key);
@@ -1309,7 +1474,7 @@ export function obsmEntryDefect(item, { latentKey = null, rejected }) {
   }
   if (item.storage !== 'dense') return null;
   if (!item.usable) return String(item.reason);
-  if (isVectorFieldKey(key)) return 'a vector field';
+  if (vectorKeys.has(key)) return 'a vector field';
   if (key === latentKey) return 'the latent space';
   return null;
 }
@@ -1324,6 +1489,7 @@ export function nothingPlottableMessage({ nObs, descriptions }) {
   const holds = descriptions.length > 0 ? descriptions.join(', ') : 'nothing';
   return (
     'Cellucid found nothing to plot. It needs an obsm array with one row per ' +
-    `cell (${formatCount(nObs)}) and at least one numeric column. obsm holds: ${holds}.`
+    `cell (${formatCount(nObs)}) and at least one numeric column. obsm holds: ${holds}.` +
+    ' Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again.'
   );
 }

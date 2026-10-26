@@ -3,8 +3,7 @@ import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
-import { createRestOfPageId } from '../assets/js/app/analysis/shared/page-derivation-utils.js';
-import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
+import { CancellableJob } from '../assets/js/app/jobs/cancellable-job.js';
 
 function deferred() {
   let reject;
@@ -34,132 +33,92 @@ function pageData(pageId, values = [1, 2, 3]) {
   };
 }
 
-function analysisNotificationRecorder(id) {
-  const terminal = [];
-  return {
-    notifications: {
-      loading() {
-        return id;
-      },
-      complete(notificationId) {
-        terminal.push(['complete', notificationId]);
-      },
-      fail(notificationId) {
-        terminal.push(['fail', notificationId]);
-      },
-      dismiss(notificationId) {
-        terminal.push(['dismiss', notificationId]);
-      },
-    },
-    terminal,
-  };
+/** A job as an analysis UI starts one, without a notification center or log. */
+function quietJob(title) {
+  return new CancellableJob({
+    title,
+    readKind: 'analysis',
+    notifyAfterMs: Infinity,
+    notifications: { error() {}, dismiss() {} },
+    log: { subscribe: () => () => {} },
+  });
 }
 
-test('correlation invalidation cleanup dismisses its gated inner notification synchronously and exactly once', async () => {
-  const gate = deferred();
-  const { notifications, terminal } = analysisNotificationRecorder('correlation-inner');
+/** A read that stops when its signal aborts, as the data layer's do. */
+function readUntilAborted(signal, reads) {
+  reads.push(signal);
+  return new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+}
+
+test('a cancelled correlation job stops its reads and the run publishes nothing', async () => {
+  const reads = [];
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    getDataForPages() {
-      return gate.promise;
+    getDataForPages(options) {
+      return readUntilAborted(options.signal, reads);
     },
   };
   analysis._computeManager = null;
-  analysis._notifications = notifications;
 
   let current = true;
-  let invalidationCleanup = null;
+  const job = quietJob('Correlation');
   const run = analysis.correlationAnalysis({
     varX: { type: 'continuous_obs', key: 'x' },
     varY: { type: 'continuous_obs', key: 'y' },
     pageIds: ['page-A'],
+    job,
     isCurrent: () => current,
-    registerInvalidationCleanup(cleanup) {
-      invalidationCleanup = cleanup;
-    },
+    registerInvalidationCleanup() {},
   });
 
-  await Promise.resolve();
-  const registeredType = typeof invalidationCleanup;
+  await waitFor(() => reads.length === 2, 'both variables to be read');
+  assert.ok(reads.every(signal => signal === job.signal), 'the reads are the job\'s');
+  assert.equal(job.stepText, 'Reading the variables');
   current = false;
-  invalidationCleanup?.();
-  invalidationCleanup?.();
-  const terminalAtInvalidation = [...terminal];
-
-  gate.resolve([pageData('page-A')]);
-  const outcome = await run;
-
-  assert.equal(registeredType, 'function');
-  assert.deepEqual(
-    terminalAtInvalidation,
-    [['dismiss', 'correlation-inner']],
-    'the request-local cleanup must synchronously dismiss the inner notification',
-  );
-  assert.equal(outcome, null);
-  assert.deepEqual(
-    terminal,
-    [['dismiss', 'correlation-inner']],
-    'cleanup and stale settlement must share one exact terminal owner',
-  );
+  job.cancel();
+  assert.equal(await run, null, 'a cancelled run settles as nothing, never as a failure');
+  assert.equal(job.state, 'cancelled');
 });
 
-test('signature invalidation cleanup dismisses its gated inner notification synchronously and exactly once', async () => {
-  const gate = deferred();
-  const { notifications, terminal } = analysisNotificationRecorder('signature-inner');
+test('a cancelled signature job stops its gene reads and the run publishes nothing', async () => {
+  const reads = [];
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    getGeneExpressionSubset() {
-      return gate.promise;
+    state: { pointCount: 3 },
+    readGeneColumns(genes, options) {
+      assert.deepEqual(genes, ['Gene A']);
+      assert.equal(options.owner, job.id, 'the reads are owned by the job');
+      return readUntilAborted(options.signal, reads);
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
+    },
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  analysis._notifications = notifications;
 
   let current = true;
-  let invalidationCleanup = null;
+  const job = quietJob('Gene signature score');
   const run = analysis.computeSignatureScore({
-    genes: ['Gene A'],
+    geneSets: [{ name: 'S', genes: ['Gene A'] }],
     pageIds: ['page-A'],
+    job,
     isCurrent: () => current,
-    registerInvalidationCleanup(cleanup) {
-      invalidationCleanup = cleanup;
-    },
+    registerInvalidationCleanup() {},
   });
 
-  await Promise.resolve();
-  const registeredType = typeof invalidationCleanup;
+  await waitFor(() => reads.length === 1, 'the genes to be read');
+  assert.equal(reads[0], job.signal);
   current = false;
-  invalidationCleanup?.();
-  invalidationCleanup?.();
-  const terminalAtInvalidation = [...terminal];
-
-  gate.resolve({
-    'Gene A': {
-      'page-A': pageData('page-A'),
-    },
-  });
-  const outcome = await run;
-
-  assert.equal(registeredType, 'function');
-  assert.deepEqual(
-    terminalAtInvalidation,
-    [['dismiss', 'signature-inner']],
-    'the request-local cleanup must synchronously dismiss the inner notification',
-  );
-  assert.equal(outcome, null);
-  assert.deepEqual(
-    terminal,
-    [['dismiss', 'signature-inner']],
-    'cleanup and stale settlement must share one exact terminal owner',
-  );
+  job.cancel();
+  assert.equal(await run, null);
 });
 
 test('correlation snapshots variable records and page IDs before its first await', async () => {
   const gate = deferred();
   const requests = [];
-  const { notifications } = analysisNotificationRecorder('correlation-snapshot');
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     getDataForPages(request) {
@@ -182,7 +141,6 @@ test('correlation snapshots variable records and page IDs before its first await
       };
     },
   };
-  analysis._notifications = notifications;
 
   const varX = { type: 'continuous_obs', key: 'x' };
   const varY = { type: 'continuous_obs', key: 'y' };
@@ -218,37 +176,39 @@ test('correlation snapshots variable records and page IDs before its first await
 test('signature snapshots genes and page IDs before its first await', async () => {
   const gate = deferred();
   const received = {};
-  const { notifications } = analysisNotificationRecorder('signature-snapshot');
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    async getGeneExpressionSubset(genes, pageIds) {
+    state: { pointCount: 3 },
+    async readGeneColumns(genes) {
       received.genes = genes;
-      received.pageIds = pageIds;
       await gate.promise;
-      return {
-        'Gene A': { 'page-original': pageData('page-original', [1, 2, 3]) },
-        'Gene B': { 'page-original': pageData('page-original', [3, 4, 5]) },
-      };
+      return [Float32Array.of(1, 2, 3), Float32Array.of(3, 4, 5)];
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      received.pageIds = pageIds;
+      return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
+    },
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  analysis._notifications = notifications;
 
   const genes = ['Gene A', 'Gene B'];
   const pageIds = ['page-original'];
+  const geneSets = [{ name: 'S', genes }];
   const run = analysis.computeSignatureScore({
-    genes,
+    geneSets,
     pageIds,
     method: 'mean',
   });
 
   genes[0] = 'Gene MUTATED';
+  geneSets[0].name = 'MUTATED';
   pageIds[0] = 'page-mutated';
   gate.resolve();
 
-  const [result] = await run;
+  const { sets: [set] } = await run;
+  const [result] = set.pages;
+  assert.equal(set.name, 'S');
 
   assert.notEqual(received.genes, genes);
   assert.notEqual(received.pageIds, pageIds);
@@ -266,6 +226,8 @@ function createDEMembershipProbe(indicesByPage) {
   const computeProbe = new Error('compute manager reached');
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     state: { pointCount: 6 },
     getAvailableVariables() {
       return [{ key: 'Gene A', name: 'Gene A' }];
@@ -276,11 +238,7 @@ function createDEMembershipProbe(indicesByPage) {
     getCellIndicesForPage(pageId) {
       return indicesByPage[pageId];
     },
-    // A local source: nothing is downloaded ahead.
-    async prefetchGenePayload() {
-      return null;
-    },
-    async ensureGeneExpressionLoaded() {
+    async readGeneColumn() {
       calls.expressionRead += 1;
       throw new Error('gene expression read reached');
     },
@@ -289,7 +247,6 @@ function createDEMembershipProbe(indicesByPage) {
     calls.computeManager += 1;
     throw computeProbe;
   };
-  analysis._notifications = {};
   return { analysis, calls, computeProbe };
 }
 
@@ -300,8 +257,8 @@ test('DE rejects overlapping explicit memberships before gene expression or work
   });
 
   const error = await analysis.differentialExpression({
-    pageA: 'page-A',
-    pageB: 'page-B',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+    groupB: { name: 'B', cells: Uint32Array.of(2, 3, 4) },
     geneList: ['Gene A'],
     method: 'wilcox',
     minCells: 2,
@@ -316,17 +273,13 @@ test('DE rejects overlapping explicit memberships before gene expression or work
   assert.equal(calls.computeManager, 0);
 });
 
-test('DE accepts an explicit page versus the exact rest-of that page', async () => {
-  const pageA = 'page-A';
-  const restOfA = createRestOfPageId(pageA);
-  const { analysis, calls, computeProbe } = createDEMembershipProbe({
-    [pageA]: Uint32Array.of(0, 1, 2),
-  });
+test('DE accepts a group versus its exact complement', async () => {
+  const { analysis, calls, computeProbe } = createDEMembershipProbe({});
 
   await assert.rejects(
     analysis.differentialExpression({
-      pageA,
-      pageB: restOfA,
+      groupA: { name: 'A', cells: Uint32Array.of(0, 1, 2) },
+      groupB: { name: 'Rest of A', cells: Uint32Array.of(3, 4, 5) },
       geneList: ['Gene A'],
       method: 'wilcox',
       minCells: 2,
@@ -337,193 +290,3 @@ test('DE accepts an explicit page versus the exact rest-of that page', async () 
   assert.equal(calls.computeManager, 1);
 });
 
-test('gene subset snapshots caller genes and pages across partial-cache awaits', async t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-
-  layer._setBulkGeneCache('bulk_genes:page-A', {
-    data: {
-      'Gene A': {
-        'page-A': pageData('page-A', [1]),
-      },
-    },
-    timestamp: Date.now(),
-    geneCount: 1,
-  });
-
-  const requests = [];
-  const gates = [];
-  layer.getDataForPages = request => {
-    requests.push(request);
-    const gate = deferred();
-    gates.push(gate);
-    return gate.promise;
-  };
-
-  const genes = ['Gene A', 'Gene B', 'Gene C'];
-  const pageIds = ['page-A'];
-  const run = layer.getGeneExpressionSubset(genes, pageIds);
-  await waitFor(() => requests.length === 1, 'first partial-cache gene request');
-
-  genes[2] = 'Gene MUTATED';
-  pageIds[0] = 'page-mutated';
-  gates[0].resolve([pageData('page-A', [2])]);
-  await waitFor(() => requests.length === 2, 'second partial-cache gene request');
-  gates[1].resolve([pageData('page-A', [3])]);
-
-  const result = await run;
-
-  assert.deepEqual(
-    requests.map(request => request.variableKey),
-    ['Gene B', 'Gene C'],
-  );
-  for (const request of requests) {
-    assert.notEqual(request.pageIds, pageIds);
-    assert.deepEqual(request.pageIds, ['page-A']);
-  }
-  assert.deepEqual(Object.keys(result), ['Gene A', 'Gene B', 'Gene C']);
-});
-
-test('dataset reset invalidates a partial-cache gene subset instead of returning mixed generations', async t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-
-  layer._setBulkGeneCache('bulk_genes:page-A', {
-    data: {
-      'Gene A': {
-        'page-A': pageData('page-A', [1]),
-      },
-    },
-    timestamp: Date.now(),
-    geneCount: 1,
-  });
-
-  const gate = deferred();
-  layer.getDataForPages = () => gate.promise;
-
-  const run = layer.getGeneExpressionSubset(
-    ['Gene A', 'Gene B'],
-    ['page-A'],
-  );
-  layer.resetForDatasetReload();
-  gate.resolve([pageData('page-A', [2])]);
-
-  await assert.rejects(
-    run,
-    error => (
-      error?.code === 'ANALYSIS_DATA_REQUEST_INVALIDATED' &&
-      /invalidated|dataset lifecycle/i.test(error.message)
-    ),
-  );
-});
-
-test('cooperative bulk-gene invalidation stops every later request and dismisses its data notification once', async t => {
-  const layer = new DataLayer({}, {
-    enableNotifications: false,
-    enablePrefetch: false,
-    enableVersionTracking: false,
-  });
-  t.after(() => layer.destroy());
-
-  const firstBatchGate = deferred();
-  const startedGenes = [];
-  const progress = [];
-  const terminal = [];
-  let current = true;
-  let invalidationCleanup = null;
-
-  layer._notifications = {
-    show() {
-      return 'bulk-cooperative';
-    },
-    updateProgress() {},
-    complete(id) {
-      terminal.push(['complete', id]);
-    },
-    fail(id) {
-      terminal.push(['fail', id]);
-    },
-    dismiss(id) {
-      terminal.push(['dismiss', id]);
-    },
-  };
-  layer.refreshPageVersions = () => {};
-  layer.getAvailableVariables = () => Array.from(
-    { length: 21 },
-    (_unused, index) => ({ key: `Gene ${String(index + 1).padStart(2, '0')}` }),
-  );
-  layer.getDataForPages = async request => {
-    startedGenes.push(request.variableKey);
-    await firstBatchGate.promise;
-    return [pageData('page-A', [1])];
-  };
-
-  const run = layer.fetchBulkGeneExpression({
-    pageIds: ['page-A'],
-    geneList: layer.getAvailableVariables().map(gene => gene.key),
-    onProgress(value) {
-      progress.push(value);
-    },
-    isCurrent: () => current,
-    registerInvalidationCleanup(cleanup) {
-      invalidationCleanup = cleanup;
-    },
-  });
-
-  // The loader keeps a sliding window of `networkConcurrency` requests in
-  // flight rather than issuing fixed batches, so the invariant under test is
-  // not "the second batch never starts" — it is that *no further request* is
-  // issued once cooperative ownership is lost, whatever the window size is.
-  const window = PerformanceConfig.batch.networkConcurrency;
-  await waitFor(
-    () => startedGenes.length >= window,
-    'the bulk-gene concurrency window to fill',
-  );
-  current = false;
-  invalidationCleanup?.();
-  invalidationCleanup?.();
-  const terminalAtInvalidation = [...terminal];
-  const startedAtInvalidation = [...startedGenes];
-  firstBatchGate.resolve();
-
-  const outcome = await run.then(
-    value => ({ value }),
-    error => ({ error }),
-  );
-
-  assert.equal(typeof invalidationCleanup, 'function');
-  assert.deepEqual(
-    terminalAtInvalidation,
-    [['dismiss', 'bulk-cooperative']],
-    'invalidation must dismiss the visible data notification synchronously',
-  );
-  assert.deepEqual(
-    startedGenes,
-    startedAtInvalidation,
-    'no further gene request may start after cooperative ownership is lost',
-  );
-  assert.equal(
-    startedGenes.length,
-    window,
-    'the loader must never exceed its configured concurrency window',
-  );
-  assert.deepEqual(
-    startedGenes,
-    Array.from(
-      { length: window },
-      (_unused, index) => `Gene ${String(index + 1).padStart(2, '0')}`,
-    ),
-    'the window must be filled in requested order',
-  );
-  assert.equal(outcome.error?.code, 'ANALYSIS_DATA_REQUEST_INVALIDATED');
-  assert.deepEqual(terminal, [['dismiss', 'bulk-cooperative']]);
-  assert.deepEqual(progress, [0]);
-});

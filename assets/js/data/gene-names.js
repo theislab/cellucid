@@ -5,8 +5,9 @@
  * categories or integers names the genes; an empty or missing value takes the
  * gene's var-index name, and the list is then made unique with
  * `makeUniqueNames` (`data-mapping.js`). A value is turned into text exactly
- * as `cellucid.anndata_mapping` does with Python's `str()`, so a file read in
- * the browser and the same file served list the same names.
+ * as `cellucid.data_mapping` (`gene_name_text`) does with Python's
+ * `str()`, so a file read in the browser and the same file served list the
+ * same names.
  *
  * @module data/gene-names
  */

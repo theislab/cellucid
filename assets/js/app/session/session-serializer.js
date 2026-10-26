@@ -14,15 +14,17 @@
  */
 
 import { readBundle } from './bundle/reader.js';
+import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
+import {
+  assertDatasetSourceRecord,
+  captureDatasetSourceRecord,
+} from './dataset-source-record.js';
 import { writeBundle } from './bundle/writer.js';
 import { downloadBlob } from '../utils/download.js';
 import {
   MAX_FRAME_BYTES
 } from './bundle/format.js';
 import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
-import {
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
-} from './contributors/analysis-artifacts.js';
 import {
   CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
   PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
@@ -31,7 +33,10 @@ import {
 } from './published-default.js';
 import {
   assertDatasetFingerprint,
+  assertSessionRequires,
   buildSessionContext,
+  collectRequiredFields,
+  describeMissingRequiredFields,
   createSessionRestoreTransaction,
   datasetFingerprintMatches,
   getDatasetFingerprint,
@@ -42,12 +47,12 @@ import {
 import {
   assertArray,
   assertBoolean,
-  assertExactKeys,
   assertNonEmptyString,
-  assertPlainRecord,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from './schema-contract.js';
+import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 /**
  * @typedef {'eager'|'lazy'} ChunkPriority
@@ -151,11 +156,9 @@ const STATIC_PROFILE_BY_ID = new Map(
   BUILT_IN_STATIC_CHUNK_PROFILES.map(profile => [profile.id, profile])
 );
 const STATIC_PROFILE_BY_CONTRIBUTOR = new Map(
-  BUILT_IN_STATIC_CHUNK_PROFILES
-    .filter(profile => profile.contributorId !== 'analysis-artifacts')
-    .map(
-      profile => [profile.contributorId, profile]
-    )
+  BUILT_IN_STATIC_CHUNK_PROFILES.map(
+    profile => [profile.contributorId, profile]
+  )
 );
 
 function validateBuiltInStaticChunkProfile(entry, context) {
@@ -256,16 +259,6 @@ function assertSessionDatasetOwner(ctx, owner) {
   }
 }
 
-/**
- * Yield back to the browser so rendering stays responsive.
- * @returns {Promise<void>}
- */
-function nextTick() {
-  if (typeof requestAnimationFrame !== 'function') {
-    throw new Error('Session restore requires requestAnimationFrame.');
-  }
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
 
 /**
  * Basic manifest shape validation (untrusted input).
@@ -278,9 +271,9 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   ) {
     throw new TypeError('Session manifest profile is invalid.');
   }
-  assertExactKeys(
+  requireExactKeys(
     manifest,
-    ['createdAt', 'datasetFingerprint', 'chunks'],
+    ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks'],
     'Session manifest'
   );
   if (
@@ -293,6 +286,13 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     manifest.datasetFingerprint,
     'Session manifest datasetFingerprint'
   );
+  assertDatasetSourceRecord(manifest.source, 'Session manifest source');
+  assertSessionRequires(manifest.requires, 'Session manifest requires');
+  if (manifestProfile === 'published-default' && manifest.source !== null) {
+    throw new TypeError(
+      'A published default is applied to the sample it ships beside; its source must be null.'
+    );
+  }
   assertArray(manifest.chunks, 'Session manifest chunks');
   const chunkIds = new Set();
   const contributorOrder = new Map(
@@ -307,7 +307,7 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   for (let index = 0; index < manifest.chunks.length; index++) {
     const entry = manifest.chunks[index];
     const context = `Session manifest chunk ${index}`;
-    assertExactKeys(
+    requireExactKeys(
       entry,
       [
         'id',
@@ -384,15 +384,6 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     assertNonEmptyString(entry.label, `${context} label`);
     assertBoolean(entry.datasetDependent, `${context} datasetDependent`);
     validateBuiltInStaticChunkProfile(entry, context);
-    if (
-      contributorId === ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.contributorId
-      && entry.priority === 'eager'
-      && chunkId !== ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.id
-    ) {
-      throw new TypeError(
-        'The analysis-artifacts contributor has exactly one canonical eager cache inventory.'
-      );
-    }
     assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
       maximum: MAX_FRAME_BYTES
     });
@@ -472,7 +463,7 @@ function assertJsonValue(value, context, ancestors = new Set()) {
       assertJsonValue(value[index], `${context}[${index}]`, ancestors);
     }
   } else {
-    assertPlainRecord(value, context);
+    requirePlainRecord(value, context);
     for (const [key, child] of Object.entries(value)) {
       assertNonEmptyString(key, `${context} property name`);
       assertJsonValue(child, `${context}.${key}`, ancestors);
@@ -559,7 +550,7 @@ function assertNotifications(value) {
 
 function assertCapturedChunk(chunk, contributorId, chunkIds) {
   const context = `Session contributor "${contributorId}" chunk`;
-  assertExactKeys(
+  requireExactKeys(
     chunk,
     [
       'id',
@@ -676,7 +667,7 @@ export class SessionSerializer {
   * @param {SessionContributor[]} options.contributors
    */
   constructor(options) {
-    assertExactKeys(
+    requireExactKeys(
       options,
       [
         'state',
@@ -686,6 +677,7 @@ export class SessionSerializer {
         'comparisonModule',
         'analysisWindowManager',
         'cinematicCamera',
+        'figureExport',
         'contributors'
       ],
       'SessionSerializer options'
@@ -709,6 +701,10 @@ export class SessionSerializer {
       cinematicCamera: assertNullableOwner(
         options.cinematicCamera,
         'SessionSerializer cinematicCamera'
+      ),
+      figureExport: assertNullableOwner(
+        options.figureExport,
+        'SessionSerializer figureExport'
       )
     };
 
@@ -756,7 +752,7 @@ export class SessionSerializer {
    * @param {{ comparisonModule: object, analysisWindowManager: object }} refs
    */
   setAnalysisRefs(refs) {
-    assertExactKeys(
+    requireExactKeys(
       refs,
       ['comparisonModule', 'analysisWindowManager'],
       'Session analysis references'
@@ -779,6 +775,17 @@ export class SessionSerializer {
     this._base.cinematicCamera = assertOwner(
       cinematicCamera,
       'Session cinematic camera'
+    );
+  }
+
+  /**
+   * Set the figure-export panel once the UI is initialized.
+   * @param {object} figureExport
+   */
+  setFigureExportRef(figureExport) {
+    this._base.figureExport = assertOwner(
+      figureExport,
+      'Session figure export'
     );
   }
 
@@ -932,7 +939,7 @@ export class SessionSerializer {
     if (typeof operation !== 'function') {
       throw new TypeError('Session restore operation must be a function.');
     }
-    assertExactKeys(options, ['signal'], 'Owned session restore options');
+    requireExactKeys(options, ['signal'], 'Owned session restore options');
     const callerSignal = options.signal === null
       ? null
       : assertAbortSignal(
@@ -1105,7 +1112,7 @@ export class SessionSerializer {
         : uncompressedBytes;
       if (storedBytes.byteLength > MAX_FRAME_BYTES) {
         throw new RangeError(
-          `Session chunk "${chunk.id}" holds ${storedBytes.byteLength} bytes; ` +
+          `Session chunk "${chunk.id}" holds ${formatCountOf(storedBytes.byteLength, 'byte')}; ` +
           'a session chunk frame holds at most 4 GiB − 1 (its length is a u32).'
         );
       }
@@ -1128,6 +1135,8 @@ export class SessionSerializer {
     const manifest = {
       createdAt: new Date().toISOString(),
       datasetFingerprint: datasetOwner.fingerprint,
+      source: captureDatasetSourceRecord(this._base.dataSourceManager),
+      requires: collectRequiredFields(this._base.state),
       chunks: manifestChunks
     };
 
@@ -1159,7 +1168,7 @@ export class SessionSerializer {
    * @returns {Promise<boolean>} True if a file was selected and restored.
    */
   async loadSessionFromFile(options) {
-    assertExactKeys(
+    requireExactKeys(
       options,
       ['beforeRestore'],
       'Session file load options'
@@ -1189,6 +1198,31 @@ export class SessionSerializer {
         return false;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Read only a session file's manifest (its header) and say which dataset
+   * it belongs to and where that dataset can be opened from. Nothing is
+   * applied, and no chunk is read.
+   *
+   * @param {Blob} blob
+   * @returns {Promise<{datasetId: string, name: string|null, source: object|null}>}
+   */
+  async readSessionDataset(blob) {
+    if (!(blob instanceof Blob)) {
+      throw new TypeError('Session source must be a Blob or File.');
+    }
+    const bundle = await readBundle(blob, { signal: null, onProgress: null });
+    try {
+      validateManifest(bundle.manifest, this._contributorById, null);
+      return Object.freeze({
+        datasetId: bundle.manifest.datasetFingerprint.datasetId,
+        name: bundle.manifest.datasetFingerprint.name,
+        source: bundle.manifest.source
+      });
+    } finally {
+      await bundle.cancel('Only the session manifest was needed.');
     }
   }
 
@@ -1237,7 +1271,7 @@ export class SessionSerializer {
         'Published default session restore source must be a Blob.'
       );
     }
-    assertExactKeys(
+    requireExactKeys(
       options,
       ['signal', 'refreshUi'],
       'Published default session restore options'
@@ -1279,7 +1313,7 @@ export class SessionSerializer {
    * @returns {Promise<void>}
    */
   async _restoreFromBundleSource(source, options) {
-    assertExactKeys(
+    requireExactKeys(
       options,
       [
         'totalBytes',
@@ -1408,13 +1442,22 @@ export class SessionSerializer {
         manifest.datasetFingerprint.dataMapping
       );
       throwIfAborted(abortController.signal);
+      // Under the session's own mapping (its gene names), every field it
+      // uses has to exist before any chunk is applied.
+      const missingFields = describeMissingRequiredFields(
+        ctx.state,
+        manifest.requires
+      );
+      if (missingFields !== null) {
+        throw new RangeError(missingFields);
+      }
       // Phase split: apply eager chunks now, then continue lazy in the background.
       const iterator = chunkStream[Symbol.asyncIterator]();
 
       // Helper that decodes a chunk payload and dispatches to its contributor.
       const applyChunk = async (meta, storedBytes) => {
         throwIfAborted(abortController.signal);
-        assertPlainRecord(meta, 'Session restore chunk metadata');
+        requirePlainRecord(meta, 'Session restore chunk metadata');
         if (!(storedBytes instanceof Uint8Array)) {
           throw new TypeError('Session restore chunk bytes must be a Uint8Array.');
         }
@@ -1454,7 +1497,7 @@ export class SessionSerializer {
         throwIfAborted(abortController.signal);
         const { value, done } = await iterator.next();
         if (done) break;
-        assertExactKeys(
+        requireExactKeys(
           value,
           ['index', 'meta', 'bytes'],
           'Session streamed chunk'
@@ -1476,8 +1519,11 @@ export class SessionSerializer {
           throwIfAborted(abortController.signal);
           const { value, done } = await iterator.next();
           if (done) break;
-          await nextTick();
-          assertExactKeys(
+          // A macrotask, not an animation frame: frames do not run in a
+          // background tab or an off-screen notebook iframe, and a restore
+          // there has to finish all the same.
+          await yieldToMacrotask();
+          requireExactKeys(
             value,
             ['index', 'meta', 'bytes'],
             'Session streamed chunk'

@@ -9,7 +9,9 @@
 // Generates Perlin-Worley and detail noise textures entirely on the GPU
 // Orders of magnitude faster than CPU/Web Worker generation
 
+import { glStateOf } from '../gl-state-shadow.js';
 import { contextLostError, requireCleanWebGLState } from '../gl-errors.js';
+import { deleteGlObject, deleteProgramReleasingUse, restorableTexture } from '../gl-utils.js';
 import {
   MAX_SMOKE_NOISE_RESOLUTION,
   MIN_SMOKE_NOISE_RESOLUTION,
@@ -20,16 +22,17 @@ import {
   DETAIL_NOISE_FS,
   BLUE_NOISE_FS
 } from '../shaders/noise-shaders.js';
+import { requireKeys } from '../../utils/exact-record.js';
 
-function asError(value, fallbackMessage) {
-  return value instanceof Error ? value : new Error(fallbackMessage);
+function asError(value, defaultMessage) {
+  return value instanceof Error ? value : new Error(defaultMessage);
 }
 
-function attempt(failures, operation, fallbackMessage) {
+function attempt(failures, operation, defaultMessage) {
   try {
     operation();
   } catch (error) {
-    failures.push(asError(error, fallbackMessage));
+    failures.push(asError(error, defaultMessage));
   }
 }
 
@@ -59,16 +62,20 @@ function assertContextAvailable(gl, owner) {
 }
 
 
+// Bindings from the context; the rest from its state shadow
+// (`gl-state-shadow.js`): asking the context waits for the GPU in Firefox
+// and WebKit, and this runs once per generated batch.
 function captureGenerationState(gl) {
-  const activeTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+  const shadow = glStateOf(gl);
+  const activeTexture = shadow.activeTexture;
   return {
     activeTexture,
     arrayBuffer: gl.getParameter(gl.ARRAY_BUFFER_BINDING),
     capabilities: noiseCapabilities(gl).map(capability => [
       capability,
-      gl.isEnabled(capability),
+      shadow.isEnabled(capability),
     ]),
-    colorMask: Array.from(gl.getParameter(gl.COLOR_WRITEMASK)),
+    colorMask: shadow.colorMask,
     drawFramebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING),
     pixelUnpackBuffer: gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING),
     program: gl.getParameter(gl.CURRENT_PROGRAM),
@@ -76,7 +83,7 @@ function captureGenerationState(gl) {
     texture2D: gl.getParameter(gl.TEXTURE_BINDING_2D),
     texture3D: gl.getParameter(gl.TEXTURE_BINDING_3D),
     vertexArray: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
-    viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
+    viewport: Array.from(shadow.viewport),
   };
 }
 
@@ -134,12 +141,12 @@ function restoreGenerationState(gl, state, failures) {
   );
   attempt(
     failures,
-    () => gl.bindTexture(gl.TEXTURE_2D, state.texture2D),
+    () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(state.texture2D)),
     'GPU noise 2D-texture restoration failed with a non-Error value.'
   );
   attempt(
     failures,
-    () => gl.bindTexture(gl.TEXTURE_3D, state.texture3D),
+    () => gl.bindTexture(gl.TEXTURE_3D, restorableTexture(state.texture3D)),
     'GPU noise 3D-texture restoration failed with a non-Error value.'
   );
   attempt(
@@ -282,7 +289,7 @@ export class GPUNoiseGenerator {
 
     for (const program of this._pendingProgramDeletes) {
       try {
-        gl.deleteProgram(program);
+        deleteProgramReleasingUse(gl, program);
         this._pendingProgramDeletes.delete(program);
       } catch (error) {
         failures.push(asError(
@@ -428,32 +435,14 @@ function defaultNoiseBatchScheduler(callback) {
 }
 
 function requireGenerationOptions(options) {
-  if (
-    options === undefined
-    || options === null
-    || typeof options !== 'object'
-    || Array.isArray(options)
-    || Object.getPrototypeOf(options) !== Object.prototype
-  ) {
-    if (options === undefined) return {};
-    throw new TypeError(
-      'GPU cloud-noise generation options must be one exact plain object.'
-    );
-  }
-  const supported = new Set([
-    'batchBudgetMs',
-    'maxSlicesPerBatch',
-    'now',
-    'schedule',
-  ]);
-  for (const key of Object.keys(options)) {
-    if (!supported.has(key)) {
-      throw new RangeError(
-        `GPU cloud-noise generation option "${key}" is unknown.`
-      );
-    }
-  }
-  return options;
+  if (options === undefined) return {};
+  return requireKeys(
+    options,
+    [],
+    ['batchBudgetMs', 'maxSlicesPerBatch', 'now', 'schedule'],
+    'GPU cloud-noise generation options',
+    (message, { reason }) => (reason === 'type' ? new TypeError(message) : new RangeError(message))
+  );
 }
 
 function requirePositiveFiniteNumber(value, owner) {
@@ -495,7 +484,7 @@ function retireNoiseResource(
   owner
 ) {
   try {
-    gl[deleteMethod](resource);
+    deleteGlObject(gl, deleteMethod, resource);
     return;
   } catch (error) {
     if (typeof gl[inspectionMethod] === 'function') {

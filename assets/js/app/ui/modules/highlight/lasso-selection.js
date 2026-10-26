@@ -12,37 +12,42 @@ import {
   abandonedGestureNotice,
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
+  idleSelectionNoticeHtml,
   selectionNoticeHtml
 } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { removeStepControls, showStepControls } from './step-controls.js';
 import {
-  deliverSelectionToJupyter,
+  publishToolHint,
+  removeStepControls,
+  showStepControls
+} from './step-controls.js';
+import {
+  deliverSelectionToViewerHost,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
   requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
-  requireExactKeys,
   requireFiniteNumber,
   requireHighlightSelectionState,
-  requireJupyterSource,
+  requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
   requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
-  requireUnifiedSelectionState
+  requireUnifiedSelectionState,
 } from './exact-contract.js';
-import { formatCount } from '../../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /**
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
- * @param {any|null} [options.jupyterSource]
+ * @param {any|null} [options.viewerHostSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
@@ -51,10 +56,10 @@ import { formatCount } from '../../components/display-format.js';
 export function initLassoSelection(options) {
   requireExactKeys(
     options,
-    ['state', 'viewer', 'jupyterSource', 'selectionState', 'ui'],
+    ['state', 'viewer', 'viewerHostSource', 'selectionState', 'ui'],
     'Lasso selection options'
   );
-  const { state, viewer, jupyterSource, selectionState, ui } = options;
+  const { state, viewer, viewerHostSource, selectionState, ui } = options;
   requireMethods(
     state,
     'Lasso selection state',
@@ -76,7 +81,7 @@ export function initLassoSelection(options) {
       'setLassoStepCallback'
     ]
   );
-  requireJupyterSource(jupyterSource);
+  requireViewerHostSource(viewerHostSource);
   requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'Lasso selection UI');
   const highlightModeDescriptionEl = requireDomElement(
@@ -118,10 +123,10 @@ export function initLassoSelection(options) {
     if (destroyed) return;
     requireCompletedSelectionEvent(lassoEvent, 'lasso', state.pointCount);
 
-    const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
+    const stepsLabel = lassoEvent.steps > 1 ? ` (${formatCountOf(lassoEvent.steps, 'view')})` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'lasso',
-      label: `Lasso${stepsLabel} (${formatCount(lassoEvent.cellCount)} cells)`,
+      label: `Lasso${stepsLabel} (${formatCountOf(lassoEvent.cellCount, 'cell')})`,
       cellIndices: lassoEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -132,9 +137,9 @@ export function initLassoSelection(options) {
       state.pointCount
     );
 
-    debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
-    trackDelivery(deliverSelectionToJupyter({
-      jupyterSource,
+    debug.log(`[UI] Lasso selected ${formatCountOf(lassoEvent.cellCount, 'cell')} from ${lassoEvent.steps} view(s)`);
+    trackDelivery(deliverSelectionToViewerHost({
+      viewerHostSource,
       cellIndices: lassoEvent.cellIndices,
       source: 'lasso',
       onFailure: error => {
@@ -186,12 +191,14 @@ export function initLassoSelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after drawing reads as a broken control.
     pushHistoryStep(selectionState, 'lassoHistory', {
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
     selectionState.lassoRedoStack = [];
 
-    selectionState.lastLassoCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastLassoCandidates = stepEvent.candidates;
     selectionState.lastLassoStep = stepEvent.step;
 
     updateLassoUI(stepEvent);
@@ -208,7 +215,7 @@ export function initLassoSelection(options) {
     if (selectionState.lassoHistory.length === 0) return;
 
     selectionState.lassoRedoStack.push({
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
 
@@ -236,7 +243,7 @@ export function initLassoSelection(options) {
     if (selectionState.lassoRedoStack.length === 0) return;
 
     selectionState.lassoHistory.push({
-      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
     });
 
@@ -354,8 +361,8 @@ export function initLassoSelection(options) {
     if (destroyed) return;
     const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML =
-        `${HIGHLIGHT_MODE_COPY.lasso}${noticeHtml}`;
+      publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY.lasso);
+      highlightModeDescriptionEl.innerHTML = idleSelectionNoticeHtml(notice);
       removeStepControls(
         documentOwner,
         'lasso',
@@ -386,7 +393,7 @@ export function initLassoSelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
     showLassoControls(stepEvent.candidateCount, notice);
 
@@ -399,7 +406,7 @@ export function initLassoSelection(options) {
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
     selectionState.lastLassoCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastLassoStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

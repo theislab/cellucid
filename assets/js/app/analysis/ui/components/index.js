@@ -17,7 +17,7 @@
 // SELECTORS
 // =============================================================================
 
-export { createPageComparisonSelector, createPlotTypeSelector } from './selectors.js';
+export { createPlotTypeSelector } from './selectors.js';
 
 // PlotRegistry should be imported from '../shared/plot-registry-utils.js'
 

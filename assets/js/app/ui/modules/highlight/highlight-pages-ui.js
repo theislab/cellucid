@@ -9,12 +9,14 @@
 
 import { formatCompactCount } from '../../components/display-format.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
+import { coalesceToFrame } from '../../components/controls.js';
 import {
   requireDomElement,
-  requireExactKeys,
   requireMethods,
-  requireSafeInteger
+  requireSafeInteger,
 } from './exact-contract.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { countNoun } from '../../../../utils/format-units.js';
 
 /**
  * @param {object} options
@@ -484,7 +486,7 @@ export function initHighlightPagesUI(options) {
         activation.setAttribute(
           'aria-label',
           `${page.name}, ${count} highlighted ` +
-          `${count === 1 ? 'cell' : 'cells'}`
+          `${countNoun(count, 'cell')}`
         );
 
         const colorEl = tab.querySelector('.highlight-page-color');
@@ -605,17 +607,29 @@ export function initHighlightPagesUI(options) {
         `Highlight color for ${page.name}`
       );
 
-      listen(colorInput, 'input', () => {
-        const newColor = colorInput.value;
+      // A colour drag fires an input event per pointer move; each published
+      // colour recolours the highlights and redraws every page tab and the
+      // category builder. The swatch follows every event; the state gets
+      // the latest colour once per frame, and the final one on change.
+      const publishColor = coalesceToFrame(color => {
+        if (destroyed || !state.getHighlightPages().some(candidate => candidate.id === page.id)) return;
         requirePageOperation(
-          state.setHighlightPageColor(page.id, newColor),
+          state.setHighlightPageColor(page.id, color),
           'Highlight page color update'
         );
+      });
+      listen(colorInput, 'input', () => {
+        const newColor = colorInput.value;
         StyleManager.setVariable(
           colorIndicator,
           '--swatch-color',
           newColor
         );
+        publishColor(newColor);
+      });
+      listen(colorInput, 'change', () => {
+        publishColor(colorInput.value);
+        publishColor.flush();
       });
       listen(colorInput, 'click', (e) => {
         e.stopPropagation();
@@ -657,7 +671,7 @@ export function initHighlightPagesUI(options) {
       activation.setAttribute(
         'aria-label',
         `${page.name}, ${count} highlighted ` +
-        `${count === 1 ? 'cell' : 'cells'}`
+        `${countNoun(count, 'cell')}`
       );
       activation.appendChild(countSpan);
       listen(activation, 'click', () => {

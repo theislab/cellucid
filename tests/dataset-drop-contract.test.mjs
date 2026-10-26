@@ -48,27 +48,29 @@ test('only drags that carry files are the drop target\'s', () => {
   assert.equal(carriesFiles(null), false);
 });
 
-test('one H5AD file, one Zarr ZIP or one folder is opened by its own reader', async () => {
+test('one H5AD file, one Zarr ZIP or one Zarr folder is opened by its own reader', async () => {
   const h5ad = describeDatasetDrop(transfer([fileItem('Cells.H5AD')]));
-  assert.equal(h5ad.kind, 'h5ad');
+  assert.equal(h5ad.kind, 'file');
   assert.equal(h5ad.label, 'Cells.H5AD');
   assert.equal((await h5ad.readFiles())[0].name, 'Cells.H5AD');
 
   const zarr = describeDatasetDrop(transfer([fileItem('cells.zarr.zip')]));
-  assert.equal(zarr.kind, 'zarr-zip');
+  assert.equal(zarr.kind, 'zip');
 
+  // A folder is read as an AnnData Zarr store, hidden metadata files and all.
   const folder = describeDatasetDrop(transfer([
-    fileItem('export', directoryEntry('export', [
-      fileEntry('dataset_identity.json'),
-      directoryEntry('obs', [fileEntry('cell_type.values.bin')]),
+    fileItem('cells.zarr', directoryEntry('cells.zarr', [
+      fileEntry('.zgroup'),
+      fileEntry('.zmetadata'),
+      directoryEntry('obs', [fileEntry('.zattrs')]),
     ])),
   ]));
-  assert.equal(folder.kind, 'prepared');
-  assert.equal(folder.label, 'export');
+  assert.equal(folder.kind, 'folder');
+  assert.equal(folder.label, 'cells.zarr');
   const files = await folder.readFiles();
   assert.deepEqual(
     files.map(file => file.webkitRelativePath).sort(),
-    ['export/dataset_identity.json', 'export/obs/cell_type.values.bin'],
+    ['cells.zarr/.zgroup', 'cells.zarr/.zmetadata', 'cells.zarr/obs/.zattrs'],
   );
 });
 
@@ -76,11 +78,7 @@ test('anything else is refused with a message that says what can be dropped', ()
   for (const [items, pattern] of [
     [[], /Nothing that can be opened was dropped/],
     [[fileItem('a.h5ad'), fileItem('b.h5ad')], /2 items were dropped/],
-    [[fileItem('notes.txt')], /"notes\.txt" is not a file Cellucid can open/],
-    [
-      [fileItem('store.zarr', directoryEntry('store.zarr', []))],
-      /"store\.zarr" is a Zarr directory/,
-    ],
+    [[fileItem('notes.txt')], /"notes\.txt" is not a file Cellucid can open\. Drop one \.h5ad file, one \.loom file, .*one \.zarr folder, one Cell Ranger outs\/ folder, .*or one \.zarr\.zip archive\./],
   ]) {
     const drop = describeDatasetDrop(transfer(items));
     assert.equal(drop.kind, 'refused');

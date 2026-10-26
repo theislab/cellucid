@@ -26,7 +26,7 @@ const CALLER_ABORT_DOCUMENT = Object.freeze({
 const OVERSIZED_BODY_DOCUMENT = Object.freeze({
   error:
     `GitHub API proxy request body exceeds ` +
-    `${WORKER_REQUEST_BODY_MAX_BYTES} bytes`,
+    `${WORKER_REQUEST_BODY_MAX_BYTES.toLocaleString('en-US')} bytes`,
 });
 const INVALID_UTF8_DOCUMENT = Object.freeze({
   error: 'GitHub API proxy request body contains invalid UTF-8',

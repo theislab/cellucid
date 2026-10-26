@@ -1,0 +1,366 @@
+/* components/_session.css
+   The Session panel's own layout: the Dataset box (ui/modules/dataset-card.js),
+   the Open… menu (ui/modules/open-data-menu.js), the address bar with its
+   connection lines, and the notice next to the dataset dropdown. Controls
+   inside keep the shared look of _controls.css and _buttons.css. */
+
+/* ------------------------------------------------------------------------
+   Dataset box
+   --------------------------------------------------------------------- */
+
+.dataset-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.dataset-card > p {
+  margin: 0;
+}
+
+/* The name wraps whole: nothing of it is cut. */
+.dataset-card-name {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.dataset-card[data-state="empty"] .dataset-card-name {
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-tertiary);
+}
+
+/* Opening: the shared spinner beside what is being opened. */
+.dataset-card-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.dataset-card-title > .spinner[hidden] {
+  display: none;
+}
+
+.dataset-card[data-state="loading"] .dataset-card-name {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.dataset-card-summary {
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+}
+
+.dataset-card-origin,
+.dataset-card-read {
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.dataset-card-read {
+  font-variant-numeric: tabular-nums;
+}
+
+.dataset-card-description-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-0-5);
+}
+
+.dataset-card-description {
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* A long description shows two lines until "More". */
+.dataset-card-description[data-folded="true"] {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+/* "More" / "Less": a text button, quieter than a pill. */
+.dataset-card-more {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-link);
+  cursor: pointer;
+}
+
+.dataset-card-more:hover {
+  color: var(--color-text-link-hover);
+  text-decoration: underline;
+}
+
+.dataset-card-details {
+  margin-top: var(--space-0-5);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.dataset-card-details > .disclosure-header {
+  padding-block: var(--space-1);
+}
+
+.dataset-card-details > .disclosure-header > .disclosure-title {
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* Label and value side by side; a long value (a citation, an address)
+   wraps under itself. */
+.dataset-card-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+}
+
+.dataset-card-facts > dt {
+  color: var(--color-text-tertiary);
+}
+
+.dataset-card-facts > dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* A value of several facts (what was not read) takes the whole width under
+   its label, each fact on its own line. */
+.dataset-card-facts > .dataset-card-facts-wide {
+  grid-column: 1 / -1;
+}
+
+.dataset-card-facts > dd > div + div {
+  margin-top: var(--space-0-5);
+}
+
+.dataset-card-facts a {
+  color: var(--color-text-link);
+  text-decoration: none;
+}
+
+.dataset-card-facts a:hover {
+  color: var(--color-text-link-hover);
+  text-decoration: underline;
+}
+
+/* ------------------------------------------------------------------------
+   Open… and its menu
+   --------------------------------------------------------------------- */
+
+.open-menu {
+  position: relative;
+}
+
+.open-menu-button {
+  width: 100%;
+}
+
+/* The disclosure chevron of the sidebar, pointing at the menu below. */
+.open-menu-button::before {
+  content: '';
+  order: 1;
+  width: 5px;
+  height: 5px;
+  margin-left: var(--space-1);
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-30%) rotate(45deg);
+  opacity: var(--opacity-70);
+}
+
+.open-menu-list {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  right: 0;
+  z-index: var(--z-dropdown);
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1) 0;
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  box-shadow: var(--shadow-md);
+}
+
+.open-menu-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: max(var(--control-list-row-height), var(--control-row-min));
+  margin: 0;
+  padding: var(--space-1-5) var(--space-2-5);
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.open-menu-item:hover,
+.open-menu-item:focus-visible {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.open-menu-item:focus-visible {
+  outline-offset: calc(-1 * var(--border-width-2));
+}
+
+.open-menu-item-label {
+  font-size: var(--type-control);
+}
+
+.open-menu-item-hint {
+  /* The formats a choice opens: wrapped onto a second line, right-aligned,
+     when they are longer than the sidebar is wide, never cut off. */
+  min-width: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+  text-align: right;
+}
+
+/* ------------------------------------------------------------------------
+   Address bar and its connections
+   --------------------------------------------------------------------- */
+
+.address-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.address-row > .obs-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.address-row > .btn {
+  flex: none;
+}
+
+/* One open connection: what it is, where to, and Disconnect. */
+.connection-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-top: var(--control-row-gap);
+  min-width: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+}
+
+.connection-line[hidden] {
+  display: none;
+}
+
+.connection-kind {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
+.connection-kind::before {
+  content: '';
+  width: var(--space-1-5);
+  height: var(--space-1-5);
+  border-radius: var(--radius-full);
+  background: var(--color-success);
+}
+
+.connection-target {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.connection-line > .btn {
+  flex: none;
+}
+
+/* What to do about a sign-in that did not finish (an administrator's approval). */
+.connection-help {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--color-text-link);
+  text-decoration: underline;
+}
+
+/* A line that links to help carries a long reason beside the link and a
+   button ("Use another account"): kept on one row, the reason was squeezed to
+   a column one letter wide. The reason takes the first row whole; the link,
+   the button and the (i) follow on the next. */
+.connection-line:has(> .connection-help:not([hidden])) {
+  flex-wrap: wrap;
+}
+
+.connection-line:has(> .connection-help:not([hidden])) > .connection-target {
+  flex-basis: 100%;
+}
+
+/* ------------------------------------------------------------------------
+   Notices
+   --------------------------------------------------------------------- */
+
+/* What failed with the dataset list or the last dataset chosen, with the
+   retry that repeats it. */
+.dataset-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  margin-top: var(--control-row-gap);
+}
+
+.dataset-notice[hidden] {
+  display: none;
+}
+
+.dataset-notice-message {
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-danger-text);
+}
+
+/* The startup line in Open data, and the failure that replaces it when the
+   app's code could not load (ui/core/code-load-watch.js). */
+#data-source-status.error {
+  color: var(--color-danger-text);
+}

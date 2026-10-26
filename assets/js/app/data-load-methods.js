@@ -12,12 +12,15 @@ export const DATA_LOAD_METHODS = Object.freeze({
   SERVER_AUTO: 'server-auto',
   DATASET_DROPDOWN: 'dataset-dropdown',
   DATASET_URL_PARAM: 'dataset-url-param',
-  LOCAL_PREPARED: 'local-user-prepared',
-  LOCAL_H5AD: 'local-user-h5ad',
-  LOCAL_ZARR_ZIP: 'local-user-zarr-zip',
+  // A file, a ZIP archive or a folder from this computer, whatever format it
+  // holds: the format is reported beside it (`data_load.data_format`).
+  LOCAL_FILE: 'local-user-file',
+  LOCAL_ZIP: 'local-user-zip',
+  LOCAL_FOLDER: 'local-user-folder',
   REMOTE_URL_PARAM: 'remote-url-param',
   REMOTE_CONNECT: 'remote-connect',
-  GITHUB_URL_PARAM: 'github-url-param',
-  GITHUB_CONNECT: 'github-connect',
-  JUPYTER_AUTO: 'jupyter-auto'
+  DATA_URL_PARAM: 'data-url-param',
+  LINK_CONNECT: 'link-connect',
+  SESSION_SOURCE: 'session-source',
+  VIEWER_HOST_AUTO: 'jupyter-auto'
 });

@@ -24,6 +24,11 @@ import {
   assertMergesDocument,
   assertSchemaIdentity,
   assertUserDocument,
+  assertUserFile,
+  composeMergesFile,
+  composeUserFile,
+  projectMergesFile,
+  projectUserFile,
   parseExactJson,
   toAnnotationPublicationBytes,
 } from './wire-contract.js';
@@ -34,6 +39,7 @@ import {
   isCanonicalGitHubRepositoryName,
   parseCanonicalGitHubRepositoryReference,
 } from './github-reference.js';
+import { requireExactObjectKeys } from '../../utils/exact-record.js';
 
 const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
 const GITHUB_FORK_READINESS_ATTEMPTS = 5;
@@ -79,24 +85,6 @@ function assertExactNonblankString(value, label, { max = 2048 } = {}) {
     Array.from(value).length > max
   ) {
     throw new Error(`${label} must be an exact nonblank string`);
-  }
-  return value;
-}
-
-function assertExactObjectKeys(value, fields, label) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value)
-  ) {
-    throw new Error(`${label} must be a JSON object`);
-  }
-  const keys = Object.keys(value);
-  if (
-    keys.length !== fields.length ||
-    fields.some((field) => !Object.hasOwn(value, field))
-  ) {
-    throw new Error(`${label} must contain exactly ${fields.join(', ')}`);
   }
   return value;
 }
@@ -299,7 +287,7 @@ function assertGitHubRepositoryFullName(value, label) {
 }
 
 function assertRepositoryPublicationInfo(repoInfo) {
-  assertExactObjectKeys(
+  requireExactObjectKeys(
     repoInfo,
     [
       'full_name',
@@ -325,7 +313,7 @@ function assertRepositoryPublicationInfo(repoInfo) {
     throw new Error('GitHub repository allow_forking must be boolean');
   }
   const permissions = repoInfo.permissions;
-  assertExactObjectKeys(
+  requireExactObjectKeys(
     permissions,
     ['pull', 'triage', 'push', 'maintain', 'admin'],
     'GitHub repository permissions'
@@ -1316,7 +1304,7 @@ async function getRepoInfo({
 }
 
 function assertForkRepositoryIdentity(value) {
-  assertExactObjectKeys(
+  requireExactObjectKeys(
     value,
     ['full_name', 'fork', 'parent'],
     'GitHub fork identity'
@@ -1336,7 +1324,7 @@ function assertForkRepositoryIdentity(value) {
     }
     return { fork: false, fullName, parentFullName: null };
   }
-  assertExactObjectKeys(
+  requireExactObjectKeys(
     value.parent,
     ['full_name'],
     'GitHub fork identity parent'
@@ -2949,8 +2937,12 @@ export class CommunityAnnotationGitHubSync {
         return { doc: null, sha, path, fetched: false };
       }
       const { json } = decodeJsonContentFile(content, path);
-      assertMergesDocument(json, { path });
-      return { doc: json, sha, path, fetched: true };
+      return {
+        doc: projectMergesFile(json, this.datasetId, { path }),
+        sha,
+        path,
+        fetched: true,
+      };
     } catch (err) {
       if (isNotFoundError(err)) return { doc: null, sha: null, path, fetched: false };
       throw err;
@@ -3008,7 +3000,6 @@ export class CommunityAnnotationGitHubSync {
     assertMergesDocument(mergesDoc, {
       path: 'annotations/moderation/merges.json publish payload',
     });
-    const incoming = mergesDoc;
 
     const expectedSha = conflictIfRemoteShaNotEqual === null
       ? null
@@ -3031,9 +3022,11 @@ export class CommunityAnnotationGitHubSync {
       signal: requestSignal,
     });
 
-    if (current !== null) {
-      assertMergesDocument(current, { path: 'annotations/moderation/merges.json' });
-    }
+    // The open dataset's merges replace that dataset's part of the file;
+    // every other dataset's merges stay as published.
+    const incoming = composeMergesFile(current, this.datasetId, mergesDoc, {
+      path: 'annotations/moderation/merges.json',
+    });
     const currentComparable = current
       ? { version: current.version, merges: current.merges }
       : null;
@@ -3341,8 +3334,11 @@ export class CommunityAnnotationGitHubSync {
           'from the recursive tree; start a new Pull'
         );
       }
-      assertUserDocument(json, { path, filename });
-      return { path, sha, doc: json };
+      return {
+        path,
+        sha,
+        doc: projectUserFile(json, this.datasetId, { path, filename }),
+      };
     };
     for (let start = 0; start < toFetch.length;) {
       let end = start;
@@ -3399,8 +3395,11 @@ export class CommunityAnnotationGitHubSync {
         ref: branch,
         signal: requestSignal,
       });
-      assertUserDocument(json, { path, filename: `${key}.json` });
-      return { doc: json, sha: sha || null, path };
+      return {
+        doc: projectUserFile(json, this.datasetId, { path, filename: `${key}.json` }),
+        sha: sha || null,
+        path,
+      };
     } catch (err) {
       if (err?.status === 404) return null;
       throw err;
@@ -3433,9 +3432,14 @@ export class CommunityAnnotationGitHubSync {
     }
     const fileUser = `ghid_${id}`;
     const path = `annotations/users/${fileUser}.json`;
-    assertUserDocument(userDoc, { path, filename: `${fileUser}.json` });
-    const content = encodeBase64Bytes(
-      toAnnotationPublicationBytes(userDoc, { path })
+    // The open dataset's section alone must fit the file limit; checked
+    // before any request, because the published file can only be larger.
+    toAnnotationPublicationBytes(
+      composeUserFile(null, this.datasetId, userDoc, {
+        path,
+        filename: `${fileUser}.json`,
+      }),
+      { path }
     );
     const authenticatedUser = assertAuthUserResponse(
       await workerAuthRequest(workerOrigin, '/auth/user', {
@@ -3450,6 +3454,7 @@ export class CommunityAnnotationGitHubSync {
     }
 
     let sha = null;
+    let published = null;
     let remoteUpdatedAt = null;
     let remoteContentBase64 = null;
     try {
@@ -3468,12 +3473,23 @@ export class CommunityAnnotationGitHubSync {
         contentBase64: existingContentBase64,
       } = decodeJsonContentFile(existing, path);
       sha = existingSha;
-      assertUserDocument(parsed, { path, filename: `${fileUser}.json` });
+      published = assertUserFile(parsed, { path, filename: `${fileUser}.json` });
       remoteUpdatedAt = parsed.updatedAt;
       remoteContentBase64 = existingContentBase64;
     } catch (err) {
       if (err?.status !== 404) throw err;
     }
+    // The open dataset's view replaces that dataset's section of the file;
+    // the contributor's other datasets stay as published.
+    const content = encodeBase64Bytes(
+      toAnnotationPublicationBytes(
+        composeUserFile(published, this.datasetId, userDoc, {
+          path,
+          filename: `${fileUser}.json`,
+        }),
+        { path }
+      )
+    );
 
     if (
       remoteContentBase64 !== null &&

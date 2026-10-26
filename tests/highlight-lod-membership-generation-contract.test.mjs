@@ -6,12 +6,10 @@ import {
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
-  buildKnnAdjacency,
-  findKnnNeighborsUpToDegree,
   HighlightRenderer,
   HighlightTools,
-  resetKnnCache,
 } from '../assets/js/rendering/highlight-renderer.js';
+import { extractConnectivityEdges } from '../assets/js/data/connectivity-edges.js';
 
 const FULL_DETAIL_ADMISSION = 0xff;
 const PROJECTED_POINT_COUNT = 30_000_000;
@@ -896,45 +894,39 @@ test('highlight publication keys exact geometry, dimension, and membership while
 });
 
 test('transparency publication exactly retires same-reference KNN paths', () => {
-  // Edges 0-1 and 1-2.
-  const adjacency = buildKnnAdjacency(
-    Uint32Array.from([0, 1]),
-    Uint32Array.from([1, 2]),
-    3,
-  );
+  // Edges 0-1 and 1-2, as the reader's edge payload.
+  const graph = extractConnectivityEdges({
+    format: 'csr',
+    shape: [3, 3],
+    indptr: Int32Array.of(0, 1, 3, 4),
+    indices: Int32Array.of(1, 0, 2, 1),
+    data: new Float32Array(4).fill(1),
+  }, 3);
   const transparency = Uint8Array.from([1, 1, 1]);
-  resetKnnCache();
-  assert.deepEqual(
-    [...findKnnNeighborsUpToDegree(
-      0,
-      2,
-      adjacency,
-      transparency,
-    ).allCells],
-    [0, 1, 2],
-  );
-
-  // Filtering owns this Float32Array and mutates it in place. The explicit
-  // viewer publication must invalidate visited/frontier state even though
-  // the array identity is unchanged.
-  transparency[1] = 0;
   const tools = Object.assign(
     Object.create(HighlightTools.prototype),
     {
       _disposed: false,
       _transparencyGenerations: new Map(),
+      getViewTransparency: () => transparency,
+      knnGraph: graph,
+      knnSeedCell: { cellIndex: 0, viewId: 'live' },
     },
   );
+  const reach = degree => {
+    const expansion = tools._knnQuery();
+    assert.equal(expansion.expandTo(degree, Infinity), true);
+    return [...expansion.cells()];
+  };
+  assert.deepEqual(reach(2), [0, 1, 2]);
+
+  // Filtering owns this array and mutates it in place. The explicit viewer
+  // publication must invalidate the expansion even though the array identity
+  // is unchanged.
+  transparency[1] = 0;
+  assert.deepEqual(reach(2), [0, 1, 2], 'the expansion is reused until the publication');
   assert.equal(tools.handleTransparencyChange('live'), 1);
-  assert.deepEqual(
-    [...findKnnNeighborsUpToDegree(
-      0,
-      2,
-      adjacency,
-      transparency,
-    ).allCells],
-    [0],
-  );
+  assert.deepEqual(reach(2), [0]);
 });
 
 function makeHighlightUploadFailureFixture() {

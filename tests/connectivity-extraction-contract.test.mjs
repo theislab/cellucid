@@ -3,20 +3,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
-import { loaderMetadata, obsmColumnReader } from './helpers/anndata-mapping-mocks.mjs';
+import { loaderMetadata, obsmColumnReader, withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
 import {
-  loadConnectivityManifest,
+  loadConnectivitySummary,
   loadEdges,
 } from '../assets/js/data/data-loaders.js';
 import {
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import {
   extractConnectivityEdges,
-} from '../assets/js/data/sparse-utils.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
-import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
+} from '../assets/js/data/connectivity-edges.js';
+import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
+import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
 function dense(values) {
   return {
@@ -54,9 +54,9 @@ test('official AnnData-style weighted connectivity is preserved exactly', () => 
   };
   const edges = extractConnectivityEdges(matrix, 3);
 
-  assert.deepEqual(Array.from(edges.sources), [0, 1]);
-  assert.deepEqual(Array.from(edges.destinations), [1, 2]);
-  assert.deepEqual(Array.from(edges.weights), [1, 2]);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), [0, 1]);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1, 2]);
+  assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([1, 2]));
 });
 
 test('dense direct connectivity requires exact weighted symmetry and zero diagonal', async t => {
@@ -66,9 +66,9 @@ test('dense direct connectivity requires exact weighted symmetry and zero diagon
   ]);
   const snapshot = valid.data.slice();
   const edges = extractConnectivityEdges(valid, 2);
-  assert.deepEqual(Array.from(edges.sources), [0]);
-  assert.deepEqual(Array.from(edges.destinations), [1]);
-  assert.deepEqual(Array.from(edges.weights), [1]);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), [0]);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1]);
+  assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([1]));
   assert.deepEqual(valid.data, snapshot, 'extraction must not mutate input');
 
   const invalid = [
@@ -128,9 +128,9 @@ test('sparse direct connectivity is exact, canonical, and non-mutating', async t
     indptr: matrix.indptr.slice(),
   };
   const edges = extractConnectivityEdges(matrix, 3);
-  assert.deepEqual(Array.from(edges.sources), [0, 0]);
-  assert.deepEqual(Array.from(edges.destinations), [1, 2]);
-  assert.deepEqual(Array.from(edges.weights), [1, 2]);
+  assert.deepEqual(Array.from(edgeListOf(edges).sources), [0, 0]);
+  assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1, 2]);
+  assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([1, 2]));
   assert.deepEqual(matrix.data, snapshots.data);
   assert.deepEqual(matrix.indices, snapshots.indices);
   assert.deepEqual(matrix.indptr, snapshots.indptr);
@@ -204,17 +204,44 @@ test('sparse direct connectivity is exact, canonical, and non-mutating', async t
     );
   });
 
-  await t.test('explicit sparse zeros are rejected instead of dropped', () => {
+  await t.test('explicit sparse zeros are not edges', () => {
+    // Other tools keep stored zeros; each is dropped, as if it were not
+    // stored, after the duplicate check every stored coordinate takes part in.
+    const none = extractConnectivityEdges(
+      sparse({
+        data: [0, 0],
+        indices: [1, 0],
+        indptr: [0, 1, 2],
+      }),
+      2
+    );
+    assert.equal(edgeListOf(none).sources.length, 0);
+
+    // 3 cells: a real 0-1 edge, stored zeros at 0-2 (both sides), 1-2 (one
+    // side) and on the diagonal.
+    const mixed = extractConnectivityEdges(
+      sparse({
+        data: [0, 0.5, 0, 0.5, 0, 0],
+        indices: [0, 1, 2, 0, 2, 0],
+        indptr: [0, 3, 5, 6],
+        shape: [3, 3],
+      }),
+      3
+    );
+    assert.deepEqual(Array.from(edgeListOf(mixed).sources), [0]);
+    assert.deepEqual(Array.from(edgeListOf(mixed).destinations), [1]);
+    assert.deepEqual(edgeWeightsOf(mixed), edgeWeightsFrom([0.5]));
+
     assert.throws(
       () => extractConnectivityEdges(
         sparse({
-          data: [0, 0],
-          indices: [1, 0],
-          indptr: [0, 1, 2],
+          data: [0, 0.5, 0.5],
+          indices: [1, 1, 0],
+          indptr: [0, 2, 3],
         }),
         2
       ),
-      /omit zero-weight coordinates/i
+      /duplicate coordinate/i
     );
   });
 
@@ -253,6 +280,9 @@ function createDirectLoader(connectivity) {
     readObsmColumns: obsmColumnReader({
       X_umap_2d: { data: [0, 0, 1, 1], width: 2 },
     }),
+    async hasConnectivities() {
+      return connectivity !== null;
+    },
     async getConnectivityEdges() {
       return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
     },
@@ -266,13 +296,13 @@ function createDirectLoader(connectivity) {
 
 async function finalizeDirect(format, connectivity, id) {
   const loader = createDirectLoader(connectivity);
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   await adapter.initialize();
   const identity = await adapter.finalizeDirectIdentity({
     id,
     name: id,
+    preferFileName: false,
     description: `Exact ${format} connectivity fixture`,
-    cellucidDataVersion: `${format}_loader`,
     source: {
       name: format === 'h5ad' ? 'H5AD file' : 'Zarr store',
       filename: format === 'h5ad'
@@ -280,22 +310,17 @@ async function finalizeDirect(format, connectivity, id) {
         : `${id}.zarr`,
     },
   });
-  const source = format === 'h5ad'
-    ? new H5adDataSource()
-    : new ZarrDataSource();
+  const source = new AnnDataFileSource();
   source._loader = loader;
   source._adapter = adapter;
   source._metadata = identity;
   source.datasetId = id;
-  if (format === 'h5ad') {
-    source.filename = `${id}.h5ad`;
-  } else {
-    source.dirname = `${id}.zarr`;
-  }
+  source.format = format;
+  source.filename = format === 'h5ad' ? `${id}.h5ad` : `${id}.zarr`;
   return { adapter, identity, loader, source };
 }
 
-test('H5AD and Zarr reject inexact graphs before direct identity publication', async t => {
+test('H5AD and Zarr open without reading the graph and refuse an inexact one when its edges are read', async t => {
   const invalid = [
     [
       'negative weight',
@@ -340,14 +365,15 @@ test('H5AD and Zarr reject inexact graphs before direct identity publication', a
   for (const format of ['h5ad', 'zarr']) {
     for (const [name, matrix, expectedError] of invalid) {
       await t.test(`${format} ${name}`, async () => {
-        await assert.rejects(
-          finalizeDirect(
-            format,
-            matrix,
-            `invalid-${format}-${name}`
-          ),
-          expectedError
+        const { adapter, identity, loader } = await finalizeDirect(
+          format,
+          matrix,
+          `invalid-${format}-${name}`
         );
+        assert.equal(identity.stats.has_connectivity, true);
+        assert.equal(identity.stats.n_edges, null);
+        assert.equal(loader.connectivityCalls, 0, 'opening never reads the graph');
+        await assert.rejects(adapter.getConnectivityEdges(), expectedError);
       });
     }
   }
@@ -365,11 +391,12 @@ test('H5AD and Zarr publish exact numeric weights through their adapters', async
         `${format}-weighted-connectivity`
       );
       assert.equal(identity.stats.has_connectivity, true);
-      assert.equal(identity.stats.n_edges, 1);
+      assert.equal(identity.stats.n_edges, null, 'counted when the edges are read');
       const edges = await adapter.getConnectivityEdges();
-      assert.deepEqual(Array.from(edges.sources), [0]);
-      assert.deepEqual(Array.from(edges.destinations), [1]);
-      assert.deepEqual(Array.from(edges.weights), [2]);
+      assert.equal(edges.nEdges, 1);
+      assert.deepEqual(Array.from(edgeListOf(edges).sources), [0]);
+      assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1]);
+      assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([2]));
     });
   }
 });
@@ -395,8 +422,9 @@ test('H5AD and Zarr explicit empty graphs stay present end to end', async t => {
         n_categorical_fields: 0,
         n_continuous_fields: 0,
         has_connectivity: true,
-        n_edges: 0,
+        n_edges: null,
       });
+      assert.equal(loader.connectivityCalls, 0, 'opening never reads the graph');
       const callsAfterFinalization = loader.connectivityCalls;
 
       const manager = getDataSourceManager();
@@ -410,44 +438,40 @@ test('H5AD and Zarr explicit empty graphs stay present end to end', async t => {
       manager.activeDatasetMetadata = identity;
       try {
         const signal = new AbortController().signal;
-        const graphUrl =
-          `${format}://${id}/connectivity_manifest.json`;
-        const manifest = await loadConnectivityManifest(
+        const graphUrl = `anndata://${id}/obsp`;
+        const summary = await loadConnectivitySummary(
           graphUrl,
           { signal }
         );
-        assert.deepEqual(manifest, {
-          format: 'edge_pairs',
+        assert.deepEqual(summary, {
           n_cells: 2,
-          n_edges: 0,
-          max_neighbors: 0,
-          index_dtype: 'uint32',
-          index_bytes: 4,
+          n_edges: null,
+          max_neighbors: null,
         });
-        assert.equal(Object.isFrozen(manifest), true);
+        assert.equal(Object.isFrozen(summary), true);
         assert.equal(
           loader.connectivityCalls,
           callsAfterFinalization,
-          'manifest access must remain metadata-only'
+          'reading the summary must remain metadata-only'
         );
 
         const edges = await loadEdges(
           graphUrl,
-          manifest,
+          summary,
           { signal }
         );
         assert.deepEqual(edges, await adapter.getConnectivityEdges());
         assert.equal(
           loader.connectivityCalls,
-          callsAfterFinalization,
-          'edge access must reuse the finalized direct payload'
+          callsAfterFinalization + 1,
+          'the graph is read once, when its edges are first asked for'
         );
         assert.equal(edges.nCells, 2);
         assert.equal(edges.nEdges, 0);
         assert.equal(edges.maxNeighbors, 0);
-        assert.deepEqual(Array.from(edges.sources), []);
-        assert.deepEqual(Array.from(edges.destinations), []);
-        assert.deepEqual(Array.from(edges.weights), []);
+        assert.deepEqual(Array.from(edgeListOf(edges).sources), []);
+        assert.deepEqual(Array.from(edgeListOf(edges).destinations), []);
+        assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([]));
       } finally {
         manager.activeSource = previous.activeSource;
         manager.activeDatasetId = previous.activeDatasetId;
@@ -456,4 +480,32 @@ test('H5AD and Zarr explicit empty graphs stay present end to end', async t => {
       }
     });
   }
+});
+
+test('symmetry is checked entry by entry in one pass, in CSR and CSC, unsorted lines included', () => {
+  const csr = (indptr, indices, data, format = 'csr') => ({
+    format, shape: [3, 3], indptr: Int32Array.from(indptr), indices: Int32Array.from(indices), data: Float32Array.from(data),
+  });
+  // 0-1 (w 2) and 1-2 (w 3), symmetric; line 1 stored unsorted.
+  for (const format of ['csr', 'csc']) {
+    const graph = csr([0, 1, 3, 4], [1, 2, 0, 1], [2, 3, 2, 3], format);
+    const before = Array.from(graph.indices);
+    const edges = extractConnectivityEdges(graph, 3);
+    assert.deepEqual(Array.from(edgeListOf(edges).sources), [0, 1], format);
+    assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1, 2], format);
+    assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([2, 3]), format);
+    assert.deepEqual(Array.from(graph.indices), before, `${format}: the input is not changed`);
+  }
+  const asymmetric = /exactly symmetric/;
+  // An upper entry without its partner.
+  assert.throws(() => extractConnectivityEdges(csr([0, 1, 1, 1], [1], [2]), 3), asymmetric);
+  // A lower entry without its partner.
+  assert.throws(() => extractConnectivityEdges(csr([0, 0, 1, 1], [0], [2]), 3), asymmetric);
+  // Partners with different weights.
+  assert.throws(() => extractConnectivityEdges(csr([0, 1, 2, 2], [1, 0], [2, 5]), 3), asymmetric);
+  // A stored zero is no edge and needs no partner.
+  const zero = extractConnectivityEdges(csr([0, 2, 3, 3], [1, 2, 0], [2, 0, 2]), 3);
+  assert.deepEqual([Array.from(edgeListOf(zero).sources), Array.from(edgeListOf(zero).destinations)], [[0], [1]]);
+  // A duplicate coordinate, even unsorted.
+  assert.throws(() => extractConnectivityEdges(csr([0, 2, 3, 3], [1, 1, 0], [2, 2, 2]), 3), /duplicate coordinate/);
 });

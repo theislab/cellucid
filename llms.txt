@@ -2,7 +2,7 @@
 
 > Cellucid is a free, open-source, GPU-accelerated web app for interactive single-cell data visualization. It shows millions of cells in the browser, in 1D, 2D and 3D embeddings such as UMAP, colored by gene expression or cell metadata, with filtering, selection, RNA-velocity overlays, figure export and community annotation.
 
-The app runs at https://www.cellucid.com/ and needs a WebGL2 browser. It opens AnnData `.h5ad` files and `.zarr.zip` archives directly, and exports prepared with the `cellucid` Python package (Scanpy/AnnData) or the `cellucid` R package (Seurat, SingleCellExperiment).
+The app runs at https://www.cellucid.com/ and needs a WebGL2 browser. It reads AnnData directly: `.h5ad` files, Zarr store folders and `.zarr.zip` archives, including the Cellucid-ready AnnData the `cellucid` Python package (Scanpy/AnnData) and the `cellucid` R package (Seurat, SingleCellExperiment) write.
 
 ## Documentation
 

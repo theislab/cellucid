@@ -15,7 +15,8 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 /** The last rung of the 18-level ladder: every point, no reduction. */
 // Two different numbers for two different things, and conflating them is what
@@ -29,8 +30,8 @@ const FULL_DETAIL_REPORTED_LEVEL = -1;
 const ADAPTIVE_FLOOR_LADDER_INDEX = 8;
 
 const FIXTURE_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
-  '&dataset=current-ui-prepared&acceptance=benchmark-harness-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
+  '&dataset=current-ui&acceptance=benchmark-harness-ci';
 
 const HARNESS_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
 const PROCESS_INTENSIVE = Object.freeze({
@@ -361,6 +362,12 @@ test('synthetic generation runs off the main thread', PROCESS_INTENSIVE, async (
 
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  // The audit below records every worker the page constructs while it is
+  // installed, so it starts once the start dataset is open: its reader
+  // workers are the opening's, not the generation's. The welcome dialog shows
+  // before that, and on a loaded machine the opening's workers otherwise
+  // land inside the audit.
+  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', { timeout: 120_000 });
 
   const result = await page.evaluate(
     async ({ moduleUrl, count }) => {
@@ -411,7 +418,7 @@ test('synthetic generation runs off the main thread', PROCESS_INTENSIVE, async (
   expect(result.colorsAreUint8).toBe(true);
   expect(result.workerMs).toBeGreaterThan(0);
   expect(result.workers).toEqual([{
-    url: expect.stringMatching(/\/generation-worker\.js$/),
+    url: expect.stringMatching(workerScriptPattern('benchmarkGenerationWorker')),
     type: 'module',
   }]);
   expect(browserErrors).toEqual([]);

@@ -12,6 +12,8 @@
 
 import { getGitHubWorkerOrigin } from './github-auth.js';
 import { parseExactJson } from './wire-contract.js';
+import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const CAP_DEFAULT_TIMEOUT_MS = 12_000;
 const CAP_WORKER_CONTRACT_VERSION = 1;
@@ -63,21 +65,6 @@ function exceedsCodePointLimit(value, maximum) {
     if (count > maximum) return true;
   }
   return false;
-}
-
-function assertExactObject(value, label, expectedKeys) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be a JSON object`);
-  }
-  const actual = Object.keys(value).sort();
-  const expected = expectedKeys.slice().sort();
-  if (
-    actual.length !== expected.length ||
-    !actual.every((key, index) => key === expected[index])
-  ) {
-    throw new Error(`${label} must contain exactly ${expected.join(', ')}`);
-  }
-  return value;
 }
 
 function assertBoundedString(value, label, maxCodePoints, {
@@ -150,9 +137,9 @@ function createAbortError(message, cause = undefined) {
   return error;
 }
 
-function ownerAbortReason(signal, fallbackCause = undefined) {
+function ownerAbortReason(signal, defaultCause = undefined) {
   if (signal?.reason instanceof Error) return signal.reason;
-  return createAbortError('CAP request was cancelled', fallbackCause);
+  return createAbortError('CAP request was cancelled', defaultCause);
 }
 
 function createRequestAbortScope(signal, timeoutMs) {
@@ -354,12 +341,6 @@ async function readBoundedResponseText(response) {
     } catch (cause) {
       await cancelLiveReader();
       throw cause;
-    } finally {
-      try {
-        reader.releaseLock?.();
-      } catch {
-        // Stream cleanup cannot replace its primary outcome.
-      }
     }
   }
 
@@ -381,11 +362,7 @@ async function executeLookupProxy(body, {
   signal = null,
   timeoutMs = CAP_DEFAULT_TIMEOUT_MS,
 } = {}) {
-  assertExactObject(
-    body,
-    'CAP proxy request body',
-    ['kind', 'term', 'limit']
-  );
+  requireExactObjectKeys(body, ['kind', 'term', 'limit'], 'CAP proxy request body');
   const scope = createRequestAbortScope(signal, timeoutMs);
   try {
     throwIfAborted(scope);
@@ -450,10 +427,10 @@ async function executeLookupProxy(body, {
         cause,
       });
     }
-    return assertExactObject(
+    return requireExactObjectKeys(
       document,
-      `CAP proxy ${CAP_LOOKUP_PATH} response`,
-      ['contractVersion', 'results', 'omittedInvalidCount']
+      ['contractVersion', 'results', 'omittedInvalidCount'],
+      `CAP proxy ${CAP_LOOKUP_PATH} response`
     );
   } catch (error) {
     throwIfAborted(scope, error);
@@ -475,12 +452,8 @@ async function executeLookupProxy(body, {
 
 function validateLookupResult(value, index) {
   const path = `CAP lookup results[${index}]`;
-  const item = assertExactObject(value, path, LOOKUP_RESULT_KEYS);
-  const scores = assertExactObject(
-    item.scores,
-    `${path}.scores`,
-    ['agree', 'disagree', 'idk']
-  );
+  const item = requireExactObjectKeys(value, LOOKUP_RESULT_KEYS, path);
+  const scores = requireExactObjectKeys(item.scores, ['agree', 'disagree', 'idk'], `${path}.scores`);
   const agree = assertNonnegativeSafeInteger(scores.agree, `${path}.scores.agree`);
   const disagree = assertNonnegativeSafeInteger(scores.disagree, `${path}.scores.disagree`);
   const idk = assertNonnegativeSafeInteger(scores.idk, `${path}.scores.idk`);
@@ -531,7 +504,7 @@ function validateEnvelope(document, validator, label, maxResults) {
     !Array.isArray(document.results) ||
     document.results.length > maxResults
   ) {
-    throw new Error(`${label}.results must be an array of at most ${maxResults} items`);
+    throw new Error(`${label}.results must be an array of at most ${formatCountOf(maxResults, 'item')}`);
   }
   const omittedInvalidCount = assertNonnegativeSafeInteger(
     document.omittedInvalidCount,
@@ -774,17 +747,6 @@ function assertLimit(value, maximum, label) {
   return value;
 }
 
-function assertOptions(options, allowedKeys, label) {
-  if (!options || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error(`${label} must be an object`);
-  }
-  const unknown = Object.keys(options).filter((key) => !allowedKeys.includes(key));
-  if (unknown.length) {
-    throw new Error(`${label} contains unknown option ${JSON.stringify(unknown[0])}`);
-  }
-  return options;
-}
-
 /**
  * Search CAP cell-label metadata.
  *
@@ -792,8 +754,9 @@ function assertOptions(options, allowedKeys, label) {
  */
 export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
   assertLimit(limit, CAP_LOOKUP_LIMIT, 'CAP result limit');
-  const exactOptions = assertOptions(
+  const exactOptions = requireObjectKeys(
     options,
+    [],
     ['kind', 'markerGenes', 'signal', 'timeoutMs'],
     'CAP search options'
   );
@@ -821,8 +784,9 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
 }
 
 export async function lookupByOntologyId(ontologyId, options = {}) {
-  const exactOptions = assertOptions(
+  const exactOptions = requireObjectKeys(
     options,
+    [],
     ['signal', 'timeoutMs'],
     'CAP ontology lookup options'
   );

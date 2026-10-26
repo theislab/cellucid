@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=render-blend-contract-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=render-blend-contract-ci`;
 
 async function installBlendBoundaryAudit(page) {
   await page.addInitScript(() => {
@@ -162,10 +162,34 @@ test('grid multiview scatter, highlight, connectivity, and centroid draws own ex
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
-  const setup = await page.evaluate(() => {
+  const setup = await page.evaluate(async () => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
     const ui = window._cellucidUi;
@@ -212,13 +236,10 @@ test('grid multiview scatter, highlight, connectivity, and centroid draws own ex
     viewer.setShowCentroidPoints(true, snapshot.id);
 
     const edgeCount = 2;
-    const edgeSetup = viewer.setupEdgesV2({
-      sources: Uint32Array.from([0, 1]),
-      destinations: Uint32Array.from([1, 2]),
-      weights: Float64Array.from([1, 0.5]),
-      nEdges: edgeCount,
-      nCells: pointCount,
-    }, positions);
+    const edgeSetup = viewer.setupEdgesV2(
+      edgePayloadOf(Uint32Array.from([0, 1]), Uint32Array.from([1, 2]), Float32Array.from([1, 0.5]), pointCount),
+      positions,
+    );
     const snapshotEdgeSetup = viewer.setupEdgesV2ForView(
       snapshot.id,
       viewer.getViewPositions(snapshot.id),
@@ -390,7 +411,7 @@ test('grid draw failure restores depth writes before the frame unwinds', async (
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   await page.evaluate(() => {
@@ -541,11 +562,10 @@ test('figure-export canvas and PNG preserve translucent color during compositing
 }) => {
   await page.goto('/tests/browser/fixtures/webgl-harness.html');
   const proof = await page.evaluate(async () => {
-    const {
-      rasterizePointsWebgl,
-      releaseWebglRasterCanvas,
-    } = await import(
-      '/assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js'
+    // The real path: the figure-export worker draws the point pass and
+    // encodes it; the page composites the frame it hands back.
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
     );
     const identity = () => Float32Array.from([
       1, 0, 0, 0,
@@ -553,14 +573,116 @@ test('figure-export canvas and PNG preserve translucent color during compositing
       0, 0, 1, 0,
       0, 0, 0, 1,
     ]);
-    const webglCanvas = rasterizePointsWebgl({
-      dimension: 3,
-      colors: Uint8Array.from([255, 0, 0, 128]),
-      outputHeightPx: 16,
-      outputWidthPx: 16,
-      pointSizePx: 16,
-      positions: Float32Array.from([0, 0, 0]),
-      renderState: {
+    const session = client.openFigureExportWorkerSession();
+    try {
+      const frame = await session.request('rasterizePoints', client.pointRasterArgs(session, {
+        positions: Float32Array.from([0, 0, 0]),
+        dimension: 3,
+        colors: Uint8Array.from([255, 0, 0, 128]),
+        transparency: null,
+        lodMembership: null,
+        drawOrder: null,
+        renderState: {
+          antialias: true,
+          cameraPosition: [0, 0, 3],
+          fogColor: [0, 0, 0],
+          fogDensity: 0,
+          fogFar: 3.5,
+          fogNear: 2.5,
+          fov: 1,
+          lightDir: [0, 0, 1],
+          lightingStrength: 0,
+          modelMatrix: identity(),
+          mvpMatrix: identity(),
+          pointSize: 16,
+          projectionMatrix: identity(),
+          shaderQuality: 'ultralight',
+          sizeAttenuation: 0,
+          viewMatrix: identity(),
+          viewportHeight: 16,
+          viewportWidth: 16,
+        },
+        outputWidthPx: 16,
+        outputHeightPx: 16,
+        viewRect01: null,
+        pointSizePx: 16,
+        overlayPoints: null,
+        highlightArray: null,
+        emphasizeSelection: false,
+        selectionMutedOpacity: 0.15,
+      }));
+
+      const composite = (source, paper) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 16;
+        canvas.height = 16;
+        const context = canvas.getContext('2d', { alpha: true });
+        if (paper !== null) {
+          context.fillStyle = paper;
+          context.fillRect(0, 0, 16, 16);
+        }
+        context.drawImage(source, 0, 0);
+        return Array.from(context.getImageData(8, 8, 1, 1).data);
+      };
+      // Read back straight: alpha applied once, not twice.
+      const straightPixel = composite(frame, null);
+      const immediateComposite = composite(frame, '#ffffff');
+      // The frame crosses to the encoder as the pixels the page reads.
+      const dataUrl = await client.requestPngDataUrl(session, client.pagePixels(frame));
+      const base64 = dataUrl.slice('data:image/png;base64,'.length);
+      const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+      const decodedPng = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+      const encodedComposite = composite(decodedPng, '#ffffff');
+      decodedPng.close();
+      return {
+        dataUrlPrefix: dataUrl.slice(0, 'data:image/png;base64,'.length),
+        encodedComposite,
+        immediateComposite,
+        straightPixel,
+      };
+    } finally {
+      session.close();
+    }
+  });
+
+  expect(proof).toEqual({
+    dataUrlPrefix: 'data:image/png;base64,',
+    encodedComposite: [255, 127, 127, 255],
+    immediateComposite: [255, 127, 127, 255],
+    straightPixel: [255, 0, 0, 128],
+  });
+});
+
+test('repeated raster passes reuse one export context, never losing it', async ({
+  page,
+}) => {
+  await page.goto('/tests/browser/fixtures/webgl-harness.html');
+  const proof = await page.evaluate(async () => {
+    // The rasterizer runs in the figure-export worker on an OffscreenCanvas;
+    // here it runs on the page's own OffscreenCanvas so its contexts can be
+    // counted.
+    const contexts = [];
+    const canvases = new Set();
+    const originalGetContext = OffscreenCanvas.prototype.getContext;
+    OffscreenCanvas.prototype.getContext = function getContext(type, ...args) {
+      const context = originalGetContext.call(this, type, ...args);
+      if (type === 'webgl2') {
+        contexts.push(context);
+        canvases.add(this);
+      }
+      return context;
+    };
+    try {
+      const { rasterizePointsWebgl } = await import(
+        '/assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js'
+      );
+      const identity = () => Float32Array.from([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);
+      const renderState = {
         antialias: true,
         cameraPosition: [0, 0, 3],
         fogColor: [0, 0, 0],
@@ -572,167 +694,56 @@ test('figure-export canvas and PNG preserve translucent color during compositing
         lightingStrength: 0,
         modelMatrix: identity(),
         mvpMatrix: identity(),
-        pointSize: 16,
+        pointSize: 4,
         projectionMatrix: identity(),
         shaderQuality: 'ultralight',
         sizeAttenuation: 0,
         viewMatrix: identity(),
-        viewportHeight: 16,
-        viewportWidth: 16,
-      },
-    });
-    const gl = webglCanvas.getContext('webgl2');
-    const rawPixel = new Uint8Array(4);
-    gl.readPixels(
-      8,
-      8,
-      1,
-      1,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      rawPixel,
-    );
-
-    const compositeOverWhite = source => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 16;
-      canvas.height = 16;
-      const context = canvas.getContext('2d', { alpha: true });
-      context.fillStyle = '#ffffff';
-      context.fillRect(0, 0, 16, 16);
-      context.drawImage(source, 0, 0);
-      return Array.from(context.getImageData(8, 8, 1, 1).data);
-    };
-    const immediateComposite = compositeOverWhite(webglCanvas);
-    const pngBlob = await new Promise((resolve, reject) => {
-      webglCanvas.toBlob(
-        blob => (
-          blob
-            ? resolve(blob)
-            : reject(new Error('Figure-export PNG encoding returned null'))
-        ),
-        'image/png',
-      );
-    });
-    const decodedPng = await createImageBitmap(pngBlob);
-    const encodedComposite = compositeOverWhite(decodedPng);
-    decodedPng.close();
-    const premultipliedAlpha =
-      gl.getContextAttributes().premultipliedAlpha;
-    const released = releaseWebglRasterCanvas(webglCanvas);
-
-    return {
-      encodedComposite,
-      immediateComposite,
-      premultipliedAlpha,
-      rawPixel: Array.from(rawPixel),
-      released,
-    };
-  });
-
-  expect(proof).toEqual({
-    encodedComposite: [255, 127, 127, 255],
-    immediateComposite: [255, 127, 127, 255],
-    premultipliedAlpha: true,
-    rawPixel: [128, 0, 0, 128],
-    released: true,
-  });
-});
-
-test('repeated raster passes reuse one export context, never losing it mid-session', async ({
-  page,
-}) => {
-  await page.goto('/tests/browser/fixtures/webgl-harness.html');
-  const proof = await page.evaluate(async () => {
-    const {
-      rasterizePointsWebgl,
-      releaseWebglRasterCanvas,
-    } = await import(
-      '/assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js'
-    );
-    const identity = () => Float32Array.from([
-      1, 0, 0, 0,
-      0, 1, 0, 0,
-      0, 0, 1, 0,
-      0, 0, 0, 1,
-    ]);
-    const renderState = {
-      antialias: true,
-      cameraPosition: [0, 0, 3],
-      fogColor: [0, 0, 0],
-      fogDensity: 0,
-      fogFar: 3.5,
-      fogNear: 2.5,
-      fov: 1,
-      lightDir: [0, 0, 1],
-      lightingStrength: 0,
-      modelMatrix: identity(),
-      mvpMatrix: identity(),
-      pointSize: 4,
-      projectionMatrix: identity(),
-      shaderQuality: 'ultralight',
-      sizeAttenuation: 0,
-      viewMatrix: identity(),
-      viewportHeight: 8,
-      viewportWidth: 8,
-    };
-    const releases = [];
-    const canvases = new Set();
-    const contexts = new Set();
-    // Two passes leased at once take two contexts; both return to the pool.
-    const overlapping = [];
-    for (let index = 0; index < 2; index++) {
-      overlapping.push(rasterizePointsWebgl({
-        dimension: 3,
-        colors: Uint8Array.from([255, 0, 0, 255]),
-        outputHeightPx: 8,
-        outputWidthPx: 8,
-        pointSizePx: 4,
-        positions: Float32Array.from([0, 0, 0]),
-        renderState,
-      }));
+        viewportHeight: 8,
+        viewportWidth: 8,
+      };
+      const passes = [];
+      for (let index = 0; index < 24; index++) {
+        const frame = rasterizePointsWebgl({
+          dimension: 3,
+          colors: Uint8Array.from([255, 0, 0, 255]),
+          outputHeightPx: 8,
+          outputWidthPx: 8,
+          pointSizePx: 4,
+          positions: Float32Array.from([0, 0, 0]),
+          renderState,
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = 8;
+        canvas.height = 8;
+        const context = canvas.getContext('2d');
+        context.drawImage(frame, 0, 0);
+        const pixel = context.getImageData(4, 4, 1, 1).data;
+        const [rasterCanvas] = canvases;
+        passes.push({
+          drewRed: pixel[0] > 0 && pixel[3] > 0,
+          frameSize: `${frame.width}x${frame.height}`,
+          lost: contexts[0].isContextLost(),
+          shrunk: rasterCanvas.width === 1 && rasterCanvas.height === 1,
+        });
+        frame.close();
+        await Promise.resolve();
+      }
+      return { passes, canvasCount: canvases.size, contextCount: contexts.length };
+    } finally {
+      OffscreenCanvas.prototype.getContext = originalGetContext;
     }
-    const overlappingDistinct = overlapping[0] !== overlapping[1];
-    for (const canvas of overlapping) releaseWebglRasterCanvas(canvas);
-    for (let index = 0; index < 24; index++) {
-      const canvas = rasterizePointsWebgl({
-        dimension: 3,
-        colors: Uint8Array.from([255, 0, 0, 255]),
-        outputHeightPx: 8,
-        outputWidthPx: 8,
-        pointSizePx: 4,
-        positions: Float32Array.from([0, 0, 0]),
-        renderState,
-      });
-      const gl = canvas.getContext('webgl2');
-      canvases.add(canvas);
-      contexts.add(gl);
-      const pixel = new Uint8Array(4);
-      gl.readPixels(4, 4, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
-      releases.push({
-        beforeReleaseLost: gl.isContextLost(),
-        drewRed: pixel[0] > 0 && pixel[3] > 0,
-        first: releaseWebglRasterCanvas(canvas),
-        second: releaseWebglRasterCanvas(canvas),
-        afterReleaseLost: gl.isContextLost(),
-        shrunk: canvas.width === 1 && canvas.height === 1,
-      });
-      await Promise.resolve();
-    }
-    return { releases, canvasCount: canvases.size, contextCount: contexts.size, overlappingDistinct };
   });
 
-  expect(proof.overlappingDistinct).toBe(true);
-  // Sequential passes all draw on the same pooled canvas and context.
+  // Every pass draws on the same canvas and context, which shrinks to one
+  // pixel after each frame leaves it.
   expect(proof.canvasCount).toBe(1);
   expect(proof.contextCount).toBe(1);
-  expect(proof.releases).toEqual(
+  expect(proof.passes).toEqual(
     Array.from({ length: 24 }, () => ({
-      beforeReleaseLost: false,
       drewRed: true,
-      first: true,
-      second: false,
-      afterReleaseLost: false,
+      frameSize: '8x8',
+      lost: false,
       shrunk: true,
     })),
   );

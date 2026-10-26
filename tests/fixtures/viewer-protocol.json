@@ -1,0 +1,399 @@
+{
+  "schema": 1,
+  "channel": {
+    "path": "_cellucid/ws",
+    "hello": [
+      "type",
+      "viewerId",
+      "viewerToken"
+    ],
+    "welcome": [
+      "type"
+    ],
+    "closeCodes": {
+      "normal": 1000,
+      "goingAway": 1001,
+      "protocolViolation": 1008,
+      "unauthorized": 4401,
+      "replaced": 4409
+    },
+    "binaryFrame": "uint32 little-endian header length, UTF-8 JSON header, body"
+  },
+  "page": {
+    "parameters": [
+      "viewer",
+      "viewerId",
+      "viewerToken",
+      "anndata"
+    ],
+    "mode": "viewer"
+  },
+  "runtimes": {
+    "python": "Python",
+    "jupyter": "Jupyter",
+    "r": "R"
+  },
+  "protocolDocument": {
+    "channel": "_cellucid/ws",
+    "commands": [
+      "clearHighlights",
+      "debug_snapshot",
+      "freeze",
+      "highlight",
+      "ping",
+      "requestSessionBundle",
+      "resetCamera",
+      "setColorBy",
+      "setDataMapping",
+      "setVisibility"
+    ],
+    "binaryCommands": [
+      "highlight",
+      "setVisibility"
+    ],
+    "events": [
+      "click",
+      "command_error",
+      "data_mapping",
+      "debug_snapshot",
+      "hover",
+      "pong",
+      "ready",
+      "selection",
+      "session_bundle"
+    ]
+  },
+  "commands": {
+    "ping": [
+      "type",
+      "requestId"
+    ],
+    "debug_snapshot": [
+      "type",
+      "requestId"
+    ],
+    "requestSessionBundle": [
+      "type",
+      "requestId"
+    ],
+    "clearHighlights": [
+      "type"
+    ],
+    "setColorBy": [
+      "type",
+      "field"
+    ],
+    "resetCamera": [
+      "type"
+    ],
+    "freeze": [
+      "type"
+    ],
+    "setDataMapping": [
+      "type",
+      "requestId",
+      "mapping"
+    ]
+  },
+  "binaryCommands": {
+    "highlight": [
+      "type",
+      "color"
+    ],
+    "setVisibility": [
+      "type",
+      "visible",
+      "all"
+    ]
+  },
+  "events": {
+    "hover": [
+      "type",
+      "cell",
+      "position"
+    ],
+    "click": [
+      "type",
+      "cell",
+      "button",
+      "shift",
+      "ctrl"
+    ],
+    "ready": [
+      "type",
+      "n_cells",
+      "dimensions"
+    ],
+    "pong": [
+      "type",
+      "requestId",
+      "t"
+    ],
+    "debug_snapshot": [
+      "type",
+      "requestId",
+      "ts",
+      "locationHref",
+      "origin",
+      "serverUrl",
+      "connected",
+      "userAgent"
+    ],
+    "command_error": [
+      "type",
+      "command",
+      "reason"
+    ],
+    "data_mapping": [
+      "type",
+      "requestId",
+      "origin",
+      "mapping"
+    ]
+  },
+  "binaryEvents": {
+    "selection": [
+      "type",
+      "source"
+    ],
+    "session_bundle": [
+      "type",
+      "requestId"
+    ]
+  },
+  "dataMappingOrigins": [
+    "default",
+    "best_guess",
+    "session",
+    "user",
+    "notebook"
+  ],
+  "commandErrorReasonLimit": 240,
+  "examples": {
+    "hello": {
+      "type": "hello",
+      "viewerId": "0123456789abcdef",
+      "viewerToken": "0123456789abcdef0123456789abcdef"
+    },
+    "welcome": {
+      "type": "welcome"
+    },
+    "commands": [
+      {
+        "type": "ping",
+        "requestId": "r1"
+      },
+      {
+        "type": "debug_snapshot",
+        "requestId": "r2"
+      },
+      {
+        "type": "requestSessionBundle",
+        "requestId": "r3"
+      },
+      {
+        "type": "clearHighlights"
+      },
+      {
+        "type": "setColorBy",
+        "field": "cell_type"
+      },
+      {
+        "type": "resetCamera"
+      },
+      {
+        "type": "freeze"
+      },
+      {
+        "type": "setDataMapping",
+        "requestId": "r4",
+        "mapping": {
+          "kind": "anndata",
+          "embeddings": {
+            "enabled": [
+              {
+                "key": "X_umap",
+                "columns": [
+                  0,
+                  1
+                ]
+              }
+            ],
+            "defaults": {
+              "1d": null,
+              "2d": {
+                "key": "X_umap",
+                "columns": [
+                  0,
+                  1
+                ]
+              },
+              "3d": null
+            }
+          },
+          "knn": null,
+          "geneNames": "index",
+          "expression": "X",
+          "log1p": {},
+          "highlyVariable": null,
+          "latent": null,
+          "vectorFields": []
+        }
+      }
+    ],
+    "binaryCommands": [
+      {
+        "header": {
+          "type": "highlight",
+          "color": "#e41a1c"
+        },
+        "cells": [
+          0,
+          2,
+          7
+        ],
+        "hex": "280000007b2274797065223a22686967686c69676874222c22636f6c6f72223a2223653431613163227d2020000000000200000007000000"
+      },
+      {
+        "header": {
+          "type": "highlight",
+          "color": "#00FF7f"
+        },
+        "cells": [
+          5,
+          2147483648,
+          4294967295
+        ],
+        "hex": "280000007b2274797065223a22686967686c69676874222c22636f6c6f72223a2223303046463766227d20200500000000000080ffffffff"
+      },
+      {
+        "header": {
+          "type": "setVisibility",
+          "visible": false,
+          "all": false
+        },
+        "cells": [
+          1,
+          3
+        ],
+        "hex": "340000007b2274797065223a227365745669736962696c697479222c2276697369626c65223a66616c73652c22616c6c223a66616c73657d0100000003000000"
+      },
+      {
+        "header": {
+          "type": "setVisibility",
+          "visible": true,
+          "all": true
+        },
+        "cells": [],
+        "hex": "340000007b2274797065223a227365745669736962696c697479222c2276697369626c65223a747275652c22616c6c223a747275657d2020"
+      }
+    ],
+    "events": [
+      {
+        "type": "hover",
+        "cell": 3,
+        "position": {
+          "x": 0.5,
+          "y": -1,
+          "z": 0
+        }
+      },
+      {
+        "type": "hover",
+        "cell": null,
+        "position": null
+      },
+      {
+        "type": "click",
+        "cell": 3,
+        "button": 0,
+        "shift": false,
+        "ctrl": true
+      },
+      {
+        "type": "ready",
+        "n_cells": 100,
+        "dimensions": 2
+      },
+      {
+        "type": "pong",
+        "requestId": "r1",
+        "t": 1761300000000
+      },
+      {
+        "type": "debug_snapshot",
+        "requestId": "r2",
+        "ts": "2026-10-24T12:00:00.000Z",
+        "locationHref": "http://127.0.0.1:8765/?viewer=true",
+        "origin": "http://127.0.0.1:8765",
+        "serverUrl": "http://127.0.0.1:8765",
+        "connected": true,
+        "userAgent": null
+      },
+      {
+        "type": "command_error",
+        "command": "setColorBy",
+        "reason": "no field named cell_type"
+      },
+      {
+        "type": "data_mapping",
+        "requestId": "r4",
+        "origin": "notebook",
+        "mapping": {
+          "kind": "anndata",
+          "embeddings": {
+            "enabled": [
+              {
+                "key": "X_umap",
+                "columns": [
+                  0,
+                  1
+                ]
+              }
+            ],
+            "defaults": {
+              "1d": null,
+              "2d": {
+                "key": "X_umap",
+                "columns": [
+                  0,
+                  1
+                ]
+              },
+              "3d": null
+            }
+          },
+          "knn": null,
+          "geneNames": "index",
+          "expression": "X",
+          "log1p": {},
+          "highlyVariable": null,
+          "latent": null,
+          "vectorFields": []
+        }
+      }
+    ],
+    "binaryEvents": [
+      {
+        "header": {
+          "type": "selection",
+          "source": "lasso"
+        },
+        "cells": [
+          0,
+          2,
+          7
+        ],
+        "hex": "250000007b2274797065223a2273656c656374696f6e222c22736f75726365223a226c6173736f227d000000000200000007000000"
+      },
+      {
+        "header": {
+          "type": "session_bundle",
+          "requestId": "r3"
+        },
+        "bodyText": "CELLUCID_SESSION\n",
+        "hex": "2a0000007b2274797065223a2273657373696f6e5f62756e646c65222c22726571756573744964223a227233227d43454c4c554349445f53455353494f4e0a"
+      }
+    ]
+  }
+}

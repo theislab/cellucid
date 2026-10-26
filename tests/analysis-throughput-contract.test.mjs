@@ -9,16 +9,13 @@
  * - A density curve is computed once per page-values array and bandwidth, and
  *   the narrow/wide bandwidths no longer run (and discard) the auto kernel sum
  *   first; the curves are bit-identical to that double computation.
- * - The quantization pool hands a decode to an idle worker instead of queueing
- *   it behind a busy one in round-robin order.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { pageValueAt } from '../assets/js/app/analysis/shared/category-counts.js';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { LRUCache } from '../assets/js/app/analysis/shared/lru-cache.js';
-import { processQuantizationWorkerMessage } from '../assets/js/data/quantization-worker.js';
-import { QuantizationWorkerPool } from '../assets/js/data/quantization-worker-pool.js';
 
 const POINT_COUNT = 64;
 
@@ -106,8 +103,13 @@ test('continuous page values keep the field element type and exact numbers', asy
   const categorical = await layer.getDataForPages({
     type: 'categorical_obs', variableKey: 'cluster', pageIds: ['a'],
   });
-  assert.ok(Array.isArray(categorical[0].values), 'category names stay a plain array');
-  assert.deepEqual(categorical[0].values.slice(0, 4), ['x', 'z', 'y', 'x']);
+  // Category codes at the field's own width, decoded through the page's categories.
+  const [categoricalPage] = categorical;
+  assert.ok(ArrayBuffer.isView(categoricalPage.values), 'category codes stay typed');
+  assert.deepEqual(
+    Array.from({ length: 4 }, (_, i) => pageValueAt(categoricalPage, i)),
+    ['x', 'z', 'y', 'x']
+  );
 });
 
 test('an empty page publishes empty values of the field type', async t => {
@@ -289,71 +291,6 @@ test('density curves are bit-identical to the double computation and computed on
     assert.equal(csv.rows.length, traces.reduce((sum, trace) => sum + trace.x.length, 0));
     assert.equal(csv.rows[0].density, traces[0].y[0].toFixed(6));
   }
-});
-
-function installHoldingWorkers(t) {
-  const original = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
-  const instances = [];
-  class HoldingWorker {
-    constructor() {
-      this.held = [];
-      this.hold = false;
-      this.received = 0;
-      this.onmessage = null;
-      this.onerror = null;
-      instances.push(this);
-    }
-    postMessage(message) {
-      this.received++;
-      if (this.hold) {
-        this.held.push(message);
-        return;
-      }
-      void this.reply(message);
-    }
-    async reply(message) {
-      const data = await processQuantizationWorkerMessage(message);
-      this.onmessage?.({ data });
-    }
-    release() {
-      this.hold = false;
-      for (const message of this.held.splice(0)) void this.reply(message);
-    }
-    terminate() {}
-  }
-  Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: HoldingWorker });
-  t.after(() => {
-    if (original === undefined) delete globalThis.Worker;
-    else Object.defineProperty(globalThis, 'Worker', original);
-  });
-  return instances;
-}
-
-test('a quantized decode goes to an idle worker, never behind a busy one', { timeout: 10_000 }, async t => {
-  const task = () => ({
-    buffer: Uint8Array.of(0, 254).buffer,
-    gzipOutputBytes: null,
-    dtype: 'uint8',
-    bits: 8,
-    minValue: 0,
-    maxValue: 1,
-  });
-  const workers = installHoldingWorkers(t);
-  const pool = new QuantizationWorkerPool({ poolSize: 2 });
-  assert.equal(await pool.init(), true);
-  workers[0].hold = true;
-  const slow = pool.dequantizeToFloat32(task());
-  // Worker 0 is busy for as long as the test holds it; every later decode must
-  // run on worker 1 as soon as it is idle, which round-robin did not do.
-  for (let i = 0; i < 4; i++) {
-    const values = await pool.dequantizeToFloat32(task());
-    assert.deepEqual(Array.from(values), [0, 1]);
-  }
-  assert.equal(workers[0].received, 1);
-  assert.equal(workers[1].received, 4);
-  workers[0].release();
-  assert.deepEqual(Array.from(await slow), [0, 1]);
-  assert.equal(pool._pending.size, 0);
 });
 
 test('kernel density slices computed apart join into the one-thread curve', async () => {

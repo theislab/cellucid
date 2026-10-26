@@ -448,7 +448,9 @@ test('marker worker uses centered moments and preserves extreme p-values', async
   runWorker('MARKERS_SET_CONTEXT', {
     codes: lowSpreadCodes,
     codeToGroupIndex: new Int32Array([0, 1]),
-    groupCount: 2
+    groupCount: 2,
+    tested: new Uint8Array(2).fill(1),
+    reference: -1
   }, 'low-spread-context');
 
   const lowSpreadValues = new Float32Array(lowSpreadSize * 2);
@@ -457,10 +459,12 @@ test('marker worker uses centered moments and preserves extreme p-values', async
     lowSpreadValues[lowSpreadSize + index] =
       100.0001 + ((index % 3) - 1) * 1e-5;
   }
-  const lowSpread = runWorker('MARKERS_COMPUTE_GENE', {
-    values: lowSpreadValues,
+  const lowSpread = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [lowSpreadValues],
     method: 'ttest',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'low-spread-gene');
   // Uncentered sums of squares over 30,000 values near 100 with a 1e-5 spread
   // cancel into a negative variance, which welchTTestFromMoments answers with
@@ -480,7 +484,9 @@ test('marker worker uses centered moments and preserves extreme p-values', async
   runWorker('MARKERS_SET_CONTEXT', {
     codes: tailCodes,
     codeToGroupIndex: new Int32Array([0, 1]),
-    groupCount: 2
+    groupCount: 2,
+    tested: new Uint8Array(2).fill(1),
+    reference: -1
   }, 'tail-context');
   const tailValues = new Float32Array(tailSize * 2);
   for (let index = 0; index < tailSize; index++) {
@@ -488,10 +494,12 @@ test('marker worker uses centered moments and preserves extreme p-values', async
     tailValues[index] = centered;
     tailValues[tailSize + index] = centered + 0.8;
   }
-  const tail = runWorker('MARKERS_COMPUTE_GENE', {
-    values: tailValues,
+  const tail = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [tailValues],
     method: 'ttest',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'tail-gene');
   assert.ok(tail.pValues instanceof Float64Array);
   assert.ok([...tail.pValues].every(pValue => pValue > 0));
@@ -781,13 +789,17 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
   runWorker('MARKERS_SET_CONTEXT', {
     codes,
     codeToGroupIndex: Int32Array.from([0, 1, 2]),
-    groupCount: 3
+    groupCount: 3,
+    tested: new Uint8Array(3).fill(1),
+    reference: -1
   }, 'one-vs-rest-context');
 
-  const result = runWorker('MARKERS_COMPUTE_GENE', {
-    values,
+  const result = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [values],
     method: 'wilcox',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'one-vs-rest-gene');
 
   // scipy.stats.mannwhitneyu(group, rest, alternative='two-sided',
@@ -802,7 +814,7 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
     assert.equal(result.nIn[group], 10);
     assert.equal(result.nOut[group], 20);
   }
-  assert.equal(result.nAll, 30);
+  assert.equal(result.nAll[0], 30);
 
   // numpy means and log2((meanIn + 0.01) / (meanOut + 0.01)); the worker keeps
   // fold change in Float32, so the tolerance is Float32 resolution.
@@ -823,19 +835,23 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
   runWorker('MARKERS_SET_CONTEXT', {
     codes: Uint16Array.from([0, 0, 0, 0, 1, 1, 1, 1]),
     codeToGroupIndex: Int32Array.from([0, 1]),
-    groupCount: 2
+    groupCount: 2,
+    tested: new Uint8Array(2).fill(1),
+    reference: -1
   }, 'all-zero-context');
-  const allZero = runWorker('MARKERS_COMPUTE_GENE', {
-    values: new Float32Array(8),
+  const allZero = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [new Float32Array(8)],
     method: 'wilcox',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'all-zero-gene');
   assert.deepEqual([...allZero.pValues], [1, 1]);
 
   delete globalThis.self;
 });
 
-test('rank inference is invariant to the export quantisation it reads', async () => {
+test('rank inference is invariant to a strictly increasing affine map of its values', async () => {
   const messages = [];
   globalThis.self = { postMessage: message => messages.push(message) };
   await import('../assets/js/app/analysis/compute/data-worker.js?quantisation-invariance');
@@ -847,13 +863,10 @@ test('rank inference is invariant to the export quantisation it reads', async ()
     return message.result;
   };
 
-  // Published exports store expression quantised, and the loader dequantises
-  // with `minValue + code * (maxValue - minValue) / maxQuant` — a strictly
-  // increasing affine map whenever minValue < maxValue. (The format also allows
-  // minValue == maxValue for a constant field, but then every code is 0, so the
-  // codes and the values are equally tied and ranks are unaffected.)
-  // A rank test must therefore return the same probability whether it is handed
-  // the codes or the dequantised values.
+  // A rank test depends only on order: handed integer codes or the values of
+  // a strictly increasing affine map of them
+  // (`minValue + code * (maxValue - minValue) / maxQuant`, minValue < maxValue),
+  // it must return the same probability.
   const dequantize = (codes, minValue, maxValue, bits) => {
     const maxQuant = bits === 8 ? 254 : 65534;
     const scale = (maxValue - minValue) / maxQuant;
@@ -879,13 +892,17 @@ test('rank inference is invariant to the export quantisation it reads', async ()
   runWorker('MARKERS_SET_CONTEXT', {
     codes: groupCodes,
     codeToGroupIndex: Int32Array.from([0, 1]),
-    groupCount: 2
+    groupCount: 2,
+    tested: new Uint8Array(2).fill(1),
+    reference: -1
   }, 'quantisation-context');
 
-  const rawResult = runWorker('MARKERS_COMPUTE_GENE', {
-    values: Float32Array.from(quantCodes),
+  const rawResult = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [Float32Array.from(quantCodes)],
     method: 'wilcox',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'quantisation-raw');
 
   for (const [bits, minValue, maxValue] of [
@@ -893,10 +910,12 @@ test('rank inference is invariant to the export quantisation it reads', async ()
     [16, 0, 400],
     [8, -3, 9.5]
   ]) {
-    const dequantised = runWorker('MARKERS_COMPUTE_GENE', {
-      values: dequantize(quantCodes, minValue, maxValue, bits),
+    const dequantised = runWorker('MARKERS_COMPUTE_GENES', {
+      columns: [dequantize(quantCodes, minValue, maxValue, bits)],
       method: 'wilcox',
-      minCells: 2
+      minCells: 2,
+      pConvention: 'exact',
+      foldChange: { mode: 'stored' }
     }, `quantisation-${bits}-${minValue}`);
     assert.deepEqual(
       [...dequantised.pValues],
@@ -1012,7 +1031,7 @@ test('Welch reports the condition that actually made its probability undefined',
   );
 });
 
-test('the marker worker publishes probabilities and effects, never a test statistic', async () => {
+test('the marker worker publishes probabilities, scores and effects, never U itself', async () => {
   const messages = [];
   globalThis.self = { postMessage: message => messages.push(message) };
   await import('../assets/js/app/analysis/compute/data-worker.js?statistic-free-contract');
@@ -1044,12 +1063,16 @@ test('the marker worker publishes probabilities and effects, never a test statis
   runWorker('MARKERS_SET_CONTEXT', {
     codes,
     codeToGroupIndex: Int32Array.from([0, 1]),
-    groupCount: 2
+    groupCount: 2,
+    tested: new Uint8Array(2).fill(1),
+    reference: -1
   }, 'statistic-free-context');
-  const result = runWorker('MARKERS_COMPUTE_GENE', {
-    values,
+  const result = runWorker('MARKERS_COMPUTE_GENES', {
+    columns: [values],
     method: 'wilcox',
-    minCells: 2
+    minCells: 2,
+    pConvention: 'exact',
+    foldChange: { mode: 'stored' }
   }, 'statistic-free-gene');
 
   // The exact statistic for this fixture, from
@@ -1067,22 +1090,31 @@ test('the marker worker publishes probabilities and effects, never a test statis
   assertRelative(result.pValues[0], 0.8797590880529592, 1e-12);
   assertRelative(result.pValues[1], 0.8797590880529592, 1e-12);
 
-  // The worker's published contract carries no statistic in any container.
+  // The worker's published contract carries no U in any container: the
+  // score is the rank-sum z, AUROC is U / (n1 n2) in [0, 1]. A task's genes
+  // are packed gene-major, with each gene's moments over every cell.
   assert.deepEqual(
     Object.keys(result).sort(),
     [
+      'auroc',
+      'genes',
+      'groupCount',
       'log2FoldChange',
       'meanInGroup',
       'meanOutGroup',
+      'moments',
       'nAll',
       'nIn',
       'nOut',
       'pValues',
       'percentInGroup',
-      'percentOutGroup'
+      'percentOutGroup',
+      'scores'
     ]
   );
-  assert.equal(result.nAll, total);
+  assert.equal(result.genes, 1);
+  assert.equal(result.groupCount, 2);
+  assert.equal(result.nAll[0], total);
   assert.deepEqual([...result.nIn], [inSize, outSize]);
   assert.deepEqual([...result.nOut], [outSize, inSize]);
 
@@ -1126,7 +1158,9 @@ test('marker worker one-vs-rest Wilcoxon equals the shared two-sample kernel exa
   runWorker('MARKERS_SET_CONTEXT', {
     codes,
     codeToGroupIndex: Int32Array.from({ length: groupCount }, (_, g) => g),
-    groupCount
+    groupCount,
+    tested: new Uint8Array(groupCount).fill(1),
+    reference: -1
   }, 'identity-context');
 
   for (const [label, draw] of [
@@ -1135,10 +1169,12 @@ test('marker worker one-vs-rest Wilcoxon equals the shared two-sample kernel exa
   ]) {
     const values = new Float32Array(cellCount);
     for (let i = 0; i < cellCount; i++) values[i] = draw();
-    const result = runWorker('MARKERS_COMPUTE_GENE', {
-      values,
+    const result = runWorker('MARKERS_COMPUTE_GENES', {
+      columns: [values],
       method: 'wilcox',
-      minCells: 2
+      minCells: 2,
+      pConvention: 'exact',
+      foldChange: { mode: 'stored' }
     }, `identity-${label}`);
     for (let group = 0; group < groupCount; group++) {
       const inGroup = [];

@@ -203,7 +203,7 @@ test('the types that are safe to time out keep the times they had', t => {
   }
 
   // A completed download is a success and times out like one.
-  const active = center.loading('Loading prepared dataset...', {
+  const active = center.loading('Loading dataset...', {
     category: 'data',
   });
   assert.equal(
@@ -276,7 +276,7 @@ test('work in progress is never evicted to make room for a sticky error', t => {
   const { center } = createRecordingCenter(t);
   center.maxNotifications = 3;
 
-  const download = center.loading('Loading embeddings/0_3d.bin...', {
+  const download = center.loading('Loading X_umap_3d...', {
     category: 'download',
   });
   for (let attempt = 0; attempt < 10; attempt++) {
@@ -339,7 +339,7 @@ test('a restore failure the serializer already published is not announced twice'
 
   // And the caller that would otherwise repeat it must consult the mark before
   // publishing, not after.
-  const loadFailureStart = controls.indexOf("'Failed to load state:'");
+  const loadFailureStart = controls.indexOf('Failed to load state:');
   assert.notEqual(
     loadFailureStart,
     -1,

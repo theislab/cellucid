@@ -10,16 +10,15 @@ import {
   assertArray,
   assertBoolean,
   assertCategoryPrimitive,
-  assertExactKeys,
   assertFiniteNumber,
   assertNonEmptyString,
-  assertPlainRecord,
   assertSafeInteger,
   DUPLICATE_CATEGORY_POSITION,
   describeCategory,
   indexCategoryPositions,
-  requireMethod
+  requireMethod,
 } from '../schema-contract.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 export const id = 'highlights-meta';
 export const HIGHLIGHT_RESTORE_TRANSACTION_ID = 'highlight-state';
@@ -32,15 +31,15 @@ const DIRECT_GROUP_KEYS = [
   'enabled',
   'cellCount'
 ];
+// A field-bound group names its field and category; their positions are
+// resolved from the names on restore and are not stored.
 const FIELD_GROUP_KEYS = [
   ...DIRECT_GROUP_KEYS,
   'fieldKey',
-  'fieldIndex',
   'fieldSource'
 ];
 const CATEGORY_GROUP_KEYS = [
   ...FIELD_GROUP_KEYS,
-  'categoryIndex',
   'categoryName'
 ];
 const RANGE_GROUP_KEYS = [
@@ -93,10 +92,17 @@ function groupKeys(type, context) {
   throw new TypeError(`${context} has unsupported type.`);
 }
 
+function liveGroupKeys(type, context) {
+  const keys = groupKeys(type, context);
+  if (type === 'category') return [...keys, 'fieldIndex', 'categoryIndex'];
+  if (type === 'range') return [...keys, 'fieldIndex'];
+  return keys;
+}
+
 function serializeGroup(group, pointCount, context) {
-  assertPlainRecord(group, context);
+  requirePlainRecord(group, context);
   const keys = groupKeys(group.type, context);
-  assertExactKeys(group, [...keys, 'cellIndices'], context);
+  requireExactKeys(group, [...liveGroupKeys(group.type, context), 'cellIndices'], context);
   if (
     group.cellIndices === null
     || group.cellIndices === undefined
@@ -114,8 +120,8 @@ function serializeGroup(group, pointCount, context) {
 }
 
 function assertGroup(group, pointCount, context) {
-  assertPlainRecord(group, context);
-  assertExactKeys(group, groupKeys(group.type, context), context);
+  requirePlainRecord(group, context);
+  requireExactKeys(group, groupKeys(group.type, context), context);
   numericSuffix(group.id, 'highlight_', `${context} id`);
   if (!GROUP_TYPES.has(group.type)) throw new TypeError(`${context} has unsupported type.`);
   assertNonEmptyString(group.label, `${context} label`);
@@ -131,15 +137,12 @@ function assertGroup(group, pointCount, context) {
 
   if (group.type === 'category') {
     assertNonEmptyString(group.fieldKey, `${context} fieldKey`);
-    assertSafeInteger(group.fieldIndex, `${context} fieldIndex`);
     if (group.fieldSource !== 'obs' && group.fieldSource !== 'var') {
       throw new TypeError(`${context} fieldSource must be "obs" or "var".`);
     }
-    assertSafeInteger(group.categoryIndex, `${context} categoryIndex`);
     assertCategoryPrimitive(group.categoryName, `${context} categoryName`);
   } else if (group.type === 'range') {
     assertNonEmptyString(group.fieldKey, `${context} fieldKey`);
-    assertSafeInteger(group.fieldIndex, `${context} fieldIndex`);
     if (group.fieldSource !== 'obs' && group.fieldSource !== 'var') {
       throw new TypeError(`${context} fieldSource must be "obs" or "var".`);
     }
@@ -289,7 +292,7 @@ function forEachFieldBoundGroup(payload, contextPrefix, visit) {
 }
 
 function assertPayload(payload, pointCount) {
-  assertExactKeys(payload, ['pages', 'activePageId'], 'Highlight metadata payload');
+  requireExactKeys(payload, ['pages', 'activePageId'], 'Highlight metadata payload');
   assertArray(payload.pages, 'Highlight metadata pages');
   if (payload.pages.length === 0) {
     throw new TypeError('Highlight metadata must contain the current nonempty page inventory.');
@@ -299,7 +302,7 @@ function assertPayload(payload, pointCount) {
   for (let pageIndex = 0; pageIndex < payload.pages.length; pageIndex++) {
     const page = payload.pages[pageIndex];
     const context = `Highlight page ${pageIndex}`;
-    assertExactKeys(page, PAGE_KEYS, context);
+    requireExactKeys(page, PAGE_KEYS, context);
     numericSuffix(page.id, 'page_', `${context} id`);
     if (pageIds.has(page.id)) {
       throw new TypeError(`Highlight page id "${page.id}" is duplicated.`);
@@ -398,7 +401,7 @@ export function capture(ctx) {
   // Restore re-derives every position from the names saved beside it, so the
   // file has to be written with names and positions that already agree.
   const bindHighlightField = createHighlightFieldBinder(state);
-  forEachFieldBoundGroup(payload, 'Current highlight', (group, context) => {
+  forEachFieldBoundGroup({ pages }, 'Current highlight', (group, context) => {
     const binding = bindHighlightField(group, context);
     if (binding.fieldIndex !== group.fieldIndex) {
       throw new RangeError(
@@ -430,7 +433,47 @@ export function capture(ctx) {
   }];
 }
 
+/**
+ * The obs fields a category group of the payload names whose categories are
+ * found when they are first loaded (a direct AnnData string or boolean
+ * column): a group binds by category name, so those fields are loaded before
+ * it is staged.
+ *
+ * @param {object} state
+ * @param {object} payload - A validated highlight metadata payload
+ * @returns {number[]} Their field positions
+ */
+function fieldsToLoadForBinding(state, payload) {
+  const fields = Array.isArray(state.obsData?.fields) ? state.obsData.fields : [];
+  const indexByKey = new Map(fields.map((field, index) => [field?.key, index]));
+  const pending = new Set();
+  forEachFieldBoundGroup(payload, 'Highlight', group => {
+    if (group.type !== 'category' || group.fieldSource !== 'obs') return;
+    const index = indexByKey.get(group.fieldKey);
+    if (index === undefined) return;
+    const field = fields[index];
+    if (field.kind === 'category' && field.categories === null) pending.add(index);
+  });
+  return [...pending];
+}
+
+/**
+ * Stage the highlight metadata of a session. Synchronous, unless a group
+ * names a field whose categories are found on load: those load first.
+ *
+ * @returns {void|Promise<void>}
+ */
 export function restore(ctx, chunkMeta, payload) {
+  const state = getState(ctx, 'restore');
+  assertPayload(payload, assertSafeInteger(state.pointCount, 'Highlight metadata dataset pointCount'));
+  const pending = fieldsToLoadForBinding(state, payload);
+  if (pending.length === 0) return stageRestore(ctx, chunkMeta, payload);
+  requireMethod(state, 'ensureFieldLoaded', 'Highlight metadata restore owner');
+  return Promise.all(pending.map(index => state.ensureFieldLoaded(index, { silent: true })))
+    .then(() => stageRestore(ctx, chunkMeta, payload));
+}
+
+function stageRestore(ctx, chunkMeta, payload) {
   const state = getState(ctx, 'restore');
   requireMethod(state, '_recomputeHighlightArray', 'Highlight metadata restore owner');
   requireMethod(state, '_notifyHighlightPageChange', 'Highlight metadata restore owner');

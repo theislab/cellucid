@@ -11,7 +11,6 @@
  * @module state/managers/field/category-ops
  */
 
-import { getCategoryColor } from '../../../../data/palettes.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { ChangeType, FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
@@ -19,7 +18,9 @@ import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import {
   buildDeleteToUnassignedTransform,
   buildMergeCategoriesTransform,
-  applyCategoryIndexMapping
+  applyCategoryIndexMapping,
+  carryCategoryStateThroughDelete,
+  carryCategoryStateThroughMerge
 } from '../../../utils/categorical-ops.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 
@@ -156,76 +157,33 @@ export class FieldCategoryOpsMethods {
     // In-place edit for user-defined derived fields:
     // avoids creating another full field copy on repeated destructive edits.
     if (editInPlace) {
-      const oldColors = sourceField._categoryColors;
-      const oldVisible = sourceField._categoryVisible;
-
-      const newColors = new Array(nextCategories.length);
-      const newVisible = {};
-      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
-
-      const merged = new Set(transform.mergedOldIndices);
-      const unassignedOld = transform.keptOldUnassignedIndex;
-      const unassignedNew = transform.unassignedNewIndex;
-
-      // Unassigned bucket: prefer the kept old unassigned color, otherwise palette default.
-      if (unassignedOld !== null) {
-        newColors[unassignedNew] = [...oldColors[unassignedOld]];
-        newVisible[unassignedNew] = oldVisible[unassignedOld];
-      } else {
-        newColors[unassignedNew] = getCategoryColor(unassignedNew);
-        newVisible[unassignedNew] = true;
-      }
-
-      // Copy remaining categories (skip those merged into unassigned).
-      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-        if (oldIdx === unassignedOld) continue;
-        if (merged.has(oldIdx)) continue;
-        const newIdx = transform.mapping[oldIdx];
-        newColors[newIdx] = [...oldColors[oldIdx]];
-        newVisible[newIdx] = oldVisible[oldIdx];
-      }
-
+      const fieldId = sourceField._userDefinedId;
       const nextCentroids = this._userDefinedFields.computeCentroidsByLayout(
         nextCodes,
         nextCategories,
         this
       );
-      const template = this._userDefinedFields.getField(sourceField._userDefinedId);
-      if (!template) {
-        throw new Error('The user-defined field registry does not own the edited field.');
-      }
       const highlightRemaps = collectHighlightCategoryRemaps(
         this,
         fieldIndex,
         transform.mapping
       );
 
-      sourceField.categories = nextCategories;
-      sourceField.codes = nextCodes;
-      sourceField._categoryColors = newColors;
-      sourceField._categoryVisible = newVisible;
-      // Freshly computed centroids are already in each layout's normalized
-      // space, and recorded as such.
-      sourceField.centroidsByLayout = nextCentroids.centroidsByLayout;
-      sourceField._normalizedLayouts = nextCentroids.normalizedLayouts;
-
-      delete sourceField._originalCategories;
-      delete sourceField.outlierQuantiles;
-      delete sourceField._outlierThreshold;
-
-      sourceField._operation = {
-        type: 'delete-to-unassigned',
-        deletedCategoryIndex: categoryIndex,
-        deletedCategoryLabel: deletedLabel,
-        unassignedLabel
-      };
-
-      // Keep serialized template in sync for persistence.
-      template.categories = nextCategories;
-      template.codes = sourceField.codes;
-      template.centroidsByLayout = sourceField.centroidsByLayout;
-      template._normalizedLayouts = sourceField._normalizedLayouts;
-      template._operation = sourceField._operation;
+      // Every view's copy of the field takes the new definition; each keeps
+      // its own colours and hidden categories. Freshly computed centroids are
+      // already in each layout's normalized space, and recorded as such.
+      this._publishUserDefinedCategorical(fieldId, {
+        categories: nextCategories,
+        codes: nextCodes,
+        centroidsByLayout: nextCentroids.centroidsByLayout,
+        normalizedLayouts: nextCentroids.normalizedLayouts,
+        operation: {
+          type: 'delete-to-unassigned',
+          deletedCategoryIndex: categoryIndex,
+          deletedCategoryLabel: deletedLabel,
+          unassignedLabel
+        }
+      }, state => carryCategoryStateThroughDelete(transform, state));
 
       // Remap any category-based highlight groups referencing this field.
       for (const remap of highlightRemaps) {
@@ -236,6 +194,7 @@ export class FieldCategoryOpsMethods {
       this._syncActiveContext();
 
       this.setActiveField(fieldIndex);
+      this._redrawViewsUsingUserDefinedField(fieldId, { includeFocused: false });
 
       this.updateFilterSummary();
       this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
@@ -280,34 +239,12 @@ export class FieldCategoryOpsMethods {
     const derivedField = created.field;
 
     // Carry forward category UI state (colors/visibility) as a convenience.
-    const newColors = new Array(nextCategories.length);
-    const newVisible = {};
-    for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
-
-    const oldColors = sourceField._categoryColors;
-    const oldVisible = sourceField._categoryVisible;
-
-    const unassignedOld = transform.keptOldUnassignedIndex;
-    const unassignedNew = transform.unassignedNewIndex;
-    if (unassignedOld !== null) {
-      newColors[unassignedNew] = [...oldColors[unassignedOld]];
-      newVisible[unassignedNew] = oldVisible[unassignedOld];
-    } else {
-      newColors[unassignedNew] = getCategoryColor(unassignedNew);
-      newVisible[unassignedNew] = true;
-    }
-
-    const merged = new Set(transform.mergedOldIndices);
-    for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-      if (oldIdx === unassignedOld) continue;
-      if (merged.has(oldIdx)) continue;
-      const newIdx = transform.mapping[oldIdx];
-      newColors[newIdx] = [...oldColors[oldIdx]];
-      newVisible[newIdx] = oldVisible[oldIdx];
-    }
-
-    derivedField._categoryColors = newColors;
-    derivedField._categoryVisible = newVisible;
+    const carried = carryCategoryStateThroughDelete(transform, {
+      colors: sourceField._categoryColors,
+      visible: sourceField._categoryVisible
+    });
+    derivedField._categoryColors = carried.colors;
+    derivedField._categoryVisible = carried.visible;
     derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled;
     // Ensure this derived field does not carry latent outlier filtering state.
     delete derivedField.outlierQuantiles;
@@ -420,66 +357,36 @@ export class FieldCategoryOpsMethods {
     this.ensureCategoryMetadata(sourceField);
 
     if (editInPlace) {
-      const oldColors = sourceField._categoryColors;
-      const oldVisible = sourceField._categoryVisible;
-      const newColors = new Array(nextCategories.length);
-      const newVisible = {};
-      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
-
-      // Merged bucket color should come from the dragged category.
-      newColors[targetNewIndex] = [...oldColors[fromCategoryIndex]];
-      newVisible[targetNewIndex] = oldVisible[fromCategoryIndex] || oldVisible[toCategoryIndex];
-
-      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-        if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
-        const newIdx = transform.mapping[oldIdx];
-        newColors[newIdx] = [...oldColors[oldIdx]];
-        newVisible[newIdx] = oldVisible[oldIdx];
-      }
-
+      const fieldId = sourceField._userDefinedId;
       const nextCentroids = this._userDefinedFields.computeCentroidsByLayout(
         nextCodes,
         nextCategories,
         this
       );
-      const template = this._userDefinedFields.getField(sourceField._userDefinedId);
-      if (!template) {
-        throw new Error('The user-defined field registry does not own the edited field.');
-      }
       const highlightRemaps = collectHighlightCategoryRemaps(
         this,
         fieldIndex,
         transform.mapping
       );
 
-      sourceField.categories = nextCategories;
-      sourceField.codes = nextCodes;
-      sourceField._categoryColors = newColors;
-      sourceField._categoryVisible = newVisible;
-      // Freshly computed centroids are already in each layout's normalized
-      // space, and recorded as such.
-      sourceField.centroidsByLayout = nextCentroids.centroidsByLayout;
-      sourceField._normalizedLayouts = nextCentroids.normalizedLayouts;
-
-      delete sourceField._originalCategories;
-      delete sourceField.outlierQuantiles;
-      delete sourceField._outlierThreshold;
-
-      sourceField._operation = {
-        type: 'merge-categories',
-        fromCategoryIndex,
-        toCategoryIndex,
-        fromCategoryLabel: fromLabel,
-        toCategoryLabel: toLabel,
-        mergedCategoryLabel: mergedLabel
-      };
-
-      // Keep serialized template in sync for persistence.
-      template.categories = nextCategories;
-      template.codes = sourceField.codes;
-      template.centroidsByLayout = sourceField.centroidsByLayout;
-      template._normalizedLayouts = sourceField._normalizedLayouts;
-      template._operation = sourceField._operation;
+      // Every view's copy of the field takes the new definition; each keeps
+      // its own colours and hidden categories, the merged category the
+      // dragged one's colour. Freshly computed centroids are already in each
+      // layout's normalized space, and recorded as such.
+      this._publishUserDefinedCategorical(fieldId, {
+        categories: nextCategories,
+        codes: nextCodes,
+        centroidsByLayout: nextCentroids.centroidsByLayout,
+        normalizedLayouts: nextCentroids.normalizedLayouts,
+        operation: {
+          type: 'merge-categories',
+          fromCategoryIndex,
+          toCategoryIndex,
+          fromCategoryLabel: fromLabel,
+          toCategoryLabel: toLabel,
+          mergedCategoryLabel: mergedLabel
+        }
+      }, state => carryCategoryStateThroughMerge(transform, fromCategoryIndex, toCategoryIndex, state));
 
       // Remap any category-based highlight groups referencing this field.
       for (const remap of highlightRemaps) {
@@ -490,6 +397,7 @@ export class FieldCategoryOpsMethods {
       this._syncActiveContext();
 
       this.setActiveField(fieldIndex);
+      this._redrawViewsUsingUserDefinedField(fieldId, { includeFocused: false });
 
       this.updateFilterSummary();
       this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
@@ -534,25 +442,12 @@ export class FieldCategoryOpsMethods {
     const derivedField = created.field;
 
     // Carry forward category UI state (colors/visibility).
-    const newColors = new Array(nextCategories.length);
-    const newVisible = {};
-    for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
-
-    const oldColors = sourceField._categoryColors;
-    const oldVisible = sourceField._categoryVisible;
-
-    newColors[targetNewIndex] = [...oldColors[fromCategoryIndex]];
-    newVisible[targetNewIndex] = oldVisible[fromCategoryIndex] || oldVisible[toCategoryIndex];
-
-    for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-      if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
-      const newIdx = transform.mapping[oldIdx];
-      newColors[newIdx] = [...oldColors[oldIdx]];
-      newVisible[newIdx] = oldVisible[oldIdx];
-    }
-
-    derivedField._categoryColors = newColors;
-    derivedField._categoryVisible = newVisible;
+    const carried = carryCategoryStateThroughMerge(transform, fromCategoryIndex, toCategoryIndex, {
+      colors: sourceField._categoryColors,
+      visible: sourceField._categoryVisible
+    });
+    derivedField._categoryColors = carried.colors;
+    derivedField._categoryVisible = carried.visible;
     derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled;
 
     delete derivedField.outlierQuantiles;

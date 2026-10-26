@@ -10,37 +10,19 @@
  *   copy and close buttons in the frame's header action bar beside the summary
  * - Copies are "floating-only" (not dockable back into the sidebar)
  * - Each window owns its own Analysis UI instance and must be cleaned up on close
- * - Settings are copied via UI exportSettings/importSettings (results intentionally excluded)
+ * - Settings are copied via UI exportSettings/importSettings; a copied window
+ *   starts without a result, while a session window also restores its result
+ *   (UI exportResult/importResult)
+ * - A new window of an analysis opens at the size its last window was given
+ *   (shared/analysis-view-sizes.js); on a phone every window is a bottom sheet
  */
 
 import { getDockableAccordions } from '../../dockable-accordions-registry.js';
-import { SIDEBAR_MAX_WIDTH_PX, SIDEBAR_MIN_WIDTH_PX } from '../../sidebar-metrics.js';
+import { SIDEBAR_MIN_WIDTH_PX } from '../../sidebar-metrics.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { analysisViewSizes } from '../shared/analysis-view-sizes.js';
 import { expandPagesWithDerived } from '../shared/page-derivation-utils.js';
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function requireExactKeys(value, expectedKeys, label) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  const actualKeys = Object.keys(value).sort();
-  const sortedExpected = [...expectedKeys].sort();
-  if (
-    actualKeys.length !== sortedExpected.length ||
-    actualKeys.some((key, index) => key !== sortedExpected[index])
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly: ${sortedExpected.join(', ')}`
-    );
-  }
-}
+import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -110,8 +92,43 @@ function requireSessionRect(rect) {
   }
 }
 
+/** `--pos-*` is written by `StyleManager.setPosition()` as a bare pixel length. */
+const PANEL_LENGTH_PATTERN = /^(-?(?:\d+(?:\.\d+)?|\.\d+))px$/;
+
+/**
+ * A window's own box: `--pos-x/y/width/height` on its frame. A measurement
+ * would report what the stylesheet drew instead — the header height of a
+ * collapsed window, the full screen of a phone sheet.
+ *
+ * @param {HTMLElement} frame
+ * @param {string} windowId
+ */
+function readWindowRect(frame, windowId) {
+  const read = (property) => {
+    const match = PANEL_LENGTH_PATTERN.exec(frame.style.getPropertyValue(property).trim());
+    if (match === null) {
+      throw new TypeError(`Analysis window "${windowId}" ${property} must be a pixel length`);
+    }
+    return Number(match[1]);
+  };
+  return {
+    left: read('--pos-x'),
+    top: read('--pos-y'),
+    width: read('--pos-width'),
+    height: read('--pos-height')
+  };
+}
+
+function readWindowLayer(frame, windowId) {
+  const raw = frame.style.getPropertyValue('--z-layer').trim();
+  if (!/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new TypeError(`Analysis window "${windowId}" must have an integer layer`);
+  }
+  return Number(raw);
+}
+
 function requireSettings(settings) {
-  if (!isPlainObject(settings)) {
+  if (!isPlainRecord(settings)) {
     throw new TypeError('Analysis window settings must be an object');
   }
   return structuredClone(settings);
@@ -209,16 +226,19 @@ export class AnalysisWindowManager {
   }
 
   /**
-   * Export all floating analysis windows as session restore descriptors.
+   * Export all floating analysis windows as session restore descriptors,
+   * back to front.
    *
    * The session bundle stores analysis windows as eager JSON so the UI can be
-   * reconstructed quickly. Results are intentionally excluded; only settings
-   * and geometry are persisted.
+   * reconstructed quickly: the window's own box (not the collapsed or phone
+   * layout the stylesheet may be drawing), whether it is open, its layer,
+   * settings and the shown result (`ui.exportResult()`: null, or
+   * `{kind, version, payload}` of JSON values and typed arrays; see
+   * shared/analysis-result-session.js).
    *
-   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>}
+   * @returns {Array<{ modeId: string, open: boolean, rect: { left: number, top: number, width: number, height: number }, z: number, settings: any, result: null|Object, headerTitle: string }>}
    */
   exportSessionWindows() {
-    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>} */
     const out = [];
 
     for (const entry of this._windows.values()) {
@@ -237,57 +257,105 @@ export class AnalysisWindowManager {
       requireNonEmptyString(entry.modeId, 'Analysis window modeId');
       requireNonEmptyString(entry.headerTitle, 'Analysis window headerTitle');
 
-      const measuredRect = entry.frame.getBoundingClientRect();
-      const rect = {
-        left: measuredRect.left,
-        top: measuredRect.top,
-        width: measuredRect.width,
-        height: measuredRect.height
-      };
+      const rect = readWindowRect(entry.frame, entry.id);
       requireSessionRect(rect);
       const settings = requireSettings(entry.ui.exportSettings());
 
       out.push({
         modeId: entry.modeId,
+        open: entry.details.open === true,
         rect,
+        z: readWindowLayer(entry.frame, entry.id),
         settings,
+        result: entry.ui.exportResult(),
         headerTitle: entry.headerTitle
       });
     }
 
-    return out;
+    return out.sort((a, b) => a.z - b.z);
   }
 
   /**
-   * Create a floating analysis window from a session restore descriptor.
+   * The sizes remembered per analysis, for the session.
+   * @returns {{window: Object, expandedView: Object}}
+   */
+  exportViewSizes() {
+    return analysisViewSizes.exportSizes();
+  }
+
+  /**
+   * Replace the sizes remembered per analysis with a session's.
+   * @param {{window: Object, expandedView: Object}} sizes
+   */
+  importViewSizes(sizes) {
+    analysisViewSizes.importSizes(sizes, modeId => this._uiManager.getTypeInfo(modeId) !== null);
+  }
+
+  /**
+   * Create a floating analysis window from a session restore descriptor:
+   * its box, open state and layer, its settings, then its result. With a
+   * result the window ID comes once the result is shown; a refused result
+   * closes the window again.
    *
-   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string }} descriptor
-   * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
+   * @param {{ modeId: string, open: boolean, rect: { left: number, top: number, width: number, height: number }, z: number, settings: Object, result: null|Object, headerTitle: string }} descriptor
+   * @returns {string|Promise<string>} windowId, or a promise of it (or of the
+   *   failure, after rollback)
    */
   createFromSessionDescriptor(descriptor) {
     this._assertWindowCreationAvailable();
     requireExactKeys(
       descriptor,
-      ['headerTitle', 'modeId', 'rect', 'settings'],
+      ['headerTitle', 'modeId', 'open', 'rect', 'result', 'settings', 'z'],
       'Analysis window descriptor'
     );
     requireNonEmptyString(descriptor.modeId, 'Analysis window descriptor modeId');
     requireSessionRect(descriptor.rect);
+    if (typeof descriptor.open !== 'boolean') {
+      throw new TypeError('Analysis window descriptor open must be a boolean');
+    }
+    if (!Number.isSafeInteger(descriptor.z) || descriptor.z < 0) {
+      throw new TypeError('Analysis window descriptor z must be a non-negative integer');
+    }
     const settings = requireSettings(descriptor.settings);
     requireNonEmptyString(
       descriptor.headerTitle,
       'Analysis window descriptor headerTitle'
     );
 
-    return this._createWindow(descriptor.modeId, settings, {
+    const { result } = descriptor;
+    if (result !== null && !isPlainRecord(result)) {
+      throw new TypeError('Analysis window descriptor result must be null or an object');
+    }
+
+    const created = this._createWindow(descriptor.modeId, settings, {
       left: descriptor.rect.left,
       top: descriptor.rect.top,
       preferredSize: {
         width: descriptor.rect.width,
         height: descriptor.rect.height
       },
-      headerTitle: descriptor.headerTitle
+      headerTitle: descriptor.headerTitle,
+      open: descriptor.open,
+      z: descriptor.z
     });
+    if (result === null || typeof created !== 'string') return created;
+    const ui = this._windows.get(created)?.ui;
+    return Promise.resolve()
+      .then(() => ui.importResult(result))
+      .then(
+        () => created,
+        async error => {
+          try {
+            await this.closeWindow(created);
+          } catch (closeError) {
+            throw new AggregateError(
+              [error, closeError],
+              `Analysis window "${created}" result restore and its close both failed`
+            );
+          }
+          throw error;
+        }
+      );
   }
 
   /**
@@ -312,7 +380,13 @@ export class AnalysisWindowManager {
       );
     }
     const settings = requireSettings(originUi.exportSettings());
-    return this._createWindow(modeId, settings, options);
+    // A new window opens at the size the last one of this analysis was given.
+    const remembered = analysisViewSizes.windowSize(modeId);
+    return this._createWindow(
+      modeId,
+      settings,
+      remembered === null ? options : { ...options, preferredSize: remembered }
+    );
   }
 
   /**
@@ -571,6 +645,13 @@ export class AnalysisWindowManager {
     }
   }
 
+  /** The shown cells changed (a filter): every window's analysis hears it. */
+  onCellVisibilityChanged() {
+    for (const entry of this._windows.values()) {
+      entry.ui.onCellVisibilityChanged?.();
+    }
+  }
+
   // ===========================================================================
   // Internal helpers
   // ===========================================================================
@@ -636,7 +717,7 @@ export class AnalysisWindowManager {
     if (typeof typeInfo.factory !== 'function') {
       throw new TypeError(`Analysis mode "${modeId}" must define a factory`);
     }
-    if (!isPlainObject(typeInfo.factoryOptions)) {
+    if (!isPlainRecord(typeInfo.factoryOptions)) {
       throw new TypeError(
         `Analysis mode "${modeId}" factoryOptions must be an object`
       );
@@ -683,6 +764,8 @@ export class AnalysisWindowManager {
     const titleEl = document.createElement('span');
     titleEl.className = 'disclosure-title';
     titleEl.textContent = headerTitle;
+    // A narrow window ends its title in an ellipsis; the tooltip has it all.
+    titleEl.title = headerTitle;
 
     summary.appendChild(titleEl);
     details.appendChild(summary);
@@ -700,6 +783,22 @@ export class AnalysisWindowManager {
       observeWindowAction(
         () => this.copyFromWindow(windowId),
         `copy of analysis window "${windowId}"`
+      );
+    });
+
+    // Maximize fills the free area beside the sidebar; pressed again (or a
+    // double-click on the header) it gives the window back its size. The
+    // dockable owner keeps the button's label and pressed state.
+    const maximizeBtn = document.createElement('button');
+    maximizeBtn.type = 'button';
+    maximizeBtn.className = 'accordion-maximize-btn';
+    maximizeBtn.title = 'Maximize window';
+    maximizeBtn.setAttribute('aria-label', 'Maximize window');
+    maximizeBtn.setAttribute('aria-pressed', 'false');
+    maximizeBtn.addEventListener('click', () => {
+      observeWindowAction(
+        () => dockable.toggleMaximize(details),
+        `maximize of analysis window "${windowId}"`
       );
     });
 
@@ -795,8 +894,10 @@ export class AnalysisWindowManager {
       }
       for (const method of [
         'destroy',
+        'exportResult',
         'exportSettings',
         'getSelectedPages',
+        'importResult',
         'importSettings',
         'onHighlightChanged',
         'onPageSelectionChange'
@@ -812,7 +913,11 @@ export class AnalysisWindowManager {
       registrationAttempted = true;
       dockable.register(details, {
         dockable: false,
-        actions: [copyBtn, closeBtn, chevron]
+        actions: [copyBtn, maximizeBtn, closeBtn, chevron],
+        // The size the user gives a window is the size the next window of
+        // this analysis opens at.
+        onGeometryChange: size => analysisViewSizes.rememberWindowSize(modeId, size),
+        sheet: true
       });
       windowEntry.frame = dockable.panelFrame(details);
       windowEntry.frame.classList.add('analysis-window-frame');
@@ -825,6 +930,11 @@ export class AnalysisWindowManager {
         // position keeps it.
         besideOpenWindows: !hasLeft
       });
+      // A restored window takes back its saved open state and layer.
+      if (options.open !== undefined) details.open = options.open;
+      if (options.z !== undefined) {
+        windowEntry.frame.style.setProperty('--z-layer', String(options.z));
+      }
       this._windows.set(windowId, windowEntry);
       return windowId;
     } catch (error) {
@@ -909,7 +1019,7 @@ export class AnalysisWindowManager {
 
   _resolvePreferredSize(options = {}) {
     if (options.preferredSize !== undefined) {
-      if (!isPlainObject(options.preferredSize)) {
+      if (!isPlainRecord(options.preferredSize)) {
         throw new TypeError('Analysis window preferredSize must be an object');
       }
       const keys = Object.keys(options.preferredSize);
@@ -968,23 +1078,27 @@ export class AnalysisWindowManager {
     return null;
   }
 
+  /**
+   * A window's least size. Its width is the sidebar's least width less the
+   * sidebar's gutter, so the form inside lays out as it does docked; its
+   * height is the content's (the dockable owner adds the header and the
+   * first row). There is no greatest size but the viewport.
+   *
+   * @returns {{minWidth: number, minHeight: number}}
+   */
   _resolveFloatConstraints(options = {}) {
     if (options.constraints !== undefined) {
       requireExactKeys(
         options.constraints,
-        ['maxHeight', 'maxWidth', 'minHeight', 'minWidth'],
+        ['minHeight', 'minWidth'],
         'Analysis window constraints'
       );
-      const { minWidth, maxWidth, minHeight, maxHeight } = options.constraints;
+      const { minWidth, minHeight } = options.constraints;
       if (
         !isFiniteNumber(minWidth) ||
-        !isFiniteNumber(maxWidth) ||
         !isFiniteNumber(minHeight) ||
-        !(isFiniteNumber(maxHeight) || maxHeight === Infinity) ||
         minWidth <= 0 ||
-        maxWidth < minWidth ||
-        minHeight < 0 ||
-        maxHeight < minHeight
+        minHeight < 0
       ) {
         throw new TypeError('Analysis window constraints are invalid');
       }
@@ -998,28 +1112,17 @@ export class AnalysisWindowManager {
     if (!isFiniteNumber(sidebarWidth) || sidebarWidth <= 0) {
       throw new TypeError('Analysis window sidebar width must be positive and finite');
     }
-    const preferredWidth = options.preferredSize?.width;
-    let referenceWidth;
-    if (preferredWidth !== undefined) {
-      referenceWidth = preferredWidth;
-    } else {
-      const referenceDetails = typeof this._sidebar.querySelector === 'function'
-        ? this._sidebar.querySelector('details.accordion-section')
-        : null;
-      referenceWidth = referenceDetails?.getBoundingClientRect().width;
-    }
+    const referenceDetails = typeof this._sidebar.querySelector === 'function'
+      ? this._sidebar.querySelector('details.accordion-section')
+      : null;
+    const referenceWidth = referenceDetails?.getBoundingClientRect().width;
     const gutter = isFiniteNumber(referenceWidth)
       ? Math.max(0, sidebarWidth - referenceWidth)
       : 0;
 
-    const minWidth = Math.max(180, SIDEBAR_MIN_WIDTH_PX - gutter);
-    const maxWidth = Math.max(minWidth, SIDEBAR_MAX_WIDTH_PX - gutter);
-
     return {
-      minWidth,
-      maxWidth,
-      minHeight: 0,
-      maxHeight: Infinity
+      minWidth: Math.max(180, SIDEBAR_MIN_WIDTH_PX - gutter),
+      minHeight: 0
     };
   }
 

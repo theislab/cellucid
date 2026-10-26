@@ -9,12 +9,19 @@
  */
 
 import { rgbToCss, COLOR_PICKER_PALETTE } from '../../../data/palettes.js';
-import { fillNeutralGray } from '../core/constants.js';
 import { BaseManager } from '../core/base-manager.js';
 import { requireCategoryCodesInInventory } from './category-codes.js';
 import {
+  alphaBytesMirror,
+  cellVisibilityMaskWrites,
+  isAllShownCellVisibilityMask,
+  recordAlphaBytesMirror,
+  requireBinaryCellVisibilityMask,
+  transparencyArrayWrites,
+  transparencyEpoch,
   writableCellVisibilityMask,
-  writableColors,
+  writableColorAlphaBytes,
+  writableNeutralColors,
   writableTransparency,
 } from './per-cell-array-ownership.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
@@ -207,8 +214,284 @@ export function collectViewFilters(view) {
   return filters;
 }
 
+/*
+ * Per-cell visibility kernels of `computeGlobalVisibility`. Each writes every
+ * cell's visibility (exactly 0 or 1), the alpha byte of its packed color, and
+ * returns how many cells it showed, in one pass. They are separate functions
+ * so each is compiled for its own loop: inside one large method, a loop that
+ * had not run yet was optimized without type feedback and deoptimized on its
+ * first real use (a 40 ms first outlier step at 562,000 cells).
+ */
+
+function publishMaskVisibility(mask, transparency, colors, pointCount) {
+  let shown = 0;
+  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    const visible = mask[i];
+    transparency[i] = visible;
+    colors[j] = visible * 255;
+    shown += visible;
+  }
+  return shown;
+}
+
+function publishCategoryVisibility(mask, filter, transparency, colors, pointCount) {
+  const { codes, visibleByCode, missingCode, spansDtype } = filter;
+  let shown = 0;
+  if (spansDtype) {
+    for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+      const visible = mask[i] === 0 ? 0 : visibleByCode[codes[i]];
+      transparency[i] = visible;
+      colors[j] = visible * 255;
+      shown += visible;
+    }
+    return shown;
+  }
+  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    const code = codes[i];
+    const visible = mask[i] === 0
+      ? 0
+      : code === missingCode ? 1 : visibleByCode[code];
+    transparency[i] = visible;
+    colors[j] = visible * 255;
+    shown += visible;
+  }
+  return shown;
+}
+
+/**
+ * `publishCategoryVisibility` for a mask known to show every cell
+ * (`isAllShownCellVisibilityMask`): the mask is not read, so a cell's
+ * visibility is its code's table entry.
+ */
+function publishCategoryVisibilityUnmasked(filter, transparency, colors, pointCount) {
+  const { codes, visibleByCode, missingCode, spansDtype } = filter;
+  let shown = 0;
+  if (spansDtype) {
+    for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+      const visible = visibleByCode[codes[i]];
+      transparency[i] = visible;
+      colors[j] = visible * 255;
+      shown += visible;
+    }
+    return shown;
+  }
+  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    const code = codes[i];
+    const visible = code === missingCode ? 1 : visibleByCode[code];
+    transparency[i] = visible;
+    colors[j] = visible * 255;
+    shown += visible;
+  }
+  return shown;
+}
+
+function publishOutlierVisibility(mask, outliers, threshold, transparency, colors, pointCount) {
+  let shown = 0;
+  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    const q = outliers[i];
+    const visible = q >= 0 && q > threshold ? 0 : mask[i];
+    transparency[i] = visible;
+    colors[j] = visible * 255;
+    shown += visible;
+  }
+  return shown;
+}
+
+function publishFilteredVisibility(
+  mask,
+  categoryFilters,
+  continuousFilters,
+  varValues,
+  varMin,
+  varMax,
+  outliers,
+  outlierThreshold,
+  transparency,
+  colors,
+  pointCount
+) {
+  let shown = 0;
+  for (let i = 0; i < pointCount; i++) {
+    // The mask is tested first. No filter can make a cell the mask already
+    // hides visible again, so its predicates are never evaluated.
+    let visible = mask[i] === 1;
+
+    for (let cf = 0; visible && cf < categoryFilters.length; cf++) {
+      const filter = categoryFilters[cf];
+      const code = filter.codes[i];
+      if (
+        (filter.spansDtype || code !== filter.missingCode)
+        && filter.visibleByCode[code] === 0
+      ) {
+        visible = false;
+      }
+    }
+
+    for (let cf = 0; visible && cf < continuousFilters.length; cf++) {
+      const filter = continuousFilters[cf];
+      const v = filter.values[i];
+      if (v !== v || v < filter.min || v > filter.max) visible = false;
+    }
+
+    if (visible && varValues !== null) {
+      const v = varValues[i];
+      if (v !== v || v < varMin || v > varMax) visible = false;
+    }
+
+    // The outlier filter of the active field (only when it applies).
+    if (visible && outliers !== null) {
+      const q = outliers[i];
+      if (q >= 0 && q > outlierThreshold) visible = false;
+    }
+
+    const value = visible ? 1 : 0;
+    transparency[i] = value;
+    colors[i * 4 + 3] = value * 255;
+    shown += value;
+  }
+  return shown;
+}
+
+/*
+ * Visibility results kept for reuse. A pass's result is a pure function of its
+ * inputs: the cell mask (by identity and write count), each category filter's
+ * codes (by identity) and per-code table (by value), each continuous filter's
+ * values (by identity) and range, the active gene's filter, and the active
+ * field's outlier quantiles and threshold. Each transparency array a pass wrote
+ * carries those inputs and its write count; while the count stands the array
+ * still holds that result, whichever view holds it now (a kept view never
+ * writes an array it shares). Views with identical filters -- the kept views of
+ * a session restore, a switch between kept views -- then cost one copy instead
+ * of a pass over every cell. Keyed weakly by the array, an entry lives exactly
+ * as long as a view holds its result.
+ */
+const VISIBILITY_RESULTS = new WeakMap();
+
+function sameVisibilityInputs(a, b) {
+  if (
+    a.mask !== b.mask
+    || a.maskWrites !== b.maskWrites
+    || a.varValues !== b.varValues
+    || a.varMin !== b.varMin
+    || a.varMax !== b.varMax
+    || a.outliers !== b.outliers
+    || a.outlierThreshold !== b.outlierThreshold
+    || a.categoryFilters.length !== b.categoryFilters.length
+    || a.continuousFilters.length !== b.continuousFilters.length
+  ) {
+    return false;
+  }
+  for (let f = 0; f < a.categoryFilters.length; f++) {
+    const x = a.categoryFilters[f];
+    const y = b.categoryFilters[f];
+    if (x.codes !== y.codes || x.visibleByCode.length !== y.visibleByCode.length) {
+      return false;
+    }
+    for (let code = 0; code < x.visibleByCode.length; code++) {
+      if (x.visibleByCode[code] !== y.visibleByCode[code]) return false;
+    }
+  }
+  for (let f = 0; f < a.continuousFilters.length; f++) {
+    const x = a.continuousFilters[f];
+    const y = b.continuousFilters[f];
+    if (x.values !== y.values || x.min !== y.min || x.max !== y.max) return false;
+  }
+  return true;
+}
+
+/**
+ * A transparency array some view holds that still carries the result of
+ * exactly these inputs, or null.
+ *
+ * @returns {{transparency: Uint8Array, shown: number}|null}
+ */
+function findVisibilityResult(state, inputs) {
+  const candidates = [state.categoryTransparency];
+  if (state.viewContexts instanceof Map) {
+    for (const ctx of state.viewContexts.values()) {
+      const held = ctx?.categoryTransparency;
+      if (held instanceof Uint8Array && !candidates.includes(held)) candidates.push(held);
+    }
+  }
+  for (const transparency of candidates) {
+    const entry = VISIBILITY_RESULTS.get(transparency);
+    if (
+      entry !== undefined
+      && transparency.length === state.pointCount
+      && entry.writes === transparencyArrayWrites(transparency)
+      && sameVisibilityInputs(entry.inputs, inputs)
+    ) {
+      return { transparency, shown: entry.shown };
+    }
+  }
+  return null;
+}
+
+/**
+ * The inputs of the visibility `transparency` holds: those of the pass that
+ * wrote it, while it has not been written since; otherwise null.
+ *
+ * @param {Uint8Array} transparency
+ * @returns {object|null}
+ */
+export function visibilityResultInputs(transparency) {
+  const entry = VISIBILITY_RESULTS.get(transparency);
+  if (entry === undefined || entry.writes !== transparencyArrayWrites(transparency)) {
+    return null;
+  }
+  return entry.inputs;
+}
+
+/**
+ * Record that `transparency` holds the visibility of `mask` with no filter:
+ * every cell the mask shows (a dataset's first generation, all 1s, which
+ * `computeGlobalVisibility` would compute for it), so the first pass adopts
+ * it instead of computing it again.
+ *
+ * @param {Uint8Array} transparency
+ * @param {Uint8Array} mask - A mask showing every cell
+ *   (`createShownCellVisibilityMask`); `transparency` holds only 1s.
+ */
+export function recordUnfilteredVisibility(transparency, mask) {
+  if (!isAllShownCellVisibilityMask(mask) || transparency.length !== mask.length) {
+    throw new TypeError('An unfiltered first visibility needs a mask showing every cell.');
+  }
+  recordVisibilityResult(transparency, {
+    mask,
+    maskWrites: cellVisibilityMaskWrites(mask),
+    categoryFilters: [],
+    continuousFilters: [],
+    varValues: null,
+    varMin: 0,
+    varMax: 0,
+    outliers: null,
+    outlierThreshold: 1,
+  }, mask.length);
+}
+
+function recordVisibilityResult(transparency, inputs, shown) {
+  VISIBILITY_RESULTS.set(transparency, {
+    inputs,
+    writes: transparencyArrayWrites(transparency),
+    shown,
+  });
+}
+
+/** Each cell's alpha byte from its visibility (exactly 0 or 1). */
+function publishAlphaBytes(transparency, colors, pointCount) {
+  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    colors[j] = transparency[i] * 255;
+  }
+}
+
 export class DataStateFilterMethods {
   computeGlobalVisibility() {
+    // Inside a batch (a filter restore, a session view's filters and active
+    // field) the pass runs once, at `endBatch`, from the final state.
+    if (this._batchMode === true) {
+      this._batchDirty.visibility = true;
+      return;
+    }
     if (this.pointCount === 0 && this.obsData === null) return;
     if (this.pointCount === 0) {
       if (
@@ -253,14 +536,7 @@ export class DataStateFilterMethods {
         'Visibility computation requires complete color, transparency, and cell-mask buffers.'
       );
     }
-    {
-      const mask = this.cellVisibilityMask;
-      for (let index = 0; index < pointCount; index++) {
-        if (mask[index] > 1) {
-          throw new TypeError(`Cell visibility mask entry ${index} must be exactly 0 or 1.`);
-        }
-      }
-    }
+    requireBinaryCellVisibilityMask(this.cellVisibilityMask);
 
     if (
       this.activeFieldSource !== null
@@ -291,7 +567,9 @@ export class DataStateFilterMethods {
     if (typeof applyOutlierFilter !== 'boolean') {
       throw new TypeError('Outlier filter state must be exactly true or false.');
     }
-    let outlierThreshold = null;
+    // Numbers even when unused: the per-cell loop below is compiled with
+    // these as doubles, and a null would deoptimize it on every later call.
+    let outlierThreshold = 1;
     let outliers = null;
     if (applyOutlierFilter) {
       outlierThreshold = this.getCurrentOutlierThreshold();
@@ -385,8 +663,8 @@ export class DataStateFilterMethods {
       }
     }
 
-    let activeVarFilterMin = null;
-    let activeVarFilterMax = null;
+    let activeVarFilterMin = 0;
+    let activeVarFilterMax = 0;
     let activeVarFilterEnabled = false;
     let activeVarValues = null;
     if (activeVarField !== null) {
@@ -412,100 +690,114 @@ export class DataStateFilterMethods {
       activeVarFilterEnabled ||
       applyOutlierFilter;
 
-    // Both arrays are exactly `pointCount` long (checked above). Hoisting them
-    // out of the loop removes one property load per point per pass.
     const cellVisibilityMask = this.cellVisibilityMask;
-    // Every branch below rewrites every entry; a kept view still sharing the
-    // array keeps the old one (per-cell-array-ownership.js).
-    const transparency = writableTransparency(this);
-
-    if (!hasAnyFilter) {
-      // Every mask entry is exactly 0 or 1, so with no filter active the
-      // published alpha *is* the mask. One typed-array copy replaces a
-      // dataset-length fill followed by a second dataset-length pass.
-      transparency.set(cellVisibilityMask);
-    } else if (
-      categoryFilters.length === 1 &&
-      continuousFilters.length === 0 &&
-      !activeVarFilterEnabled &&
-      !applyOutlierFilter
-    ) {
-      // The commonest filter -- categories hidden on one field -- with the
-      // per-code table read straight into the alpha: it holds exactly the 0
-      // or 1 the general loop below writes, at half its cost at 10,000,000
-      // cells.
-      const { codes, visibleByCode, missingCode, spansDtype } = categoryFilters[0];
-      if (spansDtype) {
-        for (let i = 0; i < pointCount; i++) {
-          transparency[i] = cellVisibilityMask[i] === 0
-            ? 0
-            : visibleByCode[codes[i]];
-        }
+    const inputs = {
+      mask: cellVisibilityMask,
+      maskWrites: cellVisibilityMaskWrites(cellVisibilityMask),
+      categoryFilters,
+      continuousFilters,
+      varValues: activeVarFilterEnabled ? activeVarValues : null,
+      varMin: activeVarFilterMin,
+      varMax: activeVarFilterMax,
+      outliers: applyOutlierFilter ? outliers : null,
+      outlierThreshold,
+    };
+    const publishedColors = this.colorsArray;
+    let transparency;
+    let colors;
+    let shown;
+    const reusable = findVisibilityResult(this, inputs);
+    if (reusable !== null) {
+      // A view already holds this exact visibility: it is adopted, and only
+      // the alpha bytes of this view's colors are published from it.
+      if (reusable.transparency === this.categoryTransparency) {
+        transparency = reusable.transparency;
       } else {
-        for (let i = 0; i < pointCount; i++) {
-          const code = codes[i];
-          transparency[i] = cellVisibilityMask[i] === 0
-            ? 0
-            : code === missingCode ? 1 : visibleByCode[code];
-        }
+        transparency = writableTransparency(this);
+        transparency.set(reusable.transparency);
+        recordVisibilityResult(transparency, inputs, reusable.shown);
       }
+      if (alphaBytesMirror(this.colorsArray, transparency)) {
+        // The alpha bytes already are this visibility: nothing to write.
+        colors = this.colorsArray;
+      } else {
+        colors = writableColorAlphaBytes(this);
+        publishAlphaBytes(transparency, colors, pointCount);
+        recordAlphaBytesMirror(colors, transparency);
+      }
+      shown = reusable.shown;
     } else {
-      for (let i = 0; i < pointCount; i++) {
-        // The mask is tested first. No filter can make a cell the mask already
-        // hides visible again, so its predicates are never evaluated — that is
-        // also what keeps this one pass equal to the two it replaces.
-        if (cellVisibilityMask[i] === 0) {
-          transparency[i] = 0;
-          continue;
-        }
-        let visible = true;
-
-        for (let cf = 0; cf < categoryFilters.length; cf++) {
-          const filter = categoryFilters[cf];
-          const code = filter.codes[i];
-          if (
-            (filter.spansDtype || code !== filter.missingCode)
-            && filter.visibleByCode[code] === 0
-          ) {
-            visible = false;
-            break;
-          }
-        }
-
-        if (visible) {
-          for (let cf = 0; cf < continuousFilters.length; cf++) {
-            const filter = continuousFilters[cf];
-            const v = filter.values[i];
-            if (v !== v || v < filter.min || v > filter.max) {
-              visible = false;
-              break;
-            }
-          }
-        }
-
-        if (visible && activeVarFilterEnabled) {
-          const v = activeVarValues[i];
-          if (v !== v || v < activeVarFilterMin || v > activeVarFilterMax) {
-            visible = false;
-          }
-        }
-
-        // Apply outlier filter for the active field (only when supported).
-        if (visible && applyOutlierFilter) {
-          const q = outliers[i];
-          if (q >= 0 && q > outlierThreshold) visible = false;
-        }
-
-        transparency[i] = visible ? 1 : 0;
+      // One pass writes each cell's visibility, the alpha byte of its packed
+      // color and the shown count; a mask entry, filter table or value is read
+      // once a cell. Every array is exactly `pointCount` long (checked above).
+      // Every branch below rewrites every entry; a kept view still sharing an
+      // array keeps the old one (per-cell-array-ownership.js).
+      transparency = writableTransparency(this);
+      colors = writableColorAlphaBytes(this);
+      if (!hasAnyFilter) {
+        // Every mask entry is exactly 0 or 1, so with no filter active the
+        // published visibility *is* the mask.
+        shown = publishMaskVisibility(cellVisibilityMask, transparency, colors, pointCount);
+      } else if (
+        categoryFilters.length === 1 &&
+        continuousFilters.length === 0 &&
+        !activeVarFilterEnabled &&
+        !applyOutlierFilter
+      ) {
+        // The commonest filter -- categories hidden on one field -- with the
+        // per-code table read straight into the visibility: it holds exactly
+        // the 0 or 1 the general loop writes, at half its cost.
+        shown = isAllShownCellVisibilityMask(cellVisibilityMask)
+          ? publishCategoryVisibilityUnmasked(categoryFilters[0], transparency, colors, pointCount)
+          : publishCategoryVisibility(
+            cellVisibilityMask, categoryFilters[0], transparency, colors, pointCount
+          );
+      } else if (
+        categoryFilters.length === 0 &&
+        continuousFilters.length === 0 &&
+        !activeVarFilterEnabled
+      ) {
+        // The outlier slider alone.
+        shown = publishOutlierVisibility(
+          cellVisibilityMask, outliers, outlierThreshold, transparency, colors, pointCount
+        );
+      } else {
+        shown = publishFilteredVisibility(
+          cellVisibilityMask,
+          categoryFilters,
+          continuousFilters,
+          activeVarFilterEnabled ? activeVarValues : null,
+          activeVarFilterMin,
+          activeVarFilterMax,
+          applyOutlierFilter ? outliers : null,
+          outlierThreshold,
+          transparency,
+          colors,
+          pointCount
+        );
       }
+      recordVisibilityResult(transparency, inputs, shown);
+      recordAlphaBytesMirror(colors, transparency);
     }
 
-    this._syncColorsAlpha();
+    if (colors !== publishedColors && String(this.activeViewId) === 'live') {
+      // The live viewer and renderer hold the state's colors by reference; a
+      // copy-on-write moved the state to a new array, so it is republished.
+      this._pushColorsToViewer();
+    }
+    this.filteredCount = { shown, total: pointCount };
+    // What `updateFilteredCount` would count from, so it can answer from here.
+    this._filteredCountMemo = {
+      transparency,
+      epoch: transparencyEpoch(this),
+      outliers,
+      threshold: outlierThreshold,
+      shown,
+    };
     const centroidsChanged = this._updateActiveCategoryCounts();
     this._pushTransparencyToViewer();
     if (centroidsChanged) this._pushCentroidsToViewer();
     this._syncActiveContext();
-    this.updateFilteredCount();
     this.updateFilterSummary();
     this._notifyVisibilityChange();
   }
@@ -646,7 +938,7 @@ export class DataStateFilterMethods {
     // transparency. Syncing them here first was a dataset-length pass whose
     // result was overwritten before anything read it; the GPU color stream's
     // alpha byte is not read while the alpha texture carries visibility.
-    this._writeCategoryColors(field, false);
+    this._writeCategoryColors(field);
     this._pushColorsToViewer();
   }
 
@@ -846,13 +1138,13 @@ export class DataStateFilterMethods {
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null;
     if (this.colorsArray) {
-      // Neutral gray (RGB) and full alpha.
-      fillNeutralGray(writableColors(this).subarray(0, this.pointCount * 4));
+      // Neutral gray RGB (left as it is when it already holds it); the alpha
+      // bytes are the visibility the pass below publishes.
+      writableNeutralColors(this);
     }
     if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
-      this.categoryTransparency = new Uint8Array(this.pointCount);
+      this.categoryTransparency = new Uint8Array(this.pointCount).fill(1);
     }
-    writableTransparency(this).fill(1);
     this._pushColorsToViewer();
     this.clearCentroids();
     this.computeGlobalVisibility();
@@ -896,9 +1188,6 @@ export class DataStateFilterMethods {
         : null,
       centroidColors: this.centroidColors
         ? new Uint8Array(this.centroidColors) // RGBA uint8
-        : null,
-      centroidOutliers: this.centroidOutliers
-        ? new Float32Array(this.centroidOutliers)
         : null,
       outlierThreshold: this.getCurrentOutlierThreshold(),
       filtersText,

@@ -10,7 +10,7 @@
 import { app, docs, python, r, repository } from "../index.mjs";
 
 const message = `
-Cellucid — see every cell. Query any gene. Fly through millions.
+Cellucid — see every cell. Query any gene. Explore in 2D and 3D.
 
 This npm package is a name reservation. Cellucid is not published as a
 JavaScript library yet; there is nothing to run here.

@@ -27,9 +27,9 @@
   --space-24: 96px;
 
   /* Layout primitives. */
+  /* The sidebar's bounds are clamped where it is resized
+     (`app/sidebar-metrics.js`: 280–560 px); the width is the one token. */
   --sidebar-width: var(--sidebar-user-width, 280px);
-  --sidebar-min-width: 200px;
-  --sidebar-max-width: 450px;
   --sidebar-toggle-width: 38px;
   --sidebar-toggle-height: 34px;
   --header-height: 36px;

@@ -1,6 +1,6 @@
 import { expect, test } from './helpers/test.mjs';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -15,7 +15,7 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
    is only correct if the mouse still works. */
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=keyboard-move-lifecycle-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=keyboard-move-lifecycle-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -38,7 +38,7 @@ async function openPreparedDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 }
 
@@ -134,13 +134,18 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
     page.locator('.accordion-panel:has(> #visualization-section)')
   ).not.toHaveClass(/floating-enter/);
 
-  /* The floating panel's only size control was pointer-only and
-     `aria-hidden`. It is a focusable window splitter now. */
+  /* The floating panel's size controls were pointer-only and `aria-hidden`.
+     Its edges are focusable window splitters now: the right edge widens it
+     by arrow key. */
   const widthHandle = page.locator(
-    '#visualization-section .accordion-width-handle'
+    '.accordion-panel:has(> #visualization-section)'
+    + ' > .accordion-resize-handle[data-edge="e"]'
   );
   await expect(widthHandle).toHaveAttribute('role', 'separator');
-  await expect(widthHandle).toHaveAttribute('aria-label', 'Panel width');
+  await expect(widthHandle).toHaveAttribute(
+    'aria-label',
+    'Resize window from its right edge'
+  );
   await expect(widthHandle).not.toHaveAttribute('aria-hidden', 'true');
   await widthHandle.focus();
   await expect(widthHandle).toBeFocused();
@@ -159,7 +164,7 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   expect(Math.abs(reportedWide - widthAfter)).toBeLessThanOrEqual(2);
   await expect(widthHandle).toHaveAttribute(
     'aria-valuetext',
-    `${reportedWide} pixels wide`
+    new RegExp(`^${reportedWide} × \\d+ pixels$`)
   );
 
   await page.keyboard.press('ArrowLeft');

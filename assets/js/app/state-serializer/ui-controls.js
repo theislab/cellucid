@@ -8,6 +8,7 @@
  */
 
 import { isGeneratedDomId } from '../ui/components/dom-id.js';
+import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 
 const SERIALIZABLE_INPUT_TYPES = new Set([
   'checkbox',
@@ -60,36 +61,8 @@ const DOMAIN_OWNED_IDS = new Set([
   'view-representation-select',
   'dataset-select',
   'pointer-lock',
-  'remote-server-url',
-  'github-repo-url',
+  'data-address',
 ]);
-
-function assertPlainRecord(value, context) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || (
-      Object.getPrototypeOf(value) !== Object.prototype
-      && Object.getPrototypeOf(value) !== null
-    )
-  ) {
-    throw new TypeError(`${context} must be a plain object.`);
-  }
-}
-
-function assertExactKeys(record, expectedKeys, context) {
-  const actualKeys = Object.keys(record).sort();
-  const exactKeys = [...expectedKeys].sort();
-  if (
-    actualKeys.length !== exactKeys.length
-    || actualKeys.some((key, index) => key !== exactKeys[index])
-  ) {
-    throw new TypeError(
-      `${context} must contain the exact keys ${exactKeys.join(', ')}.`,
-    );
-  }
-}
 
 function getUiRoots(sidebar) {
   if (!sidebar || typeof sidebar.querySelectorAll !== 'function') {
@@ -236,6 +209,27 @@ function pressedButtonId(buttons, id) {
   return pressedId;
 }
 
+/**
+ * Controls that describe the machine, not the session: neither saved nor
+ * restored.
+ *
+ * `#hp-antialias` is a device capability its owner keeps in `localStorage` and
+ * persists on every `change` event — including one a restore dispatches. A
+ * session that carried it was the last writer of a device preference: a
+ * sample's published view turned antialiasing back on after you turned it off.
+ * The stored preference also has a third state, `auto`, that a checkbox cannot
+ * express.
+ *
+ * The app theme (`#theme-select`) is part of how a shared session looks and is
+ * restored like any other control: its `change` reaches the ThemeManager, which
+ * shows and stores it exactly as a choice made by hand.
+ */
+const DEVICE_PREFERENCE_CONTROL_IDS = new Set(['hp-antialias']);
+
+function isSessionControlId(elementId) {
+  return !DOMAIN_OWNED_IDS.has(elementId) && !DEVICE_PREFERENCE_CONTROL_IDS.has(elementId);
+}
+
 function buildCurrentInventory(sidebar) {
   const inventory = new Map();
 
@@ -243,7 +237,7 @@ function buildCurrentInventory(sidebar) {
     if (isStateSerializerSkipped(input)) continue;
     if (!SERIALIZABLE_INPUT_TYPES.has(input.type)) continue;
     const elementId = assertStableId(input.id, 'Every serialized input');
-    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    if (!isSessionControlId(elementId)) continue;
     registerInventoryEntry(inventory, elementId, {
       element: input,
       type: input.type === 'search' ? 'text' : input.type,
@@ -253,7 +247,7 @@ function buildCurrentInventory(sidebar) {
   for (const select of queryAll(sidebar, 'select[id]')) {
     if (isStateSerializerSkipped(select)) continue;
     const elementId = assertStableId(select.id, 'Every serialized select');
-    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    if (!isSessionControlId(elementId)) continue;
     registerInventoryEntry(inventory, elementId, {
       element: select,
       type: 'select',
@@ -278,7 +272,7 @@ function buildCurrentInventory(sidebar) {
       group.id,
       'Every serialized pressed group',
     );
-    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    if (!isSessionControlId(elementId)) continue;
     registerInventoryEntry(inventory, elementId, {
       element: group,
       type: 'pressed-group',
@@ -314,7 +308,7 @@ function assertFiniteNumericControlValue(element, value, id) {
  * state its choices follow has been restored.
  */
 function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent = true) {
-  assertPlainRecord(record, `Session UI control "${id}"`);
+  requirePlainRecord(record, `Session UI control "${id}"`);
   const { element, type } = inventoryEntry;
 
   if (record.type !== type) {
@@ -324,7 +318,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
   }
 
   if (type === 'checkbox') {
-    assertExactKeys(record, ['type', 'checked'], `Session UI control "${id}"`);
+    requireExactKeys(record, ['type', 'checked'], `Session UI control "${id}"`);
     if (typeof record.checked !== 'boolean') {
       throw new TypeError(`Session UI control "${id}" checked must be boolean.`);
     }
@@ -332,7 +326,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
   }
 
   if (type === 'details') {
-    assertExactKeys(record, ['type', 'open'], `Session UI control "${id}"`);
+    requireExactKeys(record, ['type', 'open'], `Session UI control "${id}"`);
     if (typeof record.open !== 'boolean') {
       throw new TypeError(`Session UI control "${id}" open must be boolean.`);
     }
@@ -340,7 +334,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
   }
 
   if (type === 'pressed-group') {
-    assertExactKeys(
+    requireExactKeys(
       record,
       ['type', 'pressedId'],
       `Session UI control "${id}"`,
@@ -362,7 +356,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
     return;
   }
 
-  assertExactKeys(record, ['type', 'value'], `Session UI control "${id}"`);
+  requireExactKeys(record, ['type', 'value'], `Session UI control "${id}"`);
   if (typeof record.value !== 'string') {
     throw new TypeError(`Session UI control "${id}" value must be a string.`);
   }
@@ -389,7 +383,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
 }
 
 function validateCompleteControls(controls, inventory, laterValueIds = new Set()) {
-  assertPlainRecord(controls, 'Session UI controls');
+  requirePlainRecord(controls, 'Session UI controls');
   const candidateKeys = Object.keys(controls).sort();
   const currentKeys = [...inventory.keys()].sort();
 
@@ -458,29 +452,6 @@ function dispatchControlEvent(id, element, type) {
   if (listenerFailure !== null) throw listenerFailure;
 }
 
-/**
- * Controls that describe the machine, not the session.
- *
- * `#hp-antialias` is stored in `localStorage` because the preference describes
- * the machine that is drawing rather than the view being described. Its owner
- * therefore persists on every `change` event - including the synthetic one a
- * restore dispatches.
- *
- * That made a session the last writer of a device preference. Every sample
- * publishes an advertised default state, so switching antialiasing off and
- * reloading re-applied the saved `on` and stored it, and the setting could
- * never stay off. A shared session did the same to whoever opened it.
- *
- * The stored preference also has a third state, `auto`, that a checkbox cannot
- * express: replaying a captured tick would turn "let the dataset decide" into a
- * choice the user never made.
- *
- * These are still captured, and still required to be present, so the published
- * presets stay valid and a control that disappears from the markup is still
- * caught. They are simply not applied: the machine that is drawing keeps its
- * own answer.
- */
-const DEVICE_PREFERENCE_CONTROL_IDS = new Set(['hp-antialias']);
 
 function restoreValidatedControl(id, entry, data) {
   const { element, type } = entry;
@@ -537,7 +508,7 @@ function restoreValidatedControl(id, entry, data) {
 }
 
 function assertRestoreOptions(options) {
-  assertPlainRecord(options, 'Session UI restore options');
+  requirePlainRecord(options, 'Session UI restore options');
   const expectedKeys = [];
   if (Object.hasOwn(options, 'abortSignal')) expectedKeys.push('abortSignal');
   if (Object.hasOwn(options, 'deferControlIds')) {
@@ -546,7 +517,7 @@ function assertRestoreOptions(options) {
   if (Object.hasOwn(options, 'withholdControlIds')) {
     expectedKeys.push('withholdControlIds');
   }
-  assertExactKeys(
+  requireExactKeys(
     options,
     expectedKeys,
     'Session UI restore options',
@@ -682,9 +653,8 @@ export function createUiControlSerializer({ sidebar }) {
         for (const [id, staged] of stagedControls) {
           if (staged.entry.type !== type) continue;
           if (deferredIds.has(id) !== restoreDeferred) continue;
-          // Captured and validated, but never applied - see
-          // DEVICE_PREFERENCE_CONTROL_IDS and `withholdControlIds`.
-          if (DEVICE_PREFERENCE_CONTROL_IDS.has(id) || withheldIds.has(id)) continue;
+          // Validated, but not applied: see `withholdControlIds`.
+          if (withheldIds.has(id)) continue;
           if (abortSignal?.aborted) {
             throw new DOMException('Aborted', 'AbortError');
           }

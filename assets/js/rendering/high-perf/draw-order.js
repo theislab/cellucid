@@ -9,6 +9,8 @@
  * prefix of it; a run of units is one range per band.
  */
 
+import { formatCountOf } from '../../utils/format-units.js';
+
 const HIERARCHICAL_RADIX_BITS = 11;
 export const HIERARCHICAL_RADIX_SIZE = 1 << HIERARCHICAL_RADIX_BITS;
 const HIERARCHICAL_RADIX_MASK = HIERARCHICAL_RADIX_SIZE - 1;
@@ -224,7 +226,7 @@ export function buildHierarchicalOrder(positions, bounds, dimensionLevel) {
   const reversalBits = n <= 1 ? 0 : 32 - Math.clz32(n - 1);
   if (reversalBits > 30) {
     throw new RangeError(
-      `Hierarchical ordering supports at most ${(1 << 30).toLocaleString()} points.`
+      `Hierarchical ordering supports at most ${formatCountOf((1 << 30), 'point')}.`
     );
   }
   const reversalSpan = 1 << reversalBits;
@@ -244,7 +246,7 @@ export function buildHierarchicalOrder(positions, bounds, dimensionLevel) {
   }
   if (emitted !== n) {
     throw new Error(
-      `Hierarchical ordering emitted ${emitted} of ${n} points.`
+      `Hierarchical ordering emitted ${emitted} of ${formatCountOf(n, 'point')}.`
     );
   }
 
@@ -378,7 +380,7 @@ export function buildDrawOrder(root, dimensionLevel, pointCount, hierarchy, pref
       for (let i = 0; i < leafIndices.length; i++) {
         const id = leafIndices[i];
         if (id >= n) {
-          throw new RangeError(`Draw order: leaf contains source ID ${id} outside ${n} points.`);
+          throw new RangeError(`Draw order: leaf contains source ID ${id} outside ${formatCountOf(n, 'point')}.`);
         }
         unitOf[id] = unit;
       }
@@ -412,7 +414,7 @@ export function buildDrawOrder(root, dimensionLevel, pointCount, hierarchy, pref
       leafOffsets[base + unit] = running;
     }
     if (running !== bandEnds[band]) {
-      throw new Error(`Draw order: units place ${running} points in LOD band ${band}, not ${bandEnds[band]}.`);
+      throw new Error(`Draw order: units place ${formatCountOf(running, 'point')} in LOD band ${band}, not ${bandEnds[band]}.`);
     }
   }
 

@@ -1,0 +1,95 @@
+/* layouts/_page.css - Where the brand card (components/_welcome.css) sits
+   when it is the whole screen:
+
+   - the standalone pages (404.html, privacy.html, terms.html,
+     accessibility.html, assets/auth/callback.html):
+     `body.page` > `main.page-screen`, on the viewer's backdrop, scrolling on a
+     short screen;
+   - the startup failure screen inside the app: `.page-screen.page-screen-fixed`
+     over everything, on the same backdrop.
+
+   A reading page (privacy, terms, accessibility) widens the card with
+   `.welcome-content-wide` and sets its text with `.page-prose`. */
+
+/* The app shell never scrolls; a standalone page must, on a short screen. */
+html:has(> body.page),
+body.page {
+  height: auto;
+  min-height: 100%;
+  overflow: auto;
+}
+
+.page-screen {
+  box-sizing: border-box;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5) var(--space-4);
+}
+
+.page-screen .welcome-content {
+  max-height: none;
+}
+
+/* The startup failure and no-JavaScript screens: the page, laid over the app
+   it replaces. It takes the viewer's backdrop from <body> (base/_global.css),
+   so it reads as the 404 page does; the no-JavaScript one sits in <noscript>,
+   which passes the backdrop on. */
+.page-screen-fixed,
+noscript:has(> .page-screen-fixed) {
+  background: inherit;
+}
+
+.page-screen-fixed {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-max);
+  overflow-y: auto;
+  font-family: var(--font-sans);
+}
+
+/* A reading page: the card widened to a comfortable line length. */
+.welcome-content-wide {
+  max-width: 680px;
+}
+
+.page-prose {
+  color: var(--color-text-primary);
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
+}
+
+.page-prose h2 {
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  margin: var(--space-5) 0 var(--space-1-5);
+}
+
+.page-prose p,
+.page-prose > ul:not(.welcome-links) {
+  margin: 0 0 var(--space-2);
+}
+
+.page-prose > ul:not(.welcome-links) {
+  padding-left: var(--space-4);
+}
+
+.page-prose > ul:not(.welcome-links) > li + li {
+  margin-top: var(--space-1);
+}
+
+.page-prose a:not(.welcome-links a) {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+p.page-meta {
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: var(--type-hint);
+  margin: 0 0 var(--space-3);
+}

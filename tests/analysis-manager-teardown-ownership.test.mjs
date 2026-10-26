@@ -9,6 +9,7 @@ import { PlotRenderSlot } from '../assets/js/app/analysis/shared/plot-render-slo
 import { getMemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
 import { createDataState } from '../assets/js/app/state/index.js';
 import { EventEmitter } from '../assets/js/app/utils/event-emitter.js';
+import { encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
 import {
   setDockableAccordions,
 } from '../assets/js/app/dockable-accordions-registry.js';
@@ -399,8 +400,6 @@ test(
     layer._datasetGeneration = 4;
     layer._cacheGeneration = 7;
     layer._fieldLoadLifecycle = new AbortController();
-    layer._bulkGeneCacheGeneration = 9;
-    layer._bulkGeneCacheReplacementOwner = {};
     layer._instanceId = 'data-layer-owned';
     layer._memoryMonitor = {
       unregisterCleanupHandler(instanceId) {
@@ -412,8 +411,6 @@ test(
       },
     };
     layer._dataCache = new Map([['page', {}]]);
-    layer._bulkGeneCache = new Map([['bulk', {}]]);
-    layer._bulkGeneCacheAccessOrder = ['bulk'];
     layer._variableCache = new Map([['variable', {}]]);
     layer._pendingRequests = new Map([['request', {}]]);
     layer._prefetchQueue = [{}];
@@ -428,7 +425,6 @@ test(
     assert.equal(layer._destroyed, true);
     assert.equal(layer._datasetGeneration, 5);
     assert.equal(layer._cacheGeneration, 8);
-    assert.equal(layer._bulkGeneCacheGeneration, 10);
     assert.equal(layer._dataCache.size, 1);
     assert.equal(layer._memoryMonitor === null, false);
 
@@ -445,7 +441,6 @@ test(
 
     assert.deepEqual(events, ['memory:unregister', 'memory:drained']);
     assert.equal(layer._dataCache.size, 0);
-    assert.equal(layer._bulkGeneCache.size, 0);
     assert.equal(layer._pendingRequests.size, 0);
     assert.equal(layer._memoryMonitor, null);
     assert.equal(layer.destroy(), first);
@@ -472,8 +467,6 @@ test(
     layer._datasetGeneration = 0;
     layer._cacheGeneration = 0;
     layer._fieldLoadLifecycle = new AbortController();
-    layer._bulkGeneCacheGeneration = 0;
-    layer._bulkGeneCacheReplacementOwner = null;
     layer._instanceId = 'data-layer-prefetch-owner';
     layer._memoryMonitor = {
       unregisterCleanupHandler() {
@@ -482,8 +475,6 @@ test(
     };
     layer._options = { enablePrefetch: true };
     layer._dataCache = new Map();
-    layer._bulkGeneCache = new Map();
-    layer._bulkGeneCacheAccessOrder = [];
     layer._variableCache = new Map();
     layer._pendingRequests = new Map();
     layer._pageVersions = new Map();
@@ -895,9 +886,13 @@ function createWindowCreationHarness({ destroy }) {
             exportSettings() {
               return {};
             },
+            exportResult() {
+              return null;
+            },
             getSelectedPages() {
               return [];
             },
+            async importResult() {},
             importSettings() {},
             onHighlightChanged() {},
             onPageSelectionChange() {},
@@ -1084,8 +1079,11 @@ test(
       const summary = details.children[0];
       assert.equal(summary.children.length, 1);
       assert.equal(summary.children[0].className, 'disclosure-title');
-      const closeButton = registration.actions[1];
-      assert.equal(closeButton.className, 'accordion-close-btn');
+      assert.deepEqual(
+        registration.actions.map(action => action.className),
+        ['accordion-copy-btn', 'accordion-maximize-btn', 'accordion-close-btn', 'disclosure-chevron']
+      );
+      const closeButton = registration.actions[2];
       manager.closeWindow = receivedId => {
         assert.equal(receivedId, windowId);
         return rejectedClose;
@@ -1674,12 +1672,18 @@ test(
       createFromSessionDescriptor(descriptor) {
         events.push(`create:${descriptor.modeId}`);
       },
+      importViewSizes() {
+        events.push('sizes');
+      },
     };
 
     const result = restoreAnalysisWindows(
       { analysisWindowManager: manager },
       {},
-      { windows: [{ modeId: 'replacement' }] },
+      encodeTypedJson({
+        windows: [{ modeId: 'replacement' }],
+        sizes: { window: {}, expandedView: {} },
+      }),
     );
     const createdBeforeCloseSettled = events.includes('create:replacement');
 
@@ -1691,6 +1695,7 @@ test(
     assert.deepEqual(events, [
       'close:start',
       'close:done',
+      'sizes',
       'create:replacement',
     ]);
   },
@@ -1818,7 +1823,7 @@ test(
     const memoryMonitor = getMemoryMonitor();
     memoryMonitor.setShowNotifications(false);
     try {
-      comparison = new ComparisonModule({ state, container: {} });
+      comparison = new ComparisonModule({ state, container: {}, colorByGene: async () => null });
       dataLayer = comparison.dataLayer;
 
       await memoryMonitor.performCleanup('critical');

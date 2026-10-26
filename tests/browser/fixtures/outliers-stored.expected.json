@@ -1,0 +1,29 @@
+{
+ "_about": "SHA-256 of each field's outlier quantiles (little-endian float32, NaN where none) in each latent space, by the numpy reference; written by scripts/generate-outlier-quantile-fixtures.py.",
+ "minPoints": 10,
+ "stored": [
+  "cell_type",
+  "batch",
+  "doublet"
+ ],
+ "quantiles": {
+  "X_umap": {
+   "cell_type": "521fe65ce7f43dd5ca4c435fafe99645d735452567957755316354edb9058fe8",
+   "batch": "4958ca633750b54c313dd5bf0a62d14b5794013258c9a0efbb8a71593feb50a4",
+   "rare": "53b96b23d10ff8ea9bf70109a8e787b0a29687664281866b444e8046bf70de47",
+   "doublet": "85d7449320cd41c8f58145c4de51500427e864eb8bb1bc700e639d187a52c72f"
+  },
+  "X_scVI": {
+   "cell_type": "798a7358078aa3bb6f3c0044f56e201e5534779db9eeecf7fe91022c832a35d7",
+   "batch": "36befa06ede690254d107c58746e8f7b96b6aa9b5dfa70f2b535dbab7cd2d896",
+   "rare": "53b96b23d10ff8ea9bf70109a8e787b0a29687664281866b444e8046bf70de47",
+   "doublet": "2a9f1c28840878614f4082b2a5d2901aeb1b001a9f1fc8e7b222c4b061e2bb81"
+  },
+  "X_pca": {
+   "cell_type": "b8f3dcfd421c98fb867c9bfcdbf7a822701ee5731b415bd8813541dc2d737945",
+   "batch": "095fb305227f4e786a7063180522b2904949a50a72f74936fa81bfbb77fdbc72",
+   "rare": "53b96b23d10ff8ea9bf70109a8e787b0a29687664281866b444e8046bf70de47",
+   "doublet": "c71405e6c6b3ec4f1ff3710496400273b588eb928d2ca6d0527ee989effd4076"
+  }
+ }
+}

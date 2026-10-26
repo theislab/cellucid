@@ -113,7 +113,7 @@ test('legend destroy retires permanent slider and centroid event owners', () => 
       centroidLabelsCheckbox: centroidLabels
     },
     dataSourceManager: {
-      getCurrentDatasetId() {
+      getCurrentIdentityId() {
         return null;
       }
     }

@@ -25,19 +25,6 @@
     0 0 2px rgba(var(--shadow-rgb), var(--opacity-60));
 }
 
-/* Orbit anchor annotation overlay */
-#orbit-anchor-annotation {
-  position: fixed;
-  pointer-events: none;
-  z-index: var(--z-tooltip);
-  font-variant-numeric: tabular-nums;
-  font-size: var(--type-readout);
-  white-space: nowrap;
-  transition: opacity var(--duration-fast) var(--easing-standard), left 0.05s ease, top 0.05s ease;
-  line-height: 1.4;
-  box-shadow: var(--shadow-md);
-}
-
 /* View title overlay for small multiples */
 #view-title-layer {
   position: fixed;

@@ -3,9 +3,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
-import { StreamingGeneLoader } from '../assets/js/app/analysis/data/streaming-gene-loader.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
-import { ExpressionMatrixBuilder } from '../assets/js/app/analysis/genes-panel/expression-matrix-builder.js';
+import { markerMatrix } from '../assets/js/app/analysis/genes-panel/expression-matrix-builder.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
 import {
   ERROR_MESSAGES as GENES_PANEL_ERROR_MESSAGES,
@@ -18,11 +17,11 @@ import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
 import { LayoutEngine } from '../assets/js/app/analysis/plots/layout-engine.js';
 import geneHeatmapDefinition from '../assets/js/app/analysis/plots/types/gene-heatmap.js';
 import { waitForAvailableSlot } from '../assets/js/app/analysis/shared/concurrency-utils.js';
-import { getPerformanceFormValues } from '../assets/js/app/analysis/shared/dom-utils.js';
 import { MemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
-import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 import { cleanupAnalysisResources } from '../assets/js/app/analysis/shared/resource-cleanup.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
+import { createRunTuner } from '../assets/js/app/analysis/shared/run-tuner.js';
+import { runGeneStream } from '../assets/js/app/analysis/shared/gene-stream-runner.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 const ANALYSIS_ROOT = new URL('../assets/js/app/analysis/', import.meta.url);
@@ -34,7 +33,7 @@ async function analysisSource(path) {
 test('analysis fallback, retry, coercion, and compatibility shims are absent from current surfaces', async () => {
   const paths = [
     'data/data-layer.js',
-    'data/streaming-gene-loader.js',
+    'data/gene-route.js',
     'compute/data-worker.js',
     'genes-panel/clustering-engine.js',
     'genes-panel/constants.js',
@@ -47,6 +46,7 @@ test('analysis fallback, retry, coercion, and compatibility shims are absent fro
     'plots/types/gene-heatmap.js',
     'shared/concurrency-utils.js',
     'shared/dom-utils.js',
+    'shared/gene-stream-runner.js',
     'shared/memory-monitor.js',
     'shared/plot-theme.js',
     'shared/resource-cleanup.js',
@@ -141,61 +141,6 @@ test('layout identities and color maps are exact instead of substituted', () => 
   );
 });
 
-test('analysis performance settings use exact dataset-aware values', () => {
-  PerformanceConfig.resetToDefaults();
-  const recommendation = PerformanceConfig.getRecommendedSettings(
-    561_947,
-    30_000,
-  );
-  const batchOptions = PerformanceConfig.getBatchSizeOptions(
-    561_947,
-    30_000,
-  );
-  assert.deepEqual(
-    batchOptions.filter(option => option.selected).map(option => option.value),
-    [recommendation.preloadCount],
-  );
-  assert.ok(batchOptions.every(option => option.value <= 500));
-
-  const fields = new Map([
-    ['parallelism', { value: 'auto' }],
-    ['batchSize', { value: String(recommendation.preloadCount) }],
-    ['memoryBudget', { value: '512' }],
-    ['networkConcurrency', { value: '6' }],
-  ]);
-  const form = {
-    querySelector(selector) {
-      const match = selector.match(/^\[name="([^"]+)"\]$/);
-      return match ? fields.get(match[1]) : null;
-    },
-  };
-  assert.deepEqual(
-    getPerformanceFormValues(form),
-    {
-      parallelism: 'auto',
-      batchConfig: {
-        preloadCount: recommendation.preloadCount,
-        memoryBudgetMB: 512,
-        networkConcurrency: 6,
-      },
-    },
-  );
-
-  fields.delete('batchSize');
-  assert.throws(
-    () => getPerformanceFormValues(form),
-    /field "batchSize" is required/i,
-  );
-  assert.throws(
-    () => PerformanceConfig.getRecommendedSettings(0, 30_000),
-    /cellCount.*positive/i,
-  );
-  assert.throws(
-    () => PerformanceConfig.applyPreset('unknown-preset'),
-    /unknown preset.*unknown-preset/i,
-  );
-});
-
 test('marker p-value correction rejects malformed scientific values', () => {
   const dense = benjaminiHochbergAdjusted(Float64Array.from([0.01, 0.04, 0.03]));
   assert.ok(dense.adjustedPValues instanceof Float64Array);
@@ -229,175 +174,31 @@ test('marker p-value correction rejects malformed scientific values', () => {
   );
 });
 
-test('custom marker analysis rejects every unknown requested gene', async () => {
-  const controller = Object.create(GenesPanelController.prototype);
-  controller.dataLayer = {
-    getAvailableVariables() {
-      return [
-        { key: 'KNOWN', name: 'Known' },
-      ];
-    },
-  };
-  controller._matrixBuilder = {
-    async buildMatrix() {
-      assert.fail('matrix construction must not run for an unknown gene');
-    },
-  };
-
-  await assert.rejects(
-    controller._runCustomAnalysis({
-      groups: [],
-      genes: ['KNOWN', 'UNKNOWN'],
-      transform: 'none',
-      distance: 'euclidean',
-      linkage: 'average',
-      clusterRows: false,
-      clusterCols: false,
-      onProgress: undefined,
-      signal: undefined,
-    }),
-    // Asserted against the shared template rather than a loose pattern: the
-    // rejection has to name the gene the reader typed, so a message that lost
-    // its substitution and showed the literal `{symbol}` must fail here.
-    error => {
-      assert.equal(
-        error.message,
-        formatError(GENES_PANEL_ERROR_MESSAGES.GENE_NOT_FOUND, { symbol: 'UNKNOWN' }),
-      );
-      return true;
-    },
-  );
-});
-
-test('expression matrices encode exact primitive group labels and preserve owned colors', () => {
-  const builder = new ExpressionMatrixBuilder({ dataLayer: {} });
-  const groups = [
-    {
-      groupId: 'false-group',
-      groupName: false,
-      color: 'var(--color-category-1)',
-    },
-    {
-      groupId: 'zero-group',
-      groupName: 0,
-      color: 'var(--color-category-2)',
-    },
-  ];
-  const matrix = builder.buildMatrixFromData({
+test('marker heatmaps encode exact primitive group labels and keep each group\'s colour', () => {
+  const stats = {
     genes: ['GENE'],
-    groups,
-    geneData: new Map([
-      ['GENE', new Map([
-        ['false-group', Float32Array.from([1, 3])],
-        ['zero-group', Float32Array.from([2, 4])],
-      ])],
-    ]),
-    transform: 'none',
-  });
-
+    groups: [
+      { groupId: 'false-group', groupName: false, color: 'var(--color-category-1)' },
+      { groupId: 'zero-group', groupName: 0, color: 'var(--color-category-2)' },
+    ],
+    meanInGroupByGroup: [Float32Array.of(2), Float32Array.of(3)],
+  };
+  const matrix = markerMatrix(stats, { genes: ['GENE'], groupIndices: [0, 1], transform: 'none' });
   assert.deepEqual(matrix.groupIds, ['false-group', 'zero-group']);
   assert.deepEqual(matrix.groupNames, ['false', '0']);
-  assert.deepEqual(
-    matrix.groupColors,
-    ['var(--color-category-1)', 'var(--color-category-2)'],
-  );
+  assert.deepEqual(matrix.groupColors, ['var(--color-category-1)', 'var(--color-category-2)']);
   assert.deepEqual(Array.from(matrix.values), [2, 3]);
-
-  const baseGroup = {
-    groupId: 'group-a',
-    groupName: 'Group A',
-    color: 'var(--color-category-1)',
-  };
   for (const invalidName of ['', '   ', null, undefined, NaN, Infinity, {}]) {
     assert.throws(
-      () => builder.buildMatrixFromData({
-        genes: ['GENE'],
-        groups: [{ ...baseGroup, groupName: invalidName }],
-        geneData: new Map(),
-        transform: 'none',
-      }),
+      () => markerMatrix({ ...stats, groups: [{ ...stats.groups[0], groupName: invalidName }, stats.groups[1]] },
+        { genes: ['GENE'], groupIndices: [0, 1], transform: 'none' }),
       /group.*name.*(?:empty|string|finite|boolean)/i,
     );
   }
   assert.throws(
-    () => builder.buildMatrixFromData({
-      genes: ['GENE'],
-      groups: [{ ...baseGroup, color: '' }],
-      geneData: new Map(),
-      transform: 'none',
-    }),
-    /group.*color/i,
+    () => markerMatrix(stats, { genes: ['UNTESTED'], groupIndices: [0, 1], transform: 'none' }),
+    /was not tested/,
   );
-  assert.throws(
-    () => builder.buildMatrixFromData({
-      genes: ['GENE'],
-      groups: [
-        { ...baseGroup, groupId: 'number', groupName: 0 },
-        { ...baseGroup, groupId: 'string', groupName: '0' },
-      ],
-      geneData: new Map(),
-      transform: 'none',
-    }),
-    /duplicate display name/i,
-  );
-});
-
-test('custom marker analysis returns current metadata without stale validation fields', async () => {
-  const controller = Object.create(GenesPanelController.prototype);
-  const matrix = {
-    genes: ['KNOWN_A', 'KNOWN_B'],
-    groupIds: ['group-a'],
-    groupNames: ['Group A'],
-    groupColors: ['var(--color-category-1)'],
-    values: Float32Array.from([1, 2]),
-    rawValues: null,
-    nRows: 2,
-    nCols: 1,
-    transform: 'none',
-  };
-  controller.dataLayer = {
-    getAvailableVariables() {
-      return [
-        { key: 'KNOWN_A', name: 'Known A' },
-        { key: 'KNOWN_B', name: 'Known B' },
-      ];
-    },
-  };
-  controller._matrixBuilder = {
-    async buildMatrix(options) {
-      assert.deepEqual(options.genes, ['KNOWN_A', 'KNOWN_B']);
-      return matrix;
-    },
-  };
-
-  const result = await controller._runCustomAnalysis({
-    groups: [{
-      groupId: 'group-a',
-      groupName: 'Group A',
-      color: 'var(--color-category-1)',
-      cellIndices: Uint32Array.from([0]),
-    }],
-    genes: ['KNOWN_A', 'KNOWN_B'],
-    transform: 'none',
-    distance: 'euclidean',
-    linkage: 'average',
-    clusterRows: false,
-    clusterCols: false,
-    onProgress: undefined,
-    signal: undefined,
-  });
-
-  assert.equal(result.markers, null);
-  assert.equal(result.matrix, matrix);
-  assert.deepEqual(result.metadata, {
-    mode: 'custom',
-    transform: 'none',
-    distance: 'euclidean',
-    linkage: 'average',
-    geneCount: 2,
-    groupCount: 1,
-  });
-  assert.equal(Object.hasOwn(result.metadata, 'invalidGenes'), false);
 });
 
 test('DataLayer active-page access never substitutes the first page', () => {
@@ -500,7 +301,7 @@ test('requested clustering never becomes an unclustered result', async () => {
   // and what to change, before anything is allocated; it is never returned
   // in input order as if it were clustered.
   const engine = new ClusteringEngine();
-  const matrix = { values: new Float32Array(501 * 2), nRows: 501, nCols: 2 };
+  const matrix = { values: new Float32Array(1001 * 2), nRows: 1001, nCols: 2 };
   await assert.rejects(
     engine.clusterMatrix({
       matrix,
@@ -512,21 +313,20 @@ test('requested clustering never becomes an unclustered result', async () => {
     }),
     {
       name: 'RangeError',
-      message: 'Clustering 501 genes needs about 25 MB of memory, more than the 1 MB ' +
-        'analysis memory budget. Raise the budget in Performance settings, use fewer ' +
-        'genes, or turn clustering of genes off.',
+      message: 'Clustering 1,001 genes needs about 4 MB of memory, more than the 1 MB ' +
+        'this device gives an analysis. Show fewer genes, or turn clustering of genes off.',
     },
   );
-  // The same 501 rows within the budget are clustered (no fixed row count).
+  // The same 1,001 rows within the budget are clustered (no fixed row count).
   const clustered = await engine.clusterMatrix({
-    matrix: { ...matrix, values: Float32Array.from({ length: 501 * 2 }, (_, i) => (i * 7919) % 101) },
+    matrix: { ...matrix, values: Float32Array.from({ length: 1001 * 2 }, (_, i) => (i * 7919) % 101) },
     clusterRows: true,
     clusterCols: false,
     distance: 'euclidean',
     linkage: 'average',
     memoryBudgetBytes: 512 * 2 ** 20,
   });
-  assert.equal(clustered.rowOrder.length, 501);
+  assert.equal(clustered.rowOrder.length, 1001);
   assert.notEqual(clustered.rowDendrogram, null);
 });
 
@@ -534,17 +334,13 @@ test('marker caches require one exact dataset identity', () => {
   assert.throws(
     () => new MarkerCache({
       maxCategories: 3,
-      maxAgeDays: 7,
-      cacheVersion: 1,
     }),
     /datasetId.*required|dataset identity/i,
   );
   assert.throws(
     () => new MarkerCache({
       maxCategories: 3,
-      maxAgeDays: 7,
-      cacheVersion: 1,
-      identity: { key: '   ', persistent: false },
+      identity: { key: '   ' },
     }),
     /datasetId.*non-empty|dataset identity/i,
   );
@@ -552,15 +348,15 @@ test('marker caches require one exact dataset identity', () => {
   const manager = getDataSourceManager();
   const previousDatasetId = manager.activeDatasetId;
   const controller = Object.create(GenesPanelController.prototype);
-  controller.dataLayer = { state: { pointCount: 123 } };
+  controller.dataLayer = { state: { pointCount: 123, getDataMapping: () => ({ expression: 'X', geneNames: 'index' }) } };
   try {
     manager.activeDatasetId = null;
     assert.throws(
-      () => controller._getDatasetId(),
+      () => controller._getCacheIdentity(),
       /active dataset.*required|datasetId.*required/i,
     );
     manager.activeDatasetId = 'exact-dataset';
-    assert.equal(controller._getDatasetId(), 'exact-dataset');
+    assert.match(controller._getCacheIdentity().key, /"exact-dataset"/);
   } finally {
     manager.activeDatasetId = previousDatasetId;
   }
@@ -580,33 +376,20 @@ test('unsupported heap measurement stays explicitly unavailable without guessed 
 
 test('streaming gene loads and analysis cleanup preserve exact failures', async () => {
   const loadFailure = new Error('exact streamed gene load failure');
-  const loader = new StreamingGeneLoader({
-    dataLayer: {
-      state: { pointCount: 4 },
-      async ensureGeneExpressionLoaded() {
-        throw loadFailure;
-      },
-      async prefetchGenePayload() {
-        return null;
-      },
-      unloadGeneExpression() {
-        return true;
-      },
-      invalidateVariable() {},
-    },
-    config: {
-      preloadCount: 1,
-      networkConcurrency: 1,
-      memoryBudgetMB: 128,
-    },
-  });
-
   await assert.rejects(
-    async () => {
-      for await (const _entry of loader.streamGenesRaw(['FAILED_GENE'])) {
-        assert.fail('a failed gene must never disappear from the requested stream');
-      }
-    },
+    runGeneStream({
+      dataLayer: {
+        state: { pointCount: 4 },
+        async readGeneColumn() {
+          throw loadFailure;
+        },
+      },
+      genes: ['FAILED_GENE'],
+      tuner: createRunTuner({ poolSize: 1, cellCount: 4, budgetBytes: () => 2 ** 27 }),
+      route: null,
+      dispatch: () => assert.fail('a failed gene must never disappear from the requested stream'),
+      onResult: () => assert.fail('a failed gene has no result'),
+    }),
     error => error === loadFailure,
   );
 
@@ -653,33 +436,28 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
 
 test('gene signature median computes the exact per-cell median', async () => {
   const cellIndices = Uint32Array.from([0, 1, 2, 3]);
-  const page = values => ({
-    values,
-    cellIndices,
-    pageName: 'Exact page',
-  });
+  const columns = {
+    A: Float32Array.from([1, 100, NaN, 4]),
+    // A sparse column: its absent entry (cell 1) is a zero.
+    B: { length: 4, indices: Uint32Array.of(0, 2, 3), values: Float32Array.of(3, 5, 6) },
+    C: Float32Array.from([2, 10, 7, 8]),
+  };
   const dataLayer = {
-    async getGeneExpressionSubset() {
-      return {
-        A: { page: page(Float32Array.from([1, 100, NaN, 4])) },
-        B: { page: page(Float32Array.from([3, 0, 5, 6])) },
-        C: { page: page(Float32Array.from([2, 10, 7, 8])) },
-      };
+    state: { pointCount: 4 },
+    async readGeneColumns(genes) {
+      return genes.map(gene => columns[gene]);
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({ pageId, pageName: 'Exact page', cellIndices }));
+    },
     performCacheCleanup() {},
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = dataLayer;
   analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'signature-notification'; },
-    complete() {},
-    fail() {},
-  };
 
-  const [result] = await analysis.computeSignatureScore({
-    genes: ['A', 'B', 'C'],
+  const { sets: [{ pages: [result] }] } = await analysis.computeSignatureScore({
+    geneSets: [{ name: 'S', genes: ['A', 'B', 'C'] }],
     pageIds: ['page'],
     method: 'median',
   });
@@ -701,38 +479,31 @@ test('gene signature median computes the exact per-cell median', async () => {
 
 test('gene signature scoring preserves prototype-named gene and page cross-products', async () => {
   const exactNames = Object.getOwnPropertyNames(Object.prototype);
-  const geneData = Object.fromEntries(
-    exactNames.map((gene, geneIndex) => [
-      gene,
-      Object.fromEntries(
-        exactNames.map((pageId, pageIndex) => [
-          pageId,
-          {
-            values: Float32Array.of(geneIndex + pageIndex),
-            cellIndices: Uint32Array.of(0),
-            pageName: `Page ${pageId}`,
-          },
-        ]),
-      ),
-    ]),
-  );
+  // Page p is cell p; gene g has the value g + p there.
+  const pointCount = exactNames.length;
+  const columns = new Map(exactNames.map((gene, geneIndex) => [
+    gene,
+    Float32Array.from({ length: pointCount }, (_, cell) => geneIndex + cell),
+  ]));
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return geneData;
+    state: { pointCount },
+    async readGeneColumns(genes) {
+      return genes.map(gene => columns.get(gene));
     },
-    clearBulkGeneCache() {},
+    getPageCells(pageIds) {
+      return pageIds.map(pageId => ({
+        pageId,
+        pageName: `Page ${pageId}`,
+        cellIndices: Uint32Array.of(exactNames.indexOf(pageId)),
+      }));
+    },
     performCacheCleanup() {},
   };
   analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'prototype-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
 
-  const result = await analysis.computeSignatureScore({
-    genes: exactNames,
+  const { sets: [{ pages: result }] } = await analysis.computeSignatureScore({
+    geneSets: [{ name: 'S', genes: exactNames }],
     pageIds: exactNames,
     method: 'mean',
   });
@@ -740,78 +511,12 @@ test('gene signature scoring preserves prototype-named gene and page cross-produ
   assert.deepEqual(result.map(page => page.pageId), exactNames);
   for (const [pageIndex, page] of result.entries()) {
     assert.equal(page.pageName, `Page ${exactNames[pageIndex]}`);
-    assert.deepEqual(Array.from(page.cellIndices), [0]);
+    assert.deepEqual(Array.from(page.cellIndices), [pageIndex]);
     assert.deepEqual(Array.from(page.scores), [
       ((exactNames.length - 1) / 2) + pageIndex,
     ]);
     assert.equal(page.genesUsed, exactNames.length);
   }
-});
-
-test('gene signature scoring rejects an inherited-only gene record', async () => {
-  const pageData = {
-    values: Float32Array.of(1),
-    cellIndices: Uint32Array.of(0),
-    pageName: 'Inherited page',
-  };
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return Object.create({
-        GENE: Object.fromEntries([['page', pageData]]),
-      });
-    },
-    clearBulkGeneCache() {},
-    performCacheCleanup() {},
-  };
-  analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'inherited-gene-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
-
-  await assert.rejects(
-    analysis.computeSignatureScore({
-      genes: ['GENE'],
-      pageIds: ['page'],
-      method: 'mean',
-    }),
-    /signature data is missing for gene GENE on page page/i,
-  );
-});
-
-test('gene signature scoring rejects an inherited-only page record', async () => {
-  const pageData = {
-    values: Float32Array.of(1),
-    cellIndices: Uint32Array.of(0),
-    pageName: 'Inherited page',
-  };
-  const analysis = Object.create(MultiVariableAnalysis.prototype);
-  analysis.dataLayer = {
-    async getGeneExpressionSubset() {
-      return Object.fromEntries([
-        ['GENE', Object.create({ page: pageData })],
-      ]);
-    },
-    clearBulkGeneCache() {},
-    performCacheCleanup() {},
-  };
-  analysis._computeManager = null;
-  analysis._notifications = {
-    loading() { return 'inherited-page-signature-notification'; },
-    complete() {},
-    fail() {},
-  };
-
-  await assert.rejects(
-    analysis.computeSignatureScore({
-      genes: ['GENE'],
-      pageIds: ['page'],
-      method: 'mean',
-    }),
-    /signature data is missing for gene GENE on page page/i,
-  );
 });
 
 test('differential expression requires exact dataset and gene identities', async () => {
@@ -823,13 +528,11 @@ test('differential expression requires exact dataset and gene identities', async
     },
   };
   const options = {
-    pageA: 'page-a',
-    pageB: 'page-b',
+    groupA: { name: 'A', cells: Uint32Array.of(0, 1) },
+    groupB: { name: 'B', cells: Uint32Array.of(2, 3) },
     geneList: null,
     method: 'wilcox',
     minCells: 2,
-    parallelism: 'auto',
-    batchConfig: {},
   };
 
   await assert.rejects(
@@ -839,6 +542,8 @@ test('differential expression requires exact dataset and gene identities', async
 
   analysis.dataLayer = {
     state: { pointCount: 4 },
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'KNOWN_GENE', name: 'Known gene' }];
     },

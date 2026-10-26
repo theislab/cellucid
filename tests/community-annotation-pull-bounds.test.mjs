@@ -155,7 +155,7 @@ test('changed user files reach the sink in bounded batches, each before the next
     sha: String(index + 1).padStart(40, '0'),
   }));
   const body = id => {
-    const text = JSON.stringify({ version: 1, username: `ghid_${id}`, githubUserId: id, updatedAt: '2026-07-30T01:02:03.456Z', suggestions: {}, votes: {} });
+    const text = JSON.stringify({ version: 2, username: `ghid_${id}`, githubUserId: id, updatedAt: '2026-07-30T01:02:03.456Z', datasets: {} });
     return text + ' '.repeat(fileBytes - Buffer.byteLength(text));
   };
   let blobsFetched = 0;

@@ -401,7 +401,7 @@ uniform float u_cometStretch; // Velocity-based elongation amount
 uniform float u_invMaxMagnitude;
 
 // Visibility texture
-uniform sampler2D u_alphaTex;
+uniform highp usampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
 uniform bool u_useAlphaTex;
 
@@ -420,7 +420,7 @@ float fetchAlpha(uint cellIndex) {
   int idx = int(cellIndex);
   int y = idx / u_alphaTexWidth;
   int x = idx - y * u_alphaTexWidth;
-  return texelFetch(u_alphaTex, ivec2(x, y), 0).r;
+  return float(texelFetch(u_alphaTex, ivec2(x, y), 0).r);
 }
 
 void main() {

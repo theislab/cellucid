@@ -20,6 +20,7 @@ import { DataStateMappingMethods } from '../managers/mapping-manager.js';
 import { DataStateMappingGroupMethods } from '../managers/mapping-groups.js';
 import { DataStateVarAxisMethods } from '../managers/var-axis.js';
 import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
+import { DataStateOutlierQuantileMethods } from '../managers/outlier-quantiles.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -46,6 +47,9 @@ export class DataState extends EventEmitter {
     // Per-cell user mask (setCellVisibility), exactly 0 or 1, ANDed into
     // `categoryTransparency` by computeGlobalVisibility().
     this.cellVisibilityMask = new Uint8Array(0);
+    // The transparency array whose bytes the live viewer holds, with its write
+    // count then (`_pushTransparencyToViewer`); null when not known.
+    this._liveViewerTransparency = null;
     this.obsData = null;
     this.varData = null;
     this._obsFieldDescriptors = Object.freeze([]);
@@ -62,7 +66,6 @@ export class DataState extends EventEmitter {
     this.centroidPositions = new Float32Array(0);
     this.centroidColors = new Uint8Array(0); // RGBA uint8 (alpha packed in)
     this.centroidLabels = [];
-    this.centroidOutliers = new Float32Array(0);
 
     this._activeCategoryCounts = null;
     this.activeViewId = 'live';
@@ -88,8 +91,8 @@ export class DataState extends EventEmitter {
     this._mappingCandidates = null;
     this._mappingOrigin = null;
     this._mappingPublicationOrigin = null;
-    // Embeddings that failed their load-time check: obsm key or export id ->
-    // reason. They stay unusable for the rest of the dataset's session.
+    // Embeddings that failed their load-time check: obsm key -> reason.
+    // They stay unusable for the rest of the dataset's session.
     this._unusableEmbeddings = new Map();
     this._mappingChangeLock = null;
     // The other mapping groups (state/managers/mapping-groups.js): choices
@@ -111,7 +114,7 @@ export class DataState extends EventEmitter {
     this.activePageId = null; // Currently active page ID
     this._highlightPageIdCounter = 0;
     this.highlightArray = new Uint8Array(0); // Uint8Array per-point highlight intensity (0-255)
-    this._highlightedCellIndices = [];
+    this._highlightedCellIndices = new Uint32Array(0);
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null; // Cached visible highlight count
     this._cachedTotalHighlightCount = null; // Cached total highlight count
@@ -151,6 +154,7 @@ applyMixin(DataState.prototype, DataStateMappingMethods.prototype);
 applyMixin(DataState.prototype, DataStateMappingGroupMethods.prototype);
 applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
 applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
+applyMixin(DataState.prototype, DataStateOutlierQuantileMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);

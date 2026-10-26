@@ -14,6 +14,7 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
+import { loadAppCode } from '../../../app-code.js';
 import { buildExportFilename, formatTimestampForFilename } from './utils/export-helpers.js';
 import { downloadBlob } from '../../../utils/download.js';
 import { createFigureExportZip } from './utils/zip-archive.js';
@@ -32,6 +33,7 @@ import {
   isFigureExportSignalAborted,
   throwIfFigureExportAborted,
 } from './figure-export-contract.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
 
 const LIVE_VIEW_ID = 'live';
 const userNotifiedFailures = new WeakSet();
@@ -294,7 +296,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     }
     if (viewerCount !== stateCount) {
       throw new Error(
-        `Figure export point-count mismatch: viewer has ${viewerCount} points while state has ${stateCount}`
+        `Figure export point-count mismatch: viewer has ${formatCountOf(viewerCount, 'point')} while state has ${stateCount}`
       );
     }
     if (dataSourceManager === null) {
@@ -922,7 +924,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const notifications = getNotificationCenter();
     const countLabel = jobs.length === 1
       ? jobs[0].format.toUpperCase()
-      : `${jobs.length} exports`;
+      : `${formatCountOf(jobs.length, 'export')}`;
     const notifId = notifications.startCalculation(`Preparing ${countLabel}…`, 'render');
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const ts = formatTimestampForFilename();
@@ -962,7 +964,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           if (!svgRenderer) {
             svgRenderer = await awaitFigureExportAbortable(
               signal,
-              import('./renderers/svg-renderer.js')
+              loadAppCode(() => import('./renderers/svg-renderer.js'))
             );
             throwIfFigureExportAborted(signal);
           }
@@ -993,7 +995,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           if (!pngRenderer) {
             pngRenderer = await awaitFigureExportAbortable(
               signal,
-              import('./renderers/png-renderer.js')
+              loadAppCode(() => import('./renderers/png-renderer.js'))
             );
             throwIfFigureExportAborted(signal);
           }
@@ -1061,7 +1063,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       notifications.success(
         results.length === 1
           ? 'Exported 1 file'
-          : `Exported ${results.length} files in one ZIP archive`,
+          : `Exported ${formatCountOf(results.length, 'file')} in one ZIP archive`,
         { category: 'download', duration: 2500 }
       );
       return results;

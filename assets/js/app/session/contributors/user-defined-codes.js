@@ -5,15 +5,13 @@
  */
 
 import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
-import { decodeUvarint, pushUvarint } from '../codecs/varint.js';
+import { decodeUvarint, uvarintLength, writeUvarint } from '../codecs/varint.js';
 import { computeAllLayoutCentroids } from '../../registries/user-defined-fields/centroids.js';
 import {
   assertArray,
-  assertExactKeys,
   assertNonEmptyString,
-  assertPlainRecord,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from '../schema-contract.js';
 import {
   getCriticalUserDefinedFieldIds,
@@ -21,31 +19,35 @@ import {
 } from './user-defined-code-inventory.js';
 import { requireCategoryCodes } from '../../registries/user-defined-fields.js';
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 export const id = 'user-defined-codes';
 
-const ENC_RAW_U8 = 0;
-const ENC_RAW_U16 = 1;
-const ENC_RLE_U8 = 2;
-const ENC_RLE_U16 = 3;
-const ENC_RAW_U32 = 4;
-const ENC_RLE_U32 = 5;
+/**
+ * Codes payload (before the chunk's gzip): u8 encoding, uvarint length, then
+ *
+ * - 0 raw: `length` codes, little-endian, at the field's declared code width;
+ * - 1 runs: uvarint runCount, then runCount × (uvarint value, uvarint length),
+ *   adjacent runs with distinct values;
+ * - 2 packed: u8 bitsPerCode (1, 2 or 4), then ceil(length × bits / 8) bytes,
+ *   code i in bits [i × bits, (i + 1) × bits) counted from the least
+ *   significant bit of byte 0.
+ *
+ * The writer keeps the smallest. Measured on Suo (562k cells, 3 codes made
+ * from two highlight pages): runs 441 KB, packed 140 KB before gzip; 107 KB
+ * and 86 KB after.
+ */
+const ENC_RAW = 0;
+const ENC_RUNS = 1;
+const ENC_PACKED = 2;
 
-/** Each code width's encodings, element size and largest value. */
+/** Each code width's element size and largest value. */
 const CODE_WIDTHS = Object.freeze({
-  Uint8Array: Object.freeze({ raw: ENC_RAW_U8, rle: ENC_RLE_U8, bytes: 1, ArrayType: Uint8Array, maximum: 0xff }),
-  Uint16Array: Object.freeze({ raw: ENC_RAW_U16, rle: ENC_RLE_U16, bytes: 2, ArrayType: Uint16Array, maximum: 0xffff }),
-  Uint32Array: Object.freeze({ raw: ENC_RAW_U32, rle: ENC_RLE_U32, bytes: 4, ArrayType: Uint32Array, maximum: 0xffff_ffff }),
+  Uint8Array: Object.freeze({ bytes: 1, ArrayType: Uint8Array, maximum: 0xff }),
+  Uint16Array: Object.freeze({ bytes: 2, ArrayType: Uint16Array, maximum: 0xffff }),
+  Uint32Array: Object.freeze({ bytes: 4, ArrayType: Uint32Array, maximum: 0xffff_ffff }),
 });
 
-function codeWidthOfEncoding(encoding) {
-  for (const [codesType, width] of Object.entries(CODE_WIDTHS)) {
-    if (width.raw === encoding || width.rle === encoding) {
-      return { codesType, width, rle: width.rle === encoding };
-    }
-  }
-  return null;
-}
 const CHUNK_PREFIX = 'user-defined/codes/';
 const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
 const CHUNK_META_KEYS = Object.freeze([
@@ -80,18 +82,17 @@ function assertSignal(signal) {
   return signal;
 }
 
-function encodeRawCodes(codes) {
+function writeRawCodes(out, offset, codes) {
   if (codes instanceof Uint8Array) {
-    return new Uint8Array(codes);
+    out.set(codes, offset);
+    return;
   }
-  const width = codes.BYTES_PER_ELEMENT;
-  const bytes = new Uint8Array(codes.length * width);
-  const view = new DataView(bytes.buffer);
-  for (let index = 0; index < codes.length; index++) {
-    if (width === 2) view.setUint16(index * 2, codes[index], true);
-    else view.setUint32(index * 4, codes[index], true);
+  const view = new DataView(out.buffer, out.byteOffset + offset, codes.length * codes.BYTES_PER_ELEMENT);
+  if (codes instanceof Uint16Array) {
+    for (let index = 0; index < codes.length; index++) view.setUint16(index * 2, codes[index], true);
+  } else {
+    for (let index = 0; index < codes.length; index++) view.setUint32(index * 4, codes[index], true);
   }
-  return bytes;
 }
 
 function encodeCodesBinary(codes) {
@@ -103,53 +104,63 @@ function encodeCodesBinary(codes) {
     'User-defined codes length',
     { maximum: 0xffff_ffff }
   );
-  const width = codes instanceof Uint8Array
-    ? CODE_WIDTHS.Uint8Array
-    : codes instanceof Uint16Array ? CODE_WIDTHS.Uint16Array : CODE_WIDTHS.Uint32Array;
+  const headerBytes = 1 + uvarintLength(codesLength);
 
-  const rawHeader = [width.raw];
-  pushUvarint(codesLength, rawHeader);
-  const rawBytes = encodeRawCodes(codes);
-  const rawOut = new Uint8Array(rawHeader.length + rawBytes.byteLength);
-  rawOut.set(rawHeader, 0);
-  rawOut.set(rawBytes, rawHeader.length);
-
-  const rlePairsBytes = [];
-  let pairCount = 0;
-  if (codesLength > 0) {
-    let current = codes[0];
-    let run = 1;
-    for (let index = 1; index < codesLength; index++) {
-      const value = codes[index];
-      if (value === current) {
-        run += 1;
-      } else {
-        pairCount += 1;
-        pushUvarint(current, rlePairsBytes);
-        pushUvarint(run, rlePairsBytes);
-        current = value;
-        run = 1;
-      }
-    }
-    pairCount += 1;
-    pushUvarint(current, rlePairsBytes);
-    pushUvarint(run, rlePairsBytes);
+  // One pass sizes the run encoding and finds the largest code.
+  let runCount = 0;
+  let runBytes = 0;
+  let largest = 0;
+  for (let index = 0; index < codesLength;) {
+    const value = codes[index];
+    let end = index + 1;
+    while (end < codesLength && codes[end] === value) end++;
+    runCount += 1;
+    runBytes += uvarintLength(value) + uvarintLength(end - index);
+    if (value > largest) largest = value;
+    index = end;
   }
+  runBytes += uvarintLength(runCount);
+  const rawBytes = codesLength * codes.BYTES_PER_ELEMENT;
+  const bits = largest < 2 ? 1 : largest < 4 ? 2 : largest < 16 ? 4 : 0;
+  const packedBytes = bits === 0 ? Infinity : 1 + Math.ceil((codesLength * bits) / 8);
+  const smallest = Math.min(rawBytes, runBytes, packedBytes);
 
-  const rleHeader = [width.rle];
-  pushUvarint(codesLength, rleHeader);
-  pushUvarint(pairCount, rleHeader);
-  const rleOut = new Uint8Array(rleHeader.length + rlePairsBytes.length);
-  rleOut.set(rleHeader, 0);
-  rleOut.set(rlePairsBytes, rleHeader.length);
-  return rleOut.byteLength < rawOut.byteLength ? rleOut : rawOut;
+  if (smallest === packedBytes) {
+    const out = new Uint8Array(headerBytes + packedBytes);
+    out[0] = ENC_PACKED;
+    const body = writeUvarint(out, 1, codesLength);
+    out[body] = bits;
+    const perByte = 8 / bits;
+    for (let index = 0; index < codesLength; index++) {
+      out[body + 1 + Math.floor(index / perByte)] |= codes[index] << ((index % perByte) * bits);
+    }
+    return out;
+  }
+  if (smallest === runBytes) {
+    const out = new Uint8Array(headerBytes + runBytes);
+    out[0] = ENC_RUNS;
+    let offset = writeUvarint(out, writeUvarint(out, 1, codesLength), runCount);
+    for (let index = 0; index < codesLength;) {
+      const value = codes[index];
+      let end = index + 1;
+      while (end < codesLength && codes[end] === value) end++;
+      offset = writeUvarint(out, offset, value);
+      offset = writeUvarint(out, offset, end - index);
+      index = end;
+    }
+    return out;
+  }
+  const out = new Uint8Array(headerBytes + rawBytes);
+  out[0] = ENC_RAW;
+  writeRawCodes(out, writeUvarint(out, 1, codesLength), codes);
+  return out;
 }
 
 async function decodeCodesBinary(bytes, options) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 2) {
     throw new TypeError('Invalid user-defined codes payload.');
   }
-  assertPlainRecord(options, 'User-defined codes decode options');
+  requirePlainRecord(options, 'User-defined codes decode options');
   const optionKeys = Object.keys(options).sort();
   const expectedOptionKeys = ['expectedCodesType', 'expectedLength', 'signal'];
   if (
@@ -182,67 +193,61 @@ async function decodeCodesBinary(bytes, options) {
     );
   }
 
-  const decodedWidth = codeWidthOfEncoding(encoding);
-  if (decodedWidth === null) {
-    throw new TypeError(`Invalid user-defined codes encoding type ${encoding}.`);
-  }
-  const actualCodesType = decodedWidth.codesType;
-  const { ArrayType, bytes: elementBytes, maximum: maximumValue } = decodedWidth.width;
-  if (actualCodesType !== options.expectedCodesType) {
-    throw new TypeError(
-      `User-defined codes encoding type ${actualCodesType} does not match field metadata ${options.expectedCodesType}.`
-    );
-  }
+  const { ArrayType, bytes: elementBytes, maximum: maximumValue } =
+    CODE_WIDTHS[options.expectedCodesType];
 
-  if (encoding === ENC_RAW_U8) {
-    if (bytes.byteLength - offset !== length) {
-      throw new Error('Invalid raw-u8 user-defined codes byte length or trailing bytes.');
+  if (encoding === ENC_PACKED) {
+    const bits = bytes[offset++];
+    if (bits !== 1 && bits !== 2 && bits !== 4) {
+      throw new TypeError('Packed user-defined codes must use 1, 2 or 4 bits per code.');
     }
-    const codes = new Uint8Array(length);
-    for (
-      let outputOffset = 0;
-      outputOffset < length;
-      outputOffset += COOPERATIVE_DECODE_BUDGET
-    ) {
-      throwIfAborted(signal);
-      const end = Math.min(
-        outputOffset + COOPERATIVE_DECODE_BUDGET,
-        length
-      );
-      codes.set(
-        bytes.subarray(offset + outputOffset, offset + end),
-        outputOffset
-      );
-      if (end < length) {
+    if (bytes.byteLength - offset !== Math.ceil((length * bits) / 8)) {
+      throw new Error('Invalid packed user-defined codes byte length or trailing bytes.');
+    }
+    const perByte = 8 / bits;
+    const mask = (1 << bits) - 1;
+    const codes = new ArrayType(length);
+    for (let index = 0; index < length; index++) {
+      codes[index] = (bytes[offset + Math.floor(index / perByte)] >>> ((index % perByte) * bits)) & mask;
+      if (index + 1 < length && (index + 1) % COOPERATIVE_DECODE_BUDGET === 0) {
         await yieldToMacrotask();
+        throwIfAborted(signal);
       }
+    }
+    const usedBits = (length * bits) % 8;
+    if (usedBits !== 0 && (bytes[bytes.byteLength - 1] >>> usedBits) !== 0) {
+      throw new Error('Packed user-defined codes set bits past their length.');
     }
     throwIfAborted(signal);
     return codes;
   }
 
-  if (encoding === ENC_RAW_U16 || encoding === ENC_RAW_U32) {
+  if (encoding === ENC_RAW) {
     if (bytes.byteLength - offset !== length * elementBytes) {
       throw new Error(`Invalid raw-u${elementBytes * 8} user-defined codes byte length or trailing bytes.`);
     }
     const codes = new ArrayType(length);
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, length * elementBytes);
-    for (let index = 0; index < length; index++) {
-      throwIfAborted(signal);
-      codes[index] = elementBytes === 2
-        ? view.getUint16(index * 2, true)
-        : view.getUint32(index * 4, true);
-      if (
-        index + 1 < length
-        && (index + 1) % COOPERATIVE_DECODE_BUDGET === 0
-      ) {
-        await yieldToMacrotask();
+    if (elementBytes === 1) {
+      codes.set(bytes.subarray(offset, offset + length));
+    } else {
+      const view = new DataView(bytes.buffer, bytes.byteOffset + offset, length * elementBytes);
+      for (let index = 0; index < length; index++) {
+        codes[index] = elementBytes === 2
+          ? view.getUint16(index * 2, true)
+          : view.getUint32(index * 4, true);
+        if (index + 1 < length && (index + 1) % COOPERATIVE_DECODE_BUDGET === 0) {
+          await yieldToMacrotask();
+          throwIfAborted(signal);
+        }
       }
     }
     throwIfAborted(signal);
     return codes;
   }
 
+  if (encoding !== ENC_RUNS) {
+    throw new TypeError(`Invalid user-defined codes encoding type ${encoding}.`);
+  }
   const pairResult = decodeUvarint(bytes, offset);
   const pairCount = pairResult.value;
   offset = pairResult.nextOffset;
@@ -472,7 +477,7 @@ export async function restore(ctx, chunkMeta, payload) {
   if (!(payload instanceof Uint8Array)) {
     throw new TypeError('User-defined codes payload must be a Uint8Array.');
   }
-  assertExactKeys(
+  requireExactKeys(
     chunkMeta,
     CHUNK_META_KEYS,
     'User-defined codes chunk metadata'

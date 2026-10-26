@@ -186,12 +186,6 @@ export async function readBoundedOrcidJson(
     }
     await cancelLiveReader();
     throw primary;
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // A settled response reader may already have released its lock.
-    }
   }
 
   throwIfAborted(ownerSignal);

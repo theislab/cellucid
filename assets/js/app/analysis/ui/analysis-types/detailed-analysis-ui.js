@@ -34,6 +34,7 @@ import { createLayoutEngine } from '../../plots/layout-engine.js';
 import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
+import { PLACES } from '../../../ui/place-names.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -150,6 +151,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._controlsContainer.className = 'detailed-analysis-controls';
     this._container.appendChild(this._controlsContainer);
 
+    // The running, cancelled or failed state of the plot's job.
+    this._container.appendChild(this._getJobStatusView().root);
+
     // Preview container
     this._previewContainer = document.createElement('div');
     this._previewContainer.className = 'analysis-preview-container empty';
@@ -186,7 +190,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     // If no pages, show message
     if (pages.length === 0) {
       this._controlsContainer.innerHTML = `
-        <p class="empty-state">Create highlight pages first in the Highlighting section above.</p>
+        <p class="empty-state">Create highlight pages first in the ${PLACES.highlighting.name} section above.</p>
       `;
       const invalidationRequestId = this._invalidateAnalysisRequest();
       this._trackInteractiveTask(
@@ -545,16 +549,21 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * Run the analysis (implements abstract method from BaseAnalysisUI)
    * @override
    */
-  async _runAnalysis(requestId) {
+  async _runAnalysis(requestId, job) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
     await this._whileBusy(
       this._previewContainer,
-      () => this._runPreviewAnalysis(requestId)
+      () => this._runPreviewAnalysis(requestId, job)
     );
   }
 
+  /** @override */
+  _getJobTitle() {
+    return 'Detailed analysis';
+  }
+
   /** @private */
-  async _runPreviewAnalysis(requestId) {
+  async _runPreviewAnalysis(requestId, job) {
     const config = structuredClone(this._currentConfig);
     const pageIds = [...this._selectedPages];
     const customColors = new Map(
@@ -570,11 +579,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       if (!this._isCurrentAnalysisRequest(requestId)) return;
 
       // Fetch data
+      job.step(`Reading ${config.dataSource.variable}`);
       const fetchedPageData = await this.dataLayer.getDataForPages({
         type: config.dataSource.type,
         variableKey: config.dataSource.variable,
-        pageIds
+        pageIds,
+        silent: true,
+        signal: job.signal,
+        owner: job.id
       });
+      job.step('Drawing the plot');
       // Missing categories are excluded per variable, before any plot,
       // summary table or categorical test sees the page.
       const pageData = config.dataSource.type === 'categorical_obs'
@@ -617,7 +631,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
             pageData,
             mergedOptions,
             candidate,
-            layoutEngine
+            layoutEngine,
+            { signal: job.signal }
           )
         },
         {
@@ -747,29 +762,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this._actionsContainer) {
       this._actionsContainer.hidden = true;
     }
-    return true;
-  }
-
-  async _showError(message, requestId = null) {
-    const publicationCurrent = await this._hidePreview(requestId);
-    if (
-      !publicationCurrent ||
-      (
-        requestId !== null &&
-        !this._isCurrentAnalysisRequest(requestId)
-      )
-    ) {
-      return false;
-    }
-    if (this._previewContainer) {
-      this._previewContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message ?? '' }).root
-      );
-    }
-    this._notifications.error(
-      message,
-      { category: 'data', title: 'Analysis error' }
-    );
     return true;
   }
 

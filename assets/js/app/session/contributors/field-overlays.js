@@ -7,12 +7,10 @@
 import {
   assertArray,
   assertBoolean,
-  assertExactKeys,
   assertNonEmptyString,
   assertNullableFiniteNumber,
-  assertPlainRecord,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from '../schema-contract.js';
 import {
   getSessionRestoreSnapshot
@@ -22,11 +20,12 @@ import {
   USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
 } from './user-defined-code-inventory.js';
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 export const id = 'field-overlays';
 
 function assertStringRecord(value, context) {
-  assertPlainRecord(value, context);
+  requirePlainRecord(value, context);
   for (const [key, entry] of Object.entries(value)) {
     assertNonEmptyString(key, `${context} key`);
     assertNonEmptyString(entry, `${context} value for "${key}"`);
@@ -34,7 +33,7 @@ function assertStringRecord(value, context) {
 }
 
 function assertRenames(value) {
-  assertExactKeys(value, ['fields', 'categories'], 'Field rename registry state');
+  requireExactKeys(value, ['fields', 'categories'], 'Field rename registry state');
   assertStringRecord(value.fields, 'Field rename registry fields');
   assertStringRecord(value.categories, 'Field rename registry categories');
 }
@@ -53,7 +52,7 @@ function assertUniqueStringArray(value, context) {
 }
 
 function assertDeletedFields(value) {
-  assertExactKeys(value, ['deleted', 'purged'], 'Field delete registry state');
+  requireExactKeys(value, ['deleted', 'purged'], 'Field delete registry state');
   const deleted = assertUniqueStringArray(
     value.deleted,
     'Field delete registry deleted entries'
@@ -71,7 +70,7 @@ function assertDeletedFields(value) {
 
 function assertNullableRecord(value, context) {
   if (value === null) return;
-  assertPlainRecord(value, context);
+  requirePlainRecord(value, context);
 }
 
 function assertPrimitiveCategoryArray(value, context) {
@@ -95,10 +94,10 @@ function assertPrimitiveCategoryArray(value, context) {
 }
 
 function assertUserDefinedMetaItem(item, index) {
-  assertPlainRecord(item, `User-defined field metadata ${index}`);
+  requirePlainRecord(item, `User-defined field metadata ${index}`);
   const commonContext = `User-defined field metadata ${index}`;
   if (item.kind === 'continuous') {
-    assertExactKeys(
+    requireExactKeys(
       item,
       [
         'id',
@@ -114,7 +113,7 @@ function assertUserDefinedMetaItem(item, index) {
       commonContext
     );
   } else if (item.kind === 'category') {
-    assertExactKeys(
+    requireExactKeys(
       item,
       [
         'id',
@@ -191,7 +190,7 @@ function assertUserDefinedFields(value) {
 }
 
 function assertPayload(payload) {
-  assertExactKeys(
+  requireExactKeys(
     payload,
     ['renames', 'deletedFields', 'userDefinedFields'],
     'Field overlays payload'

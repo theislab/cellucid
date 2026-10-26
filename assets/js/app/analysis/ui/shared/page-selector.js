@@ -38,13 +38,16 @@
  * pageSelector.destroy();
  */
 
-import { formatCells, formatCompactCount } from '../../../ui/components/display-format.js';
+import { formatCompactCount } from '../../../ui/components/display-format.js';
+import { formatCells, formatCountOf } from '../../../../utils/format-units.js';
 import { createDomId } from '../../../ui/components/dom-id.js';
 import { createInfoTip } from '../../../ui/components/controls.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { deriveRestOfColor } from '../../shared/color-utils.js';
 import { getPageColor } from '../../core/plugin-contract.js';
+import { isPlainRecord, requireExactKeys } from '../../../../utils/exact-record.js';
+import { PLACES } from '../../../ui/place-names.js';
 
 /** What the Dynamic chip does: its hover title and part of its accessible name. */
 const DYNAMIC_MODE_DESCRIPTION = 'Follows the active highlight page.';
@@ -58,30 +61,6 @@ export const PAGE_MODE = {
   DYNAMIC: 'dynamic',  // Follow the active highlight page
   MANUAL: 'manual'     // User-selected pages
 };
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function requireExactKeys(value, expectedKeys, label) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  const actualKeys = Object.keys(value).sort();
-  const sortedExpected = [...expectedKeys].sort();
-  if (
-    actualKeys.length !== sortedExpected.length ||
-    actualKeys.some((key, index) => key !== sortedExpected[index])
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly: ${sortedExpected.join(', ')}`
-    );
-  }
-}
 
 /**
  * Announce a page chip's toggle state.
@@ -151,7 +130,7 @@ export class PageSelectorComponent {
     this.showCellCounts = options.showCellCounts ?? true;
     this.showSelectAll = options.showSelectAll ?? true;
     this.showHeader = options.showHeader ?? true;
-    this.emptyMessage = options.emptyMessage || 'Create highlight pages first using the Highlighted Cells section above.';
+    this.emptyMessage = options.emptyMessage || `Create highlight pages first in the ${PLACES.highlighting.name} section above.`;
     this.label = options.label ?? 'Compare pages';
     if (typeof this.label !== 'string' || this.label.length === 0 || this.label.endsWith(':')) {
       throw new TypeError('Page selector label must be non-empty text without a trailing colon');
@@ -648,7 +627,7 @@ export class PageSelectorComponent {
         const pageName = this._getPageName(pageId);
         this._modeIndicatorEl.textContent = `(${pageName})`;
       } else {
-        this._modeIndicatorEl.textContent = `(${selectedCount} pages)`;
+        this._modeIndicatorEl.textContent = `(${formatCountOf(selectedCount, 'page')})`;
       }
     }
   }
@@ -746,7 +725,7 @@ export class PageSelectorComponent {
     const seenPageIds = new Set();
     for (const page of basePages) {
       if (
-        !isPlainObject(page) ||
+        !isPlainRecord(page) ||
         typeof page.id !== 'string' ||
         page.id.length === 0 ||
         typeof page.name !== 'string' ||

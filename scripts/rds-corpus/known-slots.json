@@ -1,0 +1,150 @@
+{
+  "checkedWith": {
+    "R": "4.5.3",
+    "SeuratObject": "5.4.0",
+    "SingleCellExperiment": "1.32.0",
+    "SummarizedExperiment": "1.40.0",
+    "S4Vectors": "0.48.1"
+  },
+  "slots": {
+    "Seurat": [
+      "active.assay",
+      "active.ident",
+      "assays",
+      "commands",
+      "graphs",
+      "images",
+      "meta.data",
+      "misc",
+      "neighbors",
+      "project.name",
+      "reductions",
+      "tools",
+      "version"
+    ],
+    "Assay": [
+      "assay.orig",
+      "counts",
+      "data",
+      "key",
+      "meta.features",
+      "misc",
+      "scale.data",
+      "var.features"
+    ],
+    "StdAssay": [
+      "assay.orig",
+      "cells",
+      "default",
+      "features",
+      "key",
+      "layers",
+      "meta.data",
+      "misc"
+    ],
+    "Assay5": [
+      "assay.orig",
+      "cells",
+      "default",
+      "features",
+      "key",
+      "layers",
+      "meta.data",
+      "misc"
+    ],
+    "LogMap": [
+      ".Data"
+    ],
+    "DimReduc": [
+      "assay.used",
+      "cell.embeddings",
+      "feature.loadings",
+      "feature.loadings.projected",
+      "global",
+      "jackstraw",
+      "key",
+      "misc",
+      "stdev"
+    ],
+    "Graph": [
+      "Dim",
+      "Dimnames",
+      "assay.used",
+      "factors",
+      "i",
+      "p",
+      "x"
+    ],
+    "Neighbor": [
+      "alg.idx",
+      "alg.info",
+      "cell.names",
+      "nn.dist",
+      "nn.idx"
+    ],
+    "SpatialImage": [
+      "assay",
+      "key",
+      "misc"
+    ],
+    "FOV": [
+      "assay",
+      "boundaries",
+      "coords_x_orientation",
+      "key",
+      "misc",
+      "molecules"
+    ],
+    "Centroids": [
+      "bbox",
+      "cells",
+      "coords",
+      "nsides",
+      "proj4string",
+      "radius",
+      "theta"
+    ],
+    "Segmentation": [
+      "bbox",
+      "compact",
+      "plotOrder",
+      "polygons",
+      "proj4string",
+      "sf.data"
+    ],
+    "SingleCellExperiment": [
+      "NAMES",
+      "assays",
+      "colData",
+      "elementMetadata",
+      "int_colData",
+      "int_elementMetadata",
+      "int_metadata",
+      "metadata",
+      "rowRanges"
+    ],
+    "SummarizedExperiment": [
+      "NAMES",
+      "assays",
+      "colData",
+      "elementMetadata",
+      "metadata"
+    ],
+    "RangedSummarizedExperiment": [
+      "NAMES",
+      "assays",
+      "colData",
+      "elementMetadata",
+      "metadata",
+      "rowRanges"
+    ],
+    "DFrame": [
+      "elementMetadata",
+      "elementType",
+      "listData",
+      "metadata",
+      "nrows",
+      "rownames"
+    ]
+  }
+}

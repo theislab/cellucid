@@ -11,17 +11,18 @@ import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const FULL_H5AD = path.join(FIXTURES, 'data-mapping-full.h5ad');
 const FULL_ZARR = path.join(FIXTURES, 'data-mapping-full.zarr.zip');
 const EXPECTED = JSON.parse(readFileSync(path.join(FIXTURES, 'data-mapping-full.expected.json'), 'utf8'));
 const START_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=data-mapping-groups-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=data-mapping-groups-ci';
 
 function collectBrowserErrors(page) {
   const errors = [];
@@ -35,15 +36,19 @@ function collectBrowserErrors(page) {
 async function openFullFixture(page, input, file) {
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openCollapsedPanels(page);
-  await page.locator(input).setInputFiles(file);
+  await chooseFiles(page.locator(input), file);
   await expect(page.locator('#dataset-name')).toHaveText('data-mapping-full');
   await expect.poll(() => page.evaluate(
     () => window._cellucidState.getMappingCandidates() !== null
   )).toBe(true);
-  const header = page.locator('#data-mapping-disclosure .disclosure-header');
+  const header = page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header');
   if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+  // Arrays that are off and wider than 3 columns, or cannot be drawn, are
+  // listed under "Other arrays", collapsed; open it so every row is listed.
+  const others = page.locator('#data-mapping-more > .disclosure-header');
+  if (await others.isVisible() && (await others.getAttribute('aria-expanded')) !== 'true') await others.click();
   // Every further group is a collapsed disclosure; open them all.
   for (const section of ['genes', 'knn', 'latent', 'vectors']) {
     const groupHeader = page.locator(`[data-mapping-section="${section}"] .disclosure-header`);
@@ -64,7 +69,7 @@ const mappingGroup = (page, group) => page.evaluate(
   group,
 );
 
-const edgeCount = page => page.evaluate(() => window._cellucidState.getConnectivityEdgeCount());
+const edgeCount = page => page.evaluate(() => window._cellucidState.getConnectivityGraphFact()?.edges ?? null);
 
 async function apply(page) {
   await page.locator('#data-mapping-apply').click();
@@ -86,8 +91,8 @@ async function findCellPoint(page) {
 }
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the neighbour graph is chosen, redrawn, refused and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -109,12 +114,14 @@ for (const [format, input, file] of [
         'distances · sparse 300 × 300',
         'scvi_connectivities · sparse 300 × 300',
       ]);
-      expect(await edgeCount(page)).toBe(EXPECTED.knn.connectivities.n_edges);
-      await expect(page.locator('.data-mapping-facts')).not.toContainText('Neighbour graph');
+      // The graph the file opens with is not read at open, so its edges are
+      // not counted yet; they are once its edges are read.
+      expect(await edgeCount(page)).toBeNull();
 
       // Edges are shown, then the graph changes under them.
       await page.locator('#toggle-connectivity').check();
       await expect.poll(() => page.evaluate(() => window._cellucidViewer.hasConnectivityData())).toBe(true);
+      await expect.poll(() => edgeCount(page)).toBe(EXPECTED.knn.connectivities.n_edges);
       await select.selectOption('scvi_connectivities');
       await expect(page.locator('.data-mapping-status')).toHaveText('Apply replaces the neighbour graph.');
       await apply(page);
@@ -198,8 +205,8 @@ const activeGene = page => page.evaluate(() => {
 });
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: gene names and expression change the gene list, keeping cells and the coloured gene`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -225,14 +232,15 @@ for (const [format, input, file] of [
         'highly_variable · true/false values cannot name genes',
         'dispersions · floating-point values cannot name genes',
       ]);
+      // One short line: what was guessed from the file, then the names note.
       await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint'))
-        .toHaveText("Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
+        .toHaveText("Guessed: highly variable genes. Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
 
       // A highlight and a filtered gene colouring are in place.
       await page.evaluate(() => {
         const state = window._cellucidState;
         state.ensureHighlightPage();
-        state.addHighlightDirect({ type: 'annotation', label: 'kept', cellIndices: [1, 2, 3] });
+        state.addHighlightDirect({ type: 'annotation', label: 'kept', cellIndices: Uint32Array.of(1, 2, 3) });
       });
       await colourByGene(page, 'ENSG00000000003');
       const range = await page.evaluate(() => {
@@ -252,7 +260,8 @@ for (const [format, input, file] of [
       expect(await activeGene(page)).toEqual({ key: 'LYZ', index: 2, filter: range });
       expect(await page.evaluate(() => window._cellucidState.getDataMapping().geneNames)).toBe('column:gene_symbols');
       await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(
-        "1 gene has no 'gene_symbols' value and uses its var index name. "
+        "Guessed: highly variable genes. "
+        + "1 gene has no 'gene_symbols' value and uses its var index name. "
           + "1 duplicate name was made unique, e.g. 'LYZ' → 'LYZ-1'."
       );
       expect(await page.evaluate(() => window._cellucidState.getHighlightedCellCount())).toBe(3);
@@ -317,8 +326,8 @@ const activeOutliers = page => page.evaluate(async () => {
 });
 
 for (const [format, input, file] of [
-  ['H5AD', '#user-data-h5ad-input', FULL_H5AD],
-  ['Zarr ZIP', '#user-data-zarr-archive-input', FULL_ZARR],
+  ['H5AD', '#user-data-file-input', FULL_H5AD],
+  ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
   test.describe(`${format}: the latent space of outlier filters is chosen, computed as the server does, and restored`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
@@ -331,38 +340,61 @@ for (const [format, input, file] of [
       const errors = collectBrowserErrors(page);
       await openFullFixture(page, input, file);
       const latent = page.locator('#data-mapping-latent');
+      const note = page.locator('#outlier-filter-note');
       await expect(latent).toHaveValue('');
       await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-      await expect(page.locator('#outlier-filter-container')).toBeHidden();
+      // No latent space: one button, whose title names the file's candidates.
+      await expect(page.locator('#outlier-filter-container')).toBeVisible();
+      await expect(page.locator('#outlier-filter')).toBeHidden();
+      await expect(note).toBeHidden();
+      await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
+      await expect(page.locator('#outlier-filter-action')).toHaveAttribute('title', /X_scVI/);
 
       await latent.selectOption('X_scVI');
       await expect(page.locator('.data-mapping-status')).toHaveText('Apply measures outliers in the new space.');
       await apply(page);
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
-      await expect(page.locator('#outlier-filter-container')).toBeVisible();
+      // Applying reads nothing; the control says what the first use reads.
+      await expect(page.locator('#outlier-filter')).toBeEnabled();
+      await expect(note).toHaveText(/^First use reads X_scVI \(.+\)\.$/);
+      expect(await activeOutliers(page)).toBeNull();
+      await page.evaluate(() => window._cellucidState.setOutlierThresholdForActive(0.5));
       expect(await activeOutliers(page)).toEqual({
         key: 'cell_type',
-        threshold: 1,
+        threshold: 0.5,
         sha256: EXPECTED.latent.X_scVI.cell_type,
       });
-      await page.evaluate(() => window._cellucidState.setOutlierThresholdForActive(0.5));
 
-      // Another space: new quantiles, the same threshold.
+      // Another space: the filter in use gets new quantiles, the same threshold.
       await latent.selectOption('X_pca');
       await apply(page);
-      expect(await activeOutliers(page)).toEqual({
+      await expect.poll(() => activeOutliers(page)).toEqual({
         key: 'cell_type',
         threshold: 0.5,
         sha256: EXPECTED.latent.X_pca.cell_type,
       });
 
-      // A space with a NaN is refused, and stays unavailable with its reason.
+      // A space with a NaN is refused when it is read: the control says why,
+      // the threshold is back at 100%, and the space is offered no more.
       await latent.selectOption('X_broken');
       await apply(page);
-      await expect(page.locator('[data-mapping-group="latent"] .data-mapping-row-error'))
-        .toHaveText('X_broken: NaN at cell 5.');
+      await expect(note).toHaveText('This latent space cannot be used.');
+      await expect(note).toHaveAttribute('title', /NaN at cell 5/);
+      await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
+      await expect(latent.locator('option[value="X_broken"]')).toContainText('NaN at cell 5');
+      expect(await activeOutliers(page)).toBeNull();
+      await expect(page.locator('#outlier-filter')).toHaveValue('100');
+
+      await latent.selectOption('X_pca');
+      await apply(page);
+      // Left, it is offered no more.
       await expect(latent.locator('option[value="X_broken"]')).toBeDisabled();
-      expect(await mappingGroup(page, 'latent')).toBe('X_pca');
+      await page.evaluate(() => window._cellucidState.setOutlierThresholdForActive(0.5));
+      expect(await activeOutliers(page)).toEqual({
+        key: 'cell_type',
+        threshold: 0.5,
+        sha256: EXPECTED.latent.X_pca.cell_type,
+      });
 
       // The session restores the space and the threshold.
       const downloadPromise = page.waitForEvent('download');
@@ -386,11 +418,12 @@ for (const [format, input, file] of [
         sha256: EXPECTED.latent.X_pca.cell_type,
       });
 
-      // None removes the outlier filter.
+      // None removes the outlier filter: the control waits for a latent space.
       await latent.selectOption('');
       await apply(page);
       expect(await activeOutliers(page)).toBeNull();
-      await expect(page.locator('#outlier-filter-container')).toBeHidden();
+      await expect(page.locator('#outlier-filter')).toBeHidden();
+      await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
       expect(errors).toEqual([]);
     });
   });
@@ -409,11 +442,14 @@ for (const [format, input, file] of [
       const box = (embedding, label) => section
         .locator(`fieldset[data-embedding="${embedding}"] .data-mapping-vector-option`, { hasText: label })
         .locator('input');
+      // Each vector is bound to the embedding it is named for, as scVelo names
+      // them: velocity_umap to X_umap and velocity_tsne to X_tsne.
       await expect(section.locator('fieldset[data-embedding="X_umap"] .data-mapping-vector-option')).toHaveText([
-        'velocity_umap_2d suggested',
+        'velocity_umap suggested',
         'velocity_tsne',
       ]);
-      await expect(box('X_umap', 'velocity_umap_2d')).toBeChecked();
+      await expect(box('X_umap', 'velocity_umap')).toBeChecked();
+      await expect(box('X_tsne', 'velocity_tsne')).toBeChecked();
       await expect(page.locator('#velocity-overlay-controls')).toBeVisible();
 
       // PCA columns 2 and 3 turned on as the 2D default, with velocity_pca read
@@ -432,25 +468,31 @@ for (const [format, input, file] of [
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       expect(await mappingGroup(page, 'vectorFields')).toEqual([
         { key: 'velocity_pca', embedding: { key: 'X_pca', columns: [2, 3] } },
-        { key: 'velocity_umap_2d', embedding: { key: 'X_umap', columns: [0, 1] } },
+        { key: 'velocity_tsne', embedding: { key: 'X_tsne', columns: [0, 1] } },
+        { key: 'velocity_umap', embedding: { key: 'X_umap', columns: [0, 1] } },
       ]);
-      // Two fields now: the view's embedding offers only velocity_pca.
-      await expect(page.locator('#velocity-field option:not([disabled])')).toHaveText(['velocity_pca']);
-      await page.locator('#velocity-field').selectOption('velocity_pca');
+      // Each is bound to the embedding it is named for, so all three are the
+      // one field `velocity`, drawn over whichever of them a view shows.
+      // It is the default field, so it is chosen already: the overlay
+      // settings, the field list among them, open once the overlay is on.
+      await expect(page.locator('#velocity-field option:not([disabled])')).toHaveText(['velocity']);
       await page.locator('#velocity-overlay-enabled').check();
+      await expect(page.locator('#velocity-field')).toBeVisible();
+      await expect(page.locator('#velocity-field')).toHaveValue('velocity');
       await expect.poll(() => page.evaluate(
-        () => window._cellucidViewer.hasVectorFieldForLayout('velocity_pca', 'X_pca[2,3]')
+        () => window._cellucidViewer.hasVectorFieldForLayout('velocity', 'X_pca[2,3]')
       )).toBe(true);
 
       // Unbinding every field hides the overlay and drops its GPU data.
       await box('X_pca[2,3]', 'velocity_pca').uncheck();
-      await box('X_umap', 'velocity_umap_2d').uncheck();
+      await box('X_tsne', 'velocity_tsne').uncheck();
+      await box('X_umap', 'velocity_umap').uncheck();
       await expect(page.locator('.data-mapping-status')).toHaveText('Apply rebinds vector fields; the overlay turns off.');
       const downloadPromise = page.waitForEvent('download');
       await apply(page);
       await expect(page.locator('#velocity-overlay-controls')).toBeHidden();
       expect(await page.evaluate(
-        () => window._cellucidViewer.hasVectorFieldForLayout('velocity_pca', 'X_pca[2,3]')
+        () => window._cellucidViewer.hasVectorFieldForLayout('velocity', 'X_pca[2,3]')
       )).toBe(false);
       await page.locator('#save-state-btn').click();
       sessionPath = testInfo.outputPath('vectors.cellucid-session');
@@ -461,7 +503,7 @@ for (const [format, input, file] of [
     test('a fresh open restores the unbound vector fields', async ({ page }) => {
       const errors = collectBrowserErrors(page);
       await openFullFixture(page, input, file);
-      expect((await mappingGroup(page, 'vectorFields')).length).toBe(1);
+      expect((await mappingGroup(page, 'vectorFields')).length).toBe(2);
       const chooserPromise = page.waitForEvent('filechooser');
       await page.locator('#load-state-btn').click();
       await (await chooserPromise).setFiles(sessionPath);

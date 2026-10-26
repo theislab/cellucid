@@ -6,26 +6,29 @@ import {
   parseEmbeddingMetadata,
   requireRepresentationRef,
 } from '../assets/js/data/dimension-manager.js';
+import { loadsAsReader } from './helpers/dimension-loads.mjs';
 
 function axes(dimension) {
   return Array.from({ length: dimension }, (_, index) => index);
 }
 
 /**
- * Version-3 `embeddings` metadata. `entries` are `[id, dimension, options]`
- * in item order; `options.sourceKey` and `options.columns` are the item's
- * provenance and `options.label` its display label.
+ * A dataset identity's `embeddings` metadata. `entries` are `[id,
+ * dimension, options]` in item order; `options.sourceKey` (the id by
+ * default) and `options.columns` are the item's provenance and
+ * `options.label` its display label. Item `i` reads `obsm` entry `i`.
  */
 function embeddings(entries, defaults, defaultDimension) {
   const items = {};
   entries.forEach(([id, dimension, options = {}], index) => {
+    const columns = options.columns ?? axes(dimension);
     items[id] = {
       label: options.label ?? id,
       dimension,
-      file: `embeddings/${index}_${dimension}d.bin`,
+      path: `obsm/${index}/${columns.join('-')}`,
       source: {
-        key: options.sourceKey ?? null,
-        columns: options.columns ?? axes(dimension),
+        key: options.sourceKey ?? id,
+        columns,
       },
     };
   });
@@ -91,7 +94,7 @@ test('valid embedding metadata replacement invalidates all prior coordinate stat
   assert.equal(manager.getDefaultLayout(3), 'X_umap_3d');
   assert.equal(manager.getDefaultLayout(2), null);
   assert.equal(manager.getDefaultLayoutKey(), 'X_umap_3d');
-  assert.equal(manager.getLayout('X_umap_3d').path, 'embeddings/0_3d.bin');
+  assert.equal(manager.getLayout('X_umap_3d').path, 'obsm/0/0-1-2');
   assert.equal(manager.positionCache.size, 0);
   assert.equal(manager.normalizedPositionCache.size, 0);
   assert.equal(manager.normTransformCache.size, 0);
@@ -123,8 +126,8 @@ test('invalid view layouts reject without substituting or mutating state', () =>
   assert.equal(manager.getOpeningLayout(3), null);
   assert.equal(manager.hasDimension(3), false);
   assert.throws(
-    () => manager.resolveRepresentation({ key: 'X_umap_3d', columns: null }),
-    /no embedding "X_umap_3d"/i
+    () => manager.resolveRepresentation({ key: 'X_umap_3d', columns: [0, 1, 2] }),
+    /cannot plot obsm\['X_umap_3d'\] columns \[0, 1, 2\]/i
   );
   assert.equal(manager.getViewLayout('main'), 'X_umap');
   assert.equal(manager.getViewDimension('main'), 2);
@@ -140,17 +143,6 @@ test('dimension metadata and configuration reject coercive normalization', () =>
           source_key: 'X_umap',
           action: 'used_as',
         },
-      },
-    }),
-    /exactly default_dimension, defaults, and items/i
-  );
-  // The version-2 shape is not read at all.
-  assert.throws(
-    () => new DimensionManager({
-      embeddingsMetadata: {
-        available_dimensions: [2],
-        default_dimension: 2,
-        files: { '2d': 'points_2d.bin' },
       },
     }),
     /exactly default_dimension, defaults, and items/i
@@ -215,15 +207,15 @@ test('dimension metadata and configuration reject coercive normalization', () =>
   const item = metadata().items.X_umap;
   for (const rejected of [
     { ...item, basis: 'umap' },
-    { label: item.label, dimension: item.dimension, file: item.file },
-    { ...item, source: { key: null } },
+    { label: item.label, dimension: item.dimension, path: item.path },
+    { ...item, source: { key: 'X_umap' } },
     { ...item, source: { ...item.source, extra: true } },
   ]) {
     assert.throws(
       () => new DimensionManager({
         embeddingsMetadata: { ...metadata(), items: { X_umap: rejected } },
       }),
-      /exactly label, dimension, file, and source|source must be exactly \{ key, columns \}/
+      /exactly label, dimension, path, and source|source must be exactly \{ key, columns \}/
     );
   }
   for (const rejected of [
@@ -305,17 +297,16 @@ test('the current metadata contract registers one layout per embedding item, sev
     layoutKey: 'X_pca_23',
     dimension: 2,
     label: 'PCA 3/4',
-    path: 'embeddings/1_2d.bin',
+    path: 'obsm/1/2-3',
     provenance: { key: 'X_pca', columns: [2, 3] },
     origin: 'identity',
   });
-  // An item whose source key is null has no addressable provenance.
   assert.deepEqual(manager.getLayout('X_umap_3d'), {
     layoutKey: 'X_umap_3d',
     dimension: 3,
     label: 'X_umap_3d',
-    path: 'embeddings/3_3d.bin',
-    provenance: null,
+    path: 'obsm/3/0-1-2',
+    provenance: { key: 'X_umap_3d', columns: [0, 1, 2] },
     origin: 'identity',
   });
   // Every declared embedding is enabled, in item order: three 2D
@@ -351,12 +342,14 @@ test('an embedding reference resolves by embedding id or by provenance, never by
     embeddingsMetadata: multiLayoutMetadata(),
   });
 
-  // `columns: null` names an export embedding by its id (= layout key); the
-  // dimension is the layout's, never asked of the caller.
-  assert.equal(manager.resolveRepresentation({ key: 'X_pca', columns: null }), 'X_pca');
-  assert.equal(manager.resolveRepresentation({ key: 'X_pca_23', columns: null }), 'X_pca_23');
-  assert.equal(manager.resolveRepresentation({ key: 'X_umap_3d', columns: null }), 'X_umap_3d');
-  assert.equal(manager.getLayout(manager.resolveRepresentation({ key: 'X_umap_3d', columns: null })).dimension, 3);
+  // A reference without columns names no layout: every embedding reference
+  // lists the columns it plots, so a bare key is refused, never looked up.
+  for (const key of ['X_pca', 'X_pca_23', 'X_umap_3d', 'X_missing']) {
+    assert.throws(
+      () => manager.resolveRepresentation({ key, columns: null }),
+      new RegExp(`reference to obsm\\['${key}'\\] must list the columns it plots`),
+    );
+  }
 
   // Columns name a source array and the columns plotted: the provenance.
   assert.equal(manager.resolveRepresentation({ key: 'X_pca', columns: [2, 3] }), 'X_pca_23');
@@ -374,11 +367,10 @@ test('an embedding reference resolves by embedding id or by provenance, never by
     () => manager.resolveRepresentation({ key: 'X_pca_23', columns: [2, 3] }),
     /cannot plot obsm\['X_pca_23'\] columns \[2, 3\]/,
   );
-  // A null source key is not addressable by provenance.
-  assert.equal(manager.findLayoutByProvenance('X_umap_3d', [0, 1, 2]), null);
+  assert.equal(manager.findLayoutByProvenance('X_umap_3d', [0, 1, 2]), 'X_umap_3d');
   assert.throws(
-    () => manager.resolveRepresentation({ key: 'X_missing', columns: null }),
-    /no embedding "X_missing"/,
+    () => manager.resolveRepresentation({ key: 'X_missing', columns: [0, 1] }),
+    /cannot plot obsm\['X_missing'\] columns \[0, 1\]/,
   );
   for (const malformed of [
     { key: 'X_pca' },
@@ -409,7 +401,7 @@ test('layout registration validates the whole batch before publishing any', () =
     layoutKey: 'tsne',
     dimension: 2,
     label: 't-SNE',
-    path: 'tsne.bin',
+    path: 'obsm/7/0-1',
     provenance: { key: 'X_tsne', columns: [0, 1] },
     origin: 'mapping',
   };
@@ -452,21 +444,23 @@ test('a reference names exactly one registered layout', () => {
     layoutKey: 'tsne',
     dimension: 2,
     label: 't-SNE',
-    path: 'tsne.bin',
-    provenance: null,
+    path: 'obsm/7/0-1',
+    provenance: { key: 'X_tsne', columns: [0, 1] },
     origin: 'mapping',
   }]);
 
-  assert.equal(manager.resolveRepresentation({ key: 'X_umap', columns: null }), 'X_umap');
   // Resolving names a registered layout whether or not it is enabled; the
   // data state refuses to show one that is not.
-  assert.equal(manager.resolveRepresentation({ key: 'tsne', columns: null }), 'tsne');
+  assert.equal(manager.resolveRepresentation({ key: 'X_tsne', columns: [0, 1] }), 'tsne');
+  // A bare key names no layout, registered or not.
+  for (const key of ['X_umap', 'X_tsne', 'tsne', 'missing']) {
+    assert.throws(
+      () => manager.resolveRepresentation({ key, columns: null }),
+      /must list the columns it plots/,
+    );
+  }
   assert.equal(manager.isEnabled('tsne'), false);
-  assert.throws(
-    () => manager.resolveRepresentation({ key: 'missing', columns: null }),
-    /no embedding "missing"/,
-  );
-  // A layout without provenance cannot be named by columns.
+  // A layout key is not an obsm key.
   assert.throws(
     () => manager.resolveRepresentation({ key: 'tsne', columns: [0, 1] }),
     /cannot plot obsm\['tsne'\] columns \[0, 1\]/,
@@ -565,7 +559,7 @@ test('position caches are keyed by layout and every shown or pinned layout survi
     layoutKey,
     dimension: 2,
     label: layoutKey,
-    path: `${layoutKey}.bin`,
+    path: `obsm/${layoutKey}/0-1`,
     provenance: null,
     origin: 'mapping',
   })));
@@ -574,7 +568,7 @@ test('position caches are keyed by layout and every shown or pinned layout survi
     ['tsne', Float32Array.from([0, 0, 10, 10, 20, 20, 30, 30])],
     ['pca', Float32Array.from([0, 0, 2, 4, 4, 8, 6, 12])],
   ]);
-  manager.loadLayout = async layoutKey => raw.get(layoutKey);
+  loadsAsReader(manager, async layoutKey => raw.get(layoutKey));
 
   manager.setViewLayout('live', 'X_umap');
   const umap = await manager.getPositions('X_umap', { showProgress: false });
@@ -626,7 +620,7 @@ test('a layout provider registers an AnnData reference once, as a mapping layout
       layoutKey: `${ref.key}[${ref.columns.join(',')}]`,
       dimension: ref.columns.length,
       label: `${ref.key}[${ref.columns.join(',')}]`,
-      path: `_cellucid/mapping/embeddings/1/${ref.columns.join('-')}.bin`,
+      path: `obsm/1/${ref.columns.join('-')}`,
       provenance: { key: ref.key, columns: [...ref.columns] },
       origin: 'mapping',
     };
@@ -656,9 +650,9 @@ test('a layout provider registers an AnnData reference once, as a mapping layout
 
   // A provider that describes anything but the requested reference is a bug.
   for (const wrong of [
-    ref => ({ layoutKey: 'w1', dimension: 2, label: 'w1', path: 'w1.bin', provenance: { key: 'X_other', columns: ref.columns }, origin: 'mapping' }),
-    ref => ({ layoutKey: 'w2', dimension: 2, label: 'w2', path: 'w2.bin', provenance: { key: ref.key, columns: [1, 0] }, origin: 'mapping' }),
-    ref => ({ layoutKey: 'w3', dimension: 2, label: 'w3', path: 'w3.bin', provenance: { key: ref.key, columns: ref.columns }, origin: 'identity' }),
+    ref => ({ layoutKey: 'w1', dimension: 2, label: 'w1', path: 'obsm/4/0-1', provenance: { key: 'X_other', columns: ref.columns }, origin: 'mapping' }),
+    ref => ({ layoutKey: 'w2', dimension: 2, label: 'w2', path: 'obsm/5/1-0', provenance: { key: ref.key, columns: [1, 0] }, origin: 'mapping' }),
+    ref => ({ layoutKey: 'w3', dimension: 2, label: 'w3', path: 'obsm/6/0-1', provenance: { key: ref.key, columns: ref.columns }, origin: 'identity' }),
   ]) {
     manager.setLayoutProvider(wrong);
     assert.throws(
@@ -753,7 +747,7 @@ test('the position budget never refuses the layouts the views show plus the one 
     layoutKey: 'tsne',
     dimension: 2,
     label: 'tsne',
-    path: 'tsne.bin',
+    path: 'obsm/7/0-1',
     provenance: null,
     origin: 'mapping',
   }]);
@@ -761,7 +755,7 @@ test('the position budget never refuses the layouts the views show plus the one 
     ['X_umap', Float32Array.from([0, 0, 1, 1, 2, 2, 3, 3])],
     ['tsne', Float32Array.from([0, 0, 10, 10, 20, 20, 30, 30])],
   ]);
-  manager.loadLayout = async layoutKey => raw.get(layoutKey);
+  loadsAsReader(manager, async layoutKey => raw.get(layoutKey));
   manager.setViewLayout('live', 'X_umap');
   await manager.getPositions('X_umap', { showProgress: false });
   // A second view shows t-SNE beside UMAP: both are shown, so both stay.

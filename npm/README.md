@@ -4,7 +4,7 @@
 
 # Cellucid
 
-**See every cell. Query any gene. Fly through millions.**
+**See every cell. Query any gene. Explore in 2D and 3D.**
 
 Cellucid is a browser-first, GPU-accelerated workspace for exploring large
 single-cell datasets in real time. Move naturally through 1D, 2D, and 3D
@@ -51,7 +51,7 @@ troubleshooting are covered in the
 - Orbit, Planar, and Free Fly navigation with reproducible Camera Path animation
 - Community annotation, voting, and consensus with optional GitHub collaboration
 - Shareable session state plus publication-ready SVG and high-DPI PNG export
-- Direct H5AD and Zarr loading, prepared datasets, local or remote servers, Jupyter, Python, and R
+- Reads AnnData directly (`.h5ad`, Zarr folders, `.zarr.zip`), and Loom, 10x Cell Ranger HDF5 and `outs/` folders, MuData, Seurat and SingleCellExperiment `.rds` files and MatrixMarket folders as AnnData, from local files, links, dataset catalogs, servers, Jupyter and R; Cellucid-ready AnnData from the Python and R packages
 
 ## Links
 

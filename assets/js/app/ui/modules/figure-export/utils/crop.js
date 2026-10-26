@@ -14,6 +14,7 @@
  */
 
 import { computeLetterboxedRect } from './letterbox.js';
+import { requireExactKeys } from '../../../../../utils/exact-record.js';
 
 const MIN_NORM_SIZE = 0.02;
 const CROP_INPUT_KEYS = Object.freeze([
@@ -24,26 +25,6 @@ const CROP_INPUT_KEYS = Object.freeze([
   'y',
 ]);
 const CROP_RECT_KEYS = Object.freeze(['height', 'width', 'x', 'y']);
-
-function assertExactKeys(value, expectedKeys, context) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${context} must be a plain object.`);
-  }
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== expectedKeys.length ||
-    keys.some((key, index) => key !== expectedKeys[index])
-  ) {
-    throw new TypeError(
-      `${context} must contain exactly: ${expectedKeys.join(', ')}.`
-    );
-  }
-}
 
 function assertRectNumbers(rect, context) {
   for (const key of CROP_RECT_KEYS) {
@@ -83,7 +64,7 @@ function assertRectNumbers(rect, context) {
  */
 export function assertCropRect01(crop) {
   if (crop === null) return null;
-  assertExactKeys(crop, CROP_INPUT_KEYS, 'Figure export crop');
+  requireExactKeys(crop, CROP_INPUT_KEYS, 'Figure export crop');
   if (crop.enabled !== true) {
     throw new TypeError(
       'Figure export crop.enabled must be true; use null when cropping is disabled.'
@@ -116,7 +97,7 @@ export function assertCropRect01(crop) {
  */
 export function cropRect01ToPx(crop01, viewportWidth, viewportHeight) {
   if (crop01 === null) return null;
-  assertExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
+  requireExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
   assertRectNumbers(crop01, 'Normalized figure export crop');
   if (
     typeof viewportWidth !== 'number' ||
@@ -163,7 +144,7 @@ export function fitCropIntoRect({
   viewportHeight,
   destRect,
 }) {
-  assertExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
+  requireExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
   assertRectNumbers(crop01, 'Normalized figure export crop');
   assertPositiveFinite(viewportWidth, 'Figure export crop viewport width');
   assertPositiveFinite(viewportHeight, 'Figure export crop viewport height');
@@ -222,7 +203,7 @@ export function planCropRaster({
   deviceRect,
   zoomLimit,
 }) {
-  assertExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
+  requireExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
   assertRectNumbers(crop01, 'Normalized figure export crop');
   assertPositiveFinite(viewportWidth, 'Figure export crop viewport width');
   assertPositiveFinite(viewportHeight, 'Figure export crop viewport height');

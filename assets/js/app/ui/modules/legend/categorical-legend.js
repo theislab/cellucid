@@ -31,7 +31,8 @@ import {
   createButton,
   createIconButton
 } from '../../components/controls.js';
-import { formatCount } from '../../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 const INIT_KEYS = new Set(['state', 'legendEl', 'dataSourceManager']);
@@ -58,18 +59,6 @@ const CATEGORY_TYPE_ORDER = new Map([
   ['number', 1],
   ['string', 2]
 ]);
-
-function requirePlainRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
-  return value;
-}
 
 function requireMethod(owner, methodName, label) {
   if (
@@ -254,9 +243,9 @@ function requireCategoryCounts(visibleCount, availableCount) {
 function formatCategoryCount(visibleCount, availableCount) {
   requireCategoryCounts(visibleCount, availableCount);
   if (availableCount > 0 && availableCount !== visibleCount) {
-    return `${formatCount(visibleCount)} / ${formatCount(availableCount)} cells`;
+    return `${formatCount(visibleCount)} / ${formatCountOf(availableCount, 'cell')}`;
   }
-  return `${formatCount(visibleCount)} cells`;
+  return `${formatCountOf(visibleCount, 'cell')}`;
 }
 
 /** Write text only when it changed, so an unchanged row is not relaid out. */
@@ -383,24 +372,14 @@ function requireCategoricalLegendModel(field, model) {
 }
 
 export function initCategoricalLegend(options) {
-  requirePlainRecord(options, 'Categorical legend options');
-  for (const key of Object.keys(options)) {
-    if (!INIT_KEYS.has(key)) {
-      throw new TypeError(`Categorical legend contains unknown option "${key}"`);
-    }
-  }
-  for (const key of INIT_KEYS) {
-    if (!Object.hasOwn(options, key)) {
-      throw new TypeError(`Categorical legend requires option "${key}"`);
-    }
-  }
+  requireExactKeys(options, INIT_KEYS, 'Categorical legend options');
   const { state, legendEl, dataSourceManager } = options;
   for (const methodName of REQUIRED_STATE_METHODS) {
     requireMethod(state, methodName, 'Categorical legend state');
   }
   requireMethod(
     dataSourceManager,
-    'getCurrentDatasetId',
+    'getCurrentIdentityId',
     'Categorical legend dataSourceManager'
   );
   const ownerDocument = (
@@ -1062,16 +1041,36 @@ export function initCategoricalLegend(options) {
       let stride = 0;
       let windowStart = -1;
       let windowEnd = -1;
-      const fillWindow = (first, last) => {
-        rows.clear();
+      // The rows of positions [from, to), built, as one fragment.
+      const buildRows = (from, to) => {
         const fragment = ownerDocument.createDocumentFragment();
-        for (let position = first; position < last; position++) {
+        for (let position = from; position < to; position++) {
           const catIdx = sortedIndices[position];
           const entry = buildEntry(catIdx);
           rows.set(catIdx, entry);
           fragment.appendChild(entry.row);
         }
-        windowEl.replaceChildren(fragment);
+        return fragment;
+      };
+      // The window moves by whole rows: the rows it keeps stay the same
+      // nodes, never detached, so a focused control, an open rename and a
+      // hovered row survive a scroll; only the rows entering it are built
+      // and only the rows leaving it removed.
+      const fillWindow = (first, last) => {
+        const overlaps = windowStart >= 0 && first < windowEnd && last > windowStart;
+        if (!overlaps) {
+          rows.clear();
+          windowEl.replaceChildren(buildRows(first, last));
+        } else {
+          for (let position = windowStart; position < windowEnd; position++) {
+            if (position >= first && position < last) continue;
+            const catIdx = sortedIndices[position];
+            rows.get(catIdx)?.row.remove();
+            rows.delete(catIdx);
+          }
+          if (first < windowStart) windowEl.prepend(buildRows(first, windowStart));
+          if (last > windowEnd) windowEl.append(buildRows(windowEnd, last));
+        }
         windowStart = first;
         windowEnd = last;
         StyleManager.setVariable(windowEl, '--legend-virtual-offset', `${first * stride}px`);
@@ -1637,9 +1636,23 @@ export function initCategoricalLegend(options) {
     });
   }
 
+  /**
+   * The legend shows something else (a continuous field, or nothing): its
+   * rows, field and model are let go, so a field of a dataset no longer shown
+   * is not kept alive with its codes and quantiles.
+   */
+  function releaseCategoricalLegend() {
+    closeTransientInteractions();
+    renderedRows = new Map();
+    renderedField = null;
+    renderedModel = null;
+    renderedAnnotating = false;
+  }
+
   return {
     refreshCategoryCounts,
     renderCategoricalLegend,
+    releaseCategoricalLegend,
     destroy: () => {
       if (destroyed) return;
       destroyed = true;

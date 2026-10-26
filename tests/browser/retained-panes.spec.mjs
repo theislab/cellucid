@@ -1,10 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=retained-panes-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=retained-panes-ci`;
 
 /**
  * Retained panes (viewer.js): in a grid, a pane whose scene and camera did not
@@ -16,7 +16,7 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   for (let kept = 0; kept < 3; kept++) {
     const before = await page.evaluate(() => window._cellucidViewer.getSnapshotViews().length);

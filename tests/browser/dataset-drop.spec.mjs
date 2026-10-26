@@ -9,15 +9,13 @@
  * gives its one item the directory entry a real folder drop would carry,
  * built from the fixture files.
  */
-import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test } from './helpers/test.mjs';
 import {
   H5AD,
   H5AD_PATH,
   START,
-  TRAJECTORY,
-  demoExportsDirectory,
+  ZARR_FOLDER,
   expectNeverPublished,
   expectNoFailureAnnounced,
   expectSettledOn,
@@ -29,120 +27,14 @@ import {
   startUrl,
 } from './helpers/dataset-loading.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import {
+  createDrag,
+  dragAndDrop,
+  filePayload,
+  folderPayload,
+} from './helpers/dataset-drop.mjs';
 
 const OVERLAY = '#dataset-drop-overlay';
-
-async function filePayload(filePath, name = path.basename(filePath)) {
-  return { name, base64: (await readFile(filePath)).toString('base64') };
-}
-
-async function folderPayload(directory) {
-  const files = [];
-  const walk = async (absolute, relative) => {
-    for (const entry of await readdir(absolute, { withFileTypes: true })) {
-      const entryPath = `${relative}/${entry.name}`;
-      if (entry.isDirectory()) {
-        await walk(path.join(absolute, entry.name), entryPath);
-      } else {
-        files.push({
-          path: entryPath,
-          base64: (await readFile(path.join(absolute, entry.name)))
-            .toString('base64'),
-        });
-      }
-    }
-  };
-  await walk(directory, path.basename(directory));
-  return files;
-}
-
-/**
- * Build a DataTransfer in the page. `files` become its file items; with
- * `folder`, its single item answers `webkitGetAsEntry()` with a directory
- * entry over those files, as a dropped folder does.
- */
-async function createDrag(page, { files = [], folder = null }) {
-  return page.evaluateHandle(({ files, folder }) => {
-    const decode = base64 => Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const dataTransfer = new DataTransfer();
-    for (const file of files) {
-      dataTransfer.items.add(new File([decode(file.base64)], file.name));
-    }
-    if (folder !== null) {
-      const root = { name: folder.name, children: new Map() };
-      for (const file of folder.files) {
-        const parts = file.path.split('/').slice(1);
-        let node = root;
-        for (const part of parts.slice(0, -1)) {
-          if (!node.children.has(part)) {
-            node.children.set(part, { name: part, children: new Map() });
-          }
-          node = node.children.get(part);
-        }
-        const name = parts.at(-1);
-        node.children.set(name, { name, file: new File([decode(file.base64)], name) });
-      }
-      const toEntry = node => (node.file !== undefined
-        ? {
-            isFile: true,
-            isDirectory: false,
-            name: node.name,
-            file: ok => ok(node.file),
-          }
-        : {
-            isFile: false,
-            isDirectory: true,
-            name: node.name,
-            createReader() {
-              let listed = false;
-              return {
-                readEntries(ok) {
-                  ok(listed ? [] : [...node.children.values()].map(toEntry));
-                  listed = true;
-                },
-              };
-            },
-          });
-      // An item wrapper is created afresh on every read of `items`, so the
-      // folder's entry is answered by the prototype for its placeholder file.
-      dataTransfer.items.add(new File([new Uint8Array()], folder.name));
-      const entry = toEntry(root);
-      const nativeEntry = DataTransferItem.prototype.webkitGetAsEntry;
-      DataTransferItem.prototype.webkitGetAsEntry = function webkitGetAsEntry() {
-        const file = this.getAsFile();
-        if (file !== null && file.name === folder.name && file.size === 0) {
-          return entry;
-        }
-        return nativeEntry === undefined ? null : nativeEntry.call(this);
-      };
-    }
-    return dataTransfer;
-  }, { files, folder });
-}
-
-/** Drag over the viewer, then drop; returns whether the page cancelled it. */
-async function dragAndDrop(page, dataTransfer, { drop = true } = {}) {
-  return page.evaluate(({ dataTransfer, drop }) => {
-    const target = document.getElementById('glcanvas');
-    const fire = type => {
-      const event = new DragEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        dataTransfer,
-      });
-      target.dispatchEvent(event);
-      return { defaultPrevented: event.defaultPrevented };
-    };
-    const over = [fire('dragenter'), fire('dragover')];
-    const overlayShown = !document.getElementById('dataset-drop-overlay').hidden;
-    // Whether the drop target offers a copy (the guard offers "none" until it
-    // is ready). A synthetic DataTransfer does not keep `dropEffect`, so the
-    // readiness the guard reads is reported instead.
-    const dropTargetReady = document.documentElement.dataset.datasetDrop === 'ready';
-    const dropped = drop ? fire('drop') : null;
-    return { over, overlayShown, dropTargetReady, dropped };
-  }, { dataTransfer, drop });
-}
 
 test('a dropped .h5ad file opens like a picked one', async ({ page }) => {
   const productErrors = await openStarted(page);
@@ -162,16 +54,17 @@ test('a dropped .h5ad file opens like a picked one', async ({ page }) => {
   expect(productErrors).toEqual([]);
 });
 
-test('a dropped prepared export folder opens like a picked one', async ({ page }) => {
+test('a dropped Zarr store folder opens like a picked one', async ({ page }) => {
   const productErrors = await openStarted(page);
+  // Every file of the store, its hidden metadata files (`.zgroup`,
+  // `.zattrs`, `.zmetadata`) with the rest, as a real folder drop lists them.
+  const files = await folderPayload(ZARR_FOLDER.path);
+  expect(files.some(file => file.path.endsWith('/.zmetadata'))).toBe(true);
   const drag = await createDrag(page, {
-    folder: {
-      name: TRAJECTORY.id,
-      files: await folderPayload(path.join(demoExportsDirectory, TRAJECTORY.id)),
-    },
+    folder: { name: path.basename(ZARR_FOLDER.path), files },
   });
   await dragAndDrop(page, drag);
-  await expectSettledOn(page, { ...TRAJECTORY, select: /^dataset:local-user:/ });
+  await expectSettledOn(page, ZARR_FOLDER);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -241,7 +134,7 @@ test('before the data controls exist a dropped file is refused and never navigat
   const catalogHeld = new Promise(resolve => {
     releaseCatalog = resolve;
   });
-  await page.route(/\/demo-custom-exports\/datasets\.json/, async route => {
+  await page.route(/\/demo-catalog\/datasets\.json/, async route => {
     await catalogHeld;
     await route.continue().catch(() => {});
   });

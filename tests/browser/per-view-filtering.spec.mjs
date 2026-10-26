@@ -1,17 +1,17 @@
 import { readFile } from 'node:fs/promises';
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { decodePng } from './helpers/png-pixels.mjs';
 import { comparePixels, pixelParityVerdict } from './helpers/pixel-parity.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=per-view-filtering-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=per-view-filtering-ci`;
 
 const MEMORY_OWNERSHIP_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=view-memory-ownership-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=view-memory-ownership-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -37,7 +37,7 @@ test('side-by-side filters stay with one view and survive coloring changes', asy
   await dismissWelcome(page);
   await openCollapsedPanels(page);
 
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   await expect(page.locator('#active-filter-scope-title')).toHaveText('Filters');
   await page.locator('#active-filter-scope-btn').click();
@@ -112,24 +112,24 @@ test('side-by-side filters stay with one view and survive coloring changes', asy
   expect(productErrors).toEqual([]);
 });
 
-test('Jupyter visibility replay stays isolated across live and snapshot views', async ({ page }, testInfo) => {
+test('Viewer host visibility replay stays isolated across live and snapshot views', async ({ page }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const proof = await page.evaluate(async () => {
     const [
       { DataStateColorMethods },
       { DataStateFilterMethods },
       { viewContextCoreMethods },
-      { createJupyterCommandHandlers },
+      { createViewerHostCommandHandlers },
     ] = await Promise.all([
       import('/assets/js/app/state/managers/color-manager.js'),
       import('/assets/js/app/state/managers/filter-manager.js'),
       import('/assets/js/app/state/managers/view-context-core.js'),
-      import('/assets/js/app/jupyter-command-handler.js'),
+      import('/assets/js/app/viewer-host-command-handler.js'),
     ]);
 
     const pointCount = 4;
@@ -153,7 +153,6 @@ test('Jupyter visibility replay stays isolated across live and snapshot views', 
       cellVisibilityMask: Uint8Array.from([1, 1, 1, 1]),
       centroidPositions: new Float32Array(),
       centroidColors: new Uint8Array(),
-      centroidOutliers: new Float32Array(),
       centroidLabels: [],
       filteredCount: { shown: pointCount, total: pointCount },
       viewContexts: new Map(),
@@ -200,7 +199,7 @@ test('Jupyter visibility replay stays isolated across live and snapshot views', 
     );
     state.createViewFromActive('snapshot-jupyter');
 
-    const commands = createJupyterCommandHandlers({
+    const commands = createViewerHostCommandHandlers({
       state,
       viewer,
       refreshUi() {},
@@ -311,7 +310,7 @@ test('Jupyter visibility replay stays isolated across live and snapshot views', 
 
   await page.evaluate(result => {
     const card = document.createElement('section');
-    card.setAttribute('aria-label', 'Jupyter multiview visibility proof');
+    card.setAttribute('aria-label', 'Viewer host multiview visibility proof');
     Object.assign(card.style, {
       position: 'fixed',
       inset: '24px 24px auto auto',
@@ -327,7 +326,7 @@ test('Jupyter visibility replay stays isolated across live and snapshot views', 
       whiteSpace: 'pre-wrap',
     });
     card.textContent = [
-      'Jupyter multiview visibility replay: PASS',
+      'Viewer host multiview visibility replay: PASS',
       '',
       ...result.sequence.map(entry => (
         `${entry.viewId}: mask [${entry.mask.join(', ')}]`
@@ -412,7 +411,7 @@ function readViewPublication(page) {
       transparencyType: transparency.constructor.name,
       transparency: Array.from(transparency),
       colors: Array.from(viewer.getViewColors('live')),
-      betaCells: state.getCellIndicesForCategory(field, 1, transparency),
+      betaCells: Array.from(state.getCellIndicesForCategory(field, 1, transparency)),
     };
   });
 }

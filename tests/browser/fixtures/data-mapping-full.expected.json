@@ -1,9 +1,8 @@
 {
   "genes": {
     "X/column-0": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 1,
-        "names": null,
         "renamed": [
           [
             "LYZ",
@@ -30,9 +29,8 @@
       ]
     },
     "X/column-1": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [
           [
             "Gene Expression",
@@ -75,9 +73,8 @@
       ]
     },
     "X/index": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [],
         "source": null
       },
@@ -99,9 +96,8 @@
       ]
     },
     "layer-0/column-0": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 1,
-        "names": null,
         "renamed": [
           [
             "LYZ",
@@ -128,9 +124,8 @@
       ]
     },
     "layer-0/column-1": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [
           [
             "Gene Expression",
@@ -173,9 +168,8 @@
       ]
     },
     "layer-0/index": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [],
         "source": null
       },
@@ -197,9 +191,8 @@
       ]
     },
     "layer-1/column-0": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 1,
-        "names": null,
         "renamed": [
           [
             "LYZ",
@@ -226,9 +219,8 @@
       ]
     },
     "layer-1/column-1": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [
           [
             "Gene Expression",
@@ -271,9 +263,8 @@
       ]
     },
     "layer-1/index": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [],
         "source": null
       },
@@ -295,9 +286,8 @@
       ]
     },
     "raw/column-0": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 1,
-        "names": null,
         "renamed": [
           [
             "LYZ",
@@ -328,9 +318,8 @@
       ]
     },
     "raw/index": {
-      "name_set": {
+      "gene_names": {
         "filled_from_index": 0,
-        "names": null,
         "renamed": [],
         "source": null
       },
@@ -360,9 +349,10 @@
     "connectivities": {
       "destinations": "c20363492cd8524a5888b85f381c32e7ffffc7c4f51a4b6d669584a47f02eabc",
       "max_neighbors": 18,
+      "max_weight": 0.9996094703674316,
       "n_edges": 1747,
       "sources": "d7e71512d8f9eb941502db6b1e090c91ce40c991d5b47094c1f631ed09b2f251",
-      "weights": "088ef5e75f1894fedb942f76eafdf67fbee197bf4506eff704a7cb4ccc5bda82"
+      "strength": "162cb23f38ec82c32f5fd0ca65df940365c0c370fe0b0e7857e45fe431e5fb72"
     },
     "distances": {
       "refused": true
@@ -370,9 +360,10 @@
     "scvi_connectivities": {
       "destinations": "6dac06caed7e030f055ecf16e335405375c6578290db8128abd51831240697f9",
       "max_neighbors": 15,
+      "max_weight": 0.9994146823883057,
       "n_edges": 1178,
       "sources": "9e78dd763ffb290d90349011ca03e89f75636dfab86db2cc6bbc59e19abf0bf9",
-      "weights": "0649da48bed79b838ce3fbdf06785799a31c410a4721a35c4e53e42e5e717a88"
+      "strength": "adcf984f441bb9c9e8d2e991dc72c264dd8efe8ee33dfd5e6c5c5189c06cdd9d"
     }
   },
   "latent": {
@@ -403,7 +394,7 @@
       "batch": "b39dc8ba935350072e83a95a43737587a8a00787eba6ffe43d988f95d6d87d0b",
       "cell_type": "cfba209687c3841229ec1c0d0b2300d1d364cd3079c93210235a6d31c56f493f"
     },
-    "velocity_umap_2d": {
+    "velocity_umap": {
       "batch": "23c8493dc007c4497e4f5ec89d9df8e15a3bba17f0bd2732f351b667b6c8480d",
       "cell_type": "13ae982616080b99d3d36aa561882400bcb52b3a73f74e9db5d159f5e6bab521"
     }
@@ -413,6 +404,6 @@
     "velocity_pca@X_pca[0,1,2]": "14e44fa3ec70d9abc02ac1839876796ea1f52ca73ad251fb3b881d623969c1f8",
     "velocity_pca@X_pca[2,3]": "d4a1fcd9b8e7c7fcc0c1f3f01a26fe3de3d5a8aba78b53c4a90acc6741f8069c",
     "velocity_tsne@X_tsne[0,1]": "96976ff22f0987caedc48c761874172d727329b9da40601d08d9402ea49e3c6f",
-    "velocity_umap_2d@X_umap[0,1]": "bba8d8019acde033d0d89d0efc975dda2ccd165ca4cab508fc40cb0b07771933"
+    "velocity_umap@X_umap[0,1]": "bba8d8019acde033d0d89d0efc975dda2ccd165ca4cab508fc40cb0b07771933"
   }
 }

@@ -19,11 +19,14 @@ import {
   highlightStateMethods,
 } from '../assets/js/app/state/managers/highlight-manager.js';
 import {
-  SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
-  SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+  NOT_A_SESSION_FILE_MESSAGE,
+  SESSION_BUNDLE_MAGIC_BYTES,
+} from '../assets/js/app/session/bundle/format.js';
+import {
   assertDatasetFingerprint,
   datasetFingerprintMatches,
   describeDataMappingMismatch,
+  describeMissingRequiredFields,
   digestCellOrder,
   getDatasetFingerprint,
   verifySessionFingerprint,
@@ -45,14 +48,20 @@ const SELECTED_ROWS = [0, 2];
 const IDENTITY_ORDER = [0, 1, 2, 3, 4, 5];
 
 /**
- * The layouts of a prepared export: an embedding id names each one; the
- * mapping enables every one and names each dimension's default. `X_tsne_2d`
- * is a second 2D embedding a view can show beside the 2D default.
+ * The layouts of a file whose arrays are read whole: each layout is keyed by
+ * its obsm key; the mapping enables every one and names each dimension's
+ * default. `X_tsne_2d` is a second 2D embedding a view can show beside the 2D
+ * default.
  */
-const EXPORT_LAYOUTS = Object.freeze([
-  Object.freeze({ layoutKey: 'X_umap_2d', dimension: 2, scale: 1, provenance: null }),
-  Object.freeze({ layoutKey: 'X_tsne_2d', dimension: 2, scale: 3, provenance: null }),
-  Object.freeze({ layoutKey: 'X_umap_3d', dimension: 3, scale: 1, provenance: null }),
+const KEYED_COLUMNS = Object.freeze({
+  X_umap_2d: Object.freeze([0, 1]),
+  X_tsne_2d: Object.freeze([0, 1]),
+  X_umap_3d: Object.freeze([0, 1, 2]),
+});
+const KEYED_LAYOUTS = Object.freeze([
+  Object.freeze({ layoutKey: 'X_umap_2d', dimension: 2, scale: 1, provenance: { key: 'X_umap_2d', columns: [0, 1] } }),
+  Object.freeze({ layoutKey: 'X_tsne_2d', dimension: 2, scale: 3, provenance: { key: 'X_tsne_2d', columns: [0, 1] } }),
+  Object.freeze({ layoutKey: 'X_umap_3d', dimension: 3, scale: 1, provenance: { key: 'X_umap_3d', columns: [0, 1, 2] } }),
 ]);
 
 /**
@@ -80,26 +89,32 @@ const ANNDATA_LAYOUTS = Object.freeze([
   }),
 ]);
 
-/** The embeddings group of an export mapping: enabled ids and defaults. */
-function exportEmbeddings(enabled, { d2 = null, d3 = null } = {}) {
+/** The embeddings group of a keyed mapping: enabled keys and defaults. */
+function keyedEmbeddings(enabled, { d2 = null, d3 = null } = {}) {
+  const ref = key => ({ key, columns: [...KEYED_COLUMNS[key]] });
   return {
-    enabled: enabled.map(key => ({ key, columns: null })),
+    enabled: enabled.map(ref),
     defaults: {
       '1d': null,
-      '2d': d2 === null ? null : { key: d2, columns: null },
-      '3d': d3 === null ? null : { key: d3, columns: null },
+      '2d': d2 === null ? null : ref(d2),
+      '3d': d3 === null ? null : ref(d3),
     },
   };
 }
 
-function exportMapping(overrides = {}) {
+function keyedMapping(overrides = {}) {
   return validateDataMapping({
-    kind: 'export',
-    embeddings: exportEmbeddings(
+    kind: 'anndata',
+    embeddings: keyedEmbeddings(
       ['X_tsne_2d', 'X_umap_2d', 'X_umap_3d'],
       { d2: 'X_umap_2d', d3: 'X_umap_3d' },
     ),
+    knn: null,
     geneNames: 'index',
+    expression: 'X',
+    log1p: {},
+    highlyVariable: null,
+    latent: null,
     vectorFields: [],
     ...overrides,
   });
@@ -131,6 +146,8 @@ function anndataMapping(overrides = {}) {
     knn: 'connectivities',
     geneNames: 'index',
     expression: 'X',
+    log1p: {},
+    highlyVariable: null,
     latent: null,
     vectorFields: [],
     ...overrides,
@@ -222,8 +239,9 @@ function makeDimensionManager({
       release();
     };
   };
-  manager.getPositions = async (layoutKey, options) => {
-    log.push(['getPositions', layoutKey, { ...options }]);
+  manager.getPositions = async (...args) => {
+    const [layoutKey] = args;
+    log.push(['getPositions', ...args]);
     if (!manager.normalizedPositionCache.has(layoutKey)) {
       log.push(['load', layoutKey]);
       if (deferLoads) {
@@ -231,7 +249,7 @@ function makeDimensionManager({
       }
       manager.normalizedPositionCache.set(layoutKey, stored.get(layoutKey));
     }
-    return prototypeGet.call(manager, layoutKey, options);
+    return prototypeGet.call(manager, layoutKey);
   };
   return { manager, log, pendingLoads, stored };
 }
@@ -240,9 +258,9 @@ function makeDatasetState({
   cellOrder,
   pages,
   activePageId = 'page_1',
-  kind = 'export',
-  mapping = kind === 'export' ? exportMapping() : anndataMapping(),
-  layouts = kind === 'export' ? EXPORT_LAYOUTS : ANNDATA_LAYOUTS,
+  kind = 'keyed',
+  mapping = kind === 'keyed' ? keyedMapping() : anndataMapping(),
+  layouts = kind === 'keyed' ? KEYED_LAYOUTS : ANNDATA_LAYOUTS,
   liveLayoutKey = 'X_umap_3d',
   positionsOverride = null,
   deferLoads = false,
@@ -280,6 +298,7 @@ function makeDatasetState({
     assert.equal(viewId, 'live');
     return manager.getViewLayout('live');
   };
+  state.getActiveViewId = () => 'live';
   state.highlightPages = pages;
   state.activePageId = activePageId;
   state._highlightPageIdCounter = 1;
@@ -298,6 +317,7 @@ function makeDatasetState({
 
 function makeDataSourceManager() {
   return {
+    getCurrentIdentityId: () => 'pancreas',
     getCurrentSourceType: () => 'local-demo',
     getCurrentDatasetId: () => 'pancreas',
   };
@@ -312,6 +332,7 @@ function makeSerializer(state) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors: [
       highlightsMetaContributor,
       highlightsCellsContributor,
@@ -510,56 +531,21 @@ test('an unchanged dataset restores the exact selected set', async () => {
   // duration and released.
   assert.deepEqual(destination.dimensionLog, [
     ['pin', 'X_umap_3d'],
-    ['getPositions', 'X_umap_3d', { showProgress: false }],
+    ['getPositions', 'X_umap_3d'],
     ['release', 'X_umap_3d'],
   ]);
   assert.equal(heldPins(destination), 0);
 });
 
-test('a session written without cell identity is refused, not trusted', async () => {
+test('a file without the format-2 signature is refused by its signature, before anything is read', async () => {
   const { bundle } = await captureSelectionBundle();
-  const legacy = await rewriteSessionBundle(bundle, manifest => {
-    // Exactly the four-key fingerprint every session file written before
-    // cell-order identity carries.
-    delete manifest.datasetFingerprint.cellOrder;
-    delete manifest.datasetFingerprint.dataMapping;
-    assert.deepEqual(Object.keys(manifest.datasetFingerprint).sort(), [
-      'cellCount',
-      'datasetId',
-      'sourceType',
-      'varCount',
-    ]);
-  });
-  const destination = makeDatasetState({
-    cellOrder: [5, 4, 3, 2, 1, 0],
-    pages: emptyPages(),
-  });
-
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(legacy),
-      error => {
-        assert.equal(error.message, SESSION_WITHOUT_CELL_IDENTITY_MESSAGE);
-        return true;
-      },
-    );
-  });
-  assert.deepEqual(restoredSelection(destination), []);
-  assert.deepEqual(destination.dimensionLog, []);
-});
-
-test('a session written before data mappings is refused with its own message', async () => {
-  const { bundle } = await captureSelectionBundle();
-  const preMapping = await rewriteSessionBundle(bundle, manifest => {
-    // Exactly the fingerprint the release before data mappings wrote: a
-    // cell order with only its dimension and digest, and no data mapping.
-    delete manifest.datasetFingerprint.dataMapping;
-    delete manifest.datasetFingerprint.cellOrder.embedding;
-    assert.deepEqual(
-      Object.keys(manifest.datasetFingerprint.cellOrder).sort(),
-      ['digest', 'dimension'],
-    );
-  });
+  const bytes = new Uint8Array(await bundle.arrayBuffer());
+  // The same framing behind an unversioned signature.
+  const signature = new TextEncoder().encode('CELLUCID_SESSION\n');
+  const rest = bytes.subarray(SESSION_BUNDLE_MAGIC_BYTES.byteLength);
+  const unversioned = new Uint8Array(signature.byteLength + rest.byteLength);
+  unversioned.set(signature, 0);
+  unversioned.set(rest, signature.byteLength);
   const destination = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
@@ -567,19 +553,33 @@ test('a session written before data mappings is refused with its own message', a
 
   await withNotificationHarness(async () => {
     await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(preMapping),
+      makeSerializer(destination).restoreFromBlob(new Blob([unversioned])),
       error => {
-        assert.equal(error.message, SESSION_WITHOUT_DATA_MAPPING_MESSAGE);
+        assert.equal(error.message, NOT_A_SESSION_FILE_MESSAGE);
         return true;
       },
     );
   });
-  assert.notEqual(
-    SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
-    SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
-  );
   assert.deepEqual(restoredSelection(destination), []);
-  // Refused during manifest validation: no layout was even looked at.
+  // Refused at the signature: no layout was even looked at.
+  assert.deepEqual(destination.dimensionLog, []);
+});
+
+test('a fingerprint missing a format-2 field is a schema violation', async () => {
+  const { bundle } = await captureSelectionBundle();
+  const withoutName = await rewriteSessionBundle(bundle, manifest => {
+    delete manifest.datasetFingerprint.name;
+  });
+  const destination = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  });
+  await withNotificationHarness(async () => {
+    await assert.rejects(
+      makeSerializer(destination).restoreFromBlob(withoutName),
+      /must contain exactly/,
+    );
+  });
   assert.deepEqual(destination.dimensionLog, []);
 });
 
@@ -590,7 +590,7 @@ test(
     const manifest = await readManifest(bundle);
     assert.deepEqual(manifest.datasetFingerprint.cellOrder.embedding, {
       key: 'X_umap_3d',
-      columns: null,
+      columns: [0, 1, 2],
     });
     assert.equal(manifest.datasetFingerprint.cellOrder.dimension, 3);
 
@@ -614,7 +614,7 @@ test(
     // digested and released; the live view kept showing its 2D layout.
     assert.deepEqual(destination.dimensionLog, [
       ['pin', 'X_umap_3d'],
-      ['getPositions', 'X_umap_3d', { showProgress: false }],
+      ['getPositions', 'X_umap_3d'],
       ['load', 'X_umap_3d'],
       ['release', 'X_umap_3d'],
     ]);
@@ -632,13 +632,13 @@ test(
     const { bundle } = await captureSelectionBundle({ liveLayoutKey: 'X_tsne_2d' });
     const manifest = await readManifest(bundle);
     assert.deepEqual(manifest.datasetFingerprint.cellOrder, {
-      embedding: { key: 'X_tsne_2d', columns: null },
+      embedding: { key: 'X_tsne_2d', columns: [0, 1] },
       dimension: 2,
       digest: digestCellOrder(positionsForCellOrder(IDENTITY_ORDER, 2, 3), 2),
     });
     // The mapping records the enabled set and the defaults, not what one view
     // shows.
-    assert.deepEqual(manifest.datasetFingerprint.dataMapping, exportMapping());
+    assert.deepEqual(manifest.datasetFingerprint.dataMapping, keyedMapping());
 
     const destination = makeDatasetState({
       cellOrder: IDENTITY_ORDER,
@@ -677,23 +677,23 @@ test('a session naming an embedding this dataset does not have is refused by nam
   const destination = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
-    layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
+    layouts: KEYED_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
   });
   const message = await refusal(destination, bundle);
   assert.equal(
     message,
-    "This session recorded its cell order on embedding 'X_tsne_2d' in 2D, "
+    "This session recorded its cell order on obsm['X_tsne_2d'] columns [0, 1] in 2D, "
       + 'which this dataset does not have. The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
   );
   assert.deepEqual(restoredSelection(destination), []);
   assert.deepEqual(destination.dimensionLog, []);
 
-  // A layout of that name in another dimension is not the one recorded.
-  const wrongDimension = await rewriteSessionBundle(bundle, manifest => {
+  // Other columns of an array the dataset plots are not the layout recorded.
+  const otherColumns = await rewriteSessionBundle(bundle, manifest => {
     manifest.datasetFingerprint.cellOrder.embedding = {
       key: 'X_umap_3d',
-      columns: null,
+      columns: [0, 1],
     };
   });
   const sameLayouts = makeDatasetState({
@@ -701,8 +701,8 @@ test('a session naming an embedding this dataset does not have is refused by nam
     pages: emptyPages(),
   });
   assert.match(
-    await refusal(sameLayouts, wrongDimension),
-    /^This session recorded its cell order on embedding 'X_umap_3d' in 2D, which this dataset does not have\./,
+    await refusal(sameLayouts, otherColumns),
+    /^This session recorded its cell order on obsm\['X_umap_3d'\] columns \[0, 1\] in 2D, which this dataset does not have\./,
   );
   assert.deepEqual(sameLayouts.dimensionLog, []);
 });
@@ -717,8 +717,8 @@ test('a session restores the embeddings it names, before its views', async () =>
   const otherSlot = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
-    mapping: exportMapping({
-      embeddings: exportEmbeddings(
+    mapping: keyedMapping({
+      embeddings: keyedEmbeddings(
         ['X_tsne_2d', 'X_umap_2d', 'X_umap_3d'],
         { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
       ),
@@ -739,9 +739,9 @@ test('a data mapping mismatch is refused naming the group, before any layout loa
   const missingSlot = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
-    layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
-    mapping: exportMapping({
-      embeddings: exportEmbeddings(
+    layouts: KEYED_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
+    mapping: keyedMapping({
+      embeddings: keyedEmbeddings(
         ['X_tsne_2d', 'X_umap_3d'],
         { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
       ),
@@ -749,7 +749,7 @@ test('a data mapping mismatch is refused naming the group, before any layout loa
   });
   assert.equal(
     await refusal(missingSlot, bundle),
-    "This session shows embedding 'X_umap_2d', which this dataset does not "
+    "This session shows obsm['X_umap_2d'] columns [0, 1], which this dataset does not "
       + 'have. The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
   );
@@ -760,7 +760,7 @@ test('a data mapping mismatch is refused naming the group, before any layout loa
   const otherGenes = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
-    mapping: exportMapping({ geneNames: 'column:gene_symbols' }),
+    mapping: keyedMapping({ geneNames: 'column:gene_symbols' }),
   });
   assert.equal(
     await refusal(otherGenes, bundle),
@@ -769,21 +769,6 @@ test('a data mapping mismatch is refused naming the group, before any layout loa
       + ' Open the dataset version the session was saved on, then load the session again.',
   );
   assert.deepEqual(otherGenes.dimensionLog, []);
-
-  // An export's vector bindings are chosen among those it was exported
-  // with: a session saved without this one turns it off.
-  const otherVectors = makeDatasetState({
-    cellOrder: IDENTITY_ORDER,
-    pages: emptyPages(),
-    mapping: exportMapping({
-      vectorFields: [{ field: 'velocity', embedding: { key: 'X_umap_2d', columns: null } }],
-    }),
-  });
-  await withNotificationHarness(async () => {
-    await makeSerializer(otherVectors).restoreFromBlob(bundle);
-  });
-  assert.deepEqual(otherVectors.getDataMapping().vectorFields, []);
-  assert.deepEqual(otherVectors.appliedMappings.map(entry => entry.origin), ['session']);
 });
 
 test('every data mapping group is named the way the person loading the session knows it', () => {
@@ -831,11 +816,6 @@ test('every data mapping group is named the way the person loading the session k
       "This session shows obsm['X_umap_3d'] columns [0, 1, 2], which this "
         + 'dataset does not have. The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
-    ],
-    [
-      exportMapping(),
-      'This session was saved on an AnnData file, and a prepared export is open '
-        + 'now. Open the dataset the session was saved on, then load the session again.',
     ],
   ];
   for (const [current, expected] of cases) {
@@ -962,7 +942,7 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
   const everythingDiffers = makeDatasetState({
     cellOrder: [0, 1, 2, 3, 4],
     pages: emptyPages(),
-    mapping: exportMapping({ geneNames: 'column:symbol' }),
+    mapping: keyedMapping({ geneNames: 'column:symbol' }),
   });
   assert.match(
     await verifySessionFingerprint(ctx(everythingDiffers), saved),
@@ -973,7 +953,7 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
   const mappingAndRows = makeDatasetState({
     cellOrder: [5, 4, 3, 2, 1, 0],
     pages: emptyPages(),
-    mapping: exportMapping({ geneNames: 'column:symbol' }),
+    mapping: keyedMapping({ geneNames: 'column:symbol' }),
   });
   assert.match(
     await verifySessionFingerprint(ctx(mappingAndRows), saved),
@@ -986,28 +966,25 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
     await verifySessionFingerprint(
       {
         dataSourceManager: {
-          getCurrentSourceType: () => 'remote',
-          getCurrentDatasetId: () => 'pancreas-mirror',
+          getCurrentIdentityId: () => 'pancreas-mirror',
         },
         state: otherCopy,
       },
       saved,
     ),
-    /different copy of this dataset.*"pancreas" and "pancreas-mirror" is open now/,
+    /saved on a different dataset\. It has the same.*"pancreas" and "pancreas-mirror" is open now/,
   );
 
-  // Validation precedes everything: a pre-mapping record never reaches the
+  // Validation precedes everything: a malformed record never reaches the
   // dataset.
   await assert.rejects(
     verifySessionFingerprint(ctx(same), {
-      sourceType: saved.sourceType,
       datasetId: saved.datasetId,
       cellCount: saved.cellCount,
       varCount: saved.varCount,
       cellOrder: { dimension: 3, digest: saved.cellOrder.digest },
     }),
-    error => error instanceof RangeError
-      && error.message === SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+    /must contain exactly/,
   );
 });
 
@@ -1052,15 +1029,14 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
     'cellOrder',
     'dataMapping',
     'datasetId',
-    'sourceType',
+    'name',
     'varCount',
   ]);
-  assert.equal(fingerprint.sourceType, 'local-demo');
   assert.equal(fingerprint.datasetId, 'pancreas');
   assert.equal(fingerprint.cellCount, CELL_COUNT);
   assert.equal(fingerprint.varCount, VAR_COUNT);
   assert.deepEqual(Object.keys(fingerprint.cellOrder), ['embedding', 'dimension', 'digest']);
-  assert.deepEqual(fingerprint.cellOrder.embedding, { key: 'X_umap_3d', columns: null });
+  assert.deepEqual(fingerprint.cellOrder.embedding, { key: 'X_umap_3d', columns: [0, 1, 2] });
   assert.equal(fingerprint.cellOrder.dimension, 3);
   assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
   assert.equal(
@@ -1073,12 +1049,17 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   // same bytes on every writer.
   assert.equal(
     JSON.stringify(fingerprint.dataMapping),
-    JSON.stringify(validateDataMapping(exportMapping())),
+    JSON.stringify(validateDataMapping(keyedMapping())),
   );
   assert.deepEqual(Object.keys(fingerprint.dataMapping), [
     'kind',
     'embeddings',
+    'knn',
     'geneNames',
+    'expression',
+    'log1p',
+    'highlyVariable',
+    'latent',
     'vectorFields',
   ]);
   assert.strictEqual(assertDatasetFingerprint(fingerprint, 'Fingerprint'), fingerprint);
@@ -1110,7 +1091,7 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
       fingerprintOf(makeDatasetState({
         cellOrder: IDENTITY_ORDER,
         pages: emptyPages(),
-        mapping: exportMapping({ geneNames: 'column:symbol' }),
+        mapping: keyedMapping({ geneNames: 'column:symbol' }),
       })),
     ),
     false,
@@ -1125,14 +1106,14 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   assert.throws(() => fingerprintOf(noLayoutKey), /getViewLayoutKey/);
 });
 
-test('cellOrder.embedding names the live layout by export id or by obsm key and columns', () => {
-  const exportFingerprint = fingerprintOf(makeDatasetState({
+test('cellOrder.embedding names the live layout by obsm key and columns, whatever its layout key', () => {
+  const keyedFingerprint = fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
     liveLayoutKey: 'X_tsne_2d',
   }));
-  assert.deepEqual(exportFingerprint.cellOrder.embedding, { key: 'X_tsne_2d', columns: null });
-  assert.equal(exportFingerprint.cellOrder.dimension, 2);
+  assert.deepEqual(keyedFingerprint.cellOrder.embedding, { key: 'X_tsne_2d', columns: [0, 1] });
+  assert.equal(keyedFingerprint.cellOrder.dimension, 2);
 
   const anndataFingerprint = fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
@@ -1149,6 +1130,8 @@ test('cellOrder.embedding names the live layout by export id or by obsm key and 
     'knn',
     'geneNames',
     'expression',
+    'log1p',
+    'highlyVariable',
     'latent',
     'vectorFields',
   ]);
@@ -1218,19 +1201,10 @@ test('an AnnData session is verified on the obsm columns it names', async () => 
   );
   assert.deepEqual(otherColumns.dimensionLog, []);
 
-  // An AnnData session opened on a prepared export is a different source.
-  const exportDestination = makeDatasetState({
-    cellOrder: IDENTITY_ORDER,
-    pages: emptyPages(),
-  });
-  assert.match(
-    await refusal(exportDestination, bundle),
-    /^This session was saved on an AnnData file, and a prepared export is open now\./,
-  );
 });
 
 test('a fingerprint record must be exact and its data mapping canonical', () => {
-  const exportFingerprint = fingerprintOf(makeDatasetState({
+  const keyedFingerprint = fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
   }));
@@ -1243,7 +1217,7 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
     ...value,
     cellOrder: { ...value.cellOrder },
   });
-  const rejects = (mutate, pattern, base = exportFingerprint) => {
+  const rejects = (mutate, pattern, base = keyedFingerprint) => {
     const record = clone(base);
     mutate(record);
     assert.throws(
@@ -1252,23 +1226,18 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
     );
   };
 
-  assert.doesNotThrow(() => assertDatasetFingerprint(clone(exportFingerprint), 'Saved'));
+  assert.doesNotThrow(() => assertDatasetFingerprint(clone(keyedFingerprint), 'Saved'));
   assert.doesNotThrow(() => assertDatasetFingerprint(clone(anndataFingerprint), 'Saved'));
 
   // Exact top-level and cellOrder keys.
-  rejects(record => { record.legacyDimension = 3; }, /exact keys|legacyDimension/);
+  rejects(record => { record.legacyDimension = 3; }, /must contain exactly|legacyDimension/);
   rejects(record => { record.cellOrder.layoutKey = 'X_umap_3d'; }, /cellOrder/);
   // A record with a mapping but a cell order without its embedding is a
   // schema violation, not the pre-mapping file.
   rejects(record => { delete record.cellOrder.embedding; }, /cellOrder/);
   rejects(record => { record.cellOrder.digest = 'ABCDEF0123456789'; }, /hexadecimal/);
   rejects(record => { record.cellOrder.dimension = 4; }, /dimension/);
-  // An export names its embedding by id alone; AnnData by key and columns,
-  // one column per axis.
-  rejects(
-    record => { record.cellOrder.embedding = { key: 'X_umap_3d', columns: [0, 1, 2] }; },
-    /columns must be null/,
-  );
+  // An embedding is named by its obsm key and columns, one column per axis.
   rejects(
     record => { record.cellOrder.embedding = { key: 'X_umap_3d', columns: [0, 1] }; },
     /exactly 3 columns/,
@@ -1283,16 +1252,16 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
   rejects(record => { record.dataMapping.kind = 'h5ad'; }, /kind/);
   rejects(
     record => {
-      const { kind, embeddings, geneNames, vectorFields } = record.dataMapping;
-      record.dataMapping = { kind, geneNames, embeddings, vectorFields };
+      const { kind, embeddings, knn, geneNames, expression, log1p, highlyVariable, latent, vectorFields } = record.dataMapping;
+      record.dataMapping = { kind, geneNames, embeddings, knn, expression, log1p, highlyVariable, latent, vectorFields };
     },
     /canonical form/,
   );
   rejects(
     record => {
       record.dataMapping.vectorFields = [
-        { field: 'velocity', embedding: { key: 'X_umap_3d', columns: null } },
-        { field: 'drift', embedding: { key: 'X_umap_2d', columns: null } },
+        { key: 'velocity_umap_3d', embedding: { key: 'X_umap_3d', columns: [0, 1, 2] } },
+        { key: 'drift_umap_2d', embedding: { key: 'X_umap_2d', columns: [0, 1] } },
       ];
     },
     /sorted/,
@@ -1307,27 +1276,14 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
     record => {
       record.dataMapping.embeddings = record.dataMapping.embeddings.defaults;
     },
-    /missing defaults, enabled/,
+    /\(missing: defaults, enabled; unexpected: 1d, 2d, 3d\)/,
   );
 
-  // The two records written by earlier releases get the messages a person
-  // can act on, not a schema error.
-  const fourKeys = clone(exportFingerprint);
-  delete fourKeys.cellOrder;
-  delete fourKeys.dataMapping;
-  assert.throws(
-    () => assertDatasetFingerprint(fourKeys, 'Saved'),
-    error => error instanceof RangeError
-      && error.message === SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
-  );
-  const preMapping = clone(exportFingerprint);
-  delete preMapping.dataMapping;
-  delete preMapping.cellOrder.embedding;
-  assert.throws(
-    () => assertDatasetFingerprint(preMapping, 'Saved'),
-    error => error instanceof RangeError
-      && error.message === SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
-  );
+  // A record without its name, or with a name that is not a string, is a
+  // schema violation; null is a dataset that states none.
+  rejects(record => { delete record.name; }, /must contain exactly/);
+  rejects(record => { record.name = 7; }, /name/);
+  assert.doesNotThrow(() => assertDatasetFingerprint({ ...clone(keyedFingerprint), name: null }, 'Saved'));
 });
 
 test('cell-order digests are stable and dataset-wide', () => {
@@ -1362,7 +1318,7 @@ async function verifyRefusals() {
     counts: await verify(makeDatasetState({ cellOrder: [0, 1, 2, 3, 4], pages: emptyPages() })),
     copy: await verify(
       makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }),
-      { getCurrentSourceType: () => 'remote', getCurrentDatasetId: () => null },
+      { getCurrentIdentityId: () => null },
     ),
     kind: await verify(makeDatasetState({
       cellOrder: IDENTITY_ORDER,
@@ -1372,9 +1328,9 @@ async function verifyRefusals() {
     slot: await verify(makeDatasetState({
       cellOrder: IDENTITY_ORDER,
       pages: emptyPages(),
-      layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
-      mapping: exportMapping({
-        embeddings: exportEmbeddings(
+      layouts: KEYED_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
+      mapping: keyedMapping({
+        embeddings: keyedEmbeddings(
           ['X_tsne_2d', 'X_umap_3d'],
           { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
         ),
@@ -1383,12 +1339,12 @@ async function verifyRefusals() {
     group: await verify(makeDatasetState({
       cellOrder: IDENTITY_ORDER,
       pages: emptyPages(),
-      mapping: exportMapping({ geneNames: 'column:symbol' }),
+      mapping: keyedMapping({ geneNames: 'column:symbol' }),
     })),
     missingEmbedding: await verify(makeDatasetState({
       cellOrder: IDENTITY_ORDER,
       pages: emptyPages(),
-      layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
+      layouts: KEYED_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
     })),
     digest: await verify(makeDatasetState({
       cellOrder: [5, 4, 3, 2, 1, 0],
@@ -1397,10 +1353,12 @@ async function verifyRefusals() {
     // Choosing None leaves zero cells open: no dataset at all.
     none: await verify(
       { pointCount: 0, varData: { fields: [] } },
-      { getCurrentSourceType: () => null, getCurrentDatasetId: () => null },
+      { getCurrentIdentityId: () => null },
     ),
-    withoutCellIdentity: SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
-    withoutDataMapping: SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+    missingFields: describeMissingRequiredFields(
+      makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }),
+      { obs: ['cell_type', 'donor'], var: ['Cd8a'] },
+    ),
   };
 }
 
@@ -1428,7 +1386,7 @@ test('with no dataset open there are no counts to compare, only a dataset to nam
 test('every refusal tells the person loading the session what to do next', async () => {
   const refusals = await verifyRefusals();
   const withoutNextStep = Object.entries(refusals)
-    .filter(([, message]) => !/Open the dataset|Load the version|Re-create/.test(message))
+    .filter(([, message]) => !/Open the dataset|Open its dataset|Load the version|Re-create/.test(message))
     .map(([cause, message]) => `${cause}: ${message}`);
   assert.deepEqual(withoutNextStep, []);
 });

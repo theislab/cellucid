@@ -198,14 +198,13 @@ test('the reader still accepts a field that is partly missing', () => {
 test('a transport failure is explained by status, with the server quoted', () => {
   const subject = { kind: 'gene', name: 'A2ML1' };
   const refused = Object.assign(
-    new Error('Failed to load remote://host/var/0.values.f32: Internal Server Error — Internal server error'),
+    new Error('Failed to load https://host/data.h5ad: Internal Server Error — Internal server error'),
     { status: 500, serverDetail: 'Internal server error' },
   );
   const message = explainContinuousPayloadFailure({ subject, error: refused });
   assert.match(message, /^Gene "A2ML1" could not be loaded: the server answered 500\./);
   assert.match(message, /The server said: Internal server error/);
-  assert.match(message, /refuses a gene containing NaN or ±Infinity/);
-  assert.match(message, /A server new enough to say so answers 422/);
+  assert.match(message, /failed while reading the file this payload is in/);
   assert.match(message, /prints the reason to its own console/);
 
   const missing = Object.assign(new Error('Failed to load x: Not Found'), {
@@ -218,31 +217,6 @@ test('a transport failure is explained by status, with the server quoted', () =>
   });
   assert.match(missingMessage, /does not have this payload/);
   assert.doesNotMatch(missingMessage, /The server said/);
-
-  // A server new enough to diagnose the column answers 422 and puts the counted
-  // reason in the body, so the classification adds only what the body cannot.
-  const refusedPrecisely = Object.assign(
-    new Error('Failed to load remote://host/var/0.values.f32: Unprocessable Content'),
-    {
-      status: 422,
-      serverDetail:
-        "Gene 'A2ML1' cannot be published: of 18,142,044 cells, 4,118,237 NaN. "
-        + 'First affected cells: 3, 11, 12, 19, 24, ... Cellucid publishes '
-        + 'finite float32 only.',
-    },
-  );
-  const preciseMessage = explainContinuousPayloadFailure({
-    subject,
-    error: refusedPrecisely,
-  });
-  assert.match(preciseMessage, /the server answered 422\./);
-  assert.match(preciseMessage, /4,118,237 NaN/);
-  assert.match(preciseMessage, /examined this payload and will not publish it/);
-  assert.doesNotMatch(
-    preciseMessage,
-    /most often/,
-    'a server that named the cause must not be second-guessed',
-  );
 
   const unclassified = Object.assign(new Error('Failed to load x: Teapot'), {
     status: 418,

@@ -4,7 +4,7 @@ import test from 'node:test';
 
 import { closeModal } from '../assets/js/app/analysis/ui/components/modal.js';
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
-import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
+import { createRequestIdTracker } from '../assets/js/app/jobs/cancellable-job.js';
 import { CommunityAnnotationFileCache } from '../assets/js/app/community-annotations/file-cache.js';
 
 const exactFailureSurfaces = [
@@ -114,40 +114,41 @@ test('form-based analysis requires concrete result rendering and propagates exec
   );
 
   const primaryError = new Error('analysis implementation failed');
-  let failedNotification = null;
+  const shown = [];
   const ui = Object.create(FormBasedAnalysisUI.prototype);
   ui._isDestroyed = false;
   ui._isLoading = false;
   ui._analysisRequestTracker = createRequestIdTracker();
   ui._activeAnalysisRequestId = null;
   ui._analysisInvalidationOwner = null;
-  ui._getFormValues = () => ({});
-  ui._validateForm = () => ({ valid: true });
-  ui._formContainer = {
-    querySelector() {
-      return { disabled: false, textContent: 'Run Analysis' };
-    },
-  };
+  ui._getTitle = () => 'Manual';
+  ui._options = {};
+  ui._selectedPages = [];
+  ui._runRow = null;
+  ui._highlightRevision = 0;
   ui._notifications = {
-    loading() {
-      return 'analysis-notification';
-    },
-    complete() {
-      throw new Error('failed analysis must not complete its notification');
-    },
-    fail(id, message) {
-      failedNotification = { id, message };
+    error(message) {
+      shown.push(message);
     },
   };
   ui._runAnalysisImpl = async () => {
     throw primaryError;
   };
-
-  await assert.rejects(() => ui._runAnalysis(), error => error === primaryError);
-  assert.deepEqual(failedNotification, {
-    id: 'analysis-notification',
-    message: 'Analysis failed: analysis implementation failed',
-  });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    await ui._runAnalysis();
+  } finally {
+    console.error = originalError;
+  }
+  // The failure ends the run's job, which says why once (here, before its
+  // progress notification showed, as an error notification).
+  assert.equal(ui._shownJob.state, 'failed');
+  assert.equal(ui._shownJob.message, primaryError.message);
+  assert.deepEqual(shown, ['Manual failed: analysis implementation failed']);
+  assert.equal(errors.length, 1, 'and is logged once');
+  assert.equal(errors[0][1], primaryError);
 });
 
 test('form-based modal exports fail when no exact modal plot exists', async () => {

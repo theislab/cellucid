@@ -392,13 +392,6 @@
   font-style: italic;
 }
 
-/* A chip that only reports a page (DE status, compared pages) is not a
-   control and takes no pointer feedback. */
-.chip-status {
-  cursor: default;
-  pointer-events: none;
-}
-
 /* One page chip: the toggle button and, beside it, the colour input laid
    over the swatch the button draws. */
 .analysis-page-chip {
@@ -420,6 +413,8 @@
 .analysis-preview-container {
   margin-top: var(--control-block-gap);
   min-height: 180px;
+  /* A plot drawn wider than the panel (a dot plot naming every gene) scrolls. */
+  overflow-x: auto;
   border: var(--border-light);
   background: var(--color-surface-elevated);
   position: relative;
@@ -533,16 +528,6 @@
 }
 
 /* =========================================================================
-   Performance Settings (shared by DE Analysis, Genes Panel)
-   ========================================================================= */
-
-.analysis-performance-settings,
-.de-performance-settings,
-.cluster-params {
-  margin-top: var(--control-block-gap);
-}
-
-/* =========================================================================
    Plotly Minimal Styling for Analysis Module
    ========================================================================= */
 
@@ -618,89 +603,6 @@
 .analysis-preview-plot .modebar-btn[data-title="Produced with Plotly"],
 .analysis-modal-plot .modebar-btn[data-title="Produced with Plotly"] {
   display: none !important;
-}
-
-/* Responsive adjustments for modal */
-@media (max-width: 768px) {
-  .analysis-modal-content {
-    width: 95vw;
-    min-width: unset;
-    height: 95vh;
-    min-height: unset;
-  }
-
-  /* Hide edge resize handles on mobile */
-  .analysis-modal-edge-resize {
-    display: none;
-  }
-
-  .analysis-modal-body {
-    flex-direction: column;
-    min-height: 0;
-  }
-
-  .analysis-modal-plot-section {
-    flex: 1;
-    min-width: unset;
-    min-height: 200px;
-    border-bottom: var(--border-width-1) solid var(--color-border-light);
-  }
-
-  .analysis-modal-options {
-    width: 100%;
-    min-width: unset;
-    max-width: unset;
-    max-height: 200px;
-    border-left: none;
-    border-top: var(--border-width-1) solid var(--color-border-light);
-  }
-
-  .analysis-modal-footer-area {
-    flex-direction: column;
-    height: auto;
-    min-height: unset;
-    max-height: unset;
-  }
-
-  .analysis-modal-stats-panel,
-  .analysis-modal-annotations-panel {
-    min-width: unset;
-    min-height: 100px;
-  }
-
-  .analysis-modal-annotations-panel {
-    border-left: none;
-    border-top: var(--border-width-1) solid var(--color-border-light);
-  }
-
-  /* Hide internal resizers on mobile */
-  .analysis-modal-resizer,
-  .analysis-modal-resizer-intersection {
-    display: none;
-  }
-}
-
-/* Modal edge resize handles */
-.analysis-modal-edge-resize {
-  position: absolute;
-  background: transparent;
-  z-index: 10;
-}
-
-.analysis-modal-edge-resize-right {
-  top: 0;
-  right: -4px;
-  width: 8px;
-  height: 100%;
-  cursor: ew-resize;
-}
-
-.analysis-modal-edge-resize-bottom {
-  bottom: -4px;
-  left: 0;
-  width: 100%;
-  height: 8px;
-  cursor: ns-resize;
 }
 
 /* =========================================================================
@@ -836,27 +738,9 @@
   color: var(--color-success-text);
 }
 
-/* Gene List Input */
-/* A gene list is an .obs-select textarea set in the mono face. */
-.gene-list-input {
-  font-variant-numeric: tabular-nums;
-  min-height: var(--space-12);
-}
-
 /* ========================================================================= */
 /* Quick Insights Panel - Compact Editorial Style                            */
 /* ========================================================================= */
-
-.quick-insights-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  margin: 0;
-  padding: var(--control-box-padding-y) var(--control-box-padding-x);
-  color: var(--color-text-secondary);
-  font-size: var(--type-hint);
-}
 
 /* Insights Header - Compact */
 .insights-header {
@@ -1174,99 +1058,6 @@
   border-color: color-mix(in srgb, var(--color-border-strong) 50%, transparent);
 }
 
-/* ========================================================================= */
-/* Floating analysis window copies (sub-accordion items)                      */
-/* ========================================================================= */
-
-/* The window's frame carries copy, close and the open/closed chevron in its
-   header action bar (`_accordion.css`); the summary keeps the slot for all
-   three. */
-.accordion-panel.analysis-window-frame {
-  --panel-action-size: 18px;
-  --panel-actions-width: calc(
-    2 * var(--panel-action-size) + 2 * var(--space-2) + var(--space-3)
-  );
-}
-
-.analysis-window-frame > .accordion-panel-actions {
-  font-family: inherit;
-  font-weight: var(--font-weight-regular);
-  font-size: var(--type-heading);
-  letter-spacing: normal;
-}
-
-.analysis-window-panel > summary {
-  padding: var(--control-panel-summary-padding-y) var(--control-panel-summary-padding-x);
-  font-family: inherit;
-  font-weight: var(--font-weight-regular);
-  font-size: var(--type-heading);
-  text-transform: none;
-  letter-spacing: normal;
-  background: transparent;
-  border-bottom: var(--border-width-1) solid var(--color-border-light);
-  color: var(--color-text-primary);
-}
-
-.analysis-window-panel > summary::before {
-  display: none;
-  content: none;
-}
-
-.analysis-window-panel > summary:hover,
-:where(.analysis-window-frame:has(> .accordion-panel-actions :hover)) > .analysis-window-panel > summary {
-  background: var(--color-surface-secondary);
-  color: var(--color-text-primary);
-}
-
-.analysis-window-panel[open] > summary {
-  background: var(--color-surface-tertiary);
-  border-bottom: var(--border-width-1) solid var(--color-border-light);
-}
-
-.analysis-window-panel[open] > summary .disclosure-title {
-  color: var(--color-text-primary);
-  font-weight: var(--font-weight-semibold);
-}
-
-.analysis-window-frame:has(> .analysis-window-panel > summary:hover, > .accordion-panel-actions :hover)
-  > .accordion-panel-actions > .disclosure-chevron {
-  opacity: var(--opacity-70);
-}
-
-.analysis-window-frame:has(> .analysis-window-panel[open])
-  > .accordion-panel-actions > .disclosure-chevron {
-  transform: rotate(180deg);
-  opacity: var(--opacity-80);
-}
-
-.analysis-window-frame > .accordion-panel-actions > .accordion-copy-btn,
-.analysis-window-frame > .accordion-panel-actions > .accordion-close-btn {
-  border-color: color-mix(in srgb, var(--color-border-strong) 25%, transparent);
-  box-shadow: none;
-  opacity: var(--opacity-35);
-  transition:
-    opacity var(--duration-fast) var(--easing-standard),
-    border-color var(--duration-fast) var(--easing-standard),
-    background-color var(--duration-fast) var(--easing-standard);
-}
-
-.analysis-window-frame:has(
-    > .analysis-window-panel > summary:hover,
-    > .analysis-window-panel > summary:focus,
-    > .accordion-panel-actions :hover,
-    > .accordion-panel-actions :focus
-  ) > .accordion-panel-actions > :is(.accordion-copy-btn, .accordion-close-btn) {
-  opacity: var(--opacity-90);
-  background: color-mix(in srgb, var(--color-surface-elevated) 80%, transparent);
-  border-color: color-mix(in srgb, var(--color-border-strong) 50%, transparent);
-}
-
-.analysis-window-frame.accordion-floating > .analysis-window-panel .accordion-content {
-  padding: var(--space-2) var(--space-2-5) var(--space-2-5);
-  background: var(--color-surface-secondary);
-  border-top: var(--border-width-1) solid var(--color-border-light);
-}
-
 .stat-value {
   color: var(--color-text-primary);
   font-weight: var(--font-weight-medium);
@@ -1284,48 +1075,6 @@
 /* ========================================================================= */
 /* DE Analysis Specific Styles                                                */
 /* ========================================================================= */
-
-.de-page-info {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1-5);
-}
-
-.de-page-info > .field-label {
-  margin: 0;
-}
-
-.de-vs {
-  font-size: var(--type-hint);
-  color: var(--color-text-tertiary);
-  font-weight: var(--font-weight-medium);
-}
-
-.page-comparison-row {
-  display: flex;
-  align-items: flex-end;
-  gap: var(--control-block-gap);
-  flex-wrap: wrap;
-}
-
-/* Each dropdown keeps its own label above it, like every field. */
-.page-comparison-dropdown {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 120px;
-}
-
-.page-comparison-dropdown .page-select {
-  flex: 1;
-  min-width: 80px;
-}
-
-.page-comparison-row .de-vs {
-  flex-shrink: 0;
-  padding-bottom: var(--control-padding-y);
-}
 
 /* DE Modal Stats */
 .de-modal-stats {
@@ -1383,10 +1132,6 @@
 /* Gene Signature Specific Styles                                             */
 /* ========================================================================= */
 
-.gene-signature-panel .gene-list-input {
-  min-height: var(--space-20);
-}
-
 /* Gene Chips in Modal */
 .modal-gene-chips {
   display: flex;
@@ -1395,17 +1140,6 @@
   max-height: 200px;
   overflow-y: auto;
   padding: var(--control-row-gap) 0;
-}
-
-.gene-chip {
-  display: inline-block;
-  padding: calc(var(--space-0-5) + var(--space-px)) var(--space-2);
-  font-size: var(--type-compact);
-  font-variant-numeric: tabular-nums;
-  background: var(--color-surface-tertiary);
-  border: var(--border-width-1) solid var(--color-border-light);
-  border-radius: var(--radius-none);
-  color: var(--color-text-secondary);
 }
 
 /* ========================================================================= */
@@ -1526,13 +1260,503 @@
   border-top: var(--border-width-1) solid var(--color-border-default);
 }
 
-/* The custom-mode gene list in the Marker Genes window: one gene per line. */
-.analysis-gene-list {
-  white-space: pre-wrap;
+.modal-gene-section {
+  margin-top: var(--control-block-gap);
+}
+
+/* ========================================================================= */
+/* Options forms (analysis/options/render-options-form.js)                    */
+/* ========================================================================= */
+
+/* The essentials, then "More options" with one disclosure per purpose. */
+.analysis-options-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-block-gap);
+}
+
+.analysis-options-essentials {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-block-gap);
+}
+
+.analysis-options-group > .disclosure-content,
+.analysis-more-options > .disclosure-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-block-gap);
+}
+
+/* Nested groups sit flush in "More options": no second panel surface. */
+.analysis-more-options > .disclosure-content {
+  background: transparent;
+  padding-inline: 0;
+}
+
+.analysis-options-changed {
+  flex: 0 0 auto;
+  color: var(--color-accent-text);
+}
+
+/* A text-weight action: Reset, All / None / Invert, Add set, Import. */
+.analysis-link-btn {
+  align-self: flex-start;
+  min-height: var(--control-target-min);
+  padding: 0 var(--space-1);
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.analysis-link-btn:hover {
+  color: var(--color-text-primary);
+}
+
+.analysis-link-btn:focus-visible {
+  outline: var(--border-width-2) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.analysis-options-reset {
+  align-self: flex-end;
+}
+
+.analysis-number-input[aria-invalid="true"],
+.analysis-options-form input[aria-invalid="true"] {
+  border-color: var(--color-danger-text);
+}
+
+/* Toggle chips (Exclude genes): each a button with aria-pressed. */
+.analysis-flag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.analysis-flag {
+  min-height: var(--control-target-min);
+  padding: 0 var(--space-2);
+  border: var(--border-width-1) solid var(--color-border-default);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-elevated);
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--type-hint);
+  cursor: pointer;
+}
+
+.analysis-flag[aria-pressed="true"] {
+  background: var(--color-interactive-primary);
+  border-color: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+}
+
+.analysis-flag:focus-visible {
+  outline: var(--border-width-2) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* A short state beside a result or a group: skipped, Cached, low n, stale. */
+.analysis-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0-5);
+  padding: 0 var(--space-1-5);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-secondary);
+  font-size: var(--type-hint);
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+button.analysis-chip {
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.analysis-chip-warning {
+  background: var(--color-warning-soft);
+  color: var(--color-warning-text);
+}
+
+.analysis-chip-info {
+  background: var(--color-info-soft);
+  color: var(--color-info-text);
+}
+
+/* Run: one muted line above it says why it is disabled; nothing below it. */
+.analysis-run-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+}
+
+.analysis-run-reason {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+}
+
+/* ========================================================================= */
+/* Group picker (analysis/ui/components/group-picker.js)                      */
+/* ========================================================================= */
+
+.group-picker-toggle {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* In the top layer, placed under its toggle. */
+.group-picker-panel {
+  position: fixed;
+  inset: var(--group-picker-top, auto) auto var(--group-picker-bottom, auto) var(--group-picker-left, 0);
+  width: var(--group-picker-width, 280px);
+  max-width: calc(100vw - 16px);
+  margin: 0;
+  padding: var(--space-2);
+  border: var(--border-width-1) solid var(--color-border-default);
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-lg);
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.group-picker-panel:popover-open {
+  display: flex;
+}
+
+.group-picker-grip {
+  display: none;
+}
+
+.group-picker-actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.group-picker-summary {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+}
+
+.group-picker-list {
+  max-height: 280px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.group-picker-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: 28px;
+  padding-inline: var(--space-1);
   font-size: var(--type-control);
+  cursor: pointer;
+}
+
+.group-picker-row:hover {
+  background: var(--color-surface-tertiary);
+}
+
+.group-picker-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-default);
+}
+
+.group-picker-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-picker-count {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+}
+
+.group-picker-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* A phone shows the picker as a bottom sheet. */
+@media (max-width: 720px) {
+  .group-picker-panel {
+    inset: auto 0 0 0;
+    width: 100%;
+    max-width: none;
+    max-height: 75dvh;
+    padding-bottom: calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
+    border-width: var(--border-width-1) 0 0;
+  }
+
+  .group-picker-panel::backdrop {
+    background: var(--color-surface-overlay);
+  }
+
+  .group-picker-grip {
+    display: block;
+    align-self: center;
+    width: 40px;
+    height: 4px;
+    margin-bottom: var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--color-border-default);
+  }
+
+  .group-picker-list {
+    max-height: none;
+    flex: 1 1 auto;
+  }
+
+  .group-picker-row {
+    height: 36px;
+  }
+}
+
+/* ========================================================================= */
+/* Gene set editor (analysis/ui/components/gene-set-editor.js)               */
+/* ========================================================================= */
+
+.gene-set-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.gene-set-rows > .gene-set-row + .gene-set-row {
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.gene-set-row > .disclosure-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.gene-set-missing {
+  color: var(--color-warning-text);
+}
+
+.gene-set-name-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.gene-set-name-row > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.gene-set-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.gene-set-chips:empty {
+  display: none;
+}
+
+/* One gene, in a set editor or a signature result: a pill, as it can carry
+   its own remove button. (One rule: an earlier square .gene-chip lost every
+   property but its padding to this one.) */
+.gene-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0-5);
+  padding: calc(var(--space-0-5) + var(--space-px)) var(--space-2) calc(var(--space-0-5) + var(--space-px)) var(--space-1-5);
+  border: var(--border-width-1) solid var(--color-border-light);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-elevated);
+  font-size: var(--type-hint);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+.gene-chip-missing {
+  border-color: var(--color-warning);
+  background: var(--color-warning-soft);
+  color: var(--color-warning-text);
+}
+
+.gene-chip-remove {
+  min-width: 24px;
+  min-height: 24px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  opacity: var(--opacity-70);
+}
+
+.gene-chip-remove:hover,
+.gene-chip-remove:focus-visible {
+  opacity: 1;
+}
+
+.gene-set-tools,
+.gene-set-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+@media (pointer: coarse) {
+  .gene-chip-remove {
+    min-width: 32px;
+    min-height: 32px;
+  }
+}
+
+/* A row of chips above a result (skipped groups, low n, not found). */
+.analysis-chip-row,
+.analysis-result-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1-5);
+}
+
+/* What a result compared, its chips and its view switch, above the plot. */
+.analysis-result-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1-5);
+}
+
+.analysis-result-line {
+  margin: 0;
+  font-size: var(--type-hint);
   color: var(--color-text-secondary);
 }
 
-.modal-gene-section {
-  margin-top: var(--control-block-gap);
+.analysis-result-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1);
+}
+
+.analysis-send-to {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* The ranked list: a group per row, its markers beside it. */
+.marker-ranked-preview {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.marker-ranked-row {
+  display: grid;
+  grid-template-columns: minmax(6rem, 30%) 1fr;
+  gap: var(--space-1-5);
+  padding: var(--space-0-5) 0;
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  font-size: var(--type-hint);
+}
+
+.marker-ranked-group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+}
+
+.marker-ranked-genes {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-secondary);
+}
+
+/* A gene of a result: choosing it colours the cells by it. */
+.analysis-gene-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.analysis-gene-link:hover {
+  color: var(--color-text-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.analysis-gene-link:focus-visible {
+  outline: var(--border-width-2) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* Sortable table headers: the whole header is the button. */
+.analysis-sort-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* A result that no longer matches its form: dimmed until the next run. */
+.analysis-result-stale > :not(.analysis-stale-chip) {
+  opacity: var(--opacity-55);
+}
+
+.analysis-stale-chip {
+  margin-bottom: var(--space-1);
+}
+
+/* An analysis form: its lead (a page selector), the options and the Run row,
+   one rhythm apart; inside the options, rows are spaced by the form's gaps
+   alone, so every row stands the same distance from the one above. */
+.analysis-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-block-gap);
+}
+
+.analysis-form > * {
+  margin-top: 0;
+}
+
+.analysis-options-form .control-block {
+  margin-top: 0;
 }

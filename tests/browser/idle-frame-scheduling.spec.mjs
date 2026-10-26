@@ -10,18 +10,18 @@
  */
 
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import {
   QUIET_WINDOW_MS,
   countDrawsDuring,
-  countDrawsOverFrames,
   sceneQuietness,
+  watchDraws,
 } from './helpers/frame-scheduling.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=idle-frame-scheduling-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=idle-frame-scheduling-ci';
 
 test('a static scene stops drawing and a mutation draws it again', async ({
   page,
@@ -29,7 +29,7 @@ test('a static scene stops drawing and a mutation draws it again', async ({
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   // The scene goes quiet once startup work and the settle window run out. How
@@ -74,7 +74,7 @@ test('a still highlight lets the scene go quiet; only a pulsing one keeps drawin
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const selectQuality = quality => page.evaluate(value => {
@@ -102,13 +102,40 @@ test('a still highlight lets the scene go quiet; only a pulsing one keeps drawin
 
   // `full` pulses its ring, which is a time-driven effect that draws: the loop
   // names it as the reason for the next frame, so it never settles, and the
-  // frames keep being drawn. Frames, not a wall-clock window, because a slow
-  // renderer may draw none in a short window.
+  // frames keep being drawn. A pulse frame waits until what the last frames
+  // held is measured and the main thread has been free as long
+  // (`ambient-frame-pacing.js`), so on a slow renderer pulse frames come far
+  // apart and a window of a few animation frames can miss every one: a
+  // running count is polled until it grows, twice, so the pulse is seen to
+  // go on. Meanwhile the loop always comes back for the next pulse frame:
+  // it is armed, or a wake is pending.
   await selectQuality('full');
   await expect.poll(() => page.evaluate(
     () => window._cellucidViewer.getFrameScheduleState().animationCause,
   )).toBe('highlight');
-  expect(await countDrawsOverFrames(page, 2)).toBeGreaterThan(0);
+  const pulseState = () => page.evaluate(() => {
+    const state = window._cellucidViewer.getFrameScheduleState();
+    return {
+      settled: state.settled,
+      comesBack: state.frameArmed || state.ambientPacing.wakePending,
+      pacing: state.ambientPacing,
+    };
+  });
+  const draws = await watchDraws(page);
+  const stranded = [];
+  try {
+    for (let round = 0; round < 2; round++) {
+      const before = await draws.count();
+      await expect.poll(async () => {
+        const state = await pulseState();
+        if (state.settled || !state.comesBack) stranded.push(state);
+        return draws.count();
+      }).toBeGreaterThan(before);
+    }
+  } finally {
+    await draws.stop();
+  }
+  expect(stranded, 'a pulse that settled or that nothing brings back').toEqual([]);
 
   // Clearing the selection ends the animation and the scene goes quiet again.
   await page.evaluate(() => {
@@ -125,7 +152,7 @@ test('a selection preview republished with the same cells does not redraw the sc
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   // A still ring, so a highlight alone is no reason to keep drawing.
   await page.evaluate(() => {
@@ -133,14 +160,14 @@ test('a selection preview republished with the same cells does not redraw the sc
     select.value = 'light';
     select.dispatchEvent(new Event('change', { bubbles: true }));
   });
-  await page.evaluate(() => window._cellucidState.setPreviewHighlightFromIndices([0, 1, 2]));
+  await page.evaluate(() => window._cellucidState.setPreviewHighlightFromIndices(Uint32Array.of(0, 1, 2)));
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
   // What a lasso does on every pointer move: publish the preview again. The
   // same cells are the same picture, so the frame stays valid and nothing is
   // re-uploaded; a different set redraws.
   const invalidatedBy = indices => page.evaluate(cells => {
-    window._cellucidState.setPreviewHighlightFromIndices(cells);
+    window._cellucidState.setPreviewHighlightFromIndices(Uint32Array.from(cells));
     return window._cellucidViewer.getFrameScheduleState().invalidated;
   }, indices);
   expect(await invalidatedBy([0, 1, 2])).toBe(false);
@@ -168,7 +195,7 @@ test('a renderer slower than the settle window still settles the camera', async 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   // The dataset's first frames publish its presented state (its LOD among
@@ -280,13 +307,13 @@ test('pointer movement and typing that change nothing do not redraw the scene', 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.evaluate(() => window._cellucidViewer.setFrameInvalidationTracing(true));
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
   const canvas = await page.locator('#glcanvas').boundingBox();
-  const field = page.locator('#remote-server-url');
+  const field = page.locator('#data-address');
   const fieldBox = await field.boundingBox();
   expect(canvas).not.toBeNull();
   expect(fieldBox).not.toBeNull();
@@ -332,7 +359,7 @@ test('focus and visibility changes that end no input do not redraw the scene', a
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
@@ -379,7 +406,7 @@ test('cell lookups under the pointer, and the Cell info card, do not redraw the 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   // The field activation is asynchronous and redraws the scene when it lands
   // (new colours, labels and centroids). Its legend is the sign it has landed;
@@ -427,6 +454,41 @@ test('cell lookups under the pointer, and the Cell info card, do not redraw the 
   expect(cardDraws.draws, `draws caused by: ${cardDraws.causes}`).toBe(0);
 });
 
+test('viewer calls that change nothing drawn do not redraw the scene', async ({
+  page,
+}) => {
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI fixture',
+  );
+  await page.evaluate(() => window._cellucidViewer.setFrameInvalidationTracing(true));
+  await expect.poll(() => sceneQuietness(page)).toBe('quiet');
+  // Each of these used to mark the next frame, which redraws every pane of a
+  // grid: the figure-export preview borrows view data on every build, panels
+  // register listeners and handlers, and the navigation settings write input
+  // preferences the next gesture reads.
+  const neutralDraws = await countDrawsDuringInput(page, async () => {
+    await page.evaluate(async () => {
+      const viewer = window._cellucidViewer;
+      for (let index = 0; index < 10; index++) {
+        viewer.withBorrowedViewData('live', () => null);
+        viewer.onLodChanged(() => {})();
+        viewer.onPresentedLayoutChange(() => {})();
+        viewer.setLassoCallback(() => {});
+        viewer.setViewFocusHandler(() => {});
+        viewer.setLookSensitivity(1);
+        viewer.setMoveSpeed(1);
+        viewer.setPlanarZoomToCursor(true);
+        viewer.stopInertia();
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+    });
+    await page.waitForTimeout(250);
+  });
+  expect(neutralDraws.draws, `draws caused by: ${neutralDraws.causes}`).toBe(0);
+});
+
 test('a backdrop whose opacity target drops still settles, and reduced motion skips fades', async ({
   browser,
 }) => {
@@ -436,7 +498,7 @@ test('a backdrop whose opacity target drops still settles, and reduced motion sk
     try {
       await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
       await dismissWelcome(page);
-      await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+      await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
       // Grid (light) fades the grid to 0.85, Grid (dark) to 0.75. The fade used
       // to move only upwards, so after this switch the opacity stayed above
       // its target and the scene was redrawn on every frame, indefinitely.
@@ -469,7 +531,7 @@ test('a settled scene requests no animation frames; input, a resize and a mutati
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   const frames = count => page.evaluate(n => new Promise(resolve => {
     const step = () => (n-- <= 0 ? resolve() : requestAnimationFrame(step));
     requestAnimationFrame(step);

@@ -118,13 +118,14 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    *
    * Centroids exist for every layout whose normalized positions are resident,
    * and every one of them is recorded in `normalizedLayouts`: a field takes
-   * both together.
+   * both together. Each layout has one centroid for each category that holds
+   * at least one cell.
    *
-   * @param {Uint8Array|Uint16Array} codes
+   * @param {Uint8Array|Uint16Array|Uint32Array} codes
    * @param {(string|number|boolean)[]} categories
    * @param {object} state - DataState
    * @returns {{
-   *   centroidsByLayout: Map<string, Array<{category: string, position: number[], n_points: number}>>,
+   *   centroidsByLayout: Map<string, Array<{category: string|number|boolean, position: number[], n_points: number}>>,
    *   normalizedLayouts: Set<string>
    * }}
    */

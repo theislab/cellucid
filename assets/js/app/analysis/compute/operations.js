@@ -20,6 +20,10 @@
 export const OperationType = {
   COMPUTE_CORRELATION: 'COMPUTE_CORRELATION',
   COMPUTE_DIFFERENTIAL: 'COMPUTE_DIFFERENTIAL',
+  SET_TWO_GROUP_CONTEXT: 'SET_TWO_GROUP_CONTEXT',
+  COMPUTE_DIFFERENTIAL_OF_COLUMNS: 'COMPUTE_DIFFERENTIAL_OF_COLUMNS',
+  CLEAR_TWO_GROUP_CONTEXT: 'CLEAR_TWO_GROUP_CONTEXT',
+  COMPUTE_DIFFERENTIAL_OF_SUBSET: 'COMPUTE_DIFFERENTIAL_OF_SUBSET',
   COMPUTE_KERNEL_DENSITY: 'COMPUTE_KERNEL_DENSITY',
   COMPUTE_BOX_STATISTICS: 'COMPUTE_BOX_STATISTICS',
   COMPUTE_VIOLIN_DENSITY: 'COMPUTE_VIOLIN_DENSITY',
@@ -27,7 +31,16 @@ export const OperationType = {
   COMPUTE_STATISTICAL_TESTS: 'COMPUTE_STATISTICAL_TESTS',
   COMPUTE_ORDER_STATISTICS: 'COMPUTE_ORDER_STATISTICS',
   COMPUTE_HISTOGRAM_SAMPLES: 'COMPUTE_HISTOGRAM_SAMPLES',
-  COMPUTE_DENSITY_PLAN: 'COMPUTE_DENSITY_PLAN'
+  COMPUTE_DENSITY_PLAN: 'COMPUTE_DENSITY_PLAN',
+  COMPUTE_PAIRWISE_DISTANCES: 'COMPUTE_PAIRWISE_DISTANCES',
+  COMPUTE_AGGLOMERATION: 'COMPUTE_AGGLOMERATION',
+  COMPUTE_CSV_EXPORT: 'COMPUTE_CSV_EXPORT',
+  COMPUTE_GENE_MOMENTS: 'COMPUTE_GENE_MOMENTS',
+  // --- composition and dot plot ---
+  COMPOSITION_COUNTS: 'COMPOSITION_COUNTS',
+  GROUP_SUMMARY_SET_CONTEXT: 'GROUP_SUMMARY_SET_CONTEXT',
+  GROUP_SUMMARY_COMPUTE_GENES: 'GROUP_SUMMARY_COMPUTE_GENES',
+  GROUP_SUMMARY_CLEAR_CONTEXT: 'GROUP_SUMMARY_CLEAR_CONTEXT'
 };
 
 // ============================================================================
@@ -57,6 +70,38 @@ const Operations = {
     id: OperationType.COMPUTE_DIFFERENTIAL,
     name: 'Compute Differential Expression',
     description: 'Compute differential expression statistics (Mann-Whitney U or Welch t-test)',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.SET_TWO_GROUP_CONTEXT]: {
+    id: OperationType.SET_TWO_GROUP_CONTEXT,
+    name: 'Set Two-Group Context',
+    description: 'Hold the two groups of a differential expression run, cell by cell, for its genes',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMNS]: {
+    id: OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMNS,
+    name: 'Compute Differential Expression of Gene Columns',
+    description: 'Differential expression of a batch of whole gene columns between the two held groups',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.CLEAR_TWO_GROUP_CONTEXT]: {
+    id: OperationType.CLEAR_TWO_GROUP_CONTEXT,
+    name: 'Clear Two-Group Context',
+    description: 'Release the two groups held for a differential expression run',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET]: {
+    id: OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET,
+    name: 'Compute Differential Expression of a Cell Subset',
+    description: 'Differential expression of a run of genes read in the cells of the two held groups',
     workerCapable: true,
     cpuCapable: true
   },
@@ -121,6 +166,68 @@ const Operations = {
     id: OperationType.COMPUTE_DENSITY_PLAN,
     name: 'Compute Density Plan',
     description: 'A page\'s density curve, or the plan its kernel sum is split by',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_PAIRWISE_DISTANCES]: {
+    id: OperationType.COMPUTE_PAIRWISE_DISTANCES,
+    name: 'Compute Pairwise Distances',
+    description: 'A block of rows of the condensed distance matrix of a clustering',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_AGGLOMERATION]: {
+    id: OperationType.COMPUTE_AGGLOMERATION,
+    name: 'Compute Agglomeration',
+    description: 'Hierarchical clustering merges and leaf order from condensed distance blocks',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_CSV_EXPORT]: {
+    id: OperationType.COMPUTE_CSV_EXPORT,
+    name: 'Compute CSV Export',
+    description: 'The lines of a range of rows of a per-cell CSV file, as a Blob',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  [OperationType.COMPUTE_GENE_MOMENTS]: {
+    id: OperationType.COMPUTE_GENE_MOMENTS,
+    name: 'Compute Gene Moments',
+    description: 'Sum, sum of squares and non-zero count of each of a batch of gene columns over every cell',
+    workerCapable: true,
+    cpuCapable: true
+  },
+
+  // --- composition and dot plot ---
+  [OperationType.COMPOSITION_COUNTS]: {
+    id: OperationType.COMPOSITION_COUNTS,
+    name: 'Composition Counts',
+    description: 'Cells of each cell type in each sample or condition, in one pass over the cells',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_SET_CONTEXT]: {
+    id: OperationType.GROUP_SUMMARY_SET_CONTEXT,
+    name: 'Set Group Summary Context',
+    description: 'Hold the group of every cell for a dot plot run',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_COMPUTE_GENES]: {
+    id: OperationType.GROUP_SUMMARY_COMPUTE_GENES,
+    name: 'Group Summary of Genes',
+    description: 'Per-group sum, cells above the expression cutoff and their sum, for a run of genes',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.GROUP_SUMMARY_CLEAR_CONTEXT]: {
+    id: OperationType.GROUP_SUMMARY_CLEAR_CONTEXT,
+    name: 'Clear Group Summary Context',
+    description: 'Release the groups of a dot plot run',
     workerCapable: true,
     cpuCapable: true
   }

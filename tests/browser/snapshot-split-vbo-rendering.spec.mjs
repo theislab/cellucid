@@ -128,6 +128,9 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
     renderer.loadData(positions, colors, {
       dimensionLevel: 2,
     });
+    // The live stores are written when first drawn; this harness draws the
+    // live vertex array itself, so it writes them as a frame would.
+    renderer.flushBufferUpdates(2);
     const bytesBeforeSnapshots =
       renderer._refreshGpuMemoryStats();
     renderer.createSnapshotBuffer(

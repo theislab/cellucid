@@ -2,55 +2,68 @@ import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { H5adLoader } from '../assets/js/data/h5ad-loader.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
+import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
 
-test('H5AD loader propagates the exact owned file-release failure', () => {
-  const loader = new H5adLoader();
-  const releaseFailure = new Error('exact HDF5 close failure');
-  loader._file = {
+test('the AnnData reader propagates the exact store-release failure', () => {
+  const reader = new AnnDataReader();
+  const releaseFailure = new Error('exact store close failure');
+  let closeCalls = 0;
+  const store = {
     close() {
+      closeCalls++;
       throw releaseFailure;
     },
   };
+  reader._store = store;
+  reader._root = {};
 
   assert.throws(
-    () => loader.close(),
+    () => reader.close(),
     (error) => error === releaseFailure
   );
-  assert.notEqual(loader._file, null);
+  assert.equal(reader.isOpen, false);
+  // A store whose release failed stays owned: a later close retries it.
+  assert.equal(reader._store, store);
+  assert.throws(() => reader.close(), error => error === releaseFailure);
+  assert.equal(closeCalls, 2);
 });
 
-test('H5AD loader reports every required resource-release failure', () => {
-  const loader = new H5adLoader();
-  const fileFailure = new Error('exact HDF5 close failure');
-  const unmountFailure = new Error('exact virtual file release failure');
-  loader._file = {
+test('the AnnData reader reports every required resource-release failure', () => {
+  const reader = new AnnDataReader();
+  const storeFailure = new Error('exact store close failure');
+  const matrixFailure = new Error('exact matrix index release failure');
+  reader._store = {
     close() {
-      throw fileFailure;
+      throw storeFailure;
     },
   };
-  loader._unmount = () => {
-    throw unmountFailure;
-  };
+  reader._root = {};
+  reader._matrices.set('X', {
+    element: 'X',
+    loadPromise: null,
+    columns: {
+      dispose() {
+        throw matrixFailure;
+      },
+    },
+  });
 
   assert.throws(
-    () => loader.close(),
+    () => reader.close(),
     error => {
       assert.ok(error instanceof AggregateError);
-      assert.equal(error.errors[0], fileFailure);
-      assert.equal(error.errors[1], unmountFailure);
+      assert.equal(error.errors[0], storeFailure);
+      assert.equal(error.errors[1], matrixFailure);
       return true;
     }
   );
-  assert.notEqual(loader._file, null);
-  assert.notEqual(loader._unmount, null);
+  assert.notEqual(reader._store, null, 'the store whose release failed stays owned');
 });
 
 test('direct AnnData sources propagate cache-release failures', () => {
-  for (const source of [new H5adDataSource(), new ZarrDataSource()]) {
+  for (const source of [new AnnDataFileSource(), new AnnDataFileSource()]) {
     const releaseFailure = new Error(`${source.getType()} cache release failed`);
     source.clearCaches = () => {
       throw releaseFailure;
@@ -64,17 +77,13 @@ test('direct AnnData sources propagate cache-release failures', () => {
 
 test('direct AnnData connectivity access without an active adapter is terminal', async () => {
   await assert.rejects(
-    new H5adDataSource().getConnectivityEdges(),
-    /No h5ad file loaded/
-  );
-  await assert.rejects(
-    new ZarrDataSource().getConnectivityEdges(),
-    /No zarr directory loaded/
+    new AnnDataFileSource().getConnectivityEdges(),
+    /No dataset loaded/
   );
 });
 
-test('Zarr candidate loading preserves both opening and cleanup failures', async () => {
-  const source = new ZarrDataSource();
+test('candidate loading preserves both opening and cleanup failures', async () => {
+  const source = new AnnDataFileSource();
   const openingFailure = new Error('exact Zarr opening failure');
   const cleanupFailure = new Error('exact Zarr cleanup failure');
   const { open, close } = AnnDataReaderClient.prototype;
@@ -87,14 +96,13 @@ test('Zarr candidate loading preserves both opening and cleanup failures', async
   try {
     await assert.rejects(
       source._loadCandidate(
-        0,
         { files: new Map(), rootName: 'broken.zarr' },
         {
           datasetId: null,
           description: 'broken',
           source: { name: 'test' },
         },
-        false
+        { title: 'broken.zarr', step: 'Reading the folder' }
       ),
       error => {
         assert.ok(error instanceof AggregateError);

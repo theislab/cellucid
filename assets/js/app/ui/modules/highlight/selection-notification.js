@@ -1,11 +1,12 @@
 /**
- * Exact local-selection delivery to the connected Python/Jupyter owner.
+ * Exact local-selection delivery to the connected Python, Jupyter or R host.
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
+import { requireKeys } from '../../../../utils/exact-record.js';
 
 const DELIVERY_KEYS = new Set([
-  'jupyterSource',
+  'viewerHostSource',
   'cellIndices',
   'source',
   'onFailure'
@@ -18,34 +19,11 @@ const SELECTION_SOURCES = new Set([
 ]);
 
 function requireDelivery(options) {
-  if (
-    options === null
-    || typeof options !== 'object'
-    || Array.isArray(options)
-    || Object.getPrototypeOf(options) !== Object.prototype
-  ) {
-    throw new TypeError('Selection delivery options must be a plain object');
-  }
-  for (const key of Object.keys(options)) {
-    if (!DELIVERY_KEYS.has(key)) {
-      throw new TypeError(`Selection delivery contains unknown key "${key}"`);
-    }
-  }
-  if (!Array.isArray(options.cellIndices)) {
-    throw new TypeError('Selection delivery cellIndices must be an array');
-  }
-  // One tight loop and no hash set: a JavaScript Set holds at most 2^24
-  // entries, and a selection can be larger. Uniqueness is the transport's
-  // contract -- the Jupyter bridge sorts the cells once and refuses a
-  // duplicate while it encodes them.
-  const cellIndices = options.cellIndices;
-  for (let index = 0; index < cellIndices.length; index++) {
-    const cellIndex = cellIndices[index];
-    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
-      throw new TypeError(
-        'Selection delivery cellIndices must contain non-negative integers'
-      );
-    }
+  requireKeys(options, [], DELIVERY_KEYS, 'Selection delivery options');
+  // A cell list (ascending Uint32Array) by the selection tools' contract;
+  // the viewer channel checks the order while it encodes the cells.
+  if (!(options.cellIndices instanceof Uint32Array)) {
+    throw new TypeError('Selection delivery cellIndices must be a cell list (Uint32Array)');
   }
   if (!SELECTION_SOURCES.has(options.source)) {
     throw new TypeError(`Unknown selection delivery source: ${options.source}`);
@@ -54,14 +32,14 @@ function requireDelivery(options) {
     throw new TypeError('Selection delivery requires an onFailure callback');
   }
   if (
-    options.jupyterSource !== null
+    options.viewerHostSource !== null
     && (
-      typeof options.jupyterSource !== 'object'
-      || typeof options.jupyterSource.notifySelection !== 'function'
+      typeof options.viewerHostSource !== 'object'
+      || typeof options.viewerHostSource.notifySelection !== 'function'
     )
   ) {
     throw new TypeError(
-      'Jupyter selection source must expose notifySelection() or be null'
+      'Viewer host selection source must expose notifySelection() or be null'
     );
   }
   return options;
@@ -70,7 +48,7 @@ function requireDelivery(options) {
 export function showSelectionDeliveryFailure(error, source) {
   const exactError = error instanceof Error
     ? error
-    : new TypeError('Jupyter selection delivery rejected with a non-Error value');
+    : new TypeError('Viewer host selection delivery rejected with a non-Error value');
   console.error(`[Highlight] ${source} selection delivery failed`, exactError);
   getNotificationCenter().error(
     `Selection was saved locally, but Python notification failed: ${exactError.message}`,
@@ -78,18 +56,18 @@ export function showSelectionDeliveryFailure(error, source) {
   );
 }
 
-export function deliverSelectionToJupyter(options) {
+export function deliverSelectionToViewerHost(options) {
   const {
-    jupyterSource,
+    viewerHostSource,
     cellIndices,
     source,
     onFailure
   } = requireDelivery(options);
-  if (jupyterSource === null) return Promise.resolve(false);
+  if (viewerHostSource === null) return Promise.resolve(false);
 
-  const delivery = jupyterSource.notifySelection(cellIndices, source);
+  const delivery = viewerHostSource.notifySelection(cellIndices, source);
   if (!(delivery instanceof Promise)) {
-    throw new TypeError('Jupyter notifySelection() must return a Promise');
+    throw new TypeError('Viewer host notifySelection() must return a Promise');
   }
   return delivery.then(
     () => true,

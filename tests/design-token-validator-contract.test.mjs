@@ -9,13 +9,17 @@ const VALIDATOR_PATH = fileURLToPath(
 const REPOSITORY_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 test('the complete CSS token inventory accepts every declared runtime custom property', () => {
+  // A run takes about a second. A run that has not ended in a minute is hung
+  // (the validator once deadlocked inside process.exit()): it is killed and
+  // fails here with what it printed, instead of holding the suite.
   const result = spawnSync(process.execPath, [VALIDATOR_PATH], {
     cwd: REPOSITORY_ROOT,
     encoding: 'utf8',
+    timeout: 60_000,
   });
 
+  assert.equal(result.signal, null, `the validator did not end:\n${result.stderr}${result.stdout}`);
   assert.ifError(result.error);
-  assert.equal(result.signal, null);
   assert.equal(
     result.status,
     0,

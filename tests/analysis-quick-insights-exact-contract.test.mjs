@@ -382,7 +382,7 @@ test('Quick Insights is aria-busy from an owed update until a result renders', (
     _container: container,
     _contentContainer: null,
     _currentRequestId: 0,
-    _abortController: null,
+    _job: null,
     _debounceTimer: null,
     _pendingUpdateWhenVisible: false,
     _getEffectivePageIds: () => ['page-1'],
@@ -397,7 +397,7 @@ test('Quick Insights is aria-busy from an owed update until a result renders', (
   for (const settle of [
     () => insights._renderInsights({ pages: [] }),
     () => insights._renderEmpty(),
-    () => insights._renderError('failed'),
+    () => insights._renderJobOutcome({ state: 'failed' }),
   ]) {
     insights._renderLoading();
     assert.equal(attributes.get('aria-busy'), 'true');

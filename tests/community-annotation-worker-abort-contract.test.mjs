@@ -827,7 +827,7 @@ test('a streamed byte overrun without Content-Length cancels upstream and releas
 
       await assert.rejects(
         response.text(),
-        /body exceeds 1500000 bytes/
+        /body exceeds 1,500,000 bytes/
       );
       await harness.cancellationStarted;
       await new Promise(resolve => setImmediate(resolve));

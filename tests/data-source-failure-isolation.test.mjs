@@ -83,7 +83,7 @@ test('one failing source never fails the sibling sources', async () => {
 
 test('a source that rejects listDatasets is isolated exactly like a failing probe', async () => {
   const manager = new DataSourceManager();
-  const listFailure = new Error('catalog manifest is malformed');
+  const listFailure = new Error('dataset catalog is malformed');
 
   manager.registerSource(
     'broken-list',

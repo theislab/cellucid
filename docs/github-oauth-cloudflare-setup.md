@@ -2,7 +2,8 @@
 
 Cellucid community annotations use a GitHub App user access token. A Cloudflare
 Worker performs the OAuth code exchange, proxies the repository API calls used
-by the browser, and exposes two fixed Cell Annotation Platform (CAP) lookups.
+by the browser, and exposes one fixed Cell Annotation Platform (CAP) lookup
+(`/cap/lookup-cells`).
 The GitHub client secret is never shipped with Cellucid, and the browser never
 sends arbitrary GraphQL documents to CAP.
 
@@ -272,8 +273,9 @@ Official GitHub reference:
 
 ## 4. Run the local contract gates
 
-Use Node.js 20 or newer for the source contracts. The pinned Wrangler bundle
-gate requires Node.js 22 or newer and runs under Node.js 24 in CI. The tests
+Use Node.js 22.15 or newer (`package.json` `engines.node`) for the source
+contracts and the pinned Wrangler bundle gate, which runs under Node.js 24 in
+CI. The tests
 execute the Worker directly with mocked GitHub responses and do not modify
 Cloudflare or GitHub:
 

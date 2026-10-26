@@ -19,13 +19,13 @@
  * against the layout it must equal.
  */
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { settleStyleTransitions } from './helpers/style-transitions.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=analysis-modal-geometry-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=analysis-modal-geometry-ci';
 
 const OPEN_TRANSITION_MS = 1200;
 
@@ -41,7 +41,7 @@ test('an expanded analysis view settles centred with its resizer corner on the c
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.addStyleTag({
     content: '.analysis-modal-content { transition-duration: '

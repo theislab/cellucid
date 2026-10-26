@@ -13,8 +13,13 @@
  * @module ui/modules/filter-controls
  */
 
-import { createEmptyState, createListItem } from '../components/controls.js';
-import { formatCount } from '../components/display-format.js';
+import {
+  captureListItemFocus,
+  createEmptyState,
+  createListItem,
+  restoreListItemFocus
+} from '../components/controls.js';
+import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 
 /**
@@ -79,16 +84,18 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
 
   function renderList() {
     if (destroyed || !activeFiltersEl) return;
+    const focused = captureListItemFocus(activeFiltersEl, 'filterId');
     const filters = state.getActiveFiltersStructured ? state.getActiveFiltersStructured() : [];
     if (filters.length === 0) {
       activeFiltersEl.replaceChildren(createEmptyState('No filters active.'));
+      restoreListItemFocus(activeFiltersEl, focused, 'filterId');
       return;
     }
     const rows = filters.map((filter) => {
       const counts = state.getFilterCellCounts ? state.getFilterCellCounts(filter) : null;
       const countText =
         counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available)
-          ? ` • ${formatCount(counts.visible)} / ${formatCount(counts.available)} cells`
+          ? ` • ${formatCount(counts.visible)} / ${formatCountOf(counts.available, 'cell')}`
           : '';
       const { root } = createListItem({
         text: filter.text + countText,
@@ -99,6 +106,8 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
       return root;
     });
     activeFiltersEl.replaceChildren(...rows);
+    // A toggle or a removal rebuilds the list under the keyboard's focus.
+    restoreListItemFocus(activeFiltersEl, focused, 'filterId');
   }
 
   const listGate = activeFiltersEl
@@ -114,8 +123,8 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
     const shown = counts?.shown ?? 0;
     const total = counts?.total ?? 0;
     filterCountEl.textContent = shown === total
-      ? `Showing all ${formatCount(total)} cells`
-      : `Showing ${formatCount(shown)} of ${formatCount(total)} cells`;
+      ? `Showing all ${formatCountOf(total, 'cell')}`
+      : `Showing ${formatCount(shown)} of ${formatCountOf(total, 'cell')}`;
 
     if (viewer?.hasSnapshots && viewer.hasSnapshots()) {
       callbacks.onViewBadgesMaybeChanged?.();

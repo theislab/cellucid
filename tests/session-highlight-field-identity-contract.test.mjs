@@ -1,7 +1,7 @@
 /**
- * Field-owned highlight groups name a field and a category, and they also carry
- * the position of each. Positions move whenever a dataset is exported again
- * with one more obs column or one more category, and nothing in the dataset
+ * Field-owned highlight groups name a field and a category, and only the
+ * names are saved. Positions move whenever a dataset is exported again with
+ * one more obs column or one more category, and nothing in the dataset
  * fingerprint pins them: it covers the cells, not the obs schema. These tests
  * hold restore to the names, and hold the refusals to naming what is missing.
  */
@@ -28,8 +28,10 @@ import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
-  createInMemoryDimensionManager,
-} from '../assets/js/data/dimension-manager.js';
+  createInMemoryAnnDataDimensionManager,
+  describeOwnVarCount,
+  inMemoryAnnDataMapping,
+} from './helpers/in-memory-anndata.mjs';
 
 const CELL_COUNT = 6;
 const VAR_COUNT = 4;
@@ -84,15 +86,7 @@ function obsField(descriptor) {
  * layout (keyed "3d"): highlight identity is checked against obs and var
  * schemas, never against this mapping, which is the same on both sides.
  */
-const DATA_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: {
-    enabled: [{ key: '3d', columns: null }],
-    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
-  },
-  geneNames: 'index',
-  vectorFields: [],
-});
+const DATA_MAPPING = Object.freeze(inMemoryAnnDataMapping());
 
 function makeDatasetState({ obs = SAVED_OBS, pages }) {
   const state = Object.create(STATE_PROTOTYPE);
@@ -106,13 +100,15 @@ function makeDatasetState({ obs = SAVED_OBS, pages }) {
   };
   state.pointCount = CELL_COUNT;
   state.positionsArray = positions();
-  state.dimensionManager = createInMemoryDimensionManager({
+  state.dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: state.positionsArray,
     dimension: 3,
   });
   state.getDataMapping = () => DATA_MAPPING;
+  state.describeMappingVarCount = describeOwnVarCount;
   state.getViewDimensionLevel = () => 3;
   state.getViewLayoutKey = () => state.dimensionManager.getViewLayout('live');
+  state.getActiveViewId = () => 'live';
   state.highlightPages = pages;
   state.activePageId = 'page_1';
   state._highlightPageIdCounter = 1;
@@ -127,6 +123,7 @@ function makeDatasetState({ obs = SAVED_OBS, pages }) {
 
 function dataSourceManager() {
   return {
+    getCurrentIdentityId: () => 'pancreas',
     getCurrentSourceType: () => 'local-demo',
     getCurrentDatasetId: () => 'pancreas',
   };
@@ -141,6 +138,7 @@ function makeSerializer(state) {
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
+    figureExport: null,
     contributors: [
       highlightsMetaContributor,
       highlightsCellsContributor,
@@ -247,6 +245,15 @@ function boundNames(state) {
     cellIndices: [...group.cellIndices],
   };
 }
+
+test('a saved group records names, never positions', () => {
+  const source = makeDatasetState({ pages: categoryPages() });
+  const [chunk] = highlightsMetaContributor.capture({ state: source });
+  const [group] = chunk.payload.pages[0].highlightedGroups;
+  assert.deepEqual(Object.keys(group).sort(), [
+    'categoryName', 'cellCount', 'enabled', 'fieldKey', 'fieldSource', 'id', 'label', 'type',
+  ]);
+});
 
 test('an unchanged dataset restores the exact saved binding', async () => {
   const bundle = await captureCategoryBundle();
@@ -373,8 +380,11 @@ test('a highlighted field that is gone entirely is refused by name', async () =>
     await assert.rejects(
       makeSerializer(destination).restoreFromBlob(bundle),
       error => {
+        // The manifest's `requires` names every dataset field the session
+        // uses, so a missing one is refused before any chunk is applied.
         assert.ok(error instanceof RangeError);
-        assert.match(error.message, /obs field "cell_type"/);
+        assert.match(error.message, /observation field "cell_type"/);
+        assert.match(error.message, /was not opened/);
         return true;
       },
     );
@@ -541,7 +551,7 @@ test(
     await withNotificationHarness(async () => {
       await assert.rejects(
         makeSerializer(gone).restoreFromBlob(bundle),
-        /obs field "score"/,
+        /observation field "score"/,
       );
     });
   },

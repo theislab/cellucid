@@ -1,24 +1,24 @@
 /**
  * Unified AnnData Provider for Cellucid
  *
- * This module provides a bridge between the standard Cellucid data loaders
- * and direct AnnData file loaders (h5ad and zarr). When the active data source
- * is an h5ad file or zarr directory, this provider intercepts data requests
- * and fulfills them directly from the file instead of fetching URLs.
+ * Every dataset Cellucid shows is read in the browser by the AnnData reader,
+ * through one data source, whatever format the file arrived in
+ * (`anndata-file-source.js`). The data loaders (`data-loaders.js`) address a
+ * dataset's parts by anndata:// URLs under its base
+ * (`anndata://<dataset id>/...`); this module resolves such a URL to the
+ * adapter of the dataset that owns it -- the active dataset, or a candidate
+ * staged for selection -- and reads the part from it.
  *
- * This provides a unified interface for h5ad.js and zarr.js
- * into a single, unified module.
- *
- * Supports:
- * - H5AD files (.h5ad)
- * - Zarr directories (.zarr/)
- *
- * This allows the rest of the application to work unchanged while supporting
- * AnnData files as a data source.
+ * Every `anndata*` read below except `anndataLinkMeasurement` (active
+ * dataset only) takes an optional last argument,
+ * `candidateBinding`: null (the default) reads the active dataset; a binding
+ * from `createCandidateAnnDataBinding` reads the staged candidate it was made
+ * for, and a URL of any other dataset is refused.
  */
 
 import { getDataSourceManager } from './data-source-manager.js';
-import { parseMappingKnnManifestPath } from './data-mapping-candidates.js';
+import { ANNDATA_SOURCE_TYPE } from './anndata-file-source.js';
+import { parseMappingGraphPath } from './data-mapping-candidates.js';
 import {
   getMetadataLoadSignal,
   throwIfMetadataAborted,
@@ -27,46 +27,21 @@ import {
 
 const candidateAnnDataBindings = new WeakMap();
 
-/**
- * Supported AnnData format types
- * @typedef {'h5ad' | 'zarr'} AnnDataFormat
- */
+/** The scheme of every direct AnnData URL: `anndata://<dataset id>/<path>`. */
+const SCHEME = `${ANNDATA_SOURCE_TYPE}://`;
 
 /**
- * Check if the current data source is an AnnData file (h5ad or zarr)
- * @returns {AnnDataFormat|null} The format type or null if not AnnData
- */
-function getActiveAnnDataFormat() {
-  const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return null;
-
-  const sourceType = source.getType?.();
-
-  // Check for direct source types
-  if (sourceType === 'h5ad') return 'h5ad';
-  if (sourceType === 'zarr') return 'zarr';
-
-  // Check for local-user wrapper modes
-  if (sourceType === 'local-user') {
-    if (source.isH5adMode?.()) return 'h5ad';
-    if (source.isZarrMode?.()) return 'zarr';
-  }
-
-  return null;
-}
-
-/**
- * Check if any AnnData format is active (h5ad or zarr)
+ * Whether the active dataset is read by a direct AnnData source.
  * @returns {boolean}
  */
-export function isAnnDataActive() {
-  return getActiveAnnDataFormat() !== null;
+function isAnnDataActive() {
+  const manager = getDataSourceManager();
+  if (!manager.activeSource) return false;
+  return getAnnDataSource()?.getType?.() === ANNDATA_SOURCE_TYPE;
 }
 
 /**
- * Get the active AnnData source (works for both h5ad and zarr)
+ * Get the active AnnData source
  * @returns {Object|null}
  */
 function getAnnDataSource() {
@@ -77,19 +52,15 @@ function getAnnDataSource() {
 
   const sourceType = source.getType?.();
 
-  // Direct source types
-  if (sourceType === 'h5ad' || sourceType === 'zarr') {
+  // The direct source
+  if (sourceType === ANNDATA_SOURCE_TYPE) {
     return source;
   }
 
-  // Local-user wrapper
-  if (sourceType === 'local-user') {
-    if (source.isH5adMode?.()) {
-      return source.getH5adSource?.() || null;
-    }
-    if (source.isZarrMode?.()) {
-      return source.getZarrSource?.() || null;
-    }
+  // A wrapper source (local files, a link, a catalog) that reads the active
+  // dataset from an AnnData file
+  if (typeof source.getAnnDataSource === 'function') {
+    return source.getAnnDataSource(manager.activeDatasetId) ?? null;
   }
 
   return null;
@@ -113,7 +84,7 @@ function requireCandidateAnnDataSource(url, candidateSource) {
     parsed.datasetId.length === 0
   ) {
     throw new TypeError(
-      'Candidate AnnData binding requires an exact h5ad:// or zarr:// dataset URL.'
+      'Candidate AnnData binding requires an exact anndata:// dataset URL.'
     );
   }
   requireMethod(
@@ -126,46 +97,25 @@ function requireCandidateAnnDataSource(url, candidateSource) {
 
   if (candidateType === parsed.protocol) {
     directSource = candidateSource;
-  } else if (candidateType === 'local-user') {
-    for (const method of [
-      'getH5adSource',
-      'getZarrSource',
-      'isH5adMode',
-      'isZarrMode',
-    ]) {
-      requireMethod(
-        candidateSource,
-        method,
-        'Candidate local-user AnnData source'
-      );
-    }
-    const h5adMode = candidateSource.isH5adMode();
-    const zarrMode = candidateSource.isZarrMode();
-    if (
-      typeof h5adMode !== 'boolean' ||
-      typeof zarrMode !== 'boolean' ||
-      h5adMode === zarrMode
-    ) {
+  } else if (typeof candidateSource.getAnnDataSource === 'function') {
+    directSource = candidateSource.getAnnDataSource(parsed.datasetId);
+    if (directSource === null || typeof directSource !== 'object') {
       throw new TypeError(
-        'Candidate local-user source must own exactly one direct AnnData mode.'
+        `Candidate ${candidateType} source reads no direct AnnData file.`
       );
     }
-    const expectedMode = parsed.protocol === 'h5ad'
-      ? h5adMode
-      : zarrMode;
-    if (!expectedMode) {
+    requireMethod(directSource, 'getType', 'Candidate direct AnnData source');
+    const owned = directSource.getType();
+    if (owned !== parsed.protocol) {
       throw new Error(
         `Candidate AnnData URL uses ${parsed.protocol}://, but the candidate ` +
-        `local-user source owns ${h5adMode ? 'h5ad://' : 'zarr://'}.`
+        `${candidateType} source owns ${String(owned)}://.`
       );
     }
-    directSource = parsed.protocol === 'h5ad'
-      ? candidateSource.getH5adSource()
-      : candidateSource.getZarrSource();
   } else {
     throw new TypeError(
-      `Candidate AnnData source type must be "local-user", "h5ad", or ` +
-      `"zarr"; received "${String(candidateType)}".`
+      `Candidate AnnData source must be an "${ANNDATA_SOURCE_TYPE}" source, or ` +
+      `expose getAnnDataSource(); received "${String(candidateType)}".`
     );
   }
 
@@ -263,7 +213,7 @@ export function getActiveAnnDataBinding(url) {
   const parsed = parseAnnDataUrl(url);
   if (!parsed) {
     throw new Error(
-      `Direct AnnData access requires an explicit h5ad:// or zarr:// URL: ${String(url)}`
+      `Direct AnnData access requires an explicit anndata:// URL: ${String(url)}`
     );
   }
   if (
@@ -276,11 +226,10 @@ export function getActiveAnnDataBinding(url) {
   }
 
   const manager = getDataSourceManager();
-  const activeFormat = getActiveAnnDataFormat();
-  if (activeFormat !== parsed.protocol) {
+  if (!isAnnDataActive()) {
     throw new Error(
       `Direct AnnData URL uses ${parsed.protocol}://, but the active ` +
-      `dataset protocol is ${activeFormat ? `${activeFormat}://` : 'not AnnData'}`
+      'dataset is not read by a direct AnnData source'
     );
   }
   if (manager.activeDatasetId !== parsed.datasetId) {
@@ -306,44 +255,48 @@ export function getActiveAnnDataBinding(url) {
 }
 
 // =========================================================================
-// Unified data access functions (work for both h5ad and zarr)
+// Unified data access functions
 // =========================================================================
 
 /**
- * Load one embedding payload from an AnnData source. The path below the
- * dataset names the payload: an identity item (`embeddings/{i}_{d}d.bin`) or
- * a mapped `obsm` array (`_cellucid/mapping/embeddings/{obsm}/{cols}.bin`).
- * The bytes are the format's payload for that array, and the caller owns the
- * returned array exactly as it owns a fetched one (`getEmbeddingPayload`).
+ * Load one embedding from an AnnData source, by its route below the
+ * dataset: `obsm/{obsm}/{cols}`, an `obsm` array read at some columns.
+ * The positions are that array's display coordinates, with their display
+ * transform and bounds, and the caller owns them (`getEmbeddingPayload`).
  *
  * @param {string} url - Explicit direct AnnData URL
  * @param {number} dim - The dimension the caller's layout declares (1, 2, or 3)
- * @returns {Promise<Float32Array>}
+ * @param {{signal?: AbortSignal|null}} [options] - Cancels the read
+ * @returns {Promise<import('./embedding-payload.js').EmbeddingPayload>}
  */
 export async function anndataLoadPoints(
   url,
   dim,
+  options = {},
   candidateBinding = null
 ) {
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getEmbeddingPayload(parsed.path, dim);
+  return adapter.getEmbeddingPayload(parsed.path, dim, { signal: options.signal ?? null });
 }
 
 /**
- * Load one vector payload from an AnnData source, by its URL: the mapping
- * route `_cellucid/mapping/vectors/{vector}/{vcols}/{embedding}/{ecols}.bin`.
+ * Load one vector field from an AnnData source, by its URL: the route
+ * `vectors/{vector}/{vcols}/{embedding}/{ecols}`.
  *
- * @param {string} url - Explicit direct AnnData URL of the vector payload
+ * @param {string} url - Explicit direct AnnData URL of the vector field
  * @param {number} dim - The bound embedding's dimension (1, 2, or 3)
- * @returns {Promise<Float32Array>}
+ * @param {{signal?: AbortSignal|null}} [options] - Cancels the reads
+ * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>} Display
+ *   vectors (shared, read-only) and the largest one's magnitude
  */
 export async function anndataLoadVectors(
   url,
   dim,
+  options = {},
   candidateBinding = null
 ) {
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getVectorPayload(parsed.path, dim);
+  return adapter.getVectorPayload(parsed.path, dim, { signal: options.signal ?? null });
 }
 
 /**
@@ -368,109 +321,301 @@ export function anndataGetMappingCandidates(
 }
 
 /**
- * Load obs manifest from AnnData source
+ * The obs field list of an AnnData source (its `obs` route).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Object}
  */
-export function anndataGetObsManifest(
+export function anndataGetObsFields(
   url,
   options = {},
   candidateBinding = null
 ) {
   const signal = getMetadataLoadSignal(
     options,
-    'Direct AnnData observation manifest'
+    'Direct AnnData obs field list'
   );
   throwIfMetadataAborted(
     signal,
-    'Direct AnnData observation manifest loading'
+    'Direct AnnData obs field list loading'
   );
   const { adapter } = getAnnDataBinding(url, candidateBinding);
-  const manifest = adapter.getObsManifest();
+  const fields = adapter.getObsFields();
   throwIfMetadataAborted(
     signal,
-    'Direct AnnData observation manifest loading'
+    'Direct AnnData obs field list loading'
   );
-  return manifest;
+  return fields;
 }
 
 /**
- * Load one var manifest from an AnnData source: the file's own gene list
- * (`var_manifest.json`) or a mapped one
- * (`_cellucid/mapping/genes/{axis}/{names}/var_manifest.json`).
+ * One gene list of an AnnData source: the file's own (`var`) or a mapped one
+ * (`var/{axis}/{names}`).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Promise<Object>}
  */
-export async function anndataGetVarManifest(
+export async function anndataGetGeneList(
   url,
   options = {},
   candidateBinding = null
 ) {
   const signal = getMetadataLoadSignal(
     options,
-    'Direct AnnData variable manifest'
+    'Direct AnnData gene list'
   );
   throwIfMetadataAborted(
     signal,
-    'Direct AnnData variable manifest loading'
+    'Direct AnnData gene list loading'
   );
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  const manifest = await waitForMetadata(
-    adapter.getVarManifest(parsed.path),
+  const geneList = await waitForMetadata(
+    adapter.getGeneList(parsed.path),
     signal,
-    'Direct AnnData variable manifest loading'
+    'Direct AnnData gene list loading'
   );
   throwIfMetadataAborted(
     signal,
-    'Direct AnnData variable manifest loading'
+    'Direct AnnData gene list loading'
   );
-  return manifest;
+  return geneList;
+}
+
+/**
+ * The genes of one gene list that one boolean var column of their axis marks
+ * (`BaseAnnDataAdapter.getMarkedGenes`), by their names in that list.
+ *
+ * @param {string} url - The gene list's URL (`<base>var` or a mapped route)
+ * @param {string} column
+ * @returns {Promise<string[]|null>}
+ */
+export async function anndataLoadMarkedGenes(url, column, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getMarkedGenes(parsed.path, column);
 }
 
 /**
  * Load obs field data from AnnData source
  * @param {string} url - Explicit direct AnnData URL
  * @param {string} fieldKey - Field name
+ * @param {{signal?: AbortSignal|null}} [options] - Cancels the read
  * @returns {Promise<{data: ArrayBuffer, kind: string, categories?: string[]}>}
  */
 export async function anndataLoadObsField(
   url,
   fieldKey,
+  options = {},
   candidateBinding = null
 ) {
   const { adapter } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getObsFieldData(fieldKey);
+  return adapter.getObsFieldData(fieldKey, { signal: options.signal ?? null });
 }
 
 /**
- * Load one gene's values from an AnnData source, by its payload URL:
- * `var/{g}.values.f32` under the file's own gene list or under a mapped one.
- * @param {string} url - Explicit direct AnnData URL of the gene payload
+ * Load one gene's values from an AnnData source, by its URL: `var/{g}` for
+ * the file's own gene list, or `var/{axis}/{names}/{g}` for a mapped one.
+ * @param {string} url - Explicit direct AnnData URL of the gene
+ * @param {{signal?: AbortSignal|null}} [options] - Cancels the read
  * @returns {Promise<Float32Array>}
  */
 export async function anndataLoadGeneValues(
   url,
+  options = {},
   candidateBinding = null
 ) {
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getGeneValues(parsed.path);
+  return adapter.getGeneValues(parsed.path, {
+    signal: options.signal ?? null,
+    owner: options.owner ?? null,
+    key: options.key ?? null,
+  });
 }
 
 /**
- * Compute the outlier quantiles of one categorical obs field in one latent
- * space of an AnnData source, by its payload URL
- * (`_cellucid/mapping/latent/{obsm}/obs/{field}.outliers.f32`).
- * @param {string} url - Explicit direct AnnData URL of the outlier payload
+ * The link the AnnData file behind `url` is read over, as its reader last
+ * measured it (`AnnDataReaderClient.linkMeasurement()`:
+ * `{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`), or null when
+ * no dataset is open there or nothing has been measured yet.
+ *
+ * @param {string} url
+ * @returns {Readonly<Object>|null}
+ */
+export function anndataLinkMeasurement(url) {
+  let binding;
+  try {
+    binding = getAnnDataBinding(url, null);
+  } catch {
+    return null;
+  }
+  return binding.adapter.linkMeasurement?.() ?? null;
+}
+
+/**
+ * One gene's non-zero entries from an AnnData source, by its URL
+ * (`getGeneSparseValues`): `{length, indices, values}`, owned by the caller.
+ * @param {string} url - Explicit direct AnnData URL of the gene
+ * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] - `signal`
+ *   cancels the read; `owner` is the job it is for
+ * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}>}
+ */
+export async function anndataLoadGeneSparse(
+  url,
+  options = {},
+  candidateBinding = null
+) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getGeneSparseValues(parsed.path, {
+    signal: options.signal ?? null,
+    owner: options.owner ?? null,
+  });
+}
+
+/**
+ * Some genes' values in some cells of an AnnData source, read by cell or by
+ * gene, whichever costs less (`getGeneCellSubset`).
+ * @param {ReadonlyArray<string>} urls - Gene URLs of one matrix
+ * @param {ArrayLike<number>} cells - Distinct cell positions
+ * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] - `signal`
+ *   cancels the read; `owner` is the job it is for
+ * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
+ */
+export async function anndataLoadGeneCellSubset(
+  urls,
+  cells,
+  options = {},
+  candidateBinding = null
+) {
+  const bindings = urls.map(url => getAnnDataBinding(url, candidateBinding));
+  const { adapter } = bindings[0];
+  if (bindings.some(binding => binding.adapter !== adapter)) {
+    throw new RangeError('A cell subset reads the genes of one dataset.');
+  }
+  return adapter.getGeneCellSubset(
+    bindings.map(binding => binding.parsed.path),
+    cells,
+    { signal: options.signal ?? null, owner: options.owner ?? null }
+  );
+}
+
+/**
+ * Whether the AnnData source behind `url` delivers genes to analysis
+ * workers over a gene route (`gene-delivery.js`).
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function anndataDeliversGenes(url, candidateBinding = null) {
+  return getAnnDataBinding(url, candidateBinding).adapter.deliversGenes();
+}
+
+/**
+ * Open gene route `id` in the reader of the AnnData source behind `url`.
+ *
+ * @param {string} url
+ * @param {string} id
+ * @param {MessagePort[]} ports - One per analysis worker, transferred
+ * @returns {Promise<void>}
+ */
+export function anndataOpenGeneRoute(url, id, ports, candidateBinding = null) {
+  return getAnnDataBinding(url, candidateBinding).adapter.openGeneRoute(id, ports);
+}
+
+/**
+ * The new port of gene route `id`'s worker `worker` (the pool replaced it).
+ *
+ * @returns {Promise<void>}
+ */
+export function anndataReplaceGeneRoutePort(url, id, worker, port, generation, candidateBinding = null) {
+  return getAnnDataBinding(url, candidateBinding).adapter.replaceGeneRoutePort(id, worker, port, generation);
+}
+
+/**
+ * Let gene route `id` go.
+ *
+ * @returns {Promise<void>}
+ */
+export function anndataCloseGeneRoute(url, id, candidateBinding = null) {
+  return getAnnDataBinding(url, candidateBinding).adapter.closeGeneRoute(id);
+}
+
+/**
+ * Genes' non-zero entries of an AnnData source, by their URLs (one
+ * matrix), delivered to analysis workers (`deliverGeneColumns`).
+ *
+ * @param {ReadonlyArray<string>} urls
+ * @param {Object} delivery
+ * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+ * @returns {Promise<{bytes: number[]}>}
+ */
+export async function anndataDeliverGeneColumns(urls, delivery, options = {}, candidateBinding = null) {
+  const bindings = urls.map(url => getAnnDataBinding(url, candidateBinding));
+  const { adapter } = bindings[0];
+  if (bindings.some(binding => binding.adapter !== adapter)) {
+    throw new RangeError('A gene delivery reads the genes of one dataset.');
+  }
+  return adapter.deliverGeneColumns(
+    bindings.map(binding => binding.parsed.path),
+    delivery,
+    { signal: options.signal ?? null, owner: options.owner ?? null }
+  );
+}
+
+/**
+ * Some genes in some cells of an AnnData source, each run of genes
+ * delivered to its analysis worker (`deliverGeneCellSubset`).
+ *
+ * @param {ReadonlyArray<string>} urls
+ * @param {ArrayLike<number>} cells
+ * @param {Object} delivery
+ * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+ * @returns {Promise<{bytes: number}>}
+ */
+export async function anndataDeliverGeneCellSubset(urls, cells, delivery, options = {}, candidateBinding = null) {
+  const bindings = urls.map(url => getAnnDataBinding(url, candidateBinding));
+  const { adapter } = bindings[0];
+  if (bindings.some(binding => binding.adapter !== adapter)) {
+    throw new RangeError('A cell subset reads the genes of one dataset.');
+  }
+  return adapter.deliverGeneCellSubset(
+    bindings.map(binding => binding.parsed.path),
+    cells,
+    delivery,
+    { signal: options.signal ?? null, owner: options.owner ?? null }
+  );
+}
+
+/**
+ * What getting the outlier quantiles of one categorical obs field in one
+ * latent space costs, by its URL, before anything is read.
+ * @param {string} url
+ * @param {{signal?: AbortSignal|null}} [options]
+ * @returns {Promise<Object>}
+ */
+export async function anndataDescribeOutlierQuantiles(url, options = {}, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.describeLatentOutlierQuantiles(parsed.path, { signal: options.signal ?? null });
+}
+
+/**
+ * The outlier quantiles of one categorical obs field in one latent space of
+ * an AnnData source (stored in the file, else computed), by its URL
+ * (`outliers/{obsm}/{field}`).
+ * @param {string} url - Explicit direct AnnData URL of the outlier quantiles
+ * @param {{signal?: AbortSignal|null, codes?: Uint8Array|Uint16Array|Uint32Array|null}} [options]
+ *   `signal` cancels the computation; `codes` are the field's codes when the
+ *   caller holds them
  * @returns {Promise<Float32Array>}
  */
 export async function anndataLoadOutlierQuantiles(
   url,
+  options = {},
   candidateBinding = null
 ) {
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getLatentOutlierQuantiles(parsed.path);
+  return adapter.getLatentOutlierQuantiles(parsed.path, {
+    signal: options.signal ?? null,
+    codes: options.codes ?? null,
+  });
 }
 
 function requireMappedObspKey(adapter, obspIndex) {
@@ -485,7 +630,7 @@ function requireMappedObspKey(adapter, obspIndex) {
  * Load connectivity edges from AnnData source
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal: AbortSignal}} options
- * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number}|null>}
+ * @returns {Promise<import('./connectivity-edges.js').ConnectivityEdges|null>}
  */
 export async function anndataLoadConnectivity(
   url,
@@ -511,9 +656,9 @@ export async function anndataLoadConnectivity(
       'Direct AnnData adapters are required to implement getConnectivityEdges()'
     );
   }
-  // A mapped graph's manifest names the obsp entry; the dataset's own
-  // manifest names the graph the file opens with.
-  const obspIndex = parseMappingKnnManifestPath(parsed.path);
+  // A mapped graph's route names the obsp entry; the dataset's own route
+  // (`obsp`) names the graph the file opens with.
+  const obspIndex = parseMappingGraphPath(parsed.path);
   const edgeOptions = obspIndex === null
     ? { signal }
     : { signal, key: requireMappedObspKey(adapter, obspIndex) };
@@ -530,52 +675,53 @@ export async function anndataLoadConnectivity(
 }
 
 /**
- * Get connectivity manifest from AnnData source
+ * The summary of one neighbour graph of an AnnData source: the file's own
+ * (`obsp`) or a mapped one (`obsp/{p}`).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Promise<Object|null>}
  */
-export async function anndataGetConnectivityManifest(
+export async function anndataGetConnectivitySummary(
   url,
   options = {},
   candidateBinding = null
 ) {
   const signal = getMetadataLoadSignal(
     options,
-    'Direct AnnData connectivity manifest'
+    'Direct AnnData connectivity summary'
   );
   throwIfMetadataAborted(
     signal,
-    'Direct AnnData connectivity manifest loading'
+    'Direct AnnData connectivity summary loading'
   );
   const { adapter, source, parsed } = getAnnDataBinding(url, candidateBinding);
-  const obspIndex = parseMappingKnnManifestPath(parsed.path);
+  const obspIndex = parseMappingGraphPath(parsed.path);
   if (obspIndex !== null) {
     return waitForMetadata(
-      adapter.getMappedConnectivityManifest(obspIndex, { signal }),
+      adapter.getMappedConnectivitySummary(obspIndex, { signal }),
       signal,
-      'Direct AnnData connectivity manifest loading'
+      'Direct AnnData connectivity summary loading'
     );
   }
-  if (typeof source.getConnectivityManifest !== 'function') {
+  if (typeof source.getConnectivitySummary !== 'function') {
     throw new TypeError(
-      'Direct AnnData sources are required to implement getConnectivityManifest()'
+      'Direct AnnData sources are required to implement getConnectivitySummary()'
     );
   }
-  const manifest = await waitForMetadata(
-    source.getConnectivityManifest({ signal }),
+  const summary = await waitForMetadata(
+    source.getConnectivitySummary({ signal }),
     signal,
-    'Direct AnnData connectivity manifest loading'
+    'Direct AnnData connectivity summary loading'
   );
-  if (manifest === null) {
+  if (summary === null) {
     return null;
   }
-  if (!manifest) {
+  if (!summary) {
     throw new Error(
-      'Invalid direct connectivity manifest: only exact null represents absence'
+      'Invalid direct connectivity summary: only exact null represents absence'
     );
   }
-  return manifest;
+  return summary;
 }
 
 /**
@@ -611,58 +757,30 @@ export function anndataGetDatasetIdentity(
 // =========================================================================
 
 /**
- * Check if a URL is an h5ad:// URL
- * @param {string} url
- * @returns {boolean}
- */
-function isH5adUrl(url) {
-  return url?.startsWith('h5ad://');
-}
-
-/**
- * Check if a URL is a zarr:// URL
- * @param {string} url
- * @returns {boolean}
- */
-function isZarrUrl(url) {
-  return url?.startsWith('zarr://');
-}
-
-/**
- * Check if a URL is an AnnData URL (h5ad:// or zarr://)
+ * Check if a URL is a direct AnnData URL (`anndata://`)
  * @param {string} url
  * @returns {boolean}
  */
 export function isAnnDataUrl(url) {
-  return isH5adUrl(url) || isZarrUrl(url);
+  return typeof url === 'string' && url.startsWith(SCHEME);
 }
 
 /**
- * Parse an AnnData URL (h5ad:// or zarr://)
+ * Parse a direct AnnData URL (`anndata://<dataset id>/<path>`)
  * @param {string} url
  * @returns {{protocol: string, datasetId: string, path: string}|null}
  */
 function parseAnnDataUrl(url) {
-  if (typeof url !== 'string' || url.length === 0) return null;
-
-  let protocol;
-  if (url.startsWith('h5ad://')) {
-    protocol = 'h5ad';
-  } else if (url.startsWith('zarr://')) {
-    protocol = 'zarr';
-  } else {
-    return null;
-  }
-
-  const withoutProtocol = url.substring(protocol.length + 3); // +3 for "://"
+  if (!isAnnDataUrl(url) || url.length === 0) return null;
+  const withoutProtocol = url.substring(SCHEME.length);
   const slashIdx = withoutProtocol.indexOf('/');
 
   if (slashIdx === -1) {
-    return { protocol, datasetId: withoutProtocol, path: '' };
+    return { protocol: ANNDATA_SOURCE_TYPE, datasetId: withoutProtocol, path: '' };
   }
 
   return {
-    protocol,
+    protocol: ANNDATA_SOURCE_TYPE,
     datasetId: withoutProtocol.substring(0, slashIdx),
     path: withoutProtocol.substring(slashIdx + 1)
   };

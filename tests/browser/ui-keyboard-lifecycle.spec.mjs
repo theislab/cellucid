@@ -1,5 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import {
@@ -9,7 +9,7 @@ import {
 } from '../../assets/js/app/ui/modules/community-annotation/identity-profile-modal.js';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=ui-keyboard-lifecycle-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=ui-keyboard-lifecycle-ci`;
 
 // The ORCID timeout contract swaps the product's request deadline for this one
 // and blurs the combobox this long after the debounce would fire. The lead is
@@ -65,7 +65,7 @@ test('highlight pages provide complete roving-tab keyboard workflows', async ({
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const tablist = page.getByRole('tablist', { name: 'Highlight pages' });
@@ -153,7 +153,7 @@ test('analysis modal owns focus and releases every active pointer interaction on
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const results = await page.evaluate(async () => {
@@ -172,17 +172,14 @@ test('analysis modal owns focus and releases every active pointer interaction on
     const scenarios = [
       {
         expectedCursor: 'ew-resize',
-        eventType: 'mouse',
-        selector: '.analysis-modal-edge-resize-right'
+        selector: '.analysis-modal-edge-resize-e'
       },
       {
         expectedCursor: 'col-resize',
-        eventType: 'pointer',
         selector: '.analysis-modal-resizer-vertical'
       },
       {
         expectedCursor: 'move',
-        eventType: 'mouse',
         selector: '.analysis-modal-header'
       }
     ];
@@ -218,43 +215,34 @@ test('analysis modal owns focus and releases every active pointer interaction on
       const target = modal.querySelector(scenario.selector);
       let capturedPointer = null;
       let releasedPointer = null;
-      if (scenario.eventType === 'pointer') {
-        Object.defineProperties(target, {
-          hasPointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              return capturedPointer === pointerId;
-            }
-          },
-          releasePointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              releasedPointer = pointerId;
-              capturedPointer = null;
-            }
-          },
-          setPointerCapture: {
-            configurable: true,
-            value(pointerId) {
-              capturedPointer = pointerId;
-            }
+      Object.defineProperties(target, {
+        hasPointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            return capturedPointer === pointerId;
           }
-        });
-        target.dispatchEvent(new PointerEvent('pointerdown', {
-          bubbles: true,
-          cancelable: true,
-          clientX: 400,
-          clientY: 240,
-          pointerId: 31
-        }));
-      } else {
-        target.dispatchEvent(new MouseEvent('mousedown', {
-          bubbles: true,
-          cancelable: true,
-          clientX: 400,
-          clientY: 240
-        }));
-      }
+        },
+        releasePointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            releasedPointer = pointerId;
+            capturedPointer = null;
+          }
+        },
+        setPointerCapture: {
+          configurable: true,
+          value(pointerId) {
+            capturedPointer = pointerId;
+          }
+        }
+      });
+      target.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 400,
+        clientY: 240,
+        pointerId: 31
+      }));
       const during = {
         cursor: document.body.style.cursor,
         userSelect: readEffectiveInlineUserSelect()
@@ -271,8 +259,7 @@ test('analysis modal owns focus and releases every active pointer interaction on
       await modal._closePromise;
       outcomes.push({
         captureReleased:
-          scenario.eventType !== 'pointer' ||
-          (capturedPointer === null && releasedPointer === 31),
+          capturedPointer === null && releasedPointer === 31,
         classesCleared:
           !target.classList.contains('resizing'),
         detached: !modal.isConnected,
@@ -324,7 +311,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const section = page.locator('#community-annotation-section');
@@ -596,7 +583,7 @@ test('ORCID combobox owns bounded superseded search and complete keyboard select
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const section = page.locator('#community-annotation-section');
@@ -894,7 +881,7 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const section = page.locator('#community-annotation-section');
@@ -1101,7 +1088,7 @@ test('community profile modal cannot outlive its controls owner', async ({
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const result = await page.evaluate(async () => {
@@ -1121,8 +1108,8 @@ test('community profile modal cannot outlive its controls owner', async ({
       },
       dom: { container },
       dataSourceManager: {
-        getCurrentDatasetId() {
-          return 'current-ui-prepared';
+        getCurrentIdentityId() {
+          return 'current-ui';
         },
         onDatasetChange(listener) {
           datasetListeners.add(listener);
@@ -1207,7 +1194,7 @@ test('pending community profile launch cannot cross controls teardown', async ({
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const result = await page.evaluate(async () => {
@@ -1225,8 +1212,8 @@ test('pending community profile launch cannot cross controls teardown', async ({
       },
       dom: { container },
       dataSourceManager: {
-        getCurrentDatasetId() {
-          return 'current-ui-prepared';
+        getCurrentIdentityId() {
+          return 'current-ui';
         },
         onDatasetChange(listener) {
           datasetListeners.add(listener);
@@ -1290,7 +1277,7 @@ test('community profile publication survives reentrant focus lifecycle changes',
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const result = await page.evaluate(async () => {
@@ -1309,8 +1296,8 @@ test('community profile publication survives reentrant focus lifecycle changes',
         },
         dom: { container },
         dataSourceManager: {
-          getCurrentDatasetId() {
-            return 'current-ui-prepared';
+          getCurrentIdentityId() {
+            return 'current-ui';
           },
           onDatasetChange(listener) {
             listeners.add(listener);
@@ -1420,7 +1407,7 @@ test('community profile Save surfaces teardown failure after exact cleanup', asy
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const section = page.locator('#community-annotation-section');
@@ -1495,7 +1482,7 @@ test('community voting closes and aborts its pending field load at an exact cont
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const result = await page.evaluate(async () => {
@@ -1613,7 +1600,7 @@ test('community annotation legend and settings expose complete keyboard identiti
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
@@ -1697,7 +1684,7 @@ test('community annotation legend and settings expose complete keyboard identiti
   await expect(highlightButton).toHaveAttribute('aria-pressed', 'true');
   expect(await readGlErrorAfterFrames()).toBe(0);
   await page.evaluate(() => {
-    window._cellucidState.clearAllHighlights();
+    window._cellucidState.clearActivePageHighlights();
   });
   await expect(highlightButton).toHaveAttribute('aria-pressed', 'false');
   expect(await readGlErrorAfterFrames()).toBe(0);
@@ -1852,7 +1839,7 @@ test('community annotation GitHub sync controls expose exact accessible identiti
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const section = page.locator('#community-annotation-section');
@@ -1914,7 +1901,7 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   await page.keyboard.press('Escape');
   await expect(modal).toBeHidden();
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   // Reopened from a real invoker, closing must hand focus back to it.
@@ -1965,7 +1952,7 @@ test('licence modal owns focus, contains Tab, and returns it to its link', async
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
 
   const link = page.locator('#license-link');

@@ -2,21 +2,21 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { deliverSelectionToJupyter } from '../assets/js/app/ui/modules/highlight/selection-notification.js';
+import { deliverSelectionToViewerHost } from '../assets/js/app/ui/modules/highlight/selection-notification.js';
 
 const UI_MODULE_ROOT = new URL('../assets/js/app/ui/modules/', import.meta.url);
 
-test('Jupyter highlight delivery reports asynchronous failure exactly once', async () => {
-  const failure = new Error('synthetic Jupyter delivery failure');
+test('Viewer host highlight delivery reports asynchronous failure exactly once', async () => {
+  const failure = new Error('synthetic viewer host delivery failure');
   const observed = [];
 
-  await deliverSelectionToJupyter({
-    jupyterSource: {
+  await deliverSelectionToViewerHost({
+    viewerHostSource: {
       async notifySelection() {
         throw failure;
       }
     },
-    cellIndices: [1, 4, 9],
+    cellIndices: Uint32Array.of(1, 4, 9),
     source: 'lasso',
     onFailure(error) {
       observed.push(error);
@@ -26,15 +26,15 @@ test('Jupyter highlight delivery reports asynchronous failure exactly once', asy
   assert.deepEqual(observed, [failure]);
 });
 
-test('Jupyter highlight delivery rejects a non-Promise transport contract', () => {
+test('Viewer host highlight delivery rejects a non-Promise transport contract', () => {
   assert.throws(
-    () => deliverSelectionToJupyter({
-      jupyterSource: {
+    () => deliverSelectionToViewerHost({
+      viewerHostSource: {
         notifySelection() {
           return undefined;
         }
       },
-      cellIndices: [2],
+      cellIndices: Uint32Array.of(2),
       source: 'knn',
       onFailure() {}
     }),

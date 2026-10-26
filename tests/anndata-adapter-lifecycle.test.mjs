@@ -10,10 +10,10 @@ import {
   resolveVectorBinding,
 } from '../assets/js/data/data-mapping-candidates.js';
 import { canonicalEmbeddingId } from '../assets/js/data/data-mapping.js';
-import { mappingProbes, selectColumns } from './helpers/anndata-mapping-mocks.mjs';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
-import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
+import { mappingProbes, selectColumns, withObsmPayloads } from './helpers/anndata-mapping-mocks.mjs';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
+import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
+import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
 const INVALIDATED_REQUEST =
   /(dataset|adapter|cache|request).*(changed|cleared|closed|invalidated|superseded)|superseded|no longer active/i;
@@ -147,11 +147,12 @@ function vectorRoute(adapter, key, embedding = UMAP_REF) {
 
 /** Read `obsm[key]` as the vectors of `embedding`, through its mapping route. */
 function readVector(adapter, key, embedding = UMAP_REF) {
-  return adapter.getVectorPayload(vectorRoute(adapter, key, embedding), embedding.columns.length);
+  return adapter.getVectorPayload(vectorRoute(adapter, key, embedding), embedding.columns.length)
+    .then(payload => payload.vectors);
 }
 
 /** `velocity_umap_2d` (obsm 1) over `X_umap_2d` (obsm 0) columns [0, 1]. */
-const VELOCITY_ROUTE = '_cellucid/mapping/vectors/1/0-1/0/0-1.bin';
+const VELOCITY_ROUTE = 'vectors/1/0-1/0/0-1';
 
 /** A `{data, nDims}` loader result read at `columns`, as `readObsmColumns` returns it. */
 function columnsOf(result, columns) {
@@ -249,25 +250,17 @@ function createColdCoalescingScenario(kind) {
     },
   };
 
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, { ...UMAP_WITH_VELOCITY, nVars: 1 });
   adapter._obsFieldsMetadata = [{
     key: 'score',
     kind: 'continuous',
   }];
-  if (kind === 'vector') {
-    adapter._normInfo.set('X_umap_2d', {
-      centers: [0, 0],
-      maxRange: 4,
-      scale: 0.5,
-    });
-  }
-
-  const normalizeEmbedding =
-    adapter._normalizeEmbedding.bind(adapter);
-  adapter._normalizeEmbedding = (...args) => {
+  // Every embedding payload is made by the loader (the reader worker).
+  const readEmbedding = loader.readEmbedding;
+  loader.readEmbedding = (...args) => {
     normalizationCalls++;
-    return normalizeEmbedding(...args);
+    return readEmbedding(...args);
   };
 
   const invoke = () => {
@@ -281,7 +274,7 @@ function createColdCoalescingScenario(kind) {
       case 'connectivity':
         return adapter.getConnectivityEdges();
       case 'gene':
-        return adapter.getGeneValues('var/0.values.f32');
+        return adapter.getGeneValues('var/0');
       default:
         throw new Error(`Unknown coalesced path '${kind}'`);
     }
@@ -312,7 +305,7 @@ function createColdCoalescingScenario(kind) {
   };
 }
 
-function createScenario(kind, SourceClass = ZarrDataSource) {
+function createScenario(kind, SourceClass = AnnDataFileSource) {
   const pending = deferred();
   let targetedCalls = 0;
 
@@ -354,7 +347,7 @@ function createScenario(kind, SourceClass = ZarrDataSource) {
     },
   };
 
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
   adapter._obsFieldsMetadata = [{
     key: 'score',
@@ -368,7 +361,7 @@ function createScenario(kind, SourceClass = ZarrDataSource) {
   const invoke = () => {
     switch (kind) {
       case 'embedding':
-        return source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2);
+        return source.getAdapter().getEmbeddingPayload('obsm/0/0-1', 2).then(payload => payload.positions);
       case 'vector':
         return readVector(source.getAdapter(), 'velocity_umap_2d');
       case 'obs':
@@ -415,7 +408,7 @@ async function createWarmCacheScenario(kind) {
       return denseConnectivity(0, 2);
     },
   };
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
 
   const invoke = () => {
@@ -442,13 +435,13 @@ async function createWarmCacheScenario(kind) {
   };
 }
 
-test('H5adDataSource.clearCaches evicts the adapter vector-field cache', () => {
-  const source = new H5adDataSource();
+test('AnnDataFileSource.clearCaches evicts the adapter vector-field cache', () => {
+  const source = new AnnDataFileSource();
   const loader = {
     clearCache() {},
     close() {}
   };
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   adapter._vectorFieldCache.set(
     VELOCITY_ROUTE,
     Float32Array.from([1, 2])
@@ -460,8 +453,8 @@ test('H5adDataSource.clearCaches evicts the adapter vector-field cache', () => {
   assert.equal(adapter._vectorFieldCache.size, 0);
 });
 
-test('H5adDataSource.clearCaches invalidates delayed adapter reads', async () => {
-  const scenario = createScenario('embedding', H5adDataSource);
+test('AnnDataFileSource.clearCaches invalidates delayed adapter reads', async () => {
+  const scenario = createScenario('embedding', AnnDataFileSource);
   const staleRequest = scenario.invoke();
   const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);
   await scenario.pending.started;
@@ -479,7 +472,7 @@ function cacheIsEmpty(adapter, kind) {
   switch (kind) {
     case 'embedding':
       return adapter._embeddingCache.size === 0 &&
-        adapter._normInfo.size === 0;
+        adapter._embeddingInfo.size === 0;
     case 'vector':
       return adapter._vectorFieldCache.size === 0;
     case 'obs':
@@ -514,15 +507,15 @@ async function assertFreshResult(kind, result) {
       break;
     case 'connectivity': {
       const edges = await result;
-      assert.deepEqual(Array.from(edges.sources), [1]);
-      assert.deepEqual(Array.from(edges.destinations), [2]);
+      assert.deepEqual(Array.from(edgeListOf(edges).sources), [1]);
+      assert.deepEqual(Array.from(edgeListOf(edges).destinations), [2]);
       assert.equal(edges.nEdges, 1);
       break;
     }
   }
 }
 
-test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache', async () => {
+test('AnnDataFileSource.clearCaches evicts a populated adapter vector-field cache', async () => {
   let vectorVersion = 1;
   let vectorReads = 0;
   const loader = {
@@ -540,9 +533,9 @@ test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache',
       }, columns);
     },
   };
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   source._loader = loader;
   source._adapter = adapter;
 
@@ -568,7 +561,7 @@ test('ZarrDataSource.clearCaches evicts a populated adapter vector-field cache',
 });
 
 for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
-  test(`ZarrDataSource.clearCaches invalidates a delayed adapter ${kind} read`, async () => {
+  test(`AnnDataFileSource.clearCaches invalidates a delayed adapter ${kind} read`, async () => {
     const scenario = createScenario(kind);
     const staleRequest = scenario.invoke();
     const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);
@@ -595,7 +588,7 @@ for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
 }
 
 for (const kind of ['embedding', 'vector', 'obs', 'connectivity']) {
-  test(`ZarrDataSource.clear invalidates a delayed adapter ${kind} read`, async () => {
+  test(`AnnDataFileSource.clear invalidates a delayed adapter ${kind} read`, async () => {
     const scenario = createScenario(kind);
     const staleRequest = scenario.invoke();
     const staleAssertion = assert.rejects(staleRequest, INVALIDATED_REQUEST);
@@ -811,7 +804,7 @@ function createCoordinateCacheBudgetScenario(cacheBudgetBytes) {
       return selectColumns(payloads[key], 2, columns);
     },
   };
-  const adapter = new BaseAnnDataAdapter(loader, {
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader), {
     cacheBudgetBytes,
   });
   installPrivateCoordinateResolution(adapter, {
@@ -826,7 +819,8 @@ function hasVectorCache(adapter, key, embedding = UMAP_REF) {
 }
 
 test('embedding and vector caches share one cumulative retained-byte owner', async () => {
-  const { adapter } = createCoordinateCacheBudgetScenario(120);
+  // Room for one 40-byte result, not two.
+  const { adapter } = createCoordinateCacheBudgetScenario(79);
 
   await adapter.getEmbeddingForRef(UMAP_REF);
   assert.equal(adapter._coordinateCacheBytes, 40n);
@@ -852,7 +846,8 @@ test('embedding and vector caches share one cumulative retained-byte owner', asy
 });
 
 test('coordinate cache hits refresh one cross-kind LRU order', async () => {
-  const { adapter } = createCoordinateCacheBudgetScenario(160);
+  // Room for two 40-byte results, not three.
+  const { adapter } = createCoordinateCacheBudgetScenario(119);
 
   await adapter.getEmbeddingForRef(UMAP_REF);
   await readVector(adapter, 'velocity_a_2d');
@@ -901,20 +896,18 @@ test('a coordinate result larger than the cache budget is read and returned, nev
   assert.equal(vector.length, 10);
 });
 
-test('a raw plus normalized coordinate peak above the cache budget still loads, and only the result is retained', async () => {
-  // 80 transient read bytes plus 40 normalized bytes exceed 64: no refusal.
+test('a coordinate result is the only thing the page retains of a read', async () => {
+  // The loader reads and normalizes (the reader worker): the page holds the
+  // 40-byte result alone.
   const scenario = createCoordinateCacheBudgetScenario(64);
   const result = await scenario.adapter.getEmbeddingForRef(UMAP_REF);
   assert.equal(result.length, 10);
   assert.equal(scenario.reads.get('X_umap_2d'), 1);
-  // Only the normalized result is retained; the transient read is released.
   assert.equal(scenario.adapter._coordinateCacheBytes, 40n);
-  assert.equal(scenario.adapter._coordinateReservedOutputBytes, 0n);
   assert.equal(scenario.adapter._embeddingInFlight.size, 0);
 });
 
-test('initialize rejects non-finite embedding components before normalization', async () => {
-  let normalizationCalls = 0;
+test('initialize rejects non-finite embedding components before anything is cached', async () => {
   let reads = 0;
   const loader = {
     nObs: 2,
@@ -939,11 +932,7 @@ test('initialize rejects non-finite embedding components before normalization', 
     },
     close() {}
   };
-  const adapter = new BaseAnnDataAdapter(loader);
-  adapter._normalizeEmbedding = () => {
-    normalizationCalls++;
-    throw new Error('normalization must not see non-finite coordinates');
-  };
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
 
   // The default rule's X_umap_2d is reported, never replaced by a guess.
   await assert.rejects(
@@ -951,7 +940,6 @@ test('initialize rejects non-finite embedding components before normalization', 
     error => error.name === 'EmbeddingLoadError' &&
       /Embedding 'X_umap_2d' cannot be plotted: NaN at cell 0\./.test(error.message)
   );
-  assert.equal(normalizationCalls, 0);
   assert.equal(reads, 1);
   assert.equal(adapter._embeddingCache.size, 0);
   assert.equal(adapter._coordinateCacheBytes, 0n);
@@ -988,7 +976,7 @@ test('public coordinate reads reject every non-finite component before copy or c
         },
         close() {}
       };
-      const adapter = new BaseAnnDataAdapter(loader);
+      const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
       installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
 
       await assert.rejects(
@@ -996,7 +984,7 @@ test('public coordinate reads reject every non-finite component before copy or c
         new RegExp(`Embedding 'X_umap_2d' cannot be plotted: ${defect} at cell 0`)
       );
       assert.equal(adapter._embeddingCache.size, 0);
-      assert.equal(adapter._normInfo.size, 0);
+      assert.equal(adapter._embeddingInfo.size, 0);
       assert.equal(adapter._coordinateCacheBytes, 0n);
 
       const embedding = await adapter.getEmbeddingForRef(UMAP_REF);
@@ -1037,7 +1025,7 @@ test('adapter retains normalized results until a payload caller takes them', asy
     },
     close() {}
   };
-  const adapter = new BaseAnnDataAdapter(loader);
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
 
   const embedding = await adapter.getEmbeddingForRef(UMAP_REF);
@@ -1057,14 +1045,14 @@ test('adapter retains normalized results until a payload caller takes them', asy
 
   // The payload route hands the cached embedding to its caller, who
   // normalizes it in place for display, and the adapter forgets it.
-  const payload = await adapter.getEmbeddingPayload('embeddings/0_2d.bin', 2);
+  const { positions: payload } = await adapter.getEmbeddingPayload('obsm/0/0-1', 2);
   assert.strictEqual(payload, embedding, 'the identity path names the cached embedding');
   assert.equal(adapter._embeddingCache.has('X_umap_2d'), false);
   assert.equal(adapter._coordinateCacheBytes, 16n);
   payload.fill(7);
 
   // A caller's writes never reach a later request: it reads the array again.
-  const again = await adapter.getEmbeddingPayload('embeddings/0_2d.bin', 2);
+  const { positions: again } = await adapter.getEmbeddingPayload('obsm/0/0-1', 2);
   assert.notStrictEqual(again, payload);
   assert.deepEqual(Array.from(again), [-1, -1, 1, 1]);
   assert.deepEqual(reads, ['X_umap_2d', 'velocity_umap_2d', 'X_umap_2d']);
@@ -1099,61 +1087,31 @@ const ONE_AND_TWO = Object.freeze({
 });
 
 test('coordinate cache accounting counts aliased backing buffers once', async () => {
-  const sharedBuffer = new ArrayBuffer(40);
+  // Two payloads that are views of one buffer are charged once, by the
+  // buffer's size.
+  const sharedBuffer = new ArrayBuffer(80);
   const loader = {
     nObs: 10,
     close() {},
-    async readObsmColumns(key, columns) {
-      return Float64Array.from({ length: 10 * columns.length }, (_, index) => index);
+    async readObsmColumns() {
+      throw new Error('the payloads below are the loader\'s own');
+    },
+    async readEmbedding(key) {
+      return {
+        positions: key === 'X_one' ? new Float32Array(sharedBuffer, 0, 10) : new Float32Array(sharedBuffer),
+        transform: { center: [0, 0, 0], scale: 1 },
+        bounds: null,
+      };
     },
   };
-  // The 2D read peaks at 40 retained + 160 read + 80 normalized bytes.
-  const adapter = new BaseAnnDataAdapter(loader, {
-    cacheBudgetBytes: 280,
-  });
+  const adapter = new BaseAnnDataAdapter(loader, { cacheBudgetBytes: 80 });
   installPrivateCoordinateResolution(adapter, ONE_AND_TWO);
-  adapter._normalizeEmbedding = () => new Float32Array(sharedBuffer);
 
   await adapter.getEmbeddingForRef({ key: 'X_one', columns: [0] });
   await adapter.getEmbeddingForRef({ key: 'X_two', columns: [0, 1] });
   assert.equal(adapter._embeddingCache.size, 2);
-  assert.equal(adapter._coordinateCacheBytes, 40n);
+  assert.equal(adapter._coordinateCacheBytes, 80n);
   assert.equal(adapter._coordinateBufferRefs.size, 1);
-});
-
-test('raw coordinate reservations count a retained backing-buffer alias once', async () => {
-  // The 1D result is retained as a 160-byte buffer, and the 2D read (20
-  // Float64 values) is a view of that same buffer, so the 2D peak is
-  // 160 retained + 0 read + 80 normalized = 240 bytes; counting the alias
-  // twice would need 400.
-  const sharedBuffer = new ArrayBuffer(160);
-  new Float64Array(sharedBuffer).set(
-    Float64Array.from({ length: 20 }, (_, index) => index)
-  );
-  const loader = {
-    nObs: 10,
-    close() {},
-    async readObsmColumns(key) {
-      return key === 'X_one'
-        ? Float64Array.from({ length: 10 }, (_, index) => index)
-        : new Float64Array(sharedBuffer);
-    }
-  };
-  const adapter = new BaseAnnDataAdapter(loader, {
-    cacheBudgetBytes: 240
-  });
-  installPrivateCoordinateResolution(adapter, ONE_AND_TWO);
-  adapter._normalizeEmbedding = (_data, dimension) =>
-    dimension === 1
-      ? new Float32Array(sharedBuffer, 0, 10)
-      : new Float32Array(20);
-
-  await adapter.getEmbeddingForRef({ key: 'X_one', columns: [0] });
-  await adapter.getEmbeddingForRef({ key: 'X_two', columns: [0, 1] });
-
-  assert.equal(adapter._embeddingCache.size, 2);
-  assert.equal(adapter._coordinateCacheBytes, 240n);
-  assert.equal(adapter._coordinateBufferRefs.size, 2);
 });
 
 test('clear and close reset coordinate cache ownership for later callers', async () => {
@@ -1192,7 +1150,7 @@ test('coordinate requests name exactly what the file and its identity hold', asy
         return selectColumns([0, 0, 1, 1], 2, columns);
       },
     };
-    const adapter = new BaseAnnDataAdapter(loader);
+    const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
     installPrivateCoordinateResolution(adapter, {
       obsm: { X_umap_2d: 2, velocity_umap_2d: 2, X_pca: 4 },
       embeddings: [UMAP_REF],
@@ -1213,28 +1171,24 @@ test('coordinate requests name exactly what the file and its identity hold', asy
     assert.equal(loader.payloadReads, 0);
   });
 
-  await t.test('payload paths route to identity items or catalog entries', async () => {
+  await t.test('embedding routes name catalog entries', async () => {
     const { adapter, loader } = adapterWithReads();
     await assert.rejects(
-      adapter.getEmbeddingPayload('embeddings/1_2d.bin', 2),
-      /no embedding payload 'embeddings\/1_2d\.bin'/
-    );
-    await assert.rejects(
-      adapter.getEmbeddingPayload('embeddings/0_3d.bin', 3),
-      /no embedding payload/
+      adapter.getEmbeddingPayload('obsm/1', 2),
+      /no embedding 'obsm\/1'/
     );
     // The caller's layout dimension is checked against the payload, never clamped.
     await assert.rejects(
-      adapter.getEmbeddingPayload('_cellucid/mapping/embeddings/2/0-1.bin', 3),
+      adapter.getEmbeddingPayload('obsm/2/0-1', 3),
       /holds 2D coordinates, not 3D/
     );
     await assert.rejects(
-      adapter.getEmbeddingPayload('_cellucid/mapping/embeddings/9/0-1.bin', 2),
-      /no embedding payload/
+      adapter.getEmbeddingPayload('obsm/9/0-1', 2),
+      /no embedding 'obsm\/9\/0-1'/
     );
     await assert.rejects(
-      adapter.getEmbeddingPayload('obs/0.values.f32', 2),
-      /no embedding payload/
+      adapter.getEmbeddingPayload('obs', 2),
+      /no embedding 'obs'/
     );
     assert.equal(loader.payloadReads, 0);
 
@@ -1245,33 +1199,32 @@ test('coordinate requests name exactly what the file and its identity hold', asy
       return selectColumns([0, 1, 2, 3, 4, 5, 6, 7], 4, columns);
     };
     const mapped = await adapter.getEmbeddingPayload(
-      '_cellucid/mapping/embeddings/2/3-1.bin',
+      'obsm/2/3-1',
       2
     );
     assert.deepEqual(reads, [['X_pca', [3, 1]]]);
-    assert.equal(mapped.length, 4);
-    // Handed to the caller, so not retained; its scale stays for its vectors.
+    assert.equal(mapped.positions.length, 4);
+    // Handed to the caller, so not retained; its transform stays.
     assert.equal(adapter._embeddingCache.has('X_pca[3,1]'), false);
-    assert.equal(adapter._normInfo.has('X_pca[3,1]'), true);
+    assert.equal(adapter._embeddingInfo.has('X_pca[3,1]'), true);
   });
 
   await t.test('a vector route is read only as the binding resolveVectorBinding names', async () => {
     const { adapter, loader } = adapterWithReads();
-    adapter._normInfo.set('X_umap_2d', { scale: 1 });
     // obsm 0 is X_umap_2d, 1 velocity_umap_2d, 2 X_pca (4 columns).
     assert.equal(vectorRoute(adapter, 'velocity_umap_2d'), VELOCITY_ROUTE);
     for (const [route, dimension, pattern] of [
       // Not a vector route, or an obsm entry the catalog does not list.
-      ['vectors/0_0.bin', 2, /no vector payload 'vectors\/0_0\.bin'/],
-      ['_cellucid/mapping/vectors/9/0-1/0/0-1.bin', 2, /no vector payload/],
-      ['_cellucid/mapping/vectors/1/0-1/9/0-1.bin', 2, /no vector payload/],
+      ['vectors/0/0-1', 2, /no vector route 'vectors\/0\/0-1'/],
+      ['vectors/9/0-1/0/0-1', 2, /no vector route/],
+      ['vectors/1/0-1/9/0-1', 2, /no vector route/],
       // A vector array is never its own embedding.
-      ['_cellucid/mapping/vectors/0/0-1/0/0-1.bin', 2, /Cannot draw this vector field: obsm\['X_umap_2d'\] is the embedding itself/],
+      ['vectors/0/0-1/0/0-1', 2, /Cannot draw this vector field: obsm\['X_umap_2d'\] is the embedding itself/],
       // A 4-column array is neither 2 wide nor as wide as X_umap_2d.
-      ['_cellucid/mapping/vectors/2/0-1/0/0-1.bin', 2, /obsm\['X_pca'\] has 4 columns; it needs 2, or 2 like obsm\['X_umap_2d'\]/],
+      ['vectors/2/0-1/0/0-1', 2, /obsm\['X_pca'\] has 4 columns; it needs 2, or 2 like obsm\['X_umap_2d'\]/],
       // The vector columns are the ones the binding rule picks, nothing else.
-      ['_cellucid/mapping/vectors/1/1-0/0/0-1.bin', 2, /obsm\['velocity_umap_2d'\] cannot be bound to obsm\['X_umap_2d'\] at these columns/],
-      ['_cellucid/mapping/vectors/2/2-3/2/2-3.bin', 2, /obsm\['X_pca'\] is the embedding itself/],
+      ['vectors/1/1-0/0/0-1', 2, /obsm\['velocity_umap_2d'\] cannot be bound to obsm\['X_umap_2d'\] at these columns/],
+      ['vectors/2/2-3/2/2-3', 2, /obsm\['X_pca'\] is the embedding itself/],
       // The caller's layout dimension is checked against the payload.
       [VELOCITY_ROUTE, 3, /holds 2D vectors, not 3D/],
     ]) {
@@ -1289,10 +1242,14 @@ test('coordinate requests name exactly what the file and its identity hold', asy
     };
     const pcaRef = { key: 'X_pca', columns: [3, 1] };
     const pcaRoute = vectorRoute(adapter, 'velocity_umap_2d', pcaRef);
-    assert.equal(pcaRoute, '_cellucid/mapping/vectors/1/0-1/2/3-1.bin');
-    const vectors = await adapter.getVectorPayload(pcaRoute, 2);
-    assert.deepEqual(reads, [['X_pca', [3, 1]], ['velocity_umap_2d', [0, 1]]]);
-    assert.equal(adapter._normInfo.get('X_pca[3,1]').scale, 0.5);
+    assert.equal(pcaRoute, 'vectors/1/0-1/2/3-1');
+    const { vectors } = await adapter.getVectorPayload(pcaRoute, 2);
+    // The embedding is not read yet: both arrays are read at once, and the
+    // vectors take X_pca's scale (0.5).
+    assert.deepEqual(
+      [...reads].sort(([a], [b]) => a.localeCompare(b)),
+      [['velocity_umap_2d', [0, 1]], ['X_pca', [3, 1]]]
+    );
     assert.deepEqual(Array.from(vectors), [0.5, 0.5, 0.5, 0.5]);
     assert.strictEqual(adapter._vectorFieldCache.get(pcaRoute), vectors);
   });
@@ -1310,16 +1267,70 @@ test('coordinate requests name exactly what the file and its identity hold', asy
         return selectColumns(values, 2, columns);
       },
     };
-    const adapter = new BaseAnnDataAdapter(loader);
+    const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
     installPrivateCoordinateResolution(adapter, {
       obsm: { X_umap_2d: 2, X_tsne: 2, velocity_umap_2d: 2 },
       embeddings: [UMAP_REF],
     });
     // Another 2D embedding with a different range loads first.
+    // (X_tsne's scale is 2, X_umap_2d's 0.5.)
     await adapter.getEmbeddingForRef({ key: 'X_tsne', columns: [0, 1] });
-    assert.equal(adapter._normInfo.get('X_tsne').scale, 2);
     const vector = await readVector(adapter, 'velocity_umap_2d');
-    assert.equal(adapter._normInfo.get('X_umap_2d').scale, 0.5);
     assert.deepEqual(Array.from(vector), [0.5, 0.5, 0.5, 0.5]);
   });
+});
+
+test('a read nobody waits for any more is cancelled in the loader; one still wanted is not', async () => {
+  // Every loader read waits until its signal aborts, recording the signal.
+  const signals = new Map();
+  const hold = (kind, signal) => {
+    signals.set(kind, signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+  };
+  const loader = {
+    nObs: 3,
+    close() {},
+    readObsmColumns: (key, columns, { signal }) => hold(`obsm:${key}`, signal),
+    getObsField: (key, { signal }) => hold('obs', signal),
+    getConnectivityEdges: (key, { signal }) => hold('graph', signal),
+    getMatrixColumn: (element, index, { signal }) => hold('gene', signal),
+    async readVarNames() {
+      return { index: ['GeneA'], values: ['GeneA'] };
+    },
+  };
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  installPrivateCoordinateResolution(adapter, { ...UMAP_WITH_VELOCITY, nVars: 1 });
+  adapter._obsFieldsMetadata = [{ key: 'score', kind: 'continuous' }];
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+
+  for (const [kind, request] of [
+    ['gene', signal => adapter.getGeneValues('var/0', { signal })],
+    ['obs', signal => adapter.getObsFieldData('score', { signal })],
+    ['obsm:X_umap_2d', signal => adapter.getEmbeddingForRef(UMAP_REF, { signal })],
+    ['graph', signal => adapter.getConnectivityEdges({ signal })],
+  ]) {
+    const first = new AbortController();
+    const second = new AbortController();
+    const reads = [request(first.signal), request(second.signal)];
+    await settle();
+    assert.equal(signals.get(kind)?.aborted, false, `${kind}: the shared read started once`);
+    first.abort();
+    await assert.rejects(reads[0], { name: 'AbortError' });
+    await settle();
+    assert.equal(signals.get(kind).aborted, false, `${kind}: another caller still waits`);
+    second.abort();
+    await assert.rejects(reads[1], { name: 'AbortError' });
+    assert.equal(signals.get(kind).aborted, true, `${kind}: nobody waits, the read is cancelled`);
+  }
+
+  // A vector field whose embedding is not read yet reads both at once.
+  signals.clear();
+  const controller = new AbortController();
+  const vectors = adapter.getVectorPayload(VELOCITY_ROUTE, 2, { signal: controller.signal });
+  await settle();
+  assert.deepEqual([...signals.keys()].sort(), ['obsm:X_umap_2d', 'obsm:velocity_umap_2d']);
+  controller.abort();
+  await assert.rejects(vectors, { name: 'AbortError' });
+  assert.equal(signals.get('obsm:velocity_umap_2d').aborted, true);
+  assert.equal(signals.get('obsm:X_umap_2d').aborted, true);
 });

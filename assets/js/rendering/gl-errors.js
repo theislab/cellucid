@@ -1,3 +1,4 @@
+import { countNoun } from '../utils/format-units.js';
 /**
  * The one WebGL error boundary every renderer uses.
  *
@@ -101,7 +102,7 @@ export function requireCleanWebGLState(gl, owner) {
     : CONTEXT_LOST_WEBGL;
   if (codes.includes(contextLostCode)) throw contextLostError(owner);
   throw new Error(
-    `${owner} encountered WebGL error${codes.length === 1 ? '' : 's'} `
+    `${owner} encountered WebGL ${countNoun(codes.length, 'error')} `
       + codes.map(code => `0x${code.toString(16)}`).join(', ')
       + '.'
   );

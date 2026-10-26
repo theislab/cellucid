@@ -15,13 +15,13 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { expectFloatingSettled, openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=panel-header-controls-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=panel-header-controls-ci';
 
 const DOCKABLE_REGISTRY_URL = '/assets/js/app/dockable-accordions-registry.js';
 const DOCKABLE_CONTRIBUTOR_URL =
@@ -46,7 +46,7 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 }
 
@@ -159,8 +159,9 @@ test('no summary in the app contains an interactive element, in any panel state'
     '#floating-panels-root > .accordion-panel.analysis-window-frame',
   );
   await expect(analysisWindow).toHaveCount(1);
+  // Copy, maximize and close.
   await expect(analysisWindow.locator('> .accordion-panel-actions > button'))
-    .toHaveCount(2);
+    .toHaveCount(3);
 
   // A sidebar panel floating, then collapsed while floating.
   await control(page, PANEL, 'accordion-undock-btn').click();

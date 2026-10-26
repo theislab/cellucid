@@ -12,10 +12,14 @@
  */
 
 import { cloneCameraState } from '../camera-state-contract.js';
+import { requireExactKeys } from '../../utils/exact-record.js';
+import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../position-layout.js';
+import { firstNonBinaryByte } from '../alpha-visibility.js';
 import {
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   isViewerBackground
 } from '../viewer-backgrounds.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
 
@@ -90,57 +94,35 @@ function assertNonEmptyTrimmedString(value, label) {
   return value;
 }
 
-function assertExactPlainRecord(value, expectedKeys, label) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be one exact plain object.`);
-  }
-  const actualKeys = Object.keys(value).sort();
-  const exactKeys = expectedKeys.slice().sort();
-  if (
-    actualKeys.length !== exactKeys.length ||
-    actualKeys.some((key, index) => key !== exactKeys[index])
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly: ${exactKeys.join(', ')}.`
-    );
-  }
-  return value;
-}
-
 function assertExactFloat32Array(value, expectedLength, label) {
   if (!(value instanceof Float32Array)) {
     throw new TypeError(`${label} must be a Float32Array.`);
   }
   if (value.length !== expectedLength) {
     throw new RangeError(
-      `${label} must contain exactly ${expectedLength} values; received ${value.length}.`
+      `${label} must contain exactly ${formatCountOf(expectedLength, 'value')}; received ${value.length}.`
     );
   }
   return value;
 }
 
 /**
- * Float32 arrays already proven finite. A published positions or centroid
- * array is never written after publication, so it is scanned once, the
- * first time it is published: a representation switch back to a layout the
- * viewer has shown costs no O(N) pass (a full scan is 30-60 ms at 10M 3D).
+ * A published positions or centroid array is never written after
+ * publication, so it is proven finite once: scanned the first time it is
+ * published, or already proven where it was made (an embedding the reader
+ * worker checked, `publishPositionBounds`). A representation switch back to
+ * a layout the viewer has shown costs no O(N) pass (a full scan is 30-60 ms
+ * at 10M 3D).
  */
-const PROVEN_FINITE_FLOAT32_ARRAYS = new WeakSet();
-
 function assertFiniteFloat32Array(value, expectedLength, label) {
   const exact = assertExactFloat32Array(value, expectedLength, label);
-  if (PROVEN_FINITE_FLOAT32_ARRAYS.has(exact)) return exact;
+  if (isProvenFiniteFloat32Array(exact)) return exact;
   for (let index = 0; index < exact.length; index += 1) {
     if (!Number.isFinite(exact[index])) {
       throw new RangeError(`${label} value ${index} must be finite.`);
     }
   }
-  PROVEN_FINITE_FLOAT32_ARRAYS.add(exact);
+  markProvenFiniteFloat32Array(exact);
   return exact;
 }
 
@@ -150,7 +132,7 @@ function assertExactUint8Array(value, expectedLength, label) {
   }
   if (value.length !== expectedLength) {
     throw new RangeError(
-      `${label} must contain exactly ${expectedLength} bytes; received ${value.length}.`
+      `${label} must contain exactly ${formatCountOf(expectedLength, 'byte')}; received ${value.length}.`
     );
   }
   return value;
@@ -162,12 +144,11 @@ function assertExactUint8Array(value, expectedLength, label) {
  */
 function assertTransparencyArray(value, expectedLength, label) {
   const exact = assertExactUint8Array(value, expectedLength, label);
-  for (let index = 0; index < exact.length; index += 1) {
-    if (exact[index] > 1) {
-      throw new RangeError(
-        `${label} value ${index} must be exactly 0 or 1.`
-      );
-    }
+  const index = firstNonBinaryByte(exact);
+  if (index >= 0) {
+    throw new RangeError(
+      `${label} value ${index} must be exactly 0 or 1.`
+    );
   }
   return exact;
 }
@@ -193,7 +174,7 @@ function assertViewLayoutKey(layoutKey, label) {
 }
 
 function assertViewerDataPayload(payload) {
-  const exact = assertExactPlainRecord(
+  const exact = requireExactKeys(
     payload,
     [
       'positions',
@@ -245,7 +226,7 @@ function assertViewerDataPayload(payload) {
 }
 
 function assertCentroidPayload(payload) {
-  const exact = assertExactPlainRecord(
+  const exact = requireExactKeys(
     payload,
     ['positions', 'colors'],
     'Centroid data'
@@ -273,7 +254,7 @@ function assertCentroidPayload(payload) {
 }
 
 function cloneSnapshotMeta(value, label = 'Snapshot metadata') {
-  const exact = assertExactPlainRecord(
+  const exact = requireExactKeys(
     value,
     ['filtersText'],
     label
@@ -312,7 +293,7 @@ function assertSnapshotFieldDescriptor(fieldKey, fieldKind) {
 }
 
 function assertSnapshotConfig(config, sourcePointCount) {
-  const exact = assertExactPlainRecord(
+  const exact = requireExactKeys(
     config,
     [
       'cameraState',

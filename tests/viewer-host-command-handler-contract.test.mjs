@@ -1,0 +1,319 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  createViewerHostCommandHandlers,
+} from '../assets/js/app/viewer-host-command-handler.js';
+import {
+  DataStateFilterMethods,
+} from '../assets/js/app/state/managers/filter-manager.js';
+import {
+  DataState,
+} from '../assets/js/app/state/core/data-state.js';
+
+test('Viewer host commands mutate the exact current viewer state', async () => {
+  const calls = [];
+  const fields = [
+    { key: 'cell_type', loaded: false },
+    { key: 'score', loaded: true },
+  ];
+  const state = {
+    pointCount: 5,
+    ensureHighlightPage() {
+      calls.push('ensure-page');
+    },
+    getActivePage() {
+      return { id: 'page-1' };
+    },
+    setHighlightPageColor(pageId, color) {
+      calls.push(['page-color', pageId, color]);
+      return true;
+    },
+    addHighlightDirect(group) {
+      calls.push(['add-highlight', group]);
+      return { id: 'highlight-1' };
+    },
+    clearHighlightsOnAllPages() {
+      calls.push('clear-highlights');
+    },
+    getFields() {
+      return fields;
+    },
+    async ensureFieldLoaded(index) {
+      calls.push(['load-field', index]);
+      fields[index].loaded = true;
+    },
+    setActiveField(index) {
+      calls.push(['active-field', index]);
+      return { field: fields[index] };
+    },
+    setCellVisibility(cells, visible) {
+      calls.push(['visibility', cells, visible]);
+    },
+  };
+  const viewer = {
+    resetCamera() {
+      calls.push('reset-camera');
+    },
+  };
+  const refreshUi = () => {
+    calls.push('refresh-ui');
+  };
+  const handlers = createViewerHostCommandHandlers({
+    state,
+    viewer,
+    refreshUi,
+    reportDataMapping: async () => false,
+  });
+
+  handlers.handleHighlight(Uint32Array.of(1, 2), '#00ff00');
+  await handlers.handleMessage({
+    type: 'setColorBy',
+    field: 'cell_type',
+    viewerId: 'viewer-1',
+    viewerToken: 'secret-1',
+  });
+  await handlers.handleMessage({
+    type: 'setVisibility',
+    cells: Uint32Array.of(2),
+    visible: false,
+    viewerId: 'viewer-1',
+    viewerToken: 'secret-1',
+  });
+  await handlers.handleMessage({
+    type: 'resetCamera',
+    viewerId: 'viewer-1',
+    viewerToken: 'secret-1',
+  });
+  handlers.handleHighlight(null, null);
+
+  assert.deepEqual(calls, [
+    'ensure-page',
+    ['page-color', 'page-1', '#00ff00'],
+    ['add-highlight', {
+      type: 'annotation',
+      label: 'Python selection (2 cells)',
+      cellIndices: Uint32Array.of(1, 2),
+    }],
+    ['load-field', 0],
+    ['active-field', 0],
+    'refresh-ui',
+    ['visibility', Uint32Array.of(2), false],
+    'reset-camera',
+    'clear-highlights',
+  ]);
+});
+
+test('Viewer host highlight uses the current DataState highlight contract', () => {
+  const state = new DataState({}, null);
+  state.pointCount = 5;
+  state.highlightArray = new Uint8Array(5);
+  const handlers = createViewerHostCommandHandlers({
+    state,
+    viewer: {},
+    refreshUi() {},
+    reportDataMapping: async () => false,
+  });
+
+  const cells = Uint32Array.of(1, 3);
+  handlers.handleHighlight(cells, '#123abc');
+
+  const page = state.getActivePage();
+  assert.equal(page.color, '#123abc');
+  assert.equal(page.highlightedGroups.length, 1);
+  const [group] = page.highlightedGroups;
+  assert.ok(
+    group.cellIndices instanceof Uint32Array,
+    'a direct highlight owns its cells as a Uint32Array'
+  );
+  assert.deepEqual({ ...group, cellIndices: [...group.cellIndices] }, {
+    id: 'highlight_1',
+    type: 'annotation',
+    label: 'Python selection (2 cells)',
+    enabled: true,
+    cellIndices: [1, 3],
+    cellCount: 2,
+  });
+  assert.deepEqual([...state.highlightArray], [0, 255, 0, 255, 0]);
+});
+
+test('Viewer host highlight refuses cells that are not one cell list of this dataset', () => {
+  const state = new DataState({}, null);
+  state.pointCount = 5;
+  state.highlightArray = new Uint8Array(5);
+  const handlers = createViewerHostCommandHandlers({
+    state,
+    viewer: {},
+    refreshUi() {},
+    reportDataMapping: async () => false,
+  });
+  assert.throws(() => handlers.handleHighlight(Uint32Array.of(1, 5), '#123abc'), /inside the current dataset of 5/);
+  assert.throws(() => handlers.handleHighlight([1, 2], '#123abc'), /cell list/);
+  assert.throws(() => handlers.handleHighlight(new Uint32Array(0), '#123abc'), /cell list/);
+  assert.throws(() => handlers.handleHighlight(Uint32Array.of(1), null), /names no cells/);
+  assert.equal(state.getActivePage()?.highlightedGroups?.length ?? 0, 0);
+});
+
+test('Viewer host color-by rejects absent or ambiguous fields atomically', async () => {
+  let loadCalls = 0;
+  const handlers = createViewerHostCommandHandlers({
+    state: {
+      getFields: () => [{ key: 'duplicate' }, { key: 'duplicate' }],
+      ensureFieldLoaded: async () => {
+        loadCalls += 1;
+      },
+      setActiveField() {
+        throw new Error('must not publish');
+      },
+    },
+    viewer: { resetCamera() {} },
+    refreshUi() {},
+    reportDataMapping: async () => false,
+  });
+
+  await assert.rejects(
+    handlers.handleMessage({
+      type: 'setColorBy',
+      field: 'missing',
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    }),
+    /exactly one.*missing/i,
+  );
+  await assert.rejects(
+    handlers.handleMessage({
+      type: 'setColorBy',
+      field: 'duplicate',
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    }),
+    /exactly one.*duplicate/i,
+  );
+  assert.equal(loadCalls, 0);
+});
+
+test('manual viewer host visibility composes with current filters', () => {
+  const state = Object.assign(
+    Object.create(DataStateFilterMethods.prototype),
+    {
+      pointCount: 3,
+      obsData: { fields: [] },
+      varData: null,
+      activeFieldSource: null,
+      activeVarFieldIndex: -1,
+      colorsArray: new Uint8Array([
+        0, 0, 0, 255,
+        0, 0, 0, 255,
+        0, 0, 0, 255,
+      ]),
+      categoryTransparency: new Uint8Array([1, 1, 1]),
+      cellVisibilityMask: new Uint8Array([1, 1, 1]),
+      isOutlierFilterEnabledForActiveField: () => false,
+      getCurrentOutlierThreshold: () => 1,
+      _syncColorsAlpha() {},
+      _updateActiveCategoryCounts: () => false,
+      _pushTransparencyToViewer() {},
+      _syncActiveContext() {},
+      updateFilteredCount() {},
+      updateFilterSummary() {},
+      _notifyVisibilityChange() {},
+    },
+  );
+
+  state.setCellVisibility([1], false);
+  assert.deepEqual([...state.cellVisibilityMask], [1, 0, 1]);
+  assert.deepEqual([...state.categoryTransparency], [1, 0, 1]);
+
+  state.setCellVisibility(null, true);
+  assert.deepEqual([...state.cellVisibilityMask], [1, 1, 1]);
+  assert.deepEqual([...state.categoryTransparency], [1, 1, 1]);
+  assert.throws(
+    () => state.setCellVisibility([3], false),
+    /outside.*point count/i,
+  );
+});
+
+const NOTEBOOK_MAPPING = Object.freeze({
+  kind: 'anndata',
+  embeddings: { '1d': null, '2d': { key: 'X_pca', columns: [0, 1] }, '3d': null },
+  knn: null,
+  geneNames: 'index',
+  expression: 'X',
+  log1p: {},
+  highlyVariable: null,
+  latent: null,
+  vectorFields: [],
+});
+
+test('setDataMapping applies one transaction, then answers the request it names', async () => {
+  const calls = [];
+  let current = null;
+  const handlers = createViewerHostCommandHandlers({
+    state: {
+      async applyDataMapping(mapping, options) {
+        calls.push(['apply', mapping, options]);
+        current = mapping;
+        return true;
+      },
+      getDataMapping() {
+        return current;
+      },
+    },
+    viewer: {},
+    refreshUi() {
+      calls.push('refresh-ui');
+    },
+    async reportDataMapping(report) {
+      calls.push(['report', report]);
+      return true;
+    },
+  });
+  await handlers.handleMessage({
+    type: 'setDataMapping',
+    requestId: 'req-1',
+    mapping: NOTEBOOK_MAPPING,
+    viewerId: 'viewer-1',
+    viewerToken: 'secret-1',
+  });
+  assert.deepEqual(calls, [
+    ['apply', NOTEBOOK_MAPPING, { origin: 'notebook' }],
+    'refresh-ui',
+    ['report', { origin: 'notebook', requestId: 'req-1', mapping: NOTEBOOK_MAPPING }],
+  ]);
+});
+
+test('a refused setDataMapping reports nothing and rejects for command_error', async () => {
+  let reported = 0;
+  const handlers = createViewerHostCommandHandlers({
+    state: {
+      async applyDataMapping() {
+        throw new RangeError('obsp[\'distances\'] is not symmetric');
+      },
+      getDataMapping: () => NOTEBOOK_MAPPING,
+    },
+    viewer: {},
+    refreshUi() {},
+    async reportDataMapping() {
+      reported += 1;
+      return true;
+    },
+  });
+  await assert.rejects(
+    handlers.handleMessage({
+      type: 'setDataMapping',
+      requestId: 'req-2',
+      mapping: NOTEBOOK_MAPPING,
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    }),
+    /not symmetric/,
+  );
+  assert.equal(reported, 0);
+});
+
+test('Viewer host command handlers require the data-mapping reporter', () => {
+  assert.throws(
+    () => createViewerHostCommandHandlers({ state: {}, viewer: {}, refreshUi() {} }),
+    /reportDataMapping/,
+  );
+});

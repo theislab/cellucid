@@ -11,6 +11,7 @@ import { assertDrawOrder, assertLodMembership } from './utils/lod-membership.js'
 import { assertReferenceGridAppearance } from './utils/viewer-background.js';
 import { SHADER_QUALITIES } from '../../../../rendering/shader-quality.js';
 import { isBackdropLook } from '../../../../rendering/backdrops/backdrop-looks.js';
+import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
@@ -165,7 +166,7 @@ const BACKDROP_LOOK_SHADOW_KEYS = Object.freeze(['packed', 'size', 'window']);
  */
 function assertBackdropLook(look, context) {
   if (look === null) return;
-  assertExactKeys(look, BACKDROP_LOOK_KEYS, context);
+  requireExactKeys(look, BACKDROP_LOOK_KEYS, context);
   if (!isBackdropLook(look.id)) {
     throw new TypeError(`${context}.id must name a background look.`);
   }
@@ -183,7 +184,7 @@ function assertBackdropLook(look, context) {
     throw new TypeError(`${context}.ambient must be exactly 0 or 1.`);
   }
   if (look.shadow === null) return;
-  assertExactKeys(look.shadow, BACKDROP_LOOK_SHADOW_KEYS, `${context}.shadow`);
+  requireExactKeys(look.shadow, BACKDROP_LOOK_SHADOW_KEYS, `${context}.shadow`);
   if (!Number.isSafeInteger(look.shadow.size) || look.shadow.size <= 0) {
     throw new TypeError(`${context}.shadow.size must be a positive integer.`);
   }
@@ -197,31 +198,6 @@ function assertBackdropLook(look, context) {
     throw new TypeError(`${context}.shadow.window must be [centre u, centre v, half size].`);
   }
   look.shadow.window.forEach((value, k) => assertFiniteNumber(value, `${context}.shadow.window[${k}]`));
-}
-
-function assertPlainObject(value, context) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${context} must be a plain object.`);
-  }
-  return value;
-}
-
-function assertExactKeys(value, expectedKeys, context) {
-  assertPlainObject(value, context);
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== expectedKeys.length ||
-    keys.some((key, index) => key !== expectedKeys[index])
-  ) {
-    throw new TypeError(
-      `${context} must contain exactly: ${expectedKeys.join(', ')}.`
-    );
-  }
 }
 
 function assertString(value, context, { allowEmpty = true } = {}) {
@@ -448,7 +424,7 @@ function assertBaseRequestValues(request, context) {
 }
 
 function assertBaseRequest(request, expectedKeys, context) {
-  assertExactKeys(request, expectedKeys, context);
+  requireExactKeys(request, expectedKeys, context);
   assertFigureExportSignal(request.signal, `${context}.signal`);
   return assertBaseRequestValues(request, context);
 }
@@ -488,7 +464,7 @@ function assertStrategyContract(request, requiresSvg, context) {
 }
 
 function assertJob(job, context) {
-  assertExactKeys(job, JOB_KEYS, context);
+  requireExactKeys(job, JOB_KEYS, context);
   assertFormat(job.format, `${context}.format`);
   if (job.format === 'png') {
     assertInteger(job.dpi, `${context}.dpi`, 72);
@@ -600,7 +576,7 @@ function assertOwnedLegendValue(value, context, seen = new Set()) {
     seen.delete(value);
     return;
   }
-  assertPlainObject(value, context);
+  requirePlainRecord(value, context);
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (
@@ -627,7 +603,7 @@ function assertOwnedLegendValue(value, context, seen = new Set()) {
  * (`getPresentedViewState().renderState.backdrop`).
  */
 function assertBackdrop(backdrop, context) {
-  assertExactKeys(backdrop, BACKDROP_KEYS, context);
+  requireExactKeys(backdrop, BACKDROP_KEYS, context);
   if (typeof backdrop.flat !== 'boolean') {
     throw new TypeError(`${context}.flat must be an exact boolean.`);
   }
@@ -646,7 +622,7 @@ function assertBackdrop(backdrop, context) {
 }
 
 function assertRenderState(renderState, context) {
-  assertExactKeys(renderState, RENDER_STATE_KEYS, context);
+  requireExactKeys(renderState, RENDER_STATE_KEYS, context);
   assertBackdrop(renderState.backdrop, `${context}.backdrop`);
   for (const key of ['mvpMatrix', 'viewMatrix', 'modelMatrix', 'projectionMatrix']) {
     assertFloat32Array(renderState[key], 16, `${context}.${key}`);
@@ -707,7 +683,7 @@ function assertRenderState(renderState, context) {
  * @param {string} context
  */
 function assertViewData(data, dimensionLevel, context) {
-  assertExactKeys(data, VIEW_DATA_KEYS, context);
+  requireExactKeys(data, VIEW_DATA_KEYS, context);
   assertInteger(data.pointCount, `${context}.pointCount`, 0);
   assertInteger(dimensionLevel, `${context} dimensionLevel`, 1, 3);
   assertFloat32Array(
@@ -722,7 +698,7 @@ function assertViewData(data, dimensionLevel, context) {
     data.pointCount,
     `${context}.transparency`
   );
-  assertExactKeys(data.centroidFlags, CENTROID_FLAG_KEYS, `${context}.centroidFlags`);
+  requireExactKeys(data.centroidFlags, CENTROID_FLAG_KEYS, `${context}.centroidFlags`);
   assertBoolean(data.centroidFlags.points, `${context}.centroidFlags.points`);
   assertBoolean(data.centroidFlags.labels, `${context}.centroidFlags.labels`);
 
@@ -767,7 +743,7 @@ function assertViewData(data, dimensionLevel, context) {
 }
 
 function assertSelectionSnapshot(selection, pointCount, context) {
-  assertExactKeys(selection, SELECTION_KEYS, context);
+  requireExactKeys(selection, SELECTION_KEYS, context);
   assertInteger(selection.totalCount, `${context}.totalCount`, 0, pointCount);
   assertInteger(
     selection.visibleCount,
@@ -791,7 +767,7 @@ function assertSelectionSnapshot(selection, pointCount, context) {
 }
 
 function assertScientificState(scientificState, data, context) {
-  assertExactKeys(scientificState, SCIENTIFIC_STATE_KEYS, context);
+  requireExactKeys(scientificState, SCIENTIFIC_STATE_KEYS, context);
   assertInteger(
     scientificState.datasetGeneration,
     `${context}.datasetGeneration`,
@@ -835,7 +811,7 @@ function assertScientificState(scientificState, data, context) {
     throw new TypeError(`${context}.filters must be an array of strings.`);
   }
   if (scientificState.legendModel !== null) {
-    assertPlainObject(scientificState.legendModel, `${context}.legendModel`);
+    requirePlainRecord(scientificState.legendModel, `${context}.legendModel`);
     assertOwnedLegendValue(
       scientificState.legendModel,
       `${context}.legendModel`
@@ -855,7 +831,7 @@ function assertScientificState(scientificState, data, context) {
     `${context}.lodSizeMultiplier`,
     Number.MIN_VALUE
   );
-  assertExactKeys(
+  requireExactKeys(
     scientificState.normTransform,
     NORM_TRANSFORM_KEYS,
     `${context}.normTransform`
@@ -894,7 +870,7 @@ function assertScientificState(scientificState, data, context) {
  * @param {ReadonlyArray<any>} views
  */
 function assertMetaProvenance(meta, views) {
-  assertPlainObject(meta, 'Figure export payload.meta');
+  requirePlainRecord(meta, 'Figure export payload.meta');
   if (
     !Array.isArray(meta.views) ||
     meta.views.length !== views.length
@@ -905,7 +881,7 @@ function assertMetaProvenance(meta, views) {
   }
   meta.views.forEach((record, index) => {
     const context = `Figure export payload.meta.views[${index}]`;
-    assertExactKeys(record, META_VIEW_KEYS, context);
+    requireExactKeys(record, META_VIEW_KEYS, context);
     const view = views[index];
     if (record.id !== view.id || record.label !== view.label) {
       throw new Error(
@@ -936,13 +912,13 @@ function assertMetaProvenance(meta, views) {
 }
 
 function assertPayloadOptions(options, context) {
-  assertExactKeys(options, PAYLOAD_OPTION_KEYS, context);
+  requireExactKeys(options, PAYLOAD_OPTION_KEYS, context);
   const requestShape = { ...options, exportAllViews: false };
   assertBaseRequestValues(requestShape, context);
 }
 
 export function assertFigureExportPayload(payload) {
-  assertExactKeys(payload, PAYLOAD_KEYS, 'Figure export payload');
+  requireExactKeys(payload, PAYLOAD_KEYS, 'Figure export payload');
   assertFormat(payload.format, 'Figure export payload.format');
   assertInteger(payload.width, 'Figure export payload.width', 10);
   assertInteger(payload.height, 'Figure export payload.height', 10);
@@ -971,7 +947,7 @@ export function assertFigureExportPayload(payload) {
   const viewIds = new Set();
   payload.views.forEach((view, index) => {
     const context = `Figure export payload.views[${index}]`;
-    assertExactKeys(view, VIEW_KEYS, context);
+    requireExactKeys(view, VIEW_KEYS, context);
     assertFigureExportViewId(view.id, `${context}.id`);
     assertString(view.label, `${context}.label`, { allowEmpty: false });
     if (viewIds.has(view.id)) {

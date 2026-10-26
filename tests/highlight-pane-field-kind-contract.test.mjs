@@ -143,7 +143,7 @@ function createState() {
     addHighlightDirect() {
       return null;
     },
-    clearAllHighlights() {},
+    clearActivePageHighlights() {},
     clearPreviewHighlight() {},
     combineHighlightPages() {},
     createHighlightPage() {},
@@ -227,7 +227,7 @@ function createViewer() {
         inProgress: false,
         stepCount: 0,
         candidateCount: 0,
-        candidates: []
+        candidates: new Uint32Array(0)
       };
     },
     onLodChanged() {
@@ -298,7 +298,7 @@ function buildControls() {
     state,
     viewer,
     dom,
-    jupyterSource: null
+    viewerHostSource: null
   }));
   return { controls, documentStub, dom, state, viewer };
 }
@@ -337,7 +337,7 @@ test(
     const { controls, documentStub, state, viewer } = buildControls();
     withDocument(documentStub, () => {
       const kindOf = viewer.fieldKindSource;
-      // A dataset's default state, Load State and a Jupyter command assign the
+      // A dataset's default state, Load State and a viewer host command assign the
       // field directly; the field selector's change event never fires.
       state.setFieldForView('live', CATEGORY_FIELD);
       assert.equal(kindOf('live'), 'categorical');

@@ -1,25 +1,48 @@
 /**
- * Two things the analysis engine's streaming layer must keep true no matter how
- * it is tuned for speed:
+ * What the analysis engine's gene stream (`shared/gene-stream-runner.js`)
+ * must keep true no matter how it is tuned for speed:
  *
  * 1. Set identity. The values a comparison sees are exactly the cells that were
- *    selected, in cell-index order, and nothing else. Prefetch depth, network
- *    concurrency and buffer sizing are allowed to change *when* a gene arrives;
- *    they are never allowed to change *which cells* it contributes.
- * 2. The memory bound. The buffer that hides network latency is sized from the
- *    caller's budget, and what it pins has to stay inside that budget.
+ *    selected, in cell-index order, and nothing else. The read-ahead the run
+ *    tuner chooses is allowed to change *when* a gene arrives; it is never
+ *    allowed to change *which cells* it contributes.
+ * 2. The read-ahead is the tuner's: the stream keeps exactly as many tasks'
+ *    genes in flight as the tuner says, and tells it about every read.
+ *    (How the tuner sizes it, inside the memory budget, is
+ *    `analysis-run-tuner-contract.test.mjs`.)
+ * 3. Over a gene route the genes never reach this thread: each task's genes
+ *    are delivered to the worker its task runs on, a gene only this thread
+ *    holds is read here, and a task whose worker was replaced before its
+ *    genes arrived has them read again (`gene-delivery-contract.test.mjs`
+ *    covers the reader and the worker ends).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { StreamingGeneLoader } from '../assets/js/app/analysis/data/streaming-gene-loader.js';
+import { runGeneStream } from '../assets/js/app/analysis/shared/gene-stream-runner.js';
+import { twoGroupSubset } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import {
-  complementGatherPlan,
-  gatherFloat32,
-  indexGatherPlan
-} from '../assets/js/app/analysis/shared/typed-array-utils.js';
-import { getPerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
-import { DEFAULTS } from '../assets/js/app/analysis/genes-panel/constants.js';
+  createTwoGroupContext,
+  splitTwoGroups
+} from '../assets/js/app/analysis/compute/gene-statistics.js';
+
+/** A tuner that reads `depth` tasks ahead, `perTask` genes a task, and records what it is told. */
+function fixedTuner(depth, perTask = 1, inFlight = 4) {
+  const reads = [];
+  return {
+    reads,
+    tasks: 0,
+    pressure: 0,
+    genesPerTask: () => perTask,
+    prefetchDepth: () => depth,
+    computeInFlight: () => inFlight,
+    observeRead(read) { reads.push(read); },
+    setReadsPending() {},
+    taskStarted() { this.tasks++; },
+    observeTask() {},
+    onPressure() { this.pressure++; },
+  };
+}
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -48,65 +71,128 @@ function sortedUniqueIndices(total, count, seed) {
   return out;
 }
 
+/** The dense values a sample stands for. */
+function denseOf(sample) {
+  const out = new Float64Array(sample.length);
+  for (let k = 0; k < sample.indices.length; k++) out[sample.indices[k]] = sample.values[k];
+  return out;
+}
+
+/**
+ * The two groups' values of a gene column, split where differential
+ * expression splits them (one byte of membership per cell, groups in cell
+ * order).
+ */
+function splitColumn(values, groupA, groupB, pointCount) {
+  const membership = group => {
+    const mask = new Uint8Array(pointCount);
+    if (group.isRestOf) {
+      mask.fill(1);
+      for (const cell of group.excludedCellIndices) mask[cell] = 0;
+    } else {
+      for (const cell of group.cellIndices) mask[cell] = 1;
+    }
+    return mask;
+  };
+  const inA = membership(groupA);
+  const inB = membership(groupB);
+  const groupOfCell = new Uint8Array(pointCount);
+  for (let cell = 0; cell < pointCount; cell++) {
+    groupOfCell[cell] = inA[cell] ? 1 : (inB[cell] ? 2 : 0);
+  }
+  const { sampleA, sampleB } = splitTwoGroups(values, createTwoGroupContext(groupOfCell));
+  return { valuesA: denseOf(sampleA), valuesB: denseOf(sampleB) };
+}
+
 /**
  * DataLayer stand-in: every gene is a distinct, index-identifying signal, so a
- * mis-ordered or mis-selected cell is impossible to miss.
+ * mis-ordered or mis-selected cell is impossible to miss. A gene is read as
+ * its non-zero entries, owned by the reader, unless it is `shown` (a view
+ * holds it): then it is the shared dense array. Genes in `delivers` (and
+ * only they) can be delivered over a gene route; a delivery is recorded,
+ * never answered with values.
  */
-function createDataLayer({ pointCount, geneCount, latency = null, payloads = null, resident = new Set() }) {
-  const released = [];
-  const prefetched = [];
-  const invalidated = [];
+function createDataLayer({ pointCount, geneCount, latency = null, shown = new Set(), delivers = null }) {
   let concurrent = 0;
   let peakConcurrent = 0;
   const values = new Map();
+  const deliveries = [];
+  const readHere = [];
   for (let g = 0; g < geneCount; g++) {
     const array = new Float32Array(pointCount);
     for (let i = 0; i < pointCount; i++) array[i] = g * 1_000_000 + i;
     values.set(`GENE${g}`, array);
   }
+  const sparseOf = array => {
+    const indices = [];
+    for (let i = 0; i < array.length; i++) if (array[i] !== 0) indices.push(i);
+    return {
+      length: array.length,
+      indices: Uint32Array.from(indices),
+      values: Float32Array.from(indices, i => array[i])
+    };
+  };
+  const wait = () => (latency !== null ? new Promise(resolve => setTimeout(resolve, latency)) : Promise.resolve());
   return {
     state: { pointCount },
-    released,
-    invalidated,
-    prefetched,
+    values,
+    deliveries,
+    readHere,
     getPeakConcurrent: () => peakConcurrent,
-    // A local source has nothing to download ahead; a served one keeps the
-    // payload (`payloads`: its byte length and the cache budget).
-    async prefetchGenePayload(gene, { signal }) {
-      if (payloads === null) return null;
-      if (resident.has(gene)) return { resident: true };
-      prefetched.push(gene);
-      await new Promise(resolve => setTimeout(resolve, 1));
-      signal?.throwIfAborted();
-      return { kept: true, byteLength: payloads.byteLength, budget: payloads.budget };
+    isGeneDeliverable: gene => delivers !== null && delivers.has(gene),
+    async deliverGeneColumns(genes, delivery, options) {
+      assert.equal(options.priority, 'bulk');
+      assert.ok(options.signal instanceof AbortSignal);
+      for (const gene of genes) assert.ok(delivers.has(gene), `${gene} is deliverable`);
+      deliveries.push({ genes: [...genes], delivery });
+      await wait();
+      return { bytes: genes.map(() => 8 * pointCount) };
     },
-    async ensureGeneExpressionLoaded(gene) {
+    async readGeneColumn(gene, options) {
+      assert.equal(options.priority, 'bulk');
+      assert.ok(options.signal instanceof AbortSignal);
+      readHere.push(gene);
       concurrent++;
       if (concurrent > peakConcurrent) peakConcurrent = concurrent;
       try {
-        if (latency !== null) {
-          await new Promise(resolve => setTimeout(resolve, latency));
-        } else {
-          await Promise.resolve();
-        }
+        await wait();
         const array = values.get(gene);
         if (array === undefined) throw new Error(`unknown gene ${gene}`);
-        return { fieldIndex: 0, values: array, wasLoaded: false };
+        return shown.has(gene)
+          ? { fieldIndex: 0, values: array, owned: false }
+          : { fieldIndex: 0, values: sparseOf(array), owned: true };
       } finally {
         concurrent--;
       }
-    },
-    unloadGeneExpression(gene) {
-      released.push(gene);
-      return true;
-    },
-    invalidateVariable(type, key) {
-      invalidated.push(`${type}:${key}`);
     }
   };
 }
 
-test('streamGenes yields exactly the selected cells, in cell-index order', async () => {
+/** Run a stream with no route, collecting every gene's values by its index. */
+async function streamHere(dataLayer, genes, tuner, options = {}) {
+  const seen = new Map();
+  const completed = await runGeneStream({
+    dataLayer,
+    genes,
+    tuner,
+    route: null,
+    dispatch: async task => {
+      assert.equal(task.worker, null);
+      assert.equal(task.delivery, null);
+      return task.columns;
+    },
+    onResult: (task, columns) => {
+      task.indices.forEach((index, k) => {
+        assert.equal(task.genes[k], genes[index], 'a task names its genes by their run positions');
+        seen.set(index, columns[k]);
+      });
+    },
+    ...options,
+  });
+  return { completed, seen };
+}
+
+test('a stream sees exactly the selected cells of every gene, in cell-index order', async () => {
   const pointCount = 5000;
   const geneCount = 12;
   const dataLayer = createDataLayer({ pointCount, geneCount });
@@ -117,19 +203,14 @@ test('streamGenes yields exactly the selected cells, in cell-index order', async
   for (let index = 0; index < pointCount; index++) if (!inA[index]) remaining.push(index);
   const groupBIndices = Uint32Array.from(remaining.filter((_, i) => i % 3 === 0));
 
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 5, networkConcurrency: 3, memoryBudgetMB: 256 }
-  });
-
   const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  let seen = 0;
-  for await (const { gene, valuesA, valuesB, index } of loader.streamGenes(
-    genes,
-    { isRestOf: false, cellIndices: groupAIndices },
-    { isRestOf: false, cellIndices: groupBIndices }
-  )) {
-    assert.equal(gene, genes[index], 'streamed gene must match its request index');
+  const { completed, seen } = await streamHere(dataLayer, genes, fixedTuner(5, 2));
+  assert.equal(completed, true);
+  assert.equal(seen.size, geneCount);
+  const groupA = { isRestOf: false, cellIndices: groupAIndices };
+  const groupB = { isRestOf: false, cellIndices: groupBIndices };
+  for (const [index, values] of seen) {
+    const { valuesA, valuesB } = splitColumn(values, groupA, groupB, pointCount);
     assert.equal(valuesA.length, groupAIndices.length);
     assert.equal(valuesB.length, groupBIndices.length);
     // Every value encodes (gene, cellIndex), so the whole selected set — its
@@ -140,10 +221,7 @@ test('streamGenes yields exactly the selected cells, in cell-index order', async
     for (let i = 0; i < groupBIndices.length; i++) {
       assert.equal(valuesB[i], index * 1_000_000 + groupBIndices[i]);
     }
-    seen++;
   }
-  assert.equal(seen, geneCount);
-  assert.equal(dataLayer.released.length, geneCount, 'every streamed gene is released');
 });
 
 test('a rest-of group is exactly the complement of its excluded cells', async () => {
@@ -155,18 +233,12 @@ test('a rest-of group is exactly the complement of its excluded cells', async ()
   for (let index = 0; index < pointCount; index++) {
     if (!excludedSet.has(index)) expectedComplement.push(index);
   }
-
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 256 }
-  });
-
   const genes = ['GENE0', 'GENE1', 'GENE2', 'GENE3'];
-  for await (const { valuesA, valuesB, index } of loader.streamGenes(
-    genes,
-    { isRestOf: false, cellIndices: excluded },
-    { isRestOf: true, excludedCellIndices: excluded }
-  )) {
+  const { seen } = await streamHere(dataLayer, genes, fixedTuner(4));
+  const groupA = { isRestOf: false, cellIndices: excluded };
+  const groupB = { isRestOf: true, excludedCellIndices: excluded };
+  for (const [index, values] of seen) {
+    const { valuesA, valuesB } = splitColumn(values, groupA, groupB, pointCount);
     assert.equal(valuesA.length + valuesB.length, pointCount, 'the two sides partition the dataset');
     for (let i = 0; i < excluded.length; i++) {
       assert.equal(valuesA[i], index * 1_000_000 + excluded[i]);
@@ -177,7 +249,7 @@ test('a rest-of group is exactly the complement of its excluded cells', async ()
   }
 });
 
-test('prefetch depth and concurrency never change the streamed set', async () => {
+test('the read-ahead and the genes per task never change the streamed set', async () => {
   const pointCount = 2000;
   const geneCount = 20;
   const selection = sortedUniqueIndices(pointCount, 400, 91);
@@ -188,301 +260,236 @@ test('prefetch depth and concurrency never change the streamed set', async () =>
 
   /** @type {string[]|null} */
   let reference = null;
-  for (const config of [
-    { preloadCount: 1, networkConcurrency: 1, memoryBudgetMB: 128 },
-    { preloadCount: 3, networkConcurrency: 12, memoryBudgetMB: 512 },
-    { preloadCount: 50, networkConcurrency: 24, memoryBudgetMB: 4096 }
-  ]) {
+  for (const [depth, perTask] of [[1, 1], [3, 2], [50, 7]]) {
     const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1 });
-    const loader = new StreamingGeneLoader({ dataLayer, config });
     const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-    const digest = [];
-    for await (const { gene, valuesA, valuesB, index } of loader.streamGenes(
-      genes,
-      { isRestOf: false, cellIndices: selection },
-      { isRestOf: false, cellIndices: disjointOther }
-    )) {
+    const { seen } = await streamHere(dataLayer, genes, fixedTuner(depth, perTask));
+    const groupA = { isRestOf: false, cellIndices: selection };
+    const groupB = { isRestOf: false, cellIndices: disjointOther };
+    const digest = [...seen.keys()].sort((a, b) => a - b).map(index => {
+      const { valuesA, valuesB } = splitColumn(seen.get(index), groupA, groupB, pointCount);
       let sumA = 0;
       for (const value of valuesA) sumA += value;
       let sumB = 0;
       for (const value of valuesB) sumB += value;
-      digest.push(`${index}:${gene}:${valuesA.length}:${sumA}:${valuesB.length}:${sumB}`);
-    }
+      return `${index}:${genes[index]}:${valuesA.length}:${sumA}:${valuesB.length}:${sumB}`;
+    });
     assert.equal(digest.length, geneCount);
     if (reference === null) reference = digest;
-    else assert.deepEqual(digest, reference, `config ${JSON.stringify(config)} changed the set`);
+    else assert.deepEqual(digest, reference, `read-ahead ${depth} × ${perTask} changed the set`);
   }
 });
 
-test('streamGenesRaw yields whole per-cell vectors in request order', async () => {
-  const pointCount = 1500;
-  const geneCount = 9;
-  const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1 });
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 6, networkConcurrency: 12, memoryBudgetMB: 512 }
-  });
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  let expectedIndex = 0;
-  for await (const { gene, values, index } of loader.streamGenesRaw(genes)) {
-    assert.equal(index, expectedIndex, 'raw streaming preserves request order');
-    assert.equal(gene, genes[expectedIndex]);
-    assert.equal(values.length, pointCount);
-    assert.equal(values[0], index * 1_000_000);
-    assert.equal(values[pointCount - 1], index * 1_000_000 + pointCount - 1);
-    expectedIndex++;
-  }
-  assert.equal(expectedIndex, geneCount);
-});
-
-test('the prefetch buffer stays inside the memory budget it was given', async () => {
-  // The buffer pins one DataLayer var-field array per buffered gene. Whatever
-  // sizing rule is in force, what it pins must fit the share of the budget the
-  // loader reserves for buffered gene data.
-  const bufferBudgetFraction = 0.3;
-  for (const [pointCount, budgetMB] of [
-    [561_947, 512],
-    [561_947, 256],
-    [219_731, 512],
-    [71_650, 512],
-    [3_696, 512]
-  ]) {
-    const dataLayer = createDataLayer({ pointCount: 16, geneCount: 1 });
-    dataLayer.state.pointCount = pointCount;
-    const loader = new StreamingGeneLoader({
-      dataLayer,
-      config: { preloadCount: 500, networkConcurrency: 12, memoryBudgetMB: budgetMB }
-    });
-    loader._recalculateBufferSize();
-    const pinnedBytes = loader._maxBufferSize * pointCount * 4;
-    const reservedBytes = budgetMB * 1024 * 1024 * bufferBudgetFraction;
-    assert.ok(
-      pinnedBytes <= reservedBytes || loader._maxBufferSize === loader._minimumBufferSize,
-      `${pointCount} cells at ${budgetMB}MB pins ${(pinnedBytes / 2 ** 20).toFixed(1)}MB ` +
-      `against a ${(reservedBytes / 2 ** 20).toFixed(1)}MB reservation`
-    );
-    assert.ok(loader._maxBufferSize >= loader._minimumBufferSize);
-    assert.ok(loader._maxBufferSize <= 500);
-  }
-});
-
-test('the buffer does not throttle the configured network concurrency', async () => {
-  // One gene is one HTTP request, and `_startPrefetch` will not start more loads
-  // than there are free buffer slots. If the buffer is sized below the requested
-  // concurrency, the request parallelism the user asked for silently disappears.
-  const config = getPerformanceConfig();
-  for (const pointCount of [561_947, 219_731, 71_650, 3_696]) {
-    const dataLayer = createDataLayer({ pointCount: 16, geneCount: 1 });
-    dataLayer.state.pointCount = pointCount;
-    const loader = new StreamingGeneLoader({
-      dataLayer,
-      config: { preloadCount: config.batch.defaultPreloadCount }
-    });
-    loader._recalculateBufferSize();
-    assert.ok(
-      loader._maxBufferSize >= config.batch.networkConcurrency,
-      `${pointCount} cells: buffer ${loader._maxBufferSize} caps concurrency ` +
-      `${config.batch.networkConcurrency}`
-    );
-  }
-});
-
-test('concurrent gene loads actually reach the configured concurrency', async () => {
+test('the stream reads exactly as many tasks ahead as the tuner says, and reports every read', async () => {
   const pointCount = 4000;
   const geneCount = 60;
-  const dataLayer = createDataLayer({ pointCount, geneCount, latency: 5 });
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 100, networkConcurrency: 12, memoryBudgetMB: 512 }
-  });
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  let count = 0;
-  for await (const _item of loader.streamGenesRaw(genes)) count++;
-  assert.equal(count, geneCount);
-  assert.equal(
-    dataLayer.getPeakConcurrent(),
-    12,
-    'the loader must saturate the configured request concurrency'
-  );
+  for (const [depth, perTask] of [[1, 1], [7, 1], [4, 3]]) {
+    const dataLayer = createDataLayer({ pointCount, geneCount, latency: 5 });
+    const tuner = fixedTuner(depth, perTask, 64);
+    const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
+    const { seen } = await streamHere(dataLayer, genes, tuner);
+    assert.equal(seen.size, geneCount);
+    assert.equal(dataLayer.getPeakConcurrent(), depth * perTask, `read-ahead ${depth} × ${perTask} is filled and never exceeded`);
+    assert.equal(tuner.reads.length, geneCount / perTask, 'every task\'s read is reported to the tuner');
+    for (const read of tuner.reads) {
+      assert.equal(read.genes, perTask);
+      assert.ok(read.bytes > 0 && read.ms >= 0, 'a read is reported with its bytes, genes and time');
+    }
+    assert.equal(tuner.tasks, geneCount / perTask, 'one task a batch of genes');
+  }
 });
 
-test('an aborted stream starts no further requests and releases every gene', async () => {
+test('an aborted stream starts no further reads and settles every read and task', async () => {
   const pointCount = 4000;
   const geneCount = 60;
   const dataLayer = createDataLayer({ pointCount, geneCount, latency: 5 });
   const controller = new AbortController();
-  const loader = new StreamingGeneLoader({
-    dataLayer,
-    config: { preloadCount: 40, networkConcurrency: 12, memoryBudgetMB: 512 },
-    signal: controller.signal
-  });
   const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-
-  let requestsAtAbort = null;
-  let yielded = 0;
-  await assert.rejects(async () => {
-    for await (const _item of loader.streamGenesRaw(genes)) {
-      yielded++;
-      if (yielded === 4) {
-        requestsAtAbort = dataLayer.released.length + loader._buffer.size + loader._loadingGenes.size;
+  let done = 0;
+  let readsAtAbort = null;
+  await assert.rejects(runGeneStream({
+    dataLayer,
+    genes,
+    tuner: fixedTuner(8),
+    route: null,
+    signal: controller.signal,
+    dispatch: async task => task.columns,
+    onResult: () => {
+      done++;
+      if (done === 4) {
+        readsAtAbort = dataLayer.readHere.length;
         controller.abort(new DOMException('test abort', 'AbortError'));
       }
-    }
-  }, /abort/i);
-
-  assert.ok(yielded >= 4 && yielded < geneCount, `aborted after ${yielded} of ${geneCount}`);
-  assert.ok(requestsAtAbort !== null);
-  assert.equal(loader._buffer.size, 0, 'the buffer is emptied on abort');
-  assert.equal(loader._loadingGenes.size, 0, 'no load is left running');
-  assert.equal(loader._inFlightLoads.size, 0, 'no load task is left unsettled');
-  assert.equal(loader._waitingFor.size, 0, 'no consumer is left waiting');
-  // Every gene the run pinned in DataLayer is handed back.
-  assert.equal(
-    new Set(dataLayer.released).size,
-    dataLayer.released.length,
-    'no gene is released twice'
-  );
-  for (const gene of dataLayer.released) {
-    assert.ok(dataLayer.invalidated.includes(`gene_expression:${gene}`));
-  }
+    },
+  }), /abort/i);
+  assert.ok(done >= 4 && done < geneCount, `aborted after ${done} of ${geneCount}`);
+  assert.equal(dataLayer.readHere.length, readsAtAbort, 'no read starts after the abort');
 });
 
-test('gather helpers select exactly the requested cells', () => {
-  const source = new Float32Array(1000);
-  for (let i = 0; i < source.length; i++) source[i] = i;
-
-  const indices = sortedUniqueIndices(1000, 250, 55);
-  const gathered = gatherFloat32(source, indexGatherPlan(indices));
-  assert.equal(gathered.length, indices.length);
-  for (let i = 0; i < indices.length; i++) assert.equal(gathered[i], indices[i]);
-
-  const complement = gatherFloat32(
-    source,
-    complementGatherPlan(indices, source.length)
-  );
-  assert.equal(complement.length, source.length - indices.length);
-  const excluded = new Set(indices);
-  let write = 0;
-  for (let i = 0; i < source.length; i++) {
-    if (excluded.has(i)) continue;
-    assert.equal(complement[write++], i);
-  }
-  assert.equal(write, complement.length);
-
-  // Unsorted, arbitrary order is honoured position by position.
-  const arbitrary = [7, 3, 999, 0, 512];
-  const arbitraryGathered = gatherFloat32(source, indexGatherPlan(arbitrary));
-  assert.deepEqual(Array.from(arbitraryGathered), arbitrary);
+test('a stopped request ends its stream at once, without an error', async () => {
+  const dataLayer = createDataLayer({ pointCount: 100, geneCount: 30, latency: 5 });
+  const stop = new AbortController();
+  const genes = Array.from({ length: 30 }, (_, g) => `GENE${g}`);
+  let done = 0;
+  const completed = await runGeneStream({
+    dataLayer,
+    genes,
+    tuner: fixedTuner(4),
+    route: null,
+    stop: stop.signal,
+    dispatch: async task => task.columns,
+    onResult: () => {
+      if (++done === 3) stop.abort();
+    },
+  });
+  assert.equal(completed, false);
+  assert.ok(done < 30);
 });
 
-test('the gene-request concurrency defaults agree across the analysis engine', () => {
-  const config = getPerformanceConfig();
-  assert.equal(
-    DEFAULTS.networkConcurrency,
-    config.batch.networkConcurrency,
-    'genes-panel defaults must not diverge from PerformanceConfig'
-  );
-
-  // A preset ladder that is not monotone would mean "high performance" asks for
-  // fewer concurrent requests than the plain default.
-  const ladder = ['lowMemory', 'balanced', 'highPerformance', 'maximum'];
-  for (let i = 1; i < ladder.length; i++) {
-    assert.ok(
-      config.presets[ladder[i]].networkConcurrency >=
-        config.presets[ladder[i - 1]].networkConcurrency,
-      `${ladder[i]} must not request less concurrency than ${ladder[i - 1]}`
-    );
-  }
-  assert.equal(
-    config.presets.balanced.networkConcurrency,
-    config.batch.networkConcurrency,
-    'the balanced preset is the default and must match it'
-  );
-
-  const options = config.getNetworkConcurrencyOptions();
-  const selected = options.filter(option => option.selected);
-  assert.equal(selected.length, 1, 'exactly one concurrency option is the current one');
-  assert.equal(selected[0].value, config.batch.networkConcurrency);
-  for (const preset of ladder) {
-    assert.ok(
-      options.some(option => option.value === config.presets[preset].networkConcurrency),
-      `the ${preset} preset value must be reachable from the selector`
-    );
-  }
+test('a gene a view holds is copied for its task; a gene read for the run moves', async () => {
+  const pointCount = 64;
+  const genes = ['GENE0', 'GENE1', 'GENE2'];
+  // GENE1 is loaded for a view: its task gets a copy, never the shared array.
+  const dataLayer = createDataLayer({ pointCount, geneCount: 3, shown: new Set(['GENE1']) });
+  const { seen } = await streamHere(dataLayer, genes, fixedTuner(3));
+  const shared = dataLayer.values.get('GENE1');
+  assert.ok(seen.get(1) instanceof Float32Array);
+  assert.notEqual(seen.get(1), shared);
+  assert.deepEqual([...seen.get(1)], [...shared]);
+  assert.ok(seen.get(0).indices instanceof Uint32Array);
 });
 
-test('a served run downloads payloads ahead of decoding, without changing what it streams', async () => {
-  const pointCount = 500;
-  const geneCount = 200;
-  const selection = sortedUniqueIndices(pointCount, 100, 7);
-  const other = Uint32Array.from(
-    Array.from({ length: pointCount }, (_, i) => i).filter(i => !new Set(selection).has(i))
-  );
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  const config = { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 128 };
-  const run = async payloads => {
-    const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1, payloads });
-    const loader = new StreamingGeneLoader({ dataLayer, config });
-    const digest = [];
-    let maxAhead = 0;
-    for await (const { gene, valuesA, valuesB } of loader.streamGenes(
-      genes,
-      { isRestOf: false, cellIndices: selection },
-      { isRestOf: false, cellIndices: other }
-    )) {
-      digest.push(`${gene}:${valuesA[0]}:${valuesB.at(-1)}`);
-      maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - digest.length);
-    }
-    return { digest, prefetched: dataLayer.prefetched, maxAhead };
+/** A route stand-in: two workers, fewest genes outstanding first. */
+function fakeRoute(workers = 2) {
+  const outstanding = new Array(workers).fill(0);
+  const generations = new Array(workers).fill(0);
+  let next = 0;
+  return {
+    id: 'gene-route-test',
+    workerCount: workers,
+    outstanding,
+    generations: () => generations.slice(),
+    generation: worker => generations[worker],
+    bump(worker) { generations[worker]++; },
+    nextDeliveryId: () => next++,
+    assign(genes) {
+      let best = 0;
+      for (let worker = 1; worker < workers; worker++) if (outstanding[worker] < outstanding[best]) best = worker;
+      outstanding[best] += genes;
+      return best;
+    },
+    settle(worker, genes) { outstanding[worker] -= genes; },
   };
-  const local = await run(null);
-  const served = await run({ byteLength: 1000, budget: 64 * 1024 * 1024 });
-  assert.deepEqual(served.digest, local.digest, 'the same genes and values, in the same order');
-  assert.equal(local.prefetched.length, 0);
-  assert.ok(served.prefetched.length > 0);
-  assert.ok(served.maxAhead >= 16, `payloads ran ${served.maxAhead} genes ahead of decoding (decode window 4)`);
-  assert.equal(new Set(served.prefetched).size, served.prefetched.length, 'each payload is downloaded ahead once');
+}
+
+test('over a route, a task\'s genes go to its worker and never here; a gene only this thread holds is read here', async () => {
+  const pointCount = 32;
+  const genes = Array.from({ length: 9 }, (_, g) => `GENE${g}`);
+  // GENE4 is a user-defined copy: only this thread holds it.
+  const delivers = new Set(genes.filter(gene => gene !== 'GENE4'));
+  const dataLayer = createDataLayer({ pointCount, geneCount: 9, delivers });
+  const route = fakeRoute();
+  const tasks = [];
+  const completed = await runGeneStream({
+    dataLayer,
+    genes,
+    tuner: fixedTuner(10, 3),
+    route,
+    owner: 'job-1',
+    dispatch: async task => {
+      tasks.push(task);
+      return { ok: task.indices.length };
+    },
+    onResult: () => {},
+  });
+  assert.equal(completed, true);
+  assert.deepEqual(dataLayer.readHere, ['GENE4'], 'only the gene this thread holds is read here');
+  const delivered = tasks.filter(task => task.delivery !== null);
+  assert.deepEqual(delivered.flatMap(task => task.genes).sort(), [...delivers].sort());
+  for (const task of delivered) {
+    assert.equal(task.columns, null, 'a delivered task carries no values');
+    assert.ok(task.genes.length <= 3, 'a task takes the tuner\'s genes');
+    const request = dataLayer.deliveries.find(entry => entry.delivery.runs.some(run => run.id === task.delivery.id));
+    const run = request.delivery.runs.find(entry => entry.id === task.delivery.id);
+    assert.deepEqual(request.genes.slice(run.first, run.last), task.genes);
+    assert.equal(run.worker, task.worker, 'the genes go to the worker the task runs on');
+    assert.deepEqual(task.delivery, { route: route.id, id: run.id, generation: 0 });
+  }
+  // One read serves a task on each worker.
+  assert.ok(dataLayer.deliveries.every(entry => entry.delivery.runs.length <= 2));
+  assert.ok(dataLayer.deliveries.some(entry => entry.delivery.runs.length === 2));
+  assert.deepEqual(new Set(delivered.map(task => task.worker)), new Set([0, 1]), 'both workers are given genes');
+  const here = tasks.find(task => task.delivery === null);
+  assert.deepEqual(here.genes, ['GENE4']);
+  assert.equal(here.worker, null);
+  assert.deepEqual(route.outstanding, [0, 0], 'every delivered gene is settled');
 });
 
-test('the payload window never holds more than half the payload cache', async () => {
-  const pointCount = 50;
-  const geneCount = 120;
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  const dataLayer = createDataLayer({
-    pointCount, geneCount, latency: 1, payloads: { byteLength: 1000, budget: 20_000 },
+test('a task whose worker was replaced before its genes arrived has them delivered again', async () => {
+  const genes = ['GENE0', 'GENE1', 'GENE2', 'GENE3'];
+  const dataLayer = createDataLayer({ pointCount: 16, geneCount: 4, delivers: new Set(genes) });
+  const route = fakeRoute();
+  const answered = new Map();
+  let lostOnce = false;
+  await runGeneStream({
+    dataLayer,
+    genes,
+    tuner: fixedTuner(4, 2),
+    route,
+    dispatch: async task => {
+      if (!lostOnce && task.worker === 0) {
+        lostOnce = true;
+        route.bump(0);
+        return { lost: true };
+      }
+      return { ok: true };
+    },
+    onResult: task => task.genes.forEach(gene => answered.set(gene, (answered.get(gene) ?? 0) + 1)),
   });
-  const loader = new StreamingGeneLoader({ dataLayer, config: { preloadCount: 2, networkConcurrency: 1, memoryBudgetMB: 128 } });
-  let decoded = 0;
-  let maxAhead = 0;
-  for await (const _ of loader.streamGenesRaw(genes)) {
-    decoded++;
-    maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - decoded);
-  }
-  assert.equal(decoded, geneCount);
-  // budget / 2 / byteLength = 10 payloads (the first round may start 8 more
-  // before any size is known).
-  assert.ok(maxAhead <= 10 + 8, `at most half the cache ahead (${maxAhead})`);
+  assert.equal(lostOnce, true);
+  assert.deepEqual([...answered.keys()].sort(), genes, 'every gene is answered');
+  assert.ok([...answered.values()].every(count => count === 1), 'each once');
+  assert.equal(dataLayer.deliveries.length, 2, 'the lost task\'s genes are delivered again');
+  assert.deepEqual(dataLayer.deliveries[1].genes, dataLayer.deliveries[0].genes.slice(0, 2), 'only the lost task\'s');
 });
 
-test('a gene already in memory does not stop the run downloading the next ones ahead', async () => {
-  // The user looked at a few genes before the run: they need no download, and
-  // the genes after them still do.
-  const pointCount = 50;
-  const geneCount = 200;
-  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
-  const resident = new Set(['GENE0', 'GENE3', 'GENE40']);
-  const dataLayer = createDataLayer({
-    pointCount, geneCount, latency: 1, payloads: { byteLength: 1000, budget: 64 * 1024 * 1024 }, resident,
+test('a split stream delivers each task\'s genes to every worker, each its range of cells', async () => {
+  const genes = ['GENE0', 'GENE1', 'GENE2'];
+  const dataLayer = createDataLayer({ pointCount: 10, geneCount: 3, delivers: new Set(genes) });
+  const route = fakeRoute();
+  const split = Uint32Array.of(0, 5, 10);
+  const tasks = [];
+  await runGeneStream({
+    dataLayer,
+    genes,
+    tuner: fixedTuner(2, 3),
+    route,
+    split,
+    dispatch: async task => {
+      tasks.push(task);
+      return [];
+    },
+    onResult: () => {},
   });
-  const loader = new StreamingGeneLoader({ dataLayer, config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 128 } });
-  let decoded = 0;
-  let maxAhead = 0;
-  for await (const _ of loader.streamGenesRaw(genes)) {
-    decoded++;
-    maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - decoded);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].worker, null);
+  assert.deepEqual(tasks[0].delivery, { route: route.id, id: 0, generations: [0, 0] });
+  assert.equal(dataLayer.deliveries[0].delivery.split, split);
+  assert.deepEqual(dataLayer.deliveries[0].delivery.generations, [0, 0]);
+});
+
+test('two groups are read as their union in cell order, each position labelled with its group', () => {
+  const pointCount = 3000;
+  const groupAIndices = sortedUniqueIndices(pointCount, 40, 11);
+  const inA = new Set(groupAIndices);
+  const groupBIndices = Uint32Array.from(
+    [...sortedUniqueIndices(pointCount, 60, 12)].filter(cell => !inA.has(cell))
+  );
+  const { cells, groupOfPosition } = twoGroupSubset(groupAIndices, groupBIndices);
+  assert.deepEqual([...cells], [...cells].sort((a, b) => a - b), 'the cells are read in cell order');
+  assert.equal(cells.length, groupAIndices.length + groupBIndices.length);
+  for (let position = 0; position < cells.length; position++) {
+    assert.equal(groupOfPosition[position], inA.has(cells[position]) ? 1 : 2);
   }
-  assert.equal(decoded, geneCount);
-  assert.ok(maxAhead >= 16, `payloads ran ${maxAhead} genes ahead of decoding past the resident genes`);
-  assert.equal(dataLayer.prefetched.some(gene => resident.has(gene)), false);
-  assert.ok(dataLayer.prefetched.length >= geneCount - resident.size - 8, `${dataLayer.prefetched.length} payloads downloaded ahead`);
+  assert.throws(() => twoGroupSubset(Uint32Array.of(1, 2), Uint32Array.of(2, 3)), /both groups/);
 });

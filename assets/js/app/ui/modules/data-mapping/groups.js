@@ -1,7 +1,8 @@
 /**
  * @fileoverview The Data mapping disclosures after Embeddings: one per
- * mapping group the open dataset can change (genes, neighbour graph, latent
- * space, vector fields), each naming its current choice in its header.
+ * mapping group the open dataset can change (genes and, for a dataset of
+ * several modalities, their modality; neighbour graph, latent space, vector
+ * fields), each naming its current choice in its header.
  *
  * Markup only, as `dom.js` is: the controller (`../data-mapping-controls.js`)
  * stages the chosen values in its staged mapping, keyed by group name, and
@@ -31,8 +32,14 @@ export const GROUP_SECTIONS = Object.freeze([
     title: 'Genes',
     tip: 'data-mapping-genes',
     fields: Object.freeze([
+      // Shown only for a dataset of several modalities: the rest of the
+      // section is that modality's.
+      Object.freeze({ group: 'modality', id: 'data-mapping-modality', label: 'Modality', analyticsId: 'data-mapping:modality' }),
       Object.freeze({ group: 'expression', id: 'data-mapping-expression', label: 'Expression', analyticsId: 'data-mapping:expression' }),
       Object.freeze({ group: 'geneNames', id: 'data-mapping-gene-names', label: 'Gene names', analyticsId: 'data-mapping:gene-names' }),
+      // The transform of the expression matrix chosen above; each matrix keeps its own.
+      Object.freeze({ group: 'log1p', id: 'data-mapping-log1p', label: 'Values', analyticsId: 'data-mapping:log1p' }),
+      Object.freeze({ group: 'highlyVariable', id: 'data-mapping-highly-variable', label: 'Highly variable genes', analyticsId: 'data-mapping:highly-variable' }),
     ]),
   }),
   Object.freeze({
@@ -159,9 +166,8 @@ export function buildGroupSection(ownerDocument, section) {
 }
 
 /**
- * Show one built section's current choices. A field with no model is hidden
- * (a prepared export has gene names but no expression choice); a section
- * with no field shown is hidden.
+ * Show one built section's current choices. A field with no model is hidden;
+ * a section with no field shown is hidden.
  *
  * @param {ReturnType<typeof buildGroupSection>} node
  * @param {{

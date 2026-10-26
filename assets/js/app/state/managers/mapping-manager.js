@@ -40,11 +40,10 @@
 import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
-  EXPORT_KIND,
   compareEmbeddingRefs,
-  isVectorFieldKey,
   slotDimension,
   validateDataMapping,
+  vectorFieldKeys,
 } from '../../../data/data-mapping.js';
 import {
   MappingLoadError,
@@ -54,14 +53,13 @@ import {
 } from '../../../data/data-mapping-candidates.js';
 import { layoutEmbeddingRef } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
+import { createDatasetFieldLoadSupersededError } from './field/loading.js';
+import { sameJson } from '../../utils/same-json.js';
 
 /** Where the current mapping came from. */
 export const MAPPING_ORIGINS = Object.freeze(['default', 'best_guess', 'session', 'user', 'notebook']);
 
 
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
 
 function requireOrigin(origin) {
   if (!MAPPING_ORIGINS.includes(origin)) {
@@ -71,8 +69,8 @@ function requireOrigin(origin) {
 }
 
 /**
- * Whether an error refuses one mapping choice (a browser adapter's load check,
- * or a served route's HTTP 422) rather than failing the transport.
+ * Whether an error refuses one mapping choice (the AnnData adapter's load
+ * check) rather than failing the transport.
  */
 function isMappingLoadError(error) {
   return error instanceof MappingLoadError;
@@ -135,8 +133,8 @@ export class DataStateMappingMethods {
     const canonical = Object.freeze(
       validateDataMapping(mapping, { label: 'Dataset data mapping' })
     );
-    if (candidates !== null && (canonical.kind !== ANNDATA_KIND || candidates.kind !== ANNDATA_KIND)) {
-      throw new TypeError('Only an AnnData dataset carries a data-mapping candidate catalog.');
+    if (candidates !== null && candidates.kind !== ANNDATA_KIND) {
+      throw new TypeError('A data-mapping candidate catalog must be of kind "anndata".');
     }
     requireOrigin(origin);
     const dimensionManager = this.dimensionManager;
@@ -170,27 +168,32 @@ export class DataStateMappingMethods {
   /**
    * What usage analytics may know about the loaded dataset's mapping: whether
    * it opened on its defaults or a best guess, how many embeddings it could
-   * show, and how many it enables. Never a key name.
+   * show, how many it enables, and how many vector-field bindings it draws.
+   * Never a key name.
    *
-   * @returns {{origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number}|null}
+   * @returns {{origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number, vectorFields: number}|null}
    */
   getMappingAnalytics() {
     if (this.dataMapping === null) return null;
     const candidates = this.getMappingCandidates();
     const enabled = this.dataMapping.embeddings.enabled.length;
+    const vectorKeys = candidates === null
+      ? null
+      : vectorFieldKeys(candidates.obsm.map(item => item.key));
     const count = candidates !== null && this.canMapAnyEmbedding()
-      ? candidates.obsm.filter(item => item.usable && !isVectorFieldKey(item.key)).length
+      ? candidates.obsm.filter(item => item.usable && !vectorKeys.has(item.key)).length
       : enabled;
     return {
       origin: this._mappingPublicationOrigin === 'best_guess' ? 'best_guess' : 'default',
       embeddingCandidates: Math.max(1, count),
       enabledRepresentations: enabled,
+      vectorFields: this.dataMapping.vectorFields.length,
     };
   }
 
   /**
-   * The AnnData candidate catalog of the loaded dataset, or null for a
-   * prepared export.
+   * The AnnData candidate catalog of the loaded dataset, or null when none
+   * is loaded.
    *
    * @returns {Object|null}
    */
@@ -200,8 +203,10 @@ export class DataStateMappingMethods {
 
   /**
    * The groups the current mapping took from the best guess and still shows:
-   * embedding slots (`'embeddings.2d'`) and, for a file without `X`, the
-   * `'expression'` matrix chosen in its place.
+   * embedding slots (`'embeddings.2d'`), for a file without `X` the
+   * `'expression'` matrix chosen in its place, the matrices' `'log1p'` (read
+   * from Scanpy's `uns['log1p']`) and the `'highlyVariable'` column, each until
+   * it is changed.
    *
    * @returns {string[]}
    */
@@ -209,8 +214,8 @@ export class DataStateMappingMethods {
     const candidates = this.getMappingCandidates();
     if (candidates === null || this.dataMapping === null) return [];
     return candidates.guessed.filter(group => {
-      if (group === 'expression') {
-        return this.dataMapping.expression === candidates.defaults.expression;
+      if (group === 'expression' || group === 'log1p' || group === 'highlyVariable') {
+        return sameJson(this.dataMapping[group], candidates.defaults[group]);
       }
       const slot = group.replace(/^embeddings\./, '');
       return (
@@ -236,7 +241,7 @@ export class DataStateMappingMethods {
   /**
    * Why an embedding key cannot be plotted this session, or null.
    *
-   * @param {string} key - An obsm key or an export embedding id.
+   * @param {string} key - An obsm key.
    * @returns {string|null}
    */
   getEmbeddingUnusableReason(key) {
@@ -253,7 +258,7 @@ export class DataStateMappingMethods {
    *   dimension: number,
    *   name: string,
    *   label: string,
-   *   ref: {key: string, columns: number[]|null}|null,
+   *   ref: {key: string, columns: number[]}|null,
    *   isDefault: boolean
    * }>}
    */
@@ -262,7 +267,7 @@ export class DataStateMappingMethods {
     if (dimensionManager === null) return [];
     // A synthetic (benchmark) scene enables layouts without a data mapping;
     // its representations have no embedding reference.
-    const kind = this.dataMapping?.kind ?? null;
+    const mapped = (this.dataMapping ?? null) !== null;
     return dimensionManager.getEnabledLayoutKeys()
       .map((layoutKey, order) => {
         const layout = dimensionManager.getLayout(layoutKey);
@@ -271,7 +276,7 @@ export class DataStateMappingMethods {
           dimension: layout.dimension,
           name: representationName(layout),
           label: layout.label,
-          ref: kind === null ? null : layoutEmbeddingRef(dimensionManager, layoutKey, kind),
+          ref: mapped ? layoutEmbeddingRef(dimensionManager, layoutKey) : null,
           isDefault: dimensionManager.getDefaultLayout(layout.dimension) === layoutKey,
           order,
         };
@@ -285,11 +290,16 @@ export class DataStateMappingMethods {
   }
 
   /**
-   * Every embedding the mapper can enable, enabled or not: for a prepared
-   * export its declared embeddings; for an AnnData source every `obsm` array
+   * Every embedding the mapper can enable, enabled or not: every `obsm` array
    * (unusable ones with their reason) with every column selection that is
-   * enabled now, or its first columns when none is. A wide array can be
-   * enabled at any further selection of 1 to 3 columns.
+   * enabled now. An array with none enabled is offered at all of its columns
+   * when it is 1 to 3 wide (an embedding), and at its first two, in 2D, when
+   * it is wider: a matrix of components or latent dimensions (`X_pca`, a
+   * 3,136-column latent space) is not an embedding, and its first two columns
+   * are how it is conventionally plotted (PC1 against PC2). Offered as 3D at
+   * its first three, every such matrix read as a 3D embedding beside the
+   * file's real 2D UMAP. Embeddings are listed before wider arrays. A wide
+   * array can be enabled at any further selection of 1 to 3 columns.
    *
    * @returns {Array<{
    *   ref: {key: string, columns: number[]|null},
@@ -320,7 +330,7 @@ export class DataStateMappingMethods {
       });
     };
     const candidates = this.getMappingCandidates();
-    if (mapping.kind === EXPORT_KIND || candidates === null || !this.canMapAnyEmbedding()) {
+    if (candidates === null || !this.canMapAnyEmbedding()) {
       return enabledRefs.map(ref => {
         const layout = dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref));
         return choice(ref, {
@@ -330,21 +340,13 @@ export class DataStateMappingMethods {
           usable: true,
           reason: null,
         });
-      }).concat(mapping.kind === EXPORT_KIND
-        ? dimensionManager.getRegisteredLayouts()
-          .filter(layout => !refsInclude(enabledRefs, { key: layout.layoutKey, columns: null }))
-          .map(layout => choice({ key: layout.layoutKey, columns: null }, {
-            name: representationName(layout),
-            dimension: layout.dimension,
-            width: null,
-            usable: true,
-            reason: null,
-          }))
-        : []);
+      });
     }
     const choices = [];
+    const wideChoices = [];
+    const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
     for (const item of candidates.obsm) {
-      if (isVectorFieldKey(item.key)) continue;
+      if (vectorKeys.has(item.key)) continue;
       const width = item.usable ? obsmWidth(item) : null;
       if (!item.usable) {
         choices.push(choice({ key: item.key, columns: null }, {
@@ -359,9 +361,9 @@ export class DataStateMappingMethods {
       const selections = enabledRefs.filter(ref => ref.key === item.key);
       const shown = selections.length > 0
         ? selections
-        : [{ key: item.key, columns: Array.from({ length: Math.min(width, 3) }, (_, index) => index) }];
+        : [{ key: item.key, columns: Array.from({ length: width > 3 ? 2 : width }, (_, index) => index) }];
       for (const ref of shown) {
-        choices.push(choice(ref, {
+        (width > 3 ? wideChoices : choices).push(choice(ref, {
           name: representationName({
             layoutKey: item.key,
             label: item.key,
@@ -375,21 +377,17 @@ export class DataStateMappingMethods {
         }));
       }
     }
-    return choices;
+    return [...choices, ...wideChoices];
   }
 
   /**
    * The embedding reference of the representation a view shows.
    *
    * @param {string} viewId
-   * @returns {{key: string, columns: number[]|null}}
+   * @returns {{key: string, columns: number[]}}
    */
   getViewEmbeddingRef(viewId) {
-    return layoutEmbeddingRef(
-      this.dimensionManager,
-      this.getViewLayoutKey(viewId),
-      this.dataMapping.kind
-    );
+    return layoutEmbeddingRef(this.dimensionManager, this.getViewLayoutKey(viewId));
   }
 
   /**
@@ -419,7 +417,7 @@ export class DataStateMappingMethods {
    * what it showed.
    *
    * @param {string} viewId
-   * @param {{key: string, columns: number[]|null}} ref
+   * @param {{key: string, columns: number[]}} ref
    * @returns {Promise<string>} The layout key now shown.
    */
   async setViewEmbeddingRef(viewId, ref) {
@@ -437,7 +435,7 @@ export class DataStateMappingMethods {
    * null when it can. A layout it names is registered on demand (metadata
    * only); nothing is loaded.
    *
-   * @param {{key: string, columns: number[]|null}} ref
+   * @param {{key: string, columns: number[]}} ref
    * @returns {string|null}
    */
   describeEmbeddingRefusal(ref) {
@@ -472,11 +470,6 @@ export class DataStateMappingMethods {
   describeDataMappingRefusal(next) {
     const current = this.dataMapping;
     if (current === null) return 'No dataset is loaded.';
-    if (next.kind !== current.kind) {
-      return next.kind === EXPORT_KIND
-        ? 'This mapping belongs to a prepared export, and an AnnData file is open.'
-        : 'This mapping belongs to an AnnData file, and a prepared export is open.';
-    }
     const groupRefusal = this.describeMappingGroupRefusal(current, next);
     if (groupRefusal !== null) return groupRefusal;
     for (const ref of next.embeddings.enabled) {
@@ -558,6 +551,13 @@ export class DataStateMappingMethods {
    * groups are committed. A failure restores the previous set, every view
    * already moved and every committed group.
    *
+   * The transaction belongs to the dataset it was asked of. Once another
+   * dataset (or none) is published, at any await, it stops with the
+   * superseded error (`createDatasetFieldLoadSupersededError`, an
+   * `AbortError`): nothing more is published, and nothing is rolled back,
+   * because everything it would restore belonged to the dataset that is gone,
+   * and writing it now would land in the one that replaced it.
+   *
    * @param {Object} next - A DataMapping of the loaded dataset's kind.
    * @param {{origin: 'session'|'user'|'notebook'}} options
    * @returns {Promise<boolean>} Whether anything changed.
@@ -567,10 +567,16 @@ export class DataStateMappingMethods {
     const canonical = validateDataMapping(next, { label: 'Requested data mapping' });
     const refusal = this.describeDataMappingRefusal(canonical);
     if (refusal !== null) throw new RangeError(refusal);
+    const generation = this.getDatasetGeneration();
+    const isCurrent = () => this.getDatasetGeneration() === generation;
+    const requireCurrent = () => {
+      if (!isCurrent()) throw createDatasetFieldLoadSupersededError();
+    };
 
     while (this._mappingChangeLock) {
       await this._mappingChangeLock;
     }
+    requireCurrent();
     let unlock = null;
     this._mappingChangeLock = new Promise(resolve => {
       unlock = resolve;
@@ -596,18 +602,20 @@ export class DataStateMappingMethods {
       for (const layoutKey of new Set(moves.map(move => move.to))) {
         releases.push(dimensionManager.pinLayout(layoutKey));
         try {
-          await dimensionManager.getPositions(layoutKey, { showProgress: true });
+          await dimensionManager.getPositions(layoutKey);
         } catch (error) {
+          requireCurrent();
           if (isMappingLoadError(error)) {
             this._unusableEmbeddings.set(error.key, error.reason);
           }
           throw error;
         }
+        requireCurrent();
       }
 
       // Stage every other changed group (mapping-groups.js): their data is
       // loaded and checked before anything is published.
-      const groups = await this._stageMappingGroups(current, canonical);
+      const groups = await this._stageMappingGroups(current, canonical, { requireCurrent });
       if (!embeddingsChanged && !groups.changed) return false;
 
       // Commit: publish the representations, then move the views, then the
@@ -623,9 +631,11 @@ export class DataStateMappingMethods {
             followsDefault: move.followsDefault,
           });
           moved.push({ ...move, followed });
+          requireCurrent();
         }
         await groups.commit();
       } catch (error) {
+        requireCurrent();
         const restoreErrors = await groups.rollback();
         try {
           dimensionManager.setRepresentations(previous.enabled, previous.defaults);

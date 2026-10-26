@@ -47,15 +47,6 @@ body.dock-resizing * {
   user-select: none !important;
 }
 
-/* JavaScript-required notice */
-.noscript-message {
-  padding: var(--space-10);
-  max-width: 800px;
-  margin: 0 auto;
-  font-family: var(--font-sans);
-  color: var(--color-text-primary);
-}
-
 /* Canvas (scene) */
 #glcanvas {
   width: 100%;

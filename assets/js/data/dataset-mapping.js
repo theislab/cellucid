@@ -4,22 +4,21 @@
  *
  * A data mapping (see `data-mapping.js`) names, for one dataset, the embeddings
  * it can be shown with and each dimension's default, the vector fields bound
- * to embeddings,
- * plus — for an AnnData source — the neighbour graph, gene names, expression
- * matrix and latent space. It is recorded in every session fingerprint, so a
- * session is restored only onto the same mapping.
+ * to embeddings, the neighbour graph, gene names, expression matrix, each
+ * matrix's log1p, the highly variable genes, the latent space and, for a
+ * multimodal dataset, the modality. It is
+ * recorded in every session fingerprint, so a session is restored only onto
+ * the same mapping.
  *
- * Two kinds of source state their mapping differently:
- * - a prepared export fixes everything at `prepare()` time, so its mapping is
- *   read from `dataset_identity.json` and the default gene-name set;
- * - an AnnData dataset -- an `.h5ad` or Zarr file this viewer opened, or an
- *   object `cellucid serve` or a notebook serves -- states the mapping it is
- *   shown with as the `defaults` of its candidate catalog
- *   (`_cellucid/mapping/candidates.json`), because the graph and expression
- *   matrix in use are not visible in the identity.
+ * Every dataset is read as an AnnData store -- an `.h5ad`, a Zarr store, or
+ * any other input format presented as one -- opened here, from a link or a
+ * catalog, or served by Python or R, and states the mapping it is shown with
+ * as the `defaults` of its candidate catalog (its `candidates` route),
+ * because the graph and expression matrix in use are not visible in the
+ * identity.
  *
- * An embedding reference names one layout: an export's embedding id with
- * `columns: null`, or an AnnData `obsm` key with the 0-based columns plotted.
+ * An embedding reference names one layout: an AnnData `obsm` key with the
+ * 0-based columns plotted.
  *
  * @module data/dataset-mapping
  */
@@ -27,11 +26,12 @@
 import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
-  EXPORT_KIND,
-  exportDataMapping,
+  compareCodePoints,
+  requireMappingModality,
   validateDataMapping,
   validateEmbeddingRef,
 } from './data-mapping.js';
+import { isObjectRecord } from '../utils/exact-record.js';
 
 /**
  * The clause a mapping-choice refusal gives for a group the open dataset
@@ -42,10 +42,12 @@ export const UNCHANGEABLE_GROUP_CLAUSE = 'cannot be changed for this dataset';
 
 /** The words every mapping group is named with in a sentence. */
 export const MAPPING_GROUP_LABELS = Object.freeze({
-  kind: 'source kind',
   knn: 'neighbour graph',
+  modality: 'modality',
   geneNames: 'gene names',
   expression: 'expression matrix',
+  log1p: 'expression transform',
+  highlyVariable: 'highly variable genes',
   latent: 'latent space',
   vectorFields: 'vector fields',
 });
@@ -53,24 +55,20 @@ export const MAPPING_GROUP_LABELS = Object.freeze({
 /**
  * One group value as a sentence names it: `obsp['connectivities']`, `the var
  * index`, `var column 'gene_symbols'`, `layers['counts']`, `obsm['X_scVI']`,
- * `obsm['velocity_umap_2d'] on X_umap[0,1]`, `none`.
+ * `obsm['velocity_umap'] on X_umap[0,1]`, `none`.
  *
  * @param {string} group
  * @param {*} value
  * @returns {string}
  */
 export function describeMappingGroupValue(group, value) {
+  if (group === 'modality') return value === undefined ? 'no modality' : `'${value}'`;
   if (value === null) return 'none';
   if (group === 'vectorFields') {
     if (value.length === 0) return 'none';
-    return value.map(binding => {
-      const name = binding.field ?? `obsm['${binding.key}']`;
-      const columns = binding.embedding.columns;
-      const embedding = columns === null
-        ? binding.embedding.key
-        : `${binding.embedding.key}[${columns.join(',')}]`;
-      return `${name} on ${embedding}`;
-    }).join(', ');
+    return value.map(binding => (
+      `obsm['${binding.key}'] on ${binding.embedding.key}[${binding.embedding.columns.join(',')}]`
+    )).join(', ');
   }
   if (group === 'knn') return `obsp['${value}']`;
   if (group === 'latent') return `obsm['${value}']`;
@@ -78,47 +76,104 @@ export function describeMappingGroupValue(group, value) {
     return value === 'index' ? 'the var index' : `var column '${value.slice('column:'.length)}'`;
   }
   if (group === 'expression') {
-    return value.startsWith('layer:') ? `layers['${value.slice('layer:'.length)}']` : value;
+    return describeExpressionMatrix(value);
+  }
+  if (group === 'highlyVariable') return `var column '${value}'`;
+  if (group === 'log1p') {
+    const matrices = Object.keys(value);
+    if (matrices.length === 0) return 'values as stored';
+    return `log1p of ${matrices.map(matrix => (
+      `${describeExpressionMatrix(matrix)} (${describeLog1pBase(value[matrix].base)})`
+    )).join(', ')}`;
   }
   return JSON.stringify(value);
 }
 
-/** Relative path of the served-AnnData candidate catalog under a dataset base. */
-export const MAPPING_CANDIDATES_PATH = '_cellucid/mapping/candidates.json';
-
-function isPlainRecord(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+function describeExpressionMatrix(value) {
+  return value.startsWith('layer:') ? `layers['${value.slice('layer:'.length)}']` : value;
 }
 
-function geneNameSourceOf(varManifest) {
-  return varManifest === null ? null : varManifest.geneNameSets[0].source;
+function describeLog1pBase(base) {
+  return base === null ? 'base e' : `base ${base}`;
 }
 
 /**
- * The mapping of a prepared export (see `exportDataMapping`): every declared
- * embedding is enabled, each dimension defaults to the embedding `defaults`
- * names, genes are named by the default name set, and every declared vector
- * binding is in use.
- *
- * @param {Object} identity - A validated dataset identity.
- * @param {Object|null} varManifest - The expanded var manifest, or null.
- * @returns {Object} A canonical export DataMapping.
+ * The menu value of "as stored" in the expression transform select.
  */
-export function resolveExportDataMapping(identity, varManifest) {
-  return exportDataMapping(identity, { geneNameSource: geneNameSourceOf(varManifest) });
+export const LOG1P_AS_STORED = 'as-stored';
+
+/**
+ * The menu value one matrix's transform is shown with: `as-stored`, `e`, or
+ * the base as text (`2`).
+ *
+ * @param {Record<string, {base: number|null}>} log1p
+ * @param {string} matrix
+ * @returns {string}
+ */
+export function log1pChoiceOf(log1p, matrix) {
+  if (!Object.hasOwn(log1p, matrix)) return LOG1P_AS_STORED;
+  return log1p[matrix].base === null ? 'e' : String(log1p[matrix].base);
 }
+
+/**
+ * The `log1p` group with one matrix's transform set from a menu value
+ * (`log1pChoiceOf`), in canonical order.
+ *
+ * @param {Record<string, {base: number|null}>} log1p
+ * @param {string} matrix
+ * @param {string} choice
+ * @returns {Record<string, {base: number|null}>}
+ */
+export function withLog1pChoice(log1p, matrix, choice) {
+  const next = { ...log1p };
+  delete next[matrix];
+  if (choice !== LOG1P_AS_STORED) {
+    const base = choice === 'e' ? null : Number(choice);
+    if (base !== null && !(Number.isFinite(base) && base > 0 && base !== 1)) {
+      throw new RangeError(`A log1p base is e or a positive number other than 1, not ${choice}.`);
+    }
+    next[matrix] = { base };
+  }
+  return Object.fromEntries(Object.keys(next).sort(compareCodePoints).map(key => [key, next[key]]));
+}
+
+/**
+ * The transforms the expression transform menu offers: as stored, log1p
+ * base e (Scanpy's default), base 2 and base 10, and any other base the
+ * file's `uns['log1p']` or the mapping names.
+ *
+ * @param {Array<number|null>} knownBases
+ * @returns {Array<{value: string, label: string}>}
+ */
+export function log1pMenu(knownBases) {
+  const bases = [2, 10];
+  for (const base of knownBases) {
+    if (base !== null && !bases.includes(base)) bases.push(base);
+  }
+  return [
+    { value: LOG1P_AS_STORED, label: 'As stored (not log-transformed)' },
+    { value: 'e', label: 'log1p (base e)' },
+    ...bases.sort((left, right) => left - right).map(base => ({
+      value: String(base),
+      label: `log1p (base ${base})`,
+    })),
+  ];
+}
+
+/** The route of the candidate catalog under a dataset base. */
+export const MAPPING_CANDIDATES_ROUTE = 'candidates';
 
 /**
  * The mapping an AnnData dataset is shown with, read from its candidate
  * catalog, and checked against the dataset identity published beside it.
  *
- * @param {unknown} candidates - `_cellucid/mapping/candidates.json`.
+ * @param {unknown} candidates - The candidate catalog (`candidates`).
  * @param {Object} identity - The validated dataset identity.
  * @returns {Object} A canonical AnnData DataMapping.
  */
 export function resolveAnnDataMapping(candidates, identity) {
   if (
-    !isPlainRecord(candidates) ||
+    !isObjectRecord(candidates) ||
     candidates.kind !== ANNDATA_KIND ||
     !Object.hasOwn(candidates, 'defaults')
   ) {
@@ -129,9 +184,10 @@ export function resolveAnnDataMapping(candidates, identity) {
   const mapping = validateDataMapping(candidates.defaults, {
     label: 'AnnData data mapping',
   });
-  if (mapping.kind !== ANNDATA_KIND) {
-    throw new TypeError('An AnnData data mapping must be of kind "anndata".');
-  }
+  requireMappingModality(
+    mapping,
+    Array.isArray(candidates.modalities) ? candidates.modalities.map(item => item.name) : null
+  );
   const items = identity.embeddings.items;
   const defaults = identity.embeddings.defaults;
   for (const slot of DIMENSION_SLOTS) {
@@ -155,20 +211,16 @@ export function resolveAnnDataMapping(candidates, identity) {
 }
 
 /**
- * The embedding reference that names one registered layout under a mapping
- * kind.
+ * The embedding reference that names one registered layout: its AnnData
+ * `obsm` key and the 0-based columns it plots.
  *
  * @param {{getLayout: Function}} dimensionManager
  * @param {string} layoutKey
- * @param {'export'|'anndata'} kind
- * @returns {{key: string, columns: number[]|null}}
+ * @returns {{key: string, columns: number[]}}
  */
-export function layoutEmbeddingRef(dimensionManager, layoutKey, kind) {
+export function layoutEmbeddingRef(dimensionManager, layoutKey) {
   const layout = dimensionManager.getLayout(layoutKey);
-  if (kind === EXPORT_KIND) {
-    return { key: layout.layoutKey, columns: null };
-  }
-  if (kind !== ANNDATA_KIND || layout.provenance === null || layout.provenance.columns === null) {
+  if (layout.provenance === null || layout.provenance.columns === null) {
     throw new TypeError(
       `Layout "${layout.layoutKey}" has no AnnData obsm provenance to name it by.`
     );
@@ -179,21 +231,17 @@ export function layoutEmbeddingRef(dimensionManager, layoutKey, kind) {
 /**
  * The registered layout an embedding reference names, or null when no
  * registered layout matches it and the dataset cannot register one (see the
- * DimensionManager's layout provider). The reference is validated for the
- * kind.
+ * DimensionManager's layout provider). The reference is validated first.
  *
- * @param {{getLayout: Function, hasLayout: Function, resolveProvenanceLayout: Function}} dimensionManager
+ * @param {{getLayout: Function, resolveProvenanceLayout: Function}} dimensionManager
  * @param {unknown} ref
- * @param {'export'|'anndata'} kind
  * @param {number|null} dimension - Required dimension, or null for any.
  * @param {string} label
  * @returns {string|null} The layout key.
  */
-export function resolveEmbeddingRefLayout(dimensionManager, ref, kind, dimension, label) {
-  const valid = validateEmbeddingRef(ref, { kind, dimension, label });
-  const layoutKey = valid.columns === null
-    ? (dimensionManager.hasLayout(valid.key) ? valid.key : null)
-    : dimensionManager.resolveProvenanceLayout(valid.key, valid.columns);
+export function resolveEmbeddingRefLayout(dimensionManager, ref, dimension, label) {
+  const valid = validateEmbeddingRef(ref, { dimension, label });
+  const layoutKey = dimensionManager.resolveProvenanceLayout(valid.key, valid.columns);
   if (layoutKey === null) return null;
   if (
     dimension !== null &&
@@ -208,11 +256,9 @@ export function resolveEmbeddingRefLayout(dimensionManager, ref, kind, dimension
  * Describe one embedding reference the way the person reading a refusal
  * would recognise it.
  *
- * @param {{key: string, columns: number[]|null}} ref
+ * @param {{key: string, columns: number[]}} ref
  * @returns {string}
  */
 export function describeEmbeddingRef(ref) {
-  return ref.columns === null
-    ? `embedding '${ref.key}'`
-    : `obsm['${ref.key}'] columns [${ref.columns.join(', ')}]`;
+  return `obsm['${ref.key}'] columns [${ref.columns.join(', ')}]`;
 }

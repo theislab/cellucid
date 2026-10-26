@@ -3,10 +3,10 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
-  decodeDeltaUvarint,
-} from '../assets/js/app/session/codecs/delta-varint.js';
+  decodeCellSet,
+} from '../assets/js/app/session/codecs/cell-set.js';
 import {
-  pushUvarint,
+  encodeUvarints,
 } from '../assets/js/app/session/codecs/varint.js';
 import {
   restore as restoreUserDefinedCodes,
@@ -14,6 +14,17 @@ import {
 import {
   DimensionManager,
 } from '../assets/js/data/dimension-manager.js';
+
+/**
+ * Schedule a cancellation as the next macrotask, queued behind the decode's
+ * first yield (Node's yield is `setImmediate`, `utils/yield-macrotask.js`):
+ * it runs at the decode's first yield, whatever the speed of the machine, and
+ * only because the decode yields there. (A timer instead raced the decode: a
+ * fast machine finished all of its cells before a millisecond passed.)
+ */
+function scheduleCancel(cancel) {
+  return setImmediate(cancel);
+}
 
 /**
  * A real DimensionManager with two 2D layouts, only the first of them
@@ -27,7 +38,7 @@ function residentDimensionManager(pointCount) {
       layoutKey: 'X_umap_2d',
       dimension: 2,
       label: 'UMAP',
-      path: 'embeddings/0_2d.bin',
+      path: 'obsm/0/0-1',
       provenance: null,
       origin: 'identity',
     },
@@ -35,7 +46,7 @@ function residentDimensionManager(pointCount) {
       layoutKey: 'X_tsne_2d',
       dimension: 2,
       label: 'tSNE',
-      path: 'embeddings/1_2d.bin',
+      path: 'obsm/1/0-1',
       provenance: null,
       origin: 'identity',
     },
@@ -51,18 +62,12 @@ function residentDimensionManager(pointCount) {
   return manager;
 }
 
+/** A user-defined codes payload in the runs encoding (1). */
 function userCodesPayload({ length, pairs }) {
-  const header = [2];
-  pushUvarint(length, header);
-  pushUvarint(pairs.length, header);
-  const pairBytes = [];
-  for (const [value, run] of pairs) {
-    pushUvarint(value, pairBytes);
-    pushUvarint(run, pairBytes);
-  }
-  const payload = new Uint8Array(header.length + pairBytes.length);
-  payload.set(header, 0);
-  payload.set(pairBytes, header.length);
+  const body = encodeUvarints([length, pairs.length, ...pairs.flat()]);
+  const payload = new Uint8Array(1 + body.length);
+  payload[0] = 1;
+  payload.set(body, 1);
   return payload;
 }
 
@@ -125,38 +130,56 @@ function userCodesMetadata(payload) {
   };
 }
 
-test('large delta-uvarint decode yields so a scheduled cancellation wins', async () => {
+test('a large sorted-delta cell set yields so a scheduled cancellation wins', async () => {
   const count = 256 * 1024;
-  const countBytes = [];
-  pushUvarint(count, countBytes);
-  const payload = new Uint8Array(countBytes.length + count);
-  payload.set(countBytes, 0);
-  payload[countBytes.length] = 0;
-  payload.fill(1, countBytes.length + 1);
+  const header = encodeUvarints([count]);
+  // Encoding 0, the count, a first index of 0, then deltas of 1.
+  const payload = new Uint8Array(1 + header.length + count);
+  payload[0] = 0;
+  payload.set(header, 1);
+  payload[1 + header.length] = 0;
+  payload.fill(1, 2 + header.length);
 
   const controller = new AbortController();
   const cancellation = new Error('scheduled highlight cancellation');
   let abortFired = false;
-  const timer = setTimeout(() => {
+  const timer = scheduleCancel(() => {
     abortFired = true;
     controller.abort(cancellation);
-  }, 0);
+  });
   try {
     await assert.rejects(
-      decodeDeltaUvarint(payload, {
-        maxCount: count,
-        maxIndex: count - 1,
+      decodeCellSet(payload, {
+        cellCount: count,
+        reference: null,
         signal: controller.signal,
       }),
       error => error === cancellation,
     );
   } finally {
-    clearTimeout(timer);
+    clearImmediate(timer);
   }
   assert.equal(abortFired, true);
 });
 
-test('one very large RLE run yields and never publishes partial codes on cancel', async () => {
+test('a large bitset cell set yields so a scheduled cancellation wins', async () => {
+  const cellCount = 8 * 1024 * 1024;
+  const payload = new Uint8Array(1 + cellCount / 8).fill(0xff);
+  payload[0] = 1;
+  const controller = new AbortController();
+  const cancellation = new Error('scheduled bitset cancellation');
+  const timer = scheduleCancel(() => controller.abort(cancellation));
+  try {
+    await assert.rejects(
+      decodeCellSet(payload, { cellCount, reference: null, signal: controller.signal }),
+      error => error === cancellation,
+    );
+  } finally {
+    clearImmediate(timer);
+  }
+});
+
+test('one very large code run yields and never publishes partial codes on cancel', async () => {
   const pointCount = 1024 * 1024;
   const payload = userCodesPayload({
     length: pointCount,
@@ -171,10 +194,10 @@ test('one very large RLE run yields and never publishes partial codes on cancel'
   const unrestoredCentroids = template.centroidsByLayout;
   const unrestoredNormalized = template._normalizedLayouts;
   let abortFired = false;
-  const timer = setTimeout(() => {
+  const timer = scheduleCancel(() => {
     abortFired = true;
     controller.abort(cancellation);
-  }, 0);
+  });
   try {
     await assert.rejects(
       restoreUserDefinedCodes(
@@ -185,7 +208,7 @@ test('one very large RLE run yields and never publishes partial codes on cancel'
       error => error === cancellation,
     );
   } finally {
-    clearTimeout(timer);
+    clearImmediate(timer);
   }
 
   assert.equal(abortFired, true);
@@ -200,7 +223,7 @@ test('one very large RLE run yields and never publishes partial codes on cancel'
   assert.equal(template._normalizedLayouts.size, 0);
 });
 
-test('high-pair-count RLE decodes directly into its final typed array', async () => {
+test('a run-encoded payload with many runs decodes directly into its final typed array', async () => {
   const pointCount = 128 * 1024;
   const pairs = new Array(pointCount);
   for (let index = 0; index < pointCount; index++) {
@@ -228,7 +251,9 @@ test('high-pair-count RLE decodes directly into its final typed array', async ()
   assert.deepEqual([...template.centroidsByLayout.keys()], ['X_umap_2d']);
   assert.deepEqual([...template._normalizedLayouts], ['X_umap_2d']);
   const centroids = template.centroidsByLayout.get('X_umap_2d');
-  assert.equal(centroids.length, template.categories.length);
+  // Only c0 and c1 hold cells; the other 254 categories have no centroid.
+  assert.equal(template.categories.length, 256);
+  assert.deepEqual(centroids.map(centroid => centroid.category), ['c0', 'c1']);
   const half = pointCount / 2;
   // Even cells hold code 0, odd cells code 1.
   assert.deepEqual(centroids[0], {
@@ -241,7 +266,6 @@ test('high-pair-count RLE decodes directly into its final typed array', async ()
     position: [half, 2 * half],
     n_points: half,
   });
-  assert.deepEqual(centroids[2], { category: 'c2', position: [0, 0], n_points: 0 });
 
   const source = await readFile(
     new URL(

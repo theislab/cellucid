@@ -8,7 +8,7 @@
  */
 
 import { NotificationType } from './constants.js';
-import { formatDuration, formatCompactNumber } from './formatters.js';
+import { formatCompactNumber, formatDuration, countNoun } from '../../utils/format-units.js';
 
 function requireNonEmptyString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -71,7 +71,7 @@ export const benchmarkNotificationMethods = {
       type: NotificationType.LOADING,
       category: 'benchmark',
       title: 'Generating Data',
-      message: `${formattedCount} points (${pattern})`
+      message: `${formattedCount} ${countNoun(pointCount, 'point')} (${pattern})`
     });
   },
 

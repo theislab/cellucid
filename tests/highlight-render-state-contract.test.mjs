@@ -143,6 +143,7 @@ test('highlight animation frames bind only the preconfigured per-view VAO', () =
         ['live', {
           buffer: { id: 'live-highlight-buffer' },
           pointCount: 2,
+          drawCount: 2,
           vertexArray,
         }],
       ]),

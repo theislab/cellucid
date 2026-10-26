@@ -90,7 +90,7 @@ function buildSparseTicks(labels, maxTicks, truncateLen = null) {
 
 const geneHeatmapDefinition = {
   id: 'gene-heatmap',
-  name: 'Gene Heatmap',
+  name: 'Gene heatmap',
   description: 'Expression heatmap for marker genes',
   supportedTypes: ['expression_matrix'],
   supportedLayouts: ['single'],
@@ -104,41 +104,58 @@ const geneHeatmapDefinition = {
     rangeMode: 'auto',
     zmin: -3,
     zmax: 3,
-    // Marker selection controls (used by GenesPanelUI to rebuild markers/heatmap)
-    pValueThreshold: 0.05,
-    foldChangeThreshold: 1.0,
-    useAdjustedPValue: true,
     // Internal flag for modal option visibility; set by UI depending on whether
     // clustering/dendrogram data is available for this figure.
     hasClustering: false,
     showRowDendrogram: true,
-    showColDendrogram: true
+    showColDendrogram: true,
+    // Clustering of the marker heatmap (re-clustered by GenesPanelUI, never
+    // by testing again).
+    clusterRows: true,
+    clusterCols: true,
+    distance: 'correlation',
+    linkage: 'average'
   },
 
   optionSchema: {
-    pValueThreshold: {
-      type: 'range',
-      label: 'P-value threshold',
-      min: 0,
-      max: 0.2,
-      step: 0.001
-    },
-    foldChangeThreshold: {
-      type: 'range',
-      label: '|log2FC| threshold',
-      min: 0,
-      max: 5,
-      step: 0.1
-    },
-    useAdjustedPValue: { type: 'checkbox', label: 'Use FDR-corrected p-values' },
     transform: {
       type: 'select',
       label: 'Transform',
       options: [
-        { value: 'zscore', label: 'Z-score' },
-        { value: 'log1p', label: 'Log(1+x)' },
+        { value: 'zscore', label: 'z-score' },
+        { value: 'log1p', label: 'log(1 + x)' },
         { value: 'none', label: 'None' }
       ]
+    },
+    clusterRows: {
+      type: 'checkbox',
+      label: 'Cluster genes',
+      showWhen: (opts) => opts?.hasClustering === true
+    },
+    clusterCols: {
+      type: 'checkbox',
+      label: 'Cluster groups',
+      showWhen: (opts) => opts?.hasClustering === true
+    },
+    distance: {
+      type: 'select',
+      label: 'Distance',
+      options: [
+        { value: 'correlation', label: 'Correlation' },
+        { value: 'euclidean', label: 'Euclidean' },
+        { value: 'cosine', label: 'Cosine' }
+      ],
+      showWhen: (opts) => opts?.hasClustering === true
+    },
+    linkage: {
+      type: 'select',
+      label: 'Linkage',
+      options: [
+        { value: 'average', label: 'Average' },
+        { value: 'complete', label: 'Complete' },
+        { value: 'single', label: 'Single' }
+      ],
+      showWhen: (opts) => opts?.hasClustering === true
     },
     showRowDendrogram: {
       type: 'checkbox',
@@ -168,7 +185,7 @@ const geneHeatmapDefinition = {
       label: 'Color range',
       options: [
         { value: 'auto', label: 'Auto' },
-        { value: 'zscore', label: 'Z-score default (-3..3)' },
+        { value: 'zscore', label: 'z-score default (−3 to 3)' },
         { value: 'fixed', label: 'Fixed (zmin/zmax)' }
       ]
     },
@@ -312,18 +329,21 @@ const geneHeatmapDefinition = {
       colorbar: {
         orientation: 'h',
         thickness: 10,
-        len: 0.6,
+        len: 0.9,
         x: 0.5,
         xanchor: 'center',
         y: -0.25,
         yanchor: 'top',
+        // Upright ticks, a few of them: a narrow preview otherwise turns them.
+        tickangle: 0,
+        nticks: 4,
         tickfont: {
           family: theme.fontFamily,
           size: 9,
           color: theme.textMuted
         },
         title: {
-          text: transform === 'zscore' ? 'Z-score' : (transform === 'log1p' ? 'log(1+x)' : 'Expression'),
+          text: transform === 'zscore' ? 'z-score' : (transform === 'log1p' ? 'log(1 + x)' : 'Expression'),
           side: 'top',
           font: {
             family: theme.fontFamily,
@@ -368,26 +388,46 @@ const geneHeatmapDefinition = {
       const xs = [];
       const ys = [];
 
-      const walk = (node) => {
+      // Post-order over an explicit stack: a dendrogram can be a chain as
+      // deep as its leaf count (single linkage), deeper than the call stack.
+      const placed = new Map();
+      const place = node => {
         if (!node || typeof node !== 'object') {
           throw new TypeError(`Heatmap ${axisName} dendrogram contains an invalid node`);
         }
-        if (node.isLeaf) {
-          if (!leafPos.has(node.id)) {
-            throw new RangeError(
-              `Heatmap ${axisName} dendrogram leaf ${String(node.id)} is absent from its order`
-            );
-          }
-          const x = leafPos.get(node.id);
-          return { x, y: 0 };
+        if (!node.isLeaf) return null;
+        if (!leafPos.has(node.id)) {
+          throw new RangeError(
+            `Heatmap ${axisName} dendrogram leaf ${String(node.id)} is absent from its order`
+          );
+        }
+        return { x: leafPos.get(node.id), y: 0 };
+      };
+      const stack = [dendrogram];
+      while (stack.length > 0) {
+        const node = stack[stack.length - 1];
+        const leaf = place(node);
+        if (leaf !== null) {
+          placed.set(node, leaf);
+          stack.pop();
+          continue;
         }
         if (!Number.isFinite(node.height) || node.height < 0) {
           throw new TypeError(`Heatmap ${axisName} dendrogram heights must be finite and non-negative`);
         }
-
-        const left = walk(node.left);
-        const right = walk(node.right);
-        const x = (left.x + right.x) / 2;
+        const left = placed.get(node.left) ?? (place(node.left) || null);
+        if (left === null) {
+          stack.push(node.left);
+          continue;
+        }
+        placed.set(node.left, left);
+        const right = placed.get(node.right) ?? (place(node.right) || null);
+        if (right === null) {
+          stack.push(node.right);
+          continue;
+        }
+        placed.set(node.right, right);
+        stack.pop();
         const y = node.height;
 
         // vertical left
@@ -400,10 +440,8 @@ const geneHeatmapDefinition = {
         xs.push(left.x, right.x, null);
         ys.push(y, y, null);
 
-        return { x, y };
-      };
-
-      walk(dendrogram);
+        placed.set(node, { x: (left.x + right.x) / 2, y });
+      }
 
       if (axisName === 'row') {
         traces.push({

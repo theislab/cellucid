@@ -126,6 +126,24 @@
   white-space: pre-line;
 }
 
+/* The technical text behind a short message (a failure's raw error), folded. */
+.notification-details {
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+}
+
+.notification-details > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.notification-details-text {
+  margin-top: var(--space-0-5);
+  word-break: break-word;
+  white-space: pre-line;
+}
+
 /* A notification's one follow-up action, under its message. */
 .notification-action {
   align-self: flex-start;

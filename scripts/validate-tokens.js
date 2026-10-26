@@ -180,11 +180,17 @@ function validateFontFamilies(filePath) {
   return errors;
 }
 
+// A failure sets process.exitCode and returns rather than calling
+// process.exit(): Node can deadlock in process.exit(), joining a V8 background
+// compile thread that waits for a garbage collection only the exiting main
+// thread could run (7 of 60 failing runs hung on Node 26.11; none of 120 with
+// exitCode), and the contract suite waited on such a run for over an hour.
 function main() {
   const defined = collectDefinedTokens();
   if (defined.size === 0) {
     console.error('[validate-tokens] No tokens found. Check the definitions directories.'); // eslint-disable-line no-console
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const scanFiles = SCAN_DIRS.flatMap((p) => listFilesRecursively(p))
@@ -202,7 +208,8 @@ function main() {
     for (const { file, token } of errors) {
       console.error(`- ${path.relative(PROJECT_ROOT, file)}: ${token}`); // eslint-disable-line no-console
     }
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   console.log(`[validate-tokens] OK (${defined.size} tokens, ${scanFiles.length} files scanned)`); // eslint-disable-line no-console

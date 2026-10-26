@@ -17,9 +17,9 @@ import {
 } from './format.js';
 import {
   assertArray,
-  assertPlainRecord,
-  assertSafeInteger
+  assertSafeInteger,
 } from '../schema-contract.js';
+import { requirePlainRecord } from '../../../utils/exact-record.js';
 
 /**
  * @typedef {object} BundleWriteInput
@@ -34,7 +34,7 @@ import {
  * @returns {Blob}
  */
 export function writeBundle({ manifest, chunks }) {
-  assertPlainRecord(manifest, 'Bundle manifest');
+  requirePlainRecord(manifest, 'Bundle manifest');
   assertArray(manifest.chunks, 'Bundle manifest chunks');
   assertArray(chunks, 'Bundle stored chunks');
   if (manifest.chunks.length !== chunks.length) {
@@ -49,7 +49,7 @@ export function writeBundle({ manifest, chunks }) {
       throw new TypeError(`writeBundle: stored chunk ${index} must be a Uint8Array.`);
     }
     const meta = manifest.chunks[index];
-    assertPlainRecord(meta, `Bundle manifest chunk ${index}`);
+    requirePlainRecord(meta, `Bundle manifest chunk ${index}`);
     const storedBytes = assertSafeInteger(
       meta.storedBytes,
       `Bundle manifest chunk ${index} storedBytes`,

@@ -24,6 +24,7 @@ import {
 } from '../assets/js/app/registries/user-defined-fields/centroids.js';
 import * as fieldOverlays from '../assets/js/app/session/contributors/field-overlays.js';
 import * as userDefinedCodes from '../assets/js/app/session/contributors/user-defined-codes.js';
+import { loadsAsReader } from './helpers/dimension-loads.mjs';
 
 /** The embedding id of each dimension: one v3 `embeddings.items` entry each. */
 const LAYOUT_OF = { 1: 'X_umap_1d', 2: 'X_umap_2d', 3: 'X_umap_3d' };
@@ -83,14 +84,12 @@ function datasetManager(dimensions = [1, 2, 3]) {
   const defaults = {};
   dimensions.forEach((dimension, index) => {
     const id = LAYOUT_OF[dimension];
+    const columns = Array.from({ length: dimension }, (_value, axis) => axis);
     items[id] = {
       label: id,
       dimension,
-      file: `embeddings/${index}_${dimension}d.bin`,
-      source: {
-        key: null,
-        columns: Array.from({ length: dimension }, (_value, axis) => axis),
-      },
+      path: `obsm/${index}/${columns.join('-')}`,
+      source: { key: id, columns },
     };
     defaults[`${dimension}d`] = id;
   });
@@ -102,7 +101,7 @@ function datasetManager(dimensions = [1, 2, 3]) {
     },
   });
   // The decoded bytes of each layout; the manager normalizes them in place.
-  manager.loadLayout = async layoutKey => new Float32Array(RAW[layoutKey]);
+  loadsAsReader(manager, async layoutKey => new Float32Array(RAW[layoutKey]));
   const getPositions = manager.getPositions.bind(manager);
   manager.getPositions = layoutKey => getPositions(layoutKey, { showProgress: false });
   return manager;
@@ -137,7 +136,7 @@ async function createScene({ resident = ['X_umap_2d'], dimensions = [1, 2, 3] } 
   const { centroidPublications, viewer } = recordingViewer();
   const state = createDataState({ viewer, labelLayer: null });
   state.setDimensionManager(manager);
-  // A dataset with a var manifest and no genes, as the boot sequence installs it.
+  // A dataset with an empty gene list, as the boot sequence installs it.
   state.initVarData({ fields: [] });
   const live = await manager.getPositions('X_umap_2d');
   manager.setViewLayout('live', 'X_umap_2d');
@@ -154,7 +153,7 @@ function createFieldFromPages(state, key = 'regions') {
   ]) {
     const page = state.createHighlightPage(label);
     state.switchToPage(page.id);
-    state.addHighlightDirect({ type: 'lasso', label, cellIndices });
+    state.addHighlightDirect({ type: 'lasso', label, cellIndices: Uint32Array.from(cellIndices) });
     pageIds.push({ pageId: page.id, label });
   }
   const result = state.createCategoricalFromPages({
@@ -516,7 +515,7 @@ test('a session record carrying centroids is refused; one without them restores 
   ]) {
     assert.throws(
       () => fieldOverlays.restore({ state }, null, payloadWith({ ...item, ...extra })),
-      /exact keys/
+      /must contain exactly/
     );
   }
 

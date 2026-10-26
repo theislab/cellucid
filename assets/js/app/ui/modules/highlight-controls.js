@@ -14,13 +14,13 @@ import { annotationFieldKindForPane } from './highlight/annotation-cells.js';
 import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 import {
   requireDomElement,
-  requireExactKeys,
-  requireJupyterSource,
+  requireViewerHostSource,
   requireMethods,
   requireModeButtons,
   SELECT_MODE_DOM_KEYS,
-  pickSelectModeDom
+  pickSelectModeDom,
 } from './highlight/exact-contract.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
 
 const REQUIRED_STATE_METHODS = Object.freeze([
   'getActiveField',
@@ -39,7 +39,7 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'getTotalHighlightedCellCount',
   'toggleHighlightEnabled',
   'removeHighlightGroup',
-  'clearAllHighlights',
+  'clearActivePageHighlights',
   'clearPreviewHighlight',
   'setPreviewHighlightFromIndices',
   'addHighlightDirect',
@@ -88,13 +88,13 @@ const REQUIRED_VIEWER_METHODS = Object.freeze([
 export function initHighlightControls(options) {
   requireExactKeys(
     options,
-    ['state', 'viewer', 'dom', 'jupyterSource'],
+    ['state', 'viewer', 'dom', 'viewerHostSource'],
     'Highlight controls options'
   );
-  const { state, viewer, dom, jupyterSource } = options;
+  const { state, viewer, dom, viewerHostSource } = options;
   requireMethods(state, 'Highlight state', REQUIRED_STATE_METHODS);
   requireMethods(viewer, 'Highlight viewer', REQUIRED_VIEWER_METHODS);
-  requireJupyterSource(jupyterSource);
+  requireViewerHostSource(viewerHostSource);
   requireExactKeys(
     dom,
     [
@@ -164,7 +164,7 @@ export function initHighlightControls(options) {
   const selectionTools = initHighlightSelectionTools({
     state,
     viewer,
-    jupyterSource,
+    viewerHostSource,
     dom: {
       modeButtons: highlightModeButtons,
       modeDescription: highlightModeDescription,
@@ -182,7 +182,7 @@ export function initHighlightControls(options) {
   // gesture never moves focus. The renderer therefore reads each pane's field
   // kind from the state at the moment it needs it. There is nothing to
   // publish when a field changes — by any path: the field selector, a
-  // dataset's default state, Load State, a Jupyter command — and no cached
+  // dataset's default state, Load State, a viewer host command — and no cached
   // kind that could disagree with the panel's invitation.
   viewer.setViewFieldKindSource(
     viewId => annotationFieldKindForPane(state, viewId)

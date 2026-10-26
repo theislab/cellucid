@@ -14,11 +14,13 @@
 import {
   collectViewFilters,
   isContinuousFilterFullRange,
+  visibilityResultInputs,
 } from '../filter-manager.js';
 import {
-  POINT_VISIBILITY_THRESHOLD,
-} from '../../../../rendering/alpha-visibility.js';
-import { transparencyEpoch } from '../per-cell-array-ownership.js';
+  cellVisibilityMaskWrites,
+  isAllShownCellVisibilityMask,
+  transparencyEpoch,
+} from '../per-cell-array-ownership.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 
 /**
@@ -142,6 +144,234 @@ function sumCounts(counts) {
   return sum;
 }
 
+/**
+ * Cells per category of one codes array. Published codes are never written in
+ * place, so the tally is a property of the array (and the counted prefix).
+ */
+const CATEGORY_TOTALS = new WeakMap();
+
+function categoryTotals(codes, categoryCount, n) {
+  const cached = CATEGORY_TOTALS.get(codes);
+  if (cached !== undefined && cached.categoryCount === categoryCount && cached.n === n) {
+    return cached.total;
+  }
+  const total = tallyVisibleByCode(codes, null, categoryCount, n);
+  CATEGORY_TOTALS.set(codes, { categoryCount, n, total });
+  return total;
+}
+
+/** Cells tallied between two looks at the clock (a scheduling choice). */
+const TALLY_CELLS_PER_CHECK = 1 << 20;
+
+/** Cells per code of `codes[from, to)` added to `slots` (Uint8 and Uint16 codes). */
+function tallyCodeSlots(codes, slots, from, to) {
+  for (let i = from; i < to; i++) slots[codes[i]]++;
+}
+
+/** Cells per inventory code of Uint32 `codes[from, to)` added to `counts`. */
+function tallyInventoryCodes(codes, counts, categoryCount, from, to) {
+  for (let i = from; i < to; i++) {
+    const code = codes[i];
+    if (code < categoryCount) counts[code]++;
+  }
+}
+
+/**
+ * The cells per category of one codes array (the totals the category counts
+ * read, `categoryTotals`) tallied in slices of about `sliceMs` of
+ * main-thread time, yielding a macrotask between them, and kept like any
+ * other totals. Integer tallies, so the slices give exactly the one-pass
+ * counts.
+ *
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
+ * @param {number} categoryCount
+ * @param {{signal?: AbortSignal|null, sliceMs: number, yieldToMacrotask: () => Promise<void>}} options
+ * @returns {Promise<void>}
+ */
+export async function prepareCategoryTotals(codes, categoryCount, { signal = null, sliceMs, yieldToMacrotask }) {
+  if (!isCategoricalCodes(codes)) {
+    throw new TypeError('Category totals require typed category codes.');
+  }
+  const n = codes.length;
+  const cached = CATEGORY_TOTALS.get(codes);
+  if (cached !== undefined && cached.categoryCount === categoryCount && cached.n === n) return;
+  const wide = codes instanceof Uint32Array;
+  const counts = new Float64Array(categoryCount);
+  const slots = wide ? null : new Uint32Array(codes instanceof Uint8Array ? 256 : 65536);
+  let from = 0;
+  while (from < n) {
+    const deadline = performance.now() + sliceMs;
+    do {
+      const to = Math.min(n, from + TALLY_CELLS_PER_CHECK);
+      if (wide) tallyInventoryCodes(codes, counts, categoryCount, from, to);
+      else tallyCodeSlots(codes, slots, from, to);
+      from = to;
+    } while (from < n && performance.now() < deadline);
+    if (from < n) {
+      await yieldToMacrotask();
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException('The category tally was aborted.', 'AbortError');
+      }
+    }
+  }
+  if (!wide) for (let code = 0; code < categoryCount; code++) counts[code] = slots[code];
+  CATEGORY_TOTALS.set(codes, { categoryCount, n, total: counts });
+}
+
+/**
+ * Per-category sum of `weights` (0 or 1 a cell), or of 1 when `weights` is
+ * null, over the first `n` cells. Uint8 and Uint16 codes index a slot table
+ * spanning their whole dtype, so the loop has no branch; Uint32 codes test the
+ * inventory bound per cell.
+ */
+function tallyVisibleByCode(codes, weights, categoryCount, n) {
+  const counts = new Float64Array(categoryCount);
+  if (codes instanceof Uint32Array) {
+    for (let i = 0; i < n; i++) {
+      const code = codes[i];
+      if (code < categoryCount) counts[code] += weights === null ? 1 : weights[i];
+    }
+    return counts;
+  }
+  const slots = new Uint32Array(codes instanceof Uint8Array ? 256 : 65536);
+  if (weights === null) {
+    for (let i = 0; i < n; i++) slots[codes[i]]++;
+  } else {
+    for (let i = 0; i < n; i++) slots[codes[i]] += weights[i];
+  }
+  for (let code = 0; code < categoryCount; code++) counts[code] = slots[code];
+  return counts;
+}
+
+/**
+ * The per-category visible counts of `codes` under `alpha` read from the
+ * category totals, without a pass over the cells, when the visibility pass
+ * that wrote `alpha` shows that its visibility is a function of the code
+ * alone: a mask showing every cell, no range or outlier filter, and at most
+ * one category filter, on these very codes. Then a category's cells are all
+ * shown or all hidden. Null when that is not known.
+ */
+function visibleFromTotals(codes, alpha, total, categoryCount) {
+  const inputs = visibilityResultInputs(alpha);
+  if (
+    inputs === null
+    || !isAllShownCellVisibilityMask(inputs.mask)
+    || cellVisibilityMaskWrites(inputs.mask) !== inputs.maskWrites
+    || inputs.mask.length !== codes.length
+    || inputs.continuousFilters.length !== 0
+    || inputs.varValues !== null
+    || inputs.outliers !== null
+    || inputs.categoryFilters.length > 1
+  ) {
+    return null;
+  }
+  if (inputs.categoryFilters.length === 0) return total;
+  const filter = inputs.categoryFilters[0];
+  if (filter.codes !== codes) return null;
+  const visible = new Float64Array(categoryCount);
+  for (let code = 0; code < categoryCount; code++) {
+    visible[code] = filter.visibleByCode[code] === 0 ? 0 : total[code];
+  }
+  return visible;
+}
+
+/**
+ * Per-category count of cells shown and not hidden by the active outlier
+ * filter (the outlier test is repeated so the count never trusts a
+ * transparency written for another threshold).
+ */
+function tallyShownByCode(codes, alpha, outliers, threshold, categoryCount, n) {
+  const counts = new Float64Array(categoryCount);
+  for (let i = 0; i < n; i++) {
+    const code = codes[i];
+    if (code >= categoryCount || alpha[i] !== 1) continue;
+    const q = outliers[i];
+    if (q >= 0 && q > threshold) continue;
+    counts[code]++;
+  }
+  return counts;
+}
+
+/**
+ * Per-category counts while the active outlier filter is the only other
+ * filter: cells it keeps ("available") and those of them shown ("visible").
+ */
+function tallyOutlierCounts(codes, alpha, outliers, threshold, categoryCount, n) {
+  const available = new Float64Array(categoryCount);
+  const visible = new Float64Array(categoryCount);
+  for (let i = 0; i < n; i++) {
+    const code = codes[i];
+    if (code >= categoryCount) continue;
+    const q = outliers[i];
+    if (q >= 0 && q > threshold) continue;
+    available[code]++;
+    visible[code] += alpha[i];
+  }
+  return { available, visible };
+}
+
+/**
+ * Per-category count of cells that pass every filter but the field's own
+ * category visibility, kept per field while its inputs are unchanged.
+ */
+function availableByCode(owner, field, codes, categoryCount, n, resolved, outliers, threshold) {
+  if (!(owner._availableCountsMemos instanceof WeakMap)) {
+    owner._availableCountsMemos = new WeakMap();
+  }
+  const memo = owner._availableCountsMemos.get(field);
+  if (
+    memo !== undefined
+    && memo.codes === codes
+    && memo.categoryCount === categoryCount
+    && memo.n === n
+    && memo.outliers === outliers
+    && memo.threshold === threshold
+    && sameResolvedFilters(memo.filters, resolved)
+  ) {
+    return memo.available;
+  }
+  const { categories, ranges } = resolved;
+  const available = new Float64Array(categoryCount);
+  for (let i = 0; i < n; i++) {
+    const code = codes[i];
+    if (code >= categoryCount) continue;
+    if (outliers !== null) {
+      const q = outliers[i];
+      if (q >= 0 && q > threshold) continue;
+    }
+    if (cellPassesFilters(categories, ranges, i)) available[code]++;
+  }
+  owner._availableCountsMemos.set(field, {
+    codes, categoryCount, n, outliers, threshold, filters: resolved, available,
+  });
+  return available;
+}
+
+const COUNT_MEMO_OWNERS = Object.freeze([
+  '_categoryCountsMemos',
+  '_availableCountsMemos',
+  '_continuousCountsMemos',
+]);
+
+/**
+ * Give a copy of a field the count answers its original holds. A memo names
+ * every array and table it was counted from, so it stays exact for the copy
+ * for as long as those are the copy's inputs too (a kept view starts out
+ * sharing its source view's transparency).
+ *
+ * @param {object} owner - DataState.
+ * @param {object} from - The original field.
+ * @param {object} to - Its copy.
+ */
+export function carryFieldCountMemos(owner, from, to) {
+  for (const key of COUNT_MEMO_OWNERS) {
+    const memos = owner[key];
+    if (!(memos instanceof WeakMap)) continue;
+    const memo = memos.get(from);
+    if (memo !== undefined) memos.set(to, memo);
+  }
+}
+
 export class FieldSummaryMethods {
   /**
    * Get the active field for a specific view (without switching to it).
@@ -192,16 +422,32 @@ export class FieldSummaryMethods {
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
     const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
-    const alpha = this.categoryTransparency || [];
+    const alpha = this.categoryTransparency;
+    if (!(alpha instanceof Uint8Array) || alpha.length !== total) {
+      throw new TypeError('Filtered count requires the exact point transparency.');
+    }
+    // `computeGlobalVisibility` counts the cells it shows in its own pass and
+    // records what it counted from; the same question is answered from that.
+    const memo = this._filteredCountMemo;
+    if (
+      memo !== undefined
+      && memo !== null
+      && memo.transparency === alpha
+      && memo.epoch === transparencyEpoch(this)
+      && memo.outliers === outliers
+      && memo.threshold === threshold
+    ) {
+      this.filteredCount = { shown: memo.shown, total };
+      return;
+    }
+    // Transparency holds exactly 0 or 1 a cell (rendering/alpha-visibility.js).
     let shown = 0;
     if (!applyOutlierFilter) {
-      for (let i = 0; i < total; i++) {
-        if ((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD) shown++;
-      }
+      for (let i = 0; i < total; i++) shown += alpha[i];
     } else {
       for (let i = 0; i < total; i++) {
-        if (!((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD)) continue;
-        const q = outliers[i] ?? -1;
+        if (alpha[i] === 0) continue;
+        const q = outliers[i];
         if (q >= 0 && q > threshold) continue;
         shown++;
       }
@@ -240,17 +486,18 @@ export class FieldSummaryMethods {
 
     // One visibility change asks for the same counts more than once (the
     // centroid/legend refresh inside computeGlobalVisibility, then the Active
-    // filters row of the same field). Each is a dataset-length pass, so an
-    // unchanged question returns the counts it already answered. Every input
-    // is compared exactly: the code and transparency arrays by identity plus
-    // the transparency write epoch, the outlier quantiles and threshold, and
-    // every resolved filter's arrays, tables and bounds.
+    // filters row of each field). Each is a dataset-length pass, so an
+    // unchanged question returns the counts it already answered, per field.
+    // Every input is compared exactly: the code and transparency arrays by
+    // identity plus the transparency write epoch, the outlier quantiles and
+    // threshold, and every resolved filter's arrays, tables and bounds.
     const epoch = transparencyEpoch(this);
-    const memo = this._categoryCountsMemo;
+    if (!(this._categoryCountsMemos instanceof WeakMap)) {
+      this._categoryCountsMemos = new WeakMap();
+    }
+    const memo = this._categoryCountsMemos.get(field);
     if (
       memo !== undefined
-      && memo !== null
-      && memo.field === field
       && memo.codes === codes
       && memo.categoryCount === categoryCount
       && memo.n === n
@@ -263,43 +510,43 @@ export class FieldSummaryMethods {
       return memo.counts;
     }
 
-    const total = new Float64Array(categoryCount);
-    const available = new Float64Array(categoryCount); // respects other filters, ignores this field's category visibility
-    const visible = new Float64Array(categoryCount); // respects all filters including this field's category visibility
-
-    if (
-      categoryFilters.length === 0 &&
-      ranges.length === 0 &&
-      !applyOutlierFilter
-    ) {
-      // Nothing but this field's own visibility can hide a cell, so every
-      // counted cell is available and one pass tallies total and visible.
-      for (let i = 0; i < n; i++) {
-        const code = codes[i];
-        if (code == null || code < 0 || code >= categoryCount) continue;
-        total[code]++;
-        if ((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD) visible[code]++;
-      }
-      available.set(total);
+    let total;
+    let available;
+    let visible;
+    if (n === 0) {
+      total = new Float64Array(categoryCount);
+      available = total;
+      visible = total;
     } else {
-      for (let i = 0; i < n; i++) {
-        const code = codes[i];
-        if (code == null || code < 0 || code >= categoryCount) continue;
-        total[code]++;
-
-        // Only apply outlier filter when supported by the active field.
-        let outlierHidden = false;
-        if (applyOutlierFilter) {
-          const q = outliers[i] ?? -1;
-          outlierHidden = q >= 0 && q > threshold;
-        }
-        if (!outlierHidden && cellPassesFilters(categoryFilters, ranges, i)) {
-          available[code]++;
-        }
-
-        // Current visibility already encoded in alpha + outliers
-        if (outlierHidden || !((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD)) continue;
-        visible[code]++;
+      if (!isCategoricalCodes(codes) || !(alpha instanceof Uint8Array) || alpha.length < n) {
+        throw new TypeError(
+          'Category counts require typed category codes and the exact point transparency.'
+        );
+      }
+      // The totals are a property of the codes. "Available" depends on every
+      // filter but this field's own categories, so it is reused while those
+      // stay as they are (a legend click on this field changes only
+      // "visible"). "Visible" is each cell's 0-or-1 visibility added to its
+      // code's slot, one branch-free pass.
+      total = categoryTotals(codes, categoryCount, n);
+      const otherFilters = categoryFilters.length > 0 || ranges.length > 0;
+      if (!otherFilters && !applyOutlierFilter) {
+        available = total;
+        visible = (n === codes.length && alpha.length === n
+          ? visibleFromTotals(codes, alpha, total, categoryCount)
+          : null) ?? tallyVisibleByCode(codes, alpha, categoryCount, n);
+      } else if (!otherFilters) {
+        // The outlier slider alone: both tallies in one pass.
+        ({ available, visible } = tallyOutlierCounts(
+          codes, alpha, outliers, threshold, categoryCount, n
+        ));
+      } else {
+        available = availableByCode(
+          this, field, codes, categoryCount, n, resolved, outliers, threshold
+        );
+        visible = applyOutlierFilter
+          ? tallyShownByCode(codes, alpha, outliers, threshold, categoryCount, n)
+          : tallyVisibleByCode(codes, alpha, categoryCount, n);
       }
     }
     const counts = {
@@ -309,8 +556,7 @@ export class FieldSummaryMethods {
       visible: toCountArray(visible),
       visibleTotal: sumCounts(visible)
     };
-    this._categoryCountsMemo = {
-      field,
+    this._categoryCountsMemos.set(field, {
       codes,
       categoryCount,
       n,
@@ -320,7 +566,7 @@ export class FieldSummaryMethods {
       threshold,
       filters: resolved,
       counts,
-    };
+    });
     return counts;
   }
 
@@ -365,6 +611,28 @@ export class FieldSummaryMethods {
       ? field._continuousFilter
       : null;
 
+    // The Active filters list asks for every row's counts on each render; an
+    // unchanged question (same filters, values, outliers and self range) is
+    // answered from the previous pass for that field.
+    if (!(this._continuousCountsMemos instanceof WeakMap)) {
+      this._continuousCountsMemos = new WeakMap();
+    }
+    const memo = this._continuousCountsMemos.get(field);
+    if (
+      memo !== undefined
+      && memo.source === source
+      && memo.ignoreSelfFilter === ignoreSelfFilter
+      && memo.n === n
+      && memo.targetValues === targetValues
+      && memo.selfMin === (selfFilter === null ? null : selfFilter.min)
+      && memo.selfMax === (selfFilter === null ? null : selfFilter.max)
+      && memo.outliers === outliers
+      && memo.threshold === threshold
+      && sameResolvedFilters(memo.filters, filters)
+    ) {
+      return { ...memo.counts };
+    }
+
     const { categories: categoryFilters, ranges } = filters;
     for (let i = 0; i < n; i++) {
       if (!cellPassesFilters(categoryFilters, ranges, i)) continue;
@@ -385,7 +653,20 @@ export class FieldSummaryMethods {
       }
       visible++;
     }
-    return { available, visible };
+    const counts = { available, visible };
+    this._continuousCountsMemos.set(field, {
+      source,
+      ignoreSelfFilter,
+      n,
+      targetValues,
+      selfMin: selfFilter === null ? null : selfFilter.min,
+      selfMax: selfFilter === null ? null : selfFilter.max,
+      outliers,
+      threshold,
+      filters,
+      counts,
+    });
+    return { ...counts };
   }
 
   getFilterCellCounts(filter) {
@@ -424,12 +705,15 @@ export class FieldSummaryMethods {
     if (centroids.length === 0 || !this.centroidColors) return false;
     const categories = field.categories || [];
     const visibleCounts = counts?.visible || [];
+    // The centroid list holds only the categories with cells, so a centroid
+    // finds its category by identity, as `buildCentroidsForField` does, never
+    // by its position in the list.
     const catIndexByName = new Map();
-    categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
+    categories.forEach((cat, idx) => catIndexByName.set(cat, idx));
     let changed = false;
     for (let i = 0; i < centroids.length; i++) {
       const c = centroids[i];
-      const idx = catIndexByName.get(String(c.category));
+      const idx = catIndexByName.get(c.category);
       const count = idx != null ? (visibleCounts[idx] || 0) : 0;
       const alpha = count > 0 ? 255 : 0; // uint8 alpha
       const alphaIdx = i * 4 + 3; // alpha is 4th component in RGBA

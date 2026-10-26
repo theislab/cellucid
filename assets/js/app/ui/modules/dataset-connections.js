@@ -9,23 +9,28 @@
 
 import { formatCompactCount } from '../components/display-format.js';
 import {
+  explainedFailure,
+  isExplainedFailure,
   validateDatasetId,
-  validateDatasetIdentity
+  validateDatasetSummary
 } from '../../../data/data-source.js';
-import {
-  INVALID_GITHUB_PATH_MESSAGE,
-  parseGitHubPath
-} from '../../../data/github-data-source.js';
-import { validateRemoteServerUrl } from '../../../data/remote-source.js';
+import { getProviderRegistry } from '../../../data/sources/registry.js';
+import { probeRemoteServer, validateRemoteServerUrl } from '../../../data/remote-source.js';
+import { filePickerAccept, folderFormatOfPaths, folderMarkersOf, inputFormat, openableNamesText } from '../../../data/input-formats.js';
+import { routeAddress } from './address-routing.js';
+import { initOpenDataMenu } from './open-data-menu.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { beginOpening } from '../../../data/opening-progress.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { analytics } from '../../optional-analytics.js';
 import { debug } from '../../../utils/debug.js';
-import { initDatasetDrop } from './dataset-drop.js';
+import { initDatasetDrop, localFileLayout } from './dataset-drop.js';
 import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
 } from '../../dataset-reload-outcome.js';
+import { isPlainRecord } from '../../../utils/exact-record.js';
+import { formatCountOf, countNoun } from '../../../utils/format-units.js';
 
 const CONNECTION_OPTION_KEYS = Object.freeze([
   'clearDataset',
@@ -36,15 +41,8 @@ const CONNECTION_OPTION_KEYS = Object.freeze([
   'populateDatasetDropdown'
 ]);
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  return Object.getPrototypeOf(value) === Object.prototype;
-}
-
 function requireExactOptions(options) {
-  if (!isPlainObject(options)) {
+  if (!isPlainRecord(options)) {
     throw new TypeError('Dataset connections options must be a plain object.');
   }
   const ownKeys = Reflect.ownKeys(options);
@@ -153,7 +151,7 @@ function requireDatasetInventory(value, sourceType) {
         `${sourceType} connection published duplicate dataset id "${id}".`
       );
     }
-    validateDatasetIdentity(metadata, id, sourceType);
+    validateDatasetSummary(metadata, sourceType);
     seen.add(id);
     return metadata;
   });
@@ -176,8 +174,8 @@ function requireDatasetInventory(value, sourceType) {
  * possibilities and asks the user to check both.
  *
  * `too-large` is the row that must not be folded into `unreadable`. A byte
- * ceiling fires on a perfectly valid export that is merely bigger than the
- * browser will take, so "re-export it" is the one action guaranteed to fail:
+ * ceiling fires on a perfectly valid file that is merely bigger than the
+ * browser will take, so "write it again" is the one action guaranteed to fail:
  * the user regenerates a byte-identical file and meets the identical wall.
  * The loader tells the two apart — `TOO_LARGE` is published by whichever
  * ceiling refused — so the UI does not have to guess (CEL-0219).
@@ -204,12 +202,12 @@ const DATA_SOURCE_FAILURES = Object.freeze({
   'too-large': Object.freeze({
     cause: 'what is published there is larger than Cellucid opens in a browser.',
     action:
-      'Serve it with the Cellucid server, or publish a smaller export, then '
+      'Serve it with the Cellucid server, or publish a smaller file, then '
       + 'try again.'
   }),
   unreadable: Object.freeze({
     cause: 'what is published there is not in a format Cellucid can read.',
-    action: 'Re-export it with cellucid prepare, then try again.'
+    action: 'Write it again with anndata (or cellucid.prepare), then try again.'
   }),
   unreachable: Object.freeze({
     cause:
@@ -282,12 +280,66 @@ export function describeDataSourceFailure(subject, verb, error) {
   if (typeof verb !== 'string' || verb.length === 0) {
     throw new TypeError('Data source failure verb must be a non-empty string.');
   }
+  // A failure written for the person (a link naming several files, a file
+  // with nothing to plot) already says what is wrong and what to do.
+  if (isExplainedFailure(error)) {
+    return `${subject} could not be opened: ${explainedMessage(error)}`;
+  }
   const failure = classifyDataSourceFailure(error);
   if (failure === null) {
     return `${subject} ${verb}. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
   }
   const { cause, action } = DATA_SOURCE_FAILURES[failure];
   return `${subject} ${verb}: ${cause} ${action}`;
+}
+
+/**
+ * Causes that asking again cannot change: the same request meets the same
+ * answer (an address with nothing there, a refusal, a file Cellucid does not
+ * read). The others (no answer, a server's own problem) may pass.
+ */
+const SETTLED_FAILURES = new Set(['not-found', 'refused', 'rejected', 'too-large', 'unreadable']);
+
+/**
+ * What a failed opening over the empty viewer says (the startup opening of
+ * the data the address names): the reason itself, and whether trying again
+ * can help.
+ *
+ * - A failure written for the person (`isExplainedFailure`: a file with no
+ *   embedding, a folder without `datasets.json`, a file that is not shared)
+ *   is said as it is.
+ * - A failure the loader classified (`classifyDataSourceFailure`) is the
+ *   opening's sentence with its cause and what to do.
+ * - Anything else is the opening's sentence and the ways on.
+ *
+ * Either is settled (trying again meets it again) when its cause is one
+ * asking again cannot change (`SETTLED_FAILURES`).
+ *
+ * @param {string} sentence - What failed, as one sentence ending in "."
+ *   ("Cellucid could not read the data this link points to.")
+ * @param {unknown} error
+ * @param {{withoutLink: boolean}} options - `withoutLink`: the address names
+ *   the data, and Cellucid can be opened without it
+ * @returns {{summary: string, settled: boolean}}
+ */
+export function describeOpeningFailure(sentence, error, { withoutLink }) {
+  if (typeof sentence !== 'string' || !sentence.endsWith('.')) {
+    throw new TypeError('An opening failure sentence must be one sentence ending in ".".');
+  }
+  const failure = classifyDataSourceFailure(error);
+  if (isExplainedFailure(error)) {
+    // Settled when its cause is ("Google has limited downloads of this file
+    // for now" is not: no answer may pass).
+    return { summary: explainedMessage(error), settled: SETTLED_FAILURES.has(failure) };
+  }
+  if (failure !== null) {
+    const { cause, action } = DATA_SOURCE_FAILURES[failure];
+    return { summary: `${sentence.slice(0, -1)}: ${cause} ${action}`, settled: SETTLED_FAILURES.has(failure) };
+  }
+  return {
+    summary: `${sentence} ${withoutLink ? 'Try again, or open Cellucid without it.' : 'Try again, or open other data.'}`,
+    settled: false
+  };
 }
 
 function errorMessage(error) {
@@ -299,35 +351,41 @@ function errorMessage(error) {
 }
 
 /**
- * The raw text to append to a notification, and nothing at all when the loader
- * did publish a cause.
- *
+ * The raw text of a failure, for its notification's Details and the console:
+ * the notification itself says one sentence (`describeDataSourceFailure`).
  * An unclassified failure is as likely to be a broken invariant inside
  * Cellucid as a transport problem, and then its message is the only evidence
- * anyone has. Swallowing it would hide a defect, so it is carried through as a
- * clearly-labelled trailing detail rather than as the whole message.
+ * anyone has, so it is always kept, never quoted in the sentence.
  *
  * @param {unknown} error
  * @returns {string}
  */
-export function dataSourceFailureDetail(error) {
-  return classifyDataSourceFailure(error) === null
-    ? ` Details: ${errorMessage(error)}`
-    : '';
+export function dataSourceFailureDetails(error) {
+  return errorMessage(error);
+}
+
+function explainedMessage(error) {
+  return error instanceof AggregateError && error.errors.length > 0
+    ? explainedMessage(error.errors[0])
+    : error.message;
 }
 
 /**
- * The failure as a notification: the readable sentence, plus the raw text
- * whenever the loader classified nothing.
+ * A failure said in one sentence for the person, with the error behind it as
+ * its cause: the opening's notification shows the sentence and folds the
+ * cause under Details.
  *
- * @param {string} subject
- * @param {string} verb
- * @param {unknown} error
- * @returns {string}
+ * @param {string} sentence
+ * @param {unknown} cause
+ * @returns {Error}
  */
-export function reportDataSourceFailure(subject, verb, error) {
-  return describeDataSourceFailure(subject, verb, error)
-    + dataSourceFailureDetail(error);
+export function saidFailure(sentence, cause) {
+  return explainedFailure(
+    sentence,
+    typeof cause?.code === 'string' ? cause.code : null,
+    null,
+    { cause }
+  );
 }
 
 /**
@@ -357,38 +415,55 @@ export function describeRemoteAddressProblem(value) {
  * @param {string} value
  * @returns {string|null}
  */
-export function describeGitHubPathProblem(value) {
-  return parseGitHubPath(value) === null ? INVALID_GITHUB_PATH_MESSAGE : null;
+export function describeDataLinkProblem(value) {
+  try {
+    getProviderRegistry().resolve(value);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 /**
- * The three ways a local dataset is read. The file inputs and a drop onto the
- * viewer share them, so a dropped file is read, validated, reported and
- * superseded exactly as a picked one is.
+ * The three ways a local dataset arrives (`data/input-formats.js` layouts):
+ * one file that is the container itself (an `.h5ad`), a ZIP archive holding a
+ * store (a `.zarr.zip`), or a store folder. The file inputs and a drop onto
+ * the viewer share them, so a dropped file is read, validated, reported and
+ * superseded exactly as a picked one is. What each is is decided by the
+ * reader from its content.
  */
 const LOCAL_LOADERS = Object.freeze({
-  h5ad: Object.freeze({
-    loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
-    loadingMessage: 'Loading h5ad file...',
+  file: Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_FILE,
     load: (source, files) =>
-      source.loadFromH5adFile(files.length === 1 ? files[0] : null)
+      source.loadFromFile(files.length === 1 ? files[0] : null)
   }),
-  'zarr-zip': Object.freeze({
-    loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
-    loadingMessage: 'Loading Zarr ZIP archive...',
+  zip: Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_ZIP,
     load: (source, files) =>
-      source.loadFromZarrArchive(files.length === 1 ? files[0] : null)
+      source.loadFromFile(files.length === 1 ? files[0] : null)
   }),
-  prepared: Object.freeze({
-    loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
-    loadingMessage: 'Loading prepared dataset...',
-    load: (source, files) => source.loadFromPreparedDirectory(files)
+  folder: Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_FOLDER,
+    load: (source, files) => source.loadFromFolder(files)
   })
 });
 
 /**
+ * What File… opens and what Folder… is for, from the registry: "Choose an
+ * .h5ad file or a .zarr.zip archive, or choose Folder… for a .zarr folder or
+ * a Cell Ranger outs/ folder."
+ *
+ * @returns {string}
+ */
+function describePickableFiles() {
+  return `Choose ${openableNamesText({ layouts: ['file', 'zip'] })}, ` +
+    `or choose Folder… for ${openableNamesText({ layouts: ['folder'] })}.`;
+}
+
+/**
  * What a local choice is called while it is being read: the file, or the
- * folder a prepared export was chosen as.
+ * folder a Zarr store was chosen as.
  *
  * @param {FileList|File[]} files
  * @returns {string}
@@ -402,6 +477,59 @@ function describeLocalSelection(files) {
   return typeof first?.name === 'string' && first.name.length > 0
     ? first.name
     : 'your data';
+}
+
+/**
+ * An address as the connection line shows it: `localhost:8777`,
+ * `theislab.github.io/…/catalog/`; text that is not a web address (`hf:…`,
+ * `GSE123456`) is shown as it is.
+ *
+ * @param {string} address
+ * @returns {string}
+ */
+export function shortAddress(address) {
+  let url;
+  try {
+    url = new URL(address);
+  } catch {
+    return address;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return address;
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.length === 0) return url.host;
+  const last = `${parts.at(-1)}${url.pathname.endsWith('/') ? '/' : ''}`;
+  return parts.length === 1 ? `${url.host}/${last}` : `${url.host}/…/${last}`;
+}
+
+/**
+ * Why a folder picked with the folder dialog cannot be a Zarr store although
+ * it may be one, or null. A Zarr v2 store keeps its metadata in files whose
+ * names start with "." (`.zgroup`, `.zattrs`, `.zarray`, `.zmetadata`), and
+ * some browsers' folder dialogs (Safari's) leave every such file out. A
+ * listing with no hidden file at all and no Zarr v3 `zarr.json` is that
+ * case: the same folder dropped on the page, or zipped, is read whole.
+ *
+ * @param {ArrayLike<File>} files - As the folder input lists them
+ * @returns {string|null}
+ */
+export function describeHiddenMetadataProblem(files) {
+  const paths = Array.from(files, file => (
+    typeof file?.webkitRelativePath === 'string' && file.webkitRelativePath !== ''
+      ? file.webkitRelativePath
+      : String(file?.name ?? '')
+  ));
+  // A folder another format knows by its files (a Cell Ranger outs/ folder)
+  // is no Zarr store missing its metadata.
+  const known = folderFormatOfPaths(paths);
+  if (known !== null && inputFormat(known.format).container !== 'zarr') return null;
+  const hasHidden = paths.some(path => path.split('/').some(part => part.startsWith('.')));
+  // A Zarr v3 store's metadata (`zarr.json`) is not hidden.
+  const visibleMarkers = folderMarkersOf('zarr').filter(marker => !marker.startsWith('.'));
+  const hasVisibleMarker = paths.some(path => visibleMarkers.includes(path.split('/').at(-1)));
+  if (paths.length === 0 || hasHidden || hasVisibleMarker) return null;
+  return 'This browser left out the folder\'s hidden files (names starting with "."), '
+    + 'where a Zarr v2 store keeps its metadata. Drag the folder onto the page, '
+    + 'or open its .zarr.zip.';
 }
 
 /**
@@ -455,7 +583,7 @@ export function initDatasetConnections(options) {
     populateDatasetDropdown,
     'Dataset catalog population owner'
   );
-  if (!isPlainObject(dom)) {
+  if (!isPlainRecord(dom)) {
     throw new TypeError('Dataset connections DOM must be a plain object.');
   }
   validateDatasetId(noneDatasetValue, 'None dataset control value');
@@ -485,9 +613,14 @@ export function initDatasetConnections(options) {
   }
   const lifecycleController = new AbortController();
   const activeOperations = new Set();
-  const activeLoadingNotifications = new Set();
-  const connectionLossCleanups = new Set();
-  const connectionLossCleanupBySource = new Map();
+  /**
+   * Openings this module began (`data/opening-progress.js`), each with what
+   * stops its work. Destroying the module stops that work and ends the
+   * openings: it then waits only for operations told to stop, never for a
+   * read or a connection to answer on its own.
+   * @type {Map<Object, () => void>}
+   */
+  const activeOpenings = new Map();
   const operationInvalidators = new Set();
   let destroyed = false;
   let destroyPromise = null;
@@ -518,7 +651,7 @@ export function initDatasetConnections(options) {
     const promise = trackOperation(work);
     void promise.catch(error => {
       if (destroyed || isDatasetReloadSupersededError(error)) return;
-      debug.error(`[UI] ${label}:`, error);
+      debug.error(`[UI] ${label}: ${errorMessage(error)}`, error);
     });
     return promise;
   }
@@ -558,29 +691,46 @@ export function initDatasetConnections(options) {
     admittedControls.clear();
   }
 
-  function beginLoadingNotification(message, options) {
+  /**
+   * What is opened is shown from the first moment by the opening progress
+   * (the startup overlay, or a notification with Cancel); the source and the
+   * dataset change that read it join this opening. `cancel` is what the
+   * person's Cancel does; `stop` ends the work at once when this module is
+   * destroyed (`cancel` by default).
+   *
+   * @param {string} title
+   * @param {{cancel: () => void, stop?: () => void}} ends
+   */
+  function beginShownOpening(title, { cancel, stop = cancel }) {
     assertAlive();
-    const id = notifications.loading(message, options);
-    activeLoadingNotifications.add(id);
-    return id;
+    const opening = beginOpening({ title, onCancel: cancel });
+    activeOpenings.set(opening, stop);
+    return opening;
   }
 
-  function settleLoadingNotification(method, id, message) {
+  /**
+   * End it: `complete` with what was opened (a sentence), `fail` with why:
+   * a sentence of its own, or the error (`saidFailure` for a sentence with
+   * the error behind it), which the opening's notification shortens.
+   */
+  function settleShownOpening(method, opening, outcome) {
     if (destroyed) return;
-    activeLoadingNotifications.delete(id);
-    notifications[method](id, message);
+    activeOpenings.delete(opening);
+    if (method === 'complete') opening.end(outcome);
+    else opening.fail(outcome);
   }
 
-  function detachConnectionLoss(source) {
-    const cleanup = connectionLossCleanupBySource.get(source);
-    if (cleanup !== undefined) cleanup();
+  /** End it with nothing to say: superseded, or explained where it failed. */
+  function dismissShownOpening(opening) {
+    activeOpenings.delete(opening);
+    opening.dismiss();
   }
 
   async function populate() {
     assertAlive();
     const outcome = await populateDatasetDropdown();
     assertAlive();
-    if (!isPlainObject(outcome)) {
+    if (!isPlainRecord(outcome)) {
       throw new TypeError(
         'Dataset catalog population must publish one exact outcome.'
       );
@@ -628,7 +778,7 @@ export function initDatasetConnections(options) {
    *   `label` names the choice while it is read; `readFiles` yields its files,
    *   and runs under the choice's own intent (a dropped folder is listed
    *   there).
-   * @param {{loadMethod: string, loadingMessage: string,
+   * @param {{loadMethod: string,
    *   load: (source: Object, files: ArrayLike<File>) => Promise<Object>}} loader
    */
   async function loadLocalUserSelection(selection, loader) {
@@ -653,8 +803,8 @@ export function initDatasetConnections(options) {
 
   async function loadLocalUserSelectionForIntent(
     intent,
-    { readFiles },
-    { loadMethod, loadingMessage, load }
+    { label, readFiles },
+    { loadMethod, load }
   ) {
     const assertCurrentSelection = () => {
       if (destroyed || !datasetIntents.owns(intent)) {
@@ -697,19 +847,18 @@ export function initDatasetConnections(options) {
     // The activation joins this request, so a file that cannot be read is
     // reported as a failed load too, and the duration includes reading it.
     const dataLoad = analytics.openDataLoad(loadMethod, 'local-user');
-    const loadNotifId = beginLoadingNotification(loadingMessage, {
-      category: 'data'
+    const localOpening = beginShownOpening(label, {
+      cancel: () => userSource.disconnect()
     });
     // A newer dataset choice cancels the read itself, not only its result:
-    // the candidate's disconnect aborts a prepared folder mid-read and
-    // retires a parsed file instead of adopting it, and the read's progress
+    // the candidate's disconnect retires a parsed file instead of adopting
+    // it, and the read's progress
     // leaves the screen at once rather than when the read gets round to
     // noticing.
     const cancelRead = () => {
       userSource.disconnect();
       if (destroyed) return;
-      activeLoadingNotifications.delete(loadNotifId);
-      notifications.dismiss(loadNotifId);
+      dismissShownOpening(localOpening);
     };
     intent.transaction.signal.addEventListener('abort', cancelRead, {
       once: true
@@ -740,8 +889,7 @@ export function initDatasetConnections(options) {
         // The activation has already explained its failure next to the
         // dataset select; a second toast would repeat it.
         userSource.disconnect();
-        activeLoadingNotifications.delete(loadNotifId);
-        notifications.dismiss(loadNotifId);
+        dismissShownOpening(localOpening);
         return;
       }
       if (dataSourceManager.getSource('local-user') !== userSource) {
@@ -750,12 +898,13 @@ export function initDatasetConnections(options) {
         );
       }
       candidatePublished = true;
+      localOpening.step('Updating the dataset list');
       await populate();
       assertCurrentSelection();
-      settleLoadingNotification(
+      settleShownOpening(
         'complete',
-        loadNotifId,
-        `User data ready: ${formatCompactCount(metadata.stats.n_cells)} cells`
+        localOpening,
+        `User data ready: ${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')}`
       );
     } catch (error) {
       if (destroyed) {
@@ -773,99 +922,96 @@ export function initDatasetConnections(options) {
         const adopted =
           dataSourceManager.getSource('local-user') === userSource;
         if (!candidatePublished && !adopted) userSource.disconnect();
-        activeLoadingNotifications.delete(loadNotifId);
-        notifications.dismiss(loadNotifId);
+        dismissShownOpening(localOpening);
         return;
       }
       dataLoad.fail(error);
       if (!candidatePublished) userSource.disconnect();
-      debug.error('[UI] Failed to load user data:', error);
-      settleLoadingNotification(
-        'fail',
-        loadNotifId,
-        errorMessage(error)
-      );
+      debug.error(`[UI] Failed to load user data: ${errorMessage(error)}`, error);
+      settleShownOpening('fail', localOpening, error);
     }
   }
 
-  const localPrepared = requireControlGroup(
+  // One "Open…" button with a File… / Folder… menu: a browser's dialog
+  // picks files or one folder, never both. What was picked decides how it is
+  // read.
+  const openMenu = requireControlGroup(
     dom,
-    ['userDataBrowseBtn', 'userDataFileInput'],
-    'Prepared-directory'
+    [
+      'userDataOpenBtn',
+      'userDataOpenMenu',
+      'userDataFileItem',
+      'userDataFolderItem',
+      'userDataFileInput',
+      'userDataFolderInput'
+    ],
+    'Open file or folder'
   );
-  const localH5ad = requireControlGroup(
-    dom,
-    ['userDataH5adBtn', 'userDataH5adInput'],
-    'H5AD'
-  );
-  const localZarr = requireControlGroup(
-    dom,
-    ['userDataZarrArchiveBtn', 'userDataZarrArchiveInput'],
-    'Zarr ZIP'
-  );
-
-  if (localPrepared !== null) {
-    const { userDataBrowseBtn, userDataFileInput } = localPrepared;
-    listen(
-      userDataBrowseBtn,
-      'click',
-      () => userDataFileInput.click()
-    );
+  if (openMenu !== null) {
+    const {
+      userDataOpenBtn,
+      userDataOpenMenu,
+      userDataFileItem,
+      userDataFolderItem,
+      userDataFileInput,
+      userDataFolderInput
+    } = openMenu;
+    // File… offers every single-file format the registry names.
+    userDataFileInput.accept = filePickerAccept();
+    initOpenDataMenu({
+      button: userDataOpenBtn,
+      menu: userDataOpenMenu,
+      items: [userDataFileItem, userDataFolderItem],
+      onChoose: item => {
+        if (destroyed) return;
+        (item === userDataFolderItem ? userDataFolderInput : userDataFileInput).click();
+      },
+      signal: lifecycleController.signal
+    });
     listen(userDataFileInput, 'change', event => {
       const files = event.target.files;
       if (!files || files.length === 0) return undefined;
-      return launchOperation(async () => {
-        await loadLocalUserSelection(
-          pickedSelection(files),
-          LOCAL_LOADERS.prepared
+      const layout = localFileLayout(files[0]);
+      if (layout === null) {
+        notifications.error(
+          `"${files[0].name}" is not a file Cellucid can open. ${describePickableFiles()}`,
+          { category: 'data', title: 'Cannot open this file' }
         );
+        userDataFileInput.value = '';
+        return undefined;
+      }
+      return launchOperation(async () => {
+        await loadLocalUserSelection(pickedSelection(files), LOCAL_LOADERS[layout]);
         if (!destroyed) userDataFileInput.value = '';
-      }, 'Prepared-directory selection failed');
+      }, 'File selection failed');
     });
-    admitControls(userDataBrowseBtn, userDataFileInput);
-  }
-  if (localH5ad !== null) {
-    const { userDataH5adBtn, userDataH5adInput } = localH5ad;
-    listen(
-      userDataH5adBtn,
-      'click',
-      () => userDataH5adInput.click()
-    );
-    listen(userDataH5adInput, 'change', event => {
+    listen(userDataFolderInput, 'change', event => {
       const files = event.target.files;
       if (!files || files.length === 0) return undefined;
+      const hidden = describeHiddenMetadataProblem(files);
+      if (hidden !== null) {
+        notifications.error(hidden, {
+          category: 'data',
+          title: 'Cannot open this folder'
+        });
+        userDataFolderInput.value = '';
+        return undefined;
+      }
       return launchOperation(async () => {
         await loadLocalUserSelection(
           pickedSelection(files),
-          LOCAL_LOADERS.h5ad
+          LOCAL_LOADERS.folder
         );
-        if (!destroyed) userDataH5adInput.value = '';
-      }, 'H5AD selection failed');
+        if (!destroyed) userDataFolderInput.value = '';
+      }, 'Folder selection failed');
     });
-    admitControls(userDataH5adBtn, userDataH5adInput);
-  }
-  if (localZarr !== null) {
-    const {
-      userDataZarrArchiveBtn,
-      userDataZarrArchiveInput
-    } = localZarr;
-    listen(
-      userDataZarrArchiveBtn,
-      'click',
-      () => userDataZarrArchiveInput.click()
+    admitControls(
+      userDataOpenBtn,
+      userDataFileItem,
+      userDataFolderItem,
+      userDataFileInput,
+      userDataFolderInput
     );
-    listen(userDataZarrArchiveInput, 'change', event => {
-      const files = event.target.files;
-      if (!files || files.length === 0) return undefined;
-      return launchOperation(async () => {
-        await loadLocalUserSelection(
-          pickedSelection(files),
-          LOCAL_LOADERS['zarr-zip']
-        );
-        if (!destroyed) userDataZarrArchiveInput.value = '';
-      }, 'Zarr ZIP selection failed');
-    });
-    admitControls(userDataZarrArchiveBtn, userDataZarrArchiveInput);
   }
 
   // A file or folder dropped onto the viewer is one more way to make the same
@@ -899,15 +1045,36 @@ export function initDatasetConnections(options) {
         }
       });
 
+  /** @type {Map<string, (value: string) => Promise<boolean>>} */
+  const openers = new Map();
+  /**
+   * The address bar's way into each connection, by source type:
+   * `request(value)` opens `value` as if it had been typed.
+   * @type {Map<string, {request: (value: string, loadMethod?: string) => Promise<void>}>}
+   */
+  const connectors = new Map();
+  // Connection operations still running; the address bar's Open waits for
+  // none of them, but is not offered twice at once.
+  let busyOperations = 0;
+  let addressOpenButton = null;
+  let addressInputElement = null;
+
+  function setBusy(delta) {
+    busyOperations += delta;
+    if (addressOpenButton !== null && !destroyed) {
+      addressOpenButton.disabled = busyOperations > 0;
+    }
+  }
+
   function wireConnection(config) {
     const {
-      connectButton,
-      connectionInput,
+      connectionTarget,
       describeInputProblem,
       disconnectButton,
       disconnectContainer,
       emptyInputMessage,
       failureSubject,
+      failureVerb,
       inputLabel,
       loadMethod,
       sourceType
@@ -952,6 +1119,10 @@ export function initDatasetConnections(options) {
       return sourceType === 'remote' ? info.url : info.inputPath;
     }
 
+    /**
+     * Show whether this source is connected, and to what, under the address
+     * bar, with its Disconnect.
+     */
     function updateConnectionUI(connected) {
       assertAlive();
       if (typeof connected !== 'boolean') {
@@ -959,9 +1130,12 @@ export function initDatasetConnections(options) {
           `${inputLabel} UI state must be a boolean.`
         );
       }
-      connectButton.textContent = connected ? 'Reconnect' : 'Connect';
       disconnectContainer.hidden = !connected;
-      connectionInput.disabled = connected || recoveryBlocked;
+      const target = connected ? sourceInputValue(source) : '';
+      // One short line: the host and the last part of the path; the whole
+      // address is the title and stays in the address bar.
+      connectionTarget.textContent = shortAddress(target);
+      connectionTarget.title = target;
     }
 
     function createCandidate() {
@@ -1015,7 +1189,6 @@ export function initDatasetConnections(options) {
       datasetSelect.focus();
       let cleanupError = null;
       try {
-        detachConnectionLoss(priorSource);
         priorSource.disconnect();
       } catch (error) {
         cleanupError = error;
@@ -1026,152 +1199,30 @@ export function initDatasetConnections(options) {
       };
     }
 
-    async function recoverConnectionLoss(lostSource, error, notice) {
-      if (dataSourceManager.getSource(sourceType) !== lostSource) return;
-      const revision = ++operationRevision;
-      connectButton.disabled = true;
-      disconnectButton.disabled = true;
-      // Said at once: recovery may wait for a newer choice to settle, and the
-      // loss must not wait with it. The same notice is completed below.
-      notice.id = notifications.error(
-        `${inputLabel} connection was lost.`,
-        {
-          category: 'connectivity',
-          title: 'Connection lost',
-          duration: 0
-        }
-      );
-      // Recovery clears only the dataset it lost, and only once nothing the
-      // user chose is still loading: a newer choice in flight replaces the
-      // lost dataset itself, and clearing now would supersede that choice.
-      // Should the newer choice fail, the lost dataset is still on screen
-      // and is cleared then.
-      while (dataSourceManager.getCurrentSourceType() === sourceType) {
-        if (!datasetIntents.settled()) {
-          await datasetIntents.whenSettled();
-          assertCurrentOperation(revision);
-          continue;
-        }
-        let cleared;
-        try {
-          cleared = await clearDataset();
-        } catch (clearError) {
-          // A choice the user made while the clear ran owns the dataset now.
-          if (destroyed || !isDatasetReloadSupersededError(clearError)) {
-            throw clearError;
-          }
-          assertCurrentOperation(revision);
-          continue;
-        }
-        assertCurrentOperation(revision);
-        if (cleared !== true) {
-          recoveryBlocked = true;
-          connectButton.disabled = true;
-          connectionInput.disabled = true;
-          notifications.error(
-            `${inputLabel} connection was lost and the active dataset could ` +
-            `not be cleared safely. Reload the page before reconnecting. ` +
-            `Cause: ${errorMessage(error)}`,
-            {
-              id: notice.id,
-              category: 'connectivity',
-              duration: 0,
-              title: 'Connection recovery blocked'
-            }
-          );
-          return;
-        }
+    /**
+     * @param {string} inputValue
+     * @param {string} [clickLoadMethod]
+     * @param {{supersede?: boolean}} [options] - `supersede`: the dataset on
+     *   screen may come from this kind of source; the new connection replaces
+     *   it only once its own dataset is ready, and on failure or Cancel it
+     *   stays.
+     */
+    async function handleConnect(inputValue, clickLoadMethod = loadMethod, { supersede = false } = {}) {
+      if (recoveryBlocked) {
+        notifications.error(
+          `${inputLabel} cannot be opened again until the page is reloaded.`,
+          { category: 'connectivity' }
+        );
+        return;
       }
-
-      assertCurrentOperation(revision);
-      detachConnectionLoss(lostSource);
-      lostSource.disconnect();
-      dataSourceManager.unregisterSource(sourceType);
-      const disconnectedSource = lostSource.createConnectionCandidate();
-      requireSource(
-        disconnectedSource,
-        sourceType,
-        `${inputLabel} disconnected replacement`
-      );
-      dataSourceManager.registerSource(sourceType, disconnectedSource);
-      source = disconnectedSource;
-      await populate();
-      assertCurrentOperation(revision);
-      updateConnectionUI(false);
-      connectButton.disabled = false;
-      disconnectButton.disabled = false;
-      notifications.error(
-        `${inputLabel} connection was lost. Reconnect to continue.`,
-        {
-          id: notice.id,
-          category: 'connectivity',
-          title: 'Connection lost',
-          duration: 0
-        }
-      );
-    }
-
-    function attachConnectionLoss(candidate) {
-      if (sourceType !== 'remote') return;
-      if (connectionLossCleanupBySource.has(candidate)) return;
-      requireMethod(
-        candidate,
-        'onConnectionLost',
-        'Remote connection source'
-      );
-      const handleConnectionLost = error => {
-        launchOperation(async () => {
-          const notice = { id: undefined };
-          try {
-            await recoverConnectionLoss(candidate, error, notice);
-          } catch (recoveryError) {
-            if (
-              destroyed ||
-              isDatasetReloadSupersededError(recoveryError)
-            ) {
-              return;
-            }
-            recoveryBlocked = true;
-            connectButton.disabled = true;
-            disconnectButton.disabled = true;
-            connectionInput.disabled = true;
-            notifications.error(
-              `Remote connection recovery failed: ` +
-              `${errorMessage(recoveryError)}. Reload the page before reconnecting.`,
-              {
-                // Completes the loss notice when recovery got that far.
-                ...(notice.id === undefined ? {} : { id: notice.id }),
-                category: 'connectivity',
-                duration: 0,
-                title: 'Connection recovery blocked'
-              }
-            );
-          }
-        }, 'Remote connection recovery rejected');
-      };
-      candidate.onConnectionLost(handleConnectionLost);
-      const cleanup = () => {
-        if (typeof candidate.offConnectionLost === 'function') {
-          candidate.offConnectionLost(handleConnectionLost);
-        }
-        connectionLossCleanupBySource.delete(candidate);
-        connectionLossCleanups.delete(cleanup);
-      };
-      connectionLossCleanupBySource.set(candidate, cleanup);
-      connectionLossCleanups.add(cleanup);
-    }
-
-    attachConnectionLoss(source);
-
-    async function handleConnectClick() {
-      if (dataSourceManager.getCurrentSourceType() === sourceType) {
+      const replacesShown = dataSourceManager.getCurrentSourceType() === sourceType;
+      if (replacesShown && !supersede) {
         notifications.error(
           `${inputLabel} is the active dataset source. Disconnect it before reconnecting.`,
           { category: 'connectivity' }
         );
         return;
       }
-      const inputValue = connectionInput.value;
       if (typeof inputValue !== 'string' || inputValue.trim().length === 0) {
         notifications.error(emptyInputMessage, { category: 'connectivity' });
         return;
@@ -1179,7 +1230,7 @@ export function initDatasetConnections(options) {
       // An address the source would refuse unread is a typing problem, not a
       // connection failure: say what is wrong with it and do not start a
       // connection whose failure would be reported as if the data were at
-      // fault ("not in a format Cellucid can read ... re-export it").
+      // fault ("not in a format Cellucid can read ... write it again").
       const inputProblem = describeInputProblem(inputValue);
       if (inputProblem !== null) {
         notifications.error(inputProblem, { category: 'connectivity' });
@@ -1196,12 +1247,7 @@ export function initDatasetConnections(options) {
       const clickAction = datasetIntents.actionSequence();
       // A one-dataset connection's activation joins this request; a
       // connection that only lists datasets loads none and is canceled.
-      const dataLoad = analytics.openDataLoad(loadMethod, sourceType);
-      const connectNotifId = beginLoadingNotification(
-        `Connecting to ${inputLabel}: ${inputValue}...`,
-        { category: 'connectivity' }
-      );
-      connectButton.disabled = true;
+      const dataLoad = analytics.openDataLoad(clickLoadMethod, sourceType);
       let candidate = null;
       let candidateDisconnectAttempted = false;
       let candidatePublished = false;
@@ -1216,7 +1262,6 @@ export function initDatasetConnections(options) {
         }
         candidateDisconnectAttempted = true;
         try {
-          detachConnectionLoss(candidate);
           candidate.disconnect();
           return null;
         } catch (error) {
@@ -1224,13 +1269,27 @@ export function initDatasetConnections(options) {
         }
       }
 
+      const supersedeConnection = () => {
+        if (revision === operationRevision) operationRevision += 1;
+      };
+      // Cancel ends this connection as a newer one would: what it opened
+      // is released, and the source on screen stays. Destroying the module
+      // also disconnects the candidate, which ends its requests at once.
+      const connectOpening = beginShownOpening(inputValue, {
+        cancel: supersedeConnection,
+        stop: () => {
+          supersedeConnection();
+          const failure = disconnectCandidateOnce();
+          if (failure !== null) throw failure;
+        }
+      });
+      setBusy(1);
+
       try {
         candidate = createCandidate();
-        if (sourceType === 'remote') {
-          await candidate.connect({ url: inputValue });
-        } else {
-          await candidate.connect(inputValue);
-        }
+        const connection = sourceType === 'remote'
+          ? await candidate.connect({ url: inputValue })
+          : await candidate.connect(inputValue);
         assertCurrentOperation(revision);
         if (!sourceConnected(candidate)) {
           throw new Error(
@@ -1247,18 +1306,29 @@ export function initDatasetConnections(options) {
           const cleanupError = disconnectCandidateOnce();
           if (cleanupError !== null) throw cleanupError;
           updateConnectionUI(sourceConnected(priorSource));
-          settleLoadingNotification(
+          settleShownOpening(
             'fail',
-            connectNotifId,
-            `Connected ${inputLabel} has no datasets. Add a valid export and reconnect.`
+            connectOpening,
+            `Connected ${inputLabel} has no datasets. Add an AnnData file and reconnect.`
           );
           return;
         }
 
-        attachConnectionLoss(candidate);
-        const activationIntent = datasets.length === 1
+        // One dataset is opened. A catalog of several is only listed, unless
+        // the dataset on screen comes from this kind of source: its slot is
+        // the new connection's, so the catalog's default dataset replaces it
+        // (the others stay one choice away in the dataset list).
+        const defaultId = typeof connection?.defaultDatasetId === 'string'
+          ? connection.defaultDatasetId
+          : null;
+        const opened = datasets.length === 1
+          ? datasets[0]
+          : replacesShown
+            ? datasets.find(dataset => dataset.id === defaultId) ?? datasets[0]
+            : null;
+        const activationIntent = opened !== null
           ? datasetIntents.beginIfNoActionSince(clickAction, {
-              label: `Loading ${datasets[0].name}…`,
+              label: `Loading ${opened.name}…`,
               value: null
             })
           : null;
@@ -1267,9 +1337,9 @@ export function initDatasetConnections(options) {
           try {
             ready = await datasetIntents.activate(
               activationIntent,
-              datasets[0].id,
+              opened.id,
               sourceType,
-              loadMethod,
+              clickLoadMethod,
               candidate
             );
           } catch (error) {
@@ -1289,8 +1359,7 @@ export function initDatasetConnections(options) {
             // select; the connection is not adopted and says nothing more.
             disconnectCandidateOnce();
             updateConnectionUI(sourceConnected(priorSource));
-            activeLoadingNotifications.delete(connectNotifId);
-            notifications.dismiss(connectNotifId);
+            dismissShownOpening(connectOpening);
             return;
           }
           // Published — and possibly replaced since by a newer choice — so
@@ -1307,16 +1376,17 @@ export function initDatasetConnections(options) {
             source = candidate;
             updateConnectionUI(true);
             candidatePublished = true;
-            detachConnectionLoss(priorSource);
+            connectOpening.step('Updating the dataset list');
             await populate();
             assertCurrentOperation(revision);
-            settleLoadingNotification(
+            settleShownOpening(
               'complete',
-              connectNotifId,
+              connectOpening,
               ready === true
-                ? `Connected - dataset "${datasets[0].name}" loaded`
-                : `Connected - dataset "${datasets[0].name}" is available ` +
-                  `in Sample datasets.`
+                ? `Connected - dataset "${opened.name}" loaded`
+                : `Connected - "${opened.name}" was not opened because ` +
+                  'another dataset was chosen meanwhile. Open the address ' +
+                  'again to show it.'
             );
             return;
           }
@@ -1334,23 +1404,26 @@ export function initDatasetConnections(options) {
         );
         candidatePublished = true;
         if (adoption.cleanupError !== null) {
-          settleLoadingNotification(
+          settleShownOpening(
             'fail',
-            connectNotifId,
-            `Connected - ${adoption.count} datasets found, but the prior ` +
-            `connection could not be released: ` +
-            `${errorMessage(adoption.cleanupError)}`
+            connectOpening,
+            saidFailure(
+              `Connected - ${formatCountOf(adoption.count, 'dataset')} found, but the prior ` +
+              'connection could not be released.',
+              adoption.cleanupError
+            )
           );
           return;
         }
-        settleLoadingNotification(
+        settleShownOpening(
           'complete',
-          connectNotifId,
+          connectOpening,
           adoption.count === 1
-            ? `Connected - dataset "${datasets[0].name}" is available in ` +
-              `Sample datasets.`
-            : `Connected - ${adoption.count} datasets found. Choose one ` +
-              `from Sample datasets.`
+            ? `Connected - "${datasets[0].name}" was not opened because ` +
+              'another dataset was chosen meanwhile. Open the address again ' +
+              'to show it.'
+            : `Connected - ${formatCountOf(adoption.count, 'dataset')} found. Choose one ` +
+              `from the dataset list.`
         );
       } catch (error) {
         if (destroyed) {
@@ -1376,14 +1449,16 @@ export function initDatasetConnections(options) {
           updateConnectionUI(true);
         }
         if (candidatePublished) {
-          settleLoadingNotification(
+          settleShownOpening(
             'fail',
-            connectNotifId,
-            `Dataset loaded, but the catalog could not be refreshed: ` +
-            `${errorMessage(error)}`
+            connectOpening,
+            saidFailure(
+              'Dataset loaded, but the catalog could not be refreshed.',
+              error
+            )
           );
           debug.error(
-            `[UI] ${inputLabel} post-publication catalog error:`,
+            `[UI] ${inputLabel} post-publication catalog error: ${errorMessage(error)}`,
             error
           );
           return;
@@ -1415,8 +1490,7 @@ export function initDatasetConnections(options) {
           failureErrors.length === 1
         ) {
           dataLoad.cancel();
-          activeLoadingNotifications.delete(connectNotifId);
-          notifications.dismiss(connectNotifId);
+          dismissShownOpening(connectOpening);
           return;
         }
         try {
@@ -1431,38 +1505,25 @@ export function initDatasetConnections(options) {
               `${inputLabel} connection recovery failed.`
             );
         dataLoad.fail(exactError);
-        settleLoadingNotification(
+        settleShownOpening(
           'fail',
-          connectNotifId,
-          reportDataSourceFailure(
-            failureSubject,
-            'could not be reached',
+          connectOpening,
+          saidFailure(
+            describeDataSourceFailure(failureSubject, failureVerb, exactError),
             exactError
           )
         );
-        debug.error(`[UI] ${inputLabel} connection error:`, exactError);
+        debug.error(`[UI] ${inputLabel} connection error: ${errorMessage(exactError)}`, exactError);
       } finally {
-        if (
-          !destroyed &&
-          revision === operationRevision &&
-          !recoveryBlocked
-        ) {
-          connectButton.disabled = false;
-        }
+        setBusy(-1);
       }
     }
-    listen(connectButton, 'click', () => {
-      return launchOperation(
-        handleConnectClick,
-        `${inputLabel} connection handler rejected`
-      );
-    });
 
     async function handleDisconnectClick() {
       const revision = ++operationRevision;
       const connectedSource = source;
-      connectButton.disabled = true;
       disconnectButton.disabled = true;
+      setBusy(1);
       try {
         const wasActive =
           dataSourceManager.getCurrentSourceType() === sourceType;
@@ -1490,7 +1551,6 @@ export function initDatasetConnections(options) {
           sourceType,
           `${inputLabel} disconnected replacement`
         );
-        detachConnectionLoss(connectedSource);
         connectedSource.disconnect();
         dataSourceManager.unregisterSource(sourceType);
         dataSourceManager.registerSource(sourceType, disconnectedSource);
@@ -1505,9 +1565,7 @@ export function initDatasetConnections(options) {
         if (destroyed) return;
         if (isDatasetReloadSupersededError(error)) return;
         recoveryBlocked = true;
-        connectButton.disabled = true;
         disconnectButton.disabled = true;
-        connectionInput.disabled = true;
         notifications.error(
           `${inputLabel} disconnect could not finish safely. Reload the ` +
           `page before reconnecting. Cause: ${errorMessage(error)}`,
@@ -1517,14 +1575,14 @@ export function initDatasetConnections(options) {
             title: 'Disconnect recovery blocked'
           }
         );
-        debug.error(`[UI] ${inputLabel} disconnect error:`, error);
+        debug.error(`[UI] ${inputLabel} disconnect error: ${errorMessage(error)}`, error);
       } finally {
+        setBusy(-1);
         if (
           !destroyed &&
           revision === operationRevision &&
           !recoveryBlocked
         ) {
-          connectButton.disabled = false;
           disconnectButton.disabled = false;
         }
       }
@@ -1536,74 +1594,247 @@ export function initDatasetConnections(options) {
       );
     });
 
-    const initialConnected = sourceConnected(source);
-    if (initialConnected && connectionInput.value.length === 0) {
-      const value = sourceInputValue(source);
-      if (typeof value !== 'string' || value.length === 0) {
-        throw new TypeError(
-          `${inputLabel} connected source must publish its input value.`
-        );
-      }
-      connectionInput.value = value;
+    /**
+     * Connect to `value`. The dataset on screen stays until the new one is
+     * ready, which then replaces it, even when it comes from another
+     * connection of this kind; on failure or Cancel it stays. Failures are
+     * reported by the connect path itself.
+     *
+     * @returns {Promise<boolean>} Whether `value` is now connected.
+     */
+    async function open(value, openLoadMethod) {
+      assertAlive();
+      const connectedTo = () =>
+        sourceConnected(source) && sourceInputValue(source) === value;
+      if (connectedTo()) return true;
+      // The address bar shows what a session (or anything else) opened.
+      if (addressInputElement !== null) addressInputElement.value = value;
+      await handleConnect(value, openLoadMethod, { supersede: true });
+      return !destroyed && connectedTo();
     }
-    updateConnectionUI(initialConnected);
-    // `updateConnectionUI` owns the text input's enabled state; the two buttons
-    // have no other owner until an operation runs, so admission is theirs.
-    admitControls(connectButton, disconnectButton);
+    openers.set(sourceType, value =>
+      launchOperation(
+        () => open(value, DATA_LOAD_METHODS.SESSION_SOURCE),
+        `${inputLabel} open rejected`
+      )
+    );
+
+    /**
+     * Show the dataset of a connection that is still open: it was replaced
+     * on screen by another choice, and its address was opened again.
+     */
+    async function reopenConnected(requestLoadMethod) {
+      const datasets = requireDatasetInventory(
+        await source.listDatasets(),
+        sourceType
+      );
+      if (datasets.length !== 1) {
+        datasetSelect.focus();
+        notifications.info(
+          `${inputLabel} is open. Choose one of its datasets in the dataset list.`,
+          { category: 'connectivity' }
+        );
+        return;
+      }
+      const intent = datasetIntents.begin({
+        label: `Loading ${datasets[0].name}…`,
+        value: null
+      });
+      try {
+        await datasetIntents.activate(
+          intent,
+          datasets[0].id,
+          sourceType,
+          requestLoadMethod,
+          source
+        );
+      } catch (error) {
+        if (!isDatasetReloadSupersededError(error)) throw error;
+      } finally {
+        datasetIntents.settle(intent);
+      }
+    }
+
+    connectors.set(sourceType, Object.freeze({
+      /**
+       * Open `value` from the address bar: show it again when it is the open
+       * connection, else connect to it; what is on screen stays until it is
+       * ready.
+       */
+      async request(value) {
+        assertAlive();
+        if (recoveryBlocked) {
+          notifications.error(
+            `${inputLabel} cannot be opened again until the page is reloaded.`,
+            { category: 'connectivity' }
+          );
+          return;
+        }
+        if (sourceConnected(source) && sourceInputValue(source) === value) {
+          if (dataSourceManager.getCurrentSourceType() === sourceType) {
+            notifications.info(`${value} is already open.`, { category: 'connectivity' });
+            return;
+          }
+          await reopenConnected(loadMethod);
+          return;
+        }
+        await open(value, loadMethod);
+      }
+    }));
+
+    updateConnectionUI(sourceConnected(source));
+    // `updateConnectionUI` shows the connection; Disconnect has no other
+    // owner until an operation runs, so admission is its.
+    admitControls(disconnectButton);
+    return Object.freeze({
+      connectedValue: () => (sourceConnected(source) ? sourceInputValue(source) : null)
+    });
   }
 
   const remote = requireControlGroup(
     dom,
     [
-      'remoteConnectBtn',
       'remoteDisconnectBtn',
       'remoteDisconnectContainer',
-      'remoteServerUrl'
+      'remoteConnectionTarget'
     ],
     'Remote'
   );
-  if (remote !== null) {
-    wireConnection({
-      connectButton: remote.remoteConnectBtn,
-      connectionInput: remote.remoteServerUrl,
-      describeInputProblem: describeRemoteAddressProblem,
-      disconnectButton: remote.remoteDisconnectBtn,
-      disconnectContainer: remote.remoteDisconnectContainer,
-      emptyInputMessage:
-        'Enter a remote server address, such as http://localhost:8765, '
-        + 'before connecting.',
-      failureSubject: 'The remote server',
-      inputLabel: 'Remote server',
-      loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
-      sourceType: 'remote'
-    });
-  }
+  const remoteConnection = remote === null
+    ? null
+    : wireConnection({
+        connectionTarget: remote.remoteConnectionTarget,
+        describeInputProblem: describeRemoteAddressProblem,
+        disconnectButton: remote.remoteDisconnectBtn,
+        disconnectContainer: remote.remoteDisconnectContainer,
+        emptyInputMessage:
+          'Enter a server address, such as localhost:8765, before opening it.',
+        failureSubject: 'The Cellucid server',
+        failureVerb: 'could not be reached',
+        inputLabel: 'Server',
+        loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
+        sourceType: 'remote'
+      });
 
-  const github = requireControlGroup(
+  const dataLink = requireControlGroup(
     dom,
     [
-      'githubConnectBtn',
-      'githubDisconnectBtn',
-      'githubDisconnectContainer',
-      'githubRepoUrl'
+      'dataLinkDisconnectBtn',
+      'dataLinkDisconnectContainer',
+      'dataLinkConnectionTarget'
     ],
-    'GitHub'
+    'Data link'
   );
-  if (github !== null) {
-    wireConnection({
-      connectButton: github.githubConnectBtn,
-      connectionInput: github.githubRepoUrl,
-      describeInputProblem: describeGitHubPathProblem,
-      disconnectButton: github.githubDisconnectBtn,
-      disconnectContainer: github.githubDisconnectContainer,
-      emptyInputMessage:
-        'Enter a GitHub repository path, such as owner/repo/exports, '
-        + 'before connecting.',
-      failureSubject: 'The GitHub repository',
-      inputLabel: 'GitHub repository',
-      loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT,
-      sourceType: 'github-repo'
+  const linkConnection = dataLink === null
+    ? null
+    : wireConnection({
+        connectionTarget: dataLink.dataLinkConnectionTarget,
+        describeInputProblem: describeDataLinkProblem,
+        disconnectButton: dataLink.dataLinkDisconnectBtn,
+        disconnectContainer: dataLink.dataLinkDisconnectContainer,
+        emptyInputMessage:
+          'Paste a link or an id, such as a CELLxGENE dataset link, GSE123456, '
+          + 'or owner/repo/folder, before opening it.',
+        failureSubject: 'The linked data',
+        failureVerb: 'could not be opened',
+        inputLabel: 'Link',
+        loadMethod: DATA_LOAD_METHODS.LINK_CONNECT,
+        sourceType: 'link'
+      });
+
+  // One address bar for a server and for linked data: what is typed decides
+  // which (`address-routing.js`).
+  const addressBar = requireControlGroup(
+    dom,
+    ['dataAddressInput', 'dataAddressOpenBtn'],
+    'Address bar'
+  );
+  if (addressBar !== null) {
+    const { dataAddressInput, dataAddressOpenBtn } = addressBar;
+    addressOpenButton = dataAddressOpenBtn;
+    addressInputElement = dataAddressInput;
+    const shown = remoteConnection?.connectedValue() ?? linkConnection?.connectedValue() ?? null;
+    if (shown !== null && dataAddressInput.value.length === 0) {
+      dataAddressInput.value = shown;
+    }
+
+    /**
+     * Open what the bar holds. A web address the text cannot settle is asked
+     * whether it is a Cellucid server before anything is connected.
+     */
+    async function openAddress() {
+      const route = routeAddress(dataAddressInput.value);
+      if (route.kind === 'invalid') {
+        notifications.error(route.message, { category: 'connectivity' });
+        return;
+      }
+      let kind = route.kind === 'server' ? 'remote' : 'link';
+      let value = route.kind === 'server' ? route.url : route.value;
+      // Asking the address whether it is a server is the opening's first
+      // step: the connection that follows joins this opening, and how the
+      // opening ends is that connection's (`saysOutcome: false`), its
+      // failure included.
+      const probe = new AbortController();
+      let asking = null;
+      if (route.kind === 'ask') {
+        asking = beginOpening({
+          title: route.value,
+          step: 'Checking for a Cellucid server',
+          onCancel: () => probe.abort(),
+          saysOutcome: false
+        });
+        activeOpenings.set(asking, () => probe.abort());
+      }
+      try {
+        if (route.kind === 'ask') {
+          setBusy(1);
+          let isServer;
+          try {
+            isServer = await probeRemoteServer(route.url, {
+              signal: AbortSignal.any([lifecycleController.signal, probe.signal])
+            });
+          } finally {
+            setBusy(-1);
+          }
+          if (destroyed || probe.signal.aborted) return;
+          kind = isServer ? 'remote' : 'link';
+          value = isServer ? route.url : route.value;
+        }
+        await openKind(kind, value);
+      } catch (error) {
+        if (probe.signal.aborted && error?.name === 'AbortError') return;
+        throw error;
+      } finally {
+        if (asking !== null) dismissShownOpening(asking);
+      }
+    }
+
+    /** Hand one routed address to its connection. */
+    async function openKind(kind, value) {
+      const connector = connectors.get(kind);
+      if (connector === undefined) {
+        notifications.error(
+          kind === 'remote'
+            ? 'This page cannot connect to a Cellucid server.'
+            : 'This page cannot open linked data.',
+          { category: 'connectivity' }
+        );
+        return;
+      }
+      await connector.request(value);
+    }
+
+    listen(dataAddressOpenBtn, 'click', () => launchOperation(
+      openAddress,
+      'Address bar open rejected'
+    ));
+    listen(dataAddressInput, 'keydown', event => {
+      if (event.key !== 'Enter' || event.isComposing) return undefined;
+      event.preventDefault();
+      if (dataAddressOpenBtn.disabled) return undefined;
+      return launchOperation(openAddress, 'Address bar open rejected');
     });
+    admitControls(dataAddressInput, dataAddressOpenBtn);
   }
 
   function destroy() {
@@ -1635,21 +1866,19 @@ export function initDatasetConnections(options) {
       }
     }
     operationInvalidators.clear();
-    for (const cleanup of [...connectionLossCleanups]) {
+    for (const [opening, stop] of activeOpenings) {
       try {
-        cleanup();
+        stop();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        opening.dismiss();
       } catch (error) {
         cleanupErrors.push(error);
       }
     }
-    for (const id of activeLoadingNotifications) {
-      try {
-        notifications.dismiss(id);
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
-    activeLoadingNotifications.clear();
+    activeOpenings.clear();
     destroyPromise = Promise.allSettled(
       [...activeOperations]
     ).then(() => {
@@ -1664,5 +1893,22 @@ export function initDatasetConnections(options) {
     return destroyPromise;
   }
 
-  return Object.freeze({ destroy });
+  /**
+   * Open the connection of one source type at `value` (a data link's
+   * locator, a server address).
+   *
+   * @param {string} sourceType
+   * @param {string} value
+   * @returns {Promise<boolean>} Whether it is now connected.
+   */
+  function openConnection(sourceType, value) {
+    const opener = openers.get(sourceType);
+    if (opener === undefined) {
+      throw new Error(`No ${sourceType} connection control is wired.`);
+    }
+    validateDatasetId(value, `${sourceType} connection value`);
+    return opener(value);
+  }
+
+  return Object.freeze({ destroy, openConnection });
 }

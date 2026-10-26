@@ -17,14 +17,14 @@ import { clamp } from '../../utils/number-utils.js';
 import { initCategoricalLegend } from './legend/categorical-legend.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 import {
-  coalesceToFrame,
   createButton,
   createInfoRow,
   createInfoTip,
   createSliderField,
   createSwitch
 } from '../components/controls.js';
-import { formatPercent } from '../components/display-format.js';
+import { initOutlierFilterControl } from './outlier-filter-control.js';
+import { PLACES } from '../place-names.js';
 
 let colormapMenuIdCounter = 0;
 
@@ -32,30 +32,6 @@ let colormapMenuIdCounter = 0;
  * A legend value: three significant figures, scientific notation outside
  * 0.01 to 10,000.
  */
-/**
- * Whether a field's outlier quantiles hold at least one available value. An
- * unavailable quantile is -1 (or NaN), and a field where no category reached
- * `centroid_min_points` has nothing but those, so its control would filter
- * nothing. Remembered per array: the scan stops at the first available value,
- * and an all-unavailable array is scanned once.
- */
-const outlierAvailability = new WeakMap();
-function hasAvailableOutlierQuantile(quantiles) {
-  if (!quantiles || quantiles.length === 0) return false;
-  let available = outlierAvailability.get(quantiles);
-  if (available === undefined) {
-    available = false;
-    for (let index = 0; index < quantiles.length; index++) {
-      if (quantiles[index] >= 0) {
-        available = true;
-        break;
-      }
-    }
-    outlierAvailability.set(quantiles, available);
-  }
-  return available;
-}
-
 function formatLegendNumber(value) {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   if (value === 0) return '0';
@@ -72,12 +48,22 @@ function formatLegendNumber(value) {
   return sign + abs.toFixed(2);
 }
 
-export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null }) {
+export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null, onChooseLatent = () => {} }) {
   const displayOptionsContainer = dom?.optionsContainer || null;
   const legendEl = dom?.legendEl || null;
-  const outlierFilterContainer = dom?.outlierFilterContainer || null;
-  const outlierFilterInput = dom?.outlierFilterInput || null;
-  const outlierFilterDisplay = dom?.outlierFilterDisplay || null;
+  const outlierControl = initOutlierFilterControl({
+    state,
+    dom: {
+      container: dom?.outlierFilterContainer || null,
+      input: dom?.outlierFilterInput || null,
+      display: dom?.outlierFilterDisplay || null,
+      note: dom?.outlierFilterNote || null,
+      progress: dom?.outlierFilterProgress || null,
+      progressBar: dom?.outlierFilterProgressBar || null,
+      action: dom?.outlierFilterAction || null,
+    },
+    onChooseLatent,
+  });
   const centroidControls = dom?.centroidControls || null;
   const centroidPointsCheckbox = dom?.centroidPointsCheckbox || null;
   const centroidLabelsCheckbox = dom?.centroidLabelsCheckbox || null;
@@ -85,6 +71,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   const {
     refreshCategoryCounts,
     renderCategoricalLegend,
+    releaseCategoricalLegend,
     destroy: destroyCategoricalLegend
   } = initCategoricalLegend({ state, legendEl, dataSourceManager });
   // Counts change on every visibility frame; while the legend's panel is
@@ -93,7 +80,6 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   let countsGate = null;
   const lifecycleController = new AbortController();
   let renderLifecycleController = new AbortController();
-  let outlierFrame = null;
   let destroyed = false;
 
   function listen(
@@ -123,6 +109,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     if (!legendEl) return;
     setDisplayOptionsVisibility(field);
     if (!field) {
+      releaseCategoricalLegend();
       legendEl.replaceChildren();
       return;
     }
@@ -138,6 +125,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       renderCategoricalLegend(field, model);
       return;
     }
+    releaseCategoricalLegend();
     legendEl.replaceChildren();
 
     if (model.kind === 'continuous') {
@@ -312,7 +300,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       filterSection.className = 'legend-section legend-filter';
       const filterHeader = document.createElement('h3');
       filterHeader.className = 'section-title';
-      filterHeader.textContent = 'Visible range';
+      filterHeader.textContent = PLACES.visibleRange.name;
       filterSection.appendChild(filterHeader);
 
       let liveFilteringEnabled = true;
@@ -460,15 +448,8 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
   function handleOutlierUI(field) {
     if (destroyed) return;
-    const hasOutliers = Boolean(field) && hasAvailableOutlierQuantile(field.outlierQuantiles);
-    if (outlierFilterContainer) {
-      outlierFilterContainer.hidden = !hasOutliers;
-      if (hasOutliers) {
-        const pct = Math.round((field._outlierThreshold ?? 1.0) * 100);
-        if (outlierFilterInput) outlierFilterInput.value = String(pct);
-        if (outlierFilterDisplay) outlierFilterDisplay.textContent = formatPercent(pct);
-      }
-    }
+    // What the outlier filter can do for this field, and why; nothing is read.
+    outlierControl.render(field);
 
     if (centroidControls) {
       const isCategorical = Boolean(field && field.kind === 'category');
@@ -486,25 +467,6 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         }
       }
     }
-  }
-
-  if (outlierFilterInput) {
-    // The visibility recomputation runs at most once per frame while the
-    // thumb moves, with the readout painted in the same frame; releasing the
-    // thumb commits the final value.
-    const applyOutlierThreshold = () => {
-      if (destroyed) return;
-      const pct = parseFloat(outlierFilterInput.value);
-      if (outlierFilterDisplay) outlierFilterDisplay.textContent = formatPercent(pct);
-      state.setOutlierThresholdForActive(pct / 100);
-    };
-    outlierFrame = coalesceToFrame(applyOutlierThreshold);
-
-    listen(outlierFilterInput, 'input', () => outlierFrame());
-    listen(outlierFilterInput, 'change', () => {
-      outlierFrame.cancel();
-      applyOutlierThreshold();
-    });
   }
 
   // Centroid visibility toggles
@@ -533,9 +495,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     for (const cleanup of [
       () => renderLifecycleController.abort(),
       () => lifecycleController.abort(),
-      () => {
-        if (outlierFrame !== null) outlierFrame.cancel();
-      },
+      () => outlierControl.destroy(),
       () => countsGate?.destroy(),
       destroyCategoricalLegend
     ]) {

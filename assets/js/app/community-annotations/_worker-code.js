@@ -15,6 +15,8 @@ import {
   isCanonicalGitHubRepositoryFullName,
   isCanonicalGitHubRepositoryName,
 } from './github-reference.js';
+import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
@@ -324,7 +326,7 @@ async function readBoundedUtf8Body(
     if (new TextEncoder().encode(text).byteLength > maxBytes) {
       throw new WorkerHttpError(
         tooLargeStatus,
-        `${label} body exceeds ${maxBytes} bytes`
+        `${label} body exceeds ${formatCountOf(maxBytes, 'byte')}`
       );
     }
     return text;
@@ -368,7 +370,7 @@ async function readBoundedUtf8Body(
       if (totalBytes > maxBytes) {
         throw new WorkerHttpError(
           tooLargeStatus,
-          `${label} body exceeds ${maxBytes} bytes`
+          `${label} body exceeds ${formatCountOf(maxBytes, 'byte')}`
         );
       }
       try {
@@ -465,7 +467,7 @@ function streamBoundedGitHubJsonResponse(
     }
     throw new WorkerHttpError(
       502,
-      `${label} body exceeds ${maxBytes} bytes`
+      `${label} body exceeds ${formatCountOf(maxBytes, 'byte')}`
     );
   }
   const body = response?.body;
@@ -588,7 +590,7 @@ function streamBoundedGitHubJsonResponse(
         if (totalBytes > maxBytes) {
           throw new WorkerHttpError(
             502,
-            `${label} body exceeds ${maxBytes} bytes`
+            `${label} body exceeds ${formatCountOf(maxBytes, 'byte')}`
           );
         }
         try {
@@ -815,24 +817,7 @@ function assertExactString(
 }
 
 function assertExactFields(value, fields, label, status = 400) {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value)
-  ) {
-    throw new WorkerHttpError(status, `${label} must be a JSON object`);
-  }
-  const keys = Object.keys(value);
-  if (
-    keys.length !== fields.length ||
-    fields.some((field) => !Object.hasOwn(value, field))
-  ) {
-    throw new WorkerHttpError(
-      status,
-      `${label} must contain exactly ${fields.join(', ')}`
-    );
-  }
-  return value;
+  return requireExactObjectKeys(value, fields, label, message => new WorkerHttpError(status, message));
 }
 
 function assertCanonicalGitHubAccount(value, label) {
@@ -1187,7 +1172,7 @@ function boundedJsonResponse(data, status, headers, maxBytes, label) {
   }
   const text = JSON.stringify(data);
   if (new TextEncoder().encode(text).byteLength > maxBytes) {
-    throw new WorkerHttpError(502, `${label} exceeds ${maxBytes} bytes`);
+    throw new WorkerHttpError(502, `${label} exceeds ${formatCountOf(maxBytes, 'byte')}`);
   }
   return jsonTextResponse(text, status, headers);
 }
@@ -2570,18 +2555,7 @@ function assertAllowedGitHubProxyRoute(githubUrl, method) {
 }
 
 function assertExactRequestFields(document, required, optional, label) {
-  const allowed = new Set([...required, ...optional]);
-  const keys = Object.keys(document);
-  if (
-    required.some((key) => !Object.hasOwn(document, key)) ||
-    keys.some((key) => !allowed.has(key))
-  ) {
-    throw new WorkerHttpError(
-      400,
-      `${label} must contain required fields ${required.join(', ')} and only optional fields ${optional.join(', ')}`
-    );
-  }
-  return document;
+  return requireObjectKeys(document, required, optional, label, message => new WorkerHttpError(400, message));
 }
 
 function assertExactSha(value, label) {
@@ -3258,7 +3232,7 @@ async function githubFetchCollection(
     if (pageItems.length !== expectedLength) {
       throw new WorkerHttpError(
         502,
-        `GitHub ${field} page ${page} must contain exactly ${expectedLength} items`
+        `GitHub ${field} page ${page} must contain exactly ${formatCountOf(expectedLength, 'item')}`
       );
     }
     const baseIndex = (page - 1) * GITHUB_PAGE_SIZE;

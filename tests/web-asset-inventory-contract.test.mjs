@@ -8,6 +8,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 
@@ -21,6 +22,8 @@ import {
   isRuntimeCacheAssetPath,
   listSourceControlledAssets,
   serializeWebAssetInventory,
+  stalePageScripts,
+  stampPageScripts,
 } from '../scripts/generate-web-asset-inventory.mjs';
 
 test('web asset paths use one Windows-portable root-relative grammar', () => {
@@ -79,7 +82,7 @@ test('web inventory MIME types are explicit and never guessed', () => {
     'font/woff2'
   );
   assert.equal(
-    contentTypeForAssetPath('assets/img/favicon.ico'),
+    contentTypeForAssetPath('favicon.ico'),
     'image/vnd.microsoft.icon'
   );
   assert.equal(
@@ -116,9 +119,13 @@ test('runtime cache policy excludes only the deploy-only social preview', async 
       rootDir,
       paths: [
         'assets/img/og-preview.jpg',
+        'accessibility.html',
         'browserconfig.xml',
+        'favicon.ico',
         'index.html',
+        'privacy.html',
         'site.webmanifest',
+        'terms.html',
       ],
     }),
     /deploy-only social preview/i
@@ -204,6 +211,10 @@ test('web inventory binds exact bytes to the single index build id', async () =>
   await writeFile(join(rootDir, '404.html'), '<!doctype html><title>Not found</title>\n');
   await writeFile(join(rootDir, 'CITATION.cff'), 'cff-version: 1.2.0\n');
   await writeFile(join(rootDir, 'browserconfig.xml'), '<browserconfig/>\n');
+  await writeFile(join(rootDir, 'favicon.ico'), 'ico\n');
+  await writeFile(join(rootDir, 'privacy.html'), '<!doctype html><title>Privacy</title>\n');
+  await writeFile(join(rootDir, 'terms.html'), '<!doctype html><title>Terms</title>\n');
+  await writeFile(join(rootDir, 'accessibility.html'), '<!doctype html><title>Accessibility</title>\n');
   await writeFile(join(rootDir, 'site.webmanifest'), '{}\n');
 
   const inventory = await buildWebAssetInventory({
@@ -212,9 +223,13 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       '404.html',
       'CITATION.cff',
       'assets/js/app.js',
+      'accessibility.html',
       'browserconfig.xml',
+      'favicon.ico',
       'index.html',
+      'privacy.html',
       'site.webmanifest',
+      'terms.html',
     ],
   });
   assert.deepEqual(
@@ -228,18 +243,22 @@ test('web inventory binds exact bytes to the single index build id', async () =>
     [
       '404.html',
       'CITATION.cff',
+      'accessibility.html',
       'assets/js/app.js',
       'browserconfig.xml',
+      'favicon.ico',
       'index.html',
+      'privacy.html',
       'site.webmanifest',
+      'terms.html',
     ]
   );
   assert.equal(inventory.assets[0].content_type, 'text/html; charset=utf-8');
   assert.equal(inventory.assets[1].content_type, 'application/octet-stream');
-  assert.equal(inventory.assets[2].bytes, 27);
-  assert.match(inventory.assets[2].sha256, /^[0-9a-f]{64}$/);
+  assert.equal(inventory.assets[3].bytes, 27);
+  assert.match(inventory.assets[3].sha256, /^[0-9a-f]{64}$/);
   assert.equal(
-    inventory.assets[2].content_type,
+    inventory.assets[3].content_type,
     'application/javascript; charset=utf-8'
   );
 
@@ -262,9 +281,13 @@ test('web inventory binds exact bytes to the single index build id', async () =>
         '404.html',
         'CITATION.cff',
         'assets/js/app.js',
+        'accessibility.html',
         'browserconfig.xml',
+        'favicon.ico',
         'index.html',
+        'privacy.html',
         'site.webmanifest',
+        'terms.html',
       ],
     }),
     /exactly one.*build id/i
@@ -361,3 +384,100 @@ test(
     );
   }
 );
+
+const sha256Base64 = text => createHash('sha256').update(text, 'utf8').digest('base64');
+
+test('a page names every script by its bytes, and its policy allows exactly its inline scripts', () => {
+  const versions = new Map([
+    ['assets/js/app/main.js', 'aaaaaaaaaaaa'],
+    ['assets/js/lib/dep.js', 'bbbbbbbbbbbb'],
+    ['assets/external/vendor.js', 'cccccccccccc'],
+  ]);
+  const html = [
+    '<!doctype html><head>',
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\' https://cdn.example \'sha256-stale=\'; style-src \'self\'" />',
+    '<!-- a comment may name <script src="assets/js/nowhere.js"></script> without being one -->',
+    '<script type="importmap"></script>',
+    '<script src="assets/external/vendor.js?v=0123"></script>',
+    '<script src="https://cdn.example/x.js"></script>',
+    '<script type="application/ld+json">{"a": 1}</script>',
+    '</head><body><script type="module" src="assets/js/app/main.js"></script></body>',
+  ].join('\n');
+  const stamped = stampPageScripts({ html, pagePath: 'index.html', versions });
+
+  const map = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(stamped)[1]);
+  assert.deepEqual(map, {
+    imports: {
+      './assets/external/vendor.js': './assets/external/vendor.js?v=cccccccccccc',
+      './assets/js/app/main.js': './assets/js/app/main.js?v=aaaaaaaaaaaa',
+      './assets/js/lib/dep.js': './assets/js/lib/dep.js?v=bbbbbbbbbbbb',
+    },
+  });
+  assert.match(stamped, /<script src="assets\/external\/vendor\.js\?v=cccccccccccc"><\/script>/);
+  assert.match(stamped, /<script type="module" src="assets\/js\/app\/main\.js\?v=aaaaaaaaaaaa"><\/script>/);
+  assert.match(stamped, /<script src="https:\/\/cdn\.example\/x\.js"><\/script>/);
+  assert.match(stamped, /<!-- a comment may name <script src="assets\/js\/nowhere\.js"><\/script> without being one -->/);
+
+  const mapText = /<script type="importmap">([\s\S]*?)<\/script>/.exec(stamped)[1];
+  const policy = /content="([^"]*)"/.exec(stamped)[1];
+  assert.equal(
+    policy,
+    `default-src 'self'; script-src 'self' https://cdn.example 'sha256-${sha256Base64(mapText)}' `
+      + `'sha256-${sha256Base64('{"a": 1}')}'; style-src 'self'`
+  );
+  assert.equal(stampPageScripts({ html: stamped, pagePath: 'index.html', versions }), stamped);
+
+  // A page below the root keys its map relative to its own folder.
+  const nested = stampPageScripts({
+    html: '<script type="importmap"></script><script type="module" src="/assets/js/app/main.js"></script>',
+    pagePath: 'assets/auth/callback.html',
+    versions,
+  });
+  assert.match(nested, /"\.\.\/js\/lib\/dep\.js": "\.\.\/js\/lib\/dep\.js\?v=bbbbbbbbbbbb"/);
+  assert.match(nested, /src="\/assets\/js\/app\/main\.js\?v=aaaaaaaaaaaa"/);
+});
+
+test('a page that runs modules declares its one import map before them, and names only shipped scripts', () => {
+  const versions = new Map([['assets/js/app/main.js', 'aaaaaaaaaaaa']]);
+  const module = '<script type="module" src="assets/js/app/main.js"></script>';
+  assert.throws(
+    () => stampPageScripts({ html: module, pagePath: 'index.html', versions }),
+    /exactly one <script type="importmap">/
+  );
+  assert.throws(
+    () => stampPageScripts({ html: `${module}<script type="importmap"></script>`, pagePath: 'index.html', versions }),
+    /import map before its first module script/
+  );
+  assert.throws(
+    () => stampPageScripts({ html: '<script type="importmap"></script>', pagePath: 'index.html', versions }),
+    /runs no ES module/
+  );
+  assert.throws(
+    () => stampPageScripts({
+      html: '<script type="importmap"></script><script type="module" src="assets/js/gone.js"></script>',
+      pagePath: 'index.html',
+      versions,
+    }),
+    /not a shipped asset: assets\/js\/gone\.js/
+  );
+});
+
+test('every shipped page names the current bytes of every script it loads', async () => {
+  const rootDir = fileURLToPath(new URL('..', import.meta.url));
+  const paths = await listSourceControlledAssets(rootDir);
+  assert.deepEqual(
+    (await stalePageScripts({ rootDir, paths })).map(page => page.pagePath),
+    [],
+    'regenerate with `node scripts/generate-web-asset-inventory.mjs`.'
+  );
+  // The app's import map lists every shipped script, at its inventory digest.
+  const inventory = JSON.parse(await readFile(join(rootDir, 'cellucid-web-assets.json'), 'utf8'));
+  const index = await readFile(join(rootDir, 'index.html'), 'utf8');
+  const { imports } = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(index)[1]);
+  const scripts = inventory.assets.filter(asset => asset.path.startsWith('assets/') && asset.path.endsWith('.js'));
+  assert.ok(scripts.some(asset => asset.path === 'assets/js/app/main.js'));
+  assert.deepEqual(
+    imports,
+    Object.fromEntries(scripts.map(asset => [`./${asset.path}`, `./${asset.path}?v=${asset.sha256.slice(0, 12)}`]))
+  );
+});

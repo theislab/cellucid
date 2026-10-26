@@ -9,10 +9,13 @@ import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
 import {
+  connectivityVisibleCells,
   countVisibleConnectivityEdges,
-  createConnectivityEdgeOrder,
-  selectVisibleConnectivityEdges,
+  createConnectivityEdgeIndex,
+  createConnectivitySelectionScratch,
+  selectConnectivityEdges,
 } from '../assets/js/rendering/connectivity-edge-selection.js';
+import { connectivityEdgesFromPairs } from './helpers/connectivity-edges.mjs';
 
 const mainSource = await readFile(
   new URL('../assets/js/app/main.js', import.meta.url),
@@ -168,13 +171,21 @@ test('an edge is visible exactly when both endpoints pass the point threshold an
   const destinations = Uint32Array.from([1, 2, 3, 3]);
   const transparency = Uint8Array.from([1, 1, 1, 0]);
   const admissionLevels = Uint8Array.from([0, 1, 2, 0]);
-  const order = createConnectivityEdgeOrder(4);
+  const index = createConnectivityEdgeIndex(connectivityEdgesFromPairs(sources, destinations, 4));
   const visibleAt = (lodMembership, lodLevel) => {
     const visibility = { transparency, admissionLevels: lodMembership, lodLevel };
-    const output = new Uint32Array(4);
-    const selected = selectVisibleConnectivityEdges(order, sources, destinations, visibility, 4, output);
-    assert.equal(selected, countVisibleConnectivityEdges(sources, destinations, visibility, 0, 4));
-    return Array.from(output.subarray(0, selected)).sort();
+    const { mask } = connectivityVisibleCells(visibility, null);
+    const output = new Uint32Array(4 * 3);
+    const { shown } = selectConnectivityEdges(index, mask, 4, output, createConnectivitySelectionScratch());
+    assert.equal(shown, countVisibleConnectivityEdges(index, mask, 0, 4));
+    // Each record names its endpoints: map it back to its edge.
+    return Array.from({ length: shown }, (_value, record) => {
+      const edge = Array.from(sources).findIndex(
+        (source, at) => source === output[record * 3] && destinations[at] === output[record * 3 + 1]
+      );
+      assert.notEqual(edge, -1);
+      return edge;
+    }).sort();
   };
   // Cell 3 is hidden: edges 1-3 and 2-3 are not visible.
   assert.deepEqual(visibleAt(null, -1), [0, 1]);
@@ -321,8 +332,8 @@ test('full connectivity refresh completes every pane before publishing one share
       let edgesLoaded = true;
       let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = 0;
-      let currentEdgeLimit = 5;
       const getTotalEdges = () => 20;
+      const currentEdgeLimit = () => Math.min(5, getTotalEdges());
       const connectivityCheckbox = { checked: true };
       function updateEdgeVisibilityForView(viewId, publishActive) {
         calls.push(['refresh', viewId, publishActive]);
@@ -429,7 +440,7 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
   );
   assert.match(
     edgeLimitSource,
-    /viewer\.setEdgeVisibleTarget\(\s*Math\.min\(currentEdgeLimit, getTotalEdges\(\)\)\s*\)/
+    /viewer\.setEdgeVisibleTarget\(currentEdgeLimit\(\)\)/
   );
   assert.doesNotMatch(
     edgeLimitSource,

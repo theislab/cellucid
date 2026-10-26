@@ -134,7 +134,7 @@ function createState(field, paneFields = new Map()) {
           type,
           label,
           enabled: true,
-          cellIndices: [...cellIndices],
+          cellIndices: cellIndices.slice(),
           cellCount: cellIndices.length
         };
       },
@@ -153,7 +153,7 @@ function createState(field, paneFields = new Map()) {
         for (let cell = 0; cell < lookupField.codes.length; cell++) {
           if (lookupField.codes[cell] === categoryIndex) indices.push(cell);
         }
-        return indices;
+        return Uint32Array.from(indices);
       },
       getCellIndicesForRange(lookupField, minVal, maxVal, transparency) {
         lookups.push({ field: lookupField, transparency });
@@ -162,7 +162,7 @@ function createState(field, paneFields = new Map()) {
           const value = lookupField.values[cell];
           if (value >= minVal && value <= maxVal) indices.push(cell);
         }
-        return indices;
+        return Uint32Array.from(indices);
       },
       on(eventName, listener) {
         if (!stateListeners.has(eventName)) stateListeners.set(eventName, []);
@@ -261,7 +261,7 @@ function buildAnnotationTool(field, paneFields = new Map()) {
     const annotation = initAnnotationSelection({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       selectionState,
       ui: { modeDescriptionEl, hideRangeLabel() { rangeLabels.push(null); } }
     });
@@ -518,7 +518,7 @@ test('the lasso preview contract demands the combined-set payload', () => {
     initLassoSelection({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       selectionState: createHighlightSelectionState(),
       ui: { modeDescriptionEl }
     });
@@ -533,7 +533,7 @@ test('the lasso preview contract demands the combined-set payload', () => {
   assert.throws(
     () => previewCallback({
       type: 'lasso-preview',
-      cellIndices: [0, 1],
+      cellIndices: Uint32Array.of(0, 1),
       cellCount: 2,
       polygon
     }),
@@ -543,7 +543,7 @@ test('the lasso preview contract demands the combined-set payload', () => {
 
   previewCallback({
     type: 'lasso-preview',
-    cellIndices: [0, 1, 2],
+    cellIndices: Uint32Array.of(0, 1, 2),
     cellCount: 3,
     newCellCount: 2,
     mode: 'union',
@@ -558,7 +558,7 @@ test('the lasso preview contract demands the combined-set payload', () => {
   assert.throws(
     () => previewCallback({
       type: 'lasso-preview',
-      cellIndices: [0],
+      cellIndices: Uint32Array.of(0),
       cellCount: 1,
       newCellCount: 1,
       mode: 'replace',
@@ -595,7 +595,7 @@ test('a proximity step centred on empty space still lands', () => {
     initProximitySelection({
       state,
       viewer,
-      jupyterSource: null,
+      viewerHostSource: null,
       selectionState: createHighlightSelectionState(),
       ui: { modeDescriptionEl }
     });
@@ -607,7 +607,7 @@ test('a proximity step centred on empty space still lands', () => {
   withDocument(documentOwner.document, () => {
     previewCallback({
       type: 'proximity-preview',
-      cellIndices: [0, 1],
+      cellIndices: Uint32Array.of(0, 1),
       cellCount: 2,
       newCellCount: 2,
       centerCellIndex: -1,
@@ -617,7 +617,7 @@ test('a proximity step centred on empty space still lands', () => {
     stepCallback({
       step: 2,
       candidateCount: 3,
-      candidates: [0, 1, 2],
+      candidates: Uint32Array.of(0, 1, 2),
       mode: 'union',
       centerCellIndex: -1,
       radius: 3
@@ -640,7 +640,7 @@ test('a proximity step centred on empty space still lands', () => {
       stepCallback({
         step: 3,
         candidateCount: 1,
-        candidates: [0],
+        candidates: Uint32Array.of(0),
         mode: 'union',
         centerCellIndex: state.pointCount,
         radius: 3

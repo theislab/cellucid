@@ -400,6 +400,10 @@ async function withFakeDOM(run) {
     Plotly: {
       purge() {},
     },
+    innerWidth: 1280,
+    innerHeight: 800,
+    // A desktop viewport: the expanded view is not full screen.
+    matchMedia: () => ({ matches: false }),
     addEventListener(type, listener) {
       const listeners = windowListeners.get(type) ?? [];
       listeners.push(listener);
@@ -579,16 +583,18 @@ test('closing during edge resize, panel resize, or header drag restores exact in
       const scenarios = [
         {
           name: 'edge resize',
-          selector: '.analysis-modal-edge-resize-right',
+          selector: '.analysis-modal-edge-resize-e',
           start(element) {
             element.dispatchEvent({
+              button: 0,
               clientX: 640,
               clientY: 240,
+              pointerId: 17,
               preventDefault() {},
               stopPropagation() {},
-              type: 'mousedown'
+              type: 'pointerdown'
             });
-            return null;
+            return element;
           },
           expectedCursor: 'ew-resize'
         },
@@ -613,12 +619,15 @@ test('closing during edge resize, panel resize, or header drag restores exact in
           selector: '.analysis-modal-header',
           start(element) {
             element.dispatchEvent({
+              button: 0,
               clientX: 320,
               clientY: 40,
+              pointerId: 17,
               preventDefault() {},
-              type: 'mousedown'
+              target: { closest: () => null },
+              type: 'pointerdown'
             });
-            return null;
+            return element;
           },
           expectedCursor: 'move'
         }

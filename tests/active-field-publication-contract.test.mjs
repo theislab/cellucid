@@ -4,7 +4,7 @@
 // legend, and offers its outlier control. Those three came from two lists: the
 // complete one the field selector calls back into, and partial copies used when
 // the change arrived from state instead of from a click. The copies drifted —
-// a dataset's advertised starting state, Load State and a Jupyter command all
+// a dataset's advertised starting state, Load State and a viewer host command all
 // coloured the plot and populated the legend while the statistics line kept
 // reading "Field: None". These assertions keep the partial copies from coming
 // back.
@@ -55,7 +55,7 @@ test('the active-field publication names the field everywhere it is shown', () =
 test('every active-field refresh path uses that one publication', () => {
   const paths = [
     ['refreshUiAfterStateLoad', '  function refreshUiAfterStateLoad() {', '\n  }\n'],
-    ['handleFieldChanged', '  const handleFieldChanged = () => {', '\n  };\n'],
+    ['handleFieldChanged', '  const handleFieldChanged = ({ source }) => {', '\n  };\n'],
     // Each view carries its own active field — `setActiveView` restores
     // `ctx.activeFieldIndex` — so switching to a kept view is an active-field
     // change and needs the same publication, not a shorter copy of it.

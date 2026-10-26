@@ -1,19 +1,20 @@
 /**
  * Analysis loads must not be serialised.
  *
- * Every field of a prepared export is its own HTTP request, so the number that
- * decides how long an analysis waits is not how many requests it makes but how
- * many of them it makes *in sequence*. Two loaders used to await each unit
- * before starting the next:
+ * Every field or gene read can be its own request, so the number that decides
+ * how long an analysis waits is not how many requests it makes but how many of
+ * them it makes *in sequence*. Two loaders used to await each unit before
+ * starting the next:
  *
  *  - `fetchBulkObsFields` awaited one observation field at a time. Quick
  *    Insights asks for four fields on first open, which the categorical
  *    outlier masks turn into six requests; measured in Chromium at 150 ms
  *    emulated latency that was six strictly serial round trips spanning
  *    2.07 s with never more than one request in flight.
- *  - `fetchBulkGeneExpression` ran fixed batches of ten with a macrotask
+ *  - gene loading for a signature ran fixed batches of ten with a macrotask
  *    barrier between them, so a 60-gene signature cost six sequential waves
- *    however fast the link was.
+ *    however fast the link was. `readGeneColumns` asks for every gene at
+ *    once; the reader's fetch scheduler paces the requests.
  *
  * These tests pin the shape rather than the clock: they count how many loads
  * are open at once, which is load-invariant and reproduces identically on a
@@ -23,7 +24,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
-import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 
 /** A load gate that records peak concurrency and completion order. */
 function concurrencyRecorder() {
@@ -97,7 +97,6 @@ test('observation fields are requested together, not one after another', async (
     pageIds: ['page-1'],
     obsFields: fieldKeys,
     subsetPages: false,
-    includeCategoricalValues: false,
   });
 
   // Nothing has been released yet, so anything still serial would show one
@@ -120,155 +119,58 @@ test('observation fields are requested together, not one after another', async (
   assert.equal(result.stats.fieldsLoaded, fieldKeys.length);
 });
 
-test('observation field loading never exceeds the configured concurrency', async () => {
+test('every gene column is asked for at once and published in requested order', async () => {
   const gate = concurrencyRecorder();
   const layer = pageOnlyLayer();
-  const window = PerformanceConfig.batch.networkConcurrency;
-  const fieldKeys = Array.from(
-    { length: window * 2 + 3 },
-    (_unused, index) => `field-${index}`,
-  );
-  layer.getAvailableVariables = type => (
-    type === 'continuous_obs' ? fieldKeys.map(key => ({ key })) : []
-  );
-  layer.ensureObsFieldLoaded = async fieldKey => {
-    await gate.enter(fieldKey);
-    return { fieldIndex: 0, kind: 'continuous', values: Float32Array.of(1) };
-  };
-
-  const run = layer.fetchBulkObsFields({
-    pageIds: ['page-1'],
-    obsFields: fieldKeys,
-    subsetPages: false,
-    includeCategoricalValues: false,
-  });
-
-  await settle();
-  assert.equal(
-    gate.record.peak,
-    window,
-    'the loader must fill its window and then stop',
-  );
-
-  // Draining the window must let the rest through without a barrier.
-  while (gate.waiting > 0) {
-    gate.releaseAll();
-    await settle();
-  }
-  const result = await run;
-  assert.deepEqual(Object.keys(result.fields), fieldKeys);
-});
-
-test('bulk gene loading keeps a full window in flight instead of fixed batches', async () => {
-  const gate = concurrencyRecorder();
-  const layer = pageOnlyLayer();
-  const window = PerformanceConfig.batch.networkConcurrency;
   const geneKeys = Array.from(
-    { length: window + 3 },
+    { length: 23 },
     (_unused, index) => `Gene ${String(index).padStart(3, '0')}`,
   );
-  layer.refreshPageVersions = () => {};
-  layer._getBulkGeneCacheKey = () => 'bulk';
-  layer._getBulkGeneCache = () => null;
-  layer._setBulkGeneCache = () => {};
-  layer._bulkGeneCacheReplacementOwner = null;
-  layer._bulkGeneCacheGeneration = 0;
-  layer.getAvailableVariables = () => geneKeys.map(key => ({ key }));
-  layer.getDataForPages = async request => {
-    await gate.enter(request.variableKey);
-    return [{
-      pageId: 'page-1',
-      pageName: 'Page 1',
-      values: Float32Array.of(1),
-      cellIndices: Uint32Array.of(0),
-      cellCount: 1,
-    }];
+  layer.readGeneColumn = async geneKey => {
+    await gate.enter(geneKey);
+    return { fieldIndex: 0, values: Float32Array.of(geneKeys.indexOf(geneKey)), owned: true };
   };
 
-  const run = layer.fetchBulkGeneExpression({
-    pageIds: ['page-1'],
-    geneList: geneKeys,
-  });
+  const run = layer.readGeneColumns(geneKeys);
 
   await settle();
   assert.equal(
     gate.record.peak,
-    window,
-    'the gene loader must fill its concurrency window',
+    geneKeys.length,
+    'no gene waits on another gene; the reader paces the requests',
   );
 
-  // The distinguishing property: a batch loader cannot start gene 11 until the
-  // whole batch of ten has finished, whereas a sliding window admits one more
-  // as soon as one finishes. Releasing exactly one load must admit exactly one
-  // further gene.
-  gate.release(1);
-  await settle();
-  assert.equal(
-    gate.record.started.length,
-    window + 1,
-    'one completed load must admit exactly one more, with no batch barrier',
-  );
-
-  for (let attempt = 0; attempt < 20 && gate.waiting > 0; attempt++) {
+  while (gate.waiting > 0) {
     gate.releaseAll();
     await settle(2);
   }
-  const result = await run;
+  const columns = await run;
   assert.deepEqual(
-    Object.keys(result),
-    geneKeys,
-    'genes must be published in requested order, not completion order',
+    columns.map(column => column[0]),
+    geneKeys.map((_key, index) => index),
+    'columns must be published in requested order, not completion order',
   );
 });
 
-test('a partial bulk-gene cache fetches its misses together', async () => {
-  const gate = concurrencyRecorder();
+test('an invalidated gene-column read aborts the reads in flight', async () => {
   const layer = pageOnlyLayer();
-  const cachedGenes = ['Gene A', 'Gene B'];
-  const missingGenes = ['Gene C', 'Gene D', 'Gene E', 'Gene F'];
-  const cachedPages = { 'page-1': { values: Float32Array.of(9), cellCount: 1 } };
-
-  layer.refreshPageVersions = () => {};
-  layer._bulkGeneCacheMaxAge = 60_000;
-  layer._getBulkGeneCacheKey = () => 'bulk';
-  layer._getBulkGeneCache = () => ({
-    data: Object.fromEntries(cachedGenes.map(gene => [gene, cachedPages])),
-    timestamp: Date.now(),
+  const signals = [];
+  layer.readGeneColumn = (_geneKey, { signal }) => new Promise((_resolve, reject) => {
+    signals.push(signal);
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   });
-  layer.getDataForPages = async request => {
-    await gate.enter(request.variableKey);
-    return [{
-      pageId: 'page-1',
-      pageName: 'Page 1',
-      values: Float32Array.of(1),
-      cellIndices: Uint32Array.of(0),
-      cellCount: 1,
-    }];
-  };
-
-  const run = layer.getGeneExpressionSubset(
-    [...cachedGenes, ...missingGenes],
-    ['page-1'],
-  );
-
+  let current = true;
+  let invalidate = null;
+  const run = layer.readGeneColumns(['A', 'B'], {
+    isCurrent: () => current,
+    registerInvalidationCleanup: cleanup => { invalidate = cleanup; },
+  });
   await settle();
-  assert.equal(
-    gate.record.peak,
-    missingGenes.length,
-    'every gene the cache is missing must be requested at once',
-  );
-  assert.deepEqual(gate.record.started, missingGenes);
-
-  gate.releaseAll();
-  const result = await run;
-  assert.deepEqual(
-    Object.keys(result),
-    [...cachedGenes, ...missingGenes],
-    'the merged result must follow the requested gene order',
-  );
-  for (const gene of cachedGenes) {
-    assert.equal(result[gene], cachedPages, `${gene} must come from the cache`);
-  }
+  assert.equal(signals.length, 2);
+  current = false;
+  invalidate();
+  await assert.rejects(run, error => error.code === 'ANALYSIS_DATA_REQUEST_INVALIDATED');
+  assert.ok(signals.every(signal => signal.aborted));
 });
 
 test('a page fetch reads the exact membership its cache key was built from', async () => {

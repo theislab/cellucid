@@ -533,3 +533,44 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     assert.equal(activeTab.getAttribute('role'), 'tab');
   });
 });
+
+test('a page colour drag publishes once per frame, and its final colour on change', { concurrency: false }, async () => {
+  const frames = [];
+  const previous = {
+    requestAnimationFrame: globalThis.requestAnimationFrame,
+    cancelAnimationFrame: globalThis.cancelAnimationFrame,
+  };
+  globalThis.requestAnimationFrame = callback => frames.push(callback);
+  globalThis.cancelAnimationFrame = handle => { frames[handle - 1] = null; };
+  try {
+    await withFakeDOM(async document => {
+      const tabs = document.createElement('div');
+      const addButton = document.createElement('button');
+      document.body.appendChild(tabs);
+      document.body.appendChild(addButton);
+      const { operations, state } = createState();
+      const pagesUi = initHighlightPagesUI({ state, dom: { addPageBtn: addButton, pagesTabsEl: tabs } });
+      state.onChange = pagesUi.renderHighlightPages;
+      const input = tabs.querySelector('.color-swatch-input');
+      for (const color of ['#111111', '#222222', '#333333']) {
+        input.value = color;
+        input.dispatch('input', {});
+      }
+      assert.deepEqual(operations.filter(([kind]) => kind === 'color'), [], 'nothing before the frame');
+      for (const frame of frames.splice(0)) frame?.();
+      assert.deepEqual(operations.filter(([kind]) => kind === 'color'), [['color', 'page_1', '#333333']]);
+      input.value = '#444444';
+      input.dispatch('input', {});
+      input.dispatch('change', {});
+      assert.deepEqual(
+        operations.filter(([kind]) => kind === 'color').at(-1),
+        ['color', 'page_1', '#444444'],
+        'the final colour is published at once on change'
+      );
+      pagesUi.destroy?.();
+    });
+  } finally {
+    globalThis.requestAnimationFrame = previous.requestAnimationFrame;
+    globalThis.cancelAnimationFrame = previous.cancelAnimationFrame;
+  }
+});

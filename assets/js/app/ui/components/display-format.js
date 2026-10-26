@@ -6,25 +6,17 @@
  * reads the same way everywhere (see "Wording and numbers" in
  * `assets/css/README.md`):
  *
- * - Exact counts group thousands with a comma, independent of the browser
- *   locale: the interface copy is English, and "1.234 cells" beside
- *   "1,234 cells" read as two different numbers.
+ * - Exact counts, and a count with its noun ("1 cell", "1,200 cells"), are
+ *   `formatCount` and `formatCountOf` in `utils/format-units.js`, which every
+ *   layer can import.
  * - Compact counts use an upper-case K / M / B suffix with at most one
  *   decimal ("950", "1.5K", "15K", "2.5M").
  * - Units follow the number after a space ("1.00 u/s", "8.0 s"), except the
  *   multiplication sign and the percent sign, which attach ("3.0×", "60%").
  *   The multiplier is always U+00D7, never the letter x.
  *
- * `Intl.NumberFormat` is built once: `Number#toLocaleString` constructs a
- * formatter per call, which made a 5,000-category legend spend a quarter of a
- * second formatting its counts on every filter change.
- *
  * @module ui/components/display-format
  */
-
-const GROUPED_INTEGER = new Intl.NumberFormat('en-US', {
-  maximumFractionDigits: 0
-});
 
 function requireFinite(value, label) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -38,42 +30,6 @@ function requireDigits(digits) {
     throw new RangeError('Display digits must be an integer from 0 to 6');
   }
   return digits;
-}
-
-/**
- * An exact count with grouped thousands: `1234567` → `"1,234,567"`.
- *
- * @param {number} value
- * @returns {string}
- */
-export function formatCount(value) {
-  return GROUPED_INTEGER.format(requireFinite(value, 'Count'));
-}
-
-/**
- * An exact count with its noun, singular for one: `formatCountOf(1, 'cell')`
- * → `"1 cell"`, `formatCountOf(1200, 'cell')` → `"1,200 cells"`.
- *
- * @param {number} value
- * @param {string} singular
- * @param {string} [plural]
- * @returns {string}
- */
-export function formatCountOf(value, singular, plural = `${singular}s`) {
-  if (typeof singular !== 'string' || singular.length === 0) {
-    throw new TypeError('A counted noun must be non-empty text');
-  }
-  return `${formatCount(value)} ${value === 1 ? singular : plural}`;
-}
-
-/**
- * A count of cells: `"1 cell"`, `"12,000 cells"`.
- *
- * @param {number} value
- * @returns {string}
- */
-export function formatCells(value) {
-  return formatCountOf(value, 'cell');
 }
 
 /**

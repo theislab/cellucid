@@ -33,6 +33,7 @@ import {
   pathFrameForRegime
 } from './camera-path.js';
 import { FrameRecorder } from './frame-recorder.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
 
 /** The live view's exact identifier. */
 export const LIVE_VIEW_ID = 'live';
@@ -294,14 +295,14 @@ export function createBenchmarkMatrixRunner(options = {}) {
     const achieved = viewer.getSnapshotViews().length + 1;
     if (achieved !== target) {
       throw new Error(
-        `Benchmark requested ${target} views and the viewer published ` +
+        `Benchmark requested ${formatCountOf(target, 'view')} and the viewer published ` +
         `${achieved}.`
       );
     }
     const layout = viewer.getViewLayout();
     if (target > 1 && layout.mode !== 'grid') {
       throw new Error(
-        `Benchmark requested a grid layout for ${target} views and the ` +
+        `Benchmark requested a grid layout for ${formatCountOf(target, 'view')} and the ` +
         `viewer reports "${layout.mode}"; the renderer would take its ` +
         'single-viewport path and the view-count axis would be a fiction.'
       );
@@ -357,7 +358,7 @@ export function createBenchmarkMatrixRunner(options = {}) {
         if (remaining <= 0) {
           reject(
             new Error(
-              `Benchmark waited ${maxFrames} frames for ${description} and ` +
+              `Benchmark waited ${formatCountOf(maxFrames, 'frame')} for ${description} and ` +
               'the viewer never reported it.'
             )
           );

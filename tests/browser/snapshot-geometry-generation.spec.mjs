@@ -1,6 +1,6 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('same-reference live publication preserves immutable kept-view geometry', async ({ page }) => {
@@ -25,12 +25,12 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=snapshot-geometry-generation-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=snapshot-geometry-generation-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const publication = await page.evaluate(async () => {
@@ -256,12 +256,12 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
   const browserErrors = [];
   page.on('pageerror', error => browserErrors.push(error.message));
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=snapshot-cleanup-generation-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=snapshot-cleanup-generation-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const outcome = await page.evaluate(async () => {
@@ -389,12 +389,12 @@ test('public retirement repairs hidden-live focus to a surviving snapshot', asyn
   const browserErrors = [];
   page.on('pageerror', error => browserErrors.push(error.message));
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=snapshot-public-retirement-focus-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=snapshot-public-retirement-focus-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const outcome = await page.evaluate(async () => {

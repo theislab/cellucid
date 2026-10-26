@@ -27,14 +27,19 @@ function withManager(fields, run) {
   }
 }
 
-const EXPORT_MAPPING = Object.freeze({
-  kind: 'export',
-  embeddings: { '1d': null, '2d': { key: 'umap', columns: null }, '3d': null },
-  geneNames: 'column:symbol',
+const ANNDATA_MAPPING = Object.freeze({
+  kind: 'anndata',
+  embeddings: { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': null },
+  knn: null,
+  geneNames: 'index',
+  expression: 'X',
+  log1p: {},
+  highlyVariable: null,
+  latent: null,
   vectorFields: [],
 });
 
-function identityFor(fields, mapping = EXPORT_MAPPING) {
+function identityFor(fields, mapping = ANNDATA_MAPPING) {
   return withManager(fields, () => {
     const controller = Object.create(GenesPanelController.prototype);
     controller.dataLayer = { state: { getDataMapping: () => mapping } };
@@ -42,7 +47,7 @@ function identityFor(fields, mapping = EXPORT_MAPPING) {
   });
 }
 
-test('a reload under the same dataset id without an export timestamp is a new generation', () => {
+test('a reload under the same dataset id is a new generation', () => {
   const first = identityFor({
     activeDatasetId: 'local-user:h5ad:h5ad_adata',
     activeDatasetMetadata: { id: 'h5ad_adata' },
@@ -53,77 +58,36 @@ test('a reload under the same dataset id without an export timestamp is a new ge
     activeDatasetMetadata: { id: 'h5ad_adata' },
     _selectionRevision: 5,
   });
-  assert.equal(first.persistent, false);
-  assert.equal(reloaded.persistent, false);
+  assert.deepEqual(Object.keys(first), ['key']);
   assert.notEqual(first.key, reloaded.key);
-});
-
-test('a published export timestamp identifies the generation across loads', () => {
-  const first = identityFor({
-    activeDatasetId: 'pbmc',
-    activeDatasetMetadata: { id: 'pbmc', created_at: '2026-01-01T00:00:00Z' },
-    _selectionRevision: 1,
-  });
-  const sameExport = identityFor({
-    activeDatasetId: 'pbmc',
-    activeDatasetMetadata: { id: 'pbmc', created_at: '2026-01-01T00:00:00Z' },
-    _selectionRevision: 9,
-  });
-  const reExported = identityFor({
-    activeDatasetId: 'pbmc',
-    activeDatasetMetadata: { id: 'pbmc', created_at: '2026-02-01T00:00:00Z' },
-    _selectionRevision: 9,
-  });
-  assert.deepEqual(first, sameExport);
-  assert.equal(first.persistent, true);
-  assert.notEqual(first.key, reExported.key);
 });
 
 test('markers from one generation are never served to another under the same dataset id', async () => {
   const cache = new MarkerCache({
-    identity: { key: JSON.stringify(['load', 'adata', 1]), persistent: false },
+    identity: { key: JSON.stringify(['load', 'adata', 1]) },
   });
-  await cache.set('cell_type', { marker: 'GENE_ONLY_IN_V1' }, PARAMS);
-  assert.deepEqual(await cache.get('cell_type', PARAMS), { marker: 'GENE_ONLY_IN_V1' });
+  cache.set(PARAMS, { marker: 'GENE_ONLY_IN_V1' });
+  assert.deepEqual(cache.get(PARAMS), { marker: 'GENE_ONLY_IN_V1' });
 
-  cache.setIdentity({ key: JSON.stringify(['load', 'adata', 2]), persistent: false });
-  assert.equal(await cache.get('cell_type', PARAMS), null);
+  cache.setIdentity({ key: JSON.stringify(['load', 'adata', 2]) });
+  assert.equal(cache.get(PARAMS), null);
 });
 
-test('a generation that cannot prove itself across page loads never touches IndexedDB', async () => {
-  const cache = new MarkerCache({
-    identity: { key: JSON.stringify(['load', 'adata', 1]), persistent: false },
-  });
-  const forbidden = () => {
-    throw new Error('IndexedDB must not be used for a page-local generation');
-  };
-  cache._db = { transaction: forbidden, close() {} };
-  cache._getFromIndexedDB = forbidden;
-  cache._setInIndexedDB = forbidden;
-  await cache.set('cell_type', { marker: 'x' }, PARAMS);
-  assert.deepEqual(await cache.get('cell_type', PARAMS), { marker: 'x' });
-  assert.equal(await cache.has('cell_type', PARAMS), true);
+test('the cache lives in this page only and takes no other identity field', () => {
+  assert.throws(
+    () => new MarkerCache({ identity: { key: 'k', persistent: true } }),
+    /exactly \{ key: non-empty string \}/
+  );
+  const cache = new MarkerCache({ identity: { key: 'k' } });
+  assert.deepEqual(Object.keys(cache.getStats()).sort(), ['bytes', 'entries']);
 });
 
 test('another gene list under the same dataset generation is another identity', () => {
-  const exported = { activeDatasetId: 'pbmc', activeDatasetMetadata: { id: 'pbmc', created_at: '2026-01-01T00:00:00Z' }, _selectionRevision: 1 };
-  const bySymbol = identityFor(exported);
-  const byId = identityFor(exported, { ...EXPORT_MAPPING, geneNames: 'column:gene_id' });
-  assert.equal(byId.persistent, true);
-  assert.notEqual(bySymbol.key, byId.key);
-
-  const file = { activeDatasetId: 'local-user:h5ad:adata', activeDatasetMetadata: { id: 'adata' }, _selectionRevision: 3 };
-  const anndata = {
-    kind: 'anndata',
-    embeddings: { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': null },
-    knn: null,
-    geneNames: 'index',
-    expression: 'X',
-    latent: null,
-    vectorFields: [],
-  };
-  const onX = identityFor(file, anndata);
-  const onRaw = identityFor(file, { ...anndata, expression: 'raw' });
+  const file = { activeDatasetId: 'adata', activeDatasetMetadata: { id: 'adata' }, _selectionRevision: 3 };
+  const onX = identityFor(file);
+  const onRaw = identityFor(file, { ...ANNDATA_MAPPING, expression: 'raw' });
+  const bySymbol = identityFor(file, { ...ANNDATA_MAPPING, geneNames: 'column:gene_symbols' });
   assert.notEqual(onX.key, onRaw.key);
-  assert.equal(onX.key, identityFor(file, anndata).key);
+  assert.notEqual(onX.key, bySymbol.key);
+  assert.equal(onX.key, identityFor(file).key);
 });

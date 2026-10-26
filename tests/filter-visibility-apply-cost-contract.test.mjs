@@ -7,6 +7,13 @@ import {
 import {
   DataStateFilterMethods,
 } from '../assets/js/app/state/managers/filter-manager.js';
+import {
+  writableCellVisibilityMask,
+  writableTransparency as writableTransparencyOf,
+} from '../assets/js/app/state/managers/per-cell-array-ownership.js';
+import {
+  DataStateViewMethods,
+} from '../assets/js/app/state/managers/view-manager.js';
 
 /**
  * Cost contract for `computeGlobalVisibility`.
@@ -108,9 +115,27 @@ test('filter predicates are not evaluated for cells the visibility mask already 
   );
 });
 
-test('the unfiltered publication copies the mask instead of filling and then re-walking it', () => {
+/** A Uint8Array whose element reads are counted. Passes `instanceof`. */
+function countingUint8(values) {
+  const target = Uint8Array.from(values);
+  const counter = { reads: 0 };
+  const proxy = new Proxy(target, {
+    get(object, property) {
+      if (typeof property === 'string') {
+        const index = Number(property);
+        if (Number.isInteger(index) && index >= 0) counter.reads++;
+      }
+      const value = Reflect.get(object, property, object);
+      return typeof value === 'function' ? value.bind(object) : value;
+    },
+  });
+  return { counter, proxy };
+}
+
+test('the unfiltered publication is one pass: visibility, packed alpha and the shown count', () => {
   const mask = [1, 0, 1, 1, 0, 1, 1, 1];
   const pointCount = mask.length;
+  const counted = countingUint8(mask);
   const state = Object.assign(Object.create(DataStateFilterMethods.prototype), {
     pointCount,
     obsData: { fields: [] },
@@ -119,58 +144,56 @@ test('the unfiltered publication copies the mask instead of filling and then re-
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
     categoryTransparency: new Uint8Array(pointCount).fill(1),
-    cellVisibilityMask: Uint8Array.from(mask),
+    cellVisibilityMask: counted.proxy,
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     isOutlierFilterEnabledForActiveField: () => false,
     getCurrentOutlierThreshold: () => 1,
     _updateActiveCategoryCounts: () => false,
     _pushTransparencyToViewer() {},
     _pushCentroidsToViewer() {},
     _syncActiveContext() {},
-    updateFilteredCount() {},
     updateFilterSummary() {},
     _notifyVisibilityChange() {},
   });
 
   const nativeFill = Uint8Array.prototype.fill;
   const nativeSet = Uint8Array.prototype.set;
-  const fills = [];
-  const sets = [];
+  const bulkWrites = [];
   Uint8Array.prototype.fill = function countingFill(...args) {
-    fills.push({ args, target: this });
+    bulkWrites.push(this);
     return nativeFill.apply(this, args);
   };
   Uint8Array.prototype.set = function countingSet(...args) {
-    sets.push({ args, target: this });
+    bulkWrites.push(this);
     return nativeSet.apply(this, args);
   };
   try {
     state.computeGlobalVisibility();
+    // The first computation proves the mask binary (four cells a word, read
+    // from the mask's buffer, which this proxy does not see) and applies it
+    // (one element read a cell); a second one with the same inputs adopts
+    // the first one's result and reads nothing.
+    assert.equal(counted.counter.reads, pointCount);
+    counted.counter.reads = 0;
+    state.computeGlobalVisibility();
+    assert.equal(counted.counter.reads, 0);
+    // A mask handed out for writing is proven and applied again.
+    assert.equal(writableCellVisibilityMask(state), counted.proxy);
+    state.computeGlobalVisibility();
+    assert.equal(counted.counter.reads, pointCount);
   } finally {
     Uint8Array.prototype.fill = nativeFill;
     Uint8Array.prototype.set = nativeSet;
   }
 
-  const transparencyFills = fills.filter(
-    entry => entry.target === state.categoryTransparency,
-  );
-  const transparencyCopies = sets.filter(
-    entry => entry.target === state.categoryTransparency,
-  );
-  assert.equal(
-    transparencyFills.length,
-    0,
-    'the unfiltered path must not fill the whole array and then re-walk it',
-  );
-  assert.equal(transparencyCopies.length, 1);
-  assert.equal(transparencyCopies[0].args.length, 1);
-  assert.strictEqual(
-    transparencyCopies[0].args[0],
-    state.cellVisibilityMask,
-    'the copy source must be exactly the cell visibility mask',
-  );
+  assert.equal(bulkWrites.length, 0, 'no fill or copy runs beside the pass');
   assert.deepEqual(Array.from(state.categoryTransparency), mask);
+  assert.deepEqual(
+    Array.from(state.colorsArray).filter((_, i) => i % 4 === 3),
+    mask.map(entry => entry * 255),
+  );
+  const shown = mask.filter(entry => entry === 1).length;
+  assert.deepEqual(state.filteredCount, { shown, total: pointCount });
 });
 
 test('every mask and filter shape produces the identical published generation', () => {
@@ -222,6 +245,26 @@ test('every mask and filter shape produces the identical published generation', 
   }
 });
 
+test('a mask written after its proof is proven again: a value above one is then rejected', () => {
+  const pointCount = 9;
+  const { state } = continuousState({
+    filter: { max: pointCount - 1, min: 0 },
+    mask: new Array(pointCount).fill(1),
+    values: Array.from({ length: pointCount }, (_, index) => index),
+  });
+  state.computeGlobalVisibility();
+  // Every word and the unaligned tail are checked: a bad byte in either.
+  for (const index of [2, 8]) {
+    writableCellVisibilityMask(state)[index] = 2;
+    assert.throws(
+      () => state.computeGlobalVisibility(),
+      new RegExp(`Cell visibility mask entry ${index} must be exactly 0 or 1\\.`),
+    );
+    writableCellVisibilityMask(state)[index] = 1;
+    state.computeGlobalVisibility();
+  }
+});
+
 test('a mask value that is neither zero nor one is still rejected before anything is published', () => {
   const mask = [1, 1, 2, 1];
   const { state } = continuousState({
@@ -239,4 +282,110 @@ test('a mask value that is neither zero nor one is still rejected before anythin
     before,
     'a rejected mask must leave the published generation untouched',
   );
+});
+
+function categoryFilterState(pointCount, codes, hidden) {
+  const field = {
+    key: 'cluster',
+    kind: 'category',
+    categories: ['a', 'b', 'c'],
+    codes: Uint8Array.from(codes),
+    _categoryVisible: [true, true, true],
+    _categoryFilterEnabled: true,
+  };
+  for (const index of hidden) field._categoryVisible[index] = false;
+  const state = Object.assign(Object.create(DataStateFilterMethods.prototype), {
+    pointCount,
+    obsData: { fields: [field] },
+    varData: { fields: [] },
+    activeFieldSource: null,
+    activeFieldIndex: -1,
+    activeVarFieldIndex: -1,
+    activeViewId: 'live',
+    viewContexts: new Map(),
+    categoryTransparency: new Uint8Array(pointCount).fill(1),
+    cellVisibilityMask: new Uint8Array(pointCount).fill(1),
+    colorsArray: new Uint8Array(pointCount * 4).fill(255),
+    isOutlierFilterEnabledForActiveField: () => false,
+    getCurrentOutlierThreshold: () => 1,
+    ensureCategoryMetadata() {},
+    _updateActiveCategoryCounts: () => false,
+    _pushTransparencyToViewer() {},
+    _pushCentroidsToViewer() {},
+    _pushColorsToViewer() {},
+    _syncActiveContext() {},
+    updateFilterSummary() {},
+    _notifyVisibilityChange() {},
+  });
+  return { state, field };
+}
+
+test('a view with the same filters as a kept view adopts its visibility instead of recomputing it', () => {
+  const codes = [0, 1, 2, 0, 1, 2, 0, 1];
+  const pointCount = codes.length;
+  const { state, field } = categoryFilterState(pointCount, codes, [1]);
+  state.computeGlobalVisibility();
+  const expected = Array.from(state.categoryTransparency);
+  assert.deepEqual(expected, [1, 0, 1, 1, 0, 1, 1, 0]);
+
+  // Keep the view: the kept context holds the live arrays, so the next write
+  // on the live view goes to a copy.
+  const kept = state.categoryTransparency;
+  state.viewContexts.set('snap_1', { categoryTransparency: kept });
+  state.categoryTransparency = new Uint8Array(pointCount).fill(1);
+  state.colorsArray = new Uint8Array(pointCount * 4).fill(255);
+
+  // The same filters reached by another route (a session view's replay
+  // rebuilds the per-code tables): adopted from the kept view, by copy.
+  field._categoryVisible = [true, false, true];
+  state.computeGlobalVisibility();
+  assert.notEqual(state.categoryTransparency, kept);
+  assert.deepEqual(Array.from(state.categoryTransparency), expected);
+  assert.deepEqual(
+    Array.from(state.colorsArray).filter((_, i) => i % 4 === 3),
+    expected.map(entry => entry * 255),
+  );
+  assert.deepEqual(state.filteredCount, { shown: 5, total: pointCount });
+
+  // Different filters compute, and leave the kept view's array untouched.
+  field._categoryVisible = [false, true, true];
+  state.computeGlobalVisibility();
+  assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0, 1, 1, 0, 1]);
+  assert.deepEqual(Array.from(kept), expected);
+});
+
+test('a result is not adopted once its array was written again', () => {
+  const codes = [0, 1, 2, 0];
+  const { state, field } = categoryFilterState(codes.length, codes, [0]);
+  state.computeGlobalVisibility();
+  assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0]);
+  // A recolour writes the array outside a visibility pass (through the
+  // ownership module, as every writer does).
+  state.categoryTransparency.fill(1);
+  writableTransparencyOf(state);
+  state.computeGlobalVisibility();
+  assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0]);
+  assert.equal(field._categoryVisible[0], false);
+});
+
+test('inside a batch the visibility pass runs once, at its end', () => {
+  const codes = [0, 1, 2, 0];
+  const { state, field } = categoryFilterState(codes.length, codes, []);
+  let passes = 0;
+  state._notifyVisibilityChange = () => { passes++; };
+  Object.assign(state, {
+    _batchDepth: 0,
+    _batchMode: false,
+    _batchDirty: { visibility: false, colors: false, affectedFields: new Set() },
+    beginBatch: DataStateViewMethods.prototype.beginBatch,
+    endBatch: DataStateViewMethods.prototype.endBatch,
+  });
+  state.beginBatch();
+  state.computeGlobalVisibility();
+  field._categoryVisible[2] = false;
+  state.computeGlobalVisibility();
+  assert.equal(passes, 0);
+  state.endBatch();
+  assert.equal(passes, 1);
+  assert.deepEqual(Array.from(state.categoryTransparency), [1, 1, 0, 1]);
 });

@@ -11,6 +11,7 @@ import {
   describeShaderQualities,
   SHADER_QUALITIES,
 } from '../shader-quality.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const SUPPORTED_DIMENSION_LEVELS = new Set([1, 2, 3]);
 const SUPPORTED_SHADER_QUALITIES = new Set(SHADER_QUALITIES);
@@ -198,12 +199,12 @@ function requireSnapshotPointData(
     positions.length !== pointCount * dimension
   ) {
     throw new TypeError(
-      `${owner} positions must be a Float32Array with exactly ${pointCount * dimension} values (${dimension} per point).`
+      `${owner} positions must be a Float32Array with exactly ${formatCountOf(pointCount * dimension, 'value')} (${dimension} per point).`
     );
   }
   if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
     throw new TypeError(
-      `${owner} colors must be an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
+      `${owner} colors must be an RGBA Uint8Array with exactly ${formatCountOf(pointCount * 4, 'byte')}.`
     );
   }
   if (alphas !== null) {
@@ -212,7 +213,7 @@ function requireSnapshotPointData(
       alphas.length !== pointCount
     ) {
       throw new TypeError(
-        `${owner} alpha values must be null or a Uint8Array with exactly ${pointCount} entries.`
+        `${owner} alpha values must be null or a Uint8Array with exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`
       );
     }
   }
@@ -230,7 +231,7 @@ function requireSnapshotColors(pointCount, colors, owner) {
     colors.length !== pointCount * 4
   ) {
     throw new TypeError(
-      `${owner} colors must be an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
+      `${owner} colors must be an RGBA Uint8Array with exactly ${formatCountOf(pointCount * 4, 'byte')}.`
     );
   }
   return colors;
@@ -242,7 +243,7 @@ function requireSnapshotAlphas(pointCount, alphas, owner) {
     alphas.length !== pointCount
   ) {
     throw new TypeError(
-      `${owner} alpha values must be a Uint8Array with exactly ${pointCount} entries.`
+      `${owner} alpha values must be a Uint8Array with exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`
     );
   }
   return alphas;

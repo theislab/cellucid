@@ -12,7 +12,7 @@
  *
  * `page_view` - sent once per page load by the `config` call in
  * `app/ui/core/ga-init.js`, with `page_location` reduced to origin + path. The
- * query string (dataset ids, `remote`/`github` addresses, `exportsBaseUrl`) is
+ * query string (dataset ids, `remote` addresses and `data` links, `sampleCatalog`) is
  * never part of it. GA4's own "enhanced measurement" adds further automatic
  * events (history-change page views, scrolls, outbound clicks); those are
  * configured in the GA4 admin, not here.
@@ -26,7 +26,7 @@
  *   Example: `{startup_ms: 2140, startup_bucket: '1-3s', has_dataset: 1}`
  *
  * `startup_failure` - once, when startup ends on the terminal failure card,
- * or when the code-load watch sees the module graph fail to download.
+ * or when the code-load watch sees the module graph fail to download or run.
  *   - `startup_phase` (enum STARTUP_PHASES): where startup stopped.
  *   - `source_type` (enum SOURCE_TYPES): which source the page URL asked for.
  *   - `error_code` (enum ERROR_CODES), `error_name` (enum ERROR_NAMES),
@@ -38,6 +38,9 @@
  * superseded by a newer one, or abandoned, sends nothing.
  *   - `load_method` (enum LOAD_METHODS): how the dataset was chosen.
  *   - `source_type` (enum SOURCE_TYPES).
+ *   - `data_format` (enum DATA_FORMATS): the input format the dataset was
+ *     read as (`data/input-formats.js`: `h5ad`, `zarr`, `loom`, …), success
+ *     only.
  *   - `outcome` ('success'|'failure').
  *   - `duration_ms` (int): from the request (navigation for a startup load,
  *     the click or file pick for an interactive one) to ready or failure.
@@ -47,7 +50,6 @@
  *   - `field_count` (int): number of obs fields.
  *   - `dimensions` (enum DIMENSIONS): embedding dimensions, e.g. `'2+3'`.
  *   - `has_connectivity`, `has_vector_field` (0|1).
- *   - `data_version` (x.y.z): the writer version that prepared the export.
  *   - `state_restore` (enum STATE_RESTORES): the dataset's published
  *     default session, success only.
  *   - `mapping_origin` (enum MAPPING_ORIGINS): whether the embeddings shown
@@ -58,8 +60,8 @@
  *   - `enabled_representations` (enum EMBEDDING_CANDIDATE_BUCKETS): how many
  *     of them it opened with turned on, success only.
  *   - `error_code`, `error_name`, `http_status`: failure only.
- *   Example: `{load_method: 'local-user-h5ad', source_type: 'local-user',
- *     outcome: 'success', duration_ms: 3812, duration_bucket: '3-10s',
+ *   Example: `{load_method: 'local-user-file', source_type: 'local-user',
+ *     data_format: 'h5ad', outcome: 'success', duration_ms: 3812, duration_bucket: '3-10s',
  *     cell_bucket: '10k-100k', gene_bucket: '10k-100k', field_count: 14,
  *     dimensions: '2', has_connectivity: 0, has_vector_field: 0}`
  *
@@ -95,8 +97,10 @@
  */
 
 import { DATA_LOAD_METHODS } from '../app/data-load-methods.js';
+import { INPUT_FORMATS } from '../data/input-formats.js';
 import { DataSourceErrorCode } from '../data/data-source.js';
 import { STARTUP_STALL_CODE } from '../app/startup-phase.js';
+import { formatCountOf } from '../utils/format-units.js';
 
 /** GA4 collection limits (https://support.google.com/analytics/answer/9267744). */
 export const GA4_LIMITS = Object.freeze({
@@ -132,12 +136,15 @@ const SNAKE_CASE = /^[a-z][a-z0-9_]*$/;
 
 export const LOAD_METHODS = Object.freeze(Object.values(DATA_LOAD_METHODS));
 
+/** The input format ids a dataset is read as. */
+export const DATA_FORMATS = Object.freeze(INPUT_FORMATS.map(format => format.id));
+
 export const SOURCE_TYPES = Object.freeze([
-  'local-demo', 'local-user', 'remote', 'github-repo', 'jupyter',
+  'local-demo', 'local-user', 'remote', 'link', 'jupyter',
 ]);
 
 export const STARTUP_PHASES = Object.freeze([
-  'code-load', 'boot', 'sign-in', 'health', 'catalog', 'identity',
+  'code-load', 'boot', 'sign-in', 'health', 'catalog', 'dataset',
   'positions', 'ui', 'session', 'ready',
 ]);
 
@@ -213,7 +220,7 @@ export const FEATURES = Object.freeze({
   vector_field: null,
   analysis: Object.freeze([
     'simple', 'detailed', 'correlation', 'differential', 'signature',
-    'genes_panel',
+    'genes_panel', 'dotplot', 'composition',
   ]),
   figure_export: null,
   camera_path: null,
@@ -222,8 +229,8 @@ export const FEATURES = Object.freeze({
   community_annotation: Object.freeze(['github_connection']),
   benchmark: null,
   data_mapping: Object.freeze([
-    'embedding', 'embedding_columns', 'default', 'knn', 'gene_names', 'expression',
-    'latent', 'vector_fields',
+    'embedding', 'embedding_columns', 'default', 'knn', 'modality', 'gene_names', 'expression',
+    'log1p', 'highly_variable', 'latent', 'vector_fields',
   ]),
 });
 
@@ -240,10 +247,6 @@ const FLAG = int(0, 1);
 const DATASET_ID = Object.freeze({
   kind: 'pattern',
   pattern: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/,
-});
-const VERSION = Object.freeze({
-  kind: 'pattern',
-  pattern: /^\d{1,3}\.\d{1,3}\.\d{1,3}$/,
 });
 
 const ERROR_PARAMS = Object.freeze({
@@ -283,6 +286,7 @@ export const EVENTS = Object.freeze({
     params: Object.freeze({
       load_method: enumOf(LOAD_METHODS),
       source_type: enumOf(SOURCE_TYPES),
+      data_format: enumOf(DATA_FORMATS),
       outcome: enumOf(Object.freeze(['success', 'failure'])),
       duration_ms: int(0, 86_400_000),
       duration_bucket: enumOf(DURATION_BUCKETS),
@@ -293,7 +297,6 @@ export const EVENTS = Object.freeze({
       dimensions: enumOf(DIMENSIONS),
       has_connectivity: FLAG,
       has_vector_field: FLAG,
-      data_version: VERSION,
       state_restore: enumOf(STATE_RESTORES),
       mapping_origin: enumOf(MAPPING_ORIGINS),
       embedding_candidates: enumOf(EMBEDDING_CANDIDATE_BUCKETS),
@@ -327,8 +330,8 @@ export const EVENTS = Object.freeze({
  */
 export const GA4_CUSTOM_DEFINITIONS = Object.freeze({
   eventDimensions: Object.freeze([
-    'load_method', 'source_type', 'outcome', 'duration_bucket', 'dataset_id',
-    'cell_bucket', 'gene_bucket', 'dimensions', 'data_version',
+    'load_method', 'source_type', 'data_format', 'outcome', 'duration_bucket', 'dataset_id',
+    'cell_bucket', 'gene_bucket', 'dimensions',
     'state_restore', 'mapping_origin', 'embedding_candidates',
     'enabled_representations', 'error_code',
     'error_name', 'startup_phase',
@@ -366,7 +369,7 @@ function checkName(name, kind, maxLength) {
   ) {
     throw new AnalyticsSchemaError(
       `${kind} ${JSON.stringify(name)} must be snake_case, at most ` +
-      `${maxLength} characters, without a reserved prefix.`
+      `${formatCountOf(maxLength, 'character')}, without a reserved prefix.`
     );
   }
 }
@@ -558,10 +561,6 @@ export function durationBucket(ms) {
 }
 
 /**
- * @param {number} count
- * @returns {string} One of COUNT_BUCKETS.
- */
-/**
  * @param {number} count - Embeddings a dataset could show (at least 1).
  * @returns {string} One of EMBEDDING_CANDIDATE_BUCKETS.
  */
@@ -572,6 +571,10 @@ export function embeddingCandidateBucket(count) {
   return '10+';
 }
 
+/**
+ * @param {number} count
+ * @returns {string} One of COUNT_BUCKETS.
+ */
 export function countBucket(count) {
   if (count < 1_000) return '<1k';
   if (count < 10_000) return '1k-10k';

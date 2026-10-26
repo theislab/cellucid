@@ -22,6 +22,8 @@ import {
   MIN_SYNTHETIC_COUNT
 } from '../app/ui/modules/benchmark/generation-contract.js';
 import { formatCompactCount as formatNumber } from '../app/ui/components/display-format.js';
+import { PLACES } from '../app/ui/place-names.js';
+import { formatCountOf, formatCount, countNoun } from '../utils/format-units.js';
 
 const glbBufferPromises = new Map();
 const MEBIBYTE = 1024 * 1024;
@@ -275,7 +277,7 @@ export class GLBParser {
       }
     }
 
-    console.log(`[GLBParser] Merged ${allPositions.length} primitives: ${positions.length / 3} vertices, ${indices ? indices.length / 3 : 0} triangles`);
+    console.log(`[GLBParser] Merged ${allPositions.length} primitives: ${formatCountOf(positions.length / 3, 'vertex', 'vertices')}, ${formatCountOf(indices ? indices.length / 3 : 0, 'triangle')}`);
 
     return { positions, indices, normals: null };
   }
@@ -571,7 +573,7 @@ export class SyntheticDataGenerator {
   static octopus(count, numTentacles = 10) {
     requireSyntheticPointCount(count);
     restartSyntheticStream();
-    console.log(`Generating ${count.toLocaleString()} points (octopus with ${numTentacles} tentacles)...`);
+    console.log(`Generating ${formatCountOf(count, 'point')} (octopus with ${numTentacles} tentacles)...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
@@ -692,7 +694,7 @@ export class SyntheticDataGenerator {
   static spirals(count, numSpirals = 7) {
     requireSyntheticPointCount(count);
     restartSyntheticStream();
-    console.log(`Generating ${count.toLocaleString()} points (${numSpirals} spirals)...`);
+    console.log(`Generating ${formatCountOf(count, 'point')} (${numSpirals} spirals)...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
@@ -797,7 +799,7 @@ export class SyntheticDataGenerator {
   static flatUMAP(count, numClusters = 25) {
     requireSyntheticPointCount(count);
     restartSyntheticStream();
-    console.log(`Generating ${count.toLocaleString()} points (2D UMAP, ${numClusters} clusters)...`);
+    console.log(`Generating ${formatCountOf(count, 'point')} (2D UMAP, ${formatCountOf(numClusters, 'cluster')})...`);
     const startTime = performance.now();
 
     // A 2-D embedding: two position components per point, no padded z.
@@ -925,7 +927,7 @@ export class SyntheticDataGenerator {
       label = 'Atlas-like (multiscale clusters)'
     } = options;
 
-    console.log(`Generating ${count.toLocaleString()} points (${label})...`);
+    console.log(`Generating ${formatCountOf(count, 'point')} (${label})...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
@@ -1146,7 +1148,7 @@ export class SyntheticDataGenerator {
     restartSyntheticStream();
     // Random number of clusters between 100-200 if using default
     const actualClusters = numClusters === 150 ? 100 + Math.floor(syntheticUnitRandom() * 100) : numClusters;
-    console.log(`Generating ${count.toLocaleString()} points in ${actualClusters} clusters...`);
+    console.log(`Generating ${formatCountOf(count, 'point')} in ${formatCountOf(actualClusters, 'cluster')}...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
@@ -1224,7 +1226,7 @@ export class SyntheticDataGenerator {
   static uniformRandom(count, scale = 2.0) {
     requireSyntheticPointCount(count);
     restartSyntheticStream();
-    console.log(`Generating ${count.toLocaleString()} random points...`);
+    console.log(`Generating ${formatCount(count)} random ${countNoun(count, 'point')}...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
@@ -1264,18 +1266,18 @@ export class SyntheticDataGenerator {
         'GLB benchmark input must be one non-empty ArrayBuffer.'
       );
     }
-    console.log(`[GLB] Sampling ${count.toLocaleString()} points from GLB mesh...`);
+    console.log(`[GLB] Sampling ${formatCountOf(count, 'point')} from GLB mesh...`);
     const startTime = performance.now();
 
     // Parse GLB
     console.log('[GLB] Parsing GLB file...');
     const meshData = GLBParser.parse(glbBuffer);
-    console.log(`[GLB] Parsed: ${meshData.positions.length / 3} vertices, ${meshData.indices ? meshData.indices.length / 3 : 'no'} triangles (${(performance.now() - startTime).toFixed(0)}ms)`);
+    console.log(`[GLB] Parsed: ${formatCountOf(meshData.positions.length / 3, 'vertex', 'vertices')}, ${meshData.indices ? formatCountOf(meshData.indices.length / 3, 'triangle') : 'no triangles'} (${(performance.now() - startTime).toFixed(0)}ms)`);
 
     // Create sampler
     console.log('[GLB] Building surface sampler...');
     const sampler = new MeshSurfaceSampler(meshData.positions, meshData.indices);
-    console.log(`[GLB] Sampler ready: ${sampler.triangleCount} triangles, area=${sampler.totalArea.toFixed(4)} (${(performance.now() - startTime).toFixed(0)}ms)`);
+    console.log(`[GLB] Sampler ready: ${formatCountOf(sampler.triangleCount, 'triangle')}, area=${sampler.totalArea.toFixed(4)} (${(performance.now() - startTime).toFixed(0)}ms)`);
 
     // Compute bounding box for normalization
     let minX = Infinity, maxX = -Infinity;
@@ -1349,7 +1351,7 @@ export class SyntheticDataGenerator {
     }
 
     const elapsed = performance.now() - startTime;
-    console.log(`[GLB] Done! Sampled ${count.toLocaleString()} points in ${elapsed.toFixed(0)}ms`);
+    console.log(`[GLB] Done! Sampled ${formatCountOf(count, 'point')} in ${elapsed.toFixed(0)}ms`);
 
     return { positions, colors, dimensionLevel: 3 };
   }
@@ -1743,8 +1745,8 @@ export class BottleneckAnalyzer {
     const config = { ...this.config, ...options };
 
     console.log('[BottleneckAnalyzer] Starting bottleneck analysis...');
-    console.log(`  - Warmup: ${config.warmupFrames} frames`);
-    console.log(`  - Test: ${config.testFrames} frames`);
+    console.log(`  - Warmup: ${formatCountOf(config.warmupFrames, 'frame')}`);
+    console.log(`  - Test: ${formatCountOf(config.testFrames, 'frame')}`);
 
     // Reset state
     this._reset();
@@ -2657,7 +2659,7 @@ export class BottleneckAnalyzer {
         actions: [
           'Reduce point size to decrease fill rate requirements',
           'Make the window smaller — fewer pixels is the biggest immediate win',
-          'Turn antialiasing off under Image quality — it applies to the next frame',
+          `Turn antialiasing off under ${PLACES.performance.name} — it applies to the next frame`,
           'Enable more aggressive LOD to reduce vertex count'
         ]
       });
@@ -2671,7 +2673,7 @@ export class BottleneckAnalyzer {
         title: 'Optimize fragment processing',
         actions: [
           'Reduce point size (current scaling shows fragment sensitivity)',
-          'Turn antialiasing off under Image quality — it costs per pixel covered',
+          `Turn antialiasing off under ${PLACES.performance.name} — it costs per pixel covered`,
           'Make the window smaller, or use fewer views',
           'Filter down to the cells you are looking at — hidden points are free'
         ]
@@ -2784,7 +2786,7 @@ export class BottleneckAnalyzer {
         title: 'Low-end device detected',
         actions: [
           `Only ${jsAnalysis.cpuCores} CPU cores available`,
-          'Turn antialiasing off under Image quality — it applies to the next frame',
+          `Turn antialiasing off under ${PLACES.performance.name} — it applies to the next frame`,
           'Reduce data size or enable aggressive LOD',
           'Consider showing fewer points on mobile'
         ]

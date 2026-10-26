@@ -364,7 +364,7 @@ test('all panes share one frame phase and highlight success does not allocate fa
 
   assert.match(
     singleView,
-    /highlightTools\.drawHighlights\(renderParams,\s*timeSeconds\)/,
+    /const highlightTime = pinnedHighlightTime \?\? timeSeconds;[\s\S]*highlightTools\.drawHighlights\(renderParams,\s*highlightTime\)/,
     'the viewer-owned frame timestamp must be shared by every pane',
   );
   assert.doesNotMatch(

@@ -49,9 +49,10 @@ function requireCategoryInventory(categories) {
  * computed from its positions when a view switches to it.
  *
  * Each entry is an array of `{ category, position, n_points }` with the
- * layout's dimension of coordinates.
+ * layout's dimension of coordinates, one for each category that holds at
+ * least one cell (`computeCentroidsForDimension`).
  *
- * @param {Uint8Array|Uint16Array} codes
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
  * @param {(string|number|boolean)[]} categories
  * @param {object} state - DataState (needs `dimensionManager` and `pointCount`)
  * @returns {{
@@ -110,14 +111,67 @@ export function computeAllLayoutCentroids(codes, categories, state) {
 }
 
 /**
- * Compute centroid objects for a single dimension.
- * @param {Uint8Array|Uint16Array} codes
- * @param {(string|number|boolean)[]} categories
- * @param {Float32Array} positions - one layout's normalized positions, stride = dim
- * @param {number} dim
- * @returns {Array<{category: string|number|boolean, position: number[], n_points: number}>}
+ * Per-category sums of one layout's positions over cells `[from, to)`, one
+ * loop per dimension, each adding its axes in cell order, so a pass split
+ * into ranges makes exactly the Float64 additions of one whole pass. `v - v`
+ * is 0 exactly for a finite `v` and NaN otherwise, which tests finiteness
+ * without a call.
  */
-export function computeCentroidsForDimension(codes, categories, positions, dim) {
+function accumulateCentroids1(codes, positions, missingCode, numCategories, sums, counts, from, to) {
+  for (let i = from; i < to; i++) {
+    const cat = codes[i];
+    if (cat === missingCode) continue;
+    if (cat >= numCategories) return -(i + 1);
+    const x = positions[i];
+    if (x - x !== 0) return i + 1;
+    sums[cat * 3] += x;
+    counts[cat]++;
+  }
+  return 0;
+}
+
+function accumulateCentroids2(codes, positions, missingCode, numCategories, sums, counts, from, to) {
+  for (let i = from, base = from * 2; i < to; i++, base += 2) {
+    const cat = codes[i];
+    if (cat === missingCode) continue;
+    if (cat >= numCategories) return -(i + 1);
+    const x = positions[base];
+    const y = positions[base + 1];
+    if (x - x !== 0 || y - y !== 0) return i + 1;
+    const slot = cat * 3;
+    sums[slot] += x;
+    sums[slot + 1] += y;
+    counts[cat]++;
+  }
+  return 0;
+}
+
+function accumulateCentroids3(codes, positions, missingCode, numCategories, sums, counts, from, to) {
+  for (let i = from, base = from * 3; i < to; i++, base += 3) {
+    const cat = codes[i];
+    if (cat === missingCode) continue;
+    if (cat >= numCategories) return -(i + 1);
+    const x = positions[base];
+    const y = positions[base + 1];
+    const z = positions[base + 2];
+    if (x - x !== 0 || y - y !== 0 || z - z !== 0) return i + 1;
+    const slot = cat * 3;
+    sums[slot] += x;
+    sums[slot + 1] += y;
+    sums[slot + 2] += z;
+    counts[cat]++;
+  }
+  return 0;
+}
+
+const ACCUMULATORS = [null, accumulateCentroids1, accumulateCentroids2, accumulateCentroids3];
+
+/**
+ * The centroid pass of one layout as ranges of cells: `add(from, to)` for
+ * consecutive ranges covering `[0, codes.length)` in order, then `finish()`.
+ * Whole or in ranges, the sums are the same additions in the same order.
+ */
+function centroidAccumulator(codes, categories, positions, dim) {
   if (!isCategoricalCodes(codes)) {
     throw new TypeError('Centroid category codes must be Uint8Array, Uint16Array or Uint32Array');
   }
@@ -128,49 +182,111 @@ export function computeCentroidsForDimension(codes, categories, positions, dim) 
   if (!(positions instanceof Float32Array) || positions.length !== codes.length * dim) {
     throw new TypeError('Centroid positions must be an exact dataset-length Float32Array');
   }
-
   const numCategories = categories.length;
   const { missingValue: missingCode } = categoricalStorageForCodes(
     codes,
     'Centroid category'
   );
-  const pointCount = codes.length;
-
-  const sumsX = new Float64Array(numCategories);
-  const sumsY = new Float64Array(numCategories);
-  const sumsZ = new Float64Array(numCategories);
+  // Interleaved x, y, z sums a category: one cache line holds a category's
+  // three sums.
+  const sums = new Float64Array(numCategories * 3);
   const counts = new Uint32Array(numCategories);
+  const accumulate = ACCUMULATORS[dim];
+  return {
+    pointCount: codes.length,
+    add(from, to) {
+      const failed = accumulate(codes, positions, missingCode, numCategories, sums, counts, from, to);
+      if (failed < 0) {
+        throw new RangeError(`Centroid category code ${-failed - 1} is outside the category inventory`);
+      }
+      if (failed > 0) {
+        const cell = failed - 1;
+        for (let axis = 0; axis < dim; axis++) {
+          if (!Number.isFinite(positions[cell * dim + axis])) {
+            throw new TypeError(`Centroid position ${cell}, axis ${axis} must be finite`);
+          }
+        }
+      }
+    },
+    finish() {
+      const out = [];
+      for (let catIdx = 0; catIdx < numCategories; catIdx++) {
+        const count = counts[catIdx];
+        // A category no cell holds has no centre, so it has no centroid.
+        if (count === 0) continue;
+        const slot = catIdx * 3;
+        const x = sums[slot] / count;
+        const y = sums[slot + 1] / count;
+        const z = sums[slot + 2] / count;
+        const pos = dim === 1 ? [x] : dim === 2 ? [x, y] : [x, y, z];
+        out.push({
+          category: categories[catIdx],
+          position: pos,
+          n_points: count
+        });
+      }
+      return out;
+    },
+  };
+}
 
-  for (let i = 0; i < pointCount; i++) {
-    const cat = codes[i];
-    if (cat === missingCode) continue;
-    if (cat >= numCategories) {
-      throw new RangeError(`Centroid category code ${i} is outside the category inventory`);
-    }
-    const base = i * dim;
-    for (let axis = 0; axis < dim; axis++) {
-      if (!Number.isFinite(positions[base + axis])) {
-        throw new TypeError(`Centroid position ${i}, axis ${axis} must be finite`);
+/**
+ * Compute centroid objects for a single dimension: one for each category that
+ * holds at least one cell (`n_points >= 1`), in category-inventory order. A
+ * category no cell holds has no centroid, so the list is as long as the
+ * categories present, not the inventory, and its `i`-th entry is not the
+ * `i`-th category: a consumer finds a centroid's category by its `category`.
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
+ * @param {(string|number|boolean)[]} categories
+ * @param {Float32Array} positions - one layout's normalized positions, stride = dim
+ * @param {number} dim
+ * @returns {Array<{category: string|number|boolean, position: number[], n_points: number}>}
+ */
+export function computeCentroidsForDimension(codes, categories, positions, dim) {
+  const accumulator = centroidAccumulator(codes, categories, positions, dim);
+  accumulator.add(0, accumulator.pointCount);
+  return accumulator.finish();
+}
+
+/** Cells summed between two looks at the clock (a scheduling choice). */
+const CENTROID_CELLS_PER_CHECK = 1 << 18;
+
+/**
+ * `computeCentroidsForDimension` in slices of about `sliceMs` of main-thread
+ * time, yielding a macrotask between them, so a dataset of any size never
+ * holds the main thread for one long task. The result is identical: the
+ * same additions in the same cell order.
+ *
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
+ * @param {(string|number|boolean)[]} categories
+ * @param {Float32Array} positions
+ * @param {number} dim
+ * @param {{signal?: AbortSignal|null, sliceMs: number, yieldToMacrotask: () => Promise<void>}} options
+ * @returns {Promise<Array<{category: string|number|boolean, position: number[], n_points: number}>>}
+ */
+export async function computeCentroidsForDimensionInSlices(
+  codes,
+  categories,
+  positions,
+  dim,
+  { signal = null, sliceMs, yieldToMacrotask }
+) {
+  const accumulator = centroidAccumulator(codes, categories, positions, dim);
+  const total = accumulator.pointCount;
+  let from = 0;
+  while (from < total) {
+    const deadline = performance.now() + sliceMs;
+    do {
+      const to = Math.min(total, from + CENTROID_CELLS_PER_CHECK);
+      accumulator.add(from, to);
+      from = to;
+    } while (from < total && performance.now() < deadline);
+    if (from < total) {
+      await yieldToMacrotask();
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException('The centroid pass was aborted.', 'AbortError');
       }
     }
-    sumsX[cat] += positions[base];
-    if (dim >= 2) sumsY[cat] += positions[base + 1];
-    if (dim >= 3) sumsZ[cat] += positions[base + 2];
-    counts[cat]++;
   }
-
-  const out = [];
-  for (let catIdx = 0; catIdx < numCategories; catIdx++) {
-    const count = counts[catIdx];
-    const x = count ? sumsX[catIdx] / count : 0;
-    const y = count ? sumsY[catIdx] / count : 0;
-    const z = count ? sumsZ[catIdx] / count : 0;
-    const pos = dim === 1 ? [x] : dim === 2 ? [x, y] : [x, y, z];
-    out.push({
-      category: categories[catIdx],
-      position: pos,
-      n_points: count
-    });
-  }
-  return out;
+  return accumulator.finish();
 }

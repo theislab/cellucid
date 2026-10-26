@@ -10,7 +10,7 @@ import { escapeHtml } from '../../../utils/dom-utils.js';
 
 const barplotDefinition = {
   id: 'barplot',
-  name: 'Bar Plot',
+  name: 'Bar plot',
   description: 'Compare categorical distributions across pages',
   supportedTypes: ['categorical'],
   supportedLayouts: ['side-by-side', 'grouped', 'stacked', 'overlay'],

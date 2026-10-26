@@ -19,7 +19,7 @@ function observeBrowserErrors(page) {
 }
 
 test(
-  'analysis exact-key records survive codecs and cache lifecycles',
+  'analysis exact-key records survive codecs and data-layer lifecycles',
   async ({ page }) => {
     const browserErrors = observeBrowserErrors(page);
     await page.goto('/tests/browser/fixtures/webgl-harness.html');
@@ -169,17 +169,19 @@ test(
       }
 
       const [
-        { encodeTable, decodeTable },
+        { encodeTypedJson, decodeTypedJson },
         { DataLayer },
         { getMemoryMonitor },
       ] = await Promise.all([
-        import('/assets/js/app/session/codecs/table-codec.js'),
+        import('/assets/js/app/session/codecs/typed-json.js'),
         import('/assets/js/app/analysis/data/data-layer.js'),
         import('/assets/js/app/analysis/shared/memory-monitor.js'),
       ]);
 
       const layers = new Set();
       try {
+        // Session typed JSON (analysis results) keeps every key as an own
+        // property, Object.prototype's names included.
         const codecCases = [
           {
             dtype: 'float32',
@@ -187,9 +189,9 @@ test(
             expected: index => [index + 0.25, index + 1.25],
           },
           {
-            dtype: 'bool',
-            input: index => [index % 2 === 0, index % 2 !== 0],
-            expected: index => [index % 2 === 0 ? 1 : 0, index % 2],
+            dtype: 'uint8',
+            input: index => Uint8Array.of(index % 2, (index + 1) % 2),
+            expected: index => [index % 2, (index + 1) % 2],
           },
           {
             dtype: 'string',
@@ -198,14 +200,16 @@ test(
           },
         ];
         for (const codecCase of codecCases) {
-          const decoded = decodeTable(encodeTable({
-            rowCount: 2,
-            columns: exactNames.map((name, index) => ({
-              name,
-              dtype: codecCase.dtype,
-              data: codecCase.input(index),
-            })),
-          }));
+          const record = {};
+          exactNames.forEach((name, index) => {
+            Object.defineProperty(record, name, {
+              value: codecCase.input(index),
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
+          });
+          const decoded = decodeTypedJson(encodeTypedJson({ columns: record }));
           assertOwnRecord(
             decoded.columns,
             exactNames,
@@ -213,7 +217,7 @@ test(
           );
           for (let index = 0; index < exactNames.length; index++) {
             assertArray(
-              decoded.columns[exactNames[index]],
+              [...decoded.columns[exactNames[index]]],
               codecCase.expected(index),
               `${codecCase.dtype}.${exactNames[index]}`,
             );
@@ -242,65 +246,7 @@ test(
           await layer.destroy();
           layers.delete(layer);
         };
-        const artifacts = exactNames.flatMap((gene, geneIndex) =>
-          exactNames.map((pageId, pageIndex) => ({
-            kind: 'bulk-gene',
-            cacheKey: 'prototype-matrix',
-            gene,
-            pageId,
-            pageName: `Page ${pageId}`,
-            cellCount: 1,
-            timestamp: 1,
-            geneCount: exactNames.length,
-            values: Float32Array.of(geneIndex * 100 + pageIndex),
-            cellIndices: Uint32Array.of(pageIndex),
-          }))
-        );
-        const verifyArtifacts = (exported, label) => {
-          if (exported.length !== artifacts.length) {
-            fail(
-              `${label} count ${exported.length} != ${artifacts.length}`,
-            );
-          }
-          const byIdentity = new Map(
-            exported.map(artifact => [
-              `${artifact.gene}\u0000${artifact.pageId}`,
-              artifact,
-            ]),
-          );
-          for (let geneIndex = 0; geneIndex < exactNames.length; geneIndex++) {
-            for (
-              let pageIndex = 0;
-              pageIndex < exactNames.length;
-              pageIndex++
-            ) {
-              const gene = exactNames[geneIndex];
-              const pageId = exactNames[pageIndex];
-              const artifact = byIdentity.get(`${gene}\u0000${pageId}`);
-              if (!artifact) {
-                fail(`${label} omitted ${gene}/${pageId}`);
-              }
-              assertArray(
-                artifact.values,
-                [geneIndex * 100 + pageIndex],
-                `${label} ${gene}/${pageId} values`,
-              );
-              assertArray(
-                artifact.cellIndices,
-                [pageIndex],
-                `${label} ${gene}/${pageId} indices`,
-              );
-            }
-          }
-        };
-
         const firstLayer = createLayer();
-        if (firstLayer.importSessionCache(artifacts) !== artifacts.length) {
-          fail('The first DataLayer did not import every cache artifact');
-        }
-        const firstExport = firstLayer.exportSessionCache();
-        verifyArtifacts(firstExport, 'first DataLayer export');
-
         firstLayer.getDataForPages = async () => exactNames.map(pageId => ({
           pageId,
           pageName: `Page ${pageId}`,
@@ -336,15 +282,7 @@ test(
         }
         await destroyLayer(firstLayer);
 
-        const secondLayer = createLayer();
-        if (secondLayer.importSessionCache(firstExport) !== firstExport.length) {
-          fail('The recreated DataLayer did not import every cache artifact');
-        }
-        verifyArtifacts(
-          secondLayer.exportSessionCache(),
-          'recreated DataLayer export',
-        );
-        await destroyLayer(secondLayer);
+        await destroyLayer(createLayer());
 
         if (monitor.getCleanupHandlerCount() !== baselineCleanupHandlers) {
           fail('DataLayer destroy leaked a memory-monitor cleanup handler');
@@ -356,7 +294,6 @@ test(
 
         return {
           aggregationPages: Object.keys(aggregation.pages).length,
-          cacheArtifacts: artifacts.length,
           codecCases: codecCases.length,
           exactNames: exactNames.length,
         };
@@ -369,7 +306,6 @@ test(
 
     expect(proof).toEqual({
       aggregationPages: proof.exactNames,
-      cacheArtifacts: proof.exactNames ** 2,
       codecCases: 3,
       exactNames: proof.exactNames,
     });

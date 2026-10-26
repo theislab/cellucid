@@ -143,12 +143,16 @@ test('a grid pane whose scene and camera did not change keeps its pixels', () =>
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   // Generic invalidation bumps the scene generation; a camera change alone
   // does not; time-driven effects other than the camera's bump it per frame.
-  assert.match(viewer, /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;/);
+  assert.match(viewer, /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;/);
   assert.match(viewer, /function invalidateCameraFrame\(\) \{\n\s*frameInvalidated = true;\n(?!\s*sceneGeneration)/);
-  assert.match(viewer, /if \(sceneWideAnimationActive\(\)\) sceneGeneration \+= 1;/);
+  // Every time-driven effect bumps the scene generation; all but the
+  // highlight pulse bump the base layer's too (pulse-layer-cache.js).
+  assert.match(viewer, /if \(baseLayerAnimationActive\(\)\) \{\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*\} else if \(highlightTools !== null && highlightTools\.isHighlightAnimating\(\)\) \{\n\s*sceneGeneration \+= 1;/);
   // A retained pane is skipped; a redrawn one clears its own colour.
   assert.match(viewer, /if \(retainPanes && paneIsUnchanged\(paneDrawRecords\.get\(view\.id\), mvpMatrix, pane, paneNavigationMode\)\) \{\n\s*continue;/);
-  assert.match(viewer, /gl\.clear\(retainPanes \? gl\.COLOR_BUFFER_BIT \| gl\.DEPTH_BUFFER_BIT : gl\.DEPTH_BUFFER_BIT\);/);
+  // (A pane drawn over its kept samples, pulse-sample-mask.js, is not
+  // cleared: its marked samples are reset by the pass itself.)
+  assert.match(viewer, /const maskedPane = maskedPulsePaneReady\(view\.id, pane, paneNavigationMode, retainPanes\);\n\s*if \(!maskedPane\) \{\n\s*gl\.clear\(\n\s*\(retainPanes \? gl\.COLOR_BUFFER_BIT \| gl\.DEPTH_BUFFER_BIT : gl\.DEPTH_BUFFER_BIT\)\n\s*\| sceneStencilClearBit\(\)\n\s*\);/);
   // Frames without panes give up retention; a single view keys its own.
   assert.equal((viewer.match(/^\s+retainedLayoutKey = '';/gm) ?? []).length, 4);
   assert.match(viewer, /if \(retainSingle && paneIsUnchanged\(paneDrawRecords\.get\(view\.id\), mvpMatrix, pane, navigationMode\)\) \{\n\s*sceneTargetChangedThisFrame = false;\n\s*return;/);
@@ -163,6 +167,20 @@ test('a frame that changed no pixel skips the resolve', () => {
 });
 
 
+test('a frame the highlight pulse alone asks for waits for the ambient pacer', () => {
+  const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
+  const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));
+  // Not yet due: no draw and no animation frame; the pacer's timer re-arms.
+  assert.match(render, /if \(frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer\.isDue\(now\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.wakeWhenDue\(ensureFrameScheduled\);\n\s*drainAfterFramePhase\(\);\n\s*return;/);
+  // Every drawn frame is measured.
+  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt\);\n\s*try \{\n\s*renderSceneFrame\(\);/);
+  // The pulse is the last cause named, so 'highlight' means nothing else asks.
+  const causes = viewer.slice(viewer.indexOf('  function sceneAnimationCause() {'), viewer.indexOf('  function nextFrameCause('));
+  assert.match(causes, /return AMBIENT_FRAME_CAUSE;\n\s*return null;\n\s*\}/);
+  assert.match(viewer, /^const AMBIENT_FRAME_CAUSE = 'highlight';$/m);
+});
+
+
 test('the frame loop stops once the scene has settled and starts again on demand', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));
@@ -170,11 +188,12 @@ test('the frame loop stops once the scene has settled and starts again on demand
   assert.match(render, /^  function render\(\) \{\n(\s*\/\/.*\n)*\s*animationHandle = null;/);
   assert.doesNotMatch(render, /animationHandle = requestAnimationFrame\(render\)/);
   assert.match(render, /\}\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);\n\s*frameInvalidated = false;\n\s*framesDrawnSinceCause \+= 1;/);
-  // The settled branch returns without arming.
-  assert.match(render, /settleWindowElapsed\(\)\) \{\n(\s*\/\/.*\n)*\s*lastFrameTime = now;\n\s*drainAfterFramePhase\(\);\n\s*return;/);
+  // The settled branch returns without arming, and leaves no pulse wake to
+  // arm it later.
+  assert.match(render, /settleWindowElapsed\(\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.cancelWake\(\);\n\s*lastFrameTime = now;\n\s*drainAfterFramePhase\(\);\n\s*return;/);
   // Everything that can change a frame starts the loop.
   for (const site of [
-    /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*ensureFrameScheduled\(\);/,
+    /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*ensureFrameScheduled\(\);/,
     /function invalidateCameraFrame\(\) \{\n\s*frameInvalidated = true;\n\s*ensureFrameScheduled\(\);/,
     /activeKeys\.add\(code\);\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);/,
     /createCanvasResizeObserver\(canvas, \(\) => ensureFrameScheduled\(\)\)/,

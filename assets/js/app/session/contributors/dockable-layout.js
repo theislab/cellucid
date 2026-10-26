@@ -14,15 +14,15 @@ import { StyleManager } from '../../../utils/style-manager.js';
 import {
   assertArray,
   assertBoolean,
-  assertExactKeys,
   assertFiniteNumber,
   assertNonEmptyString,
   assertSafeInteger,
-  requireMethod
+  requireMethod,
 } from '../schema-contract.js';
 import {
   getSessionRestoreSnapshot
 } from '../session-context.js';
+import { requireExactKeys } from '../../../utils/exact-record.js';
 
 export const id = 'dockable-layout';
 
@@ -134,7 +134,7 @@ function readPanelLayer(frame, context) {
 }
 
 function assertRect(rect, context) {
-  assertExactKeys(rect, ['left', 'top', 'width', 'height'], context);
+  requireExactKeys(rect, ['left', 'top', 'width', 'height'], context);
   assertFiniteNumber(rect.left, `${context} left`);
   assertFiniteNumber(rect.top, `${context} top`);
   assertFiniteNumber(rect.width, `${context} width`);
@@ -145,7 +145,7 @@ function assertRect(rect, context) {
 }
 
 function assertPanel(panel, context) {
-  assertExactKeys(panel, ['id', 'open', 'rect', 'z'], context);
+  requireExactKeys(panel, ['id', 'open', 'rect', 'z'], context);
   assertPanelId(panel.id, `${context} id`);
   assertBoolean(panel.open, `${context} open`);
   assertRect(panel.rect, `${context} rect`);
@@ -215,7 +215,7 @@ function applyLayout(ctx, payload) {
   requireMethod(dockable, 'dock', 'Dockable layout restore owner');
   requireMethod(dockable, 'float', 'Dockable layout restore owner');
   requireMethod(dockable, 'panelFrame', 'Dockable layout restore owner');
-  assertExactKeys(payload, ['panels'], 'Dockable layout payload');
+  requireExactKeys(payload, ['panels'], 'Dockable layout payload');
   assertArray(payload.panels, 'Dockable layout panels');
 
   const ids = new Set();

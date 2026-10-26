@@ -228,8 +228,8 @@ test(
     enableLodAndRequest(renderer);
     assert.equal(errors.length, 1, 'the refusal is reported once');
     ((error) => {
-        // Built with `toLocaleString` so the assertion holds under whatever
-        // locale the runner carries, exactly as the renderer formats it.
+        // Grouped as the renderer writes every count (`formatCount`, en-US),
+        // whatever locale the runner carries.
         const affordable = Math.floor(
           (
             MEASURED_CHROMIUM_HEAP_LIMIT_BYTES -
@@ -238,17 +238,17 @@ test(
           ) / PEAK_BYTES_PER_POINT,
         );
         for (const expected of [
-          `${pointCount.toLocaleString()} points`,
+          `${pointCount.toLocaleString('en-US')} points`,
           `${Math.round(
             MEASURED_CHROMIUM_HEAP_LIMIT_BYTES / MIB,
-          ).toLocaleString()} MiB`,
+          ).toLocaleString('en-US')} MiB`,
           `${Math.round(
             projectedBuildBytes(pointCount) / MIB,
-          ).toLocaleString()} MiB`,
+          ).toLocaleString('en-US')} MiB`,
           `${Math.round(
             measuredPreBuildBytes(pointCount) / MIB,
-          ).toLocaleString()} MiB`,
-          `${affordable.toLocaleString()} points`,
+          ).toLocaleString('en-US')} MiB`,
+          `${affordable.toLocaleString('en-US')} points`,
         ]) {
           assert.ok(
             error.message.includes(expected),
@@ -328,7 +328,7 @@ test('one byte less headroom refuses the same build', (t) => {
   enableLodAndRequest(refusing.renderer);
   assert.equal(errors.length, 1);
   assert.ok(
-    errors[0].includes(`level-of-detail index for ${pointCount.toLocaleString()} points`),
+    errors[0].includes(`level-of-detail index for ${pointCount.toLocaleString('en-US')} points`),
     errors[0],
   );
   assert.equal(refusing.staged.length, 0);
@@ -391,7 +391,7 @@ test(
         assert.ok(error instanceof RangeError);
         assert.ok(
           error.message.includes(
-            `level-of-detail index for ${geometryPoints.toLocaleString()} points`,
+            `level-of-detail index for ${geometryPoints.toLocaleString('en-US')} points`,
           ),
           error.message,
         );

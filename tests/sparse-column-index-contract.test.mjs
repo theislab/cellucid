@@ -248,14 +248,15 @@ test('malformed CSR structure is refused, never clamped', async () => {
   await assert.rejects(sparseIndex(outside, factory).index.start(), /outside its 3-column shape/);
 });
 
-test('the column-index memory budget follows the device memory the browser reports', () => {
+test('the column-index memory budget is its share of the estimated device memory', () => {
   const GiB = 1024 ** 3;
-  assert.equal(columnIndexMemoryBudget({ navigator: { deviceMemory: 8 } }), 2 * GiB);
+  // Three eighths of the allowance, half the device.
+  assert.equal(columnIndexMemoryBudget({ navigator: { deviceMemory: 8 } }), 1.5 * GiB);
   assert.equal(
     columnIndexMemoryBudget({ navigator: {}, performance: { memory: { jsHeapSizeLimit: 4 * GiB } } }),
-    2 * GiB
+    3 * GiB
   );
-  assert.equal(columnIndexMemoryBudget({}), GiB);
+  assert.equal(columnIndexMemoryBudget({}), 1.5 * GiB);
 });
 
 test('a retired index still answers the genes already asked for, then lets go', async () => {
@@ -296,4 +297,177 @@ test('a retired index still answers the genes already asked for, then lets go', 
   const idle = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 })).index;
   idle.retire();
   await assert.rejects(idle.column(0), /released|superseded/);
+});
+
+/** An index over the network: values read on demand, every read range recorded. */
+function onDemandIndex(fixture) {
+  const valueRanges = [];
+  const { index, reads } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    valuesOnDemand: true,
+    retainIndicesBytes: 1 << 30,
+    readValues: async (start, end) => {
+      valueRanges.push([start, end]);
+      return fixture.data.slice(start, end);
+    },
+  });
+  return { index, reads, valueRanges };
+}
+
+test('over the network a sparse matrix is indexed by its indices alone', async () => {
+  const fixture = csrFixture(4000, 300);
+  const { index, reads, valueRanges } = onDemandIndex(fixture);
+  await index.start();
+  assert.equal(index.phase, 'ready');
+  assert.ok(reads.indices > 0);
+  assert.equal(valueRanges.length, 0, 'no value is read until a gene is asked for');
+  for (const column of [0, 7, 150, 299]) {
+    assert.deepEqual(await index.column(column), denseColumn(fixture, column));
+  }
+});
+
+test('a gene asked for during the pass reads only its own entries\' values', async () => {
+  const fixture = csrFixture(4000, 300);
+  const { index, valueRanges } = onDemandIndex(fixture);
+  const column = await index.column(42);
+  assert.deepEqual(column, denseColumn(fixture, 42));
+  const read = valueRanges.reduce((sum, [start, end]) => sum + end - start, 0);
+  assert.ok(read < fixture.data.length / 4, `read ${read} of ${fixture.data.length} values`);
+});
+
+test('a gene spread over the whole matrix reads every value once, then every gene is answered from memory', async () => {
+  // Every row holds column 0; other columns are rare.
+  const nRows = 60_000;
+  const indptr = [0];
+  const indices = [];
+  const data = [];
+  for (let row = 0; row < nRows; row++) {
+    indices.push(0);
+    data.push(1 + (row % 5));
+    if (row % 997 === 0) {
+      indices.push(1 + (row % 50));
+      data.push(2);
+    }
+    indptr.push(indices.length);
+  }
+  const fixture = { nRows, nCols: 51, indptr: Float64Array.from(indptr), indices: Int32Array.from(indices), data: Float32Array.from(data) };
+  const { index, valueRanges } = onDemandIndex(fixture);
+  await index.start();
+  assert.deepEqual(await index.column(0), denseColumn(fixture, 0));
+  const afterCommon = valueRanges.length;
+  const covered = valueRanges.reduce((sum, [start, end]) => sum + end - start, 0);
+  assert.equal(covered, fixture.data.length, 'the common gene read every value, once');
+  for (const column of [1, 13, 50]) {
+    assert.deepEqual(await index.column(column), denseColumn(fixture, column));
+  }
+  assert.equal(valueRanges.length, afterCommon, 'later genes read nothing');
+});
+
+test('a gene spread over every slab, asked for during the pass, reads each slab\'s values once, and later genes read nothing', async () => {
+  // Every row holds every fifth gene: each gene spreads over the whole matrix,
+  // as the genes of a real atlas do.
+  const nRows = 20_000;
+  const nCols = 40;
+  const indptr = [0];
+  const indices = [];
+  const data = [];
+  for (let row = 0; row < nRows; row++) {
+    for (let gene = row % 5; gene < nCols; gene += 5) {
+      indices.push(gene);
+      data.push(1 + ((row + gene) % 9));
+    }
+    indptr.push(indices.length);
+  }
+  const fixture = { nRows, nCols, indptr: Float64Array.from(indptr), indices: Int32Array.from(indices), data: Float32Array.from(data) };
+  const valueRanges = [];
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    valuesOnDemand: true,
+    retainIndicesBytes: 1 << 30,
+    slabEntries: 4096,
+    readValues: async (start, end) => {
+      valueRanges.push([start, end]);
+      return fixture.data.slice(start, end);
+    },
+  });
+  // Asked for before the pass starts: extracted from every slab.
+  assert.deepEqual(await index.column(2), denseColumn(fixture, 2));
+  await index.start();
+  const read = valueRanges.reduce((sum, [start, end]) => sum + end - start, 0);
+  assert.equal(read, fixture.data.length, 'every value read once');
+  const afterFirst = valueRanges.length;
+  for (const column of [0, 17, 39]) {
+    assert.deepEqual(await index.column(column), denseColumn(fixture, column));
+  }
+  assert.equal(valueRanges.length, afterFirst, 'later genes read nothing');
+});
+
+test('genes asked for together are weighed together: one reads its ranges, many at once read every value once', async () => {
+  // Gene g lives in its own band of rows, so each gene alone is one short range.
+  const nRows = 30_000;
+  const nCols = 50;
+  const indptr = [0];
+  const indices = [];
+  const data = [];
+  for (let row = 0; row < nRows; row++) {
+    const gene = Math.floor(row / (nRows / nCols));
+    for (let k = 0; k < 5; k++) {
+      indices.push(k === 0 ? gene : (gene + 7 * k) % nCols);
+      data.push(1 + ((row + k) % 7));
+    }
+    indptr.push(indices.length);
+  }
+  const fixture = { nRows, nCols, indptr: Float64Array.from(indptr), indices: Int32Array.from(indices), data: Float32Array.from(data) };
+  const valueRanges = [];
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    valuesOnDemand: true,
+    retainIndicesBytes: 1 << 30,
+    slabEntries: 4096,
+    // Stored at one byte per value: every value costs about one request more than a gene's range.
+    valuesStoredBytes: async () => fixture.data.length,
+    readValues: async (start, end) => {
+      valueRanges.push([start, end]);
+      return fixture.data.slice(start, end);
+    },
+  });
+  await index.start();
+  assert.deepEqual(await index.column(3), denseColumn(fixture, 3));
+  const alone = valueRanges.reduce((sum, [start, end]) => sum + end - start, 0);
+  assert.ok(alone < fixture.data.length / 2, `one gene read ${alone} of ${fixture.data.length} values`);
+
+  valueRanges.length = 0;
+  const genes = Array.from({ length: 40 }, (_, i) => i + 10);
+  const columns = await Promise.all(genes.map(gene => index.column(gene)));
+  columns.forEach((column, i) => assert.deepEqual(column, denseColumn(fixture, genes[i])));
+  const covered = valueRanges.reduce((sum, [start, end]) => sum + end - start, 0);
+  assert.equal(covered, fixture.data.length, 'forty genes at once read every value, once');
+  const afterBatch = valueRanges.length;
+  assert.deepEqual(await index.column(0), denseColumn(fixture, 0));
+  assert.equal(valueRanges.length, afterBatch, 'later genes read nothing');
+});
+
+test('an abandoned spill directory is swept when the app starts; a held one is kept', async () => {
+  const { sweepAbandonedIndexes } = await import('../assets/js/data/column-store-placement.js');
+  const removed = [];
+  const held = new Set(['cellucid-column-index/live']);
+  const parent = {
+    async *entries() {
+      yield ['live', {}];
+      yield ['crashed', {}];
+    },
+    async removeEntry(name) {
+      removed.push(name);
+    },
+  };
+  const environment = {
+    navigator: {
+      storage: { getDirectory: async () => ({ getDirectoryHandle: async () => parent }) },
+      locks: { request: async (name, _options, callback) => callback(held.has(name) ? null : { name }) },
+    },
+  };
+  await sweepAbandonedIndexes(environment);
+  assert.deepEqual(removed, ['crashed']);
+  // No OPFS, or no index directory yet: nothing to do, and nothing thrown.
+  await sweepAbandonedIndexes({ navigator: {} });
+  await sweepAbandonedIndexes({
+    navigator: { storage: { getDirectory: async () => ({ getDirectoryHandle: async () => { throw new DOMException('none', 'NotFoundError'); } }) } },
+  });
 });

@@ -11,7 +11,8 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected } from '../../community-annotations/access-store.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
-import { formatCountOf, formatPercent } from '../components/display-format.js';
+import { formatPercent } from '../components/display-format.js';
+import { formatCountOf, countNoun } from '../../../utils/format-units.js';
 import { claimModalDocumentLayer } from '../components/modal-background-owner.js';
 import * as capApi from '../../community-annotations/cap-api.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
@@ -489,7 +490,7 @@ function formatLostMarkerStats(genes) {
     counts.set(gene, (counts.get(gene) ?? 0) + 1);
   }
   return [...counts.entries()]
-    .map(([gene, count]) => count === 1 ? gene : `${gene} (${count} entries)`)
+    .map(([gene, count]) => count === 1 ? gene : `${gene} (${formatCountOf(count, 'entry', 'entries')})`)
     .join(', ');
 }
 
@@ -1079,7 +1080,7 @@ function renderCapSearchResults({
       role: 'status',
       text:
         `CAP omitted ${omittedInvalidCount} invalid upstream ` +
-        `result${omittedInvalidCount === 1 ? '' : 's'}.`
+        `${countNoun(omittedInvalidCount, 'result')}.`
     }));
   }
 
@@ -2251,7 +2252,7 @@ function openSuggestionCommentsModal({
         }
         status.textContent =
           `Page ${page + 1} of ${currentPageCount} · ` +
-          `${currentSorted.length} comment${currentSorted.length === 1 ? '' : 's'}`;
+          `${formatCountOf(currentSorted.length, 'comment')}`;
         previous.disabled = page === 0;
         next.disabled = page >= currentPageCount - 1;
       });
@@ -2530,7 +2531,7 @@ function renderSuggestionCard({
     className: 'btn btn-compact community-annotation-vote-btn vote-up',
     text: `▲ ${up}`,
     disabled: !canInteract,
-    'aria-label': `Upvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${up} upvotes`,
+    'aria-label': `Upvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${formatCountOf(up, 'upvote')}`,
     'aria-pressed': myVote === 'up' ? 'true' : 'false'
   });
   const downBtn = el('button', {
@@ -2538,7 +2539,7 @@ function renderSuggestionCard({
     className: 'btn btn-compact community-annotation-vote-btn vote-down',
     text: `▼ ${down}`,
     disabled: !canInteract,
-    'aria-label': `Downvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${down} downvotes`,
+    'aria-label': `Downvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${formatCountOf(down, 'downvote')}`,
     'aria-pressed': myVote === 'down' ? 'true' : 'false'
   });
   ownModalFocusKey(upBtn, `${suggestionFocusPrefix}:vote-up`);
@@ -2967,7 +2968,7 @@ function renderSuggestionCard({
     const bundleRow = el('div', { className: 'community-annotation-bundle-row' });
     bundleRow.appendChild(el('div', {
       className: 'field-help',
-      text: `Merged bundle (${mergedFrom.length + 1} suggestions) • votes de-duplicated`
+      text: `Merged bundle (${formatCountOf(mergedFrom.length + 1, 'suggestion')}) • votes de-duplicated`
     }));
     const mergedBtn = el('button', {
       type: 'button',
@@ -3256,9 +3257,9 @@ function renderSuggestionCard({
       const viewAllBtn = el('button', {
         type: 'button',
         className: 'community-annotation-merged-comment-btn',
-        text: `View all ${sorted.length} comments`,
+        text: `View all ${formatCountOf(sorted.length, 'comment')}`,
         'aria-label':
-          `View all ${sorted.length} comments for ` +
+          `View all ${formatCountOf(sorted.length, 'comment')} for ` +
           `${toCleanString(suggestion?.label) || 'this suggestion'}`,
         'data-secondary-action': 'comments',
         'data-suggestion-id': toCleanString(suggestion?.id)
@@ -3525,7 +3526,7 @@ function buildVotingDetail({
     }
     suggestionPageStatus.textContent =
       `Page ${page + 1} of ${suggestionPageCount} · ` +
-      `${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'}`;
+      `${formatCountOf(suggestions.length, 'suggestion')}`;
     previousSuggestionPage.disabled = page === 0;
     nextSuggestionPage.disabled = page >= suggestionPageCount - 1;
   });
@@ -3733,8 +3734,7 @@ function buildVotingDetail({
     ontInput.value = nextOntologyId;
     markerGenesInput.value = markerMerge.text;
     const parts = [
-      `Added ${markerMerge.addedGenes.length} CAP marker` +
-        `${markerMerge.addedGenes.length === 1 ? '' : 's'}.`
+      `Added ${markerMerge.addedGenes.length} CAP ${countNoun(markerMerge.addedGenes.length, 'marker')}.`
     ];
     if (selectedLabel !== labelCandidates[0]) {
       parts.push(
@@ -3744,15 +3744,15 @@ function buildVotingDetail({
     }
     if (markerMerge.duplicateGenes.length) {
       parts.push(
-        `${markerMerge.duplicateGenes.length} duplicate CAP marker` +
-        `${markerMerge.duplicateGenes.length === 1 ? '' : 's'}: ` +
+        `${markerMerge.duplicateGenes.length} duplicate CAP ` +
+        `${countNoun(markerMerge.duplicateGenes.length, 'marker')}: ` +
         `${markerMerge.duplicateGenes.join(', ')}.`
       );
     }
     if (markerMerge.omittedGenes.length) {
       parts.push(
-        `${markerMerge.omittedGenes.length} CAP marker` +
-        `${markerMerge.omittedGenes.length === 1 ? '' : 's'} omitted at ` +
+        `${markerMerge.omittedGenes.length} CAP ` +
+        `${countNoun(markerMerge.omittedGenes.length, 'marker')} omitted at ` +
         `the 50-marker limit: ` +
         `${markerMerge.omittedGenes.join(', ')}.`
       );

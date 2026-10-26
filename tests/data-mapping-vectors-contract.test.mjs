@@ -1,7 +1,8 @@
 /**
  * Vector fields of a data mapping, read from a real `.h5ad` and Zarr ZIP in
- * the browser readers, against what `cellucid-python` serves for the same
- * binding (`data-mapping-full.expected.json`):
+ * the browser readers, against the numpy reference for the same binding
+ * (`data-mapping-full.expected.json`, computed by
+ * `scripts/generate-data-mapping-fixtures.py` independently of this code):
  * - an array as wide as the embedding's dimension is read whole, one as wide
  *   as the embedding's array at the embedding's own columns, and both are
  *   scaled by that embedding's normalization: byte-identical payloads;
@@ -15,8 +16,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { resolveVectorBinding } from '../assets/js/data/data-mapping-candidates.js';
 
 const EXPECTED = JSON.parse(
@@ -41,15 +41,15 @@ async function open(t, format) {
   silenceNotifications(t);
   if (format === 'H5AD') {
     const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url))], 'data-mapping-full.h5ad');
-    const source = new H5adDataSource();
+    const source = new AnnDataFileSource();
     t.after(() => source.clear());
-    await source.loadFromFile(file);
+    await source.loadFile(file);
     return source.getAdapter();
   }
   const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url))], 'data-mapping-full.zarr.zip');
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromArchiveFile(file);
+  await source.loadFile(file);
   return source.getAdapter();
 }
 
@@ -68,7 +68,7 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
         embedding: { key: embeddingKey, columns: columns.split(',').map(Number) },
       });
       assert.equal(resolved.ok, true, name);
-      const vectors = await adapter.getVectorPayload(resolved.path, resolved.dimension);
+      const { vectors } = await adapter.getVectorPayload(resolved.path, resolved.dimension);
       assert.equal(sha256(vectors), expected, name);
     }
   });

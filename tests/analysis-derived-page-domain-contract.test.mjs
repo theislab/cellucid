@@ -35,7 +35,7 @@
  *      (`form-based-analysis.js:1678`) → the narrow validator, which throws
  *      `Form-based analysis selectedPages page "restof__page_1" was not found`.
  *
- * `_requireExactFormSettings` reaches the same wall from `importSettings`, which
+ * `_requireSettings` reaches the same wall from `importSettings`, which
  * is how a floating analysis window is populated
  * (`analysis-window-manager.js:833`) — a Correlation or Gene Signature panel can
  * legitimately export a rest-of selection, and the copy validates it before its
@@ -46,7 +46,7 @@
  * CEL-0231 — the fourth site. `_requireCustomPageColors`
  * (`form-based-analysis.js:391`) kept deriving its domain from
  * `this._pageSelector._getPages()`, the widget's current view, while
- * `_requireExactFormSettings` ten lines above it — validating the *same*
+ * `_requireSettings` ten lines above it — validating the *same*
  * settings object, in the same `importSettings` call — used the shared rule. The
  * two agree today only because every form-based selector is constructed with
  * `includeDerivedPages: true`; the option defaults to `false`
@@ -64,6 +64,7 @@ import { BaseAnalysisUI } from '../assets/js/app/analysis/ui/base-analysis-ui.js
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
 import { PageSelectorComponent } from '../assets/js/app/analysis/ui/shared/page-selector.js';
 import { createRestOfPageId } from '../assets/js/app/analysis/shared/page-derivation-utils.js';
+import { defineOptions } from '../assets/js/app/analysis/options/option-schema.js';
 
 const PAGES = [
   { id: 'page_1', name: 'Page 1' },
@@ -87,7 +88,23 @@ function createDataLayer({ emptyPageIds = [] } = {}) {
 function createSelectorlessUI(Prototype, dataLayer) {
   const ui = Object.create(Prototype);
   ui.dataLayer = dataLayer;
+  ui._getTitle = () => 'Form';
+  ui._getOptionsSchema = () => SCHEMA;
+  ui._getOptionsContext = () => ({});
   return ui;
+}
+
+const SCHEMA = defineOptions({
+  id: 'pageDomain',
+  groups: [],
+  options: [
+    { key: 'size', kind: 'number', label: 'Size', tip: 'analysis-signature', group: 'essentials', default: 1 },
+  ],
+});
+
+/** A form analysis's settings record selecting `selectedPages`. */
+function formSettings(selectedPages) {
+  return { options: { size: 1 }, selectedPages, view: { disclosures: { more: false, groups: [] } } };
 }
 
 /**
@@ -128,13 +145,7 @@ test(
     const dataLayer = createDataLayer();
     const ui = createSelectorlessUI(FormBasedAnalysisUI.prototype, dataLayer);
 
-    const validated = ui._requireExactFormSettings(
-      {
-        selectedPages: [REST_OF_PAGE_1],
-        formControls: {},
-      },
-      ['formControls', 'selectedPages'],
-    );
+    const validated = ui._requireSettings(formSettings([REST_OF_PAGE_1]));
 
     assert.deepEqual(validated.selectedPages, [REST_OF_PAGE_1]);
   },
@@ -193,10 +204,7 @@ test('the four page domains are the same domain', () => {
 
   manager.setCurrentPages(everyId, { notifyActiveUI: false });
   baseUI._requireAvailableSelectedPages(everyId, 'Analysis selectedPages');
-  formUI._requireExactFormSettings(
-    { selectedPages: everyId, formControls: {} },
-    ['formControls', 'selectedPages'],
-  );
+  formUI._requireSettings(formSettings(everyId));
   assert.deepEqual(
     colourUI._requireCustomPageColors(everyId.map(id => [id, '#3366cc'])),
     everyId.map(id => [id, '#3366cc']),
@@ -214,10 +222,7 @@ test('the four page domains are the same domain', () => {
     /was not found/,
   );
   assert.throws(
-    () => formUI._requireExactFormSettings(
-      { selectedPages: [stranger], formControls: {} },
-      ['formControls', 'selectedPages'],
-    ),
+    () => formUI._requireSettings(formSettings([stranger])),
     /was not found/,
   );
   assert.throws(
@@ -236,10 +241,7 @@ test(
     const ui = createColourUI(dataLayer, { includeDerivedPages: false });
 
     assert.deepEqual(
-      ui._requireExactFormSettings(
-        { selectedPages: [REST_OF_PAGE_1], formControls: {} },
-        ['formControls', 'selectedPages'],
-      ).selectedPages,
+      ui._requireSettings(formSettings([REST_OF_PAGE_1])).selectedPages,
       [REST_OF_PAGE_1],
     );
     assert.deepEqual(
@@ -301,10 +303,7 @@ test('widening the domain does not weaken the empty-page rule', () => {
     /zero cells/,
   );
   assert.throws(
-    () => formUI._requireExactFormSettings(
-      { selectedPages: [REST_OF_PAGE_1], formControls: {} },
-      ['formControls', 'selectedPages'],
-    ),
+    () => formUI._requireSettings(formSettings([REST_OF_PAGE_1])),
     /zero cells/,
   );
 });

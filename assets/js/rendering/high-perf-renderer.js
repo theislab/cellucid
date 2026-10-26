@@ -23,7 +23,12 @@ import {
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 import { getNotificationCenter } from '../app/notification-center.js';
-import { configureStraightAlphaBlending, drawPointsInSegments } from './gl-utils.js';
+import {
+  configureStraightAlphaBlending,
+  deleteGlObject,
+  drawPointsInSegments,
+  restorableTexture,
+} from './gl-utils.js';
 import {
   requireDimensionLevel,
   requireFiniteNumber,
@@ -51,8 +56,15 @@ import {
   settlePointDraw,
 } from './high-perf/gl-point-draw-state.js';
 import { SpatialIndex } from './high-perf/spatial-index.js';
-import { buildSpatialTreeJob } from './high-perf/spatial-tree-job.js';
+import {
+  alphaEncodingWords,
+  encodeAlphaSpan,
+  firstNonBinaryByte,
+} from './alpha-visibility.js';
+import { buildSpatialTreeJob, decodeSpatialTreeJobResult } from './high-perf/spatial-tree-job.js';
 import { GpuPermuter } from './high-perf/gpu-permute.js';
+import { spatialTreeWorkerScript } from '../../workers/scripts.js';
+import { startWorker } from '../workers/worker-script.js';
 import {
   allocateLinearTexture,
   planLinearTextureFor,
@@ -65,6 +77,7 @@ import {
   readPositionBounds,
   requirePositionArray,
 } from './position-layout.js';
+import { formatCountOf, formatCount } from '../utils/format-units.js';
 
 // ============================================================================
 // CONSTANTS
@@ -289,7 +302,7 @@ function projectLodBuildHeapBytes(pointCount) {
 }
 
 function describeHeapMebibytes(bytes) {
-  return `${Math.round(bytes / (1024 * 1024)).toLocaleString()} MiB`;
+  return `${formatCount(Math.round(bytes / (1024 * 1024)))} MiB`;
 }
 
 /**
@@ -356,13 +369,13 @@ function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
   );
   throw new RangeError(
     `${label} cannot build a level-of-detail index for ` +
-    `${pointCount.toLocaleString()} points on this device: the build peaks at ` +
+    `${formatCountOf(pointCount, 'point')} on this device: the build peaks at ` +
     `about ${describeHeapMebibytes(projectedBytes)} of JavaScript heap on top ` +
     `of the ${describeHeapMebibytes(usedBytes)} already in use, and this ` +
     `browser caps the tab at ${describeHeapMebibytes(limitBytes)}. Turn off ` +
     'adaptive level of detail and frustum culling to render this dataset at ' +
     `full detail, or subset it to at most ` +
-    `${affordablePoints.toLocaleString()} points.`
+    `${formatCountOf(affordablePoints, 'point')}.`
   );
 }
 
@@ -397,7 +410,7 @@ function requireOrderCoversColors(order, colors, owner) {
   const slots = order.drawOrder.indices.length;
   const count = colors.length >>> 2;
   if (slots !== count) {
-    throw new RangeError(`${owner} has a draw order of ${slots} slots for ${count} colours.`);
+    throw new RangeError(`${owner} has a draw order of ${slots} slots for ${formatCountOf(count, 'colour')}.`);
   }
 }
 
@@ -669,6 +682,9 @@ export class HighPerfRenderer {
     // stream dirty, and the next render uploads it once, however many
     // recolors arrived in between.
     this._colorsDirty = false;
+    this._positionsUploadPending = false;
+    // GPU stores allocated ahead of a publication (`prepareDataStores`).
+    this._preparedDataStores = null;
 
     // Per-view state for multi-view rendering (frustum culling and LOD)
     // Each view needs its own cache to avoid cross-view interference
@@ -962,10 +978,11 @@ export class HighPerfRenderer {
       );
     }
 
+    // UNPACK_ROW_LENGTH and UNPACK_IMAGE_HEIGHT are never set in this app
+    // (they stay 0), and reading them is a synchronous round trip to the GPU
+    // process in Chrome; the state below is read client-side.
     const pixelStoreParameters = [
       gl.UNPACK_ALIGNMENT,
-      gl.UNPACK_ROW_LENGTH,
-      gl.UNPACK_IMAGE_HEIGHT,
       gl.UNPACK_SKIP_PIXELS,
       gl.UNPACK_SKIP_ROWS,
       gl.UNPACK_SKIP_IMAGES,
@@ -993,8 +1010,6 @@ export class HighPerfRenderer {
     try {
       gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
-      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
-      gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
       gl.pixelStorei(gl.UNPACK_SKIP_IMAGES, 0);
@@ -1457,6 +1472,12 @@ export class HighPerfRenderer {
         );
       }
     }
+    const prepared = this._preparedDataStores ?? null;
+    if (prepared !== null) {
+      add(prepared.buffers?.positions, prepared.positionGpuByteLength);
+      add(prepared.buffers?.colors, prepared.colorGpuByteLength);
+      add(prepared.alphaTexture, prepared.alphaTextureByteLength);
+    }
     if (this._snapshotGeometryPools instanceof Map) {
       for (const geometry of this._snapshotGeometryPools.values()) {
         add(
@@ -1537,6 +1558,7 @@ export class HighPerfRenderer {
       firstRenderDone: this._firstRenderDone,
       boundingSphere: this._boundingSphere,
       colorsDirty: this._colorsDirty,
+      positionsUploadPending: this._positionsUploadPending === true,
       gpuMemoryMB: this.stats.gpuMemoryMB,
     };
   }
@@ -1578,6 +1600,7 @@ export class HighPerfRenderer {
     this._firstRenderDone = false;
     this._boundingSphere = null;
     this._colorsDirty = false;
+    this._positionsUploadPending = false;
     this._validatedSpatialIndices = new WeakSet();
   }
 
@@ -1611,7 +1634,178 @@ export class HighPerfRenderer {
     this._firstRenderDone = publication.firstRenderDone;
     this._boundingSphere = publication.boundingSphere;
     this._colorsDirty = publication.colorsDirty;
+    this._positionsUploadPending = publication.positionsUploadPending === true;
     this.stats.gpuMemoryMB = publication.gpuMemoryMB;
+  }
+
+  /**
+   * Allocate, ahead of `loadData`, the GPU stores a dataset of `pointCount`
+   * points of `dimension` components will be published into: its position
+   * and colour vertex stores and its R8 alpha texture.
+   *
+   * WebGL reports a refused allocation only through `getError`, a round trip
+   * that waits until the GPU has done the allocation and everything queued
+   * before it. Made here, in a task of its own before the dataset is
+   * published, that wait is spent outside the publishing task, and a dataset
+   * the device cannot hold is refused before anything changes. `loadData`
+   * adopts the stores when its dataset has exactly this size and dimension;
+   * any other publication, `releasePreparedDataStores`, disposal or a lost
+   * context releases them.
+   *
+   * @param {number} pointCount
+   * @param {number} dimension - Components per position (1, 2 or 3).
+   */
+  prepareDataStores(pointCount, dimension) {
+    this._assertOperational('prepare data stores');
+    if (!Number.isSafeInteger(pointCount) || pointCount < 0) {
+      throw new RangeError(
+        'HighPerfRenderer prepared point count must be a non-negative safe integer.'
+      );
+    }
+    const exactDimension = requireDimensionLevel(
+      dimension,
+      'HighPerfRenderer prepared dimension'
+    );
+    this.releasePreparedDataStores();
+    if (pointCount === 0) return;
+    const gl = this.gl;
+    const plan = planLinearTextureFor(gl, pointCount);
+    requireCleanWebGLState(gl, 'HighPerfRenderer data-store preparation');
+    const prepared = {
+      pointCount,
+      dimension: exactDimension,
+      buffers: { positions: null, colors: null },
+      positionGpuByteLength: 0,
+      colorGpuByteLength: 0,
+      alphaTexture: null,
+      alphaTextureByteLength: 0,
+      alphaPlan: plan,
+    };
+    this._preparedDataStores = prepared;
+    try {
+      const positions = gl.createBuffer();
+      const colors = gl.createBuffer();
+      prepared.buffers = { positions, colors };
+      if (!positions || !colors) {
+        throw new Error('HighPerfRenderer could not allocate the point buffers.');
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, positions);
+      prepared.positionGpuByteLength = this._allocateVertexStore(
+        positionByteLength(pointCount, exactDimension),
+        gl.STATIC_DRAW,
+        pointCount,
+        'HighPerfRenderer point-position upload'
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, colors);
+      prepared.colorGpuByteLength = this._allocateVertexStore(
+        pointCount * 4,
+        gl.DYNAMIC_DRAW,
+        pointCount,
+        'HighPerfRenderer point-color upload'
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      const texture = gl.createTexture();
+      if (!texture) {
+        throw new Error('HighPerfRenderer could not allocate the required alpha texture.');
+      }
+      prepared.alphaTexture = texture;
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      try {
+        this._withNeutralTextureUnpackState(
+          1,
+          'HighPerfRenderer prepared alpha texture',
+          () => {
+            this._allocateGpu('HighPerfRenderer could not allocate the alpha texture', () => {
+              allocateLinearTexture(gl, gl.R8, plan);
+            });
+          }
+        );
+      } finally {
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+      }
+      prepared.alphaTextureByteLength = plan.texels;
+    } catch (error) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      const cleanupFailures = this.releasePreparedDataStores();
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupFailures],
+          `HighPerfRenderer data-store preparation failed with ${cleanupFailures.length} cleanup error(s).`
+        );
+      }
+      throw error;
+    }
+    this._refreshGpuMemoryStats();
+  }
+
+  /**
+   * Release stores `prepareDataStores` allocated that no publication took.
+   *
+   * @returns {Error[]} Cleanup failures (the stores stay journaled for retry).
+   */
+  releasePreparedDataStores() {
+    if (this._preparedDataStores === null || this._preparedDataStores === undefined) return [];
+    this._queueDataRetirement(this._detachPreparedDataStores());
+    return this._drainDataRetirements();
+  }
+
+  /**
+   * The prepared stores as a publication-shaped record the retirement journal
+   * takes, the slot emptied.
+   * @private
+   */
+  _detachPreparedDataStores() {
+    const prepared = this._preparedDataStores ?? null;
+    this._preparedDataStores = null;
+    if (prepared === null) return { buffers: { positions: null, colors: null } };
+    return {
+      pointCount: prepared.pointCount,
+      currentDimensionLevel: prepared.dimension,
+      buffers: prepared.buffers,
+      positionGpuByteLength: prepared.positionGpuByteLength,
+      colorGpuByteLength: prepared.colorGpuByteLength,
+      alphaTexture: prepared.alphaTexture,
+      alphaTextureByteLength: prepared.alphaTextureByteLength,
+    };
+  }
+
+  /**
+   * The prepared stores when they are exactly for `pointCount` points of
+   * `dimension` components (the slot emptied); otherwise they are released
+   * and null is returned.
+   * @private
+   */
+  _takePreparedDataStores(pointCount, dimension) {
+    const prepared = this._preparedDataStores ?? null;
+    if (prepared === null) return null;
+    if (prepared.pointCount !== pointCount || prepared.dimension !== dimension) {
+      const failures = this.releasePreparedDataStores();
+      if (failures.length > 0) {
+        throw new AggregateError(failures, 'HighPerfRenderer could not release unused prepared stores.');
+      }
+      return null;
+    }
+    this._preparedDataStores = null;
+    return prepared;
+  }
+
+  /**
+   * Write the live positions into their store when the publication sized it
+   * without them (`_createPointStreams`). Everything that draws from the
+   * store, gathers into it, lends it to a kept view or keeps it past its
+   * publication calls this first, so the store is never read before it holds
+   * them; the first frame is the one that usually does.
+   * @private
+   */
+  _flushPendingPositionUpload() {
+    if (this._positionsUploadPending !== true) return;
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this._positions);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    // Bytes written into an accepted store: only a lost context refuses them.
+    requireLiveContext(gl, 'HighPerfRenderer point-position upload');
+    this._positionsUploadPending = false;
   }
 
   _ensureRetirementOwnershipState() {
@@ -1986,7 +2180,7 @@ export class HighPerfRenderer {
         const handle = entry.handle;
         if (handle === null) continue;
         try {
-          gl[deleteMethod](handle);
+          deleteGlObject(gl, deleteMethod, handle);
           entry.handle = null;
           // GPU memory was released: a tree build refused for memory may
           // succeed now (`_requestSpatialIndex`).
@@ -2239,6 +2433,7 @@ export class HighPerfRenderer {
           'HighPerfRenderer live geometry has no exact position VBO to share.'
         );
       }
+      this._flushPendingPositionUpload();
       // The live generation already is this geometry, on the CPU and on the
       // GPU. Copying it cost the snapshot a second array and a second VBO of
       // the same coordinates: 4 bytes per axis per point twice over, 240 MB
@@ -2307,6 +2502,22 @@ export class HighPerfRenderer {
       return pooled;
     }
     return this._acquireIndependentSnapshotGeometry(positions, dimension);
+  }
+
+  /**
+   * Whether the renderer holds a geometry over these positions: the live
+   * view's, or one pooled for a view or retained for a quick switch back.
+   * Overlays keep their own uploads of the same positions as long.
+   *
+   * @param {Float32Array} positions
+   * @returns {boolean}
+   */
+  holdsGeometryFor(positions) {
+    if (this._positions === positions) return true;
+    for (const geometry of this._snapshotGeometryPools?.values() ?? []) {
+      if (geometry.positions === positions) return true;
+    }
+    return false;
   }
 
   /**
@@ -2782,7 +2993,7 @@ export class HighPerfRenderer {
       const handle = retirement[property];
       if (handle === null) return;
       try {
-        this.gl[deleteMethod](handle);
+        deleteGlObject(this.gl, deleteMethod, handle);
         retirement[property] = null;
       } catch (error) {
         let stillAlive = true;
@@ -3039,13 +3250,13 @@ export class HighPerfRenderer {
       pointCount !== this.pointCount
     ) {
       throw new RangeError(
-        `HighPerfRenderer cannot replace ${this.pointCount.toLocaleString()} live points with ${pointCount.toLocaleString()} while snapshot views remain published.`
+        `HighPerfRenderer cannot replace ${formatCountOf(this.pointCount, 'live point')} with ${formatCount(pointCount)} while snapshot views remain published.`
       );
     }
     const expectedRGBA = pointCount * 4;
     if (colors.length !== expectedRGBA) {
       throw new RangeError(
-        `HighPerfRenderer colors must contain exactly ${expectedRGBA} RGBA bytes for ${pointCount} points; received ${colors.length}.`
+        `HighPerfRenderer colors must contain exactly ${expectedRGBA} RGBA bytes for ${formatCountOf(pointCount, 'point')}; received ${colors.length}.`
       );
     }
     // Refuse, before anything is allocated, only a dataset the device cannot
@@ -3062,16 +3273,14 @@ export class HighPerfRenderer {
         alphaValues.length !== pointCount
       ) {
         throw new TypeError(
-          `HighPerfRenderer alphaValues must be a Uint8Array with exactly ${pointCount} entries.`
+          `HighPerfRenderer alphaValues must be a Uint8Array with exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`
         );
       }
-      for (let index = 0; index < alphaValues.length; index++) {
-        const value = alphaValues[index];
-        if (!Number.isFinite(value) || value < 0 || value > 1) {
-          throw new RangeError(
-            `HighPerfRenderer alphaValues entry ${index} must be finite and in [0, 1].`
-          );
-        }
+      const index = firstNonBinaryByte(alphaValues);
+      if (index >= 0) {
+        throw new RangeError(
+          `HighPerfRenderer alphaValues entry ${index} must be finite and in [0, 1].`
+        );
       }
     }
 
@@ -3079,7 +3288,14 @@ export class HighPerfRenderer {
     // memory belongs to this upload. So is a re-order in progress.
     this._clearKeptColorStores(this._liveColorCache);
     this.evictRetainedGeometry(Infinity);
-    requireCleanWebGLState(gl, 'HighPerfRenderer data publication');
+    this._flushPendingPositionUpload();
+    // Stores allocated ahead for exactly this dataset (`prepareDataStores`):
+    // their allocations were read back when they were made, and this
+    // publication allocates nothing else, so it reads no error back at all.
+    const prepared = this._takePreparedDataStores(pointCount, dimensionLevel);
+    if (prepared === null) {
+      requireCleanWebGLState(gl, 'HighPerfRenderer data publication');
+    }
     const previousPublication = this._captureDataPublication();
     const candidateGeometryGeneration =
       this._allocateGeometryGeneration();
@@ -3095,7 +3311,7 @@ export class HighPerfRenderer {
       this._colors = colors;
       this._firstRenderDone = false;
       console.log(
-        `[HighPerfRenderer] Loading ${this.pointCount.toLocaleString()} points...`
+        `[HighPerfRenderer] Loading ${formatCountOf(this.pointCount, 'point')}...`
       );
 
       const startTime = performance.now();
@@ -3107,16 +3323,23 @@ export class HighPerfRenderer {
         positions,
         dimensionLevel
       );
-      this._createPointStreams(positions, colors, dimensionLevel);
-      this._createAlphaTexture(this.pointCount);
+      this._createPointStreams(positions, colors, dimensionLevel, prepared);
+      // The R8 texture is made holding these values: one encoding and one
+      // upload, and no staging generation.
+      this._createAlphaTexture(this.pointCount, alphaValues, prepared);
       if (alphaValues !== null) {
-        this.updateAlphas(alphaValues);
+        this._useAlphaTexture = true;
+        this._currentAlphas = alphaValues;
       }
 
-      requireCleanWebGLState(
-        gl,
-        'HighPerfRenderer candidate data publication'
-      );
+      if (prepared === null) {
+        requireCleanWebGLState(
+          gl,
+          'HighPerfRenderer candidate data publication'
+        );
+      } else {
+        requireLiveContext(gl, 'HighPerfRenderer candidate data publication');
+      }
 
       const elapsed = performance.now() - startTime;
       console.log(`[HighPerfRenderer] Data loaded in ${elapsed.toFixed(1)}ms`);
@@ -3139,6 +3362,16 @@ export class HighPerfRenderer {
         cleanupErrors.push(
           ...this._retireDataPublication(rejectedPublication)
         );
+      }
+      if (prepared !== null) {
+        // Prepared stores the candidate had not adopted yet.
+        cleanupErrors.push(...this._retireDataPublication({
+          buffers: prepared.buffers,
+          positionGpuByteLength: prepared.positionGpuByteLength,
+          colorGpuByteLength: prepared.colorGpuByteLength,
+          alphaTexture: prepared.alphaTexture,
+          alphaTextureByteLength: prepared.alphaTextureByteLength,
+        }));
       }
       try {
         gl.bindVertexArray(null);
@@ -3171,6 +3404,7 @@ export class HighPerfRenderer {
     // hostile retirement must never resurrect a partially destroyed dataset
     // or reject the valid candidate.
     this._retireDataPublication(previousPublication);
+    this._cancelStaleSpatialTreeBuilds();
     return this.stats;
   }
 
@@ -3248,7 +3482,7 @@ export class HighPerfRenderer {
     const cellCount = this.pointCount;
     const notifId = announce
       ? notifications.startCalculation(
-        `Building ${dim}D ${treeNames[dim]} for live view (${cellCount.toLocaleString()} cells)`,
+        `Building ${dim}D ${treeNames[dim]} for live view (${formatCountOf(cellCount, 'cell')})`,
         'spatial'
       )
       : null;
@@ -3347,6 +3581,7 @@ export class HighPerfRenderer {
       return this.stats;
     }
     const gl = this.gl;
+    this._flushPendingPositionUpload();
     requireCleanWebGLState(gl, 'HighPerfRenderer position publication');
     this._ensureGeometryOwnershipState();
     const previous = this._captureDataPublication();
@@ -3568,9 +3803,16 @@ export class HighPerfRenderer {
 
   /**
    * Publish the vertex streams for one dataset generation, in source order:
-   * each store is allocated straight from the published typed array -- the
-   * Float32 positions with exactly `dimension` components per point, and the
-   * RGBA8 colors -- so nothing is repacked, padded or copied on the client.
+   * both stores are sized here and written from the published arrays
+   * themselves -- the Float32 positions with exactly `dimension` components
+   * per point, and the RGBA8 colors -- so nothing is repacked, padded or
+   * copied on the client. They are written when first needed, not here: the
+   * positions by `_flushPendingPositionUpload` (the first frame, or whatever
+   * borrows, keeps or gathers into the store before it), the colors by the
+   * first frame (`_ensureLiveColorsInOrder`, as every frame after a recolor
+   * does). The task that publishes a dataset then sends none of its 16 bytes
+   * a point (3D) to the GPU, and the application's first recolor is not
+   * uploaded twice.
    * A tree's order is adopted when a frame first needs it (`_ensureStoreDrawOrder`). The color
    * stream is `DYNAMIC_DRAW` because a recolor rewrites it in place;
    * positions change only through a new publication.
@@ -3578,44 +3820,56 @@ export class HighPerfRenderer {
    * @param {Float32Array} positions
    * @param {Uint8Array} colors
    * @param {number} dimension - Components per position (1, 2 or 3).
+   * @param {object|null} [prepared] - Stores `prepareDataStores` allocated
+   *   for exactly this dataset: adopted instead of allocated.
    */
-  _createPointStreams(positions, colors, dimension) {
+  _createPointStreams(positions, colors, dimension, prepared = null) {
     const gl = this.gl;
     const pointCount = positions.length / dimension;
     this._liveOrder = null;
 
-    if (!this.buffers.positions) {
-      this.buffers.positions = gl.createBuffer();
+    if (prepared !== null) {
+      this.buffers.positions = prepared.buffers.positions;
+      this.buffers.colors = prepared.buffers.colors;
+      this._positionGpuByteLength = prepared.positionGpuByteLength;
+      this._colorGpuByteLength = prepared.colorGpuByteLength;
+      prepared.buffers = { positions: null, colors: null };
+    } else {
       if (!this.buffers.positions) {
-        throw new Error(
-          'HighPerfRenderer could not allocate the point position buffer.'
-        );
+        this.buffers.positions = gl.createBuffer();
+        if (!this.buffers.positions) {
+          throw new Error(
+            'HighPerfRenderer could not allocate the point position buffer.'
+          );
+        }
       }
-    }
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
-    this._positionGpuByteLength = this._allocateVertexStore(
-      positions,
-      gl.STATIC_DRAW,
-      pointCount,
-      'HighPerfRenderer point-position upload'
-    );
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
+      this._positionGpuByteLength = this._allocateVertexStore(
+        positions.byteLength,
+        gl.STATIC_DRAW,
+        pointCount,
+        'HighPerfRenderer point-position upload'
+      );
 
-    if (!this.buffers.colors) {
-      this.buffers.colors = gl.createBuffer();
       if (!this.buffers.colors) {
-        throw new Error(
-          'HighPerfRenderer could not allocate the point color buffer.'
-        );
+        this.buffers.colors = gl.createBuffer();
+        if (!this.buffers.colors) {
+          throw new Error(
+            'HighPerfRenderer could not allocate the point color buffer.'
+          );
+        }
       }
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.colors);
+      this._colorGpuByteLength = this._allocateVertexStore(
+        colors.byteLength,
+        gl.DYNAMIC_DRAW,
+        pointCount,
+        'HighPerfRenderer point-color upload'
+      );
     }
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.colors);
-    this._colorGpuByteLength = this._allocateVertexStore(
-      colors,
-      gl.DYNAMIC_DRAW,
-      pointCount,
-      'HighPerfRenderer point-color upload'
-    );
+    this._positionsUploadPending = true;
     this._liveColorOrder = null;
+    this._colorsDirty = true;
 
     gl.bindVertexArray(this.vao);
     this._bindPointAttributes(
@@ -3624,10 +3878,14 @@ export class HighPerfRenderer {
       dimension
     );
     gl.bindVertexArray(null);
-    requireCleanWebGLState(
-      gl,
-      'HighPerfRenderer point-stream publication'
-    );
+    if (prepared === null) {
+      requireCleanWebGLState(
+        gl,
+        'HighPerfRenderer point-stream publication'
+      );
+    } else {
+      requireLiveContext(gl, 'HighPerfRenderer point-stream publication');
+    }
   }
 
 
@@ -3649,7 +3907,7 @@ export class HighPerfRenderer {
     const gl = this.gl;
     const byteLength = typeof data === 'number' ? data : data.byteLength;
     this._allocateGpu(
-      `${owner} could not allocate ${byteLength.toLocaleString()} bytes of point storage for ${pointCount.toLocaleString()} points`,
+      `${owner} could not allocate ${formatCountOf(byteLength, 'byte')} of point storage for ${formatCountOf(pointCount, 'point')}`,
       () => gl.bufferData(gl.ARRAY_BUFFER, data, usage)
     );
     return byteLength;
@@ -3887,7 +4145,7 @@ export class HighPerfRenderer {
       this._releaseDormantSnapshotStores();
       gl.bindVertexArray(vertexArray);
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(texture));
       allocate();
       code = gl.getError();
     }
@@ -3921,8 +4179,12 @@ export class HighPerfRenderer {
    * Create or resize the alpha texture for efficient alpha-only updates.
    * Uses R8 format (1 byte per point), so an alpha change touches neither vertex stream.
    * @param {number} pointCount - Number of points to allocate for
+   * @param {Uint8Array|null} [alphas] - Values the texture is made holding
+   *   (exactly 0 or 1 a point, already validated); null makes it opaque.
+   * @param {object|null} [prepared] - Stores `prepareDataStores` allocated
+   *   for exactly this point count: its texture is adopted, not allocated.
    */
-  _createAlphaTexture(pointCount) {
+  _createAlphaTexture(pointCount, alphas = null, prepared = null) {
     const gl = this.gl;
     if (!Number.isInteger(pointCount) || pointCount < 0) {
       throw new RangeError(
@@ -3959,7 +4221,9 @@ export class HighPerfRenderer {
 
     // A linear texture holds any count the engine can allocate (layers of
     // MAX_TEXTURE_SIZE rows), so no point count is refused here.
-    const candidatePlan = planLinearTextureFor(gl, pointCount);
+    const candidatePlan = prepared !== null && prepared.alphaTexture !== null
+      ? prepared.alphaPlan
+      : planLinearTextureFor(gl, pointCount);
     const candidateWidth = candidatePlan.width;
     const candidateHeight = candidatePlan.rows;
 
@@ -3968,18 +4232,43 @@ export class HighPerfRenderer {
     // live alpha generation.
     const requiredSize = candidateWidth * candidateHeight;
     let candidateData = this._alphaTexData;
-    if (!candidateData || candidateData.length !== requiredSize) {
+    if (alphas !== null) {
+      if (!(alphas instanceof Uint8Array) || alphas.length !== pointCount) {
+        throw new TypeError(
+          'HighPerfRenderer alpha texture values must be one Uint8Array a point.'
+        );
+      }
+      // Its own owner (never the accepted one, which stays as it is until
+      // this texture is accepted): the values encoded, the padding opaque.
+      candidateData = new Uint8Array(requiredSize);
+      candidateData.fill(255, pointCount);
+      const encoded = encodeAlphaSpan(
+        alphas,
+        candidateData,
+        candidateData,
+        alphaEncodingWords(alphas, candidateData, candidateData),
+        0,
+        pointCount
+      );
+      if (encoded < 0) {
+        throw new RangeError(
+          `HighPerfRenderer alpha value at index ${-encoded - 1} must be exactly 0 or 1.`
+        );
+      }
+    } else if (!candidateData || candidateData.length !== requiredSize) {
       candidateData = new Uint8Array(requiredSize);
       // Initialize to fully opaque
       candidateData.fill(255);
     }
-    const candidateTexture = gl.createTexture();
+    const adoptedTexture = prepared !== null ? prepared.alphaTexture : null;
+    if (prepared !== null) prepared.alphaTexture = null;
+    const candidateTexture = adoptedTexture ?? gl.createTexture();
     if (!candidateTexture) {
       throw new Error(
         'HighPerfRenderer could not allocate the required alpha texture.'
       );
     }
-    let candidateTextureByteLength = 0;
+    let candidateTextureByteLength = adoptedTexture !== null ? candidatePlan.texels : 0;
     try {
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, candidateTexture);
 
@@ -3989,22 +4278,32 @@ export class HighPerfRenderer {
         1,
         'HighPerfRenderer candidate alpha texture',
         () => {
-          this._allocateGpu('HighPerfRenderer could not allocate the alpha texture', () => {
-            allocateLinearTexture(gl, gl.R8, candidatePlan);
-          });
+          if (adoptedTexture === null) {
+            this._allocateGpu('HighPerfRenderer could not allocate the alpha texture', () => {
+              allocateLinearTexture(gl, gl.R8, candidatePlan);
+            });
+          }
           writeLinearTextureRows(gl, candidatePlan, gl.RED, gl.UNSIGNED_BYTE, candidateData, 1);
-          requireCleanWebGLState(
-            gl,
-            'HighPerfRenderer candidate alpha-texture upload'
-          );
+          if (adoptedTexture === null) {
+            requireCleanWebGLState(
+              gl,
+              'HighPerfRenderer candidate alpha-texture upload'
+            );
+          } else {
+            // Rows of storage accepted when it was prepared: no allocation,
+            // so nothing to read back.
+            requireLiveContext(gl, 'HighPerfRenderer candidate alpha-texture upload');
+          }
         }
       );
       candidateTextureByteLength = candidatePlan.texels;
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
-      requireCleanWebGLState(
-        gl,
-        'HighPerfRenderer alpha-texture publication'
-      );
+      if (adoptedTexture === null) {
+        requireCleanWebGLState(
+          gl,
+          'HighPerfRenderer alpha-texture publication'
+        );
+      }
     } catch (error) {
       try {
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
@@ -4042,7 +4341,7 @@ export class HighPerfRenderer {
     }
     this._refreshGpuMemoryStats();
 
-    console.log(`[HighPerfRenderer] Created alpha texture: ${candidateWidth}x${candidateHeight} (${pointCount} points)`);
+    console.log(`[HighPerfRenderer] Created alpha texture: ${candidateWidth}x${candidateHeight} (${formatCountOf(pointCount, 'point')})`);
   }
 
   /**
@@ -4182,27 +4481,25 @@ export class HighPerfRenderer {
       this._alphaUploadRegions = regions;
     }
 
-    // Row-major traversal. It visits exactly the same indices in exactly the
-    // same order as a flat scan — same first rejection, same bytes written —
-    // and records which rows moved without a division per point.
+    // Row-major traversal that records which rows moved without a division
+    // per point, four cells a word (`encodeAlphaSpan`): a cell's byte is 255
+    // for 1 and 0 for 0, and a value above 1 is rejected naming the first
+    // such cell. Every row starts on a word boundary: a texture of more than
+    // one row is a power of two at least 2048 texels wide (`linear-texture.js`).
+    const words = alphaEncodingWords(alphas, candidate, accepted);
     let dirtyRowCount = 0;
     for (let y = 0; y < height; y++) {
       const rowStart = y * width;
+      if (rowStart >= n) break;
       const rowEnd = rowStart + width < n ? rowStart + width : n;
-      let rowChanged = false;
-      for (let i = rowStart; i < rowEnd; i++) {
-        const value = alphas[i];
-        // One comparison pair rejects NaN, infinities and out-of-range values.
-        if (!(value >= 0 && value <= 1)) {
-          throw new RangeError(
-            `HighPerfRenderer alpha value at index ${i} must be finite and in [0, 1]; received ${String(value)}.`
-          );
-        }
-        const byte = Math.round(value * 255);
-        candidate[i] = byte;
-        rowChanged ||= byte !== accepted[i];
+      const moved = encodeAlphaSpan(alphas, candidate, accepted, words, rowStart, rowEnd);
+      if (moved < 0) {
+        const i = -moved - 1;
+        throw new RangeError(
+          `HighPerfRenderer alpha value at index ${i} must be exactly 0 or 1; received ${alphas[i]}.`
+        );
       }
-      if (rowChanged) {
+      if (moved !== 0) {
         dirtyRows[y] = 1;
         dirtyRowCount++;
       }
@@ -4316,7 +4613,7 @@ export class HighPerfRenderer {
     }
     if (alphas.length !== this.pointCount) {
       throw new RangeError(
-        `HighPerfRenderer alpha values must contain exactly ${this.pointCount} entries; received ${alphas.length}.`
+        `HighPerfRenderer alpha values must contain exactly ${formatCountOf(this.pointCount, 'entry', 'entries')}; received ${alphas.length}.`
       );
     }
     // An exact empty dataset has no alpha texture by construction. Publishing
@@ -4372,6 +4669,7 @@ export class HighPerfRenderer {
       'HighPerfRenderer buffer-flush dimensionLevel'
     );
     if (dim !== this.currentDimensionLevel) return;
+    this._flushPendingPositionUpload();
     // The flag clears only after the publication returns, so a rejected
     // upload stays dirty and is retried whole on the next flush.
     if (this._colorsDirty) {
@@ -4770,6 +5068,7 @@ export class HighPerfRenderer {
     if (!this.buffers.positions || !this.buffers.colors) {
       throw new Error('HighPerfRenderer point buffers are unavailable.');
     }
+    this._flushPendingPositionUpload();
 
     const dimensionLevel = params.dimensionLevel;
 
@@ -5563,13 +5862,17 @@ export class HighPerfRenderer {
     const dimension = store.kind === 'live' ? this.currentDimensionLevel : store.geometry.dimension;
     const buffer = store.kind === 'live' ? this.buffers.positions : store.geometry.positionBuffer;
     const targets = this._colorTargetsOf(store);
+    // The gather rewrites the whole store. A store still in source order and
+    // written is its own source, copied on the GPU; a live store
+    // whose upload is still pending is not uploaded first, its words go
+    // straight to the gather; a store in another draw order takes its words
+    // from page memory.
+    const uploadPending = store.kind === 'live' && this._positionsUploadPending === true;
+    const source = previous === null && !uploadPending
+      ? { buffer, words: positions.length }
+      : new Uint32Array(positions.buffer, positions.byteOffset, positions.length);
     try {
-      this._getPermuter().writeWords(
-        buffer,
-        new Uint32Array(positions.buffer, positions.byteOffset, positions.length),
-        record,
-        dimension
-      );
+      this._getPermuter().writeWords(buffer, source, record, dimension);
       // A gather into the accepted position store: nothing to read back.
       requireLiveContext(this.gl, `${label} positions`);
     } catch (error) {
@@ -5577,6 +5880,7 @@ export class HighPerfRenderer {
       this._drainDataRetirements();
       throw error;
     }
+    if (uploadPending) this._positionsUploadPending = false;
     if (store.kind === 'live') {
       this._liveOrder = record;
     } else {
@@ -5584,7 +5888,18 @@ export class HighPerfRenderer {
     }
     this._retireDrawOrderRecord(previous);
     for (const target of targets) {
-      this._writeTargetColors(target, target.buffer, record, label);
+      if (target.key === this && this._liveColorOrder === null && !this._colorsDirty) {
+        // The live colours, written in source order: copied on the GPU.
+        this._getPermuter().writeWords(
+          target.buffer,
+          { buffer: target.buffer, words: target.source.length / 4 },
+          record,
+          1
+        );
+        requireLiveContext(this.gl, `${label} colours`);
+      } else {
+        this._writeTargetColors(target, target.buffer, record, label);
+      }
       if (target.key === this) {
         this._liveColorOrder = drawOrder;
         this._colorsDirty = false;
@@ -6171,37 +6486,6 @@ export class HighPerfRenderer {
     return this.spatialIndices.has(dim);
   }
 
-  /**
-   * Ensure spatial index exists for the specified dimension.
-   * Creates it if needed. Use for collision detection or other features that need spatial index.
-   * @param {number} dimensionLevel - The dimension level (1, 2, or 3) - REQUIRED
-   */
-  ensureSpatialIndex(dimensionLevel) {
-    this._assertOperational('ensure a spatial index');
-    const dimLevel = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer ensureSpatialIndex dimensionLevel'
-    );
-
-    if (this.pointCount > 0 && this._positions) {
-      const existingIndex = this.spatialIndices.get(dimLevel);
-      const indexStale = existingIndex && existingIndex.pointCount !== this.pointCount;
-
-      if (!existingIndex || indexStale) {
-        if (indexStale) {
-          console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale, rebuilding...`);
-          this.clearAllViewState();
-          this.spatialIndices.clear();
-        } else {
-          console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index...`);
-        }
-        // A query needs the tree, not its levels: those are built off the
-        // main thread for drawing and replace this tree when they land.
-        this._getOrBuildSpatialIndexForDimension(dimLevel, false, false);
-      }
-    }
-  }
-
   // ==========================================================================
   // SPATIAL TREES OFF THE MAIN THREAD
   //
@@ -6223,7 +6507,8 @@ export class HighPerfRenderer {
    *
    * Resolves true when the view has an index for its current positions, built
    * now or already there; false when the positions changed before the tree
-   * came back, or are too large to copy to a worker.
+   * came back, or a build for them already failed. Rejects with the build's
+   * error when this build fails (it is also notified).
    *
    * @param {string} viewId - 'live' or a snapshot id.
    * @returns {Promise<boolean>}
@@ -6233,11 +6518,11 @@ export class HighPerfRenderer {
     const exactId = requireViewId(viewId, 'HighPerfRenderer background spatial-index view id');
     const target = this._spatialIndexTarget(exactId);
     if (target === null) return Promise.resolve(true);
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       this._requestSpatialIndex(
         target.live ? { kind: 'live' } : { kind: 'snapshot', id: exactId },
         this._needsLodResources(-1),
-        installed => resolve(installed)
+        (installed, error) => (error === null ? resolve(installed) : reject(error))
       );
     });
   }
@@ -6333,16 +6618,20 @@ export class HighPerfRenderer {
    *
    * @param {{kind: 'live'}|{kind: 'snapshot', id: string}} target
    * @param {boolean} needsLOD
-   * @param {(installed: boolean) => void} [settled] - Called once with
-   *   whether a tree for the target's current positions is installed.
+   * @param {(installed: boolean, error: Error|null) => void} [settled] -
+   *   Called once with whether a tree for the target's current positions is
+   *   installed, and the error of a build that failed.
    * @private
    */
   _requestSpatialIndex(target, needsLOD, settled = null) {
+    // Builds for positions replaced since (a representation change, a kept
+    // view moved) stop before this one queues behind them.
+    this._cancelStaleSpatialTreeBuilds();
     const snapshot = target.kind === 'snapshot' ? this.snapshotBuffers.get(target.id) : null;
     const positions = target.kind === 'live' ? this._positions : snapshot?.positions;
     const dimensionLevel = target.kind === 'live' ? this.currentDimensionLevel : snapshot?.dimensionLevel;
     if (!(positions instanceof Float32Array) || positions.length === 0) {
-      settled?.(false);
+      settled?.(false, null);
       return;
     }
     this._treeBuilds ??= new WeakMap();
@@ -6360,7 +6649,7 @@ export class HighPerfRenderer {
       (failed.needsLOD || !needsLOD) &&
       failed.epoch === (this._releaseEpoch ?? 0)
     ) {
-      settled?.(false);
+      settled?.(false, null);
       return;
     }
     const pointCount = target.kind === 'live' ? this.pointCount : snapshot.pointCount;
@@ -6368,9 +6657,9 @@ export class HighPerfRenderer {
     const label = target.kind === 'live' ? 'live view' : 'a kept view';
     const notifications = getNotificationCenter();
     const build = { needsLOD, settled: settled ? [settled] : [] };
-    const finish = installed => {
+    const finish = (installed, error = null) => {
       if (this._treeBuilds?.get(positions) === build) this._treeBuilds.delete(positions);
-      for (const callback of build.settled) callback(installed);
+      for (const callback of build.settled) callback(installed, error);
     };
     let notifId = null;
     try {
@@ -6378,40 +6667,50 @@ export class HighPerfRenderer {
     } catch (error) {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
       notifications.error(describeError(error));
-      finish(false);
+      finish(false, error);
       return;
     }
     this._treeBuilds.set(positions, build);
     notifId = notifications.startCalculation(
-      `Building ${dimensionLevel}D ${treeNames[dimensionLevel]}${needsLOD ? ' and levels of detail' : ''} for ${label} (${pointCount.toLocaleString()} cells)`,
+      `Building ${dimensionLevel}D ${treeNames[dimensionLevel]}${needsLOD ? ' and levels of detail' : ''} for ${label} (${formatCountOf(pointCount, 'cell')})`,
       'spatial'
     );
     const startTime = performance.now();
-    this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
-      if (this._disposed === true || this._contextLost === true) {
-        finish(false);
-        return;
-      }
-      let installed = false;
-      try {
-        installed = this._installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, result);
-      } catch (error) {
-        this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
-        settleCalculationNotification(notifications, notifId, 'failCalculation',
-          `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
-        finish(false);
-        return;
-      }
-      settleCalculationNotification(notifications, notifId, 'completeCalculation',
-        `${dimensionLevel}D ${treeNames[dimensionLevel]} ready (${label})`, performance.now() - startTime);
-      finish(installed);
-      if (installed) this.onAsyncTreeReady?.();
-    }, error => {
+    const failBuild = error => {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
       settleCalculationNotification(notifications, notifId, 'failCalculation',
         `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
+      finish(false, error);
+    };
+    // The build was dropped because its positions are no longer drawn (a
+    // dataset or representation replaced them): nothing failed, nothing is
+    // installed, and a later request for them builds again.
+    const cancelBuild = () => {
+      settleCalculationNotification(notifications, notifId, 'dismiss');
       finish(false);
-    });
+    };
+    try {
+      this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
+        if (this._disposed === true || this._contextLost === true) {
+          finish(false);
+          return;
+        }
+        let installed = false;
+        try {
+          installed = this._installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, result);
+        } catch (error) {
+          failBuild(error);
+          return;
+        }
+        settleCalculationNotification(notifications, notifId, 'completeCalculation',
+          `${dimensionLevel}D ${treeNames[dimensionLevel]} ready (${label})`, performance.now() - startTime);
+        finish(installed);
+        if (installed) this.onAsyncTreeReady?.();
+      }, failBuild, cancelBuild);
+    } catch (error) {
+      // Handing the positions to the worker failed before it could answer.
+      failBuild(error);
+    }
   }
 
   /**
@@ -6438,10 +6737,12 @@ export class HighPerfRenderer {
   /**
    * Run one tree build: in the worker, or inline where there is no worker
    * or the positions are too large to copy to one. `onDone` gets
-   * `{tree, order}`; an inline build calls it before returning.
+   * `{tree, order}`; an inline build calls it before returning. `onCancel`
+   * is called instead when the build is dropped because its positions are no
+   * longer drawn (`_cancelStaleSpatialTreeBuilds`).
    * @private
    */
-  _buildSpatialTreeJob(positions, dimensionLevel, buildLOD, onDone, onError) {
+  _buildSpatialTreeJob(positions, dimensionLevel, buildLOD, onDone, onError, onCancel) {
     const request = {
       dimensionLevel,
       buildLOD,
@@ -6459,54 +6760,104 @@ export class HighPerfRenderer {
       onDone(result);
       return;
     }
-    if (!this._spatialTreeWorker) {
-      this._spatialTreeWorker = new Worker(
-        new URL('./high-perf/spatial-tree-worker.js', import.meta.url),
-        { type: 'module' }
-      );
-      this._spatialTreeRequests = new Map();
-      this._spatialTreeRequestId = 0;
-      this._spatialTreeWorker.onmessage = ({ data }) => {
-        const pending = this._spatialTreeRequests.get(data.id);
-        if (!pending) return;
-        this._spatialTreeRequests.delete(data.id);
-        if (data.error) pending.onError(new Error(`Background spatial index failed: ${data.error}`));
-        else pending.onDone({ tree: data.tree, order: data.order });
-      };
-      this._spatialTreeWorker.onerror = event => {
-        const error = new Error(`Background spatial index worker failed: ${event.message || 'unknown error'}`);
-        const pending = [...this._spatialTreeRequests.values()];
-        this._spatialTreeRequests.clear();
-        for (const entry of pending) entry.onError(error);
-      };
-    }
+    this._ensureSpatialTreeWorker();
+    // The tree's adoption gathers the store on the GPU: its programs compile
+    // while the worker builds.
+    this._getPermuter().prewarm(['w1', `w${dimensionLevel}`, 'source']);
     const id = ++this._spatialTreeRequestId;
     const worker = this._spatialTreeWorker;
-    this._spatialTreeRequests.set(id, { onDone, onError });
+    this._spatialTreeRequests.set(id, { onDone, onError, onCancel, positions });
     // The worker gets its own copy, sent in slices of at most
     // WORKER_POSITION_SLICE_FLOATS, one task each and each transferred: the
     // renderer keeps drawing from the original, no task copies the whole
-    // geometry, and the main thread never holds a second full copy.
+    // geometry, and the main thread never holds a second full copy. The
+    // first slice too waits for a task of its own: a request is made while a
+    // dataset or a view is being published, and its copy is not part of that
+    // publication's task.
     const total = positions.length;
     let offset = 0;
     const sendSlice = () => {
       if (this._spatialTreeWorker !== worker || !this._spatialTreeRequests.has(id)) return;
-      const end = Math.min(total, offset + WORKER_POSITION_SLICE_FLOATS);
-      const slice = positions.slice(offset, end);
-      worker.postMessage({ id, kind: 'positions', offset, total, slice }, [slice.buffer]);
-      offset = end;
-      if (offset < total) {
-        setTimeout(sendSlice, 0);
-        return;
+      try {
+        const end = Math.min(total, offset + WORKER_POSITION_SLICE_FLOATS);
+        const slice = positions.slice(offset, end);
+        worker.postMessage({ id, kind: 'positions', offset, total, slice }, [slice.buffer]);
+        offset = end;
+        if (offset < total) {
+          setTimeout(sendSlice, 0);
+          return;
+        }
+        worker.postMessage({ id, kind: 'build', ...request });
+      } catch (error) {
+        // The request never reached the worker whole: it answers nothing for it.
+        this._spatialTreeRequests.delete(id);
+        onError(error);
       }
-      worker.postMessage({ id, kind: 'build', ...request });
     };
-    if (total === 0) {
-      worker.postMessage({ id, kind: 'positions', offset: 0, total: 0, slice: new Float32Array(0) });
-      worker.postMessage({ id, kind: 'build', ...request });
-    } else {
-      sendSlice();
+    try {
+      if (total === 0) {
+        worker.postMessage({ id, kind: 'positions', offset: 0, total: 0, slice: new Float32Array(0) });
+        worker.postMessage({ id, kind: 'build', ...request });
+      } else {
+        setTimeout(sendSlice, 0);
+      }
+    } catch (error) {
+      // The request never reached the worker: it answers nothing for it.
+      this._spatialTreeRequests.delete(id);
+      throw error;
     }
+  }
+
+  /**
+   * The spatial-tree worker and its message handlers. They are made here, not
+   * in a build: a closure keeps the whole scope it was made in, and handlers
+   * made beside a build's `positions` kept the first dataset's positions for
+   * as long as the worker lived.
+   * @private
+   */
+  _ensureSpatialTreeWorker() {
+    if (this._spatialTreeWorker) return;
+    this._spatialTreeWorker = startWorker(spatialTreeWorkerScript(), { type: 'module' });
+    this._spatialTreeRequests = new Map();
+    this._spatialTreeRequestId = 0;
+    this._spatialTreeWorker.onmessage = ({ data }) => {
+      const pending = this._spatialTreeRequests.get(data.id);
+      if (!pending) return;
+      this._spatialTreeRequests.delete(data.id);
+      if (data.error) pending.onError(new Error(`Background spatial index failed: ${data.error}`));
+      else pending.onDone(decodeSpatialTreeJobResult(data));
+    };
+    this._spatialTreeWorker.onerror = event => {
+      const error = new Error(`Background spatial index worker failed: ${event.message || 'unknown error'}`);
+      const pending = [...this._spatialTreeRequests.values()];
+      this._spatialTreeRequests.clear();
+      for (const entry of pending) entry.onError(error);
+    };
+  }
+
+  /**
+   * Drop the background tree builds whose positions no view draws any more.
+   *
+   * A dataset or representation replacement leaves the builds it started in
+   * the worker: the worker builds them to the end (it answers one message at
+   * a time, so the new positions' tree waits behind them while the new data
+   * draws without culling or LOD), the main thread keeps posting their
+   * slices, and each build's closures keep its positions alive until then.
+   * The worker is the only place a running build can be stopped, so it is
+   * ended and every pending build is dropped; the builds still wanted are
+   * asked for again by the next frame that needs their tree.
+   * @private
+   */
+  _cancelStaleSpatialTreeBuilds() {
+    if (!this._spatialTreeWorker || this._spatialTreeRequests.size === 0) return;
+    const drawn = new Set([this._positions]);
+    for (const snapshot of this.snapshotBuffers.values()) drawn.add(snapshot.positions);
+    const pending = [...this._spatialTreeRequests.values()];
+    if (pending.every(entry => drawn.has(entry.positions))) return;
+    this._spatialTreeWorker.terminate();
+    this._spatialTreeWorker = null;
+    this._spatialTreeRequests.clear();
+    for (const entry of pending) entry.onCancel();
   }
 
   _retireSpatialTreeWorker() {
@@ -6571,29 +6922,6 @@ export class HighPerfRenderer {
     viewState.stats.frustumCulled = frustumCulled;
     viewState.stats.cullPercent = cullPercent;
     viewState.statsPublished = true;
-  }
-
-  /**
-   * Compatibility wrapper for non-rendering callers and focused contracts.
-   * @param {Object} viewState - Exact per-view state object.
-   * @param {Object} statsUpdate - Object with stats to update (visiblePoints, lodLevel, drawCalls, frustumCulled, cullPercent)
-   * @private
-   */
-  _updateStats(viewState, statsUpdate) {
-    if (!viewState?.stats) {
-      throw new Error('HighPerfRenderer statistics require an exact per-view state.');
-    }
-    if (!statsUpdate || typeof statsUpdate !== 'object') {
-      throw new TypeError('HighPerfRenderer statistics update must be an object.');
-    }
-    this._writeStats(
-      viewState,
-      statsUpdate.visiblePoints,
-      statsUpdate.lodLevel,
-      statsUpdate.drawCalls,
-      statsUpdate.frustumCulled,
-      statsUpdate.cullPercent
-    );
   }
 
   /**
@@ -6739,6 +7067,46 @@ export class HighPerfRenderer {
    * @param {string} viewId - `live` or an exact snapshot ID.
    * @returns {number} Positive safe-integer geometry generation.
    */
+  /**
+   * The position store a view draws from, as it is on the GPU now: its
+   * buffer, the components a point, the positions it holds, and the source
+   * point of each slot (`slotSources`, the store's draw order; null when it
+   * holds source order). Null while its bytes are not on the GPU yet. A
+   * consumer that draws from the store keys what it derived on `buffer` and
+   * `slotSources`: a store re-ordered in place keeps its buffer and changes
+   * its order.
+   *
+   * @param {string} viewId
+   * `order` is the store's draw-order record (its permutation texture), or
+   * null.
+   *
+   * @returns {{buffer: WebGLBuffer, dimension: number, positions: Float32Array, slotSources: Uint32Array|null, order: object|null}|null}
+   */
+  getViewPointStore(viewId) {
+    const exactViewId = requireViewId(viewId, 'HighPerfRenderer point-store viewId');
+    const snapshot = exactViewId === 'live' ? null : this.snapshotBuffers.get(exactViewId);
+    if (exactViewId !== 'live' && !snapshot) return null;
+    if (snapshot === null || this._snapshotUsesLiveGeometry(snapshot)) {
+      if (this._positionsUploadPending === true || !this.buffers.positions || !this._positions) return null;
+      return {
+        buffer: this.buffers.positions,
+        dimension: this.currentDimensionLevel,
+        positions: this._positions,
+        slotSources: this._liveOrder?.drawOrder.indices ?? null,
+        order: this._liveOrder ?? null,
+      };
+    }
+    const geometry = this._snapshotGeometryPools?.get(snapshot.geometryGeneration);
+    if (!geometry || geometry.positions !== snapshot.positions || !geometry.positionBuffer) return null;
+    return {
+      buffer: geometry.positionBuffer,
+      dimension: geometry.dimension,
+      positions: geometry.positions,
+      slotSources: geometry.order?.drawOrder.indices ?? null,
+      order: geometry.order ?? null,
+    };
+  }
+
   getViewGeometryGeneration(viewId) {
     const exactViewId = requireViewId(
       viewId,
@@ -6778,6 +7146,19 @@ export class HighPerfRenderer {
    * @returns {number}
    */
   getFogNear() { return this.fogNear; }
+
+  /**
+   * Put back the fog range a pane's points were drawn with, for the layers
+   * drawn over a kept base without drawing the points again
+   * (`rendering/pulse-layer-cache.js`).
+   */
+  restoreFogRange(near, far) {
+    if (!Number.isFinite(near) || !Number.isFinite(far)) {
+      throw new TypeError('HighPerfRenderer fog range must be two finite numbers.');
+    }
+    this.fogNear = near;
+    this.fogFar = far;
+  }
 
   /**
    * @returns {number}
@@ -7339,39 +7720,43 @@ export class HighPerfRenderer {
         );
       }
     }
-    // Row-major, so a moved row is marked without a division per point; the
-    // same indices are visited in the same order as a flat scan (same first
-    // rejection, same bytes). Texels past the last point are padding, 255.
+    // Row-major, so a moved row is marked without a division per point.
+    // Texels past the last point are padding, 255. Neither loop branches per
+    // cell: a colour's alpha byte is copied, and a 0/1 transparency byte
+    // becomes 0 or 255 four cells a word (`encodeAlphaSpan`, which names the
+    // first value above 1); every moved bit is ORed. Rows start on a word
+    // boundary (one row, or a power of two at least 2048 texels wide).
     const reference = accepted === null ? target : accepted;
     const pointCount = this.pointCount;
     const width = dirtyRows === null ? target.length : rowWidth;
+    const words = exactAlphas === null
+      ? null
+      : alphaEncodingWords(exactAlphas, target, reference);
     let changed = false;
     for (let rowStart = 0, row = 0; rowStart < target.length; rowStart += width, row++) {
       const rowEnd = Math.min(rowStart + width, target.length);
-      let rowChanged = false;
-      for (let index = rowStart; index < rowEnd; index++) {
-        let byte = 255;
-        if (index < pointCount) {
-          if (exactAlphas === null) {
-            byte = exactColors[index * 4 + 3];
-          } else {
-            const value = exactAlphas[index];
-            if (
-              !Number.isFinite(value) ||
-              value < 0 ||
-              value > 1
-            ) {
-              throw new RangeError(
-                `${owner} alpha value at index ${index} must be finite and in [0, 1].`
-              );
-            }
-            byte = Math.round(value * 255);
-          }
+      const pointEnd = Math.max(rowStart, Math.min(rowEnd, pointCount));
+      let moved = 0;
+      if (exactAlphas === null) {
+        for (let index = rowStart; index < pointEnd; index++) {
+          const byte = exactColors[index * 4 + 3];
+          moved |= byte ^ reference[index];
+          target[index] = byte;
         }
-        if (reference[index] !== byte) rowChanged = true;
-        target[index] = byte;
+      } else {
+        const encoded = encodeAlphaSpan(exactAlphas, target, reference, words, rowStart, pointEnd);
+        if (encoded < 0) {
+          throw new RangeError(
+            `${owner} alpha value at index ${-encoded - 1} must be exactly 0 or 1.`
+          );
+        }
+        moved = encoded;
       }
-      if (rowChanged) {
+      for (let index = pointEnd; index < rowEnd; index++) {
+        moved |= 255 ^ reference[index];
+        target[index] = 255;
+      }
+      if (moved !== 0) {
         changed = true;
         if (dirtyRows !== null) dirtyRows[row] = 1;
       }
@@ -7730,7 +8115,7 @@ export class HighPerfRenderer {
 
     console.log(
       `[HighPerfRenderer] Created snapshot buffer "${exactId}" ` +
-      `(${n.toLocaleString()} points, ` +
+      `(${formatCountOf(n, 'point')}, ` +
       `${(colorBufferByteLength / 1024 / 1024).toFixed(1)} MB colour, ` +
       `${(alphaStaging.alphaTextureByteLength / 1024 / 1024).toFixed(1)} MB R8 alpha, ` +
       `${(positions.byteLength / 1024 / 1024).toFixed(1)} MB shared positions` +
@@ -7800,7 +8185,7 @@ export class HighPerfRenderer {
       viewPositions.length !== n * exactDimensionLevel
     ) {
       throw new TypeError(
-        `${owner} positions must be a Float32Array with exactly ${n * exactDimensionLevel} values (${exactDimensionLevel} per point).`
+        `${owner} positions must be a Float32Array with exactly ${formatCountOf(n * exactDimensionLevel, 'value')} (${exactDimensionLevel} per point).`
       );
     }
     let alphaData = null;
@@ -8424,6 +8809,7 @@ export class HighPerfRenderer {
       // the exact owner of every handle/geometry release that has not yet
       // completed.
       this.snapshotBuffers.delete(exactId);
+      this._cancelStaleSpatialTreeBuilds();
       this._donateSnapshotAlphaStaging(
         snapshot.alphaTexData
       );
@@ -8612,7 +8998,7 @@ export class HighPerfRenderer {
       const cellCount = snapshot.pointCount;
       const notifId = announce
         ? notifications.startCalculation(
-          `Rebuilding ${exactDimensionLevel}D ${treeName} for a kept view (${cellCount.toLocaleString()} cells)`,
+          `Rebuilding ${exactDimensionLevel}D ${treeName} for a kept view (${formatCountOf(cellCount, 'cell')})`,
           'spatial'
         )
         : null;
@@ -8689,6 +9075,8 @@ export class HighPerfRenderer {
         `HighPerfRenderer snapshot id "${exactId}" must match render viewId "${exactParams.viewId}".`
       );
     }
+    // A kept view of the live geometry draws from the live store.
+    this._flushPendingPositionUpload();
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
       throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
@@ -8972,6 +9360,8 @@ export class HighPerfRenderer {
     this._nextGeometryGeneration = 1;
     this._boundingSphere = null;
     this._colorsDirty = false;
+    this._positionsUploadPending = false;
+    this._preparedDataStores = null;
     this._firstRenderDone = false;
 
     this._snapshotAlphaStagingData = null;
@@ -9023,6 +9413,7 @@ export class HighPerfRenderer {
     // A re-order in progress owns staging buffers of its own.
     // Capture and detach the complete current data publication before any
     // fallible deletion. Pending records own every resource across retries.
+    this._queueDataRetirement(this._detachPreparedDataStores());
     this._queueDataRetirement(this._captureDataPublication());
     this.vao = null;
     this.buffers = {
@@ -9054,6 +9445,7 @@ export class HighPerfRenderer {
     this._liveGeometryGeneration = 0;
     this._boundingSphere = null;
     this._colorsDirty = false;
+    this._positionsUploadPending = false;
     this._validatedSpatialIndices = new WeakSet();
     // Collaborators retire their own GPU handles. Drop the registrations so a
     // disposed renderer neither reports their bytes nor keeps them reachable.

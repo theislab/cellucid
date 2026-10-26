@@ -13,6 +13,7 @@ import {
 import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
+import { writableTransparency } from '../assets/js/app/state/managers/per-cell-array-ownership.js';
 
 function makePublicationHarness(viewId) {
   const publications = [];
@@ -70,6 +71,8 @@ function makePublicationHarness(viewId) {
     buildCentroidsForField() {},
     clearCentroids() {},
     computeGlobalVisibility() {
+      // A pass writes the visibility, then publishes it.
+      writableTransparency(this);
       this._pushTransparencyToViewer();
     },
     ensureCategoryMetadata(field) {
@@ -85,10 +88,8 @@ function makePublicationHarness(viewId) {
         ._writeCategoryColors.call(this, field, writeTransparency);
     },
     updateColorsContinuous(_field, options) {
-      assert.deepEqual(options, {
-        resetTransparency: true,
-      });
-      this.categoryTransparency.fill(1);
+      // Coloring never writes visibility: computeGlobalVisibility owns it.
+      assert.equal(options, undefined);
     },
     updateFilterSummary() {},
   };
@@ -160,5 +161,10 @@ for (const viewId of ['live', 'snapshot-1']) {
         .clearActiveField.call(state),
       expectedRoute,
     );
+    // A republication of bytes the live viewer already holds (the same
+    // array, not written since) sends nothing; a snapshot is always sent.
+    publications.length = 0;
+    state._pushTransparencyToViewer();
+    assert.deepEqual(publications, viewId === 'live' ? [] : ['snapshot']);
   });
 }

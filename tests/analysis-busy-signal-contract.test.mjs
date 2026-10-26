@@ -3,7 +3,7 @@
  *
  * Quick Insights was the first region to say when it was still changing; the
  * expanded view, the Detailed preview and the Correlation and Gene Signature
- * auto-runs grew after they appeared with no signal at all. The signal now
+ * runs grew after they appeared with no signal at all. The signal now
  * lives once in BaseAnalysisUI and every asynchronous region uses it.
  */
 import assert from 'node:assert/strict';
@@ -110,23 +110,17 @@ for (const [label, UIClass] of [
   ['Correlation', CorrelationAnalysisUI],
   ['Gene Signature', GeneSignatureUI],
 ]) {
-  test(`${label} auto-runs are busy until their result settles`, async () => {
+  test(`${label} runs are busy until their result settles`, async () => {
     const ui = new UIClass({ comparisonModule: {}, dataLayer: {} });
     const container = region();
     ui._container = container;
     ui._selectedPages = ['page-1'];
-    ui._canRunAnalysis = () => true;
-    ui._getFormValues = () => ({
-      variableX: { type: 'continuous_obs', key: 'x' },
-      variableY: { type: 'continuous_obs', key: 'y' },
-      genes: ['A'],
-      method: 'mean',
-      normalize: 'none',
-      plotType: 'violinplot',
-    });
+    ui._options = {};
+    ui._getRunBlocker = () => null;
+    ui._startAnalysisJob = () => ({ cancel() {}, succeed() {}, step() {}, subscribe: () => () => {}, running: true });
     const computation = deferred();
     ui._runAnalysisImpl = () => computation.promise;
-    const running = ui._runAnalysisIfValid();
+    const running = ui._runAnalysis();
     await nextTurn();
     assert.equal(container.busy, 'true');
     computation.resolve(null);

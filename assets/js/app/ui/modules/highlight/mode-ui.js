@@ -7,23 +7,24 @@
 import { HIGHLIGHT_MODE_COPY, SELECT_BAR_HINT } from './mode-copy.js';
 import {
   publishSelectBarHint,
+  publishToolHint,
   removeStepControls,
   STEP_CONTROL_TOOLS
 } from './step-controls.js';
 import {
   requireDomElement,
-  requireExactKeys,
   requireHighlightSelectionMode,
   requireHighlightSelectionState,
   requireMethods,
   requireModeButtons,
   requireSelectModeControls,
-  requireUnifiedSelectionState
+  requireUnifiedSelectionState,
 } from './exact-contract.js';
 import {
   requireSelectMode,
   SELECT_MODE_COMBINES
 } from '../../../../rendering/select-mode.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 const MODE_HANDLER_NAMES = Object.freeze({
   annotation: 'restoreAnnotationSelection',
@@ -269,7 +270,7 @@ export function initHighlightModeUI(options) {
         viewer.cancelUnifiedSelection();
       } else {
         viewer.restoreUnifiedState(
-          selectionState.annotationCandidateSet.toArray(),
+          selectionState.annotationCandidateSet.toUint32Array(),
           selectionState.annotationStepCount
         );
       }
@@ -297,7 +298,8 @@ export function initHighlightModeUI(options) {
     }
 
     removeAllStepControls();
-    highlightModeDescriptionEl.textContent = HIGHLIGHT_MODE_COPY[exactMode];
+    highlightModeDescriptionEl.textContent = '';
+    publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY[exactMode]);
     publishSelectBarHint(documentOwner, SELECT_BAR_HINT[exactMode]);
     restoreModeSelection(exactMode, unifiedState);
   }

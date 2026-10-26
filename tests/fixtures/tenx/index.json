@@ -1,0 +1,46 @@
+{
+ "fixtures": [
+  {
+   "path": "tenx/molecule_info.h5",
+   "expected": "tenx/molecule_info.h5.expected.json",
+   "layout": "file",
+   "format": "tenx-h5",
+   "refusal": "molecule-table"
+  },
+  {
+   "path": "tenx/v2-genomes-outs",
+   "expected": "tenx/v2-genomes-outs.expected.json",
+   "layout": "folder",
+   "format": "tenx-outs",
+   "refusal": null
+  },
+  {
+   "path": "tenx/v2-outs",
+   "expected": "tenx/v2-outs.expected.json",
+   "layout": "folder",
+   "format": "tenx-outs",
+   "refusal": null
+  },
+  {
+   "path": "tenx/v3-citeseq-outs",
+   "expected": "tenx/v3-citeseq-outs.expected.json",
+   "layout": "folder",
+   "format": "tenx-outs",
+   "refusal": null
+  },
+  {
+   "path": "tenx/v3-citeseq.h5",
+   "expected": "tenx/v3-citeseq.h5.expected.json",
+   "layout": "file",
+   "format": "tenx-h5",
+   "refusal": "no-embedding"
+  },
+  {
+   "path": "tenx/v3-gex.h5",
+   "expected": "tenx/v3-gex.h5.expected.json",
+   "layout": "file",
+   "format": "tenx-h5",
+   "refusal": "no-embedding"
+  }
+ ]
+}

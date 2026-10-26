@@ -18,6 +18,16 @@ export const DEFAULT_BROWSER_TEST_PORT = 4173;
 export const BROWSER_TEST_PORT_VARIABLE = 'CELLUCID_BROWSER_TEST_PORT';
 export const BROWSER_TEST_SAMPLE_PORT_VARIABLE =
   'CELLUCID_BROWSER_TEST_SAMPLE_PORT';
+// The name the application is opened at. A page served from this machine
+// (`127.0.0.1`) starts its workers from their sources; under any other name it
+// is a deployed site and starts them from their bundles
+// (`assets/js/workers/worker-script.js`). Every engine resolves `<name>.localhost`
+// to this machine itself, so `CELLUCID_BROWSER_TEST_APP_HOST=deployed.localhost`
+// runs the specs against the same server as a deployed site. The servers bind
+// `BROWSER_TEST_HOST` either way.
+export const BROWSER_TEST_APP_HOST_VARIABLE = 'CELLUCID_BROWSER_TEST_APP_HOST';
+/** The name a spec opens to see the app as a deployed site, whatever the run's own. */
+export const DEPLOYED_BROWSER_TEST_HOST = 'deployed.localhost';
 
 const LOWEST_PORT = 1024;
 const HIGHEST_PORT = 65535;
@@ -81,6 +91,18 @@ function assertPortUsableByBrowsers(value, variable) {
   }
 }
 
+function readAppHost(environment) {
+  const raw = environment[BROWSER_TEST_APP_HOST_VARIABLE];
+  if (raw === undefined || raw === '') return BROWSER_TEST_HOST;
+  if (raw !== BROWSER_TEST_HOST && !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.localhost$/.test(raw)) {
+    throw new RangeError(
+      `${BROWSER_TEST_APP_HOST_VARIABLE} must be ${BROWSER_TEST_HOST} or a <name>.localhost ` +
+        `name, which every engine resolves to this machine; received ${JSON.stringify(raw)}.`
+    );
+  }
+  return raw;
+}
+
 /**
  * Resolve the two loopback ports a browser-test run uses.
  *
@@ -91,6 +113,7 @@ function assertPortUsableByBrowsers(value, variable) {
  * @param {Record<string, string | undefined>} [environment]
  * @returns {Readonly<{
  *   host: string,
+ *   appHost: string,
  *   port: number,
  *   samplePort: number,
  *   origin: string,
@@ -127,11 +150,13 @@ export function resolveBrowserTestPorts(environment = process.env) {
     );
   }
 
+  const appHost = readAppHost(environment);
   return Object.freeze({
     host: BROWSER_TEST_HOST,
+    appHost,
     port,
     samplePort,
-    origin: `http://${BROWSER_TEST_HOST}:${port}`,
+    origin: `http://${appHost}:${port}`,
     sampleOrigin: `http://${BROWSER_TEST_HOST}:${samplePort}`,
   });
 }

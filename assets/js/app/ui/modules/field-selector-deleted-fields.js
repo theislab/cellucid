@@ -10,36 +10,10 @@ import { getFieldRegistry } from '../../utils/field-registry.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import { createButton, createDisclosure } from '../components/controls.js';
-import { formatCountOf } from '../components/display-format.js';
+import { formatCountOf } from '../../../utils/format-units.js';
+import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 const INIT_KEYS = new Set(['state', 'deletedFieldsSection']);
-
-function requirePlainRecord(value, label) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
-  return value;
-}
-
-function requireExactKeys(value, keys, label) {
-  requirePlainRecord(value, label);
-  for (const key of Object.keys(value)) {
-    if (!keys.has(key)) {
-      throw new TypeError(`${label} contains unknown key "${key}"`);
-    }
-  }
-  for (const key of keys) {
-    if (!Object.hasOwn(value, key)) {
-      throw new TypeError(`${label} requires key "${key}"`);
-    }
-  }
-  return value;
-}
 
 function requireMethod(owner, methodName, label) {
   if (

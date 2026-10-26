@@ -74,11 +74,14 @@ test('worker-computed box statistics draw exactly the one-thread box', async ({ 
             detail.push(`${t} ${key} ${a[key]} vs ${b[key]}`);
           }
         }
-        const pa = JSON.stringify(a.pts2.map(p => p.v));
-        const pb = JSON.stringify(b.pts2.map(p => p.v));
+        // Every value of an all-points box is kept as the sorted array the
+        // point layer reads, other boxes' points as Plotly's records.
+        const drawnValues = entry => (entry._cellucidVals ? Array.from(entry._cellucidVals) : entry.pts2.map(p => p.v));
+        const pa = JSON.stringify(drawnValues(a));
+        const pb = JSON.stringify(drawnValues(b));
         if (pa !== pb) {
           mismatches++;
-          detail.push(`${t} points ${a.pts2.length} vs ${b.pts2.length}`);
+          detail.push(`${t} points ${drawnValues(a).length} vs ${drawnValues(b).length}`);
         }
       }
       results.push({

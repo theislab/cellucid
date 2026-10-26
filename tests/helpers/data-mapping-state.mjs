@@ -37,5 +37,13 @@ export function installDataMappingMethods(
   state._mappingRuntime = null;
   state._mappingChangeLock = null;
   if (typeof state.emit !== 'function') state.emit = () => {};
+  // DataState's dataset generation (`field/loading.js`), which a mapping
+  // transaction belongs to; a test publishes another dataset by advancing it.
+  if (typeof state.getDatasetGeneration !== 'function') {
+    state._datasetGeneration ??= 0;
+    state.getDatasetGeneration = function getDatasetGeneration() {
+      return this._datasetGeneration;
+    };
+  }
   return state;
 }

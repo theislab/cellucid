@@ -12,9 +12,9 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -30,11 +30,14 @@ const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const playwrightCli = createRequire(import.meta.url).resolve('@playwright/test/cli');
 
 /**
- * Concurrent listings must not share Playwright's compilation cache: on
- * Windows two processes renaming the same cache entry fail. Each listing
- * owns its cache directory, and only a few run at a time.
+ * Every listing loads every spec file, so Playwright's compilation cache is
+ * what a listing mostly costs: cold, one takes about four times the CPU of a
+ * warm one. Concurrent listings must not share that cache, though: on
+ * Windows two processes renaming the same cache entry fail. So the first
+ * listing runs alone and fills a cache, each concurrent listing gets its own
+ * copy of it, and every later listing reads warm entries only.
  */
-const LISTING_CONCURRENCY = 4;
+const LISTING_CONCURRENCY = Math.max(1, availableParallelism() - 1);
 
 function listShard(project, shard, cacheDirectory) {
   return new Promise((resolve, reject) => {
@@ -78,12 +81,21 @@ test('every browser shard of the CI matrix fits its runner\'s bounded processes'
   const pending = ['chromium', 'firefox', 'webkit'].flatMap(project => shards.map(shard => [project, shard]));
   const cacheRoot = await mkdtemp(join(tmpdir(), 'cellucid-shard-capacity-'));
   try {
-    await Promise.all(Array.from({ length: LISTING_CONCURRENCY }, async (_, worker) => {
+    const listNext = async cacheDirectory => {
+      const [project, shard] = pending.shift();
+      reports.set(`${project} ${shard}`, await listShard(project, shard, cacheDirectory));
+    };
+    const warmCache = join(cacheRoot, '0');
+    await listNext(warmCache);
+    const workers = Math.min(LISTING_CONCURRENCY, pending.length);
+    const caches = [warmCache];
+    for (let worker = 1; worker < workers; worker += 1) {
       const cacheDirectory = join(cacheRoot, String(worker));
-      for (let next = pending.shift(); next !== undefined; next = pending.shift()) {
-        const [project, shard] = next;
-        reports.set(`${project} ${shard}`, await listShard(project, shard, cacheDirectory));
-      }
+      await cp(warmCache, cacheDirectory, { recursive: true });
+      caches.push(cacheDirectory);
+    }
+    await Promise.all(caches.map(async cacheDirectory => {
+      while (pending.length > 0) await listNext(cacheDirectory);
     }));
   } finally {
     await rm(cacheRoot, { recursive: true, force: true });

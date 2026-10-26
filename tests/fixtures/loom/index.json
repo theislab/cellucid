@@ -1,0 +1,53 @@
+{
+ "fixtures": [
+  {
+   "path": "loompy-2.0.17/basic.loom",
+   "expected": "loompy-2.0.17/basic.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  },
+  {
+   "path": "loompy-3.0.8/basic.loom",
+   "expected": "loompy-3.0.8/basic.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  },
+  {
+   "path": "loompy-3.0.8/graphs.loom",
+   "expected": "loompy-3.0.8/graphs.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  },
+  {
+   "path": "loompy-3.0.8/loomr-orientation.loom",
+   "expected": "loompy-3.0.8/loomr-orientation.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  },
+  {
+   "path": "loompy-3.0.8/no-embedding.loom",
+   "expected": "loompy-3.0.8/no-embedding.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": "no-embedding"
+  },
+  {
+   "path": "loompy-3.0.8/scope.loom",
+   "expected": "loompy-3.0.8/scope.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  },
+  {
+   "path": "loompy-3.0.8/velocyto.loom",
+   "expected": "loompy-3.0.8/velocyto.loom.expected.json",
+   "layout": "file",
+   "format": "loom",
+   "refusal": null
+  }
+ ]
+}

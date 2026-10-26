@@ -54,14 +54,18 @@ function createPage(id, groups) {
   return { id, name: id, color: '#ff0000', highlightedGroups: groups };
 }
 
+/** A group holds its cells as a Uint32Array (a cell list once validated). */
 function createGroup(id, cellIndices, enabled = true) {
+  const cells = cellIndices instanceof Uint32Array
+    ? cellIndices
+    : Uint32Array.from(cellIndices);
   return {
     id,
     type: 'lasso',
     label: id,
     enabled,
-    cellIndices,
-    cellCount: cellIndices.length,
+    cellIndices: cells,
+    cellCount: cells.length,
   };
 }
 
@@ -211,10 +215,10 @@ test('a preview cell outside the dataset stops the publication instead of vanish
   });
 
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, 4, 8]),
+    () => state.setPreviewHighlightFromIndices(Uint32Array.of(2, 4, 8)),
     (error) => (
       error instanceof RangeError
-      && /Preview highlight cell index 8 is outside the current dataset of 8 cells/
+      && /Preview highlight cell list must be ascending and inside the current dataset of 8 cells/
         .test(error.message)
     ),
     'a preview cell from another dataset must be reported, not dropped'
@@ -222,17 +226,19 @@ test('a preview cell outside the dataset stops the publication instead of vanish
   assert.equal(publications.length, 0);
 
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, -1]),
-    RangeError
+    () => state.setPreviewHighlightFromIndices(Uint32Array.of(4, 2)),
+    RangeError,
+    'a preview is a cell list: ascending, so every cell once'
   );
   assert.throws(
-    () => state.setPreviewHighlightFromIndices([2, 1.5]),
-    RangeError
+    () => state.setPreviewHighlightFromIndices([2, 4]),
+    TypeError,
+    'a preview is a cell list, never a plain array'
   );
   assert.throws(
     () => state.setPreviewHighlightFromIndices(new Set([1, 2])),
     TypeError,
-    'only an indexed cell collection can be a preview'
+    'only a cell list can be a preview'
   );
 });
 
@@ -246,7 +252,7 @@ test('a preview publishes the active page underneath the in-progress selection',
     ])],
   });
 
-  state.setPreviewHighlightFromIndices([1, 4, 5]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(1, 4, 5));
   const publication = publications.at(-1);
 
   assert.deepEqual(publication.painted, [0, 1, 4, 5]);
@@ -289,7 +295,7 @@ test('combining pages reads the same membership the pages render', () => {
     [...union.highlightedGroups[0].cellIndices],
     [1, 2, 3, 4, 7],
     'a disabled group contributes to neither the count nor the combination; '
-    + 'the union lists page 1 first, then what page 2 adds'
+    + 'the union is a cell list: every cell once, ascending'
   );
   assert.equal(union.highlightedGroups[0].cellCount, 5);
   assert.ok(
@@ -335,7 +341,7 @@ test('clearing highlights empties exactly the active page', () => {
     ],
   });
 
-  assert.equal(state.clearAllHighlights(), 2);
+  assert.equal(state.clearActivePageHighlights(), 2);
   assert.equal(state.getHighlightedCellCountForPage('page_2'), 0);
   assert.equal(
     state.getHighlightedCellCountForPage('page_1'),
@@ -345,7 +351,7 @@ test('clearing highlights empties exactly the active page', () => {
 
   state.activePageId = 'page_missing';
   assert.throws(
-    () => state.clearAllHighlights(),
+    () => state.clearActivePageHighlights(),
     RangeError,
     'a named-but-missing active page is a violated invariant, not a no-op'
   );
@@ -353,7 +359,7 @@ test('clearing highlights empties exactly the active page', () => {
   state.highlightPages = [];
   state.activePageId = null;
   assert.equal(
-    state.clearAllHighlights(),
+    state.clearActivePageHighlights(),
     0,
     'an empty page inventory truthfully removes nothing'
   );
@@ -370,11 +376,11 @@ test('a preview replaces the previous preview instead of accumulating it', () =>
     pages: [createPage('page_1', [createGroup('highlight_1', [0])])],
   });
 
-  state.setPreviewHighlightFromIndices([2, 3, 4, 5]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(2, 3, 4, 5));
   assert.deepEqual(publications.at(-1).painted, [0, 2, 3, 4, 5]);
 
   // The same gesture, now subtracting 4 and 5 from its candidates.
-  state.setPreviewHighlightFromIndices([2, 3]);
+  state.setPreviewHighlightFromIndices(Uint32Array.of(2, 3));
   assert.deepEqual(
     publications.at(-1).painted,
     [0, 2, 3],
@@ -396,4 +402,96 @@ test('highlight accessors expose no second definition of page membership', () =>
     Object.keys(highlightAccessorMethods).sort(),
     ['getCellAtScreenPosition']
   );
+});
+
+/**
+ * The page list counts every page on each highlight and page change (a page
+ * colour drag fires one per input event). A count is a pass over every
+ * enabled cell of the page, so it is kept while the page has the same
+ * enabled cell lists, and taken again when one of them changes.
+ */
+test('a page is counted again only when its enabled cell lists change', () => {
+  const big = createGroup('big', Uint32Array.from({ length: 1000 }, (_, cell) => cell));
+  const other = createGroup('other', [5, 2000]);
+  const page = createPage('page_1', [big, other]);
+  const { state } = createHighlightState({ pointCount: 4000, pages: [page], activePageId: 'page_1' });
+  let passes = 0;
+  const borrow = state._borrowHighlightMembershipScratch;
+  state._borrowHighlightMembershipScratch = function countedBorrow() {
+    passes += 1;
+    return borrow.call(this);
+  };
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
+  // A recolour or rename changes no cell list.
+  page.color = '#00ff00';
+  page.name = 'renamed';
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
+  assert.equal(passes, 1);
+
+  // One enabled cell list counts its length, with no pass over its cells.
+  other.enabled = false;
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 1000);
+  assert.equal(passes, 1);
+  other.enabled = true;
+  other.cellIndices = Uint32Array.of(3999);
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
+  assert.equal(passes, 2);
+  // Another dataset size is another count: out-of-range cells are refused.
+  state.pointCount = 10;
+  assert.throws(() => state.getHighlightedCellCountForPage('page_1'));
+});
+
+test('a group added with no active page is refused, not reported as kept', () => {
+  const { state } = createHighlightState({ pointCount: 8, pages: [], activePageId: null });
+  assert.throws(
+    () => state.addHighlightDirect({ type: 'lasso', label: 'lost', cellIndices: Uint32Array.of(1, 2) }),
+    /active page/,
+  );
+  // With a page, the group is on it.
+  const page = createPage('page_1', []);
+  const { state: withPage } = createHighlightState({ pointCount: 8, pages: [page], activePageId: 'page_1' });
+  const group = withPage.addHighlightDirect({ type: 'lasso', label: 'kept', cellIndices: Uint32Array.of(1, 2) });
+  assert.equal(page.highlightedGroups.at(-1), group);
+});
+
+test('the notebook clear empties every page; the Clear button only the active one', () => {
+  const pageOne = createPage('page_1', [createGroup('a', [1, 2])]);
+  const pageTwo = createPage('page_2', [createGroup('b', [3]), createGroup('c', [4])]);
+  const { state } = createHighlightState({ pointCount: 8, pages: [pageOne, pageTwo], activePageId: 'page_1' });
+  assert.equal(state.clearActivePageHighlights(), 1);
+  assert.equal(pageTwo.highlightedGroups.length, 2);
+  assert.equal(state.clearHighlightsOnAllPages(), 2);
+  assert.deepEqual([pageOne, pageTwo].map(page => page.highlightedGroups.length), [0, 0]);
+  assert.deepEqual(state.highlightPages.map(page => page.id), ['page_1', 'page_2'], 'the pages stay');
+});
+
+test('one enabled cell list is painted and published as it is', () => {
+  const group = createGroup('highlight_1', [1, 5, 9]);
+  const { state, publications } = createHighlightState({
+    pointCount: 12,
+    activePageId: 'page_1',
+    pages: [createPage('page_1', [group, createGroup('highlight_2', [0, 2], false)])],
+  });
+  state._recomputeHighlightArray();
+  assert.equal(state._highlightedCellIndices, group.cellIndices);
+  assert.deepEqual(publications.at(-1).painted, [1, 5, 9]);
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 3);
+  // Runs of consecutive cells and single cells, both painted exactly.
+  group.cellIndices = Uint32Array.of(0, 1, 2, 4, 6, 7, 11);
+  state._recomputeHighlightArray();
+  assert.deepEqual(publications.at(-1).painted, [0, 1, 2, 4, 6, 7, 11]);
+  assert.ok([...state.highlightArray].every(value => value === 0 || value === 255));
+  group.cellIndices = Uint32Array.of(1, 5, 9);
+
+  // A list that is not a cell list of this dataset goes through the
+  // collector, which refuses it as before.
+  state.pointCount = 6;
+  state.highlightArray = null;
+  assert.throws(() => state._recomputeHighlightArray(), /outside the current dataset of 6 cells/);
+  assert.throws(() => state.getHighlightedCellCountForPage('page_1'), /outside the current dataset of 6 cells/);
+  state.pointCount = 12;
+  // A list out of order is counted by the collector, each cell once.
+  group.cellIndices = Uint32Array.of(4, 2, 4);
+  assert.equal(state.getHighlightedCellCountForPage('page_1'), 2);
 });

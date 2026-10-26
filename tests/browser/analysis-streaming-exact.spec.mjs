@@ -2,22 +2,32 @@
  * The streaming analyses compute the same numbers in every engine.
  *
  * Differential expression and marker discovery stream one gene at a time: the
- * gene's gzip payload is inflated and dequantized in the decode worker, the two
+ * gene's column is read from the AnnData file in the reader worker, the two
  * groups are gathered through per-run plans, and the statistics run in the
  * analysis worker pool. Each of those steps was rewritten for speed, so this
  * pins the end result against references computed on the page itself from the
- * raw files — inflated on the main thread, decoded with the published formula
- * and tested with the shared two-sample kernels — and requires the same
- * IEEE-754 numbers, not close ones.
+ * expression the file was written with -- tested with the shared two-sample
+ * kernels -- and requires the same IEEE-754 numbers, not close ones.
  */
 import { expect, test } from './helpers/test.mjs';
-import { appUrl, encodedAppUrl } from './helpers/origins.mjs';
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
+import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const DATASET = 'synthetic-cell-types-2d';
-const DATASET_BASE = appUrl(
-  `/tests/browser/fixtures/demo-custom-exports/${DATASET}/`,
-);
+const DATASET = 'streaming-exact';
+const ROOT = appUrl('/tests/browser/fixtures/generated-streaming-exact/');
+const CELLS = 72;
+const GENES = Object.freeze(Array.from({ length: 8 }, (_, gene) => `GENE${gene + 1}`));
+const CATEGORIES = Object.freeze(['alpha', 'beta', 'gamma']);
+
+/** Dense expression, cells x genes: ties, zeros and a gene with one value. */
+const X = Float32Array.from({ length: CELLS * GENES.length }, (_, index) => {
+  const cell = Math.floor(index / GENES.length);
+  const gene = index % GENES.length;
+  if (gene === GENES.length - 1) return 1.5;
+  const value = ((cell * 31 + gene * 17) % 23) / 7 + (cell % 3 === gene % 3 ? gene : 0);
+  return value < 0.5 ? 0 : value;
+});
 
 test('streamed DE and marker statistics equal on-page references exactly', async ({
   page,
@@ -28,9 +38,27 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     if (message.type() === 'error') errors.push(`console: ${message.text()}`);
   });
 
+  await serveSyntheticCatalog(page, ROOT, {
+    id: DATASET,
+    name: 'Streaming exact fixture',
+    cells: CELLS,
+    genes: [...GENES],
+    X,
+    obs: {
+      cell_type: {
+        categories: [...CATEGORIES],
+        codes: Int8Array.from({ length: CELLS }, (_, cell) => cell % 3),
+      },
+    },
+    obsm: {
+      X_umap_2d: {
+        data: Float32Array.from({ length: CELLS * 2 }, (_, index) => Math.sin(index * 0.7) * 3),
+        columns: 2,
+      },
+    },
+  });
   await page.goto(
-    `/?exportsBaseUrl=${encodedAppUrl('/tests/browser/fixtures/demo-custom-exports/')}` +
-      `&dataset=${DATASET}`,
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET}`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -38,16 +66,17 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     () => window._comparisonModule?.state?.pointCount === 72,
   );
 
-  const proof = await page.evaluate(async datasetBase => {
+  const proof = await page.evaluate(async ({ genes: geneNames, expression }) => {
     const { computeDifferential } = await import(
       '/assets/js/app/analysis/compute/operation-handlers.js'
     );
     const { mannWhitneyU } = await import(
       '/assets/js/app/analysis/compute/math-utils.js'
     );
-    const { GenesPanelController } = await import(
+    const { GenesPanelController, GROUP_ID_PREFIX } = await import(
       '/assets/js/app/analysis/genes-panel/genes-panel-controller.js'
     );
+    const { MARKER_OPTIONS } = await import('/assets/js/app/analysis/options/marker-options.js');
     const cm = window._comparisonModule;
     const state = cm.state;
     const dataLayer = cm.dataLayer;
@@ -57,25 +86,15 @@ test('streamed DE and marker statistics equal on-page references exactly', async
       return left.length === right.length && left.every((v, i) => v === right[i]);
     };
 
-    // Reference decode: the raw file, inflated here, decoded by the formula.
-    const manifest = await (await fetch(`${datasetBase}var_manifest.json`)).json();
-    const reference = new Map();
+    // Reference: each gene's column of the expression the file was written with.
+    const referenceColumns = new Map();
     const decodeMismatches = [];
-    for (const [index, key, minValue, maxValue] of manifest.fields) {
-      const path = manifest._varSchema.pathPattern.replace('{index}', String(index));
-      const compressed = await (await fetch(`${datasetBase}${path}`)).arrayBuffer();
-      const inflated = await new Response(
-        new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip')),
-      ).arrayBuffer();
-      const codes = new Uint8Array(inflated);
-      const expected = new Float32Array(codes.length);
-      const scale = (maxValue - minValue) / 254;
-      for (let i = 0; i < codes.length; i++) {
-        expected[i] = codes[i] === 255
-          ? NaN
-          : (minValue === maxValue ? minValue : minValue + codes[i] * scale);
-      }
-      reference.set(key, expected);
+    for (const [gene, key] of geneNames.entries()) {
+      const expected = Float32Array.from(
+        { length: expression.length / geneNames.length },
+        (_, cell) => expression[cell * geneNames.length + gene],
+      );
+      referenceColumns.set(key, expected);
       const loaded = await dataLayer.ensureGeneExpressionLoaded(key);
       if (!sameBits(loaded.values, expected)) decodeMismatches.push(key);
     }
@@ -97,13 +116,13 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     let deChecks = 0;
     for (const method of ['wilcox', 'ttest']) {
       const run = await cm.multiVariableAnalysis.differentialExpression({
-        pageA,
-        pageB,
+        groupA: cm.multiVariableAnalysis.pageGroup(pageA),
+        groupB: cm.multiVariableAnalysis.pageGroup(pageB),
         method,
         minCells: 10,
       });
       for (const row of run.results) {
-        const values = reference.get(row.gene);
+        const values = referenceColumns.get(row.gene);
         deChecks++;
         const expected = computeDifferential({
           groupAValues: Float32Array.from(cellsA, i => values[i]),
@@ -118,58 +137,67 @@ test('streamed DE and marker statistics equal on-page references exactly', async
       }
     }
 
+    // Markers against the rest, and against one reference group: every
+    // tested group's p-value equals the rank-sum test of its cells against
+    // the reference's cells.
     const controller = new GenesPanelController({ dataLayer });
     const markerMismatches = [];
     let markerChecks = 0;
+    const codes = (await dataLayer.ensureObsFieldLoaded('cell_type')).codes;
     try {
-      const { groups, obsCodes } = await controller.getGroupsAndCodes('cell_type');
-      const run = await controller.runAnalysis({
-        obsCategory: 'cell_type',
-        method: 'wilcox',
-        useCache: false,
-        topNPerGroup: 'all',
-        pValueThreshold: 1,
-        foldChangeThreshold: 0,
-      });
-      const { genes, groupIds, pValuesByGroup } = run.markers.stats;
-      for (let g = 0; g < groupIds.length; g++) {
-        const group = groups.find(candidate => candidate.groupId === groupIds[g]);
-        for (let geneIndex = 0; geneIndex < genes.length; geneIndex++) {
-          const values = reference.get(genes[geneIndex]);
-          const inGroup = [];
-          const rest = [];
-          for (let cell = 0; cell < obsCodes.length; cell++) {
-            if (obsCodes[cell] === 65535 || !Number.isFinite(values[cell])) continue;
-            (obsCodes[cell] === group.groupCode ? inGroup : rest).push(values[cell]);
+      for (const choice of [{ compareAgainst: 'rest' }, { compareAgainst: 'group', referenceGroup: 'beta' }]) {
+        const options = MARKER_OPTIONS.withDefaults(
+          { groupBy: 'cell_type', minCells: 2, ...choice },
+          {
+            categoricalFields: [{ key: 'cell_type' }],
+            groupsFor: () => ['alpha', 'beta', 'gamma'].map(name => ({ id: name, name, count: 24 })),
+          },
+        );
+        controller.clearCache();
+        const { stats } = await controller.runAnalysis({ options });
+        const codeOf = group => Number(group.groupId.slice(GROUP_ID_PREFIX.length));
+        const reference = stats.groups.find(group => group.reference) ?? null;
+        stats.groups.forEach((group, g) => {
+          if (!group.tested) return;
+          for (let geneIndex = 0; geneIndex < stats.genes.length; geneIndex++) {
+            const values = referenceColumns.get(stats.genes[geneIndex]);
+            const inGroup = [];
+            const rest = [];
+            for (let cell = 0; cell < codes.length; cell++) {
+              if (!Number.isFinite(values[cell])) continue;
+              if (codes[cell] === codeOf(group)) inGroup.push(values[cell]);
+              else if (reference === null || codes[cell] === codeOf(reference)) rest.push(values[cell]);
+            }
+            const expected = mannWhitneyU(inGroup, rest).pValue;
+            markerChecks++;
+            if (!Object.is(stats.pValuesByGroup[g][geneIndex], expected)) {
+              markerMismatches.push(
+                `${choice.compareAgainst} ${group.groupName} ${stats.genes[geneIndex]}: ${stats.pValuesByGroup[g][geneIndex]} != ${expected}`,
+              );
+            }
           }
-          const expected = mannWhitneyU(inGroup, rest).pValue;
-          markerChecks++;
-          if (!Object.is(pValuesByGroup[g][geneIndex], expected)) {
-            markerMismatches.push(
-              `${groupIds[g]} ${genes[geneIndex]}: ${pValuesByGroup[g][geneIndex]} != ${expected}`,
-            );
-          }
-        }
+        });
       }
     } finally {
-      await controller.close();
+      controller.close();
     }
 
     return {
-      genes: manifest.fields.length,
+      genes: geneNames.length,
       decodeMismatches,
       deChecks,
       deMismatches,
       markerChecks,
       markerMismatches,
     };
-  }, DATASET_BASE);
+  }, { genes: GENES, expression: Array.from(X) });
 
   expect(proof.genes).toBe(8);
   expect(proof.decodeMismatches).toEqual([]);
   expect(proof.deChecks).toBe(16);
   expect(proof.deMismatches).toEqual([]);
-  expect(proof.markerChecks).toBe(24);
+  // 3 groups x 8 genes against the rest, 2 groups x 8 genes against beta.
+  expect(proof.markerChecks).toBe(40);
   expect(proof.markerMismatches).toEqual([]);
   expect(errors).toEqual([]);
 });

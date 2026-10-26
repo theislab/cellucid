@@ -1,8 +1,8 @@
 /**
  * The gene list of a data mapping, read from a real `.h5ad` and Zarr ZIP in
- * the browser readers (Phase F), against what `cellucid-python` serves for
- * the same file (`data-mapping-full.expected.json`, written by
- * `scripts/generate-data-mapping-fixtures.py` from cellucid itself):
+ * the browser readers (Phase F), against the numpy reference for the same
+ * file (`data-mapping-full.expected.json`, computed by
+ * `scripts/generate-data-mapping-fixtures.py` independently of this code):
  * - every expression matrix (`X`, each layer, `raw.X` with its own var axis)
  *   and every name source (the var index, each usable var column) gives the
  *   same unique names, the same make-unique record and byte-identical values;
@@ -17,9 +17,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
-import { MappingLoadError, mappingGenesBase } from '../assets/js/data/data-mapping-candidates.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
+import { MappingLoadError, mappingGeneListPath } from '../assets/js/data/data-mapping-candidates.js';
 import { geneNameText } from '../assets/js/data/gene-names.js';
 
 const EXPECTED = JSON.parse(
@@ -44,15 +43,15 @@ async function open(t, format) {
   silenceNotifications(t);
   if (format === 'H5AD') {
     const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url))], 'data-mapping-full.h5ad');
-    const source = new H5adDataSource();
+    const source = new AnnDataFileSource();
     t.after(() => source.clear());
-    await source.loadFromFile(file);
+    await source.loadFile(file);
     return source.getAdapter();
   }
   const file = new File([await readFile(new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url))], 'data-mapping-full.zarr.zip');
-  const source = new ZarrDataSource();
+  const source = new AnnDataFileSource();
   t.after(() => source.clear());
-  await source.loadFromArchiveFile(file);
+  await source.loadFile(file);
   return source.getAdapter();
 }
 
@@ -65,12 +64,22 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
     const adapter = await open(t, format);
     for (const [route, expected] of Object.entries(EXPECTED.genes)) {
       const [axis, names] = route.split('/');
-      const base = mappingGenesBase(axis, names);
-      const manifest = await adapter.getVarManifest(`${base}var_manifest.json`);
-      assert.deepEqual(manifest.fields.map(([, name]) => name), expected.names, route);
-      assert.deepEqual(manifest.gene_name_sets, [expected.name_set], route);
+      const listRoute = mappingGeneListPath(axis, names);
+      const list = await adapter.getGeneList(listRoute);
+      assert.deepEqual(list.fields.map(field => field.key), expected.names, route);
+      assert.deepEqual(
+        list.fields.map(field => field.path),
+        expected.names.map((_, gene) => `${listRoute}/${gene}`),
+        route
+      );
+      const { source, filledFromIndex, renamed } = list.geneNames;
+      assert.deepEqual(
+        { source, filled_from_index: filledFromIndex, renamed },
+        expected.gene_names,
+        route
+      );
       for (let index = 0; index < expected.names.length; index += 1) {
-        const values = await adapter.getGeneValues(`${base}var/${index}.values.f32`);
+        const values = await adapter.getGeneValues(`${listRoute}/${index}`);
         assert.equal(sha256(values), expected.values[index], `${route} gene ${index}`);
       }
     }
@@ -78,23 +87,23 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
 
   test(`${format}: the file opens with X named by its index, and refuses a float column`, async t => {
     const adapter = await open(t, format);
-    const own = await adapter.getVarManifest();
-    assert.deepEqual(own.fields.map(([, name]) => name), EXPECTED.genes['X/index'].names);
+    const own = await adapter.getGeneList();
+    assert.deepEqual(own.fields.map(field => field.key), EXPECTED.genes['X/index'].names);
     assert.equal(
-      sha256(await adapter.getGeneValues('var/2.values.f32')),
+      sha256(await adapter.getGeneValues('var/2')),
       EXPECTED.genes['X/index'].values[2]
     );
     const columns = adapter.getMappingCandidates().var.columns;
     const dispersions = columns.findIndex(column => column.key === 'dispersions');
     await assert.rejects(
-      adapter.getVarManifest(`${mappingGenesBase('X', `column-${dispersions}`)}var_manifest.json`),
+      adapter.getGeneList(mappingGeneListPath('X', `column-${dispersions}`)),
       error => error instanceof MappingLoadError
         && error.key === 'dispersions'
         && error.reason === 'floating-point values cannot name genes'
     );
-    await assert.rejects(adapter.getGeneValues('var/6.values.f32'), RangeError);
+    await assert.rejects(adapter.getGeneValues('var/6'), RangeError);
     await assert.rejects(
-      adapter.getVarManifest(`${mappingGenesBase('layer-9', 'index')}var_manifest.json`),
+      adapter.getGeneList(mappingGeneListPath('layer-9', 'index')),
       RangeError
     );
   });

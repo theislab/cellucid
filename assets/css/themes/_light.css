@@ -23,8 +23,10 @@
   --color-text-tertiary: var(--gray-500);
   --color-text-inverse: var(--white);
   --color-text-disabled: var(--gray-300);
-  --color-text-link: var(--cyan-600);
-  --color-text-link-hover: var(--cyan-700);
+  /* cyan-600 reads at 4.1:1 on white; cyan-700 clears AA on every light
+     text surface (5.9:1 on white), matching the documentation site. */
+  --color-text-link: var(--cyan-700);
+  --color-text-link-hover: var(--cyan-800);
 
   /* Border colors. */
   --color-border-strong: var(--gray-900);

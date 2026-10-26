@@ -70,6 +70,15 @@ function bytesOf(view) {
   return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 }
 
+/** Byte equality without a diff of megabytes when it fails. */
+function cellsEqual(left, right) {
+  if (!(left instanceof Uint8Array) || left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 /**
  * A WebGL2 double that models a buffer's data store the way the real one
  * behaves: `bufferData` with a byte length allocates a zero-filled store,
@@ -247,16 +256,36 @@ test('full detail publishes each stream straight from the published array', () =
     renderer.buffers;
   assert.notEqual(positionBuffer, colorBuffer);
   assert.deepEqual(
-    tracker.calls.bufferData.map(call => [call.buffer, call.data, call.usage]),
+    tracker.calls.bufferData.map(call => [call.buffer, call.data, call.size, call.usage]),
     [
-      [positionBuffer, positions, tracker.gl.STATIC_DRAW],
-      [colorBuffer, colors, tracker.gl.DYNAMIC_DRAW],
+      [positionBuffer, null, pointCount * 12, tracker.gl.STATIC_DRAW],
+      [colorBuffer, null, pointCount * 4, tracker.gl.DYNAMIC_DRAW],
     ],
-    'each store is allocated from the published array itself',
+    'both stores are sized; their bytes go up when first needed',
   );
   assert.equal(tracker.calls.bufferSubData.length, 0);
-  assert.deepEqual(tracker.stores.get(positionBuffer), bytesOf(positions));
-  assert.deepEqual(tracker.stores.get(colorBuffer), bytesOf(colors));
+  // Each stream crosses once, straight from the published array: the
+  // positions when the store is first needed, the colors in the first frame.
+  assert.equal(renderer._positionsUploadPending, true);
+  renderer._flushPendingPositionUpload();
+  assert.equal(renderer._positionsUploadPending, false);
+  renderer._flushPendingPositionUpload();
+  assert.equal(renderer._colorsDirty, true);
+  renderer._publishLiveColors();
+  assert.equal(renderer._colorsDirty, false);
+  assert.deepEqual(tracker.calls.bufferSubData, [{
+    buffer: positionBuffer,
+    dstByteOffset: 0,
+    length: pointCount * 12,
+    sourceBuffer: positions.buffer,
+  }, {
+    buffer: colorBuffer,
+    dstByteOffset: 0,
+    length: pointCount * 4,
+    sourceBuffer: colors.buffer,
+  }]);
+  assert.ok(cellsEqual(tracker.stores.get(positionBuffer), bytesOf(positions)));
+  assert.ok(cellsEqual(tracker.stores.get(colorBuffer), bytesOf(colors)));
   assert.equal(renderer._positionGpuByteLength, pointCount * 12);
   assert.equal(renderer._colorGpuByteLength, pointCount * 4);
   // Nothing was staged on the client.
@@ -290,8 +319,9 @@ test('a 2D or 1D embedding publishes only its own components, with no padded axi
     );
     renderer._positions = positions;
     renderer._createPointStreams(positions, colors, dimension);
+    renderer._flushPendingPositionUpload();
     const positionBuffer = renderer.buffers.positions;
-    assert.deepEqual(tracker.stores.get(positionBuffer), bytesOf(positions));
+    assert.ok(cellsEqual(tracker.stores.get(positionBuffer), bytesOf(positions)));
     assert.equal(
       renderer._positionGpuByteLength,
       pointCount * dimension * 4,
@@ -315,9 +345,12 @@ test('a full-detail recolor rewrites only the color stream, in place', () => {
   const { colors, positions, renderer, tracker } =
     createStreamFixture(pointCount);
   renderer._createPointStreams(positions, colors, 3);
+  renderer._flushPendingPositionUpload();
   const acceptedPositions =
     tracker.stores.get(renderer.buffers.positions).slice();
+  assert.ok(cellsEqual(acceptedPositions, bytesOf(positions)));
   tracker.calls.bufferData.length = 0;
+  tracker.calls.bufferSubData.length = 0;
 
   const recolored = makeColors(pointCount).map(
     (value, index) => (value + index) % 256,
@@ -344,7 +377,7 @@ test('a full-detail recolor rewrites only the color stream, in place', () => {
 
 for (const count of POINT_COUNTS) {
   test(
-    `ordered colour gather of ${count.toLocaleString()} points is byte-identical ` +
+    `ordered colour gather of ${count.toLocaleString('en-US')} points is byte-identical ` +
     'to a whole-buffer gather',
     () => {
       const pointCount = count + 3;
@@ -413,8 +446,8 @@ test('a refused GPU allocation names the dataset it could not store', () => {
     () => renderer._createPointStreams(positions, colors, 3),
     error => (
       error instanceof RangeError &&
-      error.message.includes(pointCount.toLocaleString()) &&
-      error.message.includes((pointCount * 12).toLocaleString()) &&
+      error.message.includes(pointCount.toLocaleString('en-US')) &&
+      error.message.includes((pointCount * 12).toLocaleString('en-US')) &&
       /0x505/.test(error.message)
     ),
   );
@@ -440,7 +473,7 @@ test('loadData refuses only a dataset the device cannot address, never one above
     () => renderer.loadData(positions, colors, { dimensionLevel: 3 }),
     error => (
       error instanceof RangeError &&
-      error.message.includes(pointCount.toLocaleString()) &&
+      error.message.includes(pointCount.toLocaleString('en-US')) &&
       /3 texture layers; this GPU allows 2/.test(error.message)
     ),
   );

@@ -1,14 +1,13 @@
 /**
  * A payload refused for its size must be reported as a size refusal.
  *
- * Binary payloads have no fixed ceiling: one is refused for its size only when
- * the browser cannot allocate it, which happens to perfectly well-formed
- * exports that are simply too big for this machine. Metadata keeps a fixed
- * ceiling. Every advice the app can give about a size refusal is wrong unless
- * it says so:
+ * A document has no fixed ceiling: one is refused for its size only when the
+ * browser cannot allocate or decode it, which happens to perfectly well-formed
+ * files that are simply too big for this machine. Every advice the app can
+ * give about a size refusal is wrong unless it says so:
  *
- * - "Re-export it with cellucid prepare" (the `unreadable` row) sends the user
- *   to regenerate a valid file and meet the identical wall again;
+ * - "Write it again" (the `unreadable` row) sends the user to regenerate a
+ *   valid file and meet the identical wall again;
  * - "Check your network" (the `unreachable` row) blames a connection that
  *   worked well enough to deliver more bytes than the app would accept;
  * - the unclassified shape ("Try again; if it keeps failing…") offers a retry
@@ -31,15 +30,11 @@ import {
   allocatePayloadBytes,
   fetchJson,
   readBoundedBody,
-  requireDeclaredPayloadLength,
 } from '../assets/js/data/data-source.js';
 import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 import {
-  LocalUserDirDataSource,
-} from '../assets/js/data/local-user-source.js';
-import {
   classifyDataSourceFailure,
-  dataSourceFailureDetail,
+  dataSourceFailureDetails,
   describeDataSourceFailure,
 } from '../assets/js/app/ui/modules/dataset-connections.js';
 
@@ -84,7 +79,7 @@ test('the layer that owns the byte ceiling names the cause it refused for', asyn
   // A declared length the browser cannot hold, at its allocation.
   const declared = () => allocatePayloadBytes(
     2 ** 52,
-    'Payload embeddings/0_3d.bin'
+    'Payload obsm/0/0-1-2'
   );
   assert.throws(declared, DataSourceError);
   assert.throws(declared, error => {
@@ -92,15 +87,11 @@ test('the layer that owns the byte ceiling names the cause it refused for', asyn
     return true;
   });
 
-  // A declared length that is not a length at all remains a caller-contract
-  // violation, not a size refusal: nothing was measured against the ceiling.
-  assert.throws(
-    () => requireDeclaredPayloadLength(-1, 'Payload embeddings/0_3d.bin'),
-    RangeError
-  );
+  // A caller-contract violation is not a size refusal: nothing was measured
+  // against a ceiling.
   assert.equal(
     classifyDataSourceFailure(
-      new RangeError('Payload embeddings/0_3d.bin: declared payload length must be')
+      new RangeError('Payload obsm/0/0-1-2: declared payload length must be')
     ),
     null,
     'a caller-contract violation still publishes no cause'
@@ -131,7 +122,7 @@ test('a metadata body past the longest string keeps its size cause through fetch
   hitLongestString(t);
 
   await assert.rejects(
-    fetchJson('https://untrusted.test/exports/datasets.json', 'github-repo'),
+    fetchJson('https://untrusted.test/exports/datasets.json', 'link'),
     error => {
       assert.ok(error instanceof DataSourceError);
       assert.equal(
@@ -166,52 +157,7 @@ test('the remote transport reports the longest-string limit as a size refusal', 
   );
 });
 
-test('a prepared directory refused for its size is not called malformed', async () => {
-  // Same ceiling, third producer. A prepared export whose identity document is
-  // over the metadata limit is a valid export that is merely too big, and it
-  // reaches the same failure sentence through the dataset dropdown.
-  const file = (path, contents, size = null) => {
-    const blob = new Blob([contents]);
-    Object.defineProperties(blob, {
-      name: { configurable: true, value: path.split('/').at(-1) },
-      webkitRelativePath: { configurable: true, value: path },
-      ...(size === null ? {} : { size: { configurable: true, value: size } }),
-    });
-    return blob;
-  };
-
-  // A metadata file longer than the engine's longest string: reading it as
-  // text is what fails, not a fixed cap.
-  const longestTextFile = path => {
-    const blob = file(path, '{}');
-    blob.text = async () => {
-      throw new RangeError('Invalid string length');
-    };
-    return blob;
-  };
-
-  const source = new LocalUserDirDataSource();
-  await assert.rejects(
-    source.loadFromPreparedDirectory([
-      longestTextFile('oversized/dataset_identity.json'),
-      file('oversized/obs_manifest.json', '{}'),
-      file('oversized/embeddings/0_2d.bin', new Uint8Array(16)),
-    ]),
-    error => {
-      assert.ok(error instanceof DataSourceError);
-      assert.equal(error.code, DataSourceErrorCode.TOO_LARGE);
-      assert.doesNotMatch(
-        error.message,
-        /^Invalid /,
-        'nothing parsed the document, so nothing may call it invalid'
-      );
-      assert.equal(classifyDataSourceFailure(error), 'too-large');
-      return true;
-    }
-  );
-});
-
-test('a size refusal is never given the re-export advice', () => {
+test('a size refusal is never given the write-it-again advice', () => {
   const tooLarge = new DataSourceError(
     'Remote health response: transfer of at least 67108865 bytes exceeds '
     + 'its 67108864-byte ceiling',
@@ -228,8 +174,8 @@ test('a size refusal is never given the re-export advice', () => {
   );
   assert.doesNotMatch(
     sentence,
-    /cellucid prepare|Re-export/i,
-    're-exporting produces a byte-identical file and hits the same ceiling'
+    /cellucid prepare|write it again/i,
+    'writing the file again produces a byte-identical file and hits the same ceiling'
   );
   assert.doesNotMatch(
     sentence,
@@ -244,9 +190,9 @@ test('a size refusal is never given the re-export advice', () => {
     'the notice names the cause, never the transport diagnostic'
   );
   assert.equal(
-    dataSourceFailureDetail(tooLarge),
-    '',
-    'a named cause makes the raw byte count redundant'
+    dataSourceFailureDetails(tooLarge),
+    tooLarge.message,
+    'the raw byte count is kept for the notification\'s Details only'
   );
 });
 
@@ -255,12 +201,12 @@ test('the size refusal and the format refusal no longer share a sentence', () =>
   const sentences = [];
   for (const error of [
     new DataSourceError(
-      'Invalid dataset_identity.json: stats must be an object',
+      'Invalid dataset identity: stats must be an object',
       DataSourceErrorCode.INVALID_FORMAT,
       'remote'
     ),
     new DataSourceError(
-      'Remote catalog name does not match dataset_identity.json',
+      'Remote catalog name does not match the dataset identity',
       DataSourceErrorCode.VALIDATION_ERROR,
       'remote'
     ),
@@ -289,7 +235,7 @@ test('the size refusal and the format refusal no longer share a sentence', () =>
   assert.notEqual(
     sentences[2],
     sentences[0],
-    'a malformed export and an oversized one must not read alike'
+    'a malformed file and an oversized one must not read alike'
   );
 });
 
@@ -324,7 +270,7 @@ test('every failure row is reachable, distinct, and shaped alike', () => {
     // unclassified fallback uses, and none of them carries a raw detail.
     assert.match(sentence, /^Sample datasets could not be loaded: /);
     assert.match(sentence, /try again/i);
-    assert.equal(dataSourceFailureDetail(error), '');
+    assert.doesNotMatch(sentence, /Details:/);
     sentences.add(sentence);
   }
   assert.equal(
@@ -349,6 +295,6 @@ test('the unclassified shape keeps exactly the cases it had', () => {
       describeDataSourceFailure('Sample datasets', 'could not be loaded', error),
       /^Sample datasets could not be loaded\. Try again;/
     );
-    assert.match(dataSourceFailureDetail(error), /^ Details: /);
+    assert.equal(dataSourceFailureDetails(error), error.message);
   }
 });

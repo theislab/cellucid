@@ -22,6 +22,7 @@ import { expect, test } from './helpers/test.mjs';
 
 import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -109,116 +110,18 @@ function expectClose(actual, expected, label) {
   }
 }
 
-// The dataset has no genes on purpose: such a dataset publishes no var
-// manifest, and saving a session on it used to fail for want of a var
-// inventory.
-const catalog = {
-  version: 1,
-  default: DATASET_ID,
-  datasets: [{
+// The dataset has no genes on purpose: saving a session on a dataset without
+// genes used to fail for want of a var inventory.
+async function installFixture(page) {
+  await serveSyntheticCatalog(page, ROOT, {
     id: DATASET_ID,
     name: 'User-defined centroid fixture',
-    path: `${DATASET_ID}/`,
-    n_cells: CELL_COUNT,
-    n_genes: 0,
-  }],
-};
-
-const identity = {
-  version: 3,
-  id: DATASET_ID,
-  name: 'User-defined centroid fixture',
-  description: 'Exact synthetic browser fixture with 1D, 2D and 3D layouts',
-  created_at: '2026-10-19T00:00:00Z',
-  cellucid_data_version: '0.0.9',
-  stats: {
-    n_cells: CELL_COUNT,
-    n_genes: 0,
-    n_obs_fields: 0,
-    n_categorical_fields: 0,
-    n_continuous_fields: 0,
-    has_connectivity: false,
-    n_edges: null,
-  },
-  embeddings: {
-    default_dimension: 3,
-    defaults: {
-      '1d': 'layout_1d',
-      '2d': 'layout_2d',
-      '3d': 'layout_3d',
-    },
-    items: {
-      layout_1d: {
-        label: 'Layout 1D',
-        dimension: 1,
-        file: 'embeddings/0_1d.bin',
-        source: { key: null, columns: [0] },
-      },
-      layout_2d: {
-        label: 'Layout 2D',
-        dimension: 2,
-        file: 'embeddings/1_2d.bin',
-        source: { key: null, columns: [0, 1] },
-      },
-      layout_3d: {
-        label: 'Layout 3D',
-        dimension: 3,
-        file: 'embeddings/2_3d.bin',
-        source: { key: null, columns: [0, 1, 2] },
-      },
-    },
-  },
-  obs_fields: [],
-  export_settings: {
-    compression: null,
-    var_quantization: null,
-    obs_continuous_quantization: null,
-    obs_categorical_dtype: 'uint8',
-  },
-  source: { name: 'Cellucid browser CI' },
-};
-
-const obsManifest = {
-  _format: 'compact_v2',
-  n_points: CELL_COUNT,
-  centroid_outlier_quantile: null,
-  latent_key: null,
-  compression: null,
-  _obsSchemas: {},
-  _continuousFields: [],
-  _categoricalFields: [],
-};
-
-async function installFixture(page) {
-  const json = value => ({
-    body: Buffer.from(JSON.stringify(value)),
-    contentType: 'application/json; charset=utf-8',
-  });
-  const binary = values => ({
-    body: Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-    contentType: 'application/octet-stream',
-  });
-  const base = '/tests/browser/fixtures/generated-user-defined-centroids';
-  const responses = new Map([
-    [`${base}/datasets.json`, json(catalog)],
-    [`${base}/${DATASET_ID}/dataset_identity.json`, json(identity)],
-    [`${base}/${DATASET_ID}/obs_manifest.json`, json(obsManifest)],
-    [`${base}/${DATASET_ID}/embeddings/0_1d.bin`, binary(RAW[1])],
-    [`${base}/${DATASET_ID}/embeddings/1_2d.bin`, binary(RAW[2])],
-    [`${base}/${DATASET_ID}/embeddings/2_3d.bin`, binary(RAW[3])],
-  ]);
-  await page.route(`${ROOT}**`, async route => {
-    const pathname = new URL(route.request().url()).pathname;
-    const response = responses.get(pathname);
-    if (response === undefined) {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/plain; charset=utf-8',
-        body: `Unexpected fixture request: ${pathname}\n`,
-      });
-      return;
-    }
-    await route.fulfill({ status: 200, ...response });
+    description: 'Exact synthetic browser fixture with 1D, 2D and 3D layouts',
+    cells: CELL_COUNT,
+    obsm: Object.fromEntries([1, 2, 3].map(dimension => [
+      `X_umap_${dimension}d`,
+      { data: RAW[dimension], columns: dimension },
+    ])),
   });
 }
 
@@ -240,7 +143,7 @@ function observeErrors(page) {
 
 async function openDataset(page) {
   await page.goto(
-    `/?exportsBaseUrl=${encodeURIComponent(ROOT)}`
+    `/?sampleCatalog=${encodeURIComponent(ROOT)}`
       + `&dataset=${DATASET_ID}&acceptance=user-defined-centroids-ci`,
     { waitUntil: 'domcontentloaded' },
   );
@@ -353,7 +256,7 @@ test('a categorical from a selection keeps exact labels across dimensions and se
     const pages = selections.map(({ label, cells }) => {
       const highlightPage = state.createHighlightPage(label);
       state.switchToPage(highlightPage.id);
-      state.addHighlightDirect({ type: 'lasso', label, cellIndices: [...cells] });
+      state.addHighlightDirect({ type: 'lasso', label, cellIndices: Uint32Array.from(cells) });
       return { pageId: highlightPage.id, label };
     });
     state.createCategoricalFromPages({
@@ -381,9 +284,9 @@ test('a categorical from a selection keeps exact labels across dimensions and se
 
   const storedBefore = await readStoredCentroids(page);
   expect(Object.keys(storedBefore.byLayout))
-    .toEqual(['layout_1d', 'layout_2d', 'layout_3d']);
+    .toEqual(['X_umap_1d', 'X_umap_2d', 'X_umap_3d']);
   expect(storedBefore.normalized)
-    .toEqual(['layout_1d', 'layout_2d', 'layout_3d']);
+    .toEqual(['X_umap_1d', 'X_umap_2d', 'X_umap_3d']);
 
   const sessionPath = testInfo.outputPath('user-defined-centroids.cellucid-session');
   await saveSession(page, errors, sessionPath);
@@ -434,8 +337,8 @@ test('a categorical from a selection keeps exact labels across dimensions and se
   // the restored 3D layout on this fresh page), and they equal the ones the
   // field had before saving.
   expect(await readStoredCentroids(page)).toEqual({
-    byLayout: { layout_3d: storedBefore.byLayout.layout_3d },
-    normalized: ['layout_3d'],
+    byLayout: { X_umap_3d: storedBefore.byLayout.X_umap_3d },
+    normalized: ['X_umap_3d'],
   });
   for (const dimension of [3, 2, 1, 3]) {
     await switchDimension(page, dimension);

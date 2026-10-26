@@ -10,7 +10,7 @@
  * - LRU caching for fetched data
  * - Request deduplication (prevents duplicate fetches)
  * - Prefetching for likely next selections
- * - Bulk gene expression fetching with progress
+ * - Whole gene columns for computations (sparse entries or a loaded field)
  * - Page version tracking for cache correctness
  * - Worker integration for heavy computations
  * - Notification center integration for user feedback
@@ -19,21 +19,24 @@
  * This layer delegates all actual I/O to the core dataset loaders in
  * `cellucid/assets/js/data/data-loaders.js`, which cover:
  * - Points: `loadPointsBinary`
- * - Manifests: `loadObsManifest`, `loadVarManifest`, `loadConnectivityManifest`
+ * - Field lists and graph summary: `loadObsFields`, `loadGeneList`, `loadConnectivitySummary`
  * - Fields: `loadObsFieldData`, `loadVarFieldData`
  * - Graph edges: `loadEdges`
  * - Dataset identity: `loadDatasetIdentity` (+ embeddings metadata helpers)
  *
  * The Genes Panel feature relies specifically on:
  * - `ensureObsFieldLoaded()` → categorical obs codes/categories (grouping)
- * - `ensureGeneExpressionLoaded()` → per-gene per-cell Float32 arrays (streamed)
+ * - `readGeneColumn()` → one gene's sparse entries, or a loaded field's values (streamed)
+ * - `deliverGeneColumns()` / `deliverGeneCellSubset()` → genes read at the
+ *   source and delivered to the analysis workers over a gene route
+ *   (`data/gene-delivery.js`): their values never cross this thread
  *
  * @module data/data-layer
  */
 
 import { LRUCache } from '../shared/lru-cache.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { formatDuration } from '../../notification-center/formatters.js';
+import { SharedWork, abortReasonOf, throwIfAborted } from '../../jobs/cancellable-job.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import {
   isRestOfPageId,
@@ -51,20 +54,41 @@ import {
   createSlicedYield,
   waitForAvailableSlot
 } from '../shared/concurrency-utils.js';
-import { getPerformanceConfig } from '../shared/performance-config.js';
+import { formatDuration, formatCountOf } from '../../../utils/format-units.js';
+import { isCellList } from '../../utils/cell-set.js';
 
 // =============================================================================
-// BOUNDED PARALLEL LOADING
+// PARALLEL LOADING
 // =============================================================================
 //
-// Every field of an export is its own HTTP request, and the requests a single
-// analysis needs are independent of one another. Awaiting each one before
-// starting the next makes the wall clock the *sum* of the round trips instead
-// of the deepest one, which is the difference a user feels on a real link far
-// more than any kernel cost. `networkConcurrency` is the one place that number
-// is owned and justified (`shared/performance-config.js`), so every loader
-// here asks it rather than carrying a literal of its own.
+// The fields a single analysis needs are independent of one another, and the
+// AnnData reader reads those asked for together as one batch. Awaiting each
+// one before asking for the next makes the wall clock the *sum* of the round
+// trips on a remote file instead of the deepest one. Every field a request
+// needs is asked for at once: the reader's fetch scheduler holds the reads to
+// what the link carries (`backgroundConcurrency`, measured), which no number
+// here could know.
 
+
+/** An expression matrix (`X`, `raw`, `layer:<key>`) as results name it. */
+function matrixName(matrix) {
+  return matrix.startsWith('layer:') ? `layers['${matrix.slice('layer:'.length)}']` : matrix;
+}
+
+/**
+ * A gene an expression matrix does not have, refused by name: `code`
+ * `GENE_NOT_IN_MATRIX`, `gene` the key.
+ *
+ * @param {string} gene
+ * @param {string} label - The matrix as its choice names it
+ * @returns {RangeError}
+ */
+function geneNotInMatrixError(gene, label) {
+  const error = new RangeError(`${gene} is not a gene of ${label}`);
+  error.code = 'GENE_NOT_IN_MATRIX';
+  error.gene = gene;
+  return error;
+}
 
 /**
  * The categorical codes of an observation field, exactly as the field holds
@@ -91,13 +115,13 @@ function requireAnalysisCategoryCodes(codes, fieldKey) {
 }
 
 /**
- * Drop cells whose categorical value is missing (`null`) from single-variable
- * categorical page data, keeping `values`, `cellIndices` and `cellCount`
- * aligned. Missing values are excluded per variable: counts, percentages and
- * the categorical tests are computed over the cells that have a category.
- * A page with no missing cell is returned unchanged.
+ * Drop cells whose category is missing (the page's `missingCode`) from
+ * single-variable categorical page data, keeping `values`, `cellIndices` and
+ * `cellCount` aligned. Missing values are excluded per variable: counts,
+ * percentages and the categorical tests are computed over the cells that have
+ * a category. A page with no missing cell is returned unchanged.
  *
- * @param {Array<{values: Array, cellIndices: ArrayLike<number>, cellCount: number}>} pageData
+ * @param {Array<{values: Uint8Array|Uint16Array|Uint32Array, categories: string[], missingCode: number, cellIndices: ArrayLike<number>, cellCount: number}>} pageData
  * @returns {Array<Object>}
  */
 export function excludeMissingCategoricalValues(pageData) {
@@ -108,34 +132,41 @@ export function excludeMissingCategoricalValues(pageData) {
     if (
       page === null
       || typeof page !== 'object'
-      || !Array.isArray(page.values)
+      || !isCategoricalCodes(page.values)
+      || !Array.isArray(page.categories)
+      || !Number.isSafeInteger(page.missingCode)
       || page.cellIndices === null
       || typeof page.cellIndices !== 'object'
       || page.cellIndices.length !== page.values.length
     ) {
       throw new TypeError(
-        `Categorical page ${pageIndex + 1} requires aligned values and cellIndices`
+        `Categorical page ${pageIndex + 1} requires aligned codes, categories, ` +
+        'missingCode and cellIndices'
       );
     }
     const counts = categoryCounts(page.values);
-    if (!counts.has(null)) return page;
-    const values = [];
-    const cellIndices = [];
+    const missing = counts.get(null) ?? 0;
+    if (missing === 0) return page;
+    const kept = page.values.length - missing;
+    const values = new page.values.constructor(kept);
+    const cellIndices = new Uint32Array(kept);
+    let write = 0;
     for (let index = 0; index < page.values.length; index++) {
-      const value = page.values[index];
-      if (value === null) continue;
-      values.push(value);
-      cellIndices.push(page.cellIndices[index]);
+      const code = page.values[index];
+      if (code === page.missingCode) continue;
+      values[write] = code;
+      cellIndices[write] = page.cellIndices[index];
+      write++;
     }
     // The same counts without the missing label, in the same order.
-    const kept = new Map(counts);
-    kept.delete(null);
-    adoptCategoryCounts(values, kept);
+    const keptCounts = new Map(counts);
+    keptCounts.delete(null);
+    adoptCategoryCounts(values, keptCounts);
     return {
       ...page,
       values,
-      cellIndices: Uint32Array.from(cellIndices),
-      cellCount: values.length
+      cellIndices,
+      cellCount: kept
     };
   });
 }
@@ -189,17 +220,6 @@ function pageDataValueBytes(pageData) {
  */
 function arrayLikeBytes(values) {
   return ArrayBuffer.isView(values) ? values.byteLength : values.length * 8;
-}
-
-/** @returns {number} The configured ceiling on concurrent field requests. */
-function networkConcurrency() {
-  const configured = getPerformanceConfig().batch.networkConcurrency;
-  if (!Number.isSafeInteger(configured) || configured <= 0) {
-    throw new RangeError(
-      'PerformanceConfig networkConcurrency must be a positive integer'
-    );
-  }
-  return configured;
 }
 
 /**
@@ -327,7 +347,10 @@ function finalizeDigest(lanes) {
  * @property {number} groupCount
  * @property {Array} structure - Per group: the group, its contributing
  *   `cellIndices` array (null when disabled or absent), and that array's length
- * @property {number[]} indices - The exact, deduplicated, ascending union
+ * @property {number} count - How many cells the union holds
+ * @property {ArrayLike<number>} cells - The union as stored, for walking only
+ * @property {number[]} indices - The exact, deduplicated, ascending union,
+ *   built on first read
  * @property {string|null} digestName - Page name the digest was folded with
  * @property {string|null} digest - `pageId:digest`, or null until computed
  */
@@ -351,26 +374,39 @@ function isAscendingIndexList(list, total) {
 }
 
 /**
- * The deduplicated, ascending union of several cell-index lists.
+ * The deduplicated, ascending union of several cell-index lists, as its size
+ * now and its indices on first use.
  *
- * A single list that is already strictly ascending is copied as is — a
- * category highlight is exactly that. Several lists, or an unordered one, are
- * united through a dataset-sized membership mask scanned in index order, which
- * is linear and runs no comparator. Lists carrying anything other than safe
- * integers inside the dataset (a page left over from before a reload) keep
- * the general set-and-sort union, so they are reported exactly as before.
+ * A single list that is already strictly ascending is the union itself — a
+ * category highlight, a lasso, a host's selection all are — so its size is
+ * its length and its indices are copied into an array only when a reader asks
+ * for them: the page selectors ask for counts on every highlight change, and
+ * copying a 5,000,000-cell selection into an array for a count cost 85 ms of
+ * that change. Several lists, or an unordered one, are united through a
+ * dataset-sized membership mask scanned in index order, which is linear and
+ * runs no comparator. Lists carrying anything other than safe integers inside
+ * the dataset (a page left over from before a reload) keep the general
+ * set-and-sort union, so they are reported exactly as before.
  *
  * @param {ArrayLike<number>[]} lists
  * @param {number|undefined} pointCount
- * @returns {number[]}
+ * @returns {{count: number, cells: ArrayLike<number>, indices: () => number[]}}
+ *   `cells`: the union as stored (the one list itself, uncopied), for readers
+ *   that only walk it (the page digest)
  */
-function collectSortedUnion(lists, pointCount) {
-  if (lists.length === 0) return [];
+function sortedUnionOf(lists, pointCount) {
+  if (lists.length === 0) return { count: 0, cells: [], indices: () => [] };
   const total = Number.isSafeInteger(pointCount) && pointCount > 0
     ? pointCount
     : 0;
-  if (lists.length === 1 && isAscendingIndexList(lists[0], total)) {
-    return Array.from(lists[0]);
+  const single = lists.length === 1 ? lists[0] : null;
+  if (
+    single !== null &&
+    // A Uint32Array is one of integers: a cell list is proven once
+    // (`isCellList`), not walked again on every highlight change.
+    (single instanceof Uint32Array ? isCellList(single, total) : isAscendingIndexList(single, total))
+  ) {
+    return { count: single.length, cells: single, indices: () => Array.from(single) };
   }
 
   const mask = new Uint8Array(total);
@@ -381,7 +417,8 @@ function collectSortedUnion(lists, pointCount) {
       if (!Number.isSafeInteger(index) || index < 0 || index >= total) {
         const union = new Set();
         for (const each of lists) for (const value of each) union.add(value);
-        return Array.from(union).sort((a, b) => a - b);
+        const sorted = Array.from(union).sort((a, b) => a - b);
+        return { count: sorted.length, cells: sorted, indices: () => sorted };
       }
       if (mask[index] === 0) {
         mask[index] = 1;
@@ -395,7 +432,7 @@ function collectSortedUnion(lists, pointCount) {
   for (let index = 0; union.length < count; index++) {
     if (mask[index] !== 0) union.push(index);
   }
-  return union;
+  return { count, cells: union, indices: () => union };
 }
 
 /**
@@ -491,8 +528,6 @@ export function computeCategoryGroupingDigest(codes) {
  * @property {boolean} [enablePrefetch=false] - Enable prefetching
  * @property {boolean} [enableVersionTracking=true] - Track page versions for cache correctness
  * @property {boolean} [enableNotifications=true] - Show notifications for long operations
- * @property {number} [bulkCacheMaxAge=300000] - Bulk gene cache max age (5 minutes default)
- * @property {number} [bulkCacheMaxSize=5] - Maximum bulk cache entries
  */
 
 /**
@@ -518,7 +553,6 @@ export function computeCategoryGroupingDigest(codes) {
 /**
  * @typedef {Object} CacheStats
  * @property {Object} dataCache - Data cache statistics
- * @property {Object} bulkGeneCache - Bulk gene cache statistics
  * @property {number} pendingRequests - Number of pending requests
  * @property {number} prefetchQueue - Size of prefetch queue
  */
@@ -550,6 +584,84 @@ export function computeCategoryGroupingDigest(codes) {
  *   enablePrefetch: true
  * });
  */
+/**
+ * The variable record of one gene field.
+ *
+ * @param {Object} field
+ * @param {number} index - The field's position in `varData.fields`
+ */
+function categoricalVariableInfo(field, index) {
+  return {
+    key: field.key,
+    name: field.key,
+    kind: 'category',
+    // Null until loaded for a column whose categories are found when
+    // it is first read (a direct AnnData string or boolean column).
+    categories: field.categories ?? null,
+    categoryCount: field.categories === null ? null : (field.categories || []).length,
+    loaded: field.loaded || false,
+    _fieldIndex: index
+  };
+}
+
+function continuousVariableInfo(field, index) {
+  const stats = field._continuousStats || {};
+  return {
+    key: field.key,
+    name: field.key,
+    kind: 'continuous',
+    min: stats.min ?? null,
+    max: stats.max ?? null,
+    mean: stats.mean ?? null,
+    loaded: field.loaded || false,
+    _fieldIndex: index
+  };
+}
+
+function geneVariableInfo(field, index) {
+  const stats = field._continuousStats || {};
+  return {
+    key: field.key,
+    name: field.key,
+    kind: 'continuous',
+    min: stats.min ?? 0,
+    max: stats.max ?? null,
+    mean: stats.mean ?? null,
+    loaded: field.loaded || false,
+    _fieldIndex: index,
+    _isGene: true
+  };
+}
+
+/**
+ * Index sets already checked against a field length: an index array and the
+ * largest length it was found inside.
+ * @type {WeakMap<ArrayLike<number>, number>}
+ */
+const indicesCheckedWithin = new WeakMap();
+
+/**
+ * Throw unless every index is a non-negative integer below `length`; an
+ * index set checked once is not walked again for a field at least as long.
+ *
+ * @param {ArrayLike<number>} indices
+ * @param {number} length
+ * @param {string} variableKey
+ */
+function requireIndicesWithin(indices, length, variableKey) {
+  const checked = indicesCheckedWithin.get(indices);
+  if (checked !== undefined && checked <= length) return;
+  for (let i = 0; i < indices.length; i++) {
+    const idx = indices[i];
+    if (!Number.isSafeInteger(idx) || idx < 0 || idx >= length) {
+      throw new RangeError(
+        `Cell index ${String(idx)} is outside field "${variableKey}" length ${length}`
+      );
+    }
+  }
+  if (typeof indices === 'object' && indices !== null) indicesCheckedWithin.set(indices, length);
+}
+
 export class DataLayer {
   /**
    * Create a new DataLayer instance
@@ -566,9 +678,7 @@ export class DataLayer {
       enableDedup = true,
       enablePrefetch = false,
       enableVersionTracking = true,
-      enableNotifications = true,
-      bulkCacheMaxAge = 5 * 60 * 1000, // 5 minutes
-      bulkCacheMaxSize = 5
+      enableNotifications = true
     } = options;
 
     /** @type {Object} Reference to DataState */
@@ -583,9 +693,7 @@ export class DataLayer {
       enableDedup,
       enablePrefetch,
       enableVersionTracking,
-      enableNotifications,
-      bulkCacheMaxAge,
-      bulkCacheMaxSize
+      enableNotifications
     };
 
     // Simple variable cache (for variable info lookups)
@@ -618,20 +726,18 @@ export class DataLayer {
     this._datasetGeneration = 0;
     this._cacheGeneration = 0;
     this._fieldLoadLifecycle = new AbortController();
+    /**
+     * The expression matrices other than the mapped one an analysis has read
+     * this generation (`_openMatrix`), by matrix and gene-name source.
+     * @type {Map<string, Promise<{handle: Object, indexOf: Map<string, number>, keys: string[]}>>}
+     */
+    this._matrixHandles = new Map();
     this._destroyed = false;
     this._destroyPromise = null;
 
     // Prefetch queue
     this._prefetchQueue = [];
     this._prefetchTimeout = null;
-
-    // Bulk gene data cache (separate due to size)
-    this._bulkGeneCache = new Map();
-    this._bulkGeneCacheMaxAge = bulkCacheMaxAge;
-    this._bulkGeneCacheMaxSize = bulkCacheMaxSize;
-    this._bulkGeneCacheAccessOrder = [];
-    this._bulkGeneCacheGeneration = 0;
-    this._bulkGeneCacheReplacementOwner = null;
 
     // Page version tracking for cache correctness
     this._pageVersions = enableVersionTracking ? new Map() : null;
@@ -674,39 +780,56 @@ export class DataLayer {
   // ===========================================================================
 
   /**
-   * Build (or reuse) a geneKey -> var fieldIndex map.
+   * A key -> field index lookup over `fields`, kept until a lookup finds it
+   * out of date: an answer is checked against the field it names, and a key
+   * that is absent or names another field (a field added, renamed or
+   * replaced since) rebuilds the index once before answering.
+   *
+   * @param {() => Array<{key?: string}>} fieldsOf
+   * @returns {{get: (key: string) => number|undefined}}
    * @private
    */
-  _getGeneFieldIndexMap() {
-    if (this._geneFieldIndexByKey) return this._geneFieldIndexByKey;
-    const fields = this.state?.varData?.fields || [];
-    const map = new Map();
-    for (let i = 0; i < fields.length; i++) {
-      const key = fields[i]?.key;
-      if (typeof key === 'string' && key.length > 0) {
-        map.set(key, i);
+  _createFieldIndexLookup(fieldsOf) {
+    let map = null;
+    let indexedFields = null;
+    const build = fields => {
+      map = new Map();
+      for (let i = 0; i < fields.length; i++) {
+        const key = fields[i]?.key;
+        if (typeof key === 'string' && key.length > 0) map.set(key, i);
       }
-    }
-    this._geneFieldIndexByKey = map;
-    return map;
+      indexedFields = fields;
+    };
+    return {
+      get(key) {
+        const fields = fieldsOf() || [];
+        if (map === null || indexedFields !== fields) build(fields);
+        let index = map.get(key);
+        if (index === undefined || fields[index]?.key !== key) {
+          build(fields);
+          index = map.get(key);
+        }
+        return index;
+      }
+    };
   }
 
   /**
-   * Build (or reuse) an obsKey -> obs fieldIndex map.
+   * The geneKey -> var fieldIndex lookup.
+   * @private
+   */
+  _getGeneFieldIndexMap() {
+    this._geneFieldIndexByKey ??= this._createFieldIndexLookup(() => this.state?.varData?.fields);
+    return this._geneFieldIndexByKey;
+  }
+
+  /**
+   * The obsKey -> obs fieldIndex lookup.
    * @private
    */
   _getObsFieldIndexMap() {
-    if (this._obsFieldIndexByKey) return this._obsFieldIndexByKey;
-    const fields = this.state?.obsData?.fields || [];
-    const map = new Map();
-    for (let i = 0; i < fields.length; i++) {
-      const key = fields[i]?.key;
-      if (typeof key === 'string' && key.length > 0) {
-        map.set(key, i);
-      }
-    }
-    this._obsFieldIndexByKey = map;
-    return map;
+    this._obsFieldIndexByKey ??= this._createFieldIndexLookup(() => this.state?.obsData?.fields);
+    return this._obsFieldIndexByKey;
   }
 
   /**
@@ -717,11 +840,6 @@ export class DataLayer {
   _handleMemoryCleanup() {
     const beforeMemory = this.estimateMemoryUsage();
     this._cacheGeneration += 1;
-    this._bulkGeneCacheGeneration += 1;
-
-    // Clear bulk gene cache first (largest memory consumer)
-    this._bulkGeneCache.clear();
-    this._bulkGeneCacheAccessOrder = [];
     // A retained index set is per page rather than per cached entry, so it is
     // small — but after a prune it can be the only thing still holding one.
     this._pageIndexSnapshots.clear();
@@ -799,17 +917,7 @@ export class DataLayer {
     const results = [];
     for (let i = 0; i < obsData.fields.length; i++) {
       const field = obsData.fields[i];
-      if (field.kind === 'category') {
-        results.push({
-          key: field.key,
-          name: field.key,
-          kind: 'category',
-          categories: field.categories || [],
-          categoryCount: (field.categories || []).length,
-          loaded: field.loaded || false,
-          _fieldIndex: i
-        });
-      }
+      if (field.kind === 'category') results.push(categoricalVariableInfo(field, i));
     }
     return results;
   }
@@ -826,19 +934,7 @@ export class DataLayer {
     const results = [];
     for (let i = 0; i < obsData.fields.length; i++) {
       const field = obsData.fields[i];
-      if (field.kind === 'continuous') {
-        const stats = field._continuousStats || {};
-        results.push({
-          key: field.key,
-          name: field.key,
-          kind: 'continuous',
-          min: stats.min ?? null,
-          max: stats.max ?? null,
-          mean: stats.mean ?? null,
-          loaded: field.loaded || false,
-          _fieldIndex: i
-        });
-      }
+      if (field.kind === 'continuous') results.push(continuousVariableInfo(field, i));
     }
     return results;
   }
@@ -852,20 +948,7 @@ export class DataLayer {
     const varData = this.state.varData;
     if (!varData || !varData.fields) return [];
 
-    return varData.fields.map((field, index) => {
-      const stats = field._continuousStats || {};
-      return {
-        key: field.key,
-        name: field.key,
-        kind: 'continuous',
-        min: stats.min ?? 0,
-        max: stats.max ?? null,
-        mean: stats.mean ?? null,
-        loaded: field.loaded || false,
-        _fieldIndex: index,
-        _isGene: true
-      };
-    });
+    return varData.fields.map(geneVariableInfo);
   }
 
   /**
@@ -879,8 +962,24 @@ export class DataLayer {
    * const geneInfo = dataLayer.getVariableInfo('gene_expression', 'BRCA1');
    */
   getVariableInfo(type, key) {
-    const variables = this.getAvailableVariables(type);
-    return variables.find(v => v.key === key) || null;
+    if (type === 'gene_expression') {
+      // One gene's record, found through the key index: describing every gene
+      // of an 8,192-gene panel to read one cost a record per gene per read.
+      const index = this._getGeneFieldIndexMap().get(key);
+      const field = index === undefined ? undefined : this.state.varData?.fields?.[index];
+      return field === undefined ? null : geneVariableInfo(field, index);
+    }
+    if (type !== 'categorical_obs' && type !== 'continuous_obs') {
+      throw new TypeError(`Unknown variable type: ${String(type)}`);
+    }
+    // One field's record, found through the key index.
+    const index = this._getObsFieldIndexMap().get(key);
+    const field = index === undefined ? undefined : this.state.obsData?.fields?.[index];
+    if (field === undefined) return null;
+    if (type === 'categorical_obs') {
+      return field.kind === 'category' ? categoricalVariableInfo(field, index) : null;
+    }
+    return field.kind === 'continuous' ? continuousVariableInfo(field, index) : null;
   }
 
   // ===========================================================================
@@ -994,7 +1093,7 @@ export class DataLayer {
     const page = this.getPages().find(p => p.id === pageId);
     if (!page) return 0;
 
-    return this._getPageMembership(page).indices.length;
+    return this._getPageMembership(page).count;
   }
 
   /**
@@ -1120,12 +1219,20 @@ export class DataLayer {
       );
       if (active !== null) lists.push(active);
     }
+    const union = sortedUnionOf(lists, this.state?.pointCount);
+    let indices = null;
     const record = {
       page,
       groups,
       groupCount: groups.length,
       structure,
-      indices: collectSortedUnion(lists, this.state?.pointCount),
+      count: union.count,
+      cells: union.cells,
+      // Materialised on first read and kept: a count or a digest never builds it.
+      get indices() {
+        indices ??= union.indices();
+        return indices;
+      },
       digestName: null,
       digest: null,
     };
@@ -1150,11 +1257,20 @@ export class DataLayer {
    * @param {string} source - 'obs' or 'var'
    * @param {Object} [options] - Options
    * @param {boolean} [options.silent=true] - Suppress per-field notifications
+   * @param {AbortSignal|null} [options.signal=null] - Ends this caller's lease
+   * @param {'high'|'normal'|'bulk'|'low'} [options.priority='normal']
+   * @param {string|null} [options.owner=null] - The job a gene load it starts
+   *   is read for
    * @returns {Promise<void>}
    * @private
    */
   async _ensureFieldLoaded(field, fieldIndex, source, options = {}) {
-    const { silent = true, signal: callerSignal = null, priority = 'normal' } = options;
+    const {
+      silent = true,
+      signal: callerSignal = null,
+      priority = 'normal',
+      owner = null
+    } = options;
     const datasetGeneration = this._datasetGeneration;
     const lifecycle = this._fieldLoadLifecycle;
     if (!(lifecycle instanceof AbortController)) {
@@ -1204,7 +1320,8 @@ export class DataLayer {
       await this.state.ensureVarFieldLoaded(fieldIndex, {
         signal: loadSignal,
         silent,
-        priority
+        priority,
+        owner
       });
       this._requireCurrentDatasetGeneration(datasetGeneration);
       if (
@@ -1277,24 +1394,514 @@ export class DataLayer {
   }
 
   /**
-   * Download a gene's payload ahead of decoding it (see
-   * DataState.prefetchVarFieldPayload): a long run keeps its next genes'
-   * requests in flight without holding their decoded values.
+   * One gene's values for a computation, in the cheaper of two forms, never
+   * installed in field state: the field's own dense array when it is already
+   * loaded (a gene a view shows, a user-defined copy) -- shared, so read it
+   * only -- else its non-zero entries `{length, indices, values}` read from
+   * the source, owned by the caller (`DataState.readVarSparseColumn`). The
+   * analysis kernels take either (`compute/gene-statistics.js`).
+   *
+   * `owner` is the job the read is for (`app/jobs/cancellable-job.js`).
+   *
+   * `matrix` is an analysis's "Expression matrix" (`getExpressionMatrices`):
+   * `mapped` (the one shown), or another matrix of the file, whose genes are
+   * named on its own axis (`getGeneKeys`) and always read from the source; a
+   * gene that matrix lacks is refused by name (`GENE_NOT_IN_MATRIX`).
    *
    * @param {string} geneKey
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<{kept: boolean, byteLength: number, budget: number}|{resident: true}|null>}
+   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null, matrix?: string}} [options]
+   * @returns {Promise<{fieldIndex: number, values: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, owned: boolean}>}
    */
-  async prefetchGenePayload(geneKey, options = {}) {
+  async readGeneColumn(geneKey, options = {}) {
+    const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Gene read signal must be an AbortSignal or null');
+    }
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    if (expression !== null) {
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const gene = opened.indexOf.get(geneKey);
+      if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+      const sample = await this.state.readMatrixSparseColumn(opened.handle, gene, {
+        priority,
+        owner,
+        signal: signal === null
+          ? this._fieldLoadLifecycle.signal
+          : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      return { fieldIndex: gene, values: sample, owned: true };
+    }
+    const fields = this.state.varData?.fields;
+    if (!fields) {
+      throw new Error('[DataLayer] No var fields available (gene expression disabled)');
+    }
     const fieldIndex = this._getGeneFieldIndexMap().get(geneKey);
     if (typeof fieldIndex !== 'number') {
       throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
     }
+    const field = fields[fieldIndex];
+    if (!field) {
+      throw new Error(`[DataLayer] Var field not found for gene: ${geneKey}`);
+    }
+    if (field.loaded && field.values) {
+      return { fieldIndex, values: field.values, owned: false };
+    }
+    const sample = typeof this.state.readVarSparseColumn === 'function'
+      ? await this.state.readVarSparseColumn(fieldIndex, {
+        priority,
+        owner,
+        signal: signal === null
+          ? this._fieldLoadLifecycle.signal
+          : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+      })
+      : null;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    if (sample !== null) return { fieldIndex, values: sample, owned: true };
+    // No source to read entries from (a field with no payload of its own):
+    // its values are loaded into field state, and let go of again unless
+    // something else had them loaded, so the caller then owns them.
+    const loaded = await this.ensureGeneExpressionLoaded(geneKey, { silent: true, signal, priority });
+    const released = !loaded.wasLoaded && this.unloadGeneExpression(geneKey, { preserveActive: true });
+    if (released) this.invalidateVariable('gene_expression', geneKey);
+    return { fieldIndex, values: loaded.values, owned: released };
+  }
+
+  /**
+   * The expression matrices an analysis can read its genes from (its
+   * "Expression matrix" option): `mapped`, the matrix the Data mapping shows
+   * (named in its label), then every other usable matrix of the file (`X`,
+   * each layer, `raw`). `reason` says why only the mapped one is listed: the
+   * dataset cannot change its expression matrix, or has no expression matrix.
+   *
+   * @returns {{choices: Array<{value: string, label: string}>, reason: string|null}}
+   */
+  getExpressionMatrices() {
+    const mapping = this.state.getDataMapping?.() ?? null;
+    const mapped = mapping?.expression ?? null;
+    const menu = mapped === null ? null : (this.state.getMappingGroupChoices?.('expression') ?? null);
+    const choices = [{ value: 'mapped', label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped)})` }];
+    if (menu === null) {
+      return {
+        choices,
+        reason: mapped === null ? 'This dataset has no expression matrix.' : 'This dataset reads only its mapped expression matrix.'
+      };
+    }
+    for (const choice of menu) {
+      if (choice.value !== null && choice.value !== mapped && choice.usable) {
+        choices.push({ value: choice.value, label: choice.label });
+      }
+    }
+    return { choices, reason: null };
+  }
+
+  /**
+   * What one "Expression matrix" value reads: `matrix` the matrix it names
+   * (`X`, `raw`, `layer:<key>`; the mapping's for `mapped`), `read` null when
+   * that is the mapped matrix (read through the shown gene list) else the
+   * matrix, and its short `label` (`Mapped (X)`, `raw`, `layers['counts']`).
+   *
+   * @param {string} matrix
+   * @returns {{matrix: string|null, read: string|null, label: string}}
+   */
+  resolveExpressionMatrix(matrix) {
+    const mapped = this.state.getDataMapping?.()?.expression ?? null;
+    const { choices } = this.getExpressionMatrices();
+    if (matrix === 'mapped' || matrix === mapped) {
+      return { matrix: mapped, read: null, label: choices[0].label };
+    }
+    const choice = choices.find(entry => entry.value === matrix);
+    if (choice === undefined) {
+      throw new RangeError(`This dataset has no expression matrix ${String(matrix)} to read`);
+    }
+    return { matrix, read: matrix, label: matrixName(matrix) };
+  }
+
+  /**
+   * The gene keys of one "Expression matrix", in its order: the shown genes
+   * for the mapped one, else that matrix's genes on its own axis.
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {Promise<string[]>}
+   */
+  async getGeneKeys(matrix = 'mapped') {
+    const expression = this.resolveExpressionMatrix(matrix).read;
+    if (expression === null) return this.getAvailableVariables('gene_expression').map(gene => gene.key);
+    return (await this._openMatrix(expression)).keys;
+  }
+
+  /**
+   * A matrix other than the mapped one, opened once per generation and gene
+   * name source (`DataState.openExpressionMatrix`).
+   * @private
+   */
+  _openMatrix(expression) {
+    const geneNames = this.state.getDataMapping?.()?.geneNames ?? 'index';
+    const key = JSON.stringify([this._datasetGeneration, expression, geneNames]);
+    let opened = this._matrixHandles.get(key);
+    if (opened === undefined) {
+      const label = this.resolveExpressionMatrix(expression).label;
+      opened = this.state.openExpressionMatrix(expression).then(handle => {
+        const keys = handle.fields.map(field => field.key);
+        return { handle, label, keys, indexOf: new Map(keys.map((gene, index) => [gene, index])) };
+      });
+      opened.catch(() => this._matrixHandles.delete(key));
+      this._matrixHandles.set(key, opened);
+    }
+    return opened;
+  }
+
+  /**
+   * The load the data layer reads from: it changes whenever the dataset (or
+   * its expression mapping) is replaced, so what was computed from one load
+   * is never served for another (`shared/gene-moments-cache.js`).
+   * @returns {number}
+   */
+  getDatasetGeneration() {
+    return this._datasetGeneration;
+  }
+
+  /**
+   * The cells the active view shows (its filters applied), one byte a cell:
+   * 1 shown, 0 hidden. A copy: an analysis scoped to the visible cells keeps
+   * the cells it started with whatever the filters do next.
+   *
+   * @returns {Uint8Array}
+   */
+  getVisibleCellMask() {
+    const pointCount = this.state?.pointCount;
+    const visibility = this.state?.categoryTransparency;
+    if (!(visibility instanceof Uint8Array) || visibility.length !== pointCount) {
+      throw new Error('The view has no visibility of every cell to scope an analysis by');
+    }
+    return visibility.slice();
+  }
+
+  /**
+   * The open dataset's link as the reader measured it
+   * (`{latencyMs, bytesPerMs, backgroundConcurrency, protocol}`), or null
+   * before a measurement or when the source reports none. A run's tuner
+   * sizes its read-ahead by it (`shared/run-tuner.js`).
+   *
+   * @returns {{latencyMs: number, bytesPerMs: number, backgroundConcurrency: number, protocol: string|null}|null}
+   */
+  linkMeasurement() {
+    const measure = this.state?.varFieldLoader?.linkMeasurement;
+    return typeof measure === 'function' ? (measure() ?? null) : null;
+  }
+
+  /**
+   * Some genes' values in some cells, read by cell or by gene, whichever
+   * costs less (see DataState.readVarCellSubset); null when the source
+   * cannot.
+   *
+   * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
+   * @param {ArrayLike<number>} cellIndices - Distinct cell positions
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options] -
+   *   `owner`: the job the read is for; `matrix` as `readGeneColumn`
+   * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
+   */
+  async readGeneCellSubset(geneKeys, cellIndices, options = {}) {
+    const matrix = options.matrix ?? 'mapped';
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    if (expression !== null) {
+      const datasetGeneration = this._datasetGeneration;
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const genes = geneKeys.map(geneKey => {
+        const gene = opened.indexOf.get(geneKey);
+        if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+        return gene;
+      });
+      const signal = options.signal ?? null;
+      const block = await this.state.readMatrixCellSubset(opened.handle, genes, cellIndices, {
+        owner: options.owner ?? null,
+        signal: signal === null
+          ? this._fieldLoadLifecycle.signal
+          : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      return block;
+    }
+    if (typeof this.state.readVarCellSubset !== 'function') return null;
+    const indexOf = this._getGeneFieldIndexMap();
+    const fieldIndices = geneKeys.map(geneKey => {
+      const fieldIndex = indexOf.get(geneKey);
+      if (typeof fieldIndex !== 'number') {
+        throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+      }
+      return fieldIndex;
+    });
     const signal = options.signal ?? null;
-    return this.state.prefetchVarFieldPayload(fieldIndex, {
+    return this.state.readVarCellSubset(fieldIndices, cellIndices, {
+      owner: options.owner ?? null,
       signal: signal === null
         ? this._fieldLoadLifecycle.signal
         : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
+    });
+  }
+
+  /**
+   * Whether this dataset's genes can be delivered to analysis workers over a
+   * gene route (`data/gene-delivery.js`, `analysis/data/gene-route.js`): an
+   * analysis that computes in its workers then reads them there, and their
+   * values never cross this thread.
+   *
+   * @returns {boolean}
+   */
+  deliversGenes() {
+    return typeof this.state?.deliversGenes === 'function' && this.state.deliversGenes();
+  }
+
+  /**
+   * Whether gene `geneKey` of `matrix` is read from the source, and so can be
+   * delivered: every gene of another matrix is; a gene of the mapped one is
+   * unless it is a user-defined copy, whose values only this thread holds.
+   *
+   * @param {string} geneKey
+   * @param {string} [matrix='mapped']
+   * @returns {boolean}
+   */
+  isGeneDeliverable(geneKey, matrix = 'mapped') {
+    if (matrix !== 'mapped' && this.resolveExpressionMatrix(matrix).read !== null) return true;
+    const fieldIndex = this._getGeneFieldIndexMap().get(geneKey);
+    if (typeof fieldIndex !== 'number') {
+      throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+    }
+    return this.state.isVarFieldDeliverable(fieldIndex);
+  }
+
+  /**
+   * Open gene route `id` in the dataset's reader (`gene-route.js`).
+   *
+   * @param {string} id
+   * @param {MessagePort[]} ports - The reader's ends, one per analysis worker
+   * @returns {Promise<void>}
+   */
+  openGeneRoute(id, ports) {
+    return this.state.openGeneRoute(id, ports);
+  }
+
+  /**
+   * The new port of route `id`'s worker `worker`, which the pool replaced.
+   *
+   * @returns {Promise<void>}
+   */
+  replaceGeneRoutePort(id, worker, port, generation) {
+    return this.state.replaceGeneRoutePort(id, worker, port, generation);
+  }
+
+  /**
+   * Let route `id` go.
+   *
+   * @param {string} id
+   * @returns {Promise<void>}
+   */
+  closeGeneRoute(id) {
+    return this.state.closeGeneRoute(id);
+  }
+
+  /**
+   * Some genes' non-zero entries, read at the source and delivered to the
+   * analysis workers `delivery` names (`data/gene-delivery.js`); what
+   * returns here is only each gene's bytes. Every gene must be deliverable
+   * (`isGeneDeliverable`).
+   *
+   * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
+   * @param {Object} delivery
+   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null, matrix?: string}} [options]
+   * @returns {Promise<{bytes: number[]}>}
+   */
+  async deliverGeneColumns(geneKeys, delivery, options = {}) {
+    const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Gene delivery signal must be an AbortSignal or null');
+    }
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const readSignal = signal === null
+      ? this._fieldLoadLifecycle.signal
+      : AbortSignal.any([this._fieldLoadLifecycle.signal, signal]);
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    let delivered;
+    if (expression !== null) {
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const genes = geneKeys.map(geneKey => {
+        const gene = opened.indexOf.get(geneKey);
+        if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+        return gene;
+      });
+      delivered = await this.state.deliverMatrixSparseColumns(opened.handle, genes, delivery, { priority, owner, signal: readSignal });
+    } else {
+      const indexOf = this._getGeneFieldIndexMap();
+      const fieldIndices = geneKeys.map(geneKey => {
+        const fieldIndex = indexOf.get(geneKey);
+        if (typeof fieldIndex !== 'number') throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+        return fieldIndex;
+      });
+      delivered = await this.state.deliverVarSparseColumns(fieldIndices, delivery, { priority, owner, signal: readSignal });
+    }
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    return delivered;
+  }
+
+  /**
+   * Some genes in some cells (`readGeneCellSubset`), each run of genes
+   * delivered to the analysis worker `delivery` names; what returns is the
+   * block's bytes. Every gene must be deliverable.
+   *
+   * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
+   * @param {ArrayLike<number>} cellIndices - Distinct cell positions
+   * @param {Object} delivery
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options]
+   * @returns {Promise<{bytes: number}>}
+   */
+  async deliverGeneCellSubset(geneKeys, cellIndices, delivery, options = {}) {
+    const { signal = null, owner = null, matrix = 'mapped' } = options;
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const readSignal = signal === null
+      ? this._fieldLoadLifecycle.signal
+      : AbortSignal.any([this._fieldLoadLifecycle.signal, signal]);
+    const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
+    let delivered;
+    if (expression !== null) {
+      const opened = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const genes = geneKeys.map(geneKey => {
+        const gene = opened.indexOf.get(geneKey);
+        if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
+        return gene;
+      });
+      delivered = await this.state.deliverMatrixCellSubset(opened.handle, genes, cellIndices, delivery, { owner, signal: readSignal });
+    } else {
+      const indexOf = this._getGeneFieldIndexMap();
+      const fieldIndices = geneKeys.map(geneKey => {
+        const fieldIndex = indexOf.get(geneKey);
+        if (typeof fieldIndex !== 'number') throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+        return fieldIndex;
+      });
+      delivered = await this.state.deliverVarCellSubset(fieldIndices, cellIndices, delivery, { owner, signal: readSignal });
+    }
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    return delivered;
+  }
+
+  /**
+   * Whole gene columns for a computation, in gene order: each the cheaper form
+   * `readGeneColumn` gives (a loaded field's shared dense array -- read it
+   * only -- or the gene's sparse entries). Every gene is asked for at once;
+   * the reader's fetch scheduler paces them. `signal` stops the reads in flight and rejects with its
+   * `AbortError`; `owner` is the job they are for. A request that stops
+   * being current is refused at its next step; one that registers an
+   * invalidation cleanup also aborts the reads in flight the moment it is
+   * invalidated.
+   *
+   * @param {string[]} geneKeys
+   * @param {{isCurrent?: () => boolean, registerInvalidationCleanup?: (cleanup: () => void) => void, priority?: 'high'|'normal'|'bulk'|'low', signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options]
+   * @returns {Promise<Array<ArrayLike<number>|{length: number, indices: Uint32Array, values: Float32Array}>>}
+   */
+  async readGeneColumns(geneKeys, options = {}) {
+    if (!Array.isArray(geneKeys)) {
+      throw new TypeError('Gene column keys must be an array');
+    }
+    const {
+      isCurrent,
+      registerInvalidationCleanup,
+      priority = 'normal',
+      signal = null,
+      owner: readOwner = null,
+      matrix = 'mapped'
+    } = options;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Gene column signal must be an AbortSignal or null');
+    }
+    if (isCurrent !== undefined && typeof isCurrent !== 'function') {
+      throw new TypeError('Gene column isCurrent must be a function when provided');
+    }
+    if (
+      registerInvalidationCleanup !== undefined &&
+      typeof registerInvalidationCleanup !== 'function'
+    ) {
+      throw new TypeError('Gene column registerInvalidationCleanup must be a function when provided');
+    }
+    const datasetGeneration = this._datasetGeneration;
+    const owner = new AbortController();
+    registerInvalidationCleanup?.(() => owner.abort());
+    const stopReads = () => owner.abort(abortReasonOf(signal));
+    signal?.addEventListener('abort', stopReads, { once: true });
+    const requireCurrent = () => {
+      throwIfAborted(signal);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (owner.signal.aborted || (isCurrent !== undefined && !isCurrent())) {
+        throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+      }
+    };
+    requireCurrent();
+    const columns = new Array(geneKeys.length);
+    const inFlight = new Set();
+    const tasks = [];
+    const maxInFlight = Math.max(1, geneKeys.length);
+    for (let index = 0; index < geneKeys.length; index++) {
+      await waitForAvailableSlot(inFlight, maxInFlight);
+      requireCurrent();
+      const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix })
+        .then(({ values }) => {
+          columns[index] = values;
+        });
+      tasks.push(task);
+      trackSettlement(inFlight, task);
+    }
+    try {
+      await Promise.all(tasks);
+    } catch (error) {
+      // Whether the request still owned its reads is decided before this
+      // catch stops the others: aborting `owner` here is the read failure's
+      // own cleanup, not an ownership change, and must not hide the failure.
+      const lostOwnership = owner.signal.aborted || (isCurrent !== undefined && !isCurrent());
+      owner.abort();
+      await Promise.allSettled(tasks);
+      throwIfAborted(signal);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (lostOwnership) {
+        throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+      }
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', stopReads);
+    }
+    requireCurrent();
+    return columns;
+  }
+
+  /**
+   * The exact cells of pages, as the snapshots page data is read with: each
+   * page's distinct cell indices in ascending order (shared: read only).
+   *
+   * @param {string[]} pageIds
+   * @returns {Array<{pageId: string, pageName: string, cellIndices: ArrayLike<number>}>}
+   */
+  getPageCells(pageIds) {
+    if (!Array.isArray(pageIds)) {
+      throw new TypeError('Page cell IDs must be an array');
+    }
+    this.refreshPageVersions(
+      Array.from(new Set(pageIds)).filter(id => !isRestOfPageId(id))
+    );
+    return pageIds.map(pageId => {
+      const pageInfo = this.getPageInfo(pageId);
+      if (!pageInfo) {
+        throw new Error(`Page not found: ${pageId}`);
+      }
+      return {
+        pageId,
+        pageName: pageInfo.name,
+        cellIndices: this._getVersionedCellIndices(pageId)
+      };
     });
   }
 
@@ -1321,12 +1928,14 @@ export class DataLayer {
    * @param {string} obsKey - Observation field key (e.g., 'cell_type')
    * @param {Object} [options]
    * @param {boolean} [options.silent=true] - Suppress notifications
+   * @param {AbortSignal|null} [options.signal=null] - Ends this caller's wait
+   *   (the load goes on for other callers)
    * @returns {Promise<{ fieldIndex: number, kind: string, codes?: Uint8Array|Uint16Array|Uint32Array, categories?: string[], values?: Float32Array, colors?: Object }>}
    *   Categorical codes are the field's own array, at its own width (read its
    *   missing code with `missingCategoryCode`); callers must not modify it.
    */
   async ensureObsFieldLoaded(obsKey, options = {}) {
-    const { silent = true } = options;
+    const { silent = true, signal = null } = options;
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
 
@@ -1341,7 +1950,7 @@ export class DataLayer {
     }
 
     const field = obsData.fields[fieldIndex];
-    await this._ensureFieldLoaded(field, fieldIndex, 'obs', { silent });
+    await this._ensureFieldLoaded(field, fieldIndex, 'obs', { silent, signal });
     this._requireCurrentDatasetGeneration(datasetGeneration);
     if (
       this.state.obsData !== obsData
@@ -1392,8 +2001,16 @@ export class DataLayer {
    * This is the main method for retrieving data. It handles caching,
    * deduplication, and lazy loading automatically.
    *
+   * One request is made once however many callers ask for it at the same
+   * time. `signal` ends this caller's wait at once (an `AbortError`); the
+   * request goes on for the other callers and stops when none is left, and
+   * a stopped request is never cached.
+   *
    * @param {FetchOptions} options - Fetch options
    * @param {boolean} [options.silent=false] - Suppress loading notifications (for bulk operations)
+   * @param {AbortSignal|null} [options.signal=null] - Ends this caller's wait
+   * @param {string|null} [options.owner=null] - The job a gene read it starts
+   *   is for (`app/jobs/cancellable-job.js`)
    * @returns {Promise<PageData[]>} Array of page data objects
    *
    * @example
@@ -1416,13 +2033,21 @@ export class DataLayer {
       variableKey,
       pageIds: requestedPageIds,
       silent = false,
-      noCache = false
+      noCache = false,
+      signal = null
     } = options;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Page-data fetch signal must be an AbortSignal or null');
+    }
+    throwIfAborted(signal);
     const pageIds = Array.isArray(requestedPageIds)
       ? [...requestedPageIds]
       : requestedPageIds;
+    // The request is shared: its options never carry one caller's signal.
+    const requestOptions = { ...options };
+    delete requestOptions.signal;
     const ownedOptions = {
-      ...options,
+      ...requestOptions,
       type,
       variableKey,
       pageIds,
@@ -1451,39 +2076,43 @@ export class DataLayer {
         return this._dataCache.get(cacheKey);
       }
 
-      // Check for pending request (deduplication)
-      if (this._pendingRequests && this._pendingRequests.has(cacheKey)) {
-        return this._pendingRequests.get(cacheKey);
+      // Join a pending request (deduplication) unless every caller of it
+      // has gone and it was stopped.
+      const pending = this._pendingRequests?.get(cacheKey);
+      if (pending !== undefined && !pending.abandoned) {
+        return pending.join(signal);
       }
 
-      // Create new request
-      const requestPromise = this._fetchDataForPages(
-        ownedOptions,
-        datasetGeneration
-      );
-
-      if (this._pendingRequests) {
-        this._pendingRequests.set(cacheKey, requestPromise);
-      }
-
-      try {
-        const result = await requestPromise;
+      // Create new request: cached only once it completes.
+      const work = new SharedWork(async workSignal => {
+        const result = await this._fetchDataForPages(
+          ownedOptions,
+          datasetGeneration,
+          workSignal
+        );
         this._requireCurrentDatasetGeneration(datasetGeneration);
         if (this._cacheGeneration === cacheGeneration) {
           this._dataCache.set(cacheKey, result);
         }
         return result;
-      } finally {
-        if (this._pendingRequests?.get(cacheKey) === requestPromise) {
+      });
+      if (this._pendingRequests) {
+        this._pendingRequests.set(cacheKey, work);
+      }
+      const release = () => {
+        if (this._pendingRequests?.get(cacheKey) === work) {
           this._pendingRequests.delete(cacheKey);
         }
-      }
+      };
+      work.promise.then(release, release);
+      return work.join(signal);
     }
 
     // No caching, fetch directly
     const result = await this._fetchDataForPages(
       ownedOptions,
-      datasetGeneration
+      datasetGeneration,
+      signal
     );
     this._requireCurrentDatasetGeneration(datasetGeneration);
     return result;
@@ -1518,12 +2147,15 @@ export class DataLayer {
    * Internal fetch implementation (without caching)
    * @param {FetchOptions} options - Fetch options
    * @param {boolean} [options.silent=false] - Suppress loading notifications
+   * @param {number} [datasetGeneration]
+   * @param {AbortSignal|null} [signal=null] - Stops the request's field load
    * @returns {Promise<PageData[]>}
    * @private
    */
   async _fetchDataForPages(
     options,
-    datasetGeneration = this._datasetGeneration
+    datasetGeneration = this._datasetGeneration,
+    signal = null
   ) {
     const { type, variableKey, pageIds, silent = false } = options;
     this._requireCurrentDatasetGeneration(datasetGeneration);
@@ -1569,7 +2201,10 @@ export class DataLayer {
     }
 
     try {
-      await this._ensureFieldLoaded(field, fieldIndex, source);
+      await this._ensureFieldLoaded(field, fieldIndex, source, {
+        signal,
+        owner: options.owner ?? null
+      });
     } finally {
       if (loadingNotificationId && notifications) {
         // Ensure notification is visible for minimum duration
@@ -1599,9 +2234,14 @@ export class DataLayer {
       throw new Error(`No values are available for field: ${variableKey}`);
     }
 
-    // Categories for decoding (if categorical)
+    // A categorical page holds its cells' codes at the field's own width,
+    // with the field's categories and missing code beside them.
+    const isCategory = field.kind === 'category';
     const categories = field.categories || [];
-    const ValueStorage = continuousPageValueStorage(field.kind, rawValues);
+    const ValueStorage = isCategory
+      ? rawValues.constructor
+      : continuousPageValueStorage(field.kind, rawValues);
+    const categoricalRecord = isCategory ? { categories, missingCode } : {};
 
     // Process each page
     const results = [];
@@ -1615,11 +2255,14 @@ export class DataLayer {
       const cellIndices = this._getVersionedCellIndices(pageId);
 
       if (cellIndices.length === 0) {
+        const values = ValueStorage === null ? [] : new ValueStorage(0);
+        if (isCategory) adoptCategoryCounts(values, new Map());
         results.push({
           pageId,
           pageName: pageInfo.name,
           variableInfo: { ...variableInfo },
-          values: ValueStorage === null ? [] : new ValueStorage(0),
+          values,
+          ...categoricalRecord,
           cellIndices: [],
           cellCount: 0
         });
@@ -1637,21 +2280,90 @@ export class DataLayer {
       // Continuous values keep the field's own element type, so every value
       // is exactly the number the field holds, at its width: a Float32 field
       // gives 4 bytes per cell instead of a JavaScript number array's 8, which
-      // halves what the page-data and bulk-gene caches hold.
+      // halves what the page-data cache holds.
       const values = ValueStorage === null
         ? []
         : new ValueStorage(cellIndices.length);
       let position = 0;
-      // A categorical page is counted by code as it is built — one increment
-      // per cell — and the counts are adopted for the published values, so no
-      // categorical consumer walks the labels again (shared/category-counts.js).
-      const isCategory = field.kind === 'category';
-      const codeCounts = isCategory ? new Float64Array(categories.length + 1) : null;
-      const codesInOrder = isCategory ? [] : null;
-      // The page is gathered on this thread; it hands the event loop back
-      // between slices of a large page.
-      const yieldIfSliceSpent = createSlicedYield();
+      // A typed continuous field is gathered in one tight loop: its values are
+      // numbers by type, and the page's indices are checked against the field
+      // once per index set (a page's index array is shared by every variable
+      // read for it — 50 genes of a signature check it once, not 50 times).
+      if (field.kind !== 'category' && ValueStorage !== null && ArrayBuffer.isView(rawValues)) {
+        requireIndicesWithin(cellIndices, rawValues.length, variableKey);
+        const yieldIfSliceSpent = createSlicedYield();
+        for (let from = 0; from < cellIndices.length; from += 0x10000) {
+          const to = Math.min(cellIndices.length, from + 0x10000);
+          for (let i = from; i < to; i++) values[i] = rawValues[cellIndices[i]];
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) {
+            await pending;
+            this._requireCurrentDatasetGeneration(datasetGeneration);
+          }
+        }
+        results.push({
+          pageId,
+          pageName: pageInfo.name,
+          variableInfo: { ...variableInfo, categories: undefined },
+          values,
+          cellIndices,
+          cellCount: values.length
+        });
+        continue;
+      }
+      if (isCategory) {
+        // Codes are gathered in one typed loop and counted by code as they
+        // are; the label counts are adopted for the published codes, so no
+        // categorical consumer walks the cells again
+        // (shared/category-counts.js).
+        requireIndicesWithin(cellIndices, rawValues.length, variableKey);
+        const categoryCount = categories.length;
+        const codeCounts = new Float64Array(categoryCount + 1);
+        const codesInOrder = [];
+        const yieldIfSliceSpent = createSlicedYield();
+        for (let from = 0; from < cellIndices.length; from += 0x10000) {
+          const to = Math.min(cellIndices.length, from + 0x10000);
+          for (let i = from; i < to; i++) {
+            const code = rawValues[cellIndices[i]];
+            values[i] = code;
+            if (code === missingCode) {
+              if (codeCounts[categoryCount]++ === 0) codesInOrder.push(categoryCount);
+            } else if (code >= categoryCount) {
+              throw new RangeError(
+                `Category code ${code} for "${variableKey}" is outside ` +
+                `${formatCountOf(categoryCount, 'category', 'categories')}`
+              );
+            } else if (codeCounts[code]++ === 0) {
+              codesInOrder.push(code);
+            }
+          }
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) {
+            await pending;
+            this._requireCurrentDatasetGeneration(datasetGeneration);
+          }
+        }
+        const counts = new Map();
+        for (const code of codesInOrder) {
+          counts.set(code === categoryCount ? null : categories[code], codeCounts[code]);
+        }
+        adoptCategoryCounts(values, counts);
+        results.push({
+          pageId,
+          pageName: pageInfo.name,
+          variableInfo: { ...variableInfo, categories },
+          values,
+          categories,
+          missingCode,
+          cellIndices,
+          cellCount: values.length
+        });
+        continue;
+      }
 
+      // A field held in a plain array is gathered value by value, handing the
+      // event loop back between slices of a large page.
+      const yieldIfSliceSpent = createSlicedYield();
       for (const idx of cellIndices) {
         if ((position & 0xffff) === 0xffff) {
           const pending = yieldIfSliceSpent();
@@ -1670,26 +2382,8 @@ export class DataLayer {
             `length ${rawValues.length}`
           );
         }
-        let value = rawValues[idx];
-        if (field.kind === 'category') {
-          if (!Number.isSafeInteger(value) || value < 0) {
-            throw new TypeError(
-              `Category code at cell ${idx} for "${variableKey}" must be a non-negative integer`
-            );
-          }
-          if (value === missingCode) {
-            if (codeCounts[categories.length]++ === 0) codesInOrder.push(categories.length);
-            value = null;
-          } else if (value >= categories.length) {
-            throw new RangeError(
-              `Category code ${value} for "${variableKey}" is outside ` +
-              `${categories.length} categories`
-            );
-          } else {
-            if (codeCounts[value]++ === 0) codesInOrder.push(value);
-            value = categories[value];
-          }
-        } else if (typeof value !== 'number') {
+        const value = rawValues[idx];
+        if (typeof value !== 'number') {
           // NaN is the missing value of a continuous field. It stays in place
           // so values remain aligned with cellIndices (correlation pairs two
           // variables by cell); every statistic drops it per variable.
@@ -1701,21 +2395,11 @@ export class DataLayer {
         else values[position] = value;
         position++;
       }
-      if (isCategory) {
-        const counts = new Map();
-        for (const code of codesInOrder) {
-          counts.set(code === categories.length ? null : categories[code], codeCounts[code]);
-        }
-        adoptCategoryCounts(values, counts);
-      }
 
       results.push({
         pageId,
         pageName: pageInfo.name,
-        variableInfo: {
-          ...variableInfo,
-          categories: field.kind === 'category' ? categories : undefined
-        },
+        variableInfo: { ...variableInfo, categories: undefined },
         values,
         cellIndices,
         cellCount: values.length
@@ -1747,12 +2431,12 @@ export class DataLayer {
       pageIds
     });
 
-    // Get all unique categories
+    // Every category any page holds, in first-occurrence order, from the
+    // counts each page was published with.
+    const pageCounts = pageData.map(pd => categoryCounts(pd.values));
     const allCategories = new Set();
-    for (const pd of pageData) {
-      for (const value of pd.values) {
-        allCategories.add(value);
-      }
+    for (const counts of pageCounts) {
+      for (const category of counts.keys()) allCategories.add(category);
     }
 
     // Count per page per category
@@ -1761,13 +2445,10 @@ export class DataLayer {
       pages: {}
     };
 
-    for (const pd of pageData) {
+    for (const [index, pd] of pageData.entries()) {
       const counts = {};
       for (const cat of allCategories) {
-        setOwnDataProperty(counts, cat, 0);
-      }
-      for (const value of pd.values) {
-        counts[value] += 1;
+        setOwnDataProperty(counts, cat, pageCounts[index].get(cat) ?? 0);
       }
       setOwnDataProperty(result.pages, pd.pageId, {
         name: pd.pageName,
@@ -1870,14 +2551,14 @@ export class DataLayer {
     const membership = this._getPageMembership(page);
     if (membership.digestName !== pageName) {
       foldDigestText(lanes, pageName);
-      foldDigestIndexSet(lanes, membership.indices);
+      foldDigestIndexSet(lanes, membership.cells);
       membership.digestName = pageName;
       membership.digest = `${pageId}:${finalizeDigest(lanes)}`;
     }
     const hash = membership.digest;
     // Keep the set this digest describes, so the fetch that follows reads the
     // same membership instead of rebuilding it.
-    this._pageIndexSnapshots.set(pageId, { hash, indices: membership.indices });
+    this._pageIndexSnapshots.set(pageId, { hash, membership });
     return hash;
   }
 
@@ -1903,7 +2584,9 @@ export class DataLayer {
     const version = this._getPageVersion(pageId);
     const snapshot = this._pageIndexSnapshots.get(pageId);
     if (snapshot !== undefined && snapshot.hash === version) {
-      return snapshot.indices;
+      // A digest's snapshot holds the membership, whose indices are built
+      // on this first read; a fetch's holds the indices it read.
+      return snapshot.indices ?? snapshot.membership.indices;
     }
     const indices = this.getCellIndicesForPage(pageId);
     this._pageIndexSnapshots.set(pageId, { hash: version, indices });
@@ -1990,7 +2673,6 @@ export class DataLayer {
     const uniquePageIds = Array.from(new Set(pageIds || []));
     if (uniquePageIds.length === 0) return;
     this._cacheGeneration += 1;
-    this._bulkGeneCacheGeneration += 1;
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
     }
@@ -2001,10 +2683,8 @@ export class DataLayer {
       this._pageMemberships.delete(pageId);
     }
 
-    // Both cache key formats end with the page IDs, optionally followed by a
-    // ':v=' version component:
-    //   data cache: type:variableKey:page_1,page_2[:v=...]
-    //   bulk genes: bulk_genes:page_1,page_2[:v=...]
+    // Cache keys end with the page IDs, optionally followed by a ':v='
+    // version component: type:variableKey:page_1,page_2[:v=...]
     const keyReferencesAnyPage = (key) => {
       if (!key) return false;
 
@@ -2022,13 +2702,6 @@ export class DataLayer {
         if (keyReferencesAnyPage(key)) {
           this._dataCache.delete(key);
         }
-      }
-    }
-
-    // Also clear bulk gene cache entries
-    for (const [key] of this._bulkGeneCache) {
-      if (keyReferencesAnyPage(key)) {
-        this._bulkGeneCache.delete(key);
       }
     }
   }
@@ -2050,17 +2723,7 @@ export class DataLayer {
   }
 
   /**
-   * Clear only the bulk gene cache (largest memory consumer).
-   * Useful after gene-heavy analyses that shouldn't keep multi-gene page caches alive.
-   */
-  clearBulkGeneCache() {
-    this._bulkGeneCacheGeneration += 1;
-    this._bulkGeneCache.clear();
-    this._bulkGeneCacheAccessOrder = [];
-  }
-
-  /**
-   * Clear all caches including bulk gene cache
+   * Clear every cache, the prefetch queue included
    */
   clearAllCaches() {
     this._cacheGeneration += 1;
@@ -2071,7 +2734,6 @@ export class DataLayer {
     if (this._dataCache) {
       this._dataCache.clear();
     }
-    this.clearBulkGeneCache();
     this._pageIndexSnapshots.clear();
     this._pageMemberships.clear();
     this._prefetchQueue = [];
@@ -2101,7 +2763,7 @@ export class DataLayer {
     );
     this._fieldLoadLifecycle = new AbortController();
     this._datasetGeneration += 1;
-    this._bulkGeneCacheReplacementOwner = null;
+    this._matrixHandles.clear();
     this.clearAllCaches();
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
@@ -2185,748 +2847,14 @@ export class DataLayer {
   // ===========================================================================
 
   /**
-   * Evict old/expired entries from bulk gene cache
-   * @private
-   */
-  _evictBulkGeneCacheIfNeeded() {
-    const now = Date.now();
-
-    // Remove expired entries
-    for (const [key, entry] of this._bulkGeneCache) {
-      if ((now - entry.timestamp) >= this._bulkGeneCacheMaxAge) {
-        this._bulkGeneCache.delete(key);
-        const orderIdx = this._bulkGeneCacheAccessOrder.indexOf(key);
-        if (orderIdx >= 0) {
-          this._bulkGeneCacheAccessOrder.splice(orderIdx, 1);
-        }
-      }
-    }
-
-    // Evict oldest if over limit
-    while (this._bulkGeneCache.size >= this._bulkGeneCacheMaxSize && this._bulkGeneCacheAccessOrder.length > 0) {
-      const oldestKey = this._bulkGeneCacheAccessOrder.shift();
-      if (this._bulkGeneCache.has(oldestKey)) {
-        console.debug(`[DataLayer] Evicting bulk gene cache entry: ${oldestKey.substring(0, 30)}...`);
-        this._bulkGeneCache.delete(oldestKey);
-      }
-    }
-  }
-
-  /**
-   * Add entry to bulk gene cache with LRU tracking
-   * @param {string} key - Cache key
-   * @param {Object} value - Value to cache
-   * @private
-   */
-  _setBulkGeneCache(key, value) {
-    this._evictBulkGeneCacheIfNeeded();
-
-    const existingIdx = this._bulkGeneCacheAccessOrder.indexOf(key);
-    if (existingIdx >= 0) {
-      this._bulkGeneCacheAccessOrder.splice(existingIdx, 1);
-    }
-
-    this._bulkGeneCache.set(key, value);
-    this._bulkGeneCacheAccessOrder.push(key);
-  }
-
-  /**
-   * Get entry from bulk gene cache and update access order
-   * @param {string} key - Cache key
-   * @returns {Object|undefined}
-   * @private
-   */
-  _getBulkGeneCache(key) {
-    const entry = this._bulkGeneCache.get(key);
-    if (entry) {
-      const idx = this._bulkGeneCacheAccessOrder.indexOf(key);
-      if (idx >= 0) {
-        this._bulkGeneCacheAccessOrder.splice(idx, 1);
-        this._bulkGeneCacheAccessOrder.push(key);
-      }
-    }
-    return entry;
-  }
-
-  /**
-   * Build a stable bulk-gene cache key without mutating caller-owned arrays.
-   *
-   * Carries the same complete page version component as `_getCacheKey()`, so a
-   * bulk-gene entry can never be served for a page whose cell membership has
-   * changed since it was computed.
-   *
-   * @param {string[]} pageIds
-   * @returns {string}
-   * @private
-   */
-  _getBulkGeneCacheKey(pageIds) {
-    const sortedUnique = Array.from(new Set(pageIds || [])).sort();
-    const idsPart = sortedUnique.join(',');
-
-    if (this._pageVersions) {
-      return `bulk_genes:${idsPart}:v=${this._buildVersionKey(sortedUnique)}`;
-    }
-
-    return `bulk_genes:${idsPart}`;
-  }
-
-  // ===========================================================================
-  // SESSION CACHE EXPORT/IMPORT (for session bundles)
-  // ===========================================================================
-
-  /**
-   * Replace the bulk session cache transactionally without copying retained
-   * scientific arrays. Rollback restores the exact prior Map and LRU order
-   * identities; a successful transaction releases them with its owner.
-   *
-   * @returns {Readonly<{commit: () => void, rollback: () => void}>}
-   */
-  beginSessionCacheReplacement() {
-    if (this._bulkGeneCacheReplacementOwner !== null) {
-      throw new Error(
-        'A session cache replacement is already active.'
-      );
-    }
-    const previousCache = this._bulkGeneCache;
-    const previousAccessOrder = this._bulkGeneCacheAccessOrder;
-    const replacementOwner = {};
-    const datasetGeneration = this._datasetGeneration;
-    this._bulkGeneCacheReplacementOwner = replacementOwner;
-    this._bulkGeneCacheGeneration += 1;
-    this._bulkGeneCache = new Map();
-    this._bulkGeneCacheAccessOrder = [];
-    let committed = false;
-    let rolledBack = false;
-    const requireCurrentLifecycle = () => {
-      if (
-        this._destroyed ||
-        this._datasetGeneration !== datasetGeneration
-      ) {
-        throw new Error(
-          'Session cache replacement was invalidated by a dataset lifecycle change.'
-        );
-      }
-    };
-
-    return Object.freeze({
-      commit: () => {
-        if (committed || rolledBack) return;
-        requireCurrentLifecycle();
-        if (this._bulkGeneCacheReplacementOwner !== replacementOwner) {
-          throw new Error(
-            'Session cache replacement ownership changed before commit.'
-          );
-        }
-        this._bulkGeneCacheReplacementOwner = null;
-        this._bulkGeneCacheGeneration += 1;
-        committed = true;
-      },
-      rollback: () => {
-        if (rolledBack) return;
-        requireCurrentLifecycle();
-        if (
-          this._bulkGeneCacheReplacementOwner !== null
-          && this._bulkGeneCacheReplacementOwner !== replacementOwner
-        ) {
-          throw new Error(
-            'Session cache replacement cannot roll back across a newer owner.'
-          );
-        }
-        this._bulkGeneCache = previousCache;
-        this._bulkGeneCacheAccessOrder = previousAccessOrder;
-        this._bulkGeneCacheReplacementOwner = null;
-        this._bulkGeneCacheGeneration += 1;
-        rolledBack = true;
-      }
-    });
-  }
-
-  /**
-   * Export portable analysis caches for inclusion in a session bundle.
-   *
-   * IMPORTANT:
-   * - This API intentionally avoids exposing private cache internals directly.
-   * - Callers (session contributors) are responsible for chunking/encoding.
-   * - Dev-phase: we currently export the bulk gene cache only (the largest, most
-   *   expensive-to-recompute analysis cache in typical workflows).
-   *
-   * @returns {Array<{ kind: 'bulk-gene', cacheKey: string, gene: string, pageId: string, pageName: string, cellCount: number, timestamp: number, geneCount: number, values: Float32Array, cellIndices: Uint32Array }>}
-   */
-  exportSessionCache() {
-    /** @type {Array<{ kind: 'bulk-gene', cacheKey: string, gene: string, pageId: string, pageName: string, cellCount: number, timestamp: number, geneCount: number, values: Float32Array, cellIndices: Uint32Array }>} */
-    const artifacts = [];
-
-    for (const [cacheKey, entry] of this._bulkGeneCache.entries()) {
-      const ts = Number(entry?.timestamp ?? 0) || 0;
-      const geneCount = Number(entry?.geneCount ?? 0) || 0;
-      const data = entry?.data || null;
-      if (!data || typeof data !== 'object') continue;
-
-      for (const [gene, genePages] of Object.entries(data)) {
-        if (!genePages || typeof genePages !== 'object') continue;
-
-        for (const [pageId, pd] of Object.entries(genePages)) {
-          const valuesIn = pd?.values;
-          const indicesIn = pd?.cellIndices;
-          if (!valuesIn || !indicesIn) continue;
-
-          const cellCount = Number(pd?.cellCount ?? (Array.isArray(indicesIn) ? indicesIn.length : indicesIn.length)) || 0;
-          const pageName = String(pd?.pageName || pageId);
-
-          // Convert values to Float32Array (portable, compact, renderer-friendly).
-          let values = valuesIn instanceof Float32Array ? valuesIn : null;
-          if (!values) {
-            const n = valuesIn.length >>> 0;
-            values = new Float32Array(n);
-            for (let i = 0; i < n; i++) values[i] = Number(valuesIn[i] ?? NaN);
-          }
-
-          // Convert indices to Uint32Array.
-          let cellIndices = indicesIn instanceof Uint32Array ? indicesIn : null;
-          if (!cellIndices) {
-            const n = indicesIn.length >>> 0;
-            cellIndices = new Uint32Array(n);
-            for (let i = 0; i < n; i++) cellIndices[i] = Number(indicesIn[i] ?? 0) >>> 0;
-          }
-
-          artifacts.push({
-            kind: 'bulk-gene',
-            cacheKey,
-            gene,
-            pageId,
-            pageName,
-            cellCount,
-            timestamp: ts,
-            geneCount,
-            values,
-            cellIndices
-          });
-        }
-      }
-    }
-
-    return artifacts;
-  }
-
-  /**
-   * Import a session cache artifact (or array of artifacts) into this DataLayer.
-   *
-   * This is used by the session-bundle lazy restore path to incrementally
-   * populate caches without reaching into private fields from session code.
-   *
-   * @param {any} artifactOrArtifacts
-   * @returns {number} Number of artifacts applied
-   */
-  importSessionCache(artifactOrArtifacts) {
-    const artifacts = Array.isArray(artifactOrArtifacts) ? artifactOrArtifacts : [artifactOrArtifacts];
-    let applied = 0;
-
-    for (const artifact of artifacts) {
-      if (!artifact || artifact.kind !== 'bulk-gene') continue;
-
-      const cacheKey = String(artifact.cacheKey || '').trim();
-      const gene = String(artifact.gene || '').trim();
-      const pageId = String(artifact.pageId || '').trim();
-      if (!cacheKey || !gene || !pageId) continue;
-
-      const values = artifact.values instanceof Float32Array ? artifact.values : null;
-      const cellIndices = artifact.cellIndices instanceof Uint32Array ? artifact.cellIndices : null;
-      if (!values || !cellIndices) continue;
-
-      const pageName = String(artifact.pageName || pageId);
-      const cellCount = Number(artifact.cellCount ?? cellIndices.length) || cellIndices.length;
-      const timestamp = Number(artifact.timestamp ?? Date.now()) || Date.now();
-      const geneCount = Number(artifact.geneCount ?? 0) || 0;
-
-      // Merge into the existing cache entry (or create one).
-      const existing = this._bulkGeneCache.get(cacheKey);
-      const entry = existing && typeof existing === 'object'
-        ? existing
-        : { data: {}, timestamp, geneCount };
-
-      if (
-        !Object.hasOwn(entry, 'data') ||
-        !entry.data ||
-        typeof entry.data !== 'object'
-      ) {
-        entry.data = {};
-      }
-      let genePages;
-      if (
-        Object.hasOwn(entry.data, gene) &&
-        entry.data[gene] &&
-        typeof entry.data[gene] === 'object'
-      ) {
-        genePages = entry.data[gene];
-      } else {
-        genePages = {};
-        setOwnDataProperty(entry.data, gene, genePages);
-      }
-
-      setOwnDataProperty(genePages, pageId, {
-        values,
-        cellIndices,
-        pageName,
-        cellCount
-      });
-
-      // Preserve the newest timestamp/geneCount seen for the entry.
-      entry.timestamp = Math.max(Number(entry.timestamp ?? 0) || 0, timestamp);
-      entry.geneCount = Math.max(
-        Number(entry.geneCount ?? 0) || 0,
-        geneCount,
-        Object.keys(entry.data || {}).length
-      );
-
-      // Use the canonical setter so eviction/access order are maintained.
-      this._setBulkGeneCache(cacheKey, entry);
-      applied += 1;
-    }
-
-    return applied;
-  }
-
-  /**
-   * Fetch all gene expression data for given pages
-   *
-   * Used for differential expression analysis. Shows progress notification.
-   *
-   * @param {Object} options - Fetch options
-   * @param {string[]} options.pageIds - Page IDs to fetch for
-   * @param {string[]} [options.geneList] - Optional subset of genes
-   * @param {boolean} [options.forceReload=false] - Bypass cache
-   * @param {Function} [options.onProgress] - Progress callback (0-100)
-   * @param {Function} [options.isCurrent] - Cooperative request ownership predicate
-   * @param {Function} [options.registerInvalidationCleanup] - Required when isCurrent is provided
-   * @returns {Promise<Object>} Map of geneName -> { pageId: values[] }
-   *
-   * @example
-   * const geneData = await dataLayer.fetchBulkGeneExpression({
-   *   pageIds: ['page1', 'page2'],
-   *   geneList: ['BRCA1', 'TP53', 'EGFR'],
-   *   onProgress: (p) => console.log(`${p}% complete`)
-   * });
-   */
-  async fetchBulkGeneExpression(options) {
-    if (!options || typeof options !== 'object' || Array.isArray(options)) {
-      throw new TypeError('Bulk gene fetch options must be an object');
-    }
-    const {
-      pageIds: requestedPageIds,
-      geneList: requestedGeneList = null,
-      forceReload = false,
-      onProgress,
-      isCurrent: currentPredicate,
-      registerInvalidationCleanup
-    } = options;
-    const hasCooperativeOwner = currentPredicate !== undefined;
-    if (hasCooperativeOwner && typeof currentPredicate !== 'function') {
-      throw new TypeError(
-        'Bulk gene fetch isCurrent must be a function when provided'
-      );
-    }
-    if (
-      hasCooperativeOwner &&
-      typeof registerInvalidationCleanup !== 'function'
-    ) {
-      throw new TypeError(
-        'Bulk gene fetch registerInvalidationCleanup must be a function ' +
-        'when isCurrent is provided'
-      );
-    }
-    if (
-      !hasCooperativeOwner &&
-      registerInvalidationCleanup !== undefined
-    ) {
-      throw new TypeError(
-        'Bulk gene fetch registerInvalidationCleanup requires isCurrent'
-      );
-    }
-    const pageIds = Array.isArray(requestedPageIds)
-      ? [...requestedPageIds]
-      : requestedPageIds;
-    const geneList = Array.isArray(requestedGeneList)
-      ? [...requestedGeneList]
-      : requestedGeneList;
-    const datasetGeneration = this._datasetGeneration;
-    const cacheGeneration = this._bulkGeneCacheGeneration;
-    const notifications = this._notifications;
-    let ownershipInvalidated = false;
-    let notificationId = null;
-    let notificationSettled = false;
-
-    const settleNotification = (method, message) => {
-      if (notificationSettled) return;
-      notificationSettled = true;
-      if (
-        notifications === null ||
-        notifications === undefined ||
-        notificationId === null
-      ) {
-        return;
-      }
-      notifications[method](notificationId, message);
-    };
-    const requireCurrentOwnership = () => {
-      this._requireCurrentDatasetGeneration(datasetGeneration);
-      if (
-        ownershipInvalidated ||
-        (hasCooperativeOwner && !currentPredicate())
-      ) {
-        throw this._createAnalysisDataInvalidationError(
-          'an analysis request ownership change'
-        );
-      }
-    };
-
-    if (hasCooperativeOwner) {
-      registerInvalidationCleanup(() => {
-        ownershipInvalidated = true;
-        settleNotification('dismiss');
-      });
-    }
-    requireCurrentOwnership();
-
-    if (!pageIds || pageIds.length === 0) {
-      return {};
-    }
-
-    // Ensure bulk gene cache stays correct as highlight pages change.
-    // (If versions are stale, bulk caches can return results for an old page membership.)
-    this.refreshPageVersions(Array.from(new Set(pageIds)).filter(id => !isRestOfPageId(id)));
-
-    const cacheKey = this._getBulkGeneCacheKey(pageIds);
-
-    // Check cache
-    if (!forceReload) {
-      const cached = this._getBulkGeneCache(cacheKey);
-      if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
-        requireCurrentOwnership();
-        if (geneList) {
-          const missingGenes = geneList.filter(
-            gene => !Object.hasOwn(cached.data, gene)
-          );
-          if (missingGenes.length > 0) {
-            throw new Error(
-              `Cached bulk gene data is missing requested genes: ${missingGenes.join(', ')}`
-            );
-          }
-          const filtered = {};
-          for (const gene of geneList) {
-            setOwnDataProperty(filtered, gene, cached.data[gene]);
-          }
-          return filtered;
-        }
-        return cached.data;
-      }
-    }
-
-    const allGenes = this.getAvailableVariables('gene_expression');
-    const genesToFetch = geneList
-      ? allGenes.filter(g => geneList.includes(g.key))
-      : allGenes;
-
-    if (genesToFetch.length === 0) {
-      return {};
-    }
-
-    // Show loading notification
-    if (notifications) {
-      notificationId = notifications.show({
-        type: 'progress',
-        category: 'data',
-        title: 'Loading Gene Expression',
-        message: `Preparing to load ${genesToFetch.length} genes...`,
-        progress: 0
-      });
-    }
-
-    const results = {};
-    const startTime = performance.now();
-
-    // Progress starts at zero before any request is issued, so a caller that
-    // draws a bar sees it appear rather than jump in at the first completion.
-    if (onProgress) onProgress(0);
-
-    try {
-      // One gene is one HTTP request, and the requests are independent. This
-      // used to run in fixed batches of ten with a macrotask barrier between
-      // them, so 60 genes cost six *strictly sequential* waves however fast the
-      // link was: measured 60 requests, chain depth 6, never more than 10 in
-      // flight. A sliding window keeps `networkConcurrency` requests in flight
-      // continuously instead, so the depth is set by the slowest request rather
-      // than by the batch boundary — the same shape `StreamingGeneLoader`
-      // already uses for the marker and DE paths.
-      const loadedPages = await this._loadGenePagesConcurrently(
-        genesToFetch.map(geneInfo => geneInfo.key),
-        pageIds,
-        requireCurrentOwnership,
-        progress => {
-          if (notifications && notificationId !== null) {
-            notifications.updateProgress(notificationId, progress, {
-              message:
-                `Loading gene expression: ${progress}% of ` +
-                `${genesToFetch.length} genes...`
-            });
-          }
-          if (onProgress) onProgress(progress);
-        }
-      );
-      requireCurrentOwnership();
-
-      // Publication order is the requested order, never completion order: the
-      // result is an ordered record its callers read positionally.
-      for (let index = 0; index < genesToFetch.length; index++) {
-        setOwnDataProperty(
-          results,
-          genesToFetch[index].key,
-          loadedPages[index]
-        );
-      }
-
-      requireCurrentOwnership();
-      if (
-        this._bulkGeneCacheReplacementOwner === null
-        && this._bulkGeneCacheGeneration === cacheGeneration
-      ) {
-        this._setBulkGeneCache(cacheKey, {
-          data: results,
-          timestamp: Date.now(),
-          geneCount: genesToFetch.length
-        });
-      }
-
-      const duration = performance.now() - startTime;
-      requireCurrentOwnership();
-      settleNotification(
-        'complete',
-        `Loaded ${genesToFetch.length} genes (${formatDuration(duration)})`
-      );
-
-      return results;
-
-    } catch (error) {
-      if (
-        error?.code === 'ANALYSIS_DATA_REQUEST_INVALIDATED'
-      ) {
-        settleNotification('dismiss');
-      } else {
-        settleNotification(
-          'fail',
-          `Failed to load gene expression: ${error.message}`
-        );
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Get subset of bulk gene data (from cache or fetch)
-   *
-   * @param {string[]} geneList - Genes to get
-   * @param {string[]} pageIds - Page IDs
-   * @param {Object} [options] - Cooperative request ownership
-   * @param {Function} [options.isCurrent] - Exact request ownership predicate
-   * @param {Function} [options.registerInvalidationCleanup] - Required with isCurrent
-   * @returns {Promise<Object>} Gene data by gene name
-   */
-  async getGeneExpressionSubset(geneList, pageIds, options = {}) {
-    if (!options || typeof options !== 'object' || Array.isArray(options)) {
-      throw new TypeError('Gene expression subset options must be an object');
-    }
-    const {
-      isCurrent: currentPredicate,
-      registerInvalidationCleanup
-    } = options;
-    const hasCooperativeOwner = currentPredicate !== undefined;
-    if (hasCooperativeOwner && typeof currentPredicate !== 'function') {
-      throw new TypeError(
-        'Gene expression subset isCurrent must be a function when provided'
-      );
-    }
-    if (
-      hasCooperativeOwner &&
-      typeof registerInvalidationCleanup !== 'function'
-    ) {
-      throw new TypeError(
-        'Gene expression subset registerInvalidationCleanup must be a function ' +
-        'when isCurrent is provided'
-      );
-    }
-    if (
-      !hasCooperativeOwner &&
-      registerInvalidationCleanup !== undefined
-    ) {
-      throw new TypeError(
-        'Gene expression subset registerInvalidationCleanup requires isCurrent'
-      );
-    }
-    const ownedGeneList = Array.isArray(geneList)
-      ? [...geneList]
-      : geneList;
-    const ownedPageIds = Array.isArray(pageIds)
-      ? [...pageIds]
-      : pageIds;
-    const datasetGeneration = this._datasetGeneration;
-    let ownershipInvalidated = false;
-    const requireCurrentOwnership = () => {
-      this._requireCurrentDatasetGeneration(datasetGeneration);
-      if (
-        ownershipInvalidated ||
-        (hasCooperativeOwner && !currentPredicate())
-      ) {
-        throw this._createAnalysisDataInvalidationError(
-          'an analysis request ownership change'
-        );
-      }
-    };
-    if (hasCooperativeOwner) {
-      registerInvalidationCleanup(() => {
-        ownershipInvalidated = true;
-      });
-    }
-    requireCurrentOwnership();
-
-    // This path can return cached expression values directly, so its key must
-    // be built from current page versions rather than the last-refreshed ones.
-    this.refreshPageVersions(
-      Array.from(new Set(ownedPageIds)).filter(id => !isRestOfPageId(id))
-    );
-
-    const cacheKey = this._getBulkGeneCacheKey(ownedPageIds);
-    const cached = this._getBulkGeneCache(cacheKey);
-
-    if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
-      // The bulk cache is keyed on the page set alone, so a run that asks for
-      // genes an earlier run did not fetch lands here with a partial hit. The
-      // misses used to be awaited one after another, which made a signature
-      // that added N genes cost N round trips in sequence. They are fetched
-      // together instead, under the same ceiling as a cold run.
-      const missingGenes = ownedGeneList.filter(
-        gene => !Object.hasOwn(cached.data, gene)
-      );
-      const fetchedPages = missingGenes.length === 0
-        ? []
-        : await this._loadGenePagesConcurrently(
-          missingGenes,
-          ownedPageIds,
-          requireCurrentOwnership
-        );
-      requireCurrentOwnership();
-
-      const fetchedByGene = new Map();
-      for (let index = 0; index < missingGenes.length; index++) {
-        fetchedByGene.set(missingGenes[index], fetchedPages[index]);
-      }
-
-      const results = {};
-      for (const gene of ownedGeneList) {
-        setOwnDataProperty(
-          results,
-          gene,
-          Object.hasOwn(cached.data, gene)
-            ? cached.data[gene]
-            : fetchedByGene.get(gene)
-        );
-      }
-      requireCurrentOwnership();
-      return results;
-    }
-
-    const fetchOptions = {
-      pageIds: ownedPageIds,
-      geneList: ownedGeneList,
-      forceReload: false
-    };
-    if (hasCooperativeOwner) {
-      fetchOptions.isCurrent = currentPredicate;
-      fetchOptions.registerInvalidationCleanup = registerInvalidationCleanup;
-    }
-    const result = await this.fetchBulkGeneExpression(fetchOptions);
-    requireCurrentOwnership();
-    return result;
-  }
-
-  /**
-   * Load per-page expression records for a gene list with bounded concurrency.
-   *
-   * Returns one record per requested gene, in the requested order, so a caller
-   * can publish an ordered result without depending on which request finished
-   * first.
-   *
-   * @param {string[]} geneKeys - Gene keys, already deduplicated
-   * @param {string[]} pageIds - Page IDs every gene is subset to
-   * @param {Function} requireCurrentOwnership - Throws when the request is stale
-   * @param {Function} [onProgress] - Receives whole-percent progress
-   * @returns {Promise<Object[]>} One `{ [pageId]: PageRecord }` per gene
-   * @private
-   */
-  async _loadGenePagesConcurrently(
-    geneKeys,
-    pageIds,
-    requireCurrentOwnership,
-    onProgress
-  ) {
-    const total = geneKeys.length;
-    const loaded = new Array(total);
-    const tasks = [];
-    const inFlight = new Set();
-    let completed = 0;
-
-    const maxInFlight = Math.max(1, Math.min(total, networkConcurrency()));
-    const yieldIfSliceSpent = createSlicedYield();
-
-    for (let index = 0; index < total; index++) {
-      requireCurrentOwnership();
-      // Subsetting one gene to its pages is a pass over the cell axis, so a
-      // long gene list must hand the frame back periodically. This pauses the
-      // *scheduling* loop only: the requests already in flight keep running,
-      // which is what distinguishes it from the batch barrier it replaced.
-      await yieldIfSliceSpent();
-      await waitForAvailableSlot(inFlight, maxInFlight);
-      requireCurrentOwnership();
-
-      const geneKey = geneKeys[index];
-      const position = index;
-      const task = this.getDataForPages({
-        type: 'gene_expression',
-        variableKey: geneKey,
-        pageIds,
-        silent: true // Suppress individual notifications during bulk load
-      }).then(geneData => {
-        requireCurrentOwnership();
-        const genePages = {};
-        for (const pd of geneData) {
-          setOwnDataProperty(genePages, pd.pageId, {
-            values: pd.values,
-            cellIndices: pd.cellIndices,
-            pageName: pd.pageName,
-            cellCount: pd.cellCount
-          });
-        }
-        loaded[position] = genePages;
-        completed++;
-        if (onProgress) {
-          onProgress(Math.round((completed / total) * 100));
-        }
-      });
-      tasks.push(task);
-      trackSettlement(inFlight, task);
-    }
-
-    // Every started load is awaited here, so an ownership change mid-run can
-    // never leave a rejection unobserved.
-    await Promise.all(tasks);
-    return loaded;
-  }
-
-  /**
    * Fetch bulk observation field data for analysis
    *
    * @param {Object} options - Fetch options
    * @param {string[]} options.pageIds - Page IDs
    * @param {string[]} options.obsFields - Observation field keys
    * @param {Function} [options.onProgress] - Progress callback
+   * @param {AbortSignal|null} [options.signal=null] - Stops the reads (a
+   *   job's; its job then owns the notification)
    * @returns {Promise<Object>} { fields, pageData, stats }
    */
   async fetchBulkObsFields(options) {
@@ -2935,7 +2863,7 @@ export class DataLayer {
       obsFields,
       onProgress,
       subsetPages = true,
-      includeCategoricalValues = true
+      signal = null
     } = options || {};
 
     const startTime = performance.now();
@@ -3010,7 +2938,7 @@ export class DataLayer {
           ) {
             throw new RangeError(
               `Category code ${rawFieldValues[cellIdx]} for observation field ` +
-              `"${fieldKey}" is outside ${fieldData.categories.length} categories`
+              `"${fieldKey}" is outside ${formatCountOf(fieldData.categories.length, 'category', 'categories')}`
             );
           }
         }
@@ -3056,23 +2984,6 @@ export class DataLayer {
           codes: pageCodes,
           cellCount: cellIndices.length
         };
-        if (includeCategoricalValues) {
-          const pageValues = [];
-          for (const code of pageCodes) {
-            if (code === missingCode) {
-              pageValues.push(null);
-              continue;
-            }
-            if (code >= fieldData.categories.length) {
-              throw new RangeError(
-                `Category code ${code} for observation field "${fieldKey}" ` +
-                `is outside ${fieldData.categories.length} categories`
-              );
-            }
-            pageValues.push(fieldData.categories[code]);
-          }
-          pageEntry.values = pageValues;
-        }
         setOwnDataProperty(published, pageId, pageEntry);
       }
 
@@ -3098,7 +3009,7 @@ export class DataLayer {
 
     // Show progress notification for bulk obs loading
     let notificationId = null;
-    if (this._notifications && obsFields.length > 1) {
+    if (this._notifications && obsFields.length > 1 && signal === null) {
       notificationId = this._notifications.show({
         type: 'progress',
         category: 'data',
@@ -3123,7 +3034,8 @@ export class DataLayer {
       await this._loadObsFieldsConcurrently(
         obsFields,
         handleProgress,
-        publishField
+        publishField,
+        signal
       );
 
       // Complete notification
@@ -3146,16 +3058,12 @@ export class DataLayer {
   }
 
   /**
-   * Load the requested observation fields with bounded concurrency.
+   * Load the requested observation fields together.
    *
-   * One observation field is one HTTP request in the prepared export format
-   * (two for a categorical field, which also carries an outlier mask), so
-   * awaiting each field before starting the next made a run's wall clock the
-   * *sum* of its round trips. Quick Insights asks for four fields on first
-   * open; measured at 150 ms emulated latency that was six strictly serial
-   * requests spanning 2.07 s with never more than one in flight. The requests
-   * are independent, so they are issued together under the same
-   * `networkConcurrency` ceiling every other analysis loader uses.
+   * Awaiting each field before asking for the next would make a run's wall
+   * clock the *sum* of its reads on a remote file. The fields are
+   * independent, so they are asked for together, and the reader batches and
+   * paces them.
    *
    * Fields are still *published* in request order, because `result.fields` is
    * an ordered record the callers read positionally.
@@ -3163,19 +3071,18 @@ export class DataLayer {
    * @param {string[]} obsFields - Field keys to load
    * @param {Function} [onProgress] - Progress callback
    * @param {Function} publishField - Exact field publication callback
+   * @param {AbortSignal|null} [signal] - Stops the loads still to start and
+   *   ends the wait for those under way
    * @private
    */
-  async _loadObsFieldsConcurrently(obsFields, onProgress, publishField) {
+  async _loadObsFieldsConcurrently(obsFields, onProgress, publishField, signal = null) {
     const totalFields = obsFields.length;
     const loaded = new Array(totalFields);
     const tasks = [];
     const inFlight = new Set();
     let completed = 0;
 
-    const maxInFlight = Math.max(
-      1,
-      Math.min(totalFields, networkConcurrency())
-    );
+    const maxInFlight = Math.max(1, totalFields);
 
     for (let index = 0; index < totalFields; index++) {
       const fieldKey = obsFields[index];
@@ -3191,8 +3098,9 @@ export class DataLayer {
       }
 
       await waitForAvailableSlot(inFlight, maxInFlight);
+      throwIfAborted(signal);
 
-      const task = this.ensureObsFieldLoaded(fieldKey, { silent: true })
+      const task = this.ensureObsFieldLoaded(fieldKey, { silent: true, signal })
         .then(fieldData => {
           loaded[index] = fieldData;
           completed++;
@@ -3228,14 +3136,6 @@ export class DataLayer {
         maxSize: this._options.cacheSize,
         stats: this._dataCache ? this._dataCache.getStats() : null
       },
-      bulkGeneCache: {
-        size: this._bulkGeneCache.size,
-        entries: Array.from(this._bulkGeneCache.entries()).map(([key, entry]) => ({
-          key: key.substring(0, 50),
-          geneCount: entry.geneCount,
-          ageMs: Date.now() - entry.timestamp
-        }))
-      },
       pendingRequests: this._pendingRequests ? this._pendingRequests.size : 0,
       prefetchQueue: this._prefetchQueue.length
     };
@@ -3265,20 +3165,6 @@ export class DataLayer {
       }
     }
 
-    // Bulk gene cache
-    for (const [key, entry] of this._bulkGeneCache) {
-      totalBytes += key.length * 2;
-      if (entry.data) {
-        for (const geneData of Object.values(entry.data)) {
-          for (const pageData of Object.values(geneData)) {
-            if (pageData.values) {
-              totalBytes += arrayLikeBytes(pageData.values);
-            }
-          }
-        }
-      }
-    }
-
     return {
       bytes: totalBytes,
       megabytes: (totalBytes / (1024 * 1024)).toFixed(2)
@@ -3291,29 +3177,16 @@ export class DataLayer {
    */
   performCacheCleanup() {
     let cleaned = 0;
-    const now = Date.now();
-
-    // Clean expired bulk gene entries
-    for (const [key, entry] of this._bulkGeneCache) {
-      if ((now - entry.timestamp) >= this._bulkGeneCacheMaxAge) {
-        this._bulkGeneCache.delete(key);
-        const orderIdx = this._bulkGeneCacheAccessOrder.indexOf(key);
-        if (orderIdx >= 0) {
-          this._bulkGeneCacheAccessOrder.splice(orderIdx, 1);
-        }
-        cleaned++;
-      }
-    }
 
     // Prune data cache if it supports it
     if (this._dataCache && this._dataCache.prune) {
       cleaned += this._dataCache.prune();
     }
 
-    const remaining = (this._dataCache ? this._dataCache.size() : 0) + this._bulkGeneCache.size;
+    const remaining = this._dataCache ? this._dataCache.size() : 0;
 
     if (cleaned > 0) {
-      console.debug(`[DataLayer] Cache cleanup removed ${cleaned} entries`);
+      console.debug(`[DataLayer] Cache cleanup removed ${formatCountOf(cleaned, 'entry', 'entries')}`);
     }
 
     return { cleaned, remaining };
@@ -3337,8 +3210,6 @@ export class DataLayer {
     );
     this._datasetGeneration += 1;
     this._cacheGeneration += 1;
-    this._bulkGeneCacheGeneration += 1;
-    this._bulkGeneCacheReplacementOwner = null;
     // Stop background admission immediately. Cache contents remain owned by
     // a running memory-pressure handler until unregister drains below, but no
     // timer may start new work against the terminal generation.
@@ -3365,8 +3236,6 @@ export class DataLayer {
       if (this._dataCache) {
         this._dataCache.clear();
       }
-      this._bulkGeneCache.clear();
-      this._bulkGeneCacheAccessOrder = [];
       this._variableCache.clear();
 
       if (this._pendingRequests) {

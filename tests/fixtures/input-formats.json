@@ -1,0 +1,195 @@
+{
+  "schema": 1,
+  "signatures": [
+    {
+      "offsets": [
+        0,
+        512,
+        1024,
+        2048
+      ],
+      "hex": "894844460d0a1a0a",
+      "layout": "file",
+      "container": "hdf5"
+    },
+    {
+      "offsets": [
+        0
+      ],
+      "hex": "504b0304",
+      "layout": "zip",
+      "container": "zarr"
+    },
+    {
+      "offsets": [
+        0
+      ],
+      "hex": "504b0506",
+      "layout": "zip",
+      "container": "zarr"
+    }
+  ],
+  "folderMarkers": {
+    "zarr": [
+      ".zarray",
+      ".zattrs",
+      ".zgroup",
+      ".zmetadata",
+      "zarr.json"
+    ],
+    "tenx-outs": [
+      "filtered_feature_bc_matrix.h5",
+      "sample_filtered_feature_bc_matrix.h5",
+      "filtered_gene_bc_matrices_h5.h5"
+    ],
+    "mtx": [
+      "matrix.mtx.gz",
+      "matrix.mtx",
+      "cells_x_genes.mtx",
+      "quants_mat.mtx",
+      "count_matrix.mtx",
+      "DGE.mtx"
+    ]
+  },
+  "folderMarkerPrefixes": {
+    "mtx": "_-."
+  },
+  "formats": [
+    {
+      "id": "h5ad",
+      "label": "AnnData (.h5ad)",
+      "ecosystem": "python",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".h5ad"
+        ]
+      }
+    },
+    {
+      "id": "zarr",
+      "label": "AnnData Zarr",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "zarr",
+      "names": {
+        "zip": [
+          ".zarr.zip",
+          ".zip"
+        ],
+        "folder": [
+          ".zarr"
+        ]
+      }
+    },
+    {
+      "id": "loom",
+      "label": "Loom (.loom)",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".loom"
+        ]
+      }
+    },
+    {
+      "id": "tenx-h5",
+      "label": "10x Cell Ranger HDF5 (.h5)",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".h5"
+        ]
+      }
+    },
+    {
+      "id": "tenx-outs",
+      "label": "Cell Ranger outs/ folder",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "folder": []
+      }
+    },
+    {
+      "id": "h5mu",
+      "label": "MuData (.h5mu)",
+      "ecosystem": "python",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".h5mu"
+        ]
+      }
+    },
+    {
+      "id": "mudata-zarr",
+      "label": "MuData Zarr",
+      "ecosystem": "any",
+      "access": "ranges",
+      "container": "zarr",
+      "names": {
+        "zip": [],
+        "folder": []
+      }
+    },
+    {
+      "id": "rds",
+      "label": "R object (.rds)",
+      "ecosystem": "r",
+      "access": "stream",
+      "container": "rds",
+      "names": {
+        "file": [
+          ".rds.gz",
+          ".rds"
+        ]
+      }
+    },
+    {
+      "id": "rda",
+      "label": "R data (.rda, .RData)",
+      "ecosystem": "r",
+      "access": "stream",
+      "container": "rds",
+      "names": {
+        "file": [
+          ".rdata.gz",
+          ".rda.gz",
+          ".rdata",
+          ".rda"
+        ]
+      }
+    },
+    {
+      "id": "h5seurat",
+      "label": "h5Seurat (.h5Seurat)",
+      "ecosystem": "r",
+      "access": "ranges",
+      "container": "hdf5",
+      "names": {
+        "file": [
+          ".h5seurat"
+        ]
+      },
+      "refusal": "This is an h5Seurat file (SeuratDisk), which Cellucid does not open. In R, read it with seu <- SeuratDisk::LoadH5Seurat(path) and save it with saveRDS(seu, \"object.rds\"), then open the .rds, or show it with cellucid::cellucid_view(seu)."
+    },
+    {
+      "id": "mtx",
+      "label": "MatrixMarket folder",
+      "ecosystem": "any",
+      "access": "stream",
+      "container": "text",
+      "names": {
+        "folder": []
+      }
+    }
+  ]
+}

@@ -12,13 +12,18 @@ import {
   abandonedGestureNotice,
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
+  idleSelectionNoticeHtml,
   selectionNoticeHtml
 } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { removeStepControls, showStepControls } from './step-controls.js';
 import {
-  deliverSelectionToJupyter,
+  publishToolHint,
+  removeStepControls,
+  showStepControls
+} from './step-controls.js';
+import {
+  deliverSelectionToViewerHost,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
@@ -26,23 +31,23 @@ import {
   requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
-  requireExactKeys,
   requireHighlightSelectionState,
-  requireJupyterSource,
+  requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
   requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
-  requireUnifiedSelectionState
+  requireUnifiedSelectionState,
 } from './exact-contract.js';
-import { formatCount } from '../../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /**
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
- * @param {any|null} [options.jupyterSource]
+ * @param {any|null} [options.viewerHostSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
@@ -51,10 +56,10 @@ import { formatCount } from '../../components/display-format.js';
 export function initKnnSelection(options) {
   requireExactKeys(
     options,
-    ['state', 'viewer', 'jupyterSource', 'selectionState', 'ui'],
+    ['state', 'viewer', 'viewerHostSource', 'selectionState', 'ui'],
     'KNN selection options'
   );
-  const { state, viewer, jupyterSource, selectionState, ui } = options;
+  const { state, viewer, viewerHostSource, selectionState, ui } = options;
   requireMethods(
     state,
     'KNN selection state',
@@ -76,7 +81,7 @@ export function initKnnSelection(options) {
       'setKnnStepCallback'
     ]
   );
-  requireJupyterSource(jupyterSource);
+  requireViewerHostSource(viewerHostSource);
   requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'KNN selection UI');
   const highlightModeDescriptionEl = requireDomElement(
@@ -121,7 +126,7 @@ export function initKnnSelection(options) {
     const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'knn',
-      label: `KNN${stepsLabel} (${formatCount(knnEvent.cellCount)} cells)`,
+      label: `KNN${stepsLabel} (${formatCountOf(knnEvent.cellCount, 'cell')})`,
       cellIndices: knnEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -132,9 +137,9 @@ export function initKnnSelection(options) {
       state.pointCount
     );
 
-    debug.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
-    trackDelivery(deliverSelectionToJupyter({
-      jupyterSource,
+    debug.log(`[UI] KNN selected ${formatCountOf(knnEvent.cellCount, 'cell')} from ${knnEvent.steps} selection(s)`);
+    trackDelivery(deliverSelectionToViewerHost({
+      viewerHostSource,
       cellIndices: knnEvent.cellIndices,
       source: 'knn',
       onFailure: error => {
@@ -199,12 +204,14 @@ export function initKnnSelection(options) {
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'knnHistory', {
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
     selectionState.knnRedoStack = [];
 
-    selectionState.lastKnnCandidates = [...stepEvent.candidates];
+    // Cell lists are values: a step publishes a new one, so history keeps
+    // references, not copies.
+    selectionState.lastKnnCandidates = stepEvent.candidates;
     selectionState.lastKnnStep = stepEvent.step;
 
     updateKnnUI(stepEvent);
@@ -221,7 +228,7 @@ export function initKnnSelection(options) {
     if (selectionState.knnHistory.length === 0) return;
 
     selectionState.knnRedoStack.push({
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
 
@@ -249,7 +256,7 @@ export function initKnnSelection(options) {
     if (selectionState.knnRedoStack.length === 0) return;
 
     selectionState.knnHistory.push({
-      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
     });
 
@@ -361,8 +368,8 @@ export function initKnnSelection(options) {
     if (destroyed) return;
     const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML =
-        `${HIGHLIGHT_MODE_COPY.knn}${noticeHtml}`;
+      publishToolHint(documentOwner, HIGHLIGHT_MODE_COPY.knn);
+      highlightModeDescriptionEl.innerHTML = idleSelectionNoticeHtml(notice);
       removeStepControls(
         documentOwner,
         'knn',
@@ -396,7 +403,7 @@ export function initKnnSelection(options) {
       : stepEvent.degree === 0
         ? 'seed only'
         : `${stepEvent.degree}° neighbors`;
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')} (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
     showKnnControls(stepEvent.candidateCount, notice);
 
@@ -409,7 +416,7 @@ export function initKnnSelection(options) {
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];
     selectionState.lastKnnCandidates = unifiedState.inProgress
-      ? [...unifiedState.candidates]
+      ? unifiedState.candidates
       : null;
     selectionState.lastKnnStep = unifiedState.stepCount;
     if (!unifiedState.inProgress) {

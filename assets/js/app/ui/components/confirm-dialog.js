@@ -7,6 +7,7 @@
 import { escapeHtml } from '../utils.js';
 import { claimModalDocumentLayer } from './modal-background-owner.js';
 import { createDomId } from './dom-id.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 let activeKeydownHandler = null;
 let activeDialogCancel = null;
@@ -243,7 +244,7 @@ export function showConfirmDialog({
     if (cleanupErrors.length > 1) {
       throw new AggregateError(
         cleanupErrors,
-        `Confirm dialog teardown failed in ${cleanupErrors.length} operations`
+        `Confirm dialog teardown failed in ${formatCountOf(cleanupErrors.length, 'operation')}`
       );
     }
   };

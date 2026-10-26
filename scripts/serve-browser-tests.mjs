@@ -49,9 +49,7 @@ for (const asset of inventory.assets) {
 const contentTypes = new Map([
   ['.bin', 'application/octet-stream'],
   ['.css', 'text/css; charset=utf-8'],
-  ['.f32', 'application/octet-stream'],
   ['.glb', 'model/gltf-binary'],
-  ['.gz', 'application/gzip'],
   ['.h5ad', 'application/x-hdf5'],
   ['.htm', 'text/html; charset=utf-8'],
   ['.html', 'text/html; charset=utf-8'],
@@ -66,9 +64,6 @@ const contentTypes = new Map([
   ['.png', 'image/png'],
   ['.svg', 'image/svg+xml'],
   ['.txt', 'text/plain; charset=utf-8'],
-  ['.u8', 'application/octet-stream'],
-  ['.u16', 'application/octet-stream'],
-  ['.wasm', 'application/wasm'],
   ['.webmanifest', 'application/manifest+json; charset=utf-8'],
   ['.webp', 'image/webp'],
   ['.woff', 'font/woff'],
@@ -127,10 +122,12 @@ async function serve(request, response) {
 
   const extension = path.extname(candidate).toLowerCase();
   const portableRelative = relative.split(path.sep).join('/');
+  // The keys of a Zarr store folder carry no extension (`.zgroup`, `X/0.0`,
+  // `zarr.json`): every file below a `.zarr/` folder is served as bytes.
   const contentType = pathname === '/_cellucid/health'
     ? 'text/plain; charset=utf-8'
     : inventoryContentTypes.get(portableRelative) ??
-      contentTypes.get(extension);
+      (/\.zarr\//.test(portableRelative) ? 'application/octet-stream' : contentTypes.get(extension));
   if (contentType === undefined) {
     send(
       response,
@@ -141,20 +138,35 @@ async function serve(request, response) {
     return;
   }
 
-  response.writeHead(200, {
+  // One `bytes=a-b` range, as the link source's in-place reads send, is
+  // answered with 206 and that slice; anything else gets the whole file.
+  const range = /^bytes=(\d+)-(\d+)$/.exec(request.headers.range ?? '');
+  const start = range === null ? 0 : Number(range[1]);
+  const end = range === null ? metadata.size - 1 : Math.min(Number(range[2]), metadata.size - 1);
+  if (range !== null && start > end) {
+    response.writeHead(416, {
+      ...(allowCors ? { 'Access-Control-Allow-Origin': '*' } : {}),
+      'Content-Range': `bytes */${metadata.size}`,
+    });
+    response.end();
+    return;
+  }
+  response.writeHead(range === null ? 200 : 206, {
     ...(allowCors
       ? { 'Access-Control-Allow-Origin': '*' }
       : {}),
+    'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
-    'Content-Length': metadata.size,
+    'Content-Length': end - start + 1,
     'Content-Type': contentType,
+    ...(range === null ? {} : { 'Content-Range': `bytes ${start}-${end}/${metadata.size}` }),
   });
   if (request.method === 'HEAD') {
     response.end();
     return;
   }
 
-  const stream = createReadStream(candidate);
+  const stream = createReadStream(candidate, { start, end });
   stream.on('error', () => {
     if (!response.headersSent) {
       send(response, 500, 'Read failure', allowCors);
@@ -217,6 +229,8 @@ for (const activeServer of [server, sampleServer]) {
   activeServer.headersTimeout = 121_000;
 }
 
+let bindFailed = false;
+
 function reportListenFailure(error, role, listenPort, variable) {
   if (error.code === 'EADDRINUSE') {
     process.stderr.write(`${describePortInUse(role, listenPort, variable)}\n`);
@@ -226,10 +240,19 @@ function reportListenFailure(error, role, listenPort, variable) {
         `${error.stack || error}\n`
     );
   }
-  // Exit rather than close(): the peer server may already be listening, and a
-  // half-bound pair would leave the run waiting for an address that will never
-  // answer.
-  process.exit(1);
+  // The peer server may already be listening, and a half-bound pair would
+  // leave the run waiting for an address that will never answer: both are
+  // closed (one still binding is closed when it binds, in listenOnce) and the
+  // process ends with status 1 once nothing holds it. Not process.exit():
+  // Node can deadlock there, joining a V8 background thread that waits for a
+  // garbage collection only the exiting main thread could run (measured with
+  // the token validator: 7 of 60 failing runs hung).
+  bindFailed = true;
+  process.exitCode = 1;
+  for (const activeServer of [server, sampleServer]) {
+    if (activeServer.listening) activeServer.close();
+    activeServer.closeAllConnections();
+  }
 }
 
 /**
@@ -237,7 +260,7 @@ function reportListenFailure(error, role, listenPort, variable) {
  *
  * The bind handler is `once` and is removed the moment the socket is listening,
  * so a runtime error afterwards is reported and survived rather than being
- * routed into `process.exit(1)` by a handler that outlived its purpose.
+ * routed into the bind-failure exit by a handler that outlived its purpose.
  */
 function listenOnce(activeServer, role, listenPort, variable, announce) {
   const onBindFailure = error => {
@@ -249,6 +272,10 @@ function listenOnce(activeServer, role, listenPort, variable, announce) {
   });
   activeServer.listen(listenPort, host, () => {
     activeServer.removeListener('error', onBindFailure);
+    if (bindFailed) {
+      activeServer.close();
+      return;
+    }
     activeServer.on('error', error => {
       process.stderr.write(
         `Browser-test ${role} server error: ${error.stack || error}\n`

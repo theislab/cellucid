@@ -1,26 +1,50 @@
 import { expect, test } from './helpers/test.mjs';
 
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=connectivity-edges-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=connectivity-edges-ci`;
 
 /**
  * Connectivity edges in the real viewer (rendering/connectivity-edge-layer.js):
- * every pane draws the first K of its own visible edges, from 28-byte
- * instance records that exist only for those K edges; a pane's filters, a
- * kept view, a geometry change and a dataset replacement each keep that
- * exact.
+ * every pane draws the first K of its own visible edges, from instance
+ * records that exist only for those K edges (gathered on the GPU from
+ * one position texture a geometry); a pane's filters, a kept view, a geometry change
+ * and a dataset replacement each keep that exact.
  */
 test('every pane draws exactly the first K of its own visible edges from K records', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const proof = await page.evaluate(async () => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
     const ui = window._cellucidUi;
@@ -46,9 +70,8 @@ test('every pane draws exactly the first K of its own visible edges from K recor
     const edgeCount = unique.length;
     const sources = Uint32Array.from(unique, key => Math.floor(key / nCells));
     const destinations = Uint32Array.from(unique, key => key % nCells);
-    const weights = Float64Array.from(unique, (_key, index) => 1 + (index % 3));
-
-    viewer.setupEdgesV2({ sources, destinations, weights, nEdges: edgeCount, nCells });
+    const strength = Float32Array.from(unique, (_key, index) => (1 + (index % 3)) / 3);
+    viewer.setupEdgesV2(edgePayloadOf(sources, destinations, strength, nCells));
 
     // A kept view that hides the first half of the cells.
     const payload = state.getSnapshotPayload();
@@ -100,7 +123,7 @@ test('every pane draws exactly the first K of its own visible edges from K recor
       return submissions;
     };
     const frames = await capture();
-    // The counts land in slices after the selection.
+    // The counts are reported after the selection.
     await new Promise(resolve => setTimeout(resolve, 50));
     unsubscribe();
 
@@ -121,7 +144,7 @@ test('every pane draws exactly the first K of its own visible edges from K recor
     const kept = expectedFor(snapshotTransparency);
     const memory = viewer.getConnectivityMemoryStats();
 
-    // A geometry change re-gathers records; nothing is re-selected.
+    // A geometry change reads the new positions; nothing is re-selected.
     const positions = viewer.getViewPositions('live').map(value => value * 0.5);
     viewer.updatePositions(positions, viewer.getViewDimension('live'));
     const afterMove = await capture();
@@ -158,7 +181,7 @@ test('every pane draws exactly the first K of its own visible edges from K recor
   expect(proof.kept.shown).toBeLessThan(proof.live.shown + 1);
   // GPU memory is K records a pane, never per edge.
   for (const [, gpuBytes] of proof.memory.panes) {
-    expect(gpuBytes).toBe(Math.min(proof.target, proof.edgeCount) * 28);
+    expect(gpuBytes).toBe(Math.min(proof.target, proof.edgeCount) * 40);
   }
   // Visible counts arrive and equal a full pass over the graph.
   expect(proof.counts).toEqual(
@@ -177,18 +200,36 @@ test('a dataset replacement drops the connectivity graph and every pane\'s recor
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const proof = await page.evaluate(async () => {
+    // An edge payload as the reader worker builds it: the symmetric CSR of
+    // the pairs (weights as given, largest 1) through its own extraction.
+    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+    const edgePayloadOf = (sources, destinations, weights, nCells) => {
+      const indptr = new Int32Array(nCells + 1);
+      for (let edge = 0; edge < sources.length; edge++) {
+        indptr[sources[edge] + 1]++;
+        indptr[destinations[edge] + 1]++;
+      }
+      for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+      const fill = indptr.slice(0, nCells);
+      const indices = new Int32Array(indptr[nCells]);
+      const data = new Float32Array(indptr[nCells]);
+      // Edges come ordered by source, so every row is written ascending.
+      for (let edge = 0; edge < sources.length; edge++) {
+        const s = sources[edge];
+        const d = destinations[edge];
+        indices[fill[d]] = s;
+        data[fill[d]++] = weights[edge];
+        indices[fill[s]] = d;
+        data[fill[s]++] = weights[edge];
+      }
+      return extractConnectivityEdges({ format: 'csr', shape: [nCells, nCells], indptr, indices, data }, nCells);
+    };
     const viewer = window._cellucidViewer;
     const nCells = viewer.getPointCount();
-    viewer.setupEdgesV2({
-      sources: Uint32Array.from([0, 1]),
-      destinations: Uint32Array.from([1, 2]),
-      weights: Float64Array.from([1, 2]),
-      nEdges: 2,
-      nCells,
-    });
+    viewer.setupEdgesV2(edgePayloadOf(Uint32Array.from([0, 1]), Uint32Array.from([1, 2]), Float32Array.from([0.5, 1]), nCells));
     viewer.setEdgeVisibleTarget(2);
     viewer.refreshEdgeSelectionForView('live');
     viewer.setShowConnectivity(true);
@@ -198,13 +239,17 @@ test('a dataset replacement drops the connectivity graph and every pane\'s recor
     const after = viewer.getConnectivityMemoryStats();
     return {
       beforeGpu: before.gpuBytes,
+      beforePaneGpu: before.panes[0].gpuBytes,
+      beforePositionTextureGpu: before.positionTextureBytes,
       afterGpu: after.gpuBytes,
       afterGraph: after.graphBytes,
       hasData: viewer.hasConnectivityData(),
     };
   });
   expect(pageErrors).toEqual([]);
-  expect(proof.beforeGpu).toBe(2 * 28);
+  expect(proof.beforePaneGpu).toBe(2 * 40);
+  expect(proof.beforePositionTextureGpu).toBeGreaterThan(0);
+  expect(proof.beforeGpu).toBe(proof.beforePaneGpu + proof.beforePositionTextureGpu);
   expect(proof.afterGpu).toBe(0);
   expect(proof.afterGraph).toBe(0);
   expect(proof.hasData).toBe(false);

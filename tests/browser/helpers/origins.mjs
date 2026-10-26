@@ -8,7 +8,7 @@
 // fixtures at the old one, which fails the whole spec rather than the one
 // request. So a spec never writes an origin down, it asks for one here.
 //
-// Most fixture roots travel to the application inside the `exportsBaseUrl`
+// Most fixture roots travel to the application inside the `sampleCatalog`
 // query parameter and so arrive percent-encoded. `encodedAppUrl` builds that
 // form by encoding the resolved URL, never by editing an already-encoded
 // literal — substituting a port inside `http%3A%2F%2F…%3A<port>%2F…` is how the
@@ -22,7 +22,10 @@
 //
 //     await page.evaluate(origin => { … }, APP_ORIGIN);
 
-import { resolveBrowserTestPorts } from '../../../scripts/browser-test-ports.mjs';
+import {
+  DEPLOYED_BROWSER_TEST_HOST,
+  resolveBrowserTestPorts,
+} from '../../../scripts/browser-test-ports.mjs';
 
 const { host, port, samplePort, origin, sampleOrigin } =
   resolveBrowserTestPorts();
@@ -41,6 +44,14 @@ export const APP_ORIGIN = origin;
 
 /** Origin of the permissive-CORS server, e.g. `http://<host>:<samplePort>`. */
 export const SAMPLE_ORIGIN = sampleOrigin;
+
+/**
+ * The application server under a name that is not this machine's
+ * (`deployed.localhost`, which every engine resolves to it): there the page is
+ * a deployed site and starts its workers from their bundles
+ * (`assets/js/workers/worker-script.js`).
+ */
+export const DEPLOYED_APP_ORIGIN = `http://${DEPLOYED_BROWSER_TEST_HOST}:${port}`;
 
 function join(originValue, pathname) {
   if (!pathname.startsWith('/')) {
@@ -81,10 +92,10 @@ export function encodedAppUrl(pathname) {
   return encodeURIComponent(appUrl(pathname));
 }
 
-/** Root the prepared export fixtures are served from. */
-export const EXPORTS_BASE_URL = appUrl('/tests/browser/fixtures/exports/');
+/** The browser tests' default sample catalog (`fixtures/catalog/`). */
+export const SAMPLE_CATALOG_URL = appUrl('/tests/browser/fixtures/catalog/');
 
-/** {@link EXPORTS_BASE_URL} as an `exportsBaseUrl` query-parameter value. */
-export const ENCODED_EXPORTS_BASE_URL = encodedAppUrl(
-  '/tests/browser/fixtures/exports/'
+/** {@link SAMPLE_CATALOG_URL} as an `sampleCatalog` query-parameter value. */
+export const ENCODED_SAMPLE_CATALOG_URL = encodedAppUrl(
+  '/tests/browser/fixtures/catalog/'
 );

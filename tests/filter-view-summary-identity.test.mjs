@@ -10,7 +10,7 @@ function countOwner(fields, transparency) {
     pointCount: transparency.length,
     obsData: { fields },
     varData: { fields: [] },
-    categoryTransparency: Float32Array.from(transparency),
+    categoryTransparency: Uint8Array.from(transparency),
     activeFieldSource: 'obs',
     activeFieldIndex: 0,
     activeVarFieldIndex: -1,
@@ -77,7 +77,7 @@ test('a non-active category filter row counts against the current filters', () =
   // cached counts are never refreshed.
   owner.activeFieldIndex = 1;
   score._continuousFilter = { min: 0.5, max: 1 };
-  owner.categoryTransparency = Float32Array.from([0, 1, 0, 0]);
+  owner.categoryTransparency = Uint8Array.from([0, 1, 0, 0]);
 
   assert.deepEqual(owner.getFilterCellCounts(CATEGORY_ROW), { available: 2, visible: 1 });
 });

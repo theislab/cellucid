@@ -1,23 +1,27 @@
 /**
- * Correlation Analysis UI Component
+ * Correlation: how two variables move together within each page.
  *
- * Goals:
- * - Match the `Detailed` variable selection mechanism (continuous obs + gene expression selector)
- * - Stack X and Y selectors vertically (not side-by-side)
- * - Use the centralized compute pipeline (MultiVariableAnalysis.correlationAnalysis)
- * - Render via PlotRegistry's `scatterplot`
- * - Use the standard figure modal grid with interactive plot options
+ * The form is the correlation options schema's
+ * (`options/correlation-options.js`): the X and Y variables (an obs field or
+ * a gene, the same picker Detailed uses), the pages, Run; the method and the
+ * colouring under More options. Computed by
+ * `MultiVariableAnalysis.correlationAnalysis`, drawn by the `scatterplot`
+ * plot type.
  */
 
-import { createStatusLine } from '../../../ui/components/controls.js';
-import { formatCount } from '../../../ui/components/display-format.js';
+import { formatCount } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { createSelectField, NONE_VALUE } from '../../shared/dom-utils.js';
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
-import { applyFormControlAccessibility } from '../components/control-accessibility.js';
+import { CORRELATION_OPTIONS } from '../../options/correlation-options.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
+import {
+  createResultEnvelope,
+  readResultEnvelope,
+  requireDatasetPages,
+  requireDatasetVariable
+} from '../../shared/analysis-result-session.js';
 
 function requireCorrelationVariable(variable, label) {
   if (
@@ -80,56 +84,15 @@ function requireReadyPageData(pageData, pageIds, variableKey) {
   }
 }
 
-function requireStoredCorrelationVariable(variable, label, dataLayer) {
-  if (
-    variable === null ||
-    typeof variable !== 'object' ||
-    Array.isArray(variable) ||
-    Object.keys(variable).length !== 2 ||
-    !Object.hasOwn(variable, 'type') ||
-    !Object.hasOwn(variable, 'variable') ||
-    typeof variable.type !== 'string' ||
-    typeof variable.variable !== 'string'
-  ) {
-    throw new TypeError(
-      `${label} must contain exactly string type and variable fields`
-    );
-  }
-  if (variable.type.length === 0 || variable.variable.length === 0) {
-    if (variable.type.length !== 0 || variable.variable.length !== 0) {
-      throw new TypeError(
-        `${label} type and variable must both be empty or both be selected`
-      );
-    }
-    return;
-  }
-  if (
-    variable.type !== 'continuous_obs' &&
-    variable.type !== 'gene_expression'
-  ) {
-    throw new TypeError(`${label} type is unsupported`);
-  }
-  const inventory = dataLayer.getAvailableVariables(variable.type);
-  if (!Array.isArray(inventory)) {
-    throw new TypeError(`${label} variable inventory must be an array`);
-  }
-  if (!inventory.some(candidate => candidate?.key === variable.variable)) {
-    throw new Error(
-      `${label} variable "${variable.variable}" was not found`
-    );
-  }
-}
 
 /**
  * @typedef {{ type: 'continuous_obs'|'gene_expression', key: string }} CorrelationVariable
- * @typedef {{ variableX: CorrelationVariable|null, variableY: CorrelationVariable|null, method: 'pearson'|'spearman' }} CorrelationFormValues
  */
 
 export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
-      // Correlation has its own internal page selector; don't block rendering
-      // when the global page selection is empty.
+      // Correlation has its own page selector.
       minPages: 0,
       maxPages: null,
       description: 'Select pages to analyze'
@@ -144,477 +107,137 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     return 'correlation-analysis';
   }
 
-  _getLoadingMessage() {
-    return 'Computing correlation...';
-  }
-
   _getSuccessMessage() {
     return 'Correlation analysis complete';
   }
 
   constructor(options) {
     super(options);
-
-    this._xSelector = null;
-    this._ySelector = null;
-
-    this._xIdPrefix = this._instanceId ? `${this._instanceId}-correlation-x` : 'correlation-x';
-    this._yIdPrefix = this._instanceId ? `${this._instanceId}-correlation-y` : 'correlation-y';
     this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-correlation-analysis-plot` : 'correlation-analysis-plot';
-
-    // Page selector component
     this._pageSelector = null;
     this._pageSelectContainer = null;
-
-    // Color by categorical variable
-    this._colorByVariable = null;
-
   }
 
   // ===========================================================================
-  // Page Selection Handlers
+  // Options
   // ===========================================================================
 
-  _handlePageChange = (pageIds) => {
-    this._selectedPages = pageIds || [];
-    this._currentConfig.pages = this._selectedPages;
-    // Trigger auto-update (like detailed mode)
-    this._scheduleUpdate();
-  };
-
-  _handlePageColorChange = (pageId, color) => {
-    this.dataLayer?.setPageColor?.(pageId, color);
-    // Trigger auto-update to reflect color changes
-    this._scheduleUpdate();
-  };
-
-  // ===========================================================================
-  // Auto-calculation Logic (like Detailed mode)
-  // ===========================================================================
-
-  /**
-   * Override _canRunAnalysis to check for X and Y variables
-   * @override
-   */
-  _canRunAnalysis() {
-    const xSel = this._xSelector?.getSelectedVariable?.() || { type: '', variable: '' };
-    const ySel = this._ySelector?.getSelectedVariable?.() || { type: '', variable: '' };
-    return (
-      xSel.type && xSel.variable &&
-      ySel.type && ySel.variable &&
-      this._selectedPages.length > 0
-    );
+  _getOptionsSchema() {
+    return CORRELATION_OPTIONS;
   }
 
-  /**
-   * Override to run analysis automatically when inputs are valid
-   * @override
-   */
-  async _runAnalysisIfValid(scheduledRequestId = null) {
-    if (this._isDestroyed) return;
-    if (
-      scheduledRequestId !== null &&
-      !this._isCurrentAnalysisIntent(scheduledRequestId)
-    ) {
-      return;
-    }
-    if (!this._canRunAnalysis()) {
-      this._invalidateAnalysisRequest();
-      await this._hideResult();
-      return;
-    }
+  _getOptionsContext() {
+    return {
+      variableExists: (type, key) => this.dataLayer.getAvailableVariables(type).some(variable => variable.key === key),
+      categoricalFields: this.dataLayer.getAvailableVariables('categorical_obs').map(variable => ({ key: variable.key })),
+      createVariableControl: (entry, value, onChange) => this._createVariableControl(entry, value, onChange)
+    };
+  }
 
-    // Validate that X and Y are different
-    const formValues = structuredClone(this._getFormValues());
-    if (formValues.variableX?.key === formValues.variableY?.key &&
-        formValues.variableX?.type === formValues.variableY?.type) {
-      this._invalidateAnalysisRequest();
-      await this._hideResult();
-      return;
-    }
-
-    const requestId = this._startAnalysisRequest(scheduledRequestId);
-    if (requestId === null) return;
-    const releaseBusy = this._claimBusy();
-    try {
-      const result = await this._runAnalysisImpl(formValues, requestId);
-
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      if (result) {
-        await this._showResult(result, requestId);
-        if (!this._isCurrentAnalysisRequest(requestId)) return;
-        await this._publishAnalysisResult(result, requestId);
+  /** The X / Y picker: an obs field or a gene, as in Detailed. */
+  _createVariableControl(entry, value, onChange) {
+    const root = document.createElement('div');
+    root.className = 'control-block';
+    const axis = entry.key === 'variableX' ? 'x' : 'y';
+    const selector = createVariableSelectorComponent({
+      dataLayer: this.dataLayer,
+      container: root,
+      allowedTypes: ['continuous', 'gene'],
+      idPrefix: this._instanceId ? `${this._instanceId}-correlation-${axis}` : `correlation-${axis}`,
+      typeLabel: entry.label,
+      onVariableChange: () => {
+        const selected = selector.getSelectedVariable();
+        onChange(selected.type && selected.variable ? { type: selected.type, key: selected.variable } : null);
       }
-    } catch (err) {
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      console.error('[CorrelationAnalysisUI] Analysis failed:', err);
-      await this._showError('Analysis failed: ' + err.message, requestId);
-    } finally {
-      releaseBusy();
-      this._finishAnalysisRequest(requestId);
-    }
-  }
-
-  /**
-   * Hide result container
-   */
-  _hideResult() {
-    return this._discardFormResult();
-  }
-
-  /**
-   * Show error message
-   */
-  async _showError(message, requestId = null) {
-    await this._discardFormResult();
-    if (
-      requestId !== null &&
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return false;
-    }
-    if (this._resultContainer) {
-      this._resultContainer.hidden = false;
-      this._resultContainer.appendChild(
-        createStatusLine({ tone: 'danger', text: message }).root
-      );
-    }
-    this._notifications?.error?.(message, { category: 'analysis' });
-    return true;
-  }
-
-  // ===========================================================================
-  // Page Change Notification Overrides
-  // ===========================================================================
-
-  /**
-   * Update when highlights change (cells added/removed from pages)
-   * Override base class to check for X/Y variables instead of dataSource.variable
-   * @override
-   */
-  onHighlightChanged() {
-    // This mode recalculates by itself, so a highlight change re-runs it
-    // (deferred while the panel is hidden) instead of discarding the result
-    // the way the run-button forms do.
-    this._applyHighlightChangeWhenShown();
-  }
-
-  /**
-   * @override
-   */
-  _applyHighlightChange() {
-    this._updatePageSelectorCounts();
-
-    if (this._canRunAnalysis()) {
-      this._scheduleUpdate();
-    }
-  }
-
-  /**
-   * Override _renderControls to not render a button (auto-calculate like detailed mode)
-   * @override
-   */
-  _renderControls() {
-    // Rebuilding the form on every accordion reopen must not discard the
-    // choices already made in it.
-    const carriedValues = this._captureFormControlValues();
-    this._formContainer.innerHTML = '';
-
-    // Validate requirements
-    const validation = this.validateRequirements(this._selectedPages);
-
-    if (!validation.valid) {
-      this._formContainer.appendChild(createStatusLine({
-        tone: 'warning',
-        text: validation.error || this.getRequirementText()
-      }).root);
-      return;
-    }
-
-    // Create form wrapper (no button - auto-calculates)
-    const wrapper = document.createElement('div');
-    wrapper.className = 'analysis-form';
-
-    // Render form controls
-    this._renderFormControls(wrapper);
-
-    // Same form-control accessibility pass the base class runs: scoped ids and
-    // a label bound to every control. Overriding _renderControls to drop the
-    // run button must not also drop that.
-    applyFormControlAccessibility(wrapper, this._controlScope);
-    this._restoreFormControlValues(wrapper, carriedValues);
-
-    this._formContainer.appendChild(wrapper);
-
-    // Trigger initial calculation if inputs are valid
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Render form-specific controls
-   * @param {HTMLElement} wrapper
-   */
-  _renderFormControls(wrapper) {
-    // X axis variable selector
-    const xContainer = document.createElement('div');
-    xContainer.className = 'control-block';
-    wrapper.appendChild(xContainer);
-
-    this._xSelector?.destroy?.();
-    this._xSelector = createVariableSelectorComponent({
-      dataLayer: this.dataLayer,
-      container: xContainer,
-      allowedTypes: ['continuous', 'gene'],
-      idPrefix: this._xIdPrefix,
-      typeLabel: 'X axis variable',
-      onVariableChange: () => this._scheduleUpdate()
     });
-
-    // Y axis variable selector
-    const yContainer = document.createElement('div');
-    yContainer.className = 'control-block';
-    wrapper.appendChild(yContainer);
-
-    this._ySelector?.destroy?.();
-    this._ySelector = createVariableSelectorComponent({
-      dataLayer: this.dataLayer,
-      container: yContainer,
-      allowedTypes: ['continuous', 'gene'],
-      idPrefix: this._yIdPrefix,
-      typeLabel: 'Y axis variable',
-      onVariableChange: () => this._scheduleUpdate()
-    });
-
-    // Page selector (matching DetailedAnalysisUI)
-    this._renderPageSelector(wrapper);
-
-    // Color by categorical variable selector
-    this._renderColorBySelector(wrapper);
-
-    // Correlation method selector
-    wrapper.appendChild(createSelectField({
-      label: 'Correlation method',
-      name: 'method',
-      tip: 'correlation-method',
-      options: [
-        { value: 'pearson', label: 'Pearson (linear)', selected: true },
-        { value: 'spearman', label: 'Spearman (rank)' }
-      ],
-      onChange: () => this._scheduleUpdate()
-    }).root);
+    const set = next => {
+      if (next === null) selector.clear();
+      else selector.setSelectedVariable(next.type, next.key);
+    };
+    set(value);
+    return { root, set, destroy: () => selector.destroy() };
   }
 
-  /**
-   * Render page selector using shared PageSelectorComponent
-   * @param {HTMLElement} wrapper
-   */
-  _renderPageSelector(wrapper) {
-    let pages;
-    try {
-      pages = this.dataLayer.getPages();
-    } catch (err) {
-      console.error('[CorrelationAnalysisUI] Failed to get pages:', err);
-      return;
+  _getRunBlocker(options) {
+    if (options.variableX === null || options.variableY === null) return 'Choose the X and Y variables';
+    if (options.variableX.type === options.variableY.type && options.variableX.key === options.variableY.key) {
+      return 'X and Y are the same variable';
     }
+    if (this._selectedPages.length === 0) return 'Select at least one page';
+    return null;
+  }
 
-    if (pages.length === 0) return;
-
-    // Create container for the component
+  _renderFormLead(wrapper) {
+    const pages = this.dataLayer.getPages();
+    if (!Array.isArray(pages) || pages.length === 0) return;
     this._pageSelectContainer = document.createElement('div');
     wrapper.appendChild(this._pageSelectContainer);
-
-    // Destroy previous instance if exists
     this._pageSelector?.destroy();
-
-    // Create PageSelectorComponent
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: this._handlePageChange,
-      onColorChange: this._handlePageColorChange,
+      onSelectionChange: pageIds => {
+        this._selectedPages = pageIds || [];
+        this._currentConfig.pages = this._selectedPages;
+        this._updateRunRow();
+        this._updateStale();
+      },
+      onColorChange: (pageId, color) => this.dataLayer?.setPageColor?.(pageId, color),
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages.length > 0
-        ? this._selectedPages
-        : undefined,
+      initialSelection: this._selectedPages.length > 0 ? this._selectedPages : undefined,
       includeDerivedPages: true,
-      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
-      label: 'Compare pages'
+      getCellCountForPageId: pageId => this.dataLayer.getCellCountForPageId(pageId),
+      label: 'Pages'
     });
     this._selectedPages = this._pageSelector.getSelectedPages();
     this._currentConfig.pages = [...this._selectedPages];
   }
 
-  /**
-   * Render color by categorical variable selector
-   * @param {HTMLElement} wrapper
-   */
-  _renderColorBySelector(wrapper) {
-    let categoricalVars = [];
-    try {
-      categoricalVars = this.dataLayer.getAvailableVariables('categorical_obs') || [];
-    } catch (err) {
-      console.error('[CorrelationAnalysisUI] Failed to get categorical variables:', err);
-    }
+  // ===========================================================================
+  // Run
+  // ===========================================================================
 
-    if (categoricalVars.length === 0) return;
-
-    wrapper.appendChild(createSelectField({
-      label: 'Color by',
-      name: 'colorBy',
-      options: [
-        { value: NONE_VALUE, label: 'None (color by page)', selected: !this._colorByVariable },
-        ...categoricalVars.map(v => ({
-          value: v.key,
-          label: v.key,
-          selected: this._colorByVariable === v.key
-        }))
-      ],
-      onChange: value => {
-        this._colorByVariable = (value && value !== NONE_VALUE) ? value : null;
-        this._scheduleUpdate();
-      }
-    }).root);
-  }
-
-  /**
-   * Extract form values
-   * @returns {CorrelationFormValues}
-   */
-  _getFormValues() {
-    const form = this._formContainer.querySelector('.analysis-form');
-    const method = form.querySelector('[name="method"]')?.value || 'pearson';
-
-    const xSel = this._xSelector?.getSelectedVariable?.() || { type: '', variable: '' };
-    const ySel = this._ySelector?.getSelectedVariable?.() || { type: '', variable: '' };
-
-    const variableX = xSel.type && xSel.variable ? { type: xSel.type, key: xSel.variable } : null;
-    const variableY = ySel.type && ySel.variable ? { type: ySel.type, key: ySel.variable } : null;
-
-    return {
-      variableX,
-      variableY,
-      method,
-      colorBy: this._colorByVariable
-    };
-  }
-
-  _validateForm(formValues) {
-    if (!formValues.variableX) {
-      return { valid: false, error: 'Please select an X axis variable' };
-    }
-    if (!formValues.variableY) {
-      return { valid: false, error: 'Please select a Y axis variable' };
-    }
-    if (formValues.variableX.key === formValues.variableY.key &&
-        formValues.variableX.type === formValues.variableY.type) {
-      return { valid: false, error: 'X and Y variables must be different' };
-    }
-    return { valid: true };
-  }
-
-  /**
-   * Run the correlation analysis
-   * @param {CorrelationFormValues} formValues
-   */
-  async _runAnalysisImpl(formValues, requestId = null) {
-    if (!this.multiVariableAnalysis?.correlationAnalysis) {
-      throw new Error('Correlation analysis module not available');
-    }
-    if (typeof this.dataLayer?.getDataForPages !== 'function') {
-      throw new TypeError('Correlation analysis requires dataLayer.getDataForPages()');
-    }
-    requireCorrelationVariable(formValues.variableX, 'Correlation X variable');
-    requireCorrelationVariable(formValues.variableY, 'Correlation Y variable');
-    if (
-      !Array.isArray(this._selectedPages) ||
-      this._selectedPages.length === 0 ||
-      this._selectedPages.some(
-        pageId => typeof pageId !== 'string' || pageId.length === 0
-      ) ||
-      new Set(this._selectedPages).size !== this._selectedPages.length
-    ) {
-      throw new TypeError(
-        'Correlation analysis requires unique non-empty selected page IDs'
-      );
-    }
-
+  async _runAnalysisImpl(options, requestId, job) {
+    requireCorrelationVariable(options.variableX, 'Correlation X variable');
+    requireCorrelationVariable(options.variableY, 'Correlation Y variable');
     const pageIds = [...this._selectedPages];
-    const customColors = new Map(
-      this._pageSelector?.getCustomColors?.() || []
-    );
+    const customColors = new Map(this._pageSelector?.getCustomColors?.() || []);
+    const colorBy = options.colorBy === '' ? null : options.colorBy;
     const readinessRequests = [
-      {
-        type: formValues.variableX.type,
-        variableKey: formValues.variableX.key,
-        pageIds
-      },
-      {
-        type: formValues.variableY.type,
-        variableKey: formValues.variableY.key,
-        pageIds
-      }
+      { type: options.variableX.type, variableKey: options.variableX.key, pageIds },
+      { type: options.variableY.type, variableKey: options.variableY.key, pageIds },
+      ...(colorBy === null ? [] : [{ type: 'categorical_obs', variableKey: colorBy, pageIds }])
     ];
-    if (formValues.colorBy !== null) {
-      if (typeof formValues.colorBy !== 'string' || formValues.colorBy.length === 0) {
-        throw new TypeError('Correlation colorBy must be null or a non-empty string');
-      }
-      readinessRequests.push({
-        type: 'categorical_obs',
-        variableKey: formValues.colorBy,
-        pageIds
-      });
-    }
-
-    // Materialize each scientific array in a deterministic sequence before the
-    // compute request. This is one execution path: readiness failure terminates
-    // the analysis, and no alternate render or delayed second attempt is scheduled.
+    // Each variable is read in turn before the computation.
     for (const request of readinessRequests) {
-      const readyPageData = await this.dataLayer.getDataForPages(request);
-      if (
-        requestId !== null &&
-        !this._isCurrentAnalysisRequest(requestId)
-      ) {
-        return null;
-      }
-      requireReadyPageData(
-        readyPageData,
-        pageIds,
-        request.variableKey
-      );
+      job?.step(`Reading ${request.variableKey}`);
+      const readyPageData = await this.dataLayer.getDataForPages({
+        ...request,
+        silent: true,
+        signal: job?.signal ?? null,
+        owner: job?.id ?? null
+      });
+      if (!this._isCurrentAnalysisRequest(requestId)) return null;
+      requireReadyPageData(readyPageData, pageIds, request.variableKey);
     }
-
     const correlationResults = await this.multiVariableAnalysis.correlationAnalysis({
-      varX: formValues.variableX,
-      varY: formValues.variableY,
+      varX: options.variableX,
+      varY: options.variableY,
       pageIds,
-      method: formValues.method,
-      colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null,
-      isCurrent: requestId === null
-        ? undefined
-        : () => this._isCurrentAnalysisRequest(requestId),
-      registerInvalidationCleanup: requestId === null
-        ? undefined
-        : cleanup =>
-          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
+      method: options.method,
+      colorBy: colorBy === null ? null : { type: 'categorical_obs', key: colorBy },
+      job,
+      isCurrent: () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: cleanup => this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
-    if (
-      requestId !== null &&
-      !this._isCurrentAnalysisRequest(requestId)
-    ) {
-      return null;
-    }
-
-    // Pass custom page colors to results for proper coloring
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
     if (customColors.size > 0) {
       for (const result of correlationResults) {
-        if (result.pageId && customColors.has(result.pageId)) {
-          result.pageColor = customColors.get(result.pageId);
-        }
+        if (result.pageId && customColors.has(result.pageId)) result.pageColor = customColors.get(result.pageId);
       }
     }
-
     return {
       type: 'correlation',
       plotType: 'scatterplot',
@@ -623,15 +246,15 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         showTrendline: true,
         showR2: true,
         showConfidenceInterval: true,
-        colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null
+        colorBy: colorBy === null ? null : { type: 'categorical_obs', key: colorBy }
       },
       title: 'Correlation',
-      subtitle: `${formValues.variableX.key} vs ${formValues.variableY.key}`,
+      subtitle: `${options.variableX.key} vs ${options.variableY.key}`,
       metadata: {
-        method: formValues.method || 'pearson',
-        variableX: formValues.variableX,
-        variableY: formValues.variableY,
-        colorBy: formValues.colorBy
+        method: options.method,
+        variableX: options.variableX,
+        variableY: options.variableY,
+        colorBy
       }
     };
   }
@@ -752,7 +375,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         let strengthLabel;
         let strengthClass;
         if (absR >= 0.8) {
-          strengthLabel = 'Very Strong';
+          strengthLabel = 'Very strong';
           strengthClass = 'very-strong';
         } else if (absR >= 0.6) {
           strengthLabel = 'Strong';
@@ -764,7 +387,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
           strengthLabel = 'Weak';
           strengthClass = 'weak';
         } else {
-          strengthLabel = 'Very Weak / None';
+          strengthLabel = 'Very weak or none';
           strengthClass = 'none';
         }
 
@@ -832,164 +455,110 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     downloadCSV(csv, 'correlation_results', this._notifications);
   }
 
-  destroy() {
-    if (this._destroyPromise != null) return this._destroyPromise;
-    this._isDestroyed = true;
-    const errors = [];
-    for (const [label, owner] of [
-      ['X variable selector', this._xSelector],
-      ['Y variable selector', this._ySelector],
-      ['page selector', this._pageSelector]
-    ]) {
-      if (owner === null || owner === undefined) continue;
-      if (typeof owner.destroy !== 'function') {
-        errors.push(new TypeError(`Correlation ${label} must implement destroy()`));
-        continue;
-      }
-      try {
-        owner.destroy();
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    this._xSelector = null;
-    this._ySelector = null;
-    this._pageSelector = null;
-    this._pageSelectContainer = null;
-    this._colorByVariable = null;
-    const parentTask = super.destroy();
-    if (errors.length === 0) return parentTask;
-    const destruction = Promise.resolve(parentTask).then(
-      () => {
-        if (errors.length === 1) throw errors[0];
-        throw new AggregateError(errors, 'Correlation UI cleanup failed');
-      },
-      parentError => {
-        throw new AggregateError(
-          [...errors, parentError],
-          'Correlation UI cleanup failed'
-        );
-      }
-    );
-    this._destroyPromise = destruction;
-    void destruction.catch(() => {});
-    return destruction;
+  /**
+   * The shown result for a session: each page's statistics and plotted
+   * points, variables by key.
+   * @returns {null|{kind: 'correlation', version: number, payload: unknown}}
+   */
+  exportResult() {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    return createResultEnvelope('correlation', this._lastResult);
   }
 
-  exportSettings() {
-    const base = super.exportSettings();
-    if (!this._xSelector || !this._ySelector || !this._pageSelector) {
-      throw new Error(
-        'Correlation settings require initialized variable and page selectors'
-      );
+  /**
+   * Restore a result written by `exportResult()`; refused when it names a
+   * variable, cell group or colour category the open dataset lacks.
+   * @param {null|Object} envelope
+   * @returns {Promise<void>}
+   */
+  async importResult(envelope) {
+    if (envelope === null) {
+      await this._discardFormResult();
+      return;
     }
-    const customColors = this._pageSelector.getCustomColors();
+    const result = readResultEnvelope(envelope, 'correlation');
+    const metadata = result?.metadata;
+    if (
+      result?.type !== 'correlation' ||
+      !Array.isArray(result.data) ||
+      metadata === null ||
+      typeof metadata !== 'object'
+    ) {
+      throw new TypeError('A correlation result must hold its pages and variables');
+    }
+    requireCorrelationVariable(metadata.variableX, 'Correlation result X variable');
+    requireCorrelationVariable(metadata.variableY, 'Correlation result Y variable');
+    requireDatasetVariable(
+      this.dataLayer,
+      metadata.variableX.type,
+      metadata.variableX.key,
+      'The correlation result'
+    );
+    requireDatasetVariable(
+      this.dataLayer,
+      metadata.variableY.type,
+      metadata.variableY.key,
+      'The correlation result'
+    );
+    requireDatasetPages(
+      this.dataLayer,
+      result.data.map(page => page?.pageId),
+      'The correlation result'
+    );
+    if (metadata.colorBy !== null) {
+      requireDatasetVariable(this.dataLayer, 'categorical_obs', metadata.colorBy, 'The correlation result');
+      await this.dataLayer.ensureObsFieldLoaded(metadata.colorBy);
+      const categories = new Set(
+        this.dataLayer.getVariableInfo('categorical_obs', metadata.colorBy)?.categories ?? []
+      );
+      for (const page of result.data) {
+        if (!Array.isArray(page.colorValues)) continue;
+        for (const label of page.colorValues) {
+          if (label !== null && !categories.has(label)) {
+            throw new Error(
+              `The correlation result colours by category "${String(label)}", ` +
+              `which field "${metadata.colorBy}" lacks`
+            );
+          }
+        }
+      }
+    }
+    await this._restoreAnalysisResult(result);
+  }
+
+  // ===========================================================================
+  // Sessions
+  // ===========================================================================
+
+  _getExtraSettingKeys() {
+    return ['customPageColors'];
+  }
+
+  _exportExtraSettings() {
     return {
-      ...base,
-      variableX: this._xSelector.getSelectedVariable(),
-      variableY: this._ySelector.getSelectedVariable(),
-      colorBy: this._colorByVariable,
-      customPageColors: Array.from(customColors.entries())
+      customPageColors: this._pageSelector === null ? [] : Array.from(this._pageSelector.getCustomColors().entries())
     };
   }
 
-  importSettings(settings) {
-    const base = this._requireExactFormSettings(
-      settings,
-      [
-        'colorBy',
-        'customPageColors',
-        'formControls',
-        'selectedPages',
-        'variableX',
-        'variableY'
-      ]
-    );
-    requireStoredCorrelationVariable(
-      settings.variableX,
-      'Correlation X variable',
-      this.dataLayer
-    );
-    requireStoredCorrelationVariable(
-      settings.variableY,
-      'Correlation Y variable',
-      this.dataLayer
-    );
-    if (
-      settings.colorBy !== null &&
-      (typeof settings.colorBy !== 'string' || settings.colorBy.length === 0)
-    ) {
-      throw new TypeError(
-        'Correlation colorBy must be null or a non-empty string'
-      );
+  _importExtraSettings(settings) {
+    if (this._pageSelector !== null) {
+      this._applyCustomPageColors(this._requireCustomPageColors(settings.customPageColors));
     }
-    const categoricalVariables =
-      this.dataLayer.getAvailableVariables('categorical_obs');
-    if (!Array.isArray(categoricalVariables)) {
-      throw new TypeError(
-        'Correlation categorical variable inventory must be an array'
-      );
-    }
-    if (
-      settings.colorBy !== null &&
-      !categoricalVariables.some(variable => variable?.key === settings.colorBy)
-    ) {
-      throw new Error(
-        `Correlation color variable "${settings.colorBy}" was not found`
-      );
-    }
-    const methodControl = base.formControls.method;
-    if (
-      methodControl?.type !== 'value' ||
-      (methodControl.value !== 'pearson' &&
-        methodControl.value !== 'spearman')
-    ) {
-      throw new TypeError(
-        'Correlation method control must be pearson or spearman'
-      );
-    }
-    const colorControl = base.formControls.colorBy;
-    const expectedColorValue = settings.colorBy ?? NONE_VALUE;
-    if (
-      categoricalVariables.length > 0 &&
-      (
-        colorControl?.type !== 'value' ||
-        colorControl.value !== expectedColorValue
-      )
-    ) {
-      throw new TypeError(
-        'Correlation colorBy must exactly match its form control'
-      );
-    }
-    if (categoricalVariables.length === 0 && colorControl !== undefined) {
-      throw new TypeError(
-        'Correlation colorBy control is unavailable for this dataset'
-      );
-    }
-    const customPageColors = this._requireCustomPageColors(
-      settings.customPageColors
-    );
-
-    this._applyFormSettings(base);
-    if (settings.variableX.type.length === 0) {
-      this._xSelector.clear();
-    } else {
-      this._xSelector.setSelectedVariable(
-        settings.variableX.type,
-        settings.variableX.variable
-      );
-    }
-    if (settings.variableY.type.length === 0) {
-      this._ySelector.clear();
-    } else {
-      this._ySelector.setSelectedVariable(
-        settings.variableY.type,
-        settings.variableY.variable
-      );
-    }
-    this._colorByVariable = settings.colorBy;
-    this._applyCustomPageColors(customPageColors);
   }
+
+  destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
+    this._isDestroyed = true;
+    try {
+      this._pageSelector?.destroy();
+    } catch (error) {
+      this._notifications.error(`Correlation cleanup failed: ${error.message}`, { category: 'analysis' });
+    }
+    this._pageSelector = null;
+    this._pageSelectContainer = null;
+    return super.destroy();
+  }
+
 }
 
 export function createCorrelationAnalysisUI(options) {

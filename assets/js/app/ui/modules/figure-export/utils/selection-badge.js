@@ -18,7 +18,7 @@
  * @module ui/modules/figure-export/utils/selection-badge
  */
 
-import { formatCount } from '../../../components/display-format.js';
+import { formatCount } from '../../../../../utils/format-units.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,

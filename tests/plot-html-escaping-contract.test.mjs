@@ -34,6 +34,24 @@ globalThis.window = {
   }
 };
 
+// The correlation plot places its statistics in pixels, measuring their text
+// on a canvas and the size of the box it draws into: a fixed-width stand-in
+// and a sized container.
+globalThis.document = {
+  body: {},
+  head: { appendChild() {} },
+  getElementById() {
+    return null;
+  },
+  createElement() {
+    return { getContext: () => ({ font: '', measureText: text => ({ width: text.length * 6 }) }) };
+  }
+};
+globalThis.MutationObserver = class {
+  observe() {}
+};
+const SIZED_CONTAINER = Object.freeze({ clientWidth: 720, clientHeight: 380 });
+
 // Hostile-but-plausible dataset strings.
 const HOSTILE_GENE = '<span style="color:red">X</span>';
 const HOSTILE_GENE_ESCAPED =
@@ -283,7 +301,7 @@ test('scatter plot escapes axis titles, trace names, and category legend entries
       intercept: 1
     }],
     { ...scatterplot.defaultOptions },
-    {},
+    { ...SIZED_CONTAINER },
     null
   );
 
@@ -320,7 +338,7 @@ test('scatter plot escapes the page name on the density and plain marker traces'
       yValues
     }],
     { ...scatterplot.defaultOptions, showTrendline: false, showR2: false, densityThreshold: 10 },
-    {},
+    { ...SIZED_CONTAINER },
     null
   );
 

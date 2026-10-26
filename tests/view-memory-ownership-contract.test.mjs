@@ -199,7 +199,6 @@ test('a kept view context shares per-cell arrays and copies only centroids', () 
     cellVisibilityMask: new Uint8Array(2),
     centroidPositions: new Float32Array(3),
     centroidColors: new Uint8Array(4),
-    centroidOutliers: new Float32Array(1),
     centroidLabels: [],
     filteredCount: { shown: 2, total: 2 },
   };
@@ -212,7 +211,6 @@ test('a kept view context shares per-cell arrays and copies only centroids', () 
   assert.strictEqual(ctx.cellVisibilityMask, source.cellVisibilityMask);
   assert.notStrictEqual(ctx.centroidPositions, source.centroidPositions);
   assert.notStrictEqual(ctx.centroidColors, source.centroidColors);
-  assert.notStrictEqual(ctx.centroidOutliers, source.centroidOutliers);
   assert.equal(Object.hasOwn(ctx, 'outlierQuantilesArray'), false);
 });
 

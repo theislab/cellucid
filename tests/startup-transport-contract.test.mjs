@@ -12,9 +12,15 @@ import {
 } from '../assets/js/app/startup-url-intent.js';
 import {
   normalizeStartupError,
+  describeStartupFailure,
   publishStartupFailure,
+  STARTUP_ISSUES_URL,
+  STARTUP_REQUIREMENTS_URL,
+  STARTUP_TROUBLESHOOTING_INDEX_URL,
   STARTUP_TROUBLESHOOTING_URL
 } from '../assets/js/app/startup-failure.js';
+import { DataSourceError } from '../assets/js/data/data-source.js';
+import { STARTUP_STALL_CODE } from '../assets/js/app/startup-phase.js';
 import {
   DataSourceManager
 } from '../assets/js/data/data-source-manager.js';
@@ -106,7 +112,7 @@ test('startup parameters reject duplicates, empty values, and boolean coercion',
 });
 
 test('welcome policy is exact for catalog and user-served startup intents', async t => {
-  const jupyterConfig = {
+  const viewerHostConfig = {
     serverUrl: 'http://127.0.0.1:8765',
     viewerId: 'viewer-1',
     viewerToken: 'token-1'
@@ -114,12 +120,12 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
 
   for (const [name, search] of [
     ['bare catalog', ''],
-    ['configured catalog', 'exportsBaseUrl=https%3A%2F%2Fdata.test%2Fexports%2F'],
+    ['configured catalog', 'sampleCatalog=https%3A%2F%2Fdata.test%2Fanndata%2F'],
     ['explicit Suo sample', 'dataset=suo'],
     ['explicit local-demo sample', 'source=local-demo&dataset=suo'],
     ['remote lookalike', 'remotely=https%3A%2F%2Fserver.test'],
-    ['GitHub lookalike', 'githubRepo=owner%2Frepo%2Fexports'],
-    ['Jupyter lookalike', 'jupyterMode=true'],
+    ['data link lookalike', 'dataset_link=gh%3Aowner%2Frepo'],
+    ['Viewer host lookalike', 'viewerHostMode=true'],
   ]) {
     await t.test(`${name} shows onboarding`, () => {
       const intent = resolveStartupUrlIntent(
@@ -139,19 +145,19 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
     ['same-origin prepared server', 'source=remote', null],
     ['same-origin AnnData server', 'anndata=true', null],
     [
-      'explicit GitHub repository',
-      'github=owner%2Frepo%2Fexports',
+      'explicit data link',
+      'data=gh%3Aowner%2Frepo%2Fexports',
       null
     ],
     [
       'authenticated Jupyter',
-      'jupyter=true&viewerId=viewer-1&viewerToken=token-1',
-      jupyterConfig
+      'viewer=true&viewerId=viewer-1&viewerToken=token-1',
+      viewerHostConfig
     ],
     [
       'authenticated Jupyter AnnData',
-      'jupyter=true&viewerId=viewer-1&viewerToken=token-1&anndata=true',
-      jupyterConfig
+      'viewer=true&viewerId=viewer-1&viewerToken=token-1&anndata=true',
+      viewerHostConfig
     ],
   ]) {
     await t.test(`${name} suppresses onboarding`, () => {
@@ -163,15 +169,15 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
     });
   }
 
-  await t.test('Jupyter evidence is exact rather than truthy', () => {
+  await t.test('Viewer host evidence is exact rather than truthy', () => {
     assert.throws(
       () => resolveStartupUrlIntent(
         new URLSearchParams(
-          'jupyter=true&viewerId=viewer-1&viewerToken=token-1'
+          'viewer=true&viewerId=viewer-1&viewerToken=token-1'
         ),
         true
       ),
-      /Jupyter evidence/
+      /viewer host evidence/
     );
   });
 
@@ -197,13 +203,14 @@ test('same-origin health advertisement has exact static and server identities', 
     }),
     'static'
   );
-  assert.equal(
-    classifySameOriginHealthAdvertisement({
+  // The prepared-export server is gone; its health is no server identity.
+  assert.throws(
+    () => classifySameOriginHealthAdvertisement({
       status: 'ok',
       type: 'exported',
       version: '1.2.3'
     }),
-    'server'
+    /no current server or static identity/
   );
   assert.equal(
     classifySameOriginHealthAdvertisement({
@@ -211,7 +218,6 @@ test('same-origin health advertisement has exact static and server identities', 
       type: 'anndata',
       version: '1.2.3',
       format: 'h5ad',
-      is_backed: true,
       n_cells: 3,
       n_genes: 2
     }),
@@ -319,22 +325,45 @@ test('terminal startup failure has one persistent accessible visible owner', () 
   // somewhere: on the alert itself, not on a control that just disappeared.
   assert.equal(surface.attributes.get('tabindex'), '-1');
   assert.equal(surface.focusCalls, 1);
-  assert.equal(surface.style.position, 'fixed');
-  assert.equal(surface.style.zIndex, '2147483647');
+  // The brand card over everything, styled by the shared stylesheet: no
+  // inline style of its own.
+  assert.equal(surface.className, 'page-screen page-screen-fixed');
+  assert.deepEqual(surface.style, {});
+  assert.equal(surface.attributes.get('data-failure'), 'app');
   assert.equal(
     statsElement.textContent,
     'Startup failed: Remote health response is invalid.'
   );
   assert.equal(documentOwner.body.children.length, 1);
-  // Never a dead end: the launch settings can be dropped, and the
-  // troubleshooting guide is one click away.
   const [card] = surface.children;
-  const links = card.children.at(-1).children;
+  assert.equal(card.className, 'welcome-content');
+  const [header, body] = card.children;
+  assert.equal(header.children[0].attributes.get('src'), 'assets/img/cellucid-logo.svg');
+  const [title, sentence, actions, details, links] = body.children;
+  // What happened and what to do, for a person; the technical message only
+  // under Details.
+  assert.equal(title.textContent, 'Cellucid could not start');
+  assert.equal(
+    sentence.textContent,
+    'Something went wrong while starting. Try again, or open Cellucid without this link\u2019s settings.'
+  );
+  assert.equal(details.tagName, 'details');
+  assert.equal(details.children[0].textContent, 'Details');
+  assert.equal(details.children[1].textContent, 'Remote health response is invalid.');
+  // Never a dead end: the same address again, the app without the link's
+  // settings, and where to read or report more.
   assert.deepEqual(
-    links.map(link => [link.attributes.get('href'), link.textContent]),
+    actions.children.map(row => [row.attributes.get('href'), row.children[1].children[0].textContent]),
     [
-      ['/', 'Open Cellucid without this link\u2019s settings'],
-      [STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']
+      ['/?dataset=missing', 'Try again'],
+      ['/', 'Open Cellucid without this link']
+    ]
+  );
+  assert.deepEqual(
+    links.children.map(item => [item.children[0].attributes.get('href'), item.children[0].textContent]),
+    [
+      [STARTUP_TROUBLESHOOTING_INDEX_URL, 'Troubleshooting'],
+      [STARTUP_ISSUES_URL, 'Report a problem']
     ]
   );
   assert.match(STARTUP_TROUBLESHOOTING_URL, /^https:\/\/docs\.cellucid\.com\/en\/latest\//);
@@ -346,6 +375,45 @@ test('terminal startup failure has one persistent accessible visible owner', () 
     }),
     /already has a visible owner/
   );
+});
+
+test('a failed start is described by what failed, never by its technical message', () => {
+  const withLink = { webgl2Available: true, hasLaunchSettings: true };
+  const message = 'Failed to open 10.6084/x: https://ndownloader.example/files/1: the host answered HTTP 202.';
+  const dataFailure = describeStartupFailure(new DataSourceError(message, 'NETWORK_ERROR', 'link'), withLink);
+  assert.equal(dataFailure.kind, 'data');
+  assert.equal(dataFailure.title, 'The data could not be opened');
+  assert.equal(dataFailure.offerWithoutSettings, true);
+  assert.deepEqual(dataFailure.links, [[STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']]);
+
+  const explained = new Error('missing.h5ad was not found at example.org (HTTP 404).');
+  explained.details = { explained: true };
+  assert.equal(describeStartupFailure(explained, withLink).kind, 'data');
+
+  const stall = new Error('Startup stalled while checking the data server: /_cellucid/health did not answer within 60 s.');
+  stall.code = STARTUP_STALL_CODE;
+  assert.equal(describeStartupFailure(stall, withLink).kind, 'stall');
+
+  // No WebGL2 is the browser, whatever was thrown, and a link cannot help.
+  const browser = describeStartupFailure(
+    new DataSourceError('WebGL2 is required but not supported in this browser.', 'X', 'link'),
+    { webgl2Available: false, hasLaunchSettings: true }
+  );
+  assert.equal(browser.kind, 'browser');
+  assert.equal(browser.offerWithoutSettings, false);
+  assert.deepEqual(browser.links, [[STARTUP_REQUIREMENTS_URL, 'System requirements']]);
+
+  const plain = describeStartupFailure(new Error('x'), { webgl2Available: true, hasLaunchSettings: false });
+  assert.equal(plain.kind, 'app');
+  assert.equal(plain.offerWithoutSettings, false);
+  assert.equal(plain.sentence, 'Something went wrong while starting. Try again in a moment.');
+
+  for (const described of [dataFailure, browser, plain]) {
+    assert.doesNotMatch(`${described.title} ${described.sentence}`, /https?:|HTTP \d|10\.6084/);
+  }
+  for (const url of [STARTUP_TROUBLESHOOTING_URL, STARTUP_REQUIREMENTS_URL, STARTUP_TROUBLESHOOTING_INDEX_URL]) {
+    assert.match(url, /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\//);
+  }
 });
 
 test('startup thrown values normalize to one Error contract', () => {
@@ -401,11 +469,9 @@ function createManagerSource(type, {
   const source = {
     async getMetadata(datasetId) {
       return {
-        version: 3,
         id: datasetId,
         name: datasetId,
         description: '',
-        cellucid_data_version: '1.0.0',
         stats: {
           n_cells: 1,
           n_genes: 0,
@@ -422,7 +488,7 @@ function createManagerSource(type, {
             X_umap: {
               label: 'X_umap',
               dimension: 2,
-              file: 'embeddings/0_2d.bin',
+              path: 'obsm/0/0-1',
               source: { key: 'X_umap', columns: [0, 1] }
             }
           }

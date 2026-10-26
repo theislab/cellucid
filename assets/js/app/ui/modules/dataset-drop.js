@@ -2,8 +2,9 @@
  * @fileoverview Open a dataset by dropping it onto the viewer.
  *
  * A drag that carries files shows one overlay across the whole viewer. A drop
- * of exactly one H5AD file, one Zarr ZIP archive, or one prepared export
- * folder is opened through the same reader as the matching file input — the
+ * of exactly one file or one folder whose name a format of
+ * `data/input-formats.js` names (any file, folder or archive the registry
+ * lists) is opened through the same reader as the matching file input — the
  * caller's `openDataset` — so it is validated, reported and superseded
  * exactly as a picked file is. Anything else is refused with a message that
  * says what can be dropped.
@@ -12,13 +13,14 @@
  * would leave the application. `ui/core/file-drop-guard.js`, a classic script
  * that runs before any module, cancels that for the whole document from the
  * first paint; this module adds the opening. Keyboard and screen-reader users
- * keep the H5AD, Zarr ZIP and Prepared buttons, which reach the same readers.
+ * keep the Session panel's Open… menu (File… and Folder…), which reaches
+ * the same readers.
  *
  * @module ui/modules/dataset-drop
  */
 
-import { isH5adFile } from '../../../data/h5ad.js';
-import { isZarrZipArchive } from '../../../data/local-user-source.js';
+import { fileFormatOfName, openableNamePhrases } from '../../../data/input-formats.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
  * Set on the root element while a drop opens a dataset. The guard reads it to
@@ -30,8 +32,10 @@ const DATASET_DROP_READY_VALUE = 'ready';
 /** How long a drag may go without a `dragover` before the overlay retires. */
 const DRAG_IDLE_MS = 250;
 
-const WHAT_CAN_BE_DROPPED =
-  'Drop one .h5ad file, one .zarr.zip archive, or one prepared export folder.';
+const WHAT_CAN_BE_DROPPED = (() => {
+  const phrases = openableNamePhrases().map(phrase => `one ${phrase}`);
+  return `Drop ${phrases.length > 1 ? `${phrases.slice(0, -1).join(', ')}, or ${phrases.at(-1)}` : phrases[0]}.`;
+})();
 
 /**
  * @param {DataTransfer|null|undefined} dataTransfer
@@ -55,9 +59,10 @@ function readEntryFile(entry) {
 }
 
 /**
- * List every file under a dropped folder, each carrying the path a
- * directory input would give it (`<folder>/<path inside>`), which is what the
- * prepared-export reader validates.
+ * List every file under a dropped folder, each carrying the path a folder
+ * input would give it (`<folder>/<path inside>`), which is what the Zarr
+ * folder reader takes. Hidden files (`.zgroup`, `.zarray`, `.zattrs`,
+ * `.zmetadata`) are listed like any other.
  *
  * @param {FileSystemDirectoryEntry} root
  * @returns {Promise<File[]>}
@@ -92,12 +97,27 @@ export async function readDroppedFolder(root) {
 }
 
 /**
+ * How one local file arrives, by what its name says it is
+ * (`data/input-formats.js`): `file` (a file that is the container itself, an
+ * `.h5ad`) or `zip` (a ZIP archive holding a store, a `.zarr.zip`); null for
+ * a name no format has. The picked-file input and a drop share it; the
+ * reader then decides from the content.
+ *
+ * @param {File} file
+ * @returns {'file'|'zip'|null}
+ */
+export function localFileLayout(file) {
+  const named = typeof file?.name === 'string' ? fileFormatOfName(file.name) : null;
+  return named === null ? null : named.layout;
+}
+
+/**
  * Decide what a drop is. It must run inside the `drop` event: the items of a
  * DataTransfer are readable only while that event is dispatched.
  *
  * @param {DataTransfer} dataTransfer
  * @returns {Readonly<
- *   {kind: 'h5ad'|'zarr-zip'|'prepared', label: string,
+ *   {kind: 'file'|'zip'|'folder', label: string,
  *     readFiles: () => Promise<ArrayLike<File>>} |
  *   {kind: 'refused', message: string}
  * >}
@@ -113,9 +133,7 @@ export function describeDatasetDrop(dataTransfer) {
   }
   if (count > 1) {
     return refusal(
-      `${count} items were dropped; Cellucid opens one at a time. ` +
-      'To open a prepared export, drop its folder rather than the files ' +
-      'inside it.'
+      `${formatCountOf(count, 'item')} were dropped; Cellucid opens one at a time.`
     );
   }
 
@@ -124,15 +142,10 @@ export function describeDatasetDrop(dataTransfer) {
     ? item.webkitGetAsEntry()
     : null;
   if (entry?.isDirectory) {
-    if (/\.zarr$/i.test(entry.name)) {
-      return refusal(
-        `"${entry.name}" is a Zarr directory, which a browser cannot open. ` +
-        'Zip it into a .zarr.zip archive and drop that, or open the ' +
-        'directory with a Cellucid server.'
-      );
-    }
+    // A folder is read as a store folder; one that is not is refused by the
+    // reader, which says what it lacks.
     return Object.freeze({
-      kind: 'prepared',
+      kind: 'folder',
       label: entry.name,
       readFiles: () => readDroppedFolder(entry)
     });
@@ -143,12 +156,8 @@ export function describeDatasetDrop(dataTransfer) {
     return refusal(`The dropped item could not be read. ${WHAT_CAN_BE_DROPPED}`);
   }
   const readFiles = async () => [file];
-  if (isH5adFile(file)) {
-    return Object.freeze({ kind: 'h5ad', label: file.name, readFiles });
-  }
-  if (isZarrZipArchive(file)) {
-    return Object.freeze({ kind: 'zarr-zip', label: file.name, readFiles });
-  }
+  const layout = localFileLayout(file);
+  if (layout !== null) return Object.freeze({ kind: layout, label: file.name, readFiles });
   return refusal(`"${file.name}" is not a file Cellucid can open. ${WHAT_CAN_BE_DROPPED}`);
 }
 

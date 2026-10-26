@@ -26,7 +26,7 @@ import {
 } from '../assets/js/app/ui/modules/data-mapping-controls.js';
 import {
   DIMENSIONAL_UMAP_KEYS,
-  UNSUFFIXED_UMAP_KEY,
+  UMAP_KEYS,
   defaultEmbeddingSlots,
 } from '../assets/js/data/data-mapping.js';
 import { NotificationCenter } from '../assets/js/app/notification-center.js';
@@ -55,8 +55,10 @@ function anndataMapping({ enabled, defaults }) {
     knn: null,
     geneNames: 'index',
     expression: 'X',
+    log1p: {},
+    highlyVariable: null,
     latent: null,
-    vectorFields: [{ key: 'velocity_umap_2d', embedding: UMAP }],
+    vectorFields: [{ key: 'velocity_umap', embedding: UMAP }],
   };
 }
 
@@ -74,7 +76,7 @@ function anndataMapping({ enabled, defaults }) {
 function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
   const described = describeAnnDataProbes(mappingProbes({
     nObs: N_OBS,
-    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap_2d: 2 },
+    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2 },
     hasX: true,
   }));
   const candidates = assembleAnnDataCandidates(described, {
@@ -86,7 +88,7 @@ function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
     layoutKey: 'X_umap',
     dimension: 2,
     label: 'X_umap',
-    path: 'embeddings/0_2d.bin',
+    path: 'obsm/0/0-1',
     provenance: { key: 'X_umap', columns: [0, 1] },
     origin: 'identity',
   }]);
@@ -169,7 +171,8 @@ test('a dataset opens with its best-guess slots and every narrow array enabled',
     [['X_umap', 'UMAP', 2, true], ['X_tsne', 't-SNE', 2, false]],
   );
   // The checklist offers every plottable array, enabled or not; a wide array
-  // it has not enabled is proposed at its first three columns, and a vector
+  // it has not enabled is proposed at its first two columns, in 2D, after the
+  // embeddings (a matrix of components is not a 3D embedding), and a vector
   // field is never an embedding.
   assert.deepEqual(
     state.getRepresentationChoices().map(choice => [
@@ -179,7 +182,7 @@ test('a dataset opens with its best-guess slots and every narrow array enabled',
     [
       ['X_umap', [0, 1], 'UMAP', 2, 2, true, true, true],
       ['X_tsne', [0, 1], 't-SNE', 2, 2, true, false, true],
-      ['X_pca', [0, 1, 2], 'PCA 1,2,3', 3, 6, false, false, true],
+      ['X_pca', [0, 1], 'PCA 1,2', 2, 6, false, false, true],
     ],
   );
   assert.deepEqual(state.describeViewEmbedding('snapshot-2'), {
@@ -195,6 +198,7 @@ test('a dataset opens with its best-guess slots and every narrow array enabled',
     origin: 'default',
     embeddingCandidates: 3,
     enabledRepresentations: 2,
+    vectorFields: 1,
   });
 });
 
@@ -210,7 +214,7 @@ test('changing a default loads it first, then moves only the views that follow i
   assert.equal(manager.getLayout('X_pca[3,1]').origin, 'mapping');
   assert.equal(
     manager.getLayout('X_pca[3,1]').path,
-    '_cellucid/mapping/embeddings/2/3-1.bin'
+    'obsm/2/3-1'
   );
   assert.equal(manager.getDefaultLayout(2), 'X_pca[3,1]');
   assert.deepEqual(moves, [['live', 'X_pca[3,1]', true], ['snapshot-1', 'X_pca[3,1]', true]]);
@@ -346,12 +350,13 @@ test('a mapping the panel cannot apply is refused with its reason', async () => 
 
 test('the best-guess notification names every key of the default embedding rule', () => {
   // The rule fills a dimension from X_umap_1d, X_umap_2d or X_umap_3d, and
-  // otherwise from a bare X_umap: the message lists exactly those keys.
+  // otherwise from one UMAP under a conventional name of Scanpy, a
+  // SingleCellExperiment or a Seurat object: the message lists exactly those keys.
   assert.deepEqual([...DIMENSIONAL_UMAP_KEYS], ['X_umap_1d', 'X_umap_2d', 'X_umap_3d']);
-  assert.equal(UNSUFFIXED_UMAP_KEY, 'X_umap');
-  assert.equal(DEFAULT_UMAP_KEYS_TEXT, 'X_umap_1d, X_umap_2d, X_umap_3d or X_umap');
-  for (const key of [...DIMENSIONAL_UMAP_KEYS, UNSUFFIXED_UMAP_KEY]) {
-    const slots = defaultEmbeddingSlots([{ key, width: key === 'X_umap' ? 2 : Number(key.at(-2)) }]);
+  assert.deepEqual([...UMAP_KEYS], ['X_umap', 'X_UMAP', 'X_wnn.umap', 'X_ref.umap']);
+  assert.equal(DEFAULT_UMAP_KEYS_TEXT, 'X_umap_1d, X_umap_2d, X_umap_3d, X_umap, X_UMAP, X_wnn.umap or X_ref.umap');
+  for (const key of [...DIMENSIONAL_UMAP_KEYS, ...UMAP_KEYS]) {
+    const slots = defaultEmbeddingSlots([{ key, width: UMAP_KEYS.includes(key) ? 2 : Number(key.at(-2)) }]);
     assert.notEqual(
       Object.values(slots).find(ref => ref !== null),
       undefined,
@@ -369,7 +374,7 @@ test('the best-guess notification names what is shown and where to change it', (
       anndataMapping({ enabled: [TSNE], defaults: { '2d': TSNE } }),
       ['embeddings.2d'], widthOf
     ),
-    "This file has no default UMAP (X_umap_1d, X_umap_2d, X_umap_3d or X_umap). Showing 'X_tsne' as 2D. "
+    "This file has no default UMAP (X_umap_1d, X_umap_2d, X_umap_3d, X_umap, X_UMAP, X_wnn.umap or X_ref.umap). Showing 'X_tsne' as 2D. "
       + 'Change it under Session › Data mapping.'
   );
   const pca = { key: 'X_pca', columns: [0, 1] };
@@ -378,7 +383,7 @@ test('the best-guess notification names what is shown and where to change it', (
       anndataMapping({ enabled: [pca], defaults: { '2d': pca } }),
       ['embeddings.2d'], widthOf
     ),
-    "This file has no default UMAP (X_umap_1d, X_umap_2d, X_umap_3d or X_umap). Showing columns 0 and 1 of 'X_pca' as 2D. "
+    "This file has no default UMAP (X_umap_1d, X_umap_2d, X_umap_3d, X_umap, X_UMAP, X_wnn.umap or X_ref.umap). Showing columns 0 and 1 of 'X_pca' as 2D. "
       + 'Change it under Session › Data mapping.'
   );
   const fa = { key: 'X_draw_graph_fa', columns: [0, 1, 2] };
@@ -591,8 +596,9 @@ function mountPanel(t, options) {
   };
   const controls = initDataMappingControls({ state: scene.state, root });
   t.after(() => controls.destroy());
-  const rows = () => root.querySelector('.data-mapping-list').children
-    .filter(node => node.matches('.data-mapping-row'))
+  // Every checklist row in document order, wherever the list places it.
+  const listedRows = () => root.querySelector('.data-mapping-list').querySelectorAll('.data-mapping-row');
+  const rows = () => listedRows()
     .map(row => ({
       name: row.querySelector('.data-mapping-name').textContent,
       enabled: row.querySelector('.data-mapping-enable').checked,
@@ -610,9 +616,8 @@ function mountPanel(t, options) {
               .map(field => field.querySelector('.obs-select').value),
           ],
     }));
-  const row = name => root.querySelector('.data-mapping-list').children
-    .find(node => node.matches('.data-mapping-row')
-      && node.querySelector('.data-mapping-name').textContent === name);
+  const row = name => listedRows()
+    .find(node => node.querySelector('.data-mapping-name').textContent === name);
   const status = () => root.querySelector('.data-mapping-status');
   const apply = root.querySelector('#data-mapping-apply') ?? [...root.walk()].find(node => node.id === 'data-mapping-apply');
   const revert = [...root.walk()].find(node => node.id === 'data-mapping-revert');
@@ -621,15 +626,9 @@ function mountPanel(t, options) {
 
 test('the checklist lists every representation, its dimension, its default and why a box is locked', t => {
   const panel = mountPanel(t);
-  // Listed like the picker: highest dimension first, each dimension's
-  // default first, then by name.
+  // Embeddings first, then wider arrays; within each, like the picker:
+  // highest dimension first, each dimension's default first, then by name.
   assert.deepEqual(panel.rows(), [
-    {
-      name: 'PCA 1,2,3', enabled: false, enableDisabled: false,
-      enableTitle: 'Offer PCA 1,2,3 to views',
-      // A selection of a wider array names its axis count and its columns.
-      dimension: '3D', isDefault: 'false', columns: ['3', '0', '1', '2'],
-    },
     {
       name: 'UMAP', enabled: true, enableDisabled: true,
       enableTitle: 'A vector field is drawn on this embedding, so it stays on.',
@@ -641,14 +640,21 @@ test('the checklist lists every representation, its dimension, its default and w
       enableTitle: 'Stop offering t-SNE to views',
       dimension: '2D', isDefault: 'false', columns: ['2', '0', '1'],
     },
+    {
+      name: 'PCA 1,2', enabled: false, enableDisabled: false,
+      enableTitle: 'Offer PCA 1,2 to views',
+      // A wider array is offered at its first two columns, in 2D; a
+      // selection of it names its columns.
+      dimension: '2D', isDefault: 'false', columns: ['2', '0', '1'],
+    },
   ]);
   // A wide array can be enabled at further column selections.
-  const add = panel.root.querySelector('.data-mapping-add');
+  const add = panel.row('PCA 1,2').querySelector('.data-mapping-add');
   assert.equal(add.textContent, 'Add columns');
   assert.equal(add.getAttribute('aria-label'), 'Add columns of PCA');
   // Only a wide array offers it; it is in the row's editor, closed at first.
   assert.equal(panel.root.querySelectorAll('.data-mapping-add').filter(node => !node.hidden).length, 1);
-  assert.equal(panel.row('PCA 1,2,3').querySelector('.data-mapping-editor').hidden, true);
+  assert.equal(panel.row('PCA 1,2').querySelector('.data-mapping-editor').hidden, true);
   assert.equal(add.dataset.key, 'X_pca');
   assert.equal(panel.root.querySelector('.disclosure-desc').textContent, '2 on · UMAP 2D');
   // Nothing staged: nothing to apply or revert, and each says why.
@@ -699,6 +705,17 @@ test('Default makes one representation per dimension the default, and Apply move
 
 test('turning a representation of a new dimension on makes it that dimension\'s default', t => {
   const panel = mountPanel(t);
+  // PCA is offered in 2D, which UMAP is the default of: on, it is not.
+  const pca2d = panel.row('PCA 1,2').querySelector('.data-mapping-enable');
+  pca2d.checked = true;
+  pca2d.dispatch('change');
+  assert.equal(panel.row('PCA 1,2').querySelector('.data-mapping-default').getAttribute('aria-pressed'), 'false');
+  pca2d.checked = false;
+  pca2d.dispatch('change');
+  // Shown in 3D it is the first 3D embedding, so on it is 3D's default.
+  const axes = panel.row('PCA 1,2').querySelector('.data-mapping-axes');
+  axes.value = '3';
+  axes.dispatch('change');
   const pca = panel.row('PCA 1,2,3').querySelector('.data-mapping-enable');
   pca.checked = true;
   pca.dispatch('change');
@@ -708,63 +725,67 @@ test('turning a representation of a new dimension on makes it that dimension\'s 
 
 test('Add columns adds another column selection of a wide array, edited per axis and checked for repeats', async t => {
   const panel = mountPanel(t);
-  panel.root.querySelector('.data-mapping-add').dispatch('click');
+  panel.row('PCA 1,2').querySelector('.data-mapping-add').dispatch('click');
   // The new selection takes the first columns no selection of the array uses,
-  // two of them, and is on; it is listed under the array's other selections
-  // and can be removed again before Apply.
+  // two of them, and is on; it is listed with the embeddings shown, while the
+  // array's selection that is off stays under the wider arrays, last. It can
+  // be removed again before Apply.
   assert.deepEqual(
     panel.rows().map(row => [row.name, row.enabled, row.dimension, row.columns]),
     [
-      ['PCA 1,2,3', false, '3D', ['3', '0', '1', '2']],
-      ['PCA 4,5', true, '2D', ['2', '3', '4']],
       ['UMAP', true, '2D', ['2', '0', '1']],
       ['t-SNE', true, '2D', ['2', '0', '1']],
+      ['PCA 3,4', true, '2D', ['2', '2', '3']],
+      ['PCA 1,2', false, '2D', ['2', '0', '1']],
     ],
   );
   assert.equal(panel.status().textContent, 'Apply offers these embeddings to every view.');
 
-  // Point it at the columns another enabled row plots: refused until fixed.
-  const added = panel.row('PCA 4,5');
-  const pca = panel.row('PCA 1,2,3').querySelector('.data-mapping-enable');
+  const added = panel.row('PCA 3,4');
+  assert.ok(added);
+  const pca = panel.row('PCA 1,2').querySelector('.data-mapping-enable');
   pca.checked = true;
   pca.dispatch('change');
-  const axes = panel.row('PCA 4,5').querySelector('.data-mapping-axes');
+  // A third axis takes the first column no selection of the array uses.
+  const axes = panel.row('PCA 3,4').querySelector('.data-mapping-axes');
   axes.value = '3';
   axes.dispatch('change');
-  assert.ok(added);
-  // A third axis takes the first column no selection of the array uses.
-  assert.deepEqual(panel.rows()[1].columns, ['3', '3', '4', '5']);
-  assert.equal(panel.rows()[1].name, 'PCA 4,5,6');
-  for (const [axis, column] of [['x', '0'], ['y', '1'], ['z', '2']]) {
-    const select = panel.row(panel.rows()[1].name)
+  assert.deepEqual(panel.rows()[2].columns, ['3', '2', '3', '4']);
+  assert.equal(panel.rows()[2].name, 'PCA 3,4,5');
+  // Point it back at the columns another enabled row plots: refused until fixed.
+  const twoAxes = panel.row('PCA 3,4,5').querySelector('.data-mapping-axes');
+  twoAxes.value = '2';
+  twoAxes.dispatch('change');
+  for (const [axis, column] of [['x', '0'], ['y', '1']]) {
+    const select = panel.row(panel.rows()[2].name)
       .querySelectorAll('.obs-select')
       .find(node => node.id.endsWith(`-${axis}`));
     select.value = column;
     select.dispatch('change');
   }
-  assert.equal(panel.status().textContent, 'PCA 1,2,3 is listed twice. Remove one of them.');
+  assert.equal(panel.status().textContent, 'PCA 1,2 is listed twice. Remove one of them.');
   assert.equal(panel.apply.disabled, true);
 
   // Removing the added selection settles it; the original shows no remove
   // button, only its checkbox.
-  const sameName = panel.root.querySelector('.data-mapping-list').children
-    .filter(node => node.matches('.data-mapping-row')
-      && node.querySelector('.data-mapping-name').textContent === 'PCA 1,2,3');
+  const sameName = panel.root.querySelector('.data-mapping-list').querySelectorAll('.data-mapping-row')
+    .filter(node => node.querySelector('.data-mapping-name').textContent === 'PCA 1,2');
   assert.equal(sameName.length, 2);
-  assert.equal(sameName[0].querySelector('.data-mapping-remove').hidden, true);
-  assert.equal(sameName[1].querySelector('.data-mapping-remove').hidden, false);
-  sameName[1].querySelector('.data-mapping-remove').dispatch('click');
-  const remaining = panel.rows().filter(row => row.name === 'PCA 1,2,3');
+  const removable = sameName.filter(node => !node.querySelector('.data-mapping-remove').hidden);
+  assert.equal(removable.length, 1);
+  assert.equal(removable[0].querySelector('.data-mapping-enable').checked, true, 'the added selection');
+  removable[0].querySelector('.data-mapping-remove').dispatch('click');
+  const remaining = panel.rows().filter(row => row.name === 'PCA 1,2');
   assert.equal(remaining.length, 1);
   assert.equal(panel.apply.disabled, false);
   panel.apply.dispatch('click');
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(panel.applied.at(-1).embeddings.enabled, [
-    { key: 'X_pca', columns: [0, 1, 2] },
+    { key: 'X_pca', columns: [0, 1] },
     TSNE,
     UMAP,
   ]);
-  assert.deepEqual(panel.applied.at(-1).embeddings.defaults['3d'], { key: 'X_pca', columns: [0, 1, 2] });
+  assert.deepEqual(panel.applied.at(-1).embeddings.defaults['2d'], UMAP);
 });
 
 test('every array of two or more columns offers each dimension its columns allow, in an editor closed until opened', async t => {
@@ -920,7 +941,7 @@ class FakeNotificationElement {
 
 test('analytics may send how a mapping was chosen and how many embeddings are on, never what they name', () => {
   const base = {
-    load_method: 'local-user-h5ad',
+    load_method: 'local-user-file',
     source_type: 'local-user',
     outcome: 'success',
     duration_ms: 10,
@@ -943,8 +964,8 @@ test('analytics may send how a mapping was chosen and how many embeddings are on
     ['1', '2-3', '2-3', '4-9', '4-9', '10+', '10+']
   );
   assert.deepEqual(FEATURES.data_mapping, [
-    'embedding', 'embedding_columns', 'default', 'knn', 'gene_names', 'expression',
-    'latent', 'vector_fields',
+    'embedding', 'embedding_columns', 'default', 'knn', 'modality', 'gene_names', 'expression',
+    'log1p', 'highly_variable', 'latent', 'vector_fields',
   ]);
   for (const variant of FEATURES.data_mapping) {
     assert.doesNotThrow(() => validateEvent('feature_used', { feature: 'data_mapping', variant }));
@@ -1085,4 +1106,23 @@ test('a grid export draws each view with the embedding it shows', async () => {
   // Each view's normalization comes from the layout it shows.
   assert.deepEqual(normTransformReads, ['X_umap', 'X_tsne']);
   assert.deepEqual(borrowed, ['live', 'snapshot-1']);
+});
+
+test('an Apply that another dataset supersedes writes nothing into the panel that replaced it', async t => {
+  const panel = mountPanel(t);
+  panel.row('t-SNE').querySelector('.data-mapping-default').dispatch('click');
+  // The transaction is under way when another dataset is published: the
+  // state refuses to finish it with its superseded error.
+  panel.state.applyDataMapping = async () => {
+    panel.state._datasetGeneration += 1;
+    const error = new Error('Field loading was superseded by a replacement dataset generation.');
+    error.name = 'AbortError';
+    throw error;
+  };
+  panel.apply.dispatch('click');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.doesNotMatch(panel.status().textContent, /superseded/);
+  assert.notEqual(panel.status().dataset.tone, 'danger');
+  // The panel is not left busy: it applies again.
+  assert.equal(panel.apply.disabled, false);
 });

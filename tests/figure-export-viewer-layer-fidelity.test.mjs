@@ -53,6 +53,7 @@ import {
 import {
   assertFigureExportPayload,
 } from '../assets/js/app/ui/modules/figure-export/figure-export-contract.js';
+import './helpers/figure-export-worker-in-process.mjs';
 
 const repositoryRoot = new URL('../', import.meta.url);
 

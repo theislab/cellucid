@@ -1,0 +1,125 @@
+/* components/_opening.css
+   The startup overlay: the opening under way while no dataset is shown
+   (app/opening-progress-view.js). It is centred over the empty viewer and
+   takes pointer events only on its panel, so the sidebar stays usable. The
+   bar is the shared job progress bar (_jobs.css). */
+
+.opening-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  pointer-events: none;
+  animation: opening-in var(--duration-fast) var(--easing-out);
+}
+
+.opening-overlay[hidden] {
+  display: none;
+}
+
+.opening-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: min(380px, 100%);
+  padding: var(--space-5) var(--space-6);
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  pointer-events: auto;
+}
+
+/* Titled like every dialog (components/_modals.css, Dialog chrome). */
+.opening-title {
+  margin: 0;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  overflow-wrap: anywhere;
+}
+
+.opening-step {
+  margin: 0;
+  font-size: var(--type-body);
+  color: var(--color-text-secondary);
+}
+
+.opening-overlay[data-retrying="true"] .opening-step {
+  color: var(--color-warning-text);
+}
+
+.opening-detail {
+  margin: 0;
+  min-height: 1.4em;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.opening-cancel {
+  align-self: flex-end;
+}
+
+/* A failed opening (app/opening-progress-view.js): one sentence, the detail
+   folded, and the ways on, in place of the progress. */
+.opening-overlay[data-state="running"] .opening-failure,
+.opening-overlay[data-state="running"] .opening-actions,
+.opening-overlay[data-state="failed"] .opening-bar,
+.opening-overlay[data-state="failed"] .opening-detail,
+.opening-overlay[data-state="failed"] .opening-cancel {
+  display: none;
+}
+
+/* An opening waiting for the person to pick one of a file's objects: the
+   question, one button per object, and Cancel. */
+.opening-overlay[data-state="choosing"] .opening-failure,
+.opening-overlay[data-state="choosing"] .opening-bar {
+  display: none;
+}
+
+.opening-overlay[data-state="choosing"] .opening-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+/* A failed opening, or one waiting for a pick, waits for the person, so it
+   stays in view above the sidebar, which on a phone fills the screen. */
+.opening-overlay[data-state="failed"],
+.opening-overlay[data-state="choosing"] {
+  z-index: var(--z-floating);
+}
+
+.opening-overlay[data-state="failed"] .opening-step {
+  color: var(--color-text-secondary);
+}
+
+.opening-failure {
+  margin: 0;
+}
+
+.opening-failure > summary {
+  margin: 0;
+}
+
+.opening-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+@keyframes opening-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .opening-overlay {
+    animation: none;
+  }
+}

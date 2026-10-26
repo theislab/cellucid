@@ -15,15 +15,16 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const CROWDED_H5AD = path.join(FIXTURES, 'data-mapping-crowded.h5ad');
 const START_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared&acceptance=data-mapping-layout-ci';
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui&acceptance=data-mapping-layout-ci';
 const SECTIONS = Object.freeze(['genes', 'knn', 'latent', 'vectors']);
 
 function collectBrowserErrors(page) {
@@ -38,9 +39,9 @@ function collectBrowserErrors(page) {
 async function openCrowded(page) {
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openCollapsedPanels(page);
-  await page.locator('#user-data-h5ad-input').setInputFiles(CROWDED_H5AD);
+  await chooseFiles(page.locator('#user-data-file-input'), CROWDED_H5AD);
   await expect(page.locator('#dataset-name')).toHaveText('data-mapping-crowded');
   await expect.poll(() => page.evaluate(
     () => window._cellucidState.getMappingCandidates() !== null
@@ -49,8 +50,12 @@ async function openCrowded(page) {
     const { getNotificationCenter } = await import('/assets/js/app/notification-center.js');
     getNotificationCenter().dismissAll();
   });
-  const header = page.locator('#data-mapping-disclosure .disclosure-header');
+  const header = page.locator('#data-mapping-disclosure > .disclosure-header-row > .disclosure-header');
   if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+  // Arrays that are off and wider than 3 columns, or cannot be drawn, are
+  // listed under "Other arrays", collapsed; open it so every row is listed.
+  const others = page.locator('#data-mapping-more > .disclosure-header');
+  if (await others.isVisible() && (await others.getAttribute('aria-expanded')) !== 'true') await others.click();
 }
 
 async function openSections(page) {
@@ -105,8 +110,9 @@ for (const [layout, viewport] of [
       }
       const rows = page.locator('.data-mapping-row');
       await expect(rows).toHaveCount(12);
-      // The guess turns the narrow arrays on, the 3-column one as the 3D default.
-      await expect(page.locator('#data-mapping-disclosure .disclosure-desc'))
+      // The guess turns the narrow arrays on, the 3-column t-SNE as the 3D
+      // default; the view opens on the UMAP in 2D.
+      await expect(page.locator('#data-mapping-disclosure > .disclosure-header-row .disclosure-desc'))
         .toHaveText('5 on · t-SNE scale0 latents 3D · UMAP scale0 latents 2D · guessed');
       // Every array can change its dimension; every editor starts closed.
       await expect(page.locator('.data-mapping-edit')).toHaveCount(12);
@@ -117,7 +123,12 @@ for (const [layout, viewport] of [
       // A row that is off is one line: no Default, no second line.
       const off = page.locator('.data-mapping-row[data-disabled="true"]');
       await expect(off).toHaveCount(7);
-      await expect(off.locator('.data-mapping-row-meta:visible')).toHaveCount(0);
+      // An off row has no Default or guessed line; a wide one says only how
+      // wide it is.
+      await expect(off.locator('.data-mapping-default:visible, .data-mapping-tag:visible')).toHaveCount(0);
+      for (const meta of await off.locator('.data-mapping-row-meta:visible').all()) {
+        await expect(meta).toHaveText(/^\d[\d,]* columns$/, { useInnerText: true });
+      }
       // Add columns lives in the editors, not between the rows.
       await expect(page.locator('#data-mapping-embeddings > .data-mapping-add')).toHaveCount(0);
       expect(await overflow(page)).toEqual({ out: [], sideways: false });
@@ -127,14 +138,14 @@ for (const [layout, viewport] of [
       for (const edit of await page.locator('.data-mapping-edit').all()) await edit.click();
       await openSections(page);
       expect(await overflow(page)).toEqual({ out: [], sideways: false });
-      for (const name of ['coordinates 1,2,3', 'Spatial', 'UMAP scale1 latents']) {
+      for (const name of ['coordinates 1,2', 'Spatial', 'UMAP scale1 latents']) {
         const target = row(page, name);
         const boxes = await target.locator('.data-mapping-axis-field:visible').evaluateAll(fields => fields.map(field => {
           const label = field.querySelector('label').getBoundingClientRect();
           const select = field.querySelector('select').getBoundingClientRect();
           return { labelBottom: label.bottom, selectTop: select.top, selectWidth: select.width };
         }));
-        expect(boxes.length).toBe(name === 'UMAP scale1 latents' ? 2 : 3);
+        expect(boxes.length).toBe(name === 'Spatial' ? 3 : 2);
         for (const box of boxes) {
           expect(box.selectTop).toBeGreaterThanOrEqual(box.labelBottom - 0.5);
           expect(box.selectTop).toBeCloseTo(boxes[0].selectTop, 0);
@@ -165,14 +176,16 @@ test('every control the panel had is still there and works', async ({ page }) =>
   await expect(row(page, 'UMAP scale0 latents').locator('.data-mapping-tag')).toHaveText('guessed');
   await expect(page.locator('.data-mapping-tag:visible')).toHaveCount(2);
 
-  // On/off, then Default: a 4-column array turned on is offered as 3D.
-  const coordinates = row(page, 'coordinates 1,2,3');
+  // On/off, then Default: a 4-column array is a matrix, not an embedding,
+  // and is offered at its first two columns, in 2D.
+  const coordinates = row(page, 'coordinates 1,2');
   await coordinates.locator('.data-mapping-enable').check();
   await expect(coordinates.locator('.data-mapping-default')).toBeVisible();
   await expect(coordinates.locator('.data-mapping-default')).toHaveAttribute('aria-pressed', 'false');
   await coordinates.locator('.data-mapping-default').click();
   await expect(coordinates.locator('.data-mapping-default')).toHaveAttribute('aria-pressed', 'true');
-  await expect(row(page, 't-SNE scale0 latents').locator('.data-mapping-default')).toHaveAttribute('aria-pressed', 'false');
+  await expect(row(page, 'UMAP scale0 latents').locator('.data-mapping-default')).toHaveAttribute('aria-pressed', 'false');
+  // The live view opened on the 2D default, so it follows the new one.
   await expect(status).toHaveText('Apply also switches 1 view to the new default.');
 
   // The dimension opens the editor; the dimensions offered are the ones the
@@ -187,25 +200,25 @@ test('every control the panel had is still there and works', async ({ page }) =>
   expect(await dimensions(row(page, 'Spatial'))).toEqual(['1D', '2D', '3D']);
   expect(await dimensions(row(page, 'UMAP scale1 latents'))).toEqual(['1D', '2D']);
   // Column menus: 1-based labels over 0-based values, one per axis shown.
-  await expect(coordinates.locator('.data-mapping-axis-select:visible')).toHaveCount(3);
+  await expect(coordinates.locator('.data-mapping-axis-select:visible')).toHaveCount(2);
   await expect(coordinates.locator('select[data-axis="0"] option')).toHaveText(['1', '2', '3', '4']);
-  await coordinates.locator('select[data-axis="2"]').selectOption({ value: '3' });
-  const coordinates124 = row(page, 'coordinates 1,2,4');
-  await expect(coordinates124).toHaveCount(1);
-  await expect(coordinates124.locator('.data-mapping-editor')).toBeVisible();
+  await coordinates.locator('select[data-axis="1"]').selectOption({ value: '3' });
+  const coordinates14 = row(page, 'coordinates 1,4');
+  await expect(coordinates14).toHaveCount(1);
+  await expect(coordinates14.locator('.data-mapping-editor')).toBeVisible();
 
   // Add columns: only an array wider than three columns has it; the new
   // selection opens its editor, and its remove button takes it away again.
   await expect(row(page, 'Spatial').locator('.data-mapping-add')).toBeHidden();
-  await expect(coordinates124.locator('.data-mapping-add')).toHaveText('Add columns');
-  await coordinates124.locator('.data-mapping-add').click();
-  // It takes the first column no selection uses, then the first one.
-  const addedRow = page.locator('.data-mapping-row').nth(2);
-  await expect(addedRow.locator('.data-mapping-name')).toHaveText('coordinates 3,1');
+  await expect(coordinates14.locator('.data-mapping-add')).toHaveText('Add columns');
+  await coordinates14.locator('.data-mapping-add').click();
+  // It takes the first two columns no selection uses.
+  const addedRow = row(page, 'coordinates 2,3');
+  await expect(addedRow).toHaveCount(1);
   await expect(addedRow.locator('.data-mapping-enable')).toBeChecked();
   await expect(addedRow.locator('.data-mapping-editor')).toBeVisible();
   await expect(addedRow.locator('.data-mapping-remove')).toBeVisible();
-  await expect(page.locator('#data-mapping-row-2')).toBeFocused();
+  await expect(page.locator(`#data-mapping-row-${await addedRow.getAttribute('data-row')}`)).toBeFocused();
   await addedRow.locator('.data-mapping-remove').click();
   await expect(page.locator('.data-mapping-row')).toHaveCount(12);
 
@@ -235,7 +248,7 @@ test('every control the panel had is still there and works', async ({ page }) =>
   await revert.click();
   await expect(revert).toBeDisabled();
   await expect(apply).toBeDisabled();
-  await expect(row(page, 'coordinates 1,2,3').locator('.data-mapping-enable')).not.toBeChecked();
+  await expect(row(page, 'coordinates 1,2').locator('.data-mapping-enable')).not.toBeChecked();
   await expect(page.locator('#data-mapping-expression')).toHaveValue('X');
   await expect(page.locator('#data-mapping-knn')).toHaveValue('connectivities');
   await expect(page.locator('#data-mapping-latent')).toHaveValue('');
@@ -385,20 +398,20 @@ test('a change anywhere in the panel keeps the sidebar where it was and the focu
   const latent = page.locator('#data-mapping-latent');
   expect(await settle(latent, () => latent.selectOption({ index: 1 }))).toEqual(steady);
 
-  const coordinates = row(page, 'coordinates 1,2,3');
+  const coordinates = row(page, 'coordinates 1,2');
   const enable = coordinates.locator('.data-mapping-enable');
   expect(await settle(enable, () => page.keyboard.press('Space'))).toEqual(steady);
   await expect(enable).toBeChecked();
   const isDefault = coordinates.locator('.data-mapping-default');
   expect(await settle(isDefault, () => page.keyboard.press('Enter'))).toEqual(steady);
   await expect(isDefault).toHaveAttribute('aria-pressed', 'true');
-  const edit = row(page, 'scale1 latents 1,2,3').locator('.data-mapping-edit');
+  const edit = row(page, 'scale1 latents 1,2').locator('.data-mapping-edit');
   expect(await settle(edit, () => page.keyboard.press('Enter'))).toEqual(steady);
-  const index = await row(page, 'scale1 latents 1,2,3').getAttribute('data-row');
+  const index = await row(page, 'scale1 latents 1,2').getAttribute('data-row');
   const axis = page.locator(`#data-mapping-row-${index}-y`);
   // The row is renamed by its new columns; the select is the same element.
   expect(await settle(axis, () => axis.selectOption({ value: '5' }))).toEqual(steady);
-  await expect(row(page, 'scale1 latents 1,6,3')).toHaveCount(1);
+  await expect(row(page, 'scale1 latents 1,6')).toHaveCount(1);
   const vectorHeader = page.locator('[data-mapping-section="vectors"] .disclosure-header');
   expect(await settle(vectorHeader, () => page.keyboard.press('Enter'))).toEqual(steady);
   expect(errors).toEqual([]);

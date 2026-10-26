@@ -45,6 +45,8 @@ test('Save follows the runtime cells while Load stays available', () => {
       settled: true,
       whenSettled: async () => {},
     },
+    currentDatasetIdentityId: () => null,
+    openDatasetSource: async () => false,
     sessionSerializer: {
       downloadSession() {},
       loadSessionFromFile() {}
@@ -90,6 +92,8 @@ test('session-control destroy fences late publication and drains active work', a
         settled: true,
         whenSettled: async () => {},
       },
+      currentDatasetIdentityId: () => null,
+      openDatasetSource: async () => false,
       sessionSerializer: {
         downloadSession(filename) {
           serializerCalls.push(['save', filename]);

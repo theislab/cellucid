@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
-import { H5adDataSource } from '../assets/js/data/h5ad.js';
-import { ZarrDataSource } from '../assets/js/data/zarr.js';
-import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
+import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
+import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
+import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
 const isAbortError = error => error?.name === 'AbortError';
 
@@ -253,8 +253,8 @@ test(
       'the re-load must run its own loader read'
     );
     assert.equal(edges.nEdges, scenario.expectedEdges);
-    assert.deepEqual(Array.from(edges.sources), [0, 0, 1, 2, 3, 4]);
-    assert.deepEqual(Array.from(edges.destinations), [1, 5, 2, 3, 4, 5]);
+    assert.deepEqual(Array.from(edgeListOf(edges).sources), [0, 0, 1, 2, 3, 4]);
+    assert.deepEqual(Array.from(edgeListOf(edges).destinations), [1, 5, 2, 3, 4, 5]);
     assert.strictEqual(adapter._connectivityCache.get('connectivities'), edges);
   }
 );
@@ -342,8 +342,8 @@ test(
 );
 
 for (const [label, SourceClass] of [
-  ['H5AD', H5adDataSource],
-  ['Zarr', ZarrDataSource],
+  ['H5AD', AnnDataFileSource],
+  ['Zarr', AnnDataFileSource],
 ]) {
   test(
     `${label} source connectivity edges forward their cancellation signal`,
@@ -410,7 +410,7 @@ for (const [label, SourceClass] of [
       await settleBackgroundWork();
 
       assert.equal(outcome.status, 'rejected');
-      assert.match(String(outcome.reason?.message), /unexpected key.*legacyAbort/i);
+      assert.match(String(outcome.reason?.message), /may contain only: signal \(unexpected: legacyAbort\)/i);
       assert.equal(scenario.state.loaderCalls, 0);
     }
   );

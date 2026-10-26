@@ -8,7 +8,7 @@
  * @module ui/modules/stats-display
  */
 
-import { formatCount } from '../components/display-format.js';
+import { formatCount } from '../../../utils/format-units.js';
 
 /**
  * @typedef {object} FieldInfo

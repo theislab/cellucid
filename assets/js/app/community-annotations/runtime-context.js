@@ -44,11 +44,25 @@ function normalizeGitHubUserIdOrNull(value) {
 }
 
 /**
+ * The id community annotation files a dataset's suggestions and votes under:
+ * the dataset's identity id, whatever route opened it. A file that states its
+ * id (`uns['cellucid']['id']`) has that id from a sample catalog, a link, a
+ * server or a local file, so a repository's annotations follow the dataset,
+ * not the way it was opened.
+ *
+ * @param {{getCurrentIdentityId?: Function}|null} dataSourceManager
+ * @returns {string|null}
+ */
+export function annotationDatasetIdOf(dataSourceManager) {
+  return dataSourceManager?.getCurrentIdentityId?.() ?? null;
+}
+
+/**
  * Compute the active community-annotation cache context.
  *
  * @param {object} [options]
- * @param {import('../../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
- * @param {string|null} [options.datasetId] - Overrides `dataSourceManager.getCurrentDatasetId()`.
+ * @param {import('../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
+ * @param {string|null} [options.datasetId] - Overrides `annotationDatasetIdOf(dataSourceManager)`.
  * @returns {{
  *   datasetId: string|null,
  *   userKey: string,
@@ -63,7 +77,7 @@ export function getCommunityAnnotationCacheContext({ dataSourceManager = null, d
 
   const rawDatasetId =
     datasetId === undefined
-      ? dataSourceManager?.getCurrentDatasetId?.()
+      ? annotationDatasetIdOf(dataSourceManager)
       : datasetId;
   let did = null;
   if (rawDatasetId !== null && rawDatasetId !== undefined) {
@@ -105,7 +119,7 @@ export function getCommunityAnnotationCacheContext({ dataSourceManager = null, d
  * Apply the computed cache context to the session (idempotent if unchanged).
  *
  * @param {object} [options]
- * @param {import('../../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
+ * @param {import('../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
  * @param {string|null} [options.datasetId]
  * @returns {ReturnType<typeof getCommunityAnnotationCacheContext>}
  */

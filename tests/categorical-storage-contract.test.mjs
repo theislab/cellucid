@@ -138,9 +138,7 @@ async function findLocalDerivations(directory, { recurse, skip = () => false }) 
     if (!entry.name.endsWith('.js') || skip(entry.name)) continue;
     const source = await readFile(child, 'utf8');
     source.split('\n').forEach((line, index) => {
-      // The quantization NaN marker shares these numbers but is a different
-      // contract (`quantization-contract.js`), so only categorical wording is
-      // examined here.
+      // Only categorical wording is examined here.
       if (!/categor/i.test(line)) return;
       // A comment cannot derive anything; only executable lines are scanned.
       if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
@@ -202,58 +200,3 @@ test('no application module re-derives the width or the sentinel', async () => {
   );
 });
 
-test('the reader contract matches both exporters', async () => {
-  // The readers here, `_categorical_storage` / `_declared_categorical_storage`
-  // in cellucid-python, and `.categorical_code_dtype` in cellucid-r all have to
-  // agree. The writers live in sibling repositories that are not always checked
-  // out beside this one, so their agreement is asserted when they are present
-  // and skipped explicitly when they are not.
-  const writers = [
-    {
-      // One table of widths; the server picks the narrowest that fits and
-      // the exporter checks the declared one against it.
-      // The checkout under test: CELLUCID_PYTHON_ROOT, or the sibling.
-      path: process.env.CELLUCID_PYTHON_ROOT
-        ? new URL(`file://${process.env.CELLUCID_PYTHON_ROOT.replace(/\/$/, '')}/src/cellucid/_contracts.py`)
-        : new URL('../../cellucid-python/src/cellucid/_contracts.py', import.meta.url),
-      expected: [
-        /"uint8": CategoricalCodeWidth\("u8", 1, 255\)/,
-        /"uint16": CategoricalCodeWidth\("u16", 2, 65_535\)/,
-        /"uint32": CategoricalCodeWidth\("u32", 4, 4_294_967_295\)/,
-      ],
-    },
-    {
-      path: new URL('../../cellucid-r/R/obs.R', import.meta.url),
-      expected: [
-        /uint8 = list\(dtype = "uint8", missing_value = 255L\)/,
-        /uint16 = list\(dtype = "uint16", missing_value = 65535L\)/,
-        /uint32 = list\(dtype = "uint32", missing_value = 4294967295\)/,
-        /if \(n_categories > width\$missing_value\)/,
-      ],
-    },
-  ];
-
-  let checked = 0;
-  for (const { path, expected } of writers) {
-    let source;
-    try {
-      source = await readFile(path, 'utf8');
-    } catch (error) {
-      assert.equal(
-        error.code,
-        'ENOENT',
-        `unexpected failure reading ${path.pathname}`
-      );
-      continue;
-    }
-    checked += 1;
-    for (const pattern of expected) {
-      assert.match(source, pattern, `${path.pathname} must state ${pattern}`);
-    }
-  }
-  assert.equal(
-    checked <= writers.length,
-    true,
-    `${checked} of ${writers.length} exporters were available to compare`
-  );
-});

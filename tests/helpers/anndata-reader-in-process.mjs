@@ -5,20 +5,14 @@
  * Messages take the same path as in the browser: the request is handled by
  * `createAnnDataReaderHandler`, and the reply is structured-cloned with its
  * typed arrays transferred, so a reader that kept a transferred buffer would
- * find it detached exactly as in a worker. Files are read through
- * `BytesRangeSource` because Node has no `FileReaderSync`.
+ * find it detached exactly as in a worker. Files are read as in the browser,
+ * as `File`/`Blob` slices.
  */
 
 import { setAnnDataReaderWorkerFactory } from '../../assets/js/data/anndata-reader-client.js';
 import { createAnnDataReaderHandler } from '../../assets/js/data/anndata-reader-worker.js';
-import { BytesRangeSource } from '../../assets/js/data/range-source.js';
 
-export function createInProcessAnnDataReaderWorker({
-  createRangeSource = async file => new BytesRangeSource(
-    new Uint8Array(await file.arrayBuffer()),
-    { name: file.name ?? '' }
-  ),
-} = {}) {
+export function createInProcessAnnDataReaderWorker() {
   const worker = {
     onmessage: null,
     onerror: null,
@@ -29,7 +23,6 @@ export function createInProcessAnnDataReaderWorker({
     if (!worker.terminated) worker.onmessage?.({ data });
   };
   const handle = createAnnDataReaderHandler({
-    createRangeSource,
     post: message => queueMicrotask(() => deliver(structuredClone(message))),
   });
   worker.postMessage = (message, transfer = []) => {
@@ -38,8 +31,9 @@ export function createInProcessAnnDataReaderWorker({
     // some tests stand in for Files with plain objects a clone would refuse.
     const received = transfer.length > 0 ? structuredClone(message, { transfer }) : message;
     worker.messages.push(received);
-    handle(received).then(({ reply, transfer }) => {
-      deliver(structuredClone(reply, { transfer }));
+    handle(received).then(answer => {
+      // A cancel message has no reply of its own.
+      if (answer !== null) deliver(structuredClone(answer.reply, { transfer: answer.transfer }));
     });
   };
   worker.terminate = () => {

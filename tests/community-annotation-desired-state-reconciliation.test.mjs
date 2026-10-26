@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { CommunityAnnotationGitHubSync } from '../assets/js/app/community-annotations/github-sync.js';
-import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import {
+  composeMergesFile,
+  composeUserFile,
+  parseExactJson,
+} from '../assets/js/app/community-annotations/wire-contract.js';
 
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
 const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
@@ -58,6 +62,16 @@ function validMergesDocument() {
     updatedAt: '2026-07-25T01:02:03.456Z',
     merges: [],
   };
+}
+
+/** The user file publishing the view writes for dataset "synthetic". */
+function validUserFile() {
+  return composeUserFile(null, 'synthetic', validUserDocument());
+}
+
+/** The merges file publishing the view writes for dataset "synthetic". */
+function validMergesFile(view = validMergesDocument()) {
+  return composeMergesFile(null, 'synthetic', view);
 }
 
 function exactPublishedJson(document) {
@@ -164,11 +178,11 @@ function pullRequestRecord() {
 function schemaDocument(kind) {
   const ids = {
     user:
-      'https://cellucid.com/contracts/community-annotation/user-v1.schema.json',
+      'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
     config:
       'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
     merges:
-      'https://cellucid.com/contracts/community-annotation/merges-v1.schema.json',
+      'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
   };
   return {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -318,7 +332,7 @@ class ForkPublicationWorkerMock {
     branchExists = true,
     branchSha = SHA_A,
     createdBranchSha = SHA_A,
-    forkFileText = exactPublishedJson(validUserDocument()),
+    forkFileText = exactPublishedJson(validUserFile()),
     pullRequestExists = true,
     malformedAppliedKind = null,
     forkReady = true,
@@ -525,7 +539,7 @@ class ForkPublicationWorkerMock {
       assert.equal(request.body.branch, this.branch);
       assert.equal(
         request.body.content,
-        encodeBase64(exactPublishedJson(validUserDocument())),
+        encodeBase64(exactPublishedJson(validUserFile())),
       );
       this.forkFileText = decodeBase64(request.body.content);
       return this.#mutationResult(
@@ -666,7 +680,7 @@ class DirectContentsWorkerMock {
       assert.equal(request.body.branch, 'main');
       assert.equal(
         request.body.content,
-        encodeBase64(exactPublishedJson(validUserDocument())),
+        encodeBase64(exactPublishedJson(validUserFile())),
       );
       this.remoteText = decodeBase64(request.body.content);
       this.remoteSha = SHA_C;
@@ -697,7 +711,7 @@ class DirectMutationWorkerMock {
   constructor({
     initialContent = null,
     reconciliationContent = contentDocument(
-      exactPublishedJson(validUserDocument()),
+      exactPublishedJson(validUserFile()),
       SHA_C,
     ),
     mutation,
@@ -766,7 +780,7 @@ class DirectMutationWorkerMock {
       assert.equal(request.body.branch, 'main');
       assert.equal(
         request.body.content,
-        encodeBase64(exactPublishedJson(validUserDocument())),
+        encodeBase64(exactPublishedJson(validUserFile())),
       );
       if (this.mutation.type === 'throw') {
         throw this.mutation.error;
@@ -1044,7 +1058,7 @@ test(
         state: {
           forkExists: false,
           branchExists: true,
-          forkFileText: exactPublishedJson(validUserDocument()),
+          forkFileText: exactPublishedJson(validUserFile()),
           pullRequestExists: true,
         },
         isReconciliationRead(request) {
@@ -1061,7 +1075,7 @@ test(
         state: {
           forkExists: true,
           branchExists: false,
-          forkFileText: exactPublishedJson(validUserDocument()),
+          forkFileText: exactPublishedJson(validUserFile()),
           pullRequestExists: true,
         },
         isReconciliationRead(request) {
@@ -1096,7 +1110,7 @@ test(
         state: {
           forkExists: true,
           branchExists: true,
-          forkFileText: exactPublishedJson(validUserDocument()),
+          forkFileText: exactPublishedJson(validUserFile()),
           pullRequestExists: false,
         },
         isReconciliationRead(request) {
@@ -1180,7 +1194,7 @@ test(
             forkTransient404s: 2,
             enforceForkReadiness: true,
             branchExists: true,
-            forkFileText: exactPublishedJson(validUserDocument()),
+            forkFileText: exactPublishedJson(validUserFile()),
             pullRequestExists: true,
           });
           const { calls, value: result } =
@@ -1255,7 +1269,7 @@ test(
       },
       enforceForkReadiness: true,
       branchExists: true,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
 
@@ -1304,7 +1318,7 @@ test(
       forkTransient404s: Number.MAX_SAFE_INTEGER,
       enforceForkReadiness: true,
       branchExists: true,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
 
@@ -1362,7 +1376,7 @@ test(
     const worker = new ForkPublicationWorkerMock({
       forkExists: true,
       branchExists: true,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: false,
       malformedAppliedKind: 'pulls-post',
     });
@@ -1405,7 +1419,7 @@ test(
       forkExists: true,
       branchExists: true,
       branchSha: SHA_D,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
     const { calls, value: result } =
@@ -1443,7 +1457,7 @@ test(
       forkExists: true,
       branchExists: false,
       createdBranchSha: SHA_D,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
     const { calls } = await withDeterministicOperationIds(() =>
@@ -1500,7 +1514,7 @@ test(
     const worker = new ForkPublicationWorkerMock({
       forkExists: true,
       branchExists: true,
-      forkFileText: exactPublishedJson(validUserDocument()),
+      forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
     const { calls, value: result } =
@@ -1525,7 +1539,7 @@ test(
   { concurrency: false },
   async () => {
     const worker = new DirectContentsWorkerMock({
-      remoteText: exactPublishedJson(validUserDocument()),
+      remoteText: exactPublishedJson(validUserFile()),
       remoteSha: SHA_B,
     });
     const { calls, value: result } =
@@ -1561,7 +1575,7 @@ test(
   { concurrency: false },
   async () => {
     const canonical = encodeBase64(
-      exactPublishedJson(validUserDocument()),
+      exactPublishedJson(validUserFile()),
     );
     const folded =
       `${canonical.slice(0, 16)}\r\n` +
@@ -1606,7 +1620,7 @@ test(
   { concurrency: false },
   async () => {
     const canonical = encodeBase64(
-      exactPublishedJson(validUserDocument()),
+      exactPublishedJson(validUserFile()),
     );
     const malformed =
       `${canonical.slice(0, 16)}\r${canonical.slice(16)}`;
@@ -1655,7 +1669,7 @@ test(
   { concurrency: false },
   async () => {
     const worker = new DirectContentsWorkerMock({
-      remoteText: JSON.stringify(validUserDocument()),
+      remoteText: JSON.stringify(validUserFile()),
       remoteSha: SHA_B,
     });
     await withDeterministicOperationIds(() =>
@@ -1836,7 +1850,7 @@ test(
   { concurrency: false },
   async () => {
     const merges = validMergesDocument();
-    const worker = createMergesNoOpWorker(exactPublishedJson(merges));
+    const worker = createMergesNoOpWorker(exactPublishedJson(validMergesFile(merges)));
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
         withGlobalFetch(
@@ -1864,7 +1878,7 @@ test(
   { concurrency: false },
   async () => {
     const merges = validMergesDocument();
-    const worker = createMergesNoOpWorker(JSON.stringify(merges));
+    const worker = createMergesNoOpWorker(JSON.stringify(validMergesFile(merges)));
     await withDeterministicOperationIds(() =>
       withGlobalFetch(
         worker.fetch,

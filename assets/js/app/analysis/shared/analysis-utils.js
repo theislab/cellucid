@@ -2,7 +2,6 @@
  * Analysis Utilities - Common functions for Analysis UI components
  *
  * Centralizes shared patterns to ensure DRY code:
- * - Loading state management
  * - Page requirements validation
  * - CSV export utilities
  * - Form value extraction
@@ -13,138 +12,8 @@
 
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import { downloadBlob } from '../../utils/download.js';
-
-// =============================================================================
-// LOADING STATE MANAGEMENT
-// =============================================================================
-
-/**
- * Run an analysis with standard loading state management
- *
- * Handles:
- * - Disabling/enabling run button
- * - Showing loading notification
- * - Completing/failing notification
- * - Suppressing terminal side effects after request invalidation
- *
- * @param {Object} options
- * @param {Object} options.component - The UI component (must have _notifications)
- * @param {HTMLButtonElement} [options.runButton] - The run button to disable
- * @param {string} options.loadingMessage - Loading notification message
- * @param {string} options.successMessage - Success notification message
- * @param {Function} options.analysisFunction - The async analysis function
- * @param {Function} options.isCurrent - Exact request ownership predicate
- * @param {Function} options.registerInvalidationCleanup - Register request-local cleanup
- * @param {string} [options.category='calculation'] - Notification category
- * @returns {Promise<any>} Analysis result or null if already loading
- *
- * @example
- * const result = await runAnalysisWithLoadingState({
- *   component: this,
- *   runButton: this._formContainer.querySelector('.analysis-run-btn'),
- *   loadingMessage: 'Running differential expression...',
- *   successMessage: 'Analysis complete',
- *   analysisFunction: () => this._runDEAnalysis()
- * });
- */
-export async function runAnalysisWithLoadingState(options) {
-  const {
-    component,
-    runButton,
-    loadingMessage,
-    successMessage,
-    analysisFunction,
-    isCurrent,
-    registerInvalidationCleanup,
-    category = 'calculation'
-  } = options;
-
-  if (typeof isCurrent !== 'function') {
-    throw new TypeError(
-      'Analysis loading state requires an exact request ownership predicate'
-    );
-  }
-  if (!isCurrent()) return null;
-  if (typeof registerInvalidationCleanup !== 'function') {
-    throw new TypeError(
-      'Analysis loading state requires invalidation cleanup registration'
-    );
-  }
-
-  const originalText = runButton?.textContent;
-  const notifId = component._notifications?.loading(loadingMessage, { category });
-  let notificationSettled = false;
-  let buttonRestored = false;
-  let invalidated = false;
-
-  // Update button state
-  if (runButton) {
-    runButton.disabled = true;
-    runButton.textContent = 'Running...';
-  }
-
-  const restoreButton = () => {
-    if (!runButton || buttonRestored) return;
-    runButton.disabled = false;
-    runButton.textContent = originalText;
-    buttonRestored = true;
-  };
-  const dismissNotification = () => {
-    if (
-      notificationSettled ||
-      notifId === null ||
-      notifId === undefined
-    ) {
-      return;
-    }
-    if (typeof component._notifications?.dismiss !== 'function') {
-      throw new TypeError(
-        'Invalidated analysis loading state requires notification dismissal'
-      );
-    }
-    component._notifications.dismiss(notifId);
-    notificationSettled = true;
-  };
-  const invalidate = () => {
-    invalidated = true;
-    dismissNotification();
-    restoreButton();
-  };
-  registerInvalidationCleanup(invalidate);
-
-  try {
-    const result = await analysisFunction();
-    if (!isCurrent()) {
-      invalidate();
-      return null;
-    }
-    if (
-      component._notifications &&
-      notifId !== null &&
-      notifId !== undefined
-    ) {
-      component._notifications.complete(notifId, successMessage);
-      notificationSettled = true;
-    }
-    return result;
-  } catch (error) {
-    if (invalidated || !isCurrent()) {
-      invalidate();
-      return null;
-    }
-    if (
-      component._notifications &&
-      notifId !== null &&
-      notifId !== undefined
-    ) {
-      component._notifications.fail(notifId, `Analysis failed: ${error.message}`);
-      notificationSettled = true;
-    }
-    throw error;
-  } finally {
-    if (isCurrent()) restoreButton();
-  }
-}
+import { toCSVCell } from '../compute/csv-export.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 // =============================================================================
 // PAGE REQUIREMENTS VALIDATION
@@ -216,7 +85,7 @@ export function getRequirementText(requirements) {
   } else if (maxPages) {
     return `Select ${minPages}-${maxPages} page(s)`;
   } else if (minPages > 1) {
-    return `Select at least ${minPages} pages`;
+    return `Select at least ${formatCountOf(minPages, 'page')}`;
   } else {
     return `Select at least 1 page`;
   }
@@ -225,28 +94,6 @@ export function getRequirementText(requirements) {
 // =============================================================================
 // CSV EXPORT UTILITIES
 // =============================================================================
-
-/**
- * Convert a value to a safe CSV cell.
- * - Numbers: finite numbers only; non-finite -> empty
- * - Strings/others: quoted if needed; quotes are escaped by doubling
- *
- * @param {*} value
- * @returns {string}
- */
-export function toCSVCell(value) {
-  if (value === null || value === undefined) return '';
-
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? String(value) : '';
-  }
-
-  const str = String(value);
-  if (/[",\n\r]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
 
 /**
  * Generic function to convert an array of objects to CSV format
@@ -300,40 +147,20 @@ export function toCSV(data, options = {}) {
 }
 
 /**
- * Download data as CSV file
+ * Download a CSV file.
  *
- * @param {string} csv - CSV content
+ * @param {string|Blob} csv - CSV text, or the file the CSV writer built
+ *   (compute/csv-export.js)
  * @param {string} filename - Filename without extension
  * @param {Object} [notifications] - Notification center for success message
  */
 export function downloadCSV(csv, filename, notifications) {
-  downloadBlob(new Blob([csv], { type: 'text/csv' }), `${filename}.csv`);
+  const blob = csv instanceof Blob ? csv : new Blob([csv], { type: 'text/csv' });
+  downloadBlob(blob, `${filename}.csv`);
 
   if (notifications) {
     notifications.success('Data exported as CSV', { category: 'download' });
   }
-}
-
-/**
- * Convert page data to CSV format
- *
- * @param {Object[]} pageData - Array of { pageId, pageName, values, cellIndices }
- * @param {string} variableName - Name of the variable for header
- * @returns {string} CSV content
- */
-export function pageDataToCSV(pageData, variableName = 'value') {
-  const rows = [`page,cell_index,${toCSVCell(variableName)}`];
-
-  for (const pd of pageData) {
-    const pageName = toCSVCell(pd.pageName);
-    for (let i = 0; i < pd.values.length; i++) {
-      const cellIdx = pd.cellIndices?.[i] ?? i;
-      const value = pd.values[i];
-      rows.push([pageName, toCSVCell(cellIdx), toCSVCell(value)].join(','));
-    }
-  }
-
-  return rows.join('\n');
 }
 
 /**
@@ -354,27 +181,6 @@ export function deResultsToCSV(results) {
       toCSVCell(r.pValue),
       toCSVCell(r.adjustedPValue)
     ].join(','));
-  }
-
-  return rows.join('\n');
-}
-
-/**
- * Convert signature scores to CSV
- *
- * @param {Object[]} pageData - Array of { pageName, values }
- * @returns {string} CSV content
- */
-export function signatureScoresToCSV(pageData) {
-  const rows = ['page,score'];
-
-  for (const pd of pageData) {
-    const pageName = toCSVCell(pd.pageName);
-    for (const value of pd.values) {
-      if (Number.isFinite(value)) {
-        rows.push([pageName, toCSVCell(value)].join(','));
-      }
-    }
   }
 
   return rows.join('\n');

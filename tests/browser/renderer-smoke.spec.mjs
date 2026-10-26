@@ -1,13 +1,12 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { VECTOR_DATASET, listVectorDataset } from './helpers/vector-catalog.mjs';
 import {
   PROJECTILE_MIN_CHARGE_SECONDS,
 } from '../../assets/js/rendering/projectiles.js';
 
-const CURRENT_UI_DATASET =
-  '/tests/browser/fixtures/exports/current-ui-prepared/';
 const WEBGL_HARNESS = '/tests/browser/fixtures/webgl-harness.html';
 
 async function installReadPixelsAudit(page) {
@@ -26,17 +25,6 @@ async function installReadPixelsAudit(page) {
       },
     });
   });
-}
-
-function createVelocityBytes(nCells) {
-  const bytes = Buffer.alloc(
-    nCells * 2 * Float32Array.BYTES_PER_ELEMENT,
-  );
-  for (let index = 0; index < nCells; index++) {
-    bytes.writeFloatLE(0.01, index * 2 * 4);
-    bytes.writeFloatLE((index % 3) * 0.0025, ((index * 2) + 1) * 4);
-  }
-  return bytes;
 }
 
 test('volumetric smoke completes its exact GPU density and noise path', async ({ page }) => {
@@ -75,12 +63,12 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-smoke-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-smoke-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -170,7 +158,7 @@ test('render-mode switch cancels one pending noise transaction and restarts clea
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-mode-generation-cancellation`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-mode-generation-cancellation`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -1440,13 +1428,13 @@ test('smoke on a device without float blending stays in Points with a plain mess
     }
   });
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-mode-rollback`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-mode-rollback`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
@@ -1518,13 +1506,13 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
     }
   });
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-runtime-failure-settlement`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-runtime-failure-settlement`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.evaluate(() => {
     const state = window._cellucidState;
@@ -1664,13 +1652,13 @@ test('GPU smoke density matches its prior GPU reference without product readback
 }) => {
   await installReadPixelsAudit(page);
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-density-oracle`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-density-oracle`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const proofs = await page.evaluate(async () => {
@@ -2115,13 +2103,13 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-empty-filter`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=smoke-empty-filter`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
@@ -2221,42 +2209,16 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
     }
   });
 
-  await page.route(
-    `**${CURRENT_UI_DATASET}dataset_identity.json`,
-    async route => {
-      const response = await route.fetch();
-      const identity = await response.json();
-      identity.vector_fields = {
-        default_field: 'velocity_umap',
-        fields: {
-          velocity_umap: {
-            label: 'velocity_umap',
-            files: {
-              X_umap_2d: 'vectors/0_0.bin',
-            },
-          },
-        },
-      };
-      await route.fulfill({ response, json: identity });
-    },
-  );
-  await page.route(
-    `**${CURRENT_UI_DATASET}vectors/0_0.bin`,
-    route => route.fulfill({
-      status: 200,
-      contentType: 'application/octet-stream',
-      body: createVelocityBytes(120),
-    }),
-  );
+  await listVectorDataset(page);
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-slider-endpoints`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui-vector&acceptance=velocity-slider-endpoints`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    VECTOR_DATASET.name,
   );
   await expect(page.locator('#velocity-overlay-enabled')).toBeEnabled();
   const clearColorBefore = await page.locator('#glcanvas').evaluate(canvas => {
@@ -2341,13 +2303,13 @@ test('recoloring and position changes retain the published filter generation', a
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-alpha-generation`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-alpha-generation`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   const result = await page.evaluate(async () => {
@@ -2416,12 +2378,12 @@ test('projectiles use the published full-resolution collision index', async ({ p
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-projectile-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-projectile-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   await page.locator('#navigation-mode').selectOption('free');
   await expect(page.locator('#navigation-mode')).toHaveValue('free');
@@ -2481,28 +2443,30 @@ test('spatial-index construction failures settle every owned notification', asyn
   });
 
   await page.goto(
-    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-spatial-failure-ci`,
+    `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=renderer-spatial-failure-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
-    const originalTime = console.time;
-    console.time = (label) => {
-      if (label === 'Quadtree build') {
+    // Trees are built in a worker; the build fails where the positions are
+    // handed to it.
+    const originalPostMessage = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (message, ...rest) {
+      if (message?.kind === 'positions') {
         throw new Error('synthetic spatial-index construction failure');
       }
-      return originalTime.call(console, label);
+      return Reflect.apply(originalPostMessage, this, [message, ...rest]);
     };
     try {
       return await new Promise((resolve) => {
         viewer.setProjectilesEnabled(true, resolve);
       });
     } finally {
-      console.time = originalTime;
+      Worker.prototype.postMessage = originalPostMessage;
     }
   });
 

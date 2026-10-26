@@ -2,7 +2,7 @@
  * DataSourceManager - Central coordinator for data sources and dataset switching
  *
  * Manages:
- * - Registration of data sources (local-demo, local-user, remote, jupyter)
+ * - Registration of data sources (local-demo, local-user, link, remote, jupyter)
  * - Active dataset tracking
  * - Dataset switching with callbacks
  * - State snapshot capture for session serialization and figure export
@@ -15,14 +15,12 @@ import {
   validateDatasetIdentity
 } from './data-source.js';
 import { createLocalDemoDataSource } from './local-demo-source.js';
-import { createGitHubDataSource } from './github-data-source.js';
-import {
-  throwIfMetadataAborted,
-  validateAbortSignalOrNull,
-  waitForMetadata,
-} from './metadata-load-contract.js';
+import { createLinkDataSource } from './link-source.js';
 import { debug } from '../utils/debug.js';
-import { setOwnDataProperty } from '../utils/exact-record.js';
+
+/** The source types whose datasets come from a dataset catalog, which can
+ * name a default view for a dataset (`datasets.json` `session`). */
+const PUBLISHED_STATE_SOURCE_TYPES = new Set(['local-demo', 'link']);
 
 const datasetSelectionStages = new WeakMap();
 const datasetSelectionPublications = new WeakMap();
@@ -156,9 +154,6 @@ export class DataSourceManager {
 
     /** @type {number} */
     this._selectionRevision = 0;
-
-    /** @type {Object<string, string>} Protocol handlers (protocol → sourceType) */
-    this._protocolHandlers = { ...DataSourceManager.DEFAULT_PROTOCOL_HANDLERS };
   }
 
   /**
@@ -266,10 +261,9 @@ export class DataSourceManager {
       );
     }
 
-    // GitHub is an explicit connection workflow and performs no catalog I/O
-    // until the user supplies a repository.
-    const githubSource = createGitHubDataSource();
-    this.registerSource('github-repo', githubSource);
+    // A link (GitHub, CELLxGENE, GEO, any web address) is an explicit
+    // connection workflow and performs no I/O until the user supplies one.
+    this.registerSource('link', createLinkDataSource());
 
     this._initialized = true;
     debug.log('[DataSourceManager] Initialized');
@@ -335,12 +329,14 @@ export class DataSourceManager {
    *
    * @param {Object} [options]
    * @param {boolean} [options.refresh=false] - Clear cached source state first
+   * @param {string[]} [options.skip=[]] - Source types not probed this
+   *   time: what the caller does not list now, so nothing of theirs is read
    * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[], error: Error|null}[]>}
    */
   async getAllDatasets(options = {}) {
     requireExactOptionRecord(
       options,
-      ['refresh'],
+      ['refresh', 'skip'],
       'DataSourceManager.getAllDatasets options'
     );
     const refresh = Object.hasOwn(options, 'refresh')
@@ -349,6 +345,12 @@ export class DataSourceManager {
     if (typeof refresh !== 'boolean') {
       throw new TypeError(
         'DataSourceManager.getAllDatasets refresh must be a boolean.'
+      );
+    }
+    const skip = Object.hasOwn(options, 'skip') ? options.skip : [];
+    if (!Array.isArray(skip) || skip.some(sourceType => typeof sourceType !== 'string')) {
+      throw new TypeError(
+        'DataSourceManager.getAllDatasets skip must be an array of source types.'
       );
     }
     debug.log('[DataSourceManager] getAllDatasets', {
@@ -364,7 +366,7 @@ export class DataSourceManager {
     }
 
     const allResults = await Promise.all(
-      [...this.sources.entries()].map(
+      [...this.sources.entries()].filter(([sourceType]) => !skip.includes(sourceType)).map(
         async ([sourceType, source]) => {
           const result = await this._probeSource(sourceType, source);
           // A source whose refresh failed reports that failure, even when it
@@ -412,7 +414,9 @@ export class DataSourceManager {
    *
    * @param {string} sourceType
    * @param {string} datasetId
-   * @param {{loadMethod?: string|null, source?: Object}} [options]
+   * @param {{loadMethod?: string|null, source?: Object, signal?: AbortSignal}} [options]
+   *   `signal`: the dataset change this stage is for; a catalog dataset still
+   *   being opened for it stops when it aborts (a newer choice replaced it).
    * @returns {Promise<Readonly<{
    *   baseUrl: string,
    *   datasetId: string,
@@ -427,9 +431,15 @@ export class DataSourceManager {
     validateDatasetId(datasetId, 'Dataset selection datasetId');
     const exactOptions = requireExactOptionRecord(
       options,
-      ['loadMethod', 'source'],
+      ['loadMethod', 'source', 'signal'],
       'Dataset selection stage options'
     );
+    const signal = Object.hasOwn(exactOptions, 'signal')
+      ? exactOptions.signal
+      : null;
+    if (signal !== null && !(signal instanceof AbortSignal)) {
+      throw new TypeError('Dataset selection signal must be an AbortSignal.');
+    }
     const loadMethod = requireLoadMethod(
       Object.hasOwn(exactOptions, 'loadMethod')
         ? exactOptions.loadMethod
@@ -454,7 +464,7 @@ export class DataSourceManager {
       );
     }
 
-    const metadata = await source.getMetadata(datasetId);
+    const metadata = await source.getMetadata(datasetId, { signal });
     validateDatasetIdentity(metadata, datasetId, sourceType);
     const baseUrl = source.getBaseUrl(datasetId);
     if (
@@ -470,9 +480,9 @@ export class DataSourceManager {
         { baseUrl, datasetId }
       );
     }
-    const identityId = sourceType === 'local-user'
-      ? source.getIdentityId(datasetId)
-      : datasetId;
+    // Sessions and community annotations key on the identity's id, which is
+    // the dataset id every source selects it by.
+    const identityId = metadata.id;
     try {
       validateDatasetId(
         identityId,
@@ -615,6 +625,13 @@ export class DataSourceManager {
       );
     }
     owner.state = 'discarded';
+    // A dataset a catalog opened for this stage is released, unless it is
+    // the one shown.
+    if (typeof owner.source?.releaseExcept === 'function') {
+      owner.source.releaseExcept(
+        owner.source === this.activeSource ? this.activeDatasetId : null
+      );
+    }
   }
 
   /**
@@ -743,6 +760,14 @@ export class DataSourceManager {
     }
 
     const errors = [];
+    // A catalog keeps open only the dataset now shown.
+    if (typeof this.activeSource?.releaseExcept === 'function') {
+      try {
+        this.activeSource.releaseExcept(this.activeDatasetId);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
     for (const [source, cleanup] of cleanupOwners) {
       try {
         if (cleanup === 'disconnect') {
@@ -944,23 +969,22 @@ export class DataSourceManager {
   }
 
   /**
-   * Get the active local-demo dataset's explicitly advertised state manifest.
-   * Other source types and demo catalogs without the capability return null
-   * without a network probe.
+   * The default view the active dataset's catalog names for it (the sample
+   * catalog, or a linked catalog): its session file, exact byte length and
+   * SHA-256. Other source types and datasets without one return null, without
+   * a network request.
    *
-   * @returns {string|null}
+   * @returns {Object|null}
    */
   getCurrentStateDescriptor() {
     if (!this.activeSource || !this.activeDatasetId) return null;
-    if (
-      readSourceType(this.activeSource, 'Active data source')
-      !== 'local-demo'
-    ) {
+    const sourceType = readSourceType(this.activeSource, 'Active data source');
+    if (!PUBLISHED_STATE_SOURCE_TYPES.has(sourceType)) {
       return null;
     }
     if (typeof this.activeSource.getStateDescriptor !== 'function') {
       throw new TypeError(
-        'Active local-demo source must implement getStateDescriptor().'
+        `Active ${sourceType} source must implement getStateDescriptor().`
       );
     }
     const sourceDescriptor = this.activeSource.getStateDescriptor(
@@ -968,37 +992,13 @@ export class DataSourceManager {
     );
     if (sourceDescriptor === null) return null;
     if (
-      sourceDescriptor === null
-      || typeof sourceDescriptor !== 'object'
+      typeof sourceDescriptor !== 'object'
       || Array.isArray(sourceDescriptor)
       || Object.keys(sourceDescriptor).sort().join(',')
-        !== 'manifestUrl,stateBytes,stateSha256'
+        !== 'sessionBytes,sessionSha256,sessionUrl'
     ) {
       throw new TypeError(
-        'Active dataset state descriptor must contain exactly manifestUrl, stateBytes and stateSha256.'
-      );
-    }
-    const baseUrl = this.getCurrentBaseUrl();
-    const expectedManifestUrl = new URL(
-      'state-snapshots.json',
-      baseUrl
-    ).href;
-    if (sourceDescriptor.manifestUrl !== expectedManifestUrl) {
-      throw new TypeError(
-        'Active dataset state manifest URL must be the exact dataset sibling.'
-      );
-    }
-    if (
-      typeof sourceDescriptor.stateSha256 !== 'string'
-      || !/^[0-9a-f]{64}$/.test(sourceDescriptor.stateSha256)
-    ) {
-      throw new TypeError(
-        'Active dataset state SHA-256 must be one lowercase digest.'
-      );
-    }
-    if (!Number.isSafeInteger(sourceDescriptor.stateBytes) || sourceDescriptor.stateBytes < 1) {
-      throw new TypeError(
-        'Active dataset state byte length must be a positive safe integer.'
+        'Active dataset state descriptor must contain exactly sessionUrl, sessionBytes and sessionSha256.'
       );
     }
     if (
@@ -1011,14 +1011,13 @@ export class DataSourceManager {
       );
     }
     return {
-      baseUrl,
       datasetId: this.activeDatasetId,
       identityId: this.activeIdentityId,
-      manifestUrl: sourceDescriptor.manifestUrl,
       selectionRevision: this._selectionRevision,
-      sourceType: 'local-demo',
-      stateBytes: sourceDescriptor.stateBytes,
-      stateSha256: sourceDescriptor.stateSha256,
+      sessionBytes: sourceDescriptor.sessionBytes,
+      sessionSha256: sourceDescriptor.sessionSha256,
+      sessionUrl: sourceDescriptor.sessionUrl,
+      sourceType,
     };
   }
 
@@ -1057,7 +1056,8 @@ export class DataSourceManager {
   }
 
   /**
-   * Get the exact dataset_identity.json id for the current generation.
+   * Get the identity id of the current dataset: the id sessions and
+   * community annotations key on.
    * @returns {string|null}
    */
   getCurrentIdentityId() {
@@ -1189,163 +1189,6 @@ export class DataSourceManager {
         }
       })
     );
-  }
-
-  /**
-   * Default protocol handlers for custom URL schemes.
-   * Maps protocol prefix to source type that handles it.
-   * @type {Object<string, string>}
-   */
-  static DEFAULT_PROTOCOL_HANDLERS = {
-    'local-user://': 'local-user',
-    'remote://': 'remote',
-    'remotes://': 'remote',
-    'jupyter://': 'jupyter',
-  };
-
-  /**
-   * Register a custom protocol handler
-   * Allows new data source types to register their own URL protocols.
-   * @param {string} protocol - Protocol prefix (e.g., 'remote://', 'jupyter://')
-   * @param {string} sourceType - Source type that handles this protocol
-   * @example
-   * manager.registerProtocol('remote://', 'remote-server');
-   * manager.registerProtocol('jupyter://', 'jupyter-bridge');
-   */
-  registerProtocol(protocol, sourceType) {
-    if (!protocol.endsWith('://')) {
-      debug.warn(`[DataSourceManager] Protocol should end with '://': ${protocol}`);
-    }
-    setOwnDataProperty(this._protocolHandlers, protocol, sourceType);
-    debug.log('[DataSourceManager] Registered protocol', { protocol, sourceType });
-  }
-
-  /**
-   * Unregister a custom protocol handler
-   * @param {string} protocol - Protocol prefix to remove
-   */
-  unregisterProtocol(protocol) {
-    delete this._protocolHandlers[protocol];
-  }
-
-  /**
-   * Get all registered protocol handlers
-   * @returns {Object<string, string>} Map of protocol → sourceType
-   */
-  getProtocolHandlers() {
-    return { ...this._protocolHandlers };
-  }
-
-  /**
-   * Check if a URL uses a custom protocol handled by a data source
-   * @param {string} url - URL to check
-   * @returns {boolean}
-   */
-  isCustomProtocolUrl(url) {
-    if (!url) return false;
-    for (const protocol of Object.keys(this._protocolHandlers)) {
-      if (url.startsWith(protocol)) return true;
-    }
-    return false;
-  }
-
-  /**
-   * Get the source type for a custom protocol URL
-   * @param {string} url - Custom protocol URL
-   * @returns {string|null} Source type or null if not a custom protocol
-   */
-  getSourceTypeForUrl(url) {
-    if (!url) return null;
-    for (const [protocol, sourceType] of Object.entries(this._protocolHandlers)) {
-      if (url.startsWith(protocol)) return sourceType;
-    }
-    return null;
-  }
-
-  /**
-   * Resolve a custom protocol URL to a fetchable URL (async version)
-   * Handles local-user://, remote://, jupyter://, etc.
-   * @param {string} url - URL that may use a custom protocol
-   * @param {AbortSignal|null} signal - Exact request owner
-   * @returns {Promise<string>} Standard fetchable URL (http://, https://, blob://, or data://)
-   */
-  async resolveUrl(url, signal) {
-    validateAbortSignalOrNull(signal, 'URL resolution signal');
-    throwIfMetadataAborted(signal, 'URL resolution');
-    if (!url) return url;
-
-    const sourceType = this.getSourceTypeForUrl(url);
-    if (!sourceType) {
-      // Standard HTTP(S) URL, return as-is
-      return url;
-    }
-
-    const source = this.sources.get(sourceType);
-    if (!source) {
-      throw new DataSourceError(
-        `Custom protocol URL requires registered source '${sourceType}': ${url}`,
-        DataSourceErrorCode.NOT_FOUND,
-        sourceType,
-        { sourceType, url }
-      );
-    }
-
-    return this.resolveUrlWithSource(url, signal, source);
-  }
-
-  /**
-   * Resolve one custom-protocol URL through an explicit staged source without
-   * registering or activating that source. The source implementation remains
-   * responsible for validating its exact dataset/transport URL ownership.
-   *
-   * @param {string} url
-   * @param {AbortSignal|null} signal
-   * @param {Object} source
-   * @returns {Promise<string>}
-   */
-  async resolveUrlWithSource(url, signal, source) {
-    validateAbortSignalOrNull(signal, 'Staged URL resolution signal');
-    throwIfMetadataAborted(signal, 'Staged URL resolution');
-    const sourceType = this.getSourceTypeForUrl(url);
-    if (sourceType === null) {
-      throw new DataSourceError(
-        `Explicit staged source requires one registered custom protocol URL: ${String(url)}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        null,
-        { url }
-      );
-    }
-    if (
-      source === null ||
-      typeof source !== 'object' ||
-      typeof source.getType !== 'function' ||
-      source.getType() !== sourceType
-    ) {
-      throw new DataSourceError(
-        `Staged custom protocol '${url}' requires one exact ` +
-        `'${sourceType}' source owner`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        sourceType,
-        { sourceType, url }
-      );
-    }
-    if (typeof source.resolveUrl !== 'function') {
-      throw new DataSourceError(
-        `Staged source '${sourceType}' must expose resolveUrl(url, signal) ` +
-        `to handle custom protocol URLs`,
-        DataSourceErrorCode.UNSUPPORTED,
-        sourceType,
-        { sourceType, url }
-      );
-    }
-
-    const resolvedUrl = await waitForMetadata(
-      source.resolveUrl(url, signal),
-      signal,
-      'Staged URL resolution'
-    );
-    throwIfMetadataAborted(signal, 'Staged URL resolution');
-    return resolvedUrl;
   }
 }
 

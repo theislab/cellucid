@@ -144,13 +144,8 @@ test('renderer statistics publish only after an exact per-view render update', (
   assert.equal(renderer.hasStats('live'), false);
   assert.throws(() => renderer.getStats('live'), /no published render statistics/i);
 
-  renderer._updateStats(viewState, {
-    visiblePoints: 6,
-    lodLevel: -1,
-    drawCalls: 1,
-    frustumCulled: false,
-    cullPercent: 0,
-  });
+  // visiblePoints, lodLevel, drawCalls, frustumCulled, cullPercent
+  renderer._writeStats(viewState, 6, -1, 1, false, 0);
 
   assert.equal(renderer.hasStats('live'), true);
   assert.equal(renderer.getStats('live').visiblePoints, 6);
@@ -569,6 +564,8 @@ test('a draw order adopted after a recolor gathers the latest renderer color gen
   const bound = new Map();
   const stores = new Map();
   const gl = {
+    // Read by the CPU stand-in for the GPU gather (tests/helpers/cpu-permuter.mjs).
+    _state: { stores },
     ARRAY_BUFFER: 0x8892,
     CLAMP_TO_EDGE: 0x812f,
     COPY_READ_BUFFER: 0x8f36,
@@ -641,7 +638,9 @@ test('a draw order adopted after a recolor gathers the latest renderer color gen
   ]);
   const positionBuffer = { id: 'main-positions' };
   const colorBuffer = { id: 'main-colors' };
-  stores.set(positionBuffer, new Uint8Array(positions.byteLength));
+  // The live positions are uploaded (no upload pending): the store holds them
+  // in source order, and the adoption gathers them from the store itself.
+  stores.set(positionBuffer, new Uint8Array(positions.buffer.slice(0)));
   stores.set(colorBuffer, new Uint8Array(8));
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
@@ -806,12 +805,19 @@ test('highlight drawing forwards the stable per-view render-parameter owner with
 
 test('viewer isolates highlight synchronization and drawing before later render passes', async () => {
   const viewerSource = await source('viewer.js');
+  // The pane's own synchronization (the readiness check of a pane drawn over
+  // its kept samples synchronizes earlier and reports its own failures).
   const syncIndex = viewerSource.indexOf(
-    'highlightTools.syncHighlightBufferForLod('
+    'highlightTools.syncHighlightBufferForLod(\n        viewPos,'
   );
   const drawIndex = viewerSource.indexOf(
-    'highlightTools.drawHighlights(renderParams, timeSeconds)'
+    'highlightTools.drawHighlights(renderParams, highlightTime)'
   );
+  const readyIndex = viewerSource.indexOf('function maskedPulsePaneReady(');
+  const readySync = viewerSource.indexOf('highlightTools.syncHighlightBufferForLod(', readyIndex);
+  const readyBoundary = viewerSource.indexOf('reportHighlightRenderFailure(error, viewId)', readySync);
+  assert.ok(readyIndex >= 0 && readySync > readyIndex && readyBoundary > readySync);
+  assert.ok(readyBoundary < viewerSource.indexOf('function recordMaskedPane(', readyIndex));
   const laterPassIndex = viewerSource.indexOf(
     'drawConnectivityLines(\n      width,\n      height,\n      vid,\n      paneFogNear,\n      paneFogFar',
     drawIndex
@@ -1077,10 +1083,13 @@ test('figure export never changes format, strategy, backend, or fidelity', async
     /strategy adjusted|fall back to flat circles|value:\s*['"]raster['"]|value\s*=\s*['"]hybrid['"]/i
   );
   assert.doesNotMatch(warningSource, /Export anyway/i);
+  // One backend: the figure-export worker's OffscreenCanvas, never a page
+  // canvas beside it and never a CPU substitute.
   assert.doesNotMatch(
     rasterizerSource,
-    /OffscreenCanvas|falling back to CPU|use flat circles/i
+    /document\.createElement|HTMLCanvasElement|falling back to CPU|use flat circles/i
   );
+  assert.match(rasterizerSource, /new OffscreenCanvas\(1, 1\)/);
   assert.doesNotMatch(
     pngSource,
     /WebGL rasterizer returned null[\s\S]{0,100}Canvas2D flat circles/i

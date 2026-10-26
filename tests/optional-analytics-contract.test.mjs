@@ -82,6 +82,7 @@ test('calls made before the modules arrive are delivered once, in order', async 
   const loading = analytics.load();
   assert.equal(analytics.load(), loading, 'load is idempotent');
   analytics.init();
+  const beforeBegin = performance.now();
   const load = analytics.beginDataLoad('default-demo', 'local-demo', {
     fromNavigation: true,
   });
@@ -96,8 +97,10 @@ test('calls made before the modules arrive are delivered once, in order', async 
   assert.equal(recording.loads.length, 1, 'a handle settles exactly once');
   assert.equal(recording.loads[0].outcome, 'success');
   assert.equal(recording.loads[0].loadMethod, 'default-demo');
-  // A startup load is timed from navigation start, not from this call.
-  assert.ok(recording.loads[0].durationMs >= performance.now() - 1000);
+  // A startup load is timed from navigation start, not from this call: it
+  // lasted at least as long as the page had been open when the load began.
+  assert.ok(recording.loads[0].durationMs >= beforeBegin,
+    `${recording.loads[0].durationMs} ms, the page open for ${beforeBegin} ms at the load's start`);
 });
 
 test('a dataset activation joins the open request of its load method', async () => {
@@ -105,13 +108,13 @@ test('a dataset activation joins the open request of its load method', async () 
   const analytics = await facade(async () => recording.modules);
   await analytics.load();
 
-  const request = analytics.openDataLoad('local-user-h5ad', 'local-user');
+  const request = analytics.openDataLoad('local-user-file', 'local-user');
   assert.equal(
     analytics.beginDataLoad('dataset-dropdown', 'local-demo') === request,
     false,
     'a different method starts its own request'
   );
-  const activation = analytics.beginDataLoad('local-user-h5ad', 'local-user');
+  const activation = analytics.beginDataLoad('local-user-file', 'local-user');
   assert.equal(activation, request);
   activation.fail(new Error('activation failed'));
   request.fail(new Error('reported again by the requester'));
@@ -120,14 +123,14 @@ test('a dataset activation joins the open request of its load method', async () 
   analytics.openDataLoad('remote-connect', 'remote')
     .fail(new Error('unreachable'));
   // A superseded or list-only request sends nothing.
-  analytics.openDataLoad('github-connect', 'github-repo').cancel();
+  analytics.openDataLoad('link-connect', 'link').cancel();
   const superseded = analytics.beginDataLoad('dataset-dropdown', 'local-demo');
   superseded.cancel();
   superseded.succeed({ datasetId: null, metadata: null, stateStatus: 'ready' });
 
   assert.deepEqual(
     recording.loads.map(load => [load.loadMethod, load.outcome]),
-    [['local-user-h5ad', 'failure'], ['remote-connect', 'failure']]
+    [['local-user-file', 'failure'], ['remote-connect', 'failure']]
   );
   assert.equal(recording.loads[0].error.message, 'activation failed');
 });
@@ -148,7 +151,7 @@ test('refused modules leave every entry point inert and silent', async () => {
   analytics.init();
   analytics.startPerformance({ dataSourceManager: {} });
   analytics.trackStartupFailure({ phase: 'catalog', error: new Error('x') });
-  const load = analytics.openDataLoad('local-user-h5ad', 'local-user');
+  const load = analytics.openDataLoad('local-user-file', 'local-user');
   load.fail(new Error('x'));
   analytics.beginDataLoad('dataset-dropdown', 'local-demo').succeed({
     datasetId: null,

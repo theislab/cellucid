@@ -1,9 +1,9 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=filter-legend-sync-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=filter-legend-sync-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -19,7 +19,7 @@ function observeProductErrors(page) {
 async function openPreparedFixture(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
 }
 
@@ -75,6 +75,45 @@ test('removing a category filter from Active filters re-ticks its legend checkbo
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   await expect(alphaRow.locator('.legend-checkbox')).toBeChecked();
 
+  expect(productErrors).toEqual([]);
+});
+
+test('toggling or removing a filter from the keyboard keeps the focus in the list', async ({ page }) => {
+  const productErrors = observeProductErrors(page);
+  await openPreparedFixture(page);
+  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+  await page.locator('.legend-item', {
+    has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
+  }).locator('.legend-checkbox').uncheck();
+  await page.locator('#continuous-field').selectOption({ label: 'score' });
+  await page.locator('#legend .slider-row input[type="range"]').nth(1).fill('50');
+  const rows = page.locator('#active-filters .list-item');
+  await expect(rows).toHaveCount(2);
+  const focusedIn = () => page.evaluate(() => {
+    const active = document.activeElement;
+    const row = active?.closest('.list-item');
+    return {
+      control: active?.classList.contains('list-item-remove') ? 'remove' : active?.type ?? active?.id ?? null,
+      row: row === null || row === undefined ? null : [...row.parentElement.children].indexOf(row),
+    };
+  });
+
+  // Toggling rebuilds the list: the focus stays on that checkbox.
+  await rows.nth(0).locator('input[type="checkbox"]').focus();
+  await page.keyboard.press('Space');
+  await expect(rows.nth(0).locator('input[type="checkbox"]')).not.toBeChecked();
+  expect(await focusedIn()).toEqual({ control: 'checkbox', row: 0 });
+
+  // Removing a filter moves the focus to the row now in its place.
+  await rows.nth(0).locator('.list-item-remove').focus();
+  await page.keyboard.press('Enter');
+  await expect(rows).toHaveCount(1);
+  expect(await focusedIn()).toEqual({ control: 'remove', row: 0 });
+
+  // The last one: the focus stays on the list, not the page.
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
+  expect(await page.evaluate(() => document.activeElement?.id)).toBe('active-filters');
   expect(productErrors).toEqual([]);
 });
 

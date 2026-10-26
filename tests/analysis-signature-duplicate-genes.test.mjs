@@ -1,47 +1,28 @@
+/**
+ * A gene listed twice is scored once, never a failure: the editor keeps one
+ * of each, matching resolves each dataset gene once, and the engine refuses
+ * a set that still names a gene twice (a programming error, not a user's).
+ */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
+import { parseGeneText, resolveGenes } from '../assets/js/app/analysis/shared/gene-sets.js';
+import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 
-const validValues = Object.freeze({
-  method: 'mean',
-  normalize: 'none',
-  plotType: 'violinplot',
+test('a gene typed twice, or twice by case, is matched once', () => {
+  assert.deepEqual(parseGeneText('CD3E, CD8A, CD3E'), ['CD3E', 'CD8A']);
+  assert.deepEqual(resolveGenes(['CD3E', 'cd3e', 'CD8A'], ['CD3E', 'CD8A']).resolved, ['CD3E', 'CD8A']);
 });
 
-test('a gene listed twice is a form error naming the gene, not a scoring failure', () => {
-  const ui = Object.create(GeneSignatureUI.prototype);
-  const validation = ui._validateForm({ ...validValues, genes: ['CD3E', 'CD8A', 'CD3E'] });
-  assert.equal(validation.valid, false);
-  assert.match(validation.error, /CD3E.*more than once/);
-  assert.deepEqual(
-    ui._validateForm({ ...validValues, genes: ['CD3E', 'CD8A'] }),
-    { valid: true },
-  );
-});
-
-test('the automatic signature run validates the form before scoring', async () => {
-  const shown = [];
-  let scored = 0;
-  const ui = Object.create(GeneSignatureUI.prototype);
-  Object.assign(ui, {
-    _isDestroyed: false,
-    _canRunAnalysis: () => true,
-    _startAnalysisRequest: () => 7,
-    _claimBusy: () => () => {},
-    _getFormValues: () => ({ ...validValues, genes: ['CD3E', 'CD3E'] }),
-    _runAnalysisImpl: async () => {
-      scored++;
-      return null;
+test('the engine refuses a set that names a gene twice before reading anything', async () => {
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = new Proxy({}, {
+    get() {
+      throw new Error('a refused request reached the data');
     },
-    _isCurrentAnalysisRequest: () => true,
-    _showError: async (message) => {
-      shown.push(message);
-    },
-    _finishAnalysisRequest: () => {},
   });
-  await ui._runAnalysisIfValid();
-  assert.equal(scored, 0);
-  assert.equal(shown.length, 1);
-  assert.match(shown[0], /CD3E.*more than once/);
+  await assert.rejects(
+    analysis.computeSignatureScore({ geneSets: [{ name: 'S', genes: ['CD3E', 'CD3E'] }], pageIds: ['p'] }),
+    /distinct gene keys/,
+  );
 });

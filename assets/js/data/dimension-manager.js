@@ -45,8 +45,9 @@
 import { loadPointsBinary } from './data-loaders.js';
 import { MappingLoadError } from './data-mapping-candidates.js';
 import { normalizePositions } from '../rendering/gl-utils.js';
-import { getNotificationCenter } from '../app/notification-center.js';
+import { publishPositionBounds } from '../rendering/position-layout.js';
 import { residencyBudgetBytes } from './memory-budget.js';
+import { formatCountOf } from '../utils/format-units.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 const LAYOUT_ORIGINS = new Set(['identity', 'mapping']);
@@ -221,9 +222,10 @@ function requireLayoutDescriptor(descriptor) {
 }
 
 /**
- * Validate one embedding reference as this registry resolves it: an export
- * embedding id with exact null columns, or an AnnData array key with its
- * 0-based columns (1 to 3 of them, distinct).
+ * Validate one embedding reference as this registry resolves it: an AnnData
+ * array key with its 0-based columns (1 to 3 of them, distinct), or a key with
+ * exact null columns for a layout that reads no obsm columns (one generated in
+ * memory, or an obsm array that cannot be plotted).
  *
  * @param {unknown} ref
  * @returns {Readonly<{key: string, columns: readonly number[]|null}>}
@@ -255,14 +257,13 @@ export function requireRepresentationRef(ref) {
 }
 
 /**
- * Parse the sole current embeddings metadata contract (dataset identity
- * version 3) without mutating a DimensionManager. Callers may commit the
- * returned values only after this function has validated the complete
- * candidate.
+ * Parse the embeddings metadata of a dataset identity without mutating a
+ * DimensionManager. Callers may commit the returned values only after this
+ * function has validated the complete candidate.
  *
  * Every item of `embeddings.items` becomes one layout, keyed by its embedding
- * id, in item order; `defaults` names each dimension's default. The exact file
- * and ordering rules of the format are enforced by `validateDatasetIdentity`,
+ * id, in item order; `defaults` names each dimension's default. The exact route
+ * and ordering rules are enforced by `validateDatasetIdentity`,
  * which every identity passes before its embeddings reach this parser; this
  * parser checks the structure it relies on.
  *
@@ -300,10 +301,10 @@ export function parseEmbeddingMetadata(meta) {
       !item ||
       typeof item !== 'object' ||
       Array.isArray(item) ||
-      Object.keys(item).sort().join(',') !== 'dimension,file,label,source'
+      Object.keys(item).sort().join(',') !== 'dimension,label,path,source'
     ) {
       throw new Error(
-        `Embedding "${id}" must contain exactly label, dimension, file, and source.`
+        `Embedding "${id}" must contain exactly label, dimension, path, and source.`
       );
     }
     const source = item.source;
@@ -315,11 +316,11 @@ export function parseEmbeddingMetadata(meta) {
     ) {
       throw new Error(`Embedding "${id}" source must be exactly { key, columns }.`);
     }
-    if (typeof item.file !== 'string' || item.file.length === 0) {
-      throw new Error(`Embedding "${id}" file must be a non-empty path.`);
+    if (typeof item.path !== 'string' || item.path.length === 0) {
+      throw new Error(`Embedding "${id}" path must be a non-empty route.`);
     }
-    if (source.key !== null && (typeof source.key !== 'string' || source.key.length === 0)) {
-      throw new Error(`Embedding "${id}" source key must be null or a non-empty string.`);
+    if (typeof source.key !== 'string' || source.key.length === 0) {
+      throw new Error(`Embedding "${id}" source key must be a non-empty string.`);
     }
     const dimension = requireSupportedDimension(item.dimension, `Embedding "${id}" dimension`);
     if (
@@ -336,10 +337,8 @@ export function parseEmbeddingMetadata(meta) {
       layoutKey: id,
       dimension: item.dimension,
       label: item.label,
-      path: item.file,
-      provenance: source.key === null
-        ? null
-        : { key: source.key, columns: source.columns },
+      path: item.path,
+      provenance: { key: source.key, columns: source.columns },
       origin: 'identity',
     }));
   }
@@ -388,7 +387,7 @@ export function parseEmbeddingMetadata(meta) {
  * Create a dimension manager instance
  * @param {Object} options - Configuration options
  * @param {string} options.baseUrl - Base URL for loading layout files
- * @param {Object} options.embeddingsMetadata - Embeddings metadata from dataset_identity.json
+ * @param {Object} options.embeddingsMetadata - The dataset identity's embeddings metadata
  * @param {number} options.maxPositionBytes - Maximum retained/transient position bytes
  * @returns {DimensionManager}
  */
@@ -460,7 +459,7 @@ export function createInMemoryDimensionManager(candidate) {
       positions.length * Float32Array.BYTES_PER_ELEMENT
   ) {
     throw new TypeError(
-      `In-memory positions must be a non-empty exact Float32 array with ${dimension} values per cell.`
+      `In-memory positions must be a non-empty exact Float32 array with ${formatCountOf(dimension, 'value')} per cell.`
     );
   }
   for (let index = 0; index < positions.length; index += 1) {
@@ -528,8 +527,7 @@ class DimensionManager {
     candidateAnnDataBinding = null,
     baseUrl = '',
     embeddingsMetadata = null,
-    maxPositionBytes = residencyBudgetBytes('positions'),
-    stagedSource = null
+    maxPositionBytes = residencyBudgetBytes('positions')
   } = {}) {
     if (
       !Number.isSafeInteger(maxPositionBytes) ||
@@ -541,28 +539,15 @@ class DimensionManager {
     }
     if (
       candidateAnnDataBinding !== null &&
-      (
-        typeof candidateAnnDataBinding !== 'object' ||
-        stagedSource !== null
-      )
+      typeof candidateAnnDataBinding !== 'object'
     ) {
       throw new TypeError(
-        'DimensionManager requires at most one candidate AnnData binding or ' +
-        'staged custom-protocol source.'
-      );
-    }
-    if (
-      stagedSource !== null &&
-      typeof stagedSource !== 'object'
-    ) {
-      throw new TypeError(
-        'DimensionManager stagedSource must be an object or exact null.'
+        'DimensionManager candidateAnnDataBinding must be one binding or exact null.'
       );
     }
     this.baseUrl = baseUrl;
     this.candidateAnnDataBinding = candidateAnnDataBinding;
     this._maxPositionBytes = BigInt(maxPositionBytes);
-    this.stagedSource = stagedSource;
 
     // Registered layouts: layoutKey -> frozen descriptor, in registration
     // order.
@@ -595,10 +580,16 @@ class DimensionManager {
     // source cannot read arrays on request. See setLayoutProvider().
     this._layoutProvider = null;
 
-    // Decoded positions not yet normalized: layoutKey -> Float32Array. An
-    // entry lives only between decode and the in-place normalization of the
-    // same array; every reader of coordinates reads normalizedPositionCache.
+    // Loaded positions not yet published: layoutKey -> Float32Array, already
+    // in display coordinates (the reader worker normalized an AnnData
+    // embedding; an in-memory layout is fitted as it is produced). An entry
+    // lives only between load and publication; every reader of coordinates
+    // reads normalizedPositionCache.
     this.positionCache = new Map();
+
+    // The display transform of each loaded layout, published with it:
+    // layoutKey -> { center: [x,y,z], scale: number }.
+    this.loadedTransformCache = new Map();
 
     // Loading promises to prevent duplicate fetches: layoutKey -> Promise
     this.loadingPromises = new Map();
@@ -611,8 +602,8 @@ class DimensionManager {
     this.viewLayouts = new Map();
 
     // Normalized positions for rendering: layoutKey -> Float32Array
-    // (n_cells * dimension). For a layout the loader decoded, this is the
-    // decoded array itself, normalized in place.
+    // (n_cells * dimension). For a layout the loader read, this is the
+    // loaded array itself.
     this.normalizedPositionCache = new Map();
 
     // In-flight normalization transactions. All concurrent callers for a
@@ -654,8 +645,8 @@ class DimensionManager {
    * `loadLayout` bounds a payload at `nCells * dim * 4` bytes, but it can
    * only do that once some embedding has landed and taught it the count. The
    * *first* embedding would therefore have no exact length to check unless
-   * the axis is published up front from `stats.n_cells`, which
-   * `dataset_identity.json` already states. This is the sole seam for doing
+   * the axis is published up front from `stats.n_cells`, which the dataset
+   * identity already states. This is the sole seam for doing
    * that: it exists so the invariant lives in the module that owns it rather
    * than in each construction site's memory.
    *
@@ -685,7 +676,7 @@ class DimensionManager {
   }
 
   /**
-   * Initialize from dataset_identity.json embeddings metadata: register one
+   * Initialize from the dataset identity's embeddings metadata: register one
    * layout per declared embedding, enable every one, and make each
    * dimension's declared default its default.
    * @param {Object} meta - Embeddings metadata object
@@ -946,10 +937,10 @@ class DimensionManager {
   }
 
   /**
-   * The registered layout an embedding reference names: an export embedding
-   * id (`columns` null), or an AnnData obsm array read at `columns`, which
-   * is the provenance of the layout that plots them -- registered through the
-   * layout provider when none does yet. Registering reads nothing.
+   * The registered layout an embedding reference names: an AnnData obsm
+   * array read at `columns`, which is the provenance of the layout that plots
+   * them -- registered through the layout provider when none does yet. A
+   * reference without columns names no layout. Registering reads nothing.
    *
    * @param {{key: string, columns: readonly number[]|null}} ref
    * @returns {string} The layout key.
@@ -957,14 +948,18 @@ class DimensionManager {
    */
   resolveRepresentation(ref) {
     const exact = requireRepresentationRef(ref);
-    const layoutKey = exact.columns === null
-      ? (this._layouts.has(exact.key) ? exact.key : null)
-      : this.resolveProvenanceLayout(exact.key, exact.columns);
+    // Every embedding reference names the obsm array and the columns it
+    // plots (see data/dataset-mapping.js `layoutEmbeddingRef`); a layout is
+    // found by that provenance, never by a bare key.
+    if (exact.columns === null) {
+      throw new TypeError(
+        `The embedding reference to obsm['${exact.key}'] must list the columns it plots.`
+      );
+    }
+    const layoutKey = this.resolveProvenanceLayout(exact.key, exact.columns);
     if (layoutKey === null) {
       throw new RangeError(
-        exact.columns === null
-          ? `This dataset has no embedding "${exact.key}".`
-          : `This dataset cannot plot obsm['${exact.key}'] columns [${exact.columns.join(', ')}].`
+        `This dataset cannot plot obsm['${exact.key}'] columns [${exact.columns.join(', ')}].`
       );
     }
     return layoutKey;
@@ -1043,18 +1038,13 @@ class DimensionManager {
   }
 
   /**
-   * Load raw position data for a layout (lazy load)
+   * Load raw position data for a layout (lazy load). Positions are read from
+   * the AnnData file, whose reads are counted in the Transfers log.
    * @param {string} layoutKey - Layout to load
-   * @param {Object} options - Loading options
-   * @param {boolean} options.showProgress - Show progress notification (default: true)
    * @returns {Promise<Float32Array>} Raw position data
    */
-  async loadLayout(layoutKey, options = {}) {
+  async loadLayout(layoutKey) {
     const generation = this._generation;
-    const {
-      showProgress = true,
-      progressTrackerId = null
-    } = options;
     const layout = this.getLayout(layoutKey);
     const key = layout.layoutKey;
     const dim = layout.dimension;
@@ -1091,6 +1081,9 @@ class DimensionManager {
             `In-memory layout "${key}" must produce exactly ${this.nCells * dim} Float32 values.`
           );
         }
+        // Produced coordinates are fitted to the view in place, as they are
+        // made, with the transform that maps them.
+        this.loadedTransformCache.set(key, normalizePositions(positions, dim));
         this.positionCache.set(key, positions);
         return positions;
       }).finally(() => {
@@ -1107,39 +1100,20 @@ class DimensionManager {
 
     const controller = new AbortController();
     this.loadingControllers.set(key, controller);
-    const notifications = getNotificationCenter();
-    const ownsTracker = showProgress && !progressTrackerId;
-    const trackerId = ownsTracker
-      ? notifications.startDownload(
-          `${dim}D cell positions`,
-          null,
-          { onCancel: () => controller.abort() }
-        )
-      : progressTrackerId;
 
     let promise;
     promise = loadPointsBinary(url, {
       candidateAnnDataBinding: this.candidateAnnDataBinding,
       dimension: dim,
-      displayName: `${dim}D cell positions`,
-      // Every layout of one dataset shares its cell count, so the first
-      // loaded embedding fixes the exact byte length of all the others. Before
-      // any embedding has landed the browser byte ceiling is the only bound.
-      expectedBytes: this.nCells === 0
-        ? null
-        : this.nCells * dim * Float32Array.BYTES_PER_ELEMENT,
-      progressTrackerId: trackerId,
-      showProgress: false,
-      signal: controller.signal,
-      stagedSource: this.stagedSource
+      signal: controller.signal
     })
-      .then(positions => {
+      .then(({ positions, transform, bounds }) => {
         this._assertGeneration(generation, key, promise);
 
         // Validate and cache
         if (positions.length % dim !== 0) {
           throw new Error(
-            `Invalid positions length for ${dim}D: ${positions.length} values not divisible by ${dim}.`
+            `Invalid positions length for ${dim}D: ${formatCountOf(positions.length, 'value')} not divisible by ${dim}.`
           );
         }
         const nCells = positions.length / dim;
@@ -1152,31 +1126,21 @@ class DimensionManager {
           this.nCells = nCells;
         } else if (nCells !== this.nCells) {
           throw new Error(
-            `Dimension ${dim}D has ${nCells} cells, but expected ${this.nCells} cells.`
+            `Dimension ${dim}D has ${formatCountOf(nCells, 'cell')}, but expected ${formatCountOf(this.nCells, 'cell')}.`
           );
         }
 
+        // The reader worker scanned the coordinates: their bounds are known.
+        if (bounds !== null) publishPositionBounds(positions, dim, bounds);
+        this.loadedTransformCache.set(key, transform);
         this.positionCache.set(key, positions);
         if (this.loadingPromises.get(key) === promise) {
           this.loadingPromises.delete(key);
         }
-        console.log(`[DimensionManager] Loaded ${dim}D: ${nCells.toLocaleString()} cells`);
-        if (ownsTracker) {
-          notifications.completeDownload(trackerId);
-        }
+        console.log(`[DimensionManager] Loaded ${dim}D: ${formatCountOf(nCells, 'cell')}`);
         return positions;
       })
       .catch(err => {
-        if (ownsTracker) {
-          if (err?.name === 'AbortError' || controller.signal.aborted) {
-            notifications.dismissDownload(trackerId);
-          } else {
-            notifications.failDownload(
-              trackerId,
-              err?.message || String(err)
-            );
-          }
-        }
         if (err instanceof MappingLoadError) {
           // A refused mapping choice: the panel names it and keeps the rest.
           console.warn(`[DimensionManager] ${err.message}`);
@@ -1203,13 +1167,10 @@ class DimensionManager {
    * dimension of components per cell (x, xy or xyz).
    *
    * @param {string} layoutKey
-   * @param {Object} [options]
-   * @param {boolean} [options.showProgress=true]
    * @returns {Promise<Float32Array>} Normalized positions (n_cells * dim)
    */
-  async getPositions(layoutKey, options = {}) {
+  async getPositions(layoutKey) {
     const generation = this._generation;
-    const { showProgress = true } = options;
     const key = this.getLayout(layoutKey).layoutKey;
 
     // Check cache first (cached positions are already normalized)
@@ -1223,16 +1184,15 @@ class DimensionManager {
       return cached;
     }
 
-    // First caller owns the transaction's progress policy. Later callers share
-    // its normalization, result, and cancellation outcome.
+    // Later callers share the first caller's normalization, result, and
+    // cancellation outcome.
     if (this.normalizedLoadingPromises.has(key)) {
       return this.normalizedLoadingPromises.get(key);
     }
 
     let promise;
     promise = this._loadNormalizedPositionsTransaction(key, {
-      generation,
-      showProgress
+      generation
     }).finally(() => {
       if (this.normalizedLoadingPromises.get(key) === promise) {
         this.normalizedLoadingPromises.delete(key);
@@ -1243,47 +1203,31 @@ class DimensionManager {
   }
 
   /**
-   * Run the single shared normalization transaction for a layout.
+   * Run the single shared publication transaction for a layout.
    *
-   * The decoded array is normalized in place and published as is, so a
-   * layout costs exactly `n_cells * dim * 4` bytes once loaded. No raw copy
-   * survives: centroids, vectors and figure axes are all expressed in the
-   * normalized space, through `getNormTransform` where their source is raw.
+   * The loaded array arrives in display coordinates (normalized once, where
+   * it was read or produced) and is published as is, so a layout costs
+   * exactly `n_cells * dim * 4` bytes once loaded and no pass over it runs
+   * here. Centroids and figure axes are expressed in the display space
+   * through `getNormTransform` where their source is the layout's own
+   * coordinates; vector fields arrive scaled into it.
    *
    * @param {string} layoutKey
    * @param {Object} options
    * @param {number} options.generation
-   * @param {boolean} options.showProgress
    * @returns {Promise<Float32Array>}
    * @private
    */
   async _loadNormalizedPositionsTransaction(
     layoutKey,
-    { generation, showProgress }
+    { generation }
   ) {
     const dim = this.getLayout(layoutKey).dimension;
-    const notifications = getNotificationCenter();
-    const trackerId = showProgress
-      ? notifications.startDownload(
-          `${dim}D cell positions`,
-          null,
-          {
-            onCancel: () => {
-              this.loadingControllers.get(layoutKey)?.abort();
-            }
-          }
-        )
-      : null;
     let rawPositions = null;
 
     try {
-      // The outer normalization transaction owns the terminal progress
-      // state. The raw loader only contributes byte updates to its tracker.
       try {
-        rawPositions = await this.loadLayout(layoutKey, {
-          progressTrackerId: trackerId,
-          showProgress: false
-        });
+        rawPositions = await this.loadLayout(layoutKey);
       } catch (error) {
         if (!isAllocationFailure(error)) throw error;
         // Out of memory: release everything not shown, then try once more.
@@ -1292,35 +1236,22 @@ class DimensionManager {
           `[DimensionManager] Allocation failed loading "${layoutKey}"; releasing cached positions and retrying once.`
         );
         this.releaseUnderPressure();
-        rawPositions = await this.loadLayout(layoutKey, {
-          progressTrackerId: trackerId,
-          showProgress: false
-        });
+        rawPositions = await this.loadLayout(layoutKey);
       }
       this._assertGeneration(generation);
       this._requirePositionShape(rawPositions, dim);
       this._preparePositionWorkspace(layoutKey, rawPositions);
 
-      // Normalize in place: the decoded array becomes the published one.
+      // The loaded array is already in display coordinates: it is published
+      // as it is, with the transform that maps the layout's own coordinates
+      // (centroids, figure axes) into them.
       const positions = rawPositions;
-
-      // Normalize positions to [-1,1] range for consistent rendering.
-      // This ensures all layouts render at the same scale regardless of
-      // original data range.
-      const normTransform = normalizePositions(positions, dim);
-      this._assertGeneration(generation);
-      console.log(`[DimensionManager] Normalized ${dim}D positions (scale: ${normTransform.scale.toFixed(4)})`);
-
-      // Store both the normalized positions and the transform used. The
-      // transform normalizes the layout's centroids and vectors consistently.
+      const normTransform = this.loadedTransformCache.get(layoutKey);
       this.normalizedPositionCache.set(layoutKey, positions);
       this.normTransformCache.set(layoutKey, normTransform);
 
       this.positionCache.delete(layoutKey);
-
-      if (trackerId) {
-        notifications.completeDownload(trackerId);
-      }
+      this.loadedTransformCache.delete(layoutKey);
       return positions;
     } catch (error) {
       if (
@@ -1329,19 +1260,6 @@ class DimensionManager {
         !this.normalizedPositionCache.has(layoutKey)
       ) {
         this.positionCache.delete(layoutKey);
-      }
-      if (trackerId) {
-        if (
-          error?.name === 'AbortError' ||
-          generation !== this._generation
-        ) {
-          notifications.dismissDownload(trackerId);
-        } else {
-          notifications.failDownload(
-            trackerId,
-            error?.message || String(error)
-          );
-        }
       }
       throw error;
     }
@@ -1578,6 +1496,7 @@ class DimensionManager {
     const positions = this.normalizedPositionCache.get(layoutKey) ?? null;
     this.normalizedPositionCache.delete(layoutKey);
     this.positionCache.delete(layoutKey);
+    this.loadedTransformCache.delete(layoutKey);
     if (positions !== null) this._residencyListener?.onEvict?.(positions);
   }
 
@@ -1693,6 +1612,7 @@ class DimensionManager {
       controller.abort();
     }
     this.positionCache.clear();
+    this.loadedTransformCache.clear();
     this.normalizedPositionCache.clear();
     this.normalizedLoadingPromises.clear();
     this.normTransformCache.clear();

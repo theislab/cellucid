@@ -6,33 +6,74 @@
  * - MSB is "continue"
  * - little-endian in the varint sense (least-significant 7-bit group first)
  *
+ * Writers size their output first (`uvarintLength`) and then write into one
+ * preallocated `Uint8Array` (`writeUvarint`), so encoding a set of half a
+ * million cells allocates one buffer, not a growing array of numbers.
+ *
  * This codec is intentionally small and dependency-free so other languages can
  * reimplement it easily.
  *
  * @module session/codecs/varint
  */
 
-/**
- * Append an unsigned varint to a byte array.
- * @param {number} value - Non-negative integer (safe up to 2^53-1).
- * @param {number[]} out
- */
-export function pushUvarint(value, out) {
+function assertUvarintValue(value) {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw new TypeError('pushUvarint: value must be a non-negative safe integer.');
+    throw new TypeError('Uvarint value must be a non-negative safe integer.');
   }
-  if (!Array.isArray(out)) {
-    throw new TypeError('pushUvarint: out must be an Array.');
-  }
+}
 
-  let v = value;
-  while (v >= 0x80) {
-    // Use modulo instead of bitwise ops so values > 2^32 remain correct.
-    const low7 = v % 0x80;
-    out.push(low7 + 0x80);
+/**
+ * Number of bytes `value` takes as a uvarint.
+ * @param {number} value - Non-negative safe integer.
+ * @returns {number}
+ */
+export function uvarintLength(value) {
+  assertUvarintValue(value);
+  if (value < 0x80) return 1;
+  if (value < 0x4000) return 2;
+  if (value < 0x20_0000) return 3;
+  if (value < 0x1000_0000) return 4;
+  let length = 4;
+  let v = Math.floor(value / 0x1000_0000);
+  while (v > 0) {
+    length += 1;
     v = Math.floor(v / 0x80);
   }
-  out.push(v);
+  return length;
+}
+
+/**
+ * Write one uvarint at `offset`.
+ * @param {Uint8Array} out
+ * @param {number} offset
+ * @param {number} value - Non-negative safe integer.
+ * @returns {number} The offset after the written bytes.
+ */
+export function writeUvarint(out, offset, value) {
+  assertUvarintValue(value);
+  let v = value;
+  let position = offset;
+  while (v >= 0x80) {
+    // Modulo instead of bitwise ops so values above 2^32 stay exact.
+    out[position++] = (v % 0x80) + 0x80;
+    v = Math.floor(v / 0x80);
+  }
+  out[position++] = v;
+  return position;
+}
+
+/**
+ * Encode a short list of uvarints into its own buffer.
+ * @param {number[]} values
+ * @returns {Uint8Array}
+ */
+export function encodeUvarints(values) {
+  let length = 0;
+  for (const value of values) length += uvarintLength(value);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const value of values) offset = writeUvarint(out, offset, value);
+  return out;
 }
 
 /**

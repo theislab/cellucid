@@ -174,7 +174,6 @@ test('streaming ORCID overrun and invalid UTF-8 cancel the live reader', async (
             async cancel() {
               cancelled = true;
             },
-            releaseLock() {},
           };
         },
       },
@@ -204,7 +203,6 @@ test('streaming ORCID overrun and invalid UTF-8 cancel the live reader', async (
             async cancel() {
               cancelled = true;
             },
-            releaseLock() {},
           };
         },
       },
@@ -239,7 +237,6 @@ test('owner abort remains the exact first cause and cancels a failed live reader
           async cancel() {
             cancelled = true;
           },
-          releaseLock() {},
         };
       },
     },

@@ -571,6 +571,72 @@ const ORRD_COLORS = [
   [0.498, 0.000, 0.000]
 ];
 
+/**
+ * Buckets of a colormap's byte table: `t` in `[b / B, (b + 1) / B)` reads
+ * bucket `b`, and bucket `B` holds `t >= 1`. A power of two, so `t * B` is
+ * exact and the bucket of a `t` is exactly `floor(t * B)`.
+ */
+export const COLORMAP_TABLE_BUCKETS = 65536;
+
+const COLORMAP_BYTE_TABLES = new WeakMap();
+
+/**
+ * The colormap's exact RGB bytes per bucket of `t`, four bytes a bucket:
+ * `[r, g, b, 0]` when every `t` of the bucket rounds to those bytes, and
+ * `[r, g, b, 1]` when the bytes change inside it (the caller samples that `t`
+ * itself).
+ *
+ * Exactness: inside one segment between two stops, each channel the sampler
+ * computes (`c0 + (c1 - c0) * f` with `f = t * n - i0`) is a composition of
+ * correctly rounded, monotone operations, so the rounded byte is monotone in
+ * `t`. A bucket whose closed range stays inside one segment and whose two ends
+ * round to the same bytes therefore rounds to them everywhere in between. A
+ * bucket that crosses a stop or a byte boundary is marked; about 600 of 65,537
+ * buckets are, whatever the colormap. Clamping makes every `t <= 0` the bytes
+ * of `t = 0` and every `t >= 1` those of `t = 1`, which buckets 0 and `B` hold
+ * (bucket 0 is used for `t < 0` only when it is not marked).
+ *
+ * Built once per colormap: 65,537 samples.
+ *
+ * @param {{colors: number[][], sampleInto: Function}} colormap
+ * @returns {Uint8Array} `(COLORMAP_TABLE_BUCKETS + 1) * 4` bytes.
+ */
+export function getColormapByteTable(colormap) {
+  let table = COLORMAP_BYTE_TABLES.get(colormap);
+  if (table !== undefined) return table;
+  const buckets = COLORMAP_TABLE_BUCKETS;
+  const segments = colormap.colors.length - 1;
+  table = new Uint8Array((buckets + 1) * 4);
+  const sample = [0, 0, 0];
+  colormap.sampleInto(0, sample);
+  let r = Math.round(sample[0] * 255);
+  let g = Math.round(sample[1] * 255);
+  let b = Math.round(sample[2] * 255);
+  let segment = 0;
+  for (let bucket = 0; bucket <= buckets; bucket++) {
+    const j = bucket * 4;
+    table[j] = r;
+    table[j + 1] = g;
+    table[j + 2] = b;
+    if (bucket === buckets) break;
+    const next = (bucket + 1) / buckets;
+    colormap.sampleInto(next, sample);
+    const nextR = Math.round(sample[0] * 255);
+    const nextG = Math.round(sample[1] * 255);
+    const nextB = Math.round(sample[2] * 255);
+    const nextSegment = Math.floor(next * segments);
+    table[j + 3] = (
+      nextSegment !== segment || nextR !== r || nextG !== g || nextB !== b
+    ) ? 1 : 0;
+    r = nextR;
+    g = nextG;
+    b = nextB;
+    segment = nextSegment;
+  }
+  COLORMAP_BYTE_TABLES.set(colormap, table);
+  return table;
+}
+
 function buildColormap(id, label, colors) {
   const sampleInto = makeColormapSamplerInto(colors);
   return {
@@ -768,6 +834,73 @@ function hslToRgb01(h, s, l) {
 
   const m = l - c / 2;
   return [r1 + m, g1 + m, b1 + m];
+}
+
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+/**
+ * One `#rgb`, `#rrggbb` or `#rrggbbaa` colour as an RGB triplet of 0..1
+ * channels (alpha dropped: a category's opacity is the view's), or null for
+ * any other text.
+ *
+ * @param {unknown} text
+ * @returns {[number, number, number]|null}
+ */
+function hexColorToRgb01(text) {
+  if (typeof text !== 'string' || !HEX_COLOR.test(text)) return null;
+  const digits = text.length === 4
+    ? [...text.slice(1)].map(digit => digit + digit).join('')
+    : text.slice(1, 7);
+  return [0, 2, 4].map(start => parseInt(digits.slice(start, start + 2), 16) / 255);
+}
+
+/**
+ * The colours a Scanpy palette gives the categories of one field.
+ *
+ * `stored` is `uns['<key>_colors']` as the file holds it: one colour per
+ * category, in category order, as `sc.pl.*` writes it. Read as Scanpy reads
+ * it: a palette shorter than the categories is not used (Scanpy draws its own
+ * colours then), and a longer one gives its first colours. Scanpy writes hex
+ * colours; a palette holding anything else among the colours it gives is not
+ * used, rather than mixing its colours with Cellucid's. Null when there is no
+ * palette to use.
+ *
+ * @param {unknown} stored
+ * @param {number} categoryCount
+ * @returns {Array<[number, number, number]>|null}
+ */
+export function scanpyCategoryPalette(stored, categoryCount) {
+  if (!Number.isSafeInteger(categoryCount) || categoryCount < 0) {
+    throw new RangeError('A palette colours a non-negative whole number of categories.');
+  }
+  if (!Array.isArray(stored) || categoryCount === 0 || stored.length < categoryCount) return null;
+  const colors = [];
+  for (let index = 0; index < categoryCount; index++) {
+    const rgb = hexColorToRgb01(stored[index]);
+    if (rgb === null) return null;
+    colors.push(rgb);
+  }
+  return colors;
+}
+
+/**
+ * The colour category `idx` of a categorical field opens with: its file's
+ * palette (`field.palette`, `scanpyCategoryPalette`) while that still has one
+ * colour per category, else Cellucid's own (`getCategoryColor`). Merging
+ * categories changes their count, and a palette written for the file's
+ * categories no longer says which colour each one has. A fresh array the
+ * caller owns.
+ *
+ * @param {{categories: ReadonlyArray<unknown>, palette?: ReadonlyArray<ReadonlyArray<number>>|null}} field
+ * @param {number} idx
+ * @returns {number[]}
+ */
+export function defaultCategoryColor(field, idx) {
+  const palette = field.palette;
+  const color = Array.isArray(palette) && palette.length === field.categories?.length
+    ? palette[idx]
+    : getCategoryColor(idx);
+  return [color[0], color[1], color[2]];
 }
 
 // Returns a distinct-looking color for the provided category index. Uses the base

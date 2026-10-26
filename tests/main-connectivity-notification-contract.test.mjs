@@ -10,7 +10,7 @@ const mainSource = fs.readFileSync(
 test('KNN absence uses the exact current warning notification API', () => {
   assert.match(
     mainSource,
-    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?connectivityManifest === null[\s\S]*?notifications\.warning\([\s\S]*?No neighbor graph available for this dataset/
+    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?connectivitySummary === null[\s\S]*?notifications\.warning\([\s\S]*?No neighbor graph available for this dataset/
   );
   assert.doesNotMatch(mainSource, /notifications\.warn\(/);
 });
@@ -23,7 +23,7 @@ test('KNN absence is announced once per dataset and graph generation', () => {
   // Behaviour is covered by tests/browser/knn-missing-connectivity-warning
   // .spec.mjs; this keeps the fast suite from losing the structure silently.
   const guarded = mainSource.match(
-    /setKnnEdgeLoadCallback\(\(\) => \{\s*if \(connectivityManifest === null\) \{([\s\S]*?)\n {10}return;/
+    /setKnnEdgeLoadCallback\(\(\) => \{\s*if \(connectivitySummary === null\) \{([\s\S]*?)\n {10}return;/
   );
   assert.notEqual(guarded, null, 'KNN absence guard was not found in main.js');
   const branch = guarded[1];

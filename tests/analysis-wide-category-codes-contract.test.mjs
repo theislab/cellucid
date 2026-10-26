@@ -11,6 +11,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { categoryCounts, pageValueAt } from '../assets/js/app/analysis/shared/category-counts.js';
 
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
@@ -65,24 +66,30 @@ test('page values label every uint32 code as its own category', async () => {
   const [page] = await layer._fetchDataForPages({
     type: 'categorical_obs', variableKey: 'wide', pageIds: ['P1'], silent: true,
   });
-  assert.deepEqual(countLabels(page.values), EXPECTED);
-  assert.equal(page.values.filter(value => value === null).length, 2);
+  assert.ok(page.values instanceof Uint32Array);
+  const labels = Array.from(page.values, (_, i) => pageValueAt(page, i));
+  assert.deepEqual(countLabels(labels), EXPECTED);
+  assert.equal(labels.filter(value => value === null).length, 2);
+  // The published counts are the same labels.
+  const published = new Map(categoryCounts(page.values));
+  published.delete(null);
+  assert.deepEqual(published, EXPECTED);
 });
 
 test('bulk observation fields keep the width of the field in every page', async () => {
   const layer = layerOver(wideField());
   const whole = await layer.fetchBulkObsFields({
-    pageIds: ['P1'], obsFields: ['wide'], subsetPages: false, includeCategoricalValues: false,
+    pageIds: ['P1'], obsFields: ['wide'], subsetPages: false,
   });
   assert.strictEqual(whole.fields.wide.codes, codes);
 
   const paged = await layer.fetchBulkObsFields({
-    pageIds: ['P1'], obsFields: ['wide'], subsetPages: true, includeCategoricalValues: true,
+    pageIds: ['P1'], obsFields: ['wide'], subsetPages: true,
   });
   const page = paged.fields.wide.P1;
   assert.ok(page.codes instanceof Uint32Array);
   assert.deepEqual([...page.codes], CELL_CODES);
-  assert.deepEqual(countLabels(page.values), EXPECTED);
+  assert.equal(page.values, undefined, 'pages publish codes only');
 });
 
 test('marker groups from a uint32 field carry the exact codes and cell counts', async () => {
@@ -91,15 +98,15 @@ test('marker groups from a uint32 field carry the exact codes and cell counts', 
     state: { obsData: { fields: [{ key: 'wide', loaded: true }] } },
     ensureObsFieldLoaded: async () => ({ kind: 'category', codes, categories, colors: {} }),
   };
-  const { groups, obsCodes } = await controller._getGroupsFromCategory('wide', {});
-  assert.strictEqual(obsCodes, codes);
+  const { groups, codes: groupCodes } = await controller.describeGroups('wide', null);
+  assert.strictEqual(groupCodes, codes);
   assert.deepEqual(
-    new Map(groups.map(group => [group.groupName, group.cellCount])),
+    new Map(groups.map(group => [group.groupName, group.count])),
     EXPECTED,
   );
   const beyond = groups.find(group => group.groupName === 'c69999');
-  assert.equal(beyond.groupCode, 69_999);
-  assert.deepEqual([...beyond.cellIndices], [7, 8, 9, 10, 11]);
+  assert.equal(beyond.code, 69_999);
+  assert.equal(beyond.groupId, 'category-code:69999');
 });
 
 test('the marker worker counts each cell in its group past 32,767 groups', async () => {
@@ -119,10 +126,18 @@ test('the marker worker counts each cell in its group past 32,767 groups', async
       codes: codes.slice(),
       codeToGroupIndex: Int32Array.from({ length: CATEGORY_COUNT }, (_, code) => code),
       groupCount: CATEGORY_COUNT,
+      tested: new Uint8Array(CATEGORY_COUNT).fill(1),
+      reference: -1,
     });
     const values = Float32Array.from(CELL_CODES, (_, cell) => cell + 1);
-    const result = run('MARKERS_COMPUTE_GENE', { values, method: 'ttest', minCells: 1 });
-    assert.equal(result.nAll, CELL_CODES.length - 2);
+    const result = run('MARKERS_COMPUTE_GENES', {
+      columns: [values],
+      method: 'ttest',
+      minCells: 1,
+      pConvention: 'exact',
+      foldChange: { mode: 'stored' },
+    });
+    assert.equal(result.nAll[0], CELL_CODES.length - 2);
     for (const [label, count] of EXPECTED) {
       assert.equal(result.nIn[Number(label.slice(1))], count, label);
     }

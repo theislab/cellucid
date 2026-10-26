@@ -9,9 +9,11 @@
  */
 
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
+import { requireObjectKeys } from '../../../utils/exact-record.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
- * @typedef {'none'|'expired'|'bulk'|'all'} DataLayerCleanupLevel
+ * @typedef {'none'|'expired'|'all'} DataLayerCleanupLevel
  */
 
 /**
@@ -33,13 +35,9 @@ export function clearActiveSourceCaches() {
   }
 
   const cacheOwners = [];
-  if (typeof source.getH5adSource === 'function') {
-    const h5adSource = source.getH5adSource();
-    if (h5adSource !== null) cacheOwners.push(h5adSource);
-  }
-  if (typeof source.getZarrSource === 'function') {
-    const zarrSource = source.getZarrSource();
-    if (zarrSource !== null) cacheOwners.push(zarrSource);
+  if (typeof source.getAnnDataSource === 'function') {
+    const annDataSource = source.getAnnDataSource();
+    if (annDataSource !== null) cacheOwners.push(annDataSource);
   }
   for (const cacheOwner of cacheOwners) {
     if (typeof cacheOwner?.clearCaches !== 'function') {
@@ -61,19 +59,12 @@ export function clearActiveSourceCaches() {
  * @param {DataLayerCleanupLevel} [params.dataLayerCleanup='expired'] - How aggressively to clear DataLayer caches
  */
 export function cleanupAnalysisResources(params) {
-  if (!params || typeof params !== 'object' || Array.isArray(params)) {
-    throw new TypeError('Analysis cleanup parameters must be an object');
-  }
-  const allowedKeys = new Set([
-    'dataLayer',
-    'clearSourceCaches',
-    'dataLayerCleanup'
-  ]);
-  for (const key of Object.keys(params)) {
-    if (!allowedKeys.has(key)) {
-      throw new TypeError(`Analysis cleanup contains unknown key "${key}"`);
-    }
-  }
+  requireObjectKeys(
+    params,
+    [],
+    ['dataLayer', 'clearSourceCaches', 'dataLayerCleanup'],
+    'Analysis cleanup parameters'
+  );
   const {
     dataLayer = null,
     clearSourceCaches: shouldClearSourceCaches = true,
@@ -82,7 +73,7 @@ export function cleanupAnalysisResources(params) {
   if (typeof shouldClearSourceCaches !== 'boolean') {
     throw new TypeError('clearSourceCaches must be exactly boolean');
   }
-  if (!['none', 'expired', 'bulk', 'all'].includes(dataLayerCleanup)) {
+  if (!['none', 'expired', 'all'].includes(dataLayerCleanup)) {
     throw new TypeError(
       `Unknown DataLayer cleanup level: ${String(dataLayerCleanup)}`
     );
@@ -108,17 +99,6 @@ export function cleanupAnalysisResources(params) {
         throw new TypeError('dataLayer must implement clearAllCaches()');
       }
       run(() => dataLayer.clearAllCaches());
-    } else if (dataLayerCleanup === 'bulk') {
-      if (
-        typeof dataLayer.clearBulkGeneCache !== 'function' ||
-        typeof dataLayer.performCacheCleanup !== 'function'
-      ) {
-        throw new TypeError(
-          'bulk DataLayer cleanup requires clearBulkGeneCache() and performCacheCleanup()'
-        );
-      }
-      run(() => dataLayer.clearBulkGeneCache());
-      run(() => dataLayer.performCacheCleanup());
     } else {
       if (typeof dataLayer.performCacheCleanup !== 'function') {
         throw new TypeError('dataLayer must implement performCacheCleanup()');
@@ -135,7 +115,7 @@ export function cleanupAnalysisResources(params) {
   if (errors.length > 1) {
     throw new AggregateError(
       errors,
-      `Analysis cleanup failed in ${errors.length} operations`
+      `Analysis cleanup failed in ${formatCountOf(errors.length, 'operation')}`
     );
   }
 }

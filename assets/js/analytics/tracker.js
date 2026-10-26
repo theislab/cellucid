@@ -32,8 +32,7 @@ import {
 } from '../app/ui/modules/benchmark/renderer-identity.js';
 import { detectSmokeSupport } from '../rendering/smoke-cloud/smoke-capabilities.js';
 
-const EXPORTS_META_SELECTOR = 'meta[name="cellucid-exports-base-url"]';
-const VERSION_PATTERN = /^\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+const SAMPLE_CATALOG_META_SELECTOR = 'meta[name="cellucid-sample-catalog"]';
 
 let initialized = false;
 let publicSampleCatalog = false;
@@ -156,14 +155,14 @@ function rendererClass(gl) {
 
 /**
  * Whether a dataset id is public: only the sample catalog the deployment
- * itself declares. A catalog chosen with `?exportsBaseUrl=` can be anyone's.
+ * itself declares. A catalog chosen with `?sampleCatalog=` can be anyone's.
  */
 function readPublicSampleCatalog() {
-  const metas = document.querySelectorAll(EXPORTS_META_SELECTOR);
+  const metas = document.querySelectorAll(SAMPLE_CATALOG_META_SELECTOR);
   return (
     metas.length === 1 &&
-    typeof DATA_CONFIG.EXPORTS_BASE_URL === 'string' &&
-    DATA_CONFIG.EXPORTS_BASE_URL === metas[0].getAttribute('content')
+    typeof DATA_CONFIG.SAMPLE_CATALOG_URL === 'string' &&
+    DATA_CONFIG.SAMPLE_CATALOG_URL === metas[0].getAttribute('content')
   );
 }
 
@@ -195,6 +194,8 @@ const CLICK_CONTROLS = Object.freeze({
   'analysis-header-differential': ['analysis', 'differential'],
   'analysis-header-signature': ['analysis', 'signature'],
   'analysis-header-genesPanel': ['analysis', 'genes_panel'],
+  'analysis-header-dotplot': ['analysis', 'dotplot'],
+  'analysis-header-composition': ['analysis', 'composition'],
   'gene-expression-dropdown': ['color_by_gene'],
 });
 
@@ -255,7 +256,10 @@ const DECLARED_CHANGE_CONTROLS = Object.freeze({
   'data-mapping:embedding-columns': ['data_mapping', 'embedding_columns'],
   'data-mapping:knn': ['data_mapping', 'knn'],
   'data-mapping:gene-names': ['data_mapping', 'gene_names'],
+  'data-mapping:modality': ['data_mapping', 'modality'],
   'data-mapping:expression': ['data_mapping', 'expression'],
+  'data-mapping:log1p': ['data_mapping', 'log1p'],
+  'data-mapping:highly-variable': ['data_mapping', 'highly_variable'],
   'data-mapping:latent': ['data_mapping', 'latent'],
   'data-mapping:vector-fields': ['data_mapping', 'vector_fields'],
 });
@@ -381,7 +385,7 @@ export function trackAppReady({ viewer, hasDataset }) {
 function requestedSourceType() {
   const params = new URLSearchParams(window.location.search);
   if (params.has('remote')) return 'remote';
-  if (params.has('github')) return 'github-repo';
+  if (params.has('data')) return 'link';
   const source = params.get('source');
   return source !== null && SOURCE_TYPES.includes(source)
     ? source
@@ -422,18 +426,19 @@ const STATE_RESTORES = Object.freeze({
  *   datasetId?: string|null,
  *   metadata?: Object|null,
  *   stateStatus?: string,
- *   mapping?: {origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number}|null,
+ *   dataFormat?: string|null,
+ *   mapping?: {origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number, vectorFields: number}|null,
  *   error?: unknown
  * }} load
  */
 export function trackDataLoad(load) {
   const metadata = load.metadata ?? null;
   const stats = metadata?.stats ?? null;
-  const vectorFields = metadata?.vector_fields?.fields;
   const durationMs = Math.max(0, Math.round(load.durationMs));
   send('data_load', {
     load_method: load.loadMethod,
     source_type: load.sourceType,
+    data_format: load.outcome === 'success' && typeof load.dataFormat === 'string' ? load.dataFormat : undefined,
     outcome: load.outcome,
     duration_ms: durationMs,
     duration_bucket: durationBucket(durationMs),
@@ -454,14 +459,7 @@ export function trackDataLoad(load) {
       : undefined,
     has_vector_field: metadata === null
       ? undefined
-      : Number(
-        vectorFields !== null &&
-        typeof vectorFields === 'object' &&
-        Object.keys(vectorFields).length > 0
-      ),
-    data_version: VERSION_PATTERN.test(metadata?.cellucid_data_version ?? '')
-      ? metadata.cellucid_data_version
-      : undefined,
+      : Number((load.mapping?.vectorFields ?? 0) > 0),
     state_restore: load.outcome === 'success'
       ? STATE_RESTORES[load.stateStatus]
       : undefined,

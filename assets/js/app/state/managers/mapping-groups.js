@@ -1,6 +1,9 @@
 /**
  * @fileoverview The data-mapping groups beside the embeddings: the neighbour
- * graph, gene names, expression matrix, latent space and vector fields.
+ * graph, the modality (a dataset of several feature spaces only), gene
+ * names, expression matrix, each matrix's log1p, the highly variable genes,
+ * latent space and vector fields. Gene names, expression, log1p and the
+ * highly variable genes are the modality's.
  *
  * `DataState.applyDataMapping` (`mapping-manager.js`) owns the transaction.
  * This module adds, per group:
@@ -11,10 +14,11 @@
  *   without changing what is shown, and the *commit* and *rollback* steps
  *   that publish it or restore the previous choice.
  *
- * Staging reads through the same mapping routes on every AnnData path
- * (`_cellucid/mapping/...` under the dataset base): a file read in the
- * browser answers them from its adapter, `cellucid serve` and a notebook over
- * HTTP. A choice whose data fails its check -- a graph that is not symmetric,
+ * Staging reads through the same routes on every AnnData path (`obsm/...`,
+ * `obsp/{p}`, `var/{axis}/{names}`, ... under the dataset base,
+ * `data-mapping-candidates.js`), answered by the adapter
+ * of the file read in the browser -- opened here, from a link, or served by
+ * `cellucid serve` or a notebook. A choice whose data fails its check -- a graph that is not symmetric,
  * a NaN -- is a `MappingLoadError`: that choice is marked unusable with its
  * reason for the rest of the dataset's session, and the transaction rolls
  * back.
@@ -28,18 +32,24 @@
 import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
-  VECTOR_KEY_PATTERN,
+  EMBEDDING_KEY_PREFIX,
   canonicalEmbeddingId,
-  isVectorFieldKey,
+  defaultExpression,
+  defaultHighlyVariable,
+  defaultLog1p,
+  highlyVariableCandidates,
+  vectorFieldKeys,
 } from '../../../data/data-mapping.js';
 import {
   MappingLoadError,
   axisVarColumns,
   expressionAxisRoute,
+  modalityNames,
+  modalityScope,
   geneNamesRoute,
   latentCandidateReason,
-  mappingGenesBase,
-  mappingKnnBase,
+  mappingGeneListPath,
+  mappingGraphPath,
   mappingLatentOutlierPath,
   obsmIndexOf,
   obsmWidth,
@@ -48,23 +58,30 @@ import {
 } from '../../../data/data-mapping-candidates.js';
 import {
   createVarFieldLoader,
-  loadConnectivityManifest,
-  loadOutlierQuantiles,
-  loadVarManifest,
+  loadConnectivitySummary,
+  loadGeneList,
+  varLoaderMappingOf,
 } from '../../../data/data-loaders.js';
+import { createDatasetFieldLoadSupersededError } from './field/loading.js';
 import {
   describeMappingGroupValue,
+  log1pMenu,
   MAPPING_GROUP_LABELS,
   UNCHANGEABLE_GROUP_CLAUSE,
 } from '../../../data/dataset-mapping.js';
+import { sameJson } from '../../utils/same-json.js';
+import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 
 /** The groups beside the embeddings, in the order a transaction applies them. */
-export const MAPPING_GROUPS = Object.freeze([
+const MAPPING_GROUPS = Object.freeze([
   'vectorFields',
   'knn',
   'latent',
+  'modality',
   'geneNames',
   'expression',
+  'log1p',
+  'highlyVariable',
 ]);
 
 const RUNTIME_METHODS = Object.freeze([
@@ -75,13 +92,6 @@ const RUNTIME_METHODS = Object.freeze([
   'resetGeneAnalysis',
 ]);
 
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function formatCount(value) {
-  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
 
 /**
  * The words one `obsp` candidate is listed with: `connectivities · sparse
@@ -90,7 +100,7 @@ function formatCount(value) {
  * @param {{key: string, storage: string, shape: number[]|null}} item
  * @returns {string}
  */
-export function describeObspCandidate(item) {
+function describeObspCandidate(item) {
   const kind = item.storage === 'dense' ? 'dense' : 'sparse';
   const shape = Array.isArray(item.shape) && item.shape.length === 2
     ? ` ${formatCount(item.shape[0])} × ${formatCount(item.shape[1])}`
@@ -98,60 +108,54 @@ export function describeObspCandidate(item) {
   return `${item.key} · ${kind}${shape}`;
 }
 
-/**
- * The groups each kind of dataset can change. A prepared export fixes its
- * graph, expression matrix and latent space at `prepare()` time, so they are
- * not part of its mapping at all; it can use any of the gene-name sets and
- * vector bindings it was exported with.
- */
-const CHANGEABLE_GROUPS = Object.freeze({
-  [ANNDATA_KIND]: Object.freeze(['vectorFields', 'knn', 'latent', 'geneNames', 'expression']),
-  export: Object.freeze(['vectorFields', 'geneNames']),
-});
+/** The groups an AnnData dataset can change (`modality` only a multimodal one). */
+const CHANGEABLE_GROUPS = Object.freeze([
+  'vectorFields', 'knn', 'latent', 'modality', 'geneNames', 'expression', 'log1p', 'highlyVariable',
+]);
 
 function formatColumnCount(width) {
-  return `${formatCount(width)} ${width === 1 ? 'column' : 'columns'}`;
-}
-
-/**
- * Whether `key` is named for the embedding `embeddingKey`, the way scVelo and
- * CellRank name what they compute on a basis (`velocity_umap` for `X_umap`),
- * or by the default rule (`velocity_umap_2d` for `X_umap` in 2D).
- */
-function isSuggestedVector(key, embeddingKey, dimension) {
-  const match = VECTOR_KEY_PATTERN.exec(key);
-  if (match !== null) {
-    return Number(match.groups.dimension) === dimension
-      && (embeddingKey === 'X_umap' || embeddingKey === `X_umap_${dimension}d`);
-  }
-  const basis = embeddingKey.replace(/^X_/i, '').toLowerCase();
-  return basis.length > 0 && key.toLowerCase().endsWith(`_${basis}`);
+  return `${formatCountOf(width, 'column')}`;
 }
 
 /**
  * Groups staged together: the gene names and the expression matrix are one
- * var axis, read and published as one step.
+ * var axis, read and published as one step; the matrices' log1p and the
+ * highly variable genes are answered by that axis's gene loader, made anew.
  */
 const STAGE_OF_GROUP = Object.freeze({
   vectorFields: 'vectorFields',
   knn: 'knn',
   latent: 'latent',
+  modality: 'genes',
   geneNames: 'genes',
   expression: 'genes',
+  log1p: 'genes',
+  highlyVariable: 'genes',
 });
 
 function formatGeneCount(count) {
-  return `${formatCount(count)} ${count === 1 ? 'gene' : 'genes'}`;
+  return `${formatCountOf(count, 'gene')}`;
 }
 
 /**
  * The words one expression choice is listed with: `X`, `raw.X · 30,000
- * genes`, `layers['counts']`.
+ * genes`, `layers['counts']`. `scope` is the dataset's or its modality's
+ * expression side (`modalityScope`).
  */
-function describeExpression(candidates, expression) {
+function describeExpression(scope, expression) {
   if (expression === 'X') return 'X';
-  if (expression === 'raw') return `raw.X · ${formatGeneCount(candidates.raw.n_vars)}`;
+  if (expression === 'raw') return `raw.X · ${formatGeneCount(scope.raw.n_vars)}`;
   return `layers['${expression.slice('layer:'.length)}']`;
+}
+
+/**
+ * The words one modality is listed with: `rna · 33,538 features`, and the
+ * cells it measured when it did not measure every one.
+ */
+function describeModality(item, nObs) {
+  const features = `${formatCountOf(item.var.n_vars, 'feature')}`;
+  const cells = item.n_cells === nObs ? [] : [`${formatCount(item.n_cells)} of ${formatCountOf(nObs, 'cell')}`];
+  return [item.name, features, ...cells].join(' · ');
 }
 
 export class DataStateMappingGroupMethods {
@@ -161,8 +165,8 @@ export class DataStateMappingGroupMethods {
    *
    * @param {{
    *   getBaseUrl: () => string,
-   *   getConnectivityGraph: () => {manifest: Object|null, manifestUrl: string|null},
-   *   replaceConnectivityGraph: (graph: {manifest: Object|null, manifestUrl: string|null}) => void
+   *   getConnectivityGraph: () => {summary: Object|null, url: string|null, edges: number|null},
+   *   replaceConnectivityGraph: (graph: {summary: Object|null, url: string|null}) => void
    * }|null} runtime
    */
   setMappingRuntime(runtime) {
@@ -177,13 +181,14 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
-   * The edge count of the neighbour graph in use, or null for none.
+   * The neighbour graph in use: null for none, else its edge count (null
+   * while a graph read straight from a file is not counted yet).
    *
-   * @returns {number|null}
+   * @returns {{edges: number|null}|null}
    */
-  getConnectivityEdgeCount() {
-    const manifest = this._mappingRuntime?.getConnectivityGraph().manifest ?? null;
-    return manifest === null ? null : manifest.n_edges;
+  getConnectivityGraphFact() {
+    const graph = this._mappingRuntime?.getConnectivityGraph() ?? null;
+    return (graph?.summary ?? null) === null ? null : { edges: graph.edges ?? null };
   }
 
   /**
@@ -192,11 +197,6 @@ export class DataStateMappingGroupMethods {
    */
   _resetMappingGroups() {
     this._unusableMappingChoices = new Map();
-    // A prepared export publishes every vector binding it was exported with;
-    // those are the bindings its panel offers.
-    this._exportVectorBindings = this.dataMapping?.kind === 'export'
-      ? this.dataMapping.vectorFields
-      : [];
   }
 
   /**
@@ -208,17 +208,9 @@ export class DataStateMappingGroupMethods {
   canChangeMappingGroup(group) {
     const mapping = this.dataMapping;
     if (mapping === null || mapping === undefined) return false;
-    if (mapping.kind === ANNDATA_KIND && this.getMappingCandidates() === null) return false;
-    if (!(CHANGEABLE_GROUPS[mapping.kind] ?? []).includes(group)) return false;
-    // A prepared export offers the gene-name sets and vector bindings it was
-    // exported with.
-    if (mapping.kind !== ANNDATA_KIND && group === 'geneNames') {
-      return (this.varData?.geneNameSets?.length ?? 0) > 1;
-    }
-    if (mapping.kind !== ANNDATA_KIND && group === 'vectorFields') {
-      return (this._exportVectorBindings?.length ?? 0) > 0;
-    }
-    return true;
+    if (mapping.kind !== ANNDATA_KIND || this.getMappingCandidates() === null) return false;
+    if (group === 'modality' && modalityNames(this.getMappingCandidates()) === null) return false;
+    return CHANGEABLE_GROUPS.includes(group);
   }
 
   /**
@@ -259,37 +251,54 @@ export class DataStateMappingGroupMethods {
   getMappingGroupChoices(group) {
     if (!this.canChangeMappingGroup(group)) return null;
     const candidates = this.getMappingCandidates();
+    if (group === 'modality') {
+      return candidates.modalities.map(item => {
+        const reason = this.getMappingChoiceUnusableReason('modality', item.name);
+        return { value: item.name, label: describeModality(item, candidates.n_obs), usable: reason === null, reason };
+      });
+    }
     if (group === 'expression') {
+      const scope = this._expressionScope();
       const choices = [];
-      if (candidates.X !== null) choices.push('X');
-      for (const layer of candidates.layers) choices.push(`layer:${layer.key}`);
-      if (candidates.raw !== null) choices.push('raw');
+      if (scope.X !== null) choices.push('X');
+      for (const layer of scope.layers) choices.push(`layer:${layer.key}`);
+      if (scope.raw !== null) choices.push('raw');
       return [
         { value: null, label: 'None', usable: true, reason: null },
         ...choices.map(value => {
           const layer = value.startsWith('layer:')
-            ? candidates.layers.find(entry => entry.key === value.slice('layer:'.length))
+            ? scope.layers.find(entry => entry.key === value.slice('layer:'.length))
             : null;
           const reason = layer !== null && !layer.usable
             ? layer.reason
             : this.getMappingChoiceUnusableReason('expression', value);
-          return { value, label: describeExpression(candidates, value), usable: reason === null, reason };
+          return { value, label: describeExpression(scope, value), usable: reason === null, reason };
         }),
       ];
     }
     if (group === 'geneNames') {
       return this.getGeneNameChoices(this.dataMapping.expression);
     }
+    if (group === 'highlyVariable') {
+      return this.getHighlyVariableChoices(this.dataMapping.expression);
+    }
+    if (group === 'log1p') {
+      return this.getLog1pChoices();
+    }
     if (group === 'latent') {
+      const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
+      // The latent space the file stores outlier quantiles for filters at
+      // once; any other is read whole on the filter's first use.
+      const stored = this.fieldLoader?.storedOutlierLatentKey ?? null;
       return [
         { value: null, label: 'None', usable: true, reason: null },
-        ...candidates.obsm.filter(item => !isVectorFieldKey(item.key)).map(item => {
+        ...candidates.obsm.filter(item => !vectorKeys.has(item.key)).map(item => {
           const reason = latentCandidateReason(item)
             ?? this.getMappingChoiceUnusableReason('latent', item.key);
           const width = obsmWidth(item);
           return {
             value: item.key,
-            label: width === null ? item.key : `${item.key} · ${formatColumnCount(width)}`,
+            label: [item.key, ...(width === null ? [] : [formatColumnCount(width)]), ...(item.key === stored ? ['outliers stored'] : [])].join(' · '),
             usable: reason === null,
             reason,
           };
@@ -317,25 +326,16 @@ export class DataStateMappingGroupMethods {
 
   /**
    * The gene-name choices of one expression source: the var index, then
-   * every column of that axis's var (`raw.var` for `raw`). A prepared export
-   * offers the name sets it was exported with.
+   * every column of that axis's var (`raw.var` for `raw`).
    *
    * @param {string|null} expression
    * @returns {Array<{value: string, label: string, usable: boolean, reason: string|null}>}
    */
   getGeneNameChoices(expression) {
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      return this.varData.geneNameSets.map(set => ({
-        value: set.source === null ? 'index' : `column:${set.source}`,
-        label: set.source === null ? 'var index' : set.source,
-        usable: true,
-        reason: null,
-      }));
-    }
     const candidates = this.getMappingCandidates();
     const index = { value: 'index', label: 'var index', usable: true, reason: null };
     if (expression === null) return [index];
-    const axisRoute = expressionAxisRoute(candidates, expression);
+    const axisRoute = expressionAxisRoute(candidates, expression, this._modalityInUse());
     if (axisRoute === null) return [index];
     return [
       index,
@@ -349,11 +349,51 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
+   * The highly-variable-gene choices of one expression source: None, then
+   * every boolean column of that axis's var (`raw.var` for `raw`),
+   * `highly_variable` first (`highlyVariableCandidates`).
+   *
+   * @param {string|null} expression
+   * @returns {Array<{value: string|null, label: string, usable: boolean, reason: string|null}>}
+   */
+  getHighlyVariableChoices(expression) {
+    const none = { value: null, label: 'None', usable: true, reason: null };
+    if (expression === null) return [none];
+    const candidates = this.getMappingCandidates();
+    const axisRoute = expressionAxisRoute(candidates, expression, this._modalityInUse());
+    if (axisRoute === null) return [none];
+    return [
+      none,
+      ...highlyVariableCandidates(axisVarColumns(candidates, axisRoute)).map(key => {
+        const reason = this.getMappingChoiceUnusableReason('highlyVariable', key);
+        return { value: key, label: key, usable: reason === null, reason };
+      }),
+    ];
+  }
+
+  /**
+   * The transforms an expression matrix can be read as (`log1pMenu`): as
+   * stored, or log1p of a base, with the base the file's `uns['log1p']`
+   * records and any the mapping names offered too.
+   *
+   * @returns {Array<{value: string, label: string, usable: boolean, reason: null}>}
+   */
+  getLog1pChoices() {
+    const recorded = this._expressionScope().log1p;
+    const bases = [
+      ...(recorded === null ? [] : [recorded.base]),
+      ...Object.values(this.dataMapping.log1p).map(entry => entry.base),
+    ];
+    return log1pMenu(bases).map(choice => ({ ...choice, usable: true, reason: null }));
+  }
+
+  /**
    * The vector bindings the panel offers, grouped by the embedding they bind
    * to. For an AnnData file: every embedding `mapping` shows or binds, each
    * with every `obsm` array that can be drawn on it (`resolveVectorBinding`),
-   * the arrays named for it first and marked suggested. For a prepared export:
-   * the bindings it was exported with. Every embedding `mapping` enables is
+   * the arrays named for it by the vector-field key rule (`velocity_umap` for
+   * `X_umap`, `parseVectorFieldKey`) first and marked suggested. Every embedding
+   * `mapping` enables is
    * listed, since a binding's embedding must be enabled. Null when the dataset cannot change
    * its vector fields. Embeddings bound in the mapping in use are listed too,
    * so unbinding one does not hide it.
@@ -364,22 +404,8 @@ export class DataStateMappingGroupMethods {
    */
   getVectorBindingChoices(mapping) {
     if (!this.canChangeMappingGroup('vectorFields')) return null;
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      const groups = new Map();
-      for (const binding of this._exportVectorBindings) {
-        const key = binding.embedding.key;
-        if (!groups.has(key)) groups.set(key, { embeddingKey: key, label: key, options: [] });
-        groups.get(key).options.push({
-          binding,
-          label: binding.field,
-          usable: true,
-          reason: null,
-          suggested: false,
-        });
-      }
-      return [...groups.values()];
-    }
     const candidates = this.getMappingCandidates();
+    const vectorKeys = vectorFieldKeys(candidates.obsm.map(item => item.key));
     const refs = new Map();
     for (const ref of mapping.embeddings.enabled) refs.set(JSON.stringify(ref), ref);
     // An embedding stays listed while its bindings are being edited: those
@@ -398,7 +424,7 @@ export class DataStateMappingGroupMethods {
       for (const vector of candidates.obsm) {
         // `X_…` arrays are representations (embeddings, latent spaces), as
         // AnnData names them, never vectors drawn on one.
-        if (/^X_/.test(vector.key)) continue;
+        if (vector.key.startsWith(EMBEDDING_KEY_PREFIX)) continue;
         const binding = { key: vector.key, embedding: { key: ref.key, columns: [...ref.columns] } };
         const resolved = resolveVectorBinding(candidates, binding);
         if (!resolved.ok) continue;
@@ -408,7 +434,7 @@ export class DataStateMappingGroupMethods {
           label: vector.key,
           usable: reason === null,
           reason,
-          suggested: isSuggestedVector(vector.key, ref.key, ref.columns.length),
+          suggested: vectorKeys.get(vector.key)?.embeddingKey === ref.key,
         });
       }
       options.sort((left, right) => (
@@ -431,10 +457,11 @@ export class DataStateMappingGroupMethods {
   describeMappingVarCount(mapping) {
     // A gene list the dataset cannot change is the one it shows.
     if (!this.canChangeMappingGroup('expression')) return this.getVarAxisGeneCount();
-    const candidates = this.getMappingCandidates();
     if (mapping.expression === null) return 0;
-    if (mapping.expression === 'raw') return candidates.raw?.n_vars ?? 0;
-    return candidates.var.n_vars;
+    const scope = modalityScope(this.getMappingCandidates(), mapping.modality ?? null)?.scope ?? null;
+    if (scope === null) return 0;
+    if (mapping.expression === 'raw') return scope.raw?.n_vars ?? 0;
+    return scope.var.n_vars;
   }
 
   /**
@@ -470,13 +497,30 @@ export class DataStateMappingGroupMethods {
     if (group === 'vectorFields') {
       return this._describeVectorBindingsRefusal(value);
     }
-    if (group === 'expression' || group === 'geneNames') {
+    if (group === 'modality') {
+      const names = modalityNames(this.getMappingCandidates());
+      if (value === undefined) return `names none, and this dataset has several (${names.join(', ')})`;
+      return names !== null && names.includes(value) ? null : 'this dataset does not have';
+    }
+    if (group === 'expression' || group === 'geneNames' || group === 'highlyVariable') {
+      const expression = this._pendingExpression ?? this.dataMapping.expression;
       const choices = group === 'expression'
         ? this.getMappingGroupChoices('expression')
-        : this.getGeneNameChoices(this._pendingExpression ?? this.dataMapping.expression);
+        : group === 'geneNames'
+          ? this.getGeneNameChoices(expression)
+          : this.getHighlyVariableChoices(expression);
       const choice = choices.find(entry => entry.value === value);
       if (choice === undefined) return 'this dataset does not have';
       return choice.usable ? null : `this dataset cannot use (${choice.reason})`;
+    }
+    if (group === 'log1p') {
+      // Every matrix named must be one of this dataset's.
+      const matrices = this.getMappingGroupChoices('expression')
+        .map(choice => choice.value)
+        .filter(matrix => matrix !== null);
+      return Object.keys(value).every(matrix => matrices.includes(matrix))
+        ? null
+        : 'this dataset does not have';
     }
     return UNCHANGEABLE_GROUP_CLAUSE;
   }
@@ -486,12 +530,6 @@ export class DataStateMappingGroupMethods {
    * @private
    */
   _describeVectorBindingsRefusal(bindings) {
-    if (this.dataMapping.kind !== ANNDATA_KIND) {
-      const declared = new Set(this._exportVectorBindings.map(binding => JSON.stringify(binding)));
-      return bindings.every(binding => declared.has(JSON.stringify(binding)))
-        ? null
-        : 'this dataset does not have';
-    }
     const candidates = this.getMappingCandidates();
     for (const binding of bindings) {
       if (obsmIndexOf(candidates, binding.key) < 0) return 'this dataset does not have';
@@ -515,15 +553,24 @@ export class DataStateMappingGroupMethods {
    */
   describeMappingGroupRefusal(current, next) {
     for (const group of MAPPING_GROUPS) {
-      if (!Object.hasOwn(current, group)) continue;
-      // Gene names are read from the axis of the next expression matrix, so a
-      // name source is checked whenever either changes.
+      // Gene names and the highly variable column are read from the axis of
+      // the next expression matrix, and every expression group from the
+      // next modality, so each is checked whenever those change.
       const changed = !sameJson(current[group], next[group])
-        || (group === 'geneNames' && !sameJson(current.expression, next.expression));
+        || ((group === 'geneNames' || group === 'highlyVariable')
+          && !sameJson(current.expression, next.expression))
+        || (['expression', 'geneNames', 'highlyVariable', 'log1p'].includes(group)
+          && !sameJson(current.modality, next.modality));
       if (!changed) continue;
+      if (group !== 'modality' && Object.hasOwn(next, 'modality') &&
+          this.describeMappingChoiceRefusal('modality', next.modality) !== null) {
+        // The modality is refused first; its expression groups mean nothing here.
+        continue;
+      }
       const refusal = this._withPendingExpression(
         next.expression,
-        () => this.describeMappingChoiceRefusal(group, next[group])
+        () => this.describeMappingChoiceRefusal(group, next[group]),
+        next.modality
       );
       if (refusal === null) continue;
       if (refusal === UNCHANGEABLE_GROUP_CLAUSE) {
@@ -538,17 +585,129 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
-   * Run `read` with gene-name choices taken from the axis of `expression`.
+   * One expression matrix of the open file, read for a computation without
+   * changing what is shown (an analysis's "Expression matrix"): its genes,
+   * named on that matrix's own axis -- by the mapping's gene-name column
+   * where that axis has it (X and every layer share `var`; `raw` has
+   * `raw.var`), else by its index -- and the reader of their values, through
+   * the same `var/{axis}/{names}` routes a mapping reads on every AnnData
+   * path. Nothing is installed in field state; the handle is of this
+   * dataset generation only (`readMatrixSparseColumn`, `readMatrixCellSubset`).
+   *
+   * @param {string} expression - `X`, `raw` or `layer:<key>`
+   * @returns {Promise<{expression: string, generation: number, fields: ReadonlyArray<{key: string, kind: string, path: string}>, loader: Function}>}
+   */
+  async openExpressionMatrix(expression) {
+    if (!this.canChangeMappingGroup('expression')) {
+      throw new Error('This dataset reads only its mapped expression matrix.');
+    }
+    const candidates = this.getMappingCandidates();
+    const axisRoute = expressionAxisRoute(candidates, expression, this.dataMapping.modality ?? null);
+    if (axisRoute === null) {
+      throw new RangeError(`This dataset has no expression matrix ${String(expression)}.`);
+    }
+    const mapping = this.dataMapping;
+    const column = mapping.geneNames === 'index'
+      ? undefined
+      : axisVarColumns(candidates, axisRoute).find(entry => `column:${entry.key}` === mapping.geneNames);
+    const namesRoute = column?.usable === true
+      ? geneNamesRoute(candidates, axisRoute, mapping.geneNames)
+      : 'index';
+    const generation = this._datasetGeneration;
+    const url = `${this._requireMappingRuntime().getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
+    const geneList = await loadGeneList(url, {});
+    if (this._datasetGeneration !== generation) throw createDatasetFieldLoadSupersededError();
+    if (geneList.n_points !== this.pointCount) {
+      throw new RangeError(`${String(expression)} has ${formatCountOf(geneList.n_points, 'cell')}; the dataset has ${this.pointCount}.`);
+    }
+    const loader = createVarFieldLoader(url, {
+      pointCount: geneList.n_points,
+      mapping: { expression, log1p: mapping.log1p, highlyVariable: null },
+    });
+    return Object.freeze({
+      expression,
+      generation,
+      fields: Object.freeze(geneList.fields.map(field => Object.freeze({ ...field }))),
+      loader,
+    });
+  }
+
+  /**
+   * Run `read` with gene-name choices taken from the axis of `expression`,
+   * of `modality` (a multimodal dataset's) when given.
    * @private
    */
-  _withPendingExpression(expression, read) {
-    const saved = this._pendingExpression;
+  _withPendingExpression(expression, read, modality = undefined) {
+    const saved = [this._pendingExpression, this._pendingModality];
     this._pendingExpression = expression;
+    if (modality !== undefined) this._pendingModality = modality;
     try {
       return read();
     } finally {
-      this._pendingExpression = saved;
+      [this._pendingExpression, this._pendingModality] = saved;
     }
+  }
+
+  /**
+   * Run `read` with every expression choice (`getMappingGroupChoices`,
+   * `getGeneNameChoices`, …) taken from `modality`: a panel showing a
+   * modality not applied yet lists that modality's matrices and columns.
+   * Null reads the mapping's.
+   *
+   * @template T
+   * @param {string|null} modality
+   * @param {() => T} read
+   * @returns {T}
+   */
+  withMappingModality(modality, read) {
+    const saved = this._pendingModality;
+    this._pendingModality = modality ?? saved;
+    try {
+      return read();
+    } finally {
+      this._pendingModality = saved;
+    }
+  }
+
+  /**
+   * The expression groups a mapping takes when it moves to `modality`: that
+   * modality's default expression matrix (`defaultExpression`), its var
+   * index for names, its recorded log1p, and its highly variable column
+   * (each as a dataset opening with that modality would).
+   *
+   * @param {string} modality
+   * @returns {{expression: string|null, geneNames: string, log1p: Object, highlyVariable: string|null}}
+   */
+  defaultModalityGroups(modality) {
+    const scope = modalityScope(this.getMappingCandidates(), modality)?.scope;
+    if (scope === undefined) throw new RangeError(`This dataset has no modality '${modality}'.`);
+    const layers = scope.layers.filter(layer => layer.usable).map(layer => layer.key);
+    const { expression } = defaultExpression({
+      hasX: scope.X !== null,
+      hasRaw: scope.raw !== null && scope.raw.X !== null,
+      layers,
+    });
+    const { log1p } = defaultLog1p({
+      log1p: scope.log1p,
+      hasX: scope.X !== null,
+      raw: scope.raw === null || scope.raw.X === null ? null : { dtype: scope.raw.X.dtype },
+      layers,
+    });
+    const { highlyVariable } = expression === null
+      ? { highlyVariable: null }
+      : defaultHighlyVariable(expression === 'raw' ? scope.raw.var.columns : scope.var.columns);
+    return { expression, geneNames: 'index', log1p, highlyVariable };
+  }
+
+  /** The modality expression choices are read from now: the pending one, else the mapping's. @private */
+  _modalityInUse() {
+    return this._pendingModality ?? this.dataMapping?.modality ?? null;
+  }
+
+  /** The expression side choices are read from now: the dataset's, or its modality's. @private */
+  _expressionScope() {
+    const candidates = this.getMappingCandidates();
+    return modalityScope(candidates, this._modalityInUse())?.scope ?? candidates;
   }
 
   /**
@@ -557,13 +716,17 @@ export class DataStateMappingGroupMethods {
    *
    * @param {Object} current
    * @param {Object} next
+   * @param {{requireCurrent: () => void}} owner - Throws once the dataset
+   *   the mapping was asked of is no longer the one shown; checked after
+   *   every stage's reads and before every commit step, so a refusal is
+   *   recorded on, and a step published to, only that dataset.
    * @returns {Promise<{changed: boolean, commit: () => Promise<void>, rollback: () => Promise<Error[]>}>}
    */
-  async _stageMappingGroups(current, next) {
+  async _stageMappingGroups(current, next, { requireCurrent }) {
     const steps = [];
     const staged = new Set();
     for (const group of MAPPING_GROUPS) {
-      if (!Object.hasOwn(current, group) || sameJson(current[group], next[group])) continue;
+      if (sameJson(current[group], next[group])) continue;
       const stageName = STAGE_OF_GROUP[group];
       if (staged.has(stageName)) continue;
       staged.add(stageName);
@@ -575,7 +738,9 @@ export class DataStateMappingGroupMethods {
       }
       try {
         steps.push(await stage.call(this, next, current));
+        requireCurrent();
       } catch (error) {
+        requireCurrent();
         if (error instanceof MappingLoadError) {
           this._markMappingChoiceUnusable(refusedGroup(stageName, error, next), error.key, error.reason);
         }
@@ -587,6 +752,7 @@ export class DataStateMappingGroupMethods {
       changed: steps.length > 0,
       async commit() {
         for (const step of steps) {
+          requireCurrent();
           await step.commit();
           committed.push(step);
         }
@@ -624,6 +790,7 @@ export class DataStateMappingGroupMethods {
  */
 function refusedGroup(stageName, error, next) {
   if (stageName !== 'genes') return stageName;
+  if (next.modality === error.key) return 'modality';
   return next.geneNames === `column:${error.key}` ? 'geneNames' : 'expression';
 }
 
@@ -634,29 +801,29 @@ function refusedGroup(stageName, error, next) {
  */
 const GROUP_STAGES = Object.freeze({
   /**
-   * The neighbour graph: its manifest is read (and, in the browser, the graph
+   * The neighbour graph: its summary is read (and, in the browser, the graph
    * itself extracted and checked) before anything changes; commit hands the
    * connectivity owner the new graph, rollback the previous one.
    */
   async knn(next) {
     const key = next.knn;
     const runtime = this._requireMappingRuntime();
-    let graph = { manifest: null, manifestUrl: null };
+    let graph = { summary: null, url: null };
     if (key !== null) {
       const index = obspIndexOf(this.getMappingCandidates(), key);
       if (index < 0) {
         throw new RangeError(`This dataset has no obsp['${key}'].`);
       }
-      const manifestUrl = `${runtime.getBaseUrl()}${mappingKnnBase(index)}connectivity_manifest.json`;
-      const manifest = await loadConnectivityManifest(manifestUrl, {});
-      if (manifest === null) {
+      const url = `${runtime.getBaseUrl()}${mappingGraphPath(index)}`;
+      const summary = await loadConnectivitySummary(url, {});
+      if (summary === null) {
         throw new MappingLoadError(
           key,
           'not present in this dataset',
           `obsp['${key}'] is not present in this dataset.`
         );
       }
-      graph = { manifest, manifestUrl };
+      graph = { summary, url };
     }
     const previous = runtime.getConnectivityGraph();
     return {
@@ -665,34 +832,28 @@ const GROUP_STAGES = Object.freeze({
       },
       rollback() {
         runtime.replaceConnectivityGraph({
-          manifest: previous.manifest,
-          manifestUrl: previous.manifestUrl,
+          summary: previous.summary,
+          url: previous.url,
         });
       },
     };
   },
 
   /**
-   * The latent space: every categorical field's outlier payload becomes the
-   * mapping route of the new space (`_cellucid/mapping/latent/{obsm}/obs/
-   * {field}.outliers.f32`), or none; the fields loaded now read theirs first
-   * (`stageLatentReplacement`).
+   * The latent space: every categorical field's outlier route becomes the
+   * route of the new space (`outliers/{obsm}/{field}`), or none. Nothing is read here: outlier filters
+   * in use get their quantiles after the commit (`stageLatentReplacement`).
    */
   async latent(next) {
-    const runtime = this._requireMappingRuntime();
     const candidates = this.getMappingCandidates();
     const obsmIndex = next.latent === null ? -1 : obsmIndexOf(candidates, next.latent);
     if (next.latent !== null && obsmIndex < 0) {
       throw new RangeError(`This dataset has no obsm['${next.latent}'].`);
     }
-    const manifestUrl = `${runtime.getBaseUrl()}obs_manifest.json`;
     return this.stageLatentReplacement({
-      outlierPathFor: payloadIndex => (
-        obsmIndex < 0 ? null : mappingLatentOutlierPath(obsmIndex, payloadIndex)
+      outlierPathFor: fieldIndex => (
+        obsmIndex < 0 ? null : mappingLatentOutlierPath(obsmIndex, fieldIndex)
       ),
-      loadOutliers: descriptor => loadOutlierQuantiles(manifestUrl, descriptor, {
-        pointCount: this.pointCount,
-      }),
     });
   },
 
@@ -722,52 +883,43 @@ const GROUP_STAGES = Object.freeze({
 
   /**
    * The gene list: an AnnData file's gene names and expression matrix are
-   * read through `_cellucid/mapping/genes/{axis}/{names}/`; a prepared
-   * export relabels its genes with another exported name set. Only the genes
-   * a view is coloured by are read now; the rest load on demand.
+   * read through `var/{axis}/{names}`. Only the genes a
+   * view is coloured by are read now; the rest load on demand.
    */
   async genes(next, current) {
     const runtime = this._requireMappingRuntime();
-    let varManifest;
+    let geneList;
     let varFieldLoader;
     let sameMatrix;
     // X and every layer share var; raw has its own axis.
     let sameAxis = true;
-    if (next.kind === ANNDATA_KIND && next.expression === null) {
+    if (next.expression === null) {
       // No expression matrix: an empty gene list, as a dataset without genes
       // is published.
-      varManifest = { n_points: this.pointCount, fields: [] };
+      geneList = { n_points: this.pointCount, fields: [] };
       varFieldLoader = null;
       sameMatrix = false;
       sameAxis = false;
-    } else if (next.kind === ANNDATA_KIND) {
+    } else {
       const candidates = this.getMappingCandidates();
-      const axisRoute = expressionAxisRoute(candidates, next.expression);
-      const namesRoute = geneNamesRoute(candidates, axisRoute, next.geneNames);
+      const axisRoute = expressionAxisRoute(candidates, next.expression, next.modality ?? null);
+      const namesRoute = axisRoute === null ? null : geneNamesRoute(candidates, axisRoute, next.geneNames);
       if (axisRoute === null || namesRoute === null) {
         throw new RangeError('This dataset does not have the expression matrix or gene names this mapping names.');
       }
-      const manifestUrl = `${runtime.getBaseUrl()}${mappingGenesBase(axisRoute, namesRoute)}var_manifest.json`;
-      varManifest = await loadVarManifest(manifestUrl, {});
-      varFieldLoader = createVarFieldLoader(manifestUrl, { pointCount: varManifest.n_points });
-      sameMatrix = next.expression === current.expression;
-      sameAxis = current.expression !== null
+      const url = `${runtime.getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
+      geneList = await loadGeneList(url, {});
+      varFieldLoader = createVarFieldLoader(url, {
+        pointCount: geneList.n_points,
+        mapping: varLoaderMappingOf(next),
+      });
+      const sameModality = next.modality === current.modality;
+      sameMatrix = sameModality && next.expression === current.expression;
+      sameAxis = sameModality && current.expression !== null
         && (current.expression === 'raw') === (next.expression === 'raw');
-    } else {
-      const source = next.geneNames === 'index' ? null : next.geneNames.slice('column:'.length);
-      const set = this.varData.geneNameSets.find(entry => entry.source === source);
-      if (set === undefined) {
-        throw new RangeError('This dataset was exported without these gene names.');
-      }
-      varManifest = {
-        ...this.varData,
-        fields: this._varFieldDescriptors.map((field, index) => ({ ...field, key: set.names[index] })),
-      };
-      varFieldLoader = this.varFieldLoader;
-      sameMatrix = true;
     }
     const step = await this.stageVarAxisReplacement({
-      varManifest,
+      geneList,
       varFieldLoader,
       sameAxis,
       sameMatrix,

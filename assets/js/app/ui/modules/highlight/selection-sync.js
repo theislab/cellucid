@@ -6,10 +6,10 @@
 
 import {
   requireCallback,
-  requireExactKeys,
   requireLodChangeEvent,
-  requireMethods
+  requireMethods,
 } from './exact-contract.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 /**
  * @param {object} options

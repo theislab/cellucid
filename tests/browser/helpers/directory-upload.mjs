@@ -1,3 +1,5 @@
+import { expect } from '@playwright/test';
+
 /**
  * Choose a directory in a `webkitdirectory` file input.
  *
@@ -17,6 +19,9 @@
  * @param {string} directory
  */
 export async function chooseDirectory(input, directory) {
+  // Like `chooseFiles` (file-input.mjs): a disabled input takes the files
+  // and opens nothing.
+  await expect(input).toBeEnabled();
   const inputEvent = await input.evaluateHandle(node => ({
     promise: new Promise(resolve => {
       node.addEventListener('input', () => resolve(), { once: true });

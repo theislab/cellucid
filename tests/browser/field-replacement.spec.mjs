@@ -1,9 +1,11 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL, appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
+const FIELDS_ROOT = appUrl('/tests/browser/fixtures/generated-field-cardinality/');
 const DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=field-replacement-ci`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=field-replacement-ci`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -23,98 +25,45 @@ function observeProductErrors(page) {
   return errors;
 }
 
-function makeCodes(categoryCount, pointCount = 120) {
-  return Buffer.from(
-    Uint8Array.from(
-      { length: pointCount },
-      (_value, index) => index % categoryCount,
-    ),
-  );
+const CELLS = 120;
+
+function categorical(key, categoryCount) {
+  return {
+    categories: Array.from({ length: categoryCount }, (_value, index) => `${key}-${index + 1}`),
+    codes: Int8Array.from({ length: CELLS }, (_value, index) => index % categoryCount),
+  };
 }
 
-function makeOutliers(pointCount = 120) {
-  const bytes = Buffer.alloc(pointCount * Float32Array.BYTES_PER_ELEMENT);
-  for (let index = 0; index < pointCount; index++) {
-    bytes.writeFloatLE((index % 100) / 100, index * Float32Array.BYTES_PER_ELEMENT);
-  }
-  return bytes;
-}
-
-function categoricalEntry(payloadIndex, key, categoryCount) {
-  const categories = Array.from(
-    { length: categoryCount },
-    (_value, index) => `${key}-${index + 1}`,
-  );
-  const centroids = categories.map((category, index) => ({
-    category,
-    position: [index / categoryCount, -index / categoryCount],
-    n_points: 120 / categoryCount,
-  }));
-  return [
-    payloadIndex,
-    key,
-    categories,
-    'uint8',
-    255,
-    { X_umap_2d: centroids },
-  ];
-}
-
+/** A dataset with two categorical fields of different cardinality and a continuous one. */
 async function installDifferentCardinalityFields(page) {
-  await page.route('**/current-ui-prepared/dataset_identity.json', async route => {
-    const response = await route.fetch();
-    const identity = await response.json();
-    identity.stats.n_obs_fields = 4;
-    identity.stats.n_categorical_fields = 3;
-    identity.obs_fields.push(
-      { key: 'large_category', kind: 'category', n_categories: 5 },
-      { key: 'small_category', kind: 'category', n_categories: 4 },
-    );
-    await route.fulfill({ response, json: identity });
+  await serveSyntheticCatalog(page, FIELDS_ROOT, {
+    id: 'field-cardinality',
+    name: 'Field cardinality fixture',
+    cells: CELLS,
+    obs: {
+      large_category: categorical('large_category', 5),
+      small_category: categorical('small_category', 4),
+      score: Float32Array.from({ length: CELLS }, (_value, index) => (index % 100) / 100),
+    },
+    obsm: {
+      X_umap_2d: {
+        data: Float32Array.from({ length: CELLS * 2 }, (_value, index) => Math.sin(index * 0.37) * 4),
+        columns: 2,
+      },
+    },
   });
-
-  await page.route('**/current-ui-prepared/obs_manifest.json', async route => {
-    const response = await route.fetch();
-    const manifest = await response.json();
-    // The fixture already holds obs payload indices 0 and 1, so the added
-     // fields continue that one shared space.
-    manifest._categoricalFields.push(
-      categoricalEntry(2, 'large_category', 5),
-      categoricalEntry(3, 'small_category', 4),
-    );
-    await route.fulfill({ response, json: manifest });
-  });
-
-  for (const [payloadIndex, count] of [
-    [2, 5],
-    [3, 4],
-  ]) {
-    await page.route(
-      `**/current-ui-prepared/obs/${payloadIndex}.codes.u8`,
-      route => route.fulfill({
-        status: 200,
-        contentType: 'application/octet-stream',
-        body: makeCodes(count),
-      }),
-    );
-    await page.route(
-      `**/current-ui-prepared/obs/${payloadIndex}.outliers.f32`,
-      route => route.fulfill({
-        status: 200,
-        contentType: 'application/octet-stream',
-        body: makeOutliers(),
-      }),
-    );
-  }
 }
 
 test('categorical coloring replacement commits one exact legend generation', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   await installDifferentCardinalityFields(page);
-  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await page.goto(
+    `/?sampleCatalog=${encodeURIComponent(FIELDS_ROOT)}&acceptance=field-replacement-ci`,
+    { waitUntil: 'domcontentloaded' },
+  );
   await dismissWelcome(page);
 
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Field cardinality fixture');
 
   await page.locator('#categorical-field').selectOption({ label: 'large_category' });
   await expect(page.locator('.legend-item')).toHaveCount(5);
@@ -143,7 +92,7 @@ test('dataset replacement cancels stale field editors before same-index reuse', 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
 
   await page.locator('#categorical-field').selectOption({
@@ -157,14 +106,14 @@ test('dataset replacement cancels stale field editors before same-index reuse', 
   expect(staleEditor).not.toBeNull();
 
   await page.locator('#dataset-select').selectOption('__none__');
-  await expect(page.locator('#dataset-name')).toHaveText('—');
+  await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('.inline-rename-input')).toHaveCount(0);
 
   await page.locator('#dataset-select').selectOption(
-    'dataset:local-demo:current-ui-prepared',
+    'dataset:local-demo:current-ui',
   );
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture',
+    'Current UI fixture',
   );
   await staleEditor.evaluate(input => {
     input.value = 'stale_replacement_name';

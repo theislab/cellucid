@@ -22,6 +22,7 @@ import {
   retireSnapshotView,
 } from '../../view-snapshot-publication.js';
 import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
+import { formatCountOf, countNoun } from '../../../utils/format-units.js';
 
 const LIVE_VIEW_ID = 'live';
 const VIEW_LAYOUT_MODES = new Set(['grid', 'single']);
@@ -101,7 +102,7 @@ function describeError(error) {
 function requireTypedArray(value, Type, length, label) {
   if (!(value instanceof Type) || value.length !== length) {
     throw new TypeError(
-      `${label} must be ${Type.name} with exactly ${length} entries.`
+      `${label} must be ${Type.name} with exactly ${formatCountOf(length, 'entry', 'entries')}.`
     );
   }
   return value;
@@ -171,11 +172,6 @@ function requireSnapshotPayload(payload) {
     Uint8Array,
     'Snapshot centroid colors'
   );
-  requireNullableTypedArray(
-    payload.centroidOutliers,
-    Float32Array,
-    'Snapshot centroid outliers'
-  );
   const centroidCount = payload.centroidPositions === null
     ? 0
     : payload.centroidPositions.length / 3;
@@ -184,14 +180,9 @@ function requireSnapshotPayload(payload) {
       'Snapshot centroid positions must contain complete XYZ triples.'
     );
   }
-  if (
-    (payload.centroidPositions === null) !==
-      (payload.centroidColors === null) ||
-    (payload.centroidPositions === null) !==
-      (payload.centroidOutliers === null)
-  ) {
+  if ((payload.centroidPositions === null) !== (payload.centroidColors === null)) {
     throw new TypeError(
-      'Snapshot centroid positions, colors, and outliers must be published together.'
+      'Snapshot centroid positions and colors must be published together.'
     );
   }
   if (
@@ -200,14 +191,6 @@ function requireSnapshotPayload(payload) {
   ) {
     throw new TypeError(
       'Snapshot centroid colors must contain one RGBA tuple per centroid.'
-    );
-  }
-  if (
-    payload.centroidOutliers !== null &&
-    payload.centroidOutliers.length !== centroidCount
-  ) {
-    throw new TypeError(
-      'Snapshot centroid outliers must contain one value per centroid.'
     );
   }
   if (
@@ -893,7 +876,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     text.className = 'split-badge-label';
     text.textContent = linkedPositions.length === 0
       ? views[position].shows
-      : `${views[position].shows} · with ${linkedPositions.length === 1 ? 'view' : 'views'} ${linkedPositions.join(', ')}`;
+      : `${views[position].shows} · with ${countNoun(linkedPositions.length, 'view')} ${linkedPositions.join(', ')}`;
     // The same camera mark and ring as the focused view's own row.
     const cameraIndicator = ownerDocument.createElement('span');
     cameraIndicator.className = 'split-badge-camera';

@@ -2,9 +2,7 @@
  * Short, readable names for representations (the embeddings a view can
  * show), for pickers, view rows, badges and toasts.
  *
- * A prepared export names its embeddings itself ("UMAP", "PCA
- * (unintegrated)"), and that label is used as written. A name that is an
- * array key ("X_umap_3d", "X_draw_graph_fa", "X_pca[0,2]") is turned into a
+ * A name that is an array key ("X_umap_3d", "X_draw_graph_fa", "X_pca[0,2]") is turned into a
  * short name: the `X_` prefix and a dimension suffix go (the dimension is
  * shown beside the name), the usual method names are spelled the usual way,
  * and a column selection of a wider array is shown as 1-based components
@@ -40,7 +38,7 @@ const DIMENSION_TOKEN = /^[123]d$/i;
 /**
  * A short name for one array key.
  *
- * @param {string} key - An AnnData obsm key or an export embedding id.
+ * @param {string} key - An AnnData obsm key.
  * @returns {string}
  */
 export function representationKeyName(key) {

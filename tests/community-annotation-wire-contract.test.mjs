@@ -20,6 +20,8 @@ import {
   assertSchemaIdentity,
   assertUserDocument,
   parseExactJson,
+  composeUserFile,
+  projectUserFile,
 } from '../assets/js/app/community-annotations/wire-contract.js';
 import {
   toCacheScopeKey,
@@ -2148,7 +2150,6 @@ test('Worker health trust failures cancel known oversize and invalid UTF-8 bodie
               async cancel() {
                 cancelled = true;
               },
-              releaseLock() {},
             };
           },
         },
@@ -2191,7 +2192,6 @@ test('Worker health trust failures cancel known oversize and invalid UTF-8 bodie
               async cancel() {
                 cancelled = true;
               },
-              releaseLock() {},
             };
           },
         },
@@ -2228,7 +2228,6 @@ test('Worker health trust failures cancel known oversize and invalid UTF-8 bodie
               async cancel() {
                 cancelled = true;
               },
-              releaseLock() {},
             };
           },
         },
@@ -3027,7 +3026,6 @@ test('GitHub auth observes caller cancellation at the final publication boundary
             controller.abort();
             return { done: true, value: undefined };
           },
-          releaseLock() {},
         };
       },
     },
@@ -3310,7 +3308,7 @@ test('GitHub installation discovery rejects response fields outside its contract
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
     await assert.rejects(
       () => auth.listInstallations(),
-      /must contain exactly id, account/
+      /must contain exactly: account, id \(unexpected: extra\)/
     );
   } finally {
     globalThis.fetch = previousFetch;
@@ -4127,7 +4125,9 @@ test('local persistence stores only exact wire suggestion fields', () => {
 
 test('GitHub pull returns only exact path/SHA/document records', async () => {
   const previousFetch = globalThis.fetch;
-  const document = validRemoteUser();
+  // The repository holds the contributor's file; the pull hands the app the
+  // open dataset's view of it.
+  const document = composeUserFile(null, 'synthetic', validRemoteUser());
   const responses = [
     {
       tree: [
@@ -4166,7 +4166,7 @@ test('GitHub pull returns only exact path/SHA/document records', async () => {
       {
         path: 'annotations/users/ghid_7.json',
         sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        doc: document,
+        doc: projectUserFile(document, 'synthetic'),
       },
     ]);
     assert.equal(Object.hasOwn(result.docs[0], '__path'), false);
@@ -4179,7 +4179,10 @@ test('GitHub pull returns only exact path/SHA/document records', async () => {
 
 test('GitHub pull rejects one invalid user blob instead of returning a partial set', async () => {
   const previousFetch = globalThis.fetch;
-  const invalid = validRemoteUser({ unknownField: true });
+  const invalid = {
+    ...composeUserFile(null, 'synthetic', validRemoteUser()),
+    unknownField: true,
+  };
   const responses = [
     {
       tree: [

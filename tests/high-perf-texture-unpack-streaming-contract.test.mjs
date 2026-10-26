@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -448,14 +449,16 @@ function makeRendererFixture({
   };
 }
 
+// Row length and image height are never set by the app (asserted below):
+// they stay 0, so the uploads neither read nor change them.
 function makeHostileUnpackState(label) {
   return Object.freeze({
     alignment: 8,
-    imageHeight: 19,
+    imageHeight: 0,
     pixelUnpackBuffer: Object.freeze({
       id: `${label}-pixel-unpack-buffer`,
     }),
-    rowLength: 17,
+    rowLength: 0,
     skipImages: 5,
     skipPixels: 3,
     skipRows: 7,
@@ -725,5 +728,17 @@ test('the focused mock covers every WebGL2 unpack row/skip parameter', () => {
       true,
       `${name} must remain in the hostile-state contract`,
     );
+  }
+});
+
+test('no app code sets UNPACK_ROW_LENGTH or UNPACK_IMAGE_HEIGHT, so uploads never read them back', async () => {
+  // Reading either is a synchronous GPU-process round trip in Chrome; the
+  // uploads rely on both staying at their default 0.
+  const root = new URL('../assets/js/', import.meta.url);
+  const files = (await readdir(root, { recursive: true })).filter(name => name.endsWith('.js'));
+  for (const name of files) {
+    const source = await readFile(new URL(name, root), 'utf8');
+    assert.doesNotMatch(source, /pixelStorei\(\s*gl\.UNPACK_(ROW_LENGTH|IMAGE_HEIGHT)/, name);
+    assert.doesNotMatch(source, /getParameter\(\s*gl\.UNPACK_(ROW_LENGTH|IMAGE_HEIGHT)/, name);
   }
 });

@@ -1,5 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
@@ -9,7 +9,7 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 // views that share it (they show the same representation).
 
 const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=navigation-view-target`;
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=navigation-view-target`;
 
 function viewBadge(page, pill) {
   return page.locator('#split-view-badges-list .split-badge').filter({
@@ -26,7 +26,7 @@ test('Navigation names the view it drives only while several views are open', as
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
-  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 
   const row = page.locator('#navigation-view-target');
   const target = page.locator('#navigation-view-target-badge');

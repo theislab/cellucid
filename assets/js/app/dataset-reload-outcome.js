@@ -3,6 +3,7 @@ import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
 } from '../data/dataset-lifecycle-errors.js';
+import { requireExactObjectKeys } from '../utils/exact-record.js';
 
 export {
   DATASET_RELOAD_SUPERSEDED_CODE,
@@ -76,39 +77,15 @@ const SUPPORTED_EMBEDDING_DIMENSIONS = new Set([1, 2, 3]);
 const RELOAD_SUPERSEDED_MESSAGE =
   'Dataset reload was superseded by a newer selection.';
 
-function requireExactKeys(value, expectedKeys, label) {
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value)
-  ) {
-    throw new TypeError(`${label} must be an object.`);
-  }
-  const actualKeys = Object.keys(value);
-  const missing = expectedKeys.filter(key => !Object.hasOwn(value, key));
-  const unexpected = actualKeys.filter(key => !expectedKeys.includes(key));
-  if (missing.length > 0 || unexpected.length > 0) {
-    const details = [
-      ...(missing.length > 0
-        ? [`missing key(s): ${missing.join(', ')}`]
-        : []),
-      ...(unexpected.length > 0
-        ? [`unexpected key(s): ${unexpected.join(', ')}`]
-        : [])
-    ];
-    throw new Error(`${label} has ${details.join('; ')}.`);
-  }
-}
-
 /**
  * Validate one advertised embedding payload against the canonical cell axis:
  * exactly `n_cells * dimension` coordinates, the layout every later owner
  * holds (`rendering/position-layout.js`).
  *
  * Finiteness is not re-checked here: every coordinate is refused at the one
- * decode boundary it enters through (`loadPointsBinary()` for fetched and
- * staged payloads, the AnnData adapters for direct files, and the in-memory
- * DimensionManager), before any normalization can see it.
+ * decode boundary it enters through (the AnnData adapter for a dataset, the
+ * in-memory DimensionManager for a synthetic scene), before any
+ * normalization can see it.
  *
  * @param {object} options
  * @param {Float32Array} options.positions
@@ -117,7 +94,7 @@ function requireExactKeys(value, expectedKeys, label) {
  * @returns {Float32Array}
  */
 export function validateDatasetPositionPayload(options) {
-  requireExactKeys(
+  requireExactObjectKeys(
     options,
     ['positions', 'identity', 'dimension'],
     'dataset position validation'
@@ -126,7 +103,7 @@ export function validateDatasetPositionPayload(options) {
   const nCells = identity?.stats?.n_cells;
   if (!Number.isSafeInteger(nCells) || nCells <= 0) {
     throw new Error(
-      'dataset_identity.json stats.n_cells must be a positive safe integer.'
+      'The dataset identity stats.n_cells must be a positive safe integer.'
     );
   }
   if (
@@ -153,7 +130,7 @@ export function validateDatasetPositionPayload(options) {
   ) {
     throw new Error(
       `${dimension}D dataset positions contain ${positions.length} ` +
-      `coordinates; dataset_identity.json stats.n_cells (${nCells}) ` +
+      `coordinates; the dataset identity stats.n_cells (${nCells}) ` +
       `requires exactly ${expectedLength} (${nCells} × ${dimension}).`
     );
   }
@@ -168,7 +145,6 @@ export function validateDatasetPositionPayload(options) {
  * @param {object} options
  * @param {object} options.generation
  * @param {object} options.dimensionManager
- * @param {boolean} options.showProgress
  * @param {AbortSignal} options.signal
  * @returns {Promise<Readonly<{
  *   defaultDimension: number,
@@ -176,22 +152,16 @@ export function validateDatasetPositionPayload(options) {
  * }>>}
  */
 export async function stageDatasetPositionPayload(options) {
-  requireExactKeys(
+  requireExactObjectKeys(
     options,
-    ['generation', 'dimensionManager', 'showProgress', 'signal'],
+    ['generation', 'dimensionManager', 'signal'],
     'dataset position staging'
   );
   const {
     generation,
     dimensionManager,
-    showProgress,
     signal
   } = options;
-  if (typeof showProgress !== 'boolean') {
-    throw new TypeError(
-      'Dataset position staging showProgress must be a boolean.'
-    );
-  }
   if (
     typeof dimensionManager?.getDefaultLayoutKey !== 'function' ||
     typeof dimensionManager?.getLayout !== 'function' ||
@@ -225,10 +195,7 @@ export async function stageDatasetPositionPayload(options) {
       throw new Error('The dataset names no opening representation to stage.');
     }
     const defaultDimension = dimensionManager.getLayout(defaultLayoutKey).dimension;
-    const rawPositions = await dimensionManager.loadLayout(
-      defaultLayoutKey,
-      { showProgress }
-    );
+    const rawPositions = await dimensionManager.loadLayout(defaultLayoutKey);
     if (signal.aborted) {
       throw createDatasetReloadSupersededError(
         RELOAD_SUPERSEDED_MESSAGE
@@ -240,10 +207,7 @@ export async function stageDatasetPositionPayload(options) {
       dimension: defaultDimension
     });
 
-    const positions = await dimensionManager.getPositions(
-      defaultLayoutKey,
-      { showProgress: false }
-    );
+    const positions = await dimensionManager.getPositions(defaultLayoutKey);
     if (signal.aborted) {
       throw createDatasetReloadSupersededError(
         RELOAD_SUPERSEDED_MESSAGE
@@ -257,7 +221,7 @@ export async function stageDatasetPositionPayload(options) {
     if (dimensionManager.nCells !== generation.identity.stats.n_cells) {
       throw new Error(
         `DimensionManager cell count (${dimensionManager.nCells}) must equal ` +
-        `dataset_identity.json stats.n_cells ` +
+        `the dataset identity stats.n_cells ` +
         `(${generation.identity.stats.n_cells}).`
       );
     }
@@ -273,7 +237,7 @@ export async function stageDatasetPositionPayload(options) {
 
 function captureReloadIdentity(captureIdentity) {
   const identity = captureIdentity();
-  requireExactKeys(
+  requireExactObjectKeys(
     identity,
     ['source', 'baseUrl', 'datasetId', 'selectionIdentity'],
     'dataset reload identity'
@@ -371,6 +335,12 @@ function reloadIdentitiesMatch(left, right) {
  * `beginIfNoActionSince(sequence)`: it supersedes the loads that were already
  * running then, but never anything the user did after it.
  *
+ * When the application is torn down, `retire()` stops the change in flight
+ * as a newer choice would (its reads end, its opening lets go) and refuses
+ * every later one. Teardown then waits only for work that has been told to
+ * stop, never for a read to answer on its own: a read that never answers
+ * would otherwise hold the teardown forever.
+ *
  * @param {() => object} captureIdentity
  * @returns {Readonly<{
  *   readonly actionSequence: number,
@@ -378,6 +348,7 @@ function reloadIdentitiesMatch(left, right) {
  *   begin: () => DatasetChangeTransaction,
  *   beginIfNoActionSince: (sequence: number) => DatasetChangeTransaction|null,
  *   recordAction: () => number,
+ *   retire: () => void,
  *   whenSettled: () => Promise<void>
  * }>}
  *
@@ -399,6 +370,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
   let latestGeneration = 0;
   let actionSequence = 0;
   let latest = null;
+  let retired = false;
 
   function advanceActionSequence() {
     if (actionSequence >= Number.MAX_SAFE_INTEGER) {
@@ -415,6 +387,11 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
   }
 
   function begin() {
+    if (retired) {
+      throw createDatasetReloadSupersededError(
+        'The application was closed; no dataset change can begin.'
+      );
+    }
     let identity = captureReloadIdentity(captureIdentity);
     if (latestGeneration >= Number.MAX_SAFE_INTEGER) {
       throw new RangeError('Dataset change generation is exhausted.');
@@ -492,6 +469,13 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
       },
       finish() {
         settle(record);
+      },
+      /**
+       * Stop this change where it is (the person cancelled it): it ends as a
+       * superseded one does, and the dataset on screen stays.
+       */
+      cancel() {
+        controller.abort();
       }
     });
   }
@@ -519,6 +503,16 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
      * no transaction and supersedes nothing that is loading.
      */
     recordAction: advanceActionSequence,
+    /**
+     * The application is closing: the change in flight stops now, as one a
+     * newer choice replaced, and no other begins.
+     */
+    retire() {
+      retired = true;
+      if (latest === null) return;
+      latest.controller.abort();
+      settle(latest);
+    },
     async whenSettled() {
       while (latest !== null && !latest.settled) {
         await latest.settledPromise;
@@ -631,7 +625,7 @@ export function createLatestDatasetPublicationContinuationOwner() {
  * @returns {Promise<never>}
  */
 export async function handleDatasetReloadFailure(options) {
-  requireExactKeys(
+  requireExactObjectKeys(
     options,
     ['error', 'transaction', 'cancel', 'reportFailure'],
     'dataset reload failure'
@@ -717,7 +711,7 @@ const PUBLISHED_STATE_READY_OUTCOMES = new Set([
  * @returns {Promise<object>}
  */
 export async function settlePublishedDatasetStateOutcome(options) {
-  requireExactKeys(
+  requireExactObjectKeys(
     options,
     ['outcome', 'transaction', 'cancel', 'complete'],
     'published dataset state outcome'
@@ -793,7 +787,7 @@ export async function settlePublishedDatasetStateOutcome(options) {
  * >}
  */
 export async function settlePublishedDatasetUi(options) {
-  requireExactKeys(
+  requireExactObjectKeys(
     options,
     ['synchronize', 'finalize', 'reportFailure'],
     'published dataset UI synchronization'

@@ -10,8 +10,10 @@
  * case the card must not slow down:
  *
  * - Picking reuses the viewer's exact per-view pick, which walks the view's
- *   spatial index on large panes. Up to two million cells those indices are
- *   built in idle time; beyond that the first hover builds them.
+ *   spatial index on panes of 250,000 cells or more
+ *   (`INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD` in `rendering/viewer.js`).
+ *   Those indices are built in a worker in idle time, at any size; smaller
+ *   panes are scanned directly.
  * - The per-category counts are one pass over the pane's codes and visibility,
  *   made once and reused until that pane's colouring or visibility changes.
  * - A pointer move only records the position; a lookup runs once the pointer
@@ -29,7 +31,7 @@
  * @module ui/modules/cell-info
  */
 
-import { formatCount } from '../components/display-format.js';
+import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
 
 const PICK_MOVE_THRESHOLD_PX = 2;
@@ -405,7 +407,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
       parts.scale.hidden = true;
       const code = field.codes[cellIndex];
       const counts = label === null ? null : visibleCategoryCounts(viewId, field);
-      parts.count.textContent = counts ? `${formatCount(counts[code])} cells` : '';
+      parts.count.textContent = counts ? `${formatCountOf(counts[code], 'cell')}` : '';
     } else if (field && field.kind === 'continuous' && field.values && field.values.length > cellIndex) {
       const value = field.values[cellIndex];
       parts.value.textContent = formatCellValue(value);

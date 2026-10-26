@@ -2,6 +2,7 @@
 // GPU-Accelerated Density Volume Splatting (WebGL2)
 // ============================================================================
 
+import { glStateOf } from '../gl-state-shadow.js';
 import {
   LIGHT_VOLUME_FS,
   NORMALIZE_FS,
@@ -15,13 +16,20 @@ import {
   SPLAT_VS,
 } from '../shaders/density-shaders.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../alpha-visibility.js';
-import { requireCleanWebGLState } from '../gl-errors.js';
-import { createProgram } from '../gl-utils.js';
+import { requireCleanWebGLState, requireLiveContext } from '../gl-errors.js';
+import {
+  createProgram,
+  deleteGlObject,
+  deleteProgramReleasingUse,
+  deleteTextureTracked,
+  restorableTexture,
+} from '../gl-utils.js';
 import {
   MAX_SMOKE_GRID_SIZE,
   SmokeUnsupportedError,
 } from './smoke-density-contract.js';
 import { detectSmokeSupport } from './smoke-capabilities.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const gpuSplatResourcesByContext = new WeakMap();
 export const MAX_SPLAT_POINTS_PER_BATCH = 262_144;
@@ -58,7 +66,7 @@ function deleteCachedGPUSplatResources(gl, resources) {
     const program = resources[key];
     if (!program) continue;
     try {
-      gl.deleteProgram(program);
+      deleteProgramReleasingUse(gl, program);
       resources[key] = null;
     } catch (error) {
       failures.push(asError(
@@ -162,7 +170,7 @@ function getOrCreateGPUSplatResources(gl) {
     requireCleanWebGLState(gl, `Smoke density ${label} validation`);
     if (actualBytes !== expectedBytes) {
       throw new Error(
-        `Smoke density ${label} store is ${actualBytes} bytes; expected exactly ${expectedBytes}.`
+        `Smoke density ${label} store is ${formatCountOf(actualBytes, 'byte')}; expected exactly ${expectedBytes}.`
       );
     }
   }
@@ -325,7 +333,7 @@ function getOrCreateGPUSplatResources(gl) {
 }
 
 function captureTextureBindings(gl) {
-  const activeTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+  const activeTexture = glStateOf(gl).activeTexture;
   const units = [gl.TEXTURE0, gl.TEXTURE1, gl.TEXTURE2];
   if (!units.includes(activeTexture)) units.push(activeTexture);
   const bindings = [];
@@ -342,32 +350,38 @@ function captureTextureBindings(gl) {
   return { activeTexture, bindings };
 }
 
+// Bindings are read from the context (every engine answers them on the
+// page); the rest from its state shadow (`gl-state-shadow.js`), since asking
+// the context for them waits for every queued command in Firefox and WebKit.
 function capturePipelineState(gl) {
   const textures = captureTextureBindings(gl);
+  const shadow = glStateOf(gl);
+  const blendFunc = shadow.blendFunc;
+  const blendEquation = shadow.blendEquation;
   return {
     activeTexture: textures.activeTexture,
     arrayBuffer: gl.getParameter(gl.ARRAY_BUFFER_BINDING),
-    blend: gl.isEnabled(gl.BLEND),
-    blendDstAlpha: gl.getParameter(gl.BLEND_DST_ALPHA),
-    blendDstRgb: gl.getParameter(gl.BLEND_DST_RGB),
-    blendEquationAlpha: gl.getParameter(gl.BLEND_EQUATION_ALPHA),
-    blendEquationRgb: gl.getParameter(gl.BLEND_EQUATION_RGB),
-    blendSrcAlpha: gl.getParameter(gl.BLEND_SRC_ALPHA),
-    blendSrcRgb: gl.getParameter(gl.BLEND_SRC_RGB),
-    clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
-    colorMask: Array.from(gl.getParameter(gl.COLOR_WRITEMASK)),
-    cullFace: gl.isEnabled(gl.CULL_FACE),
-    depthTest: gl.isEnabled(gl.DEPTH_TEST),
-    dither: gl.isEnabled(gl.DITHER),
+    blend: shadow.isEnabled(gl.BLEND),
+    blendDstAlpha: blendFunc.dstAlpha,
+    blendDstRgb: blendFunc.dstRgb,
+    blendEquationAlpha: blendEquation.alpha,
+    blendEquationRgb: blendEquation.rgb,
+    blendSrcAlpha: blendFunc.srcAlpha,
+    blendSrcRgb: blendFunc.srcRgb,
+    clearColor: shadow.clearColor,
+    colorMask: shadow.colorMask,
+    cullFace: shadow.isEnabled(gl.CULL_FACE),
+    depthTest: shadow.isEnabled(gl.DEPTH_TEST),
+    dither: shadow.isEnabled(gl.DITHER),
     drawFramebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING),
     program: gl.getParameter(gl.CURRENT_PROGRAM),
-    rasterizerDiscard: gl.isEnabled(gl.RASTERIZER_DISCARD),
+    rasterizerDiscard: shadow.isEnabled(gl.RASTERIZER_DISCARD),
     readFramebuffer: gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),
-    scissorTest: gl.isEnabled(gl.SCISSOR_TEST),
-    stencilTest: gl.isEnabled(gl.STENCIL_TEST),
+    scissorTest: shadow.isEnabled(gl.SCISSOR_TEST),
+    stencilTest: shadow.isEnabled(gl.STENCIL_TEST),
     textureBindings: textures.bindings,
     vertexArray: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
-    viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
+    viewport: Array.from(shadow.viewport),
   };
 }
 
@@ -404,8 +418,10 @@ function restorePipelineState(gl, state) {
   gl.bindBuffer(gl.ARRAY_BUFFER, state.arrayBuffer);
   for (const binding of state.textureBindings) {
     gl.activeTexture(binding.unit);
-    gl.bindTexture(gl.TEXTURE_2D, binding.texture2D);
-    gl.bindTexture(gl.TEXTURE_3D, binding.texture3D);
+    // A binding saved before the build may name a texture deleted since:
+    // it is not restored (gl-utils.js `restorableTexture`).
+    gl.bindTexture(gl.TEXTURE_2D, restorableTexture(binding.texture2D));
+    gl.bindTexture(gl.TEXTURE_3D, restorableTexture(binding.texture3D));
     gl.bindSampler(binding.unit - gl.TEXTURE0, binding.sampler);
   }
   gl.activeTexture(state.activeTexture);
@@ -435,7 +451,7 @@ function createAtlasTexture(gl, internalFormat, width, height, format, type) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return texture;
   } catch (error) {
-    gl.deleteTexture(texture);
+    deleteTextureTracked(gl, texture);
     throw error;
   }
 }
@@ -667,7 +683,7 @@ function deleteResources(gl, resources, deleteMethod, failures, label) {
   for (const resource of resources) {
     if (resource === null) continue;
     try {
-      gl[deleteMethod](resource);
+      deleteGlObject(gl, deleteMethod, resource);
     } catch (error) {
       failures.push(asError(
         error,
@@ -684,7 +700,7 @@ function releaseTrackedResource(gl, resources, resource, deleteMethod, label) {
       `GPU smoke density ${label} is not owned by the active build transaction.`
     );
   }
-  gl[deleteMethod](resource);
+  deleteGlObject(gl, deleteMethod, resource);
   resources.splice(index, 1);
 }
 
@@ -793,7 +809,9 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
   }
   const support = detectSmokeSupport(gl);
   if (!support.supported) throw new SmokeUnsupportedError(support);
-  requireCleanWebGLState(gl, 'GPU smoke density build preflight');
+  // One error read per build, after its allocations (`publication` below):
+  // each read is a synchronous round trip that waits for every queued
+  // command, the previous frame's included (rendering/gl-errors.js).
 
   const slicesPerRow = Math.ceil(Math.sqrt(gridSize));
   const numRows = Math.ceil(gridSize / slicesPerRow);
@@ -1299,11 +1317,13 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     ));
   }
   try {
-    requireCleanWebGLState(gl, 'GPU smoke density settlement');
+    // Deleting objects and restoring bindings allocate nothing: only a lost
+    // context can refuse them, so no error is read back here.
+    requireLiveContext(gl, 'GPU smoke density settlement');
   } catch (error) {
     settlementFailures.push(asError(
       error,
-      'GPU smoke density settlement error inspection failed with a non-Error value.'
+      'GPU smoke density settlement inspection failed with a non-Error value.'
     ));
   }
 
@@ -1313,7 +1333,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     failures.push(...settlementFailures);
     if (candidateTexture !== null) {
       try {
-        gl.deleteTexture(candidateTexture);
+        deleteTextureTracked(gl, candidateTexture);
       } catch (error) {
         failures.push(asError(
           error,
@@ -1456,13 +1476,13 @@ export function createDensityTexture3D(gl, volumeDesc) {
       );
     }
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment);
-    gl.bindTexture(gl.TEXTURE_3D, previousBinding);
+    gl.bindTexture(gl.TEXTURE_3D, restorableTexture(previousBinding));
   } catch (error) {
     const cleanupErrors = [];
     for (const cleanup of [
       () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
-      () => gl.bindTexture(gl.TEXTURE_3D, previousBinding),
-      () => gl.deleteTexture(texture),
+      () => gl.bindTexture(gl.TEXTURE_3D, restorableTexture(previousBinding)),
+      () => deleteTextureTracked(gl, texture),
     ]) {
       try {
         cleanup();

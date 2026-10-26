@@ -2,16 +2,19 @@ import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { gzipSync } from 'node:zlib';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { createOpenMenuDom } from './helpers/open-menu-dom.mjs';
+import { recordOpenings } from './helpers/opening-events.mjs';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
 import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
 import { loadPointsBinary } from '../assets/js/data/data-loaders.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { DimensionManager } from '../assets/js/data/dimension-manager.js';
 import { debug } from '../assets/js/utils/debug.js';
+import { loadsAsReader } from './helpers/dimension-loads.mjs';
+import { settle } from './helpers/virtual-time.mjs';
 
 const outcomeModuleUrl = new URL(
   '../assets/js/app/dataset-reload-outcome.js',
@@ -19,22 +22,21 @@ const outcomeModuleUrl = new URL(
 );
 
 /**
- * Version-3 `embeddings` metadata: one item per `[id, dimension]`, in the
- * (dimension, id) item order, each on its exact producer path. Each dimension's
- * default is its first item unless `defaults` names another.
+ * A dataset identity's `embeddings` metadata: one item per `[id,
+ * dimension]`, in the (dimension, id) item order, item `i` on `obsm` entry
+ * `i`. Each dimension's default is its first item unless `defaults` names
+ * another.
  */
-function embeddingsMetadata(entries, { defaults = {}, defaultDimension, gzip = false } = {}) {
+function embeddingsMetadata(entries, { defaults = {}, defaultDimension } = {}) {
   const items = {};
   const slots = {};
   entries.forEach(([id, dimension], index) => {
+    const columns = Array.from({ length: dimension }, (_, column) => column);
     items[id] = {
       label: id,
       dimension,
-      file: `embeddings/${index}_${dimension}d.bin${gzip ? '.gz' : ''}`,
-      source: {
-        key: id,
-        columns: Array.from({ length: dimension }, (_, column) => column),
-      },
+      path: `obsm/${index}/${columns.join('-')}`,
+      source: { key: id, columns },
     };
     slots[`${dimension}d`] ??= id;
   });
@@ -151,6 +153,8 @@ function captureNotifications(t) {
   notifications.success = message => {
     events.push({ kind: 'success', message });
   };
+  // A file is shown by the opening progress.
+  recordOpenings(t, events);
   t.after(() => Object.assign(notifications, originals));
   return events;
 }
@@ -192,7 +196,7 @@ function captureDownloadNotifications(t) {
   return events;
 }
 
-function installActiveAnnDataAdapter(t, adapter, sourceType = 'h5ad') {
+function installActiveAnnDataAdapter(t, adapter, sourceType = 'anndata') {
   const manager = getDataSourceManager();
   const previous = {
     activeDatasetId: manager.activeDatasetId,
@@ -237,7 +241,7 @@ async function runLocalSelection(t, { activateDataset }) {
     getType() {
       return 'local-user';
     },
-    loadFromH5adFile: async () => metadata,
+    loadFromFile: async () => metadata,
   };
   const userSource = {
     candidateCreations: 0,
@@ -272,8 +276,7 @@ async function runLocalSelection(t, { activateDataset }) {
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataH5adBtn: createButton(),
-      userDataH5adInput: input,
+      ...createOpenMenuDom({ fileInput: input }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -400,7 +403,6 @@ test('position staging rejects a misaligned raw payload before normalization or 
     stageDatasetPositionPayload({
       generation: { identity: { stats: { n_cells: 3 } } },
       dimensionManager: manager,
-      showProgress: false,
       signal: controller.signal
     }),
     /8.*coordinates.*n_cells.*3.*exactly 6|exactly 6.*3.*2/i
@@ -440,7 +442,6 @@ test('position staging validates raw and rendered buffers and is owner-abortable
   const staged = await stageDatasetPositionPayload({
     generation: { identity: { stats: { n_cells: 3 } } },
     dimensionManager: manager,
-    showProgress: true,
     signal: controller.signal
   });
   assert.deepEqual(staged, {
@@ -448,8 +449,8 @@ test('position staging validates raw and rendered buffers and is owner-abortable
     positions: staged.positions
   });
   assert.deepEqual(calls, [
-    ['raw', 'X_umap', { showProgress: true }],
-    ['render', 'X_umap', { showProgress: false }]
+    ['raw', 'X_umap', undefined],
+    ['render', 'X_umap', undefined]
   ]);
   assert.equal(staged.positions.length, 6);
 
@@ -460,7 +461,6 @@ test('position staging validates raw and rendered buffers and is owner-abortable
         ...manager,
         getPositions: async () => new Float32Array(9)
       },
-      showProgress: false,
       signal: new AbortController().signal
     }),
     /2D dataset positions contain 9 coordinates.*exactly 6/
@@ -487,7 +487,6 @@ test('position staging validates raw and rendered buffers and is owner-abortable
   const pendingStage = stageDatasetPositionPayload({
     generation: { identity: { stats: { n_cells: 3 } } },
     dimensionManager: abortingManager,
-    showProgress: false,
     signal: abortController.signal
   });
   abortController.abort();
@@ -501,7 +500,6 @@ test('position staging validates raw and rendered buffers and is owner-abortable
     stageDatasetPositionPayload({
       generation: { identity: { stats: { n_cells: 3 } } },
       dimensionManager: manager,
-      showProgress: false,
       signal: null
     }),
     /signal must be an AbortSignal/i
@@ -517,7 +515,6 @@ test('position staging validates raw and rendered buffers and is owner-abortable
         loadLayout: async () => new Float32Array(6),
         getPositions: async () => new Float32Array(9)
       },
-      showProgress: false,
       signal: new AbortController().signal
     }),
     /requires a DimensionManager/i
@@ -529,7 +526,7 @@ test('dataset reload transactions reject stale commits across local selection ep
     await import(outcomeModuleUrl);
   const source = {};
   let identity = {
-    baseUrl: 'zarr://first/',
+    baseUrl: 'anndata://first/',
     datasetId: 'first',
     selectionIdentity: 1,
     source
@@ -548,7 +545,7 @@ test('dataset reload transactions reject stale commits across local selection ep
   })();
 
   identity = {
-    baseUrl: 'zarr://second/',
+    baseUrl: 'anndata://second/',
     datasetId: 'second',
     selectionIdentity: 2,
     source
@@ -680,6 +677,49 @@ test('a change that may not touch the dataset never overrides a later action', a
   assert.throws(() => changes.beginIfNoActionSince(-1), TypeError);
   assert.throws(() => changes.beginIfNoActionSince(1.5), TypeError);
 });
+
+test('retiring the changes stops the one in flight and admits no other', async () => {
+  const { createLatestDatasetReloadCoordinator, isDatasetReloadSupersededError } =
+    await import(outcomeModuleUrl);
+  const changes = createLatestDatasetReloadCoordinator(() => ({
+    baseUrl: null,
+    datasetId: null,
+    selectionIdentity: null,
+    source: null
+  }));
+  // A file is being read when the application is torn down: its change is
+  // stopped as a newer choice would stop it, so nothing waits for the read.
+  const reading = changes.begin();
+  let stopped = 0;
+  reading.signal.addEventListener('abort', () => {
+    stopped += 1;
+  });
+  changes.retire();
+  assert.equal(stopped, 1);
+  assert.equal(reading.signal.aborted, true);
+  assert.equal(changes.settled, true);
+  await changes.whenSettled();
+  assert.throws(() => reading.assertCurrent(), isDatasetReloadSupersededError);
+  // Its owner unwinding afterwards changes nothing; no change begins again.
+  reading.finish();
+  assert.throws(() => changes.begin(), isDatasetReloadSupersededError);
+  assert.throws(
+    () => changes.beginIfNoActionSince(changes.actionSequence),
+    isDatasetReloadSupersededError
+  );
+  // Retiring with nothing in flight, or twice, is harmless.
+  changes.retire();
+  assert.equal(stopped, 1);
+  const idle = createLatestDatasetReloadCoordinator(() => ({
+    baseUrl: null,
+    datasetId: null,
+    selectionIdentity: null,
+    source: null
+  }));
+  idle.retire();
+  assert.equal(idle.settled, true);
+  assert.throws(() => idle.begin(), isDatasetReloadSupersededError);
+});
 test(
   'publication continuation remains current until a newer runtime actually publishes',
   async () => {
@@ -690,7 +730,7 @@ test(
     } = await import(outcomeModuleUrl);
     const source = {};
     let identity = {
-      baseUrl: 'zarr://first/',
+      baseUrl: 'anndata://first/',
       datasetId: 'first',
       selectionIdentity: 1,
       source
@@ -710,7 +750,7 @@ test(
 
     identity = {
       ...identity,
-      baseUrl: 'zarr://failed-b/',
+      baseUrl: 'anndata://failed-b/',
       datasetId: 'failed-b',
       selectionIdentity: 2
     };
@@ -751,7 +791,7 @@ for (const runtimeKind of ['dataset', 'synthetic']) {
       } = await import(outcomeModuleUrl);
       const source = {};
       let identity = {
-        baseUrl: 'zarr://live-a/',
+        baseUrl: 'anndata://live-a/',
         datasetId: 'live-a',
         selectionIdentity: 1,
         source
@@ -778,7 +818,7 @@ for (const runtimeKind of ['dataset', 'synthetic']) {
       if (runtimeKind === 'dataset') {
         identity = {
           ...identity,
-          baseUrl: 'zarr://failed-b/',
+          baseUrl: 'anndata://failed-b/',
           datasetId: 'failed-b',
           selectionIdentity: 2
         };
@@ -844,7 +884,7 @@ test('dataset reload identity capture requires one exact explicit shape', async 
     }),
     () => ({
       source: {},
-      baseUrl: 'zarr://selected/',
+      baseUrl: 'anndata://selected/',
       datasetId: 'selected',
       selectionIdentity: '1'
     })
@@ -854,7 +894,7 @@ test('dataset reload identity capture requires one exact explicit shape', async 
     );
     assert.throws(
       () => coordinator.begin(),
-      /reload identity|missing key|unexpected key|explicit null|selectionIdentity/i
+      /reload identity|missing: |unexpected: |explicit null|selectionIdentity/i
     );
   }
 
@@ -906,7 +946,7 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
   } = await import(outcomeModuleUrl);
   let identity = {
     source: {},
-    baseUrl: 'zarr://first/',
+    baseUrl: 'anndata://first/',
     datasetId: 'first',
     selectionIdentity: 1
   };
@@ -917,7 +957,7 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
 
   identity = {
     ...identity,
-    baseUrl: 'zarr://second/',
+    baseUrl: 'anndata://second/',
     datasetId: 'second',
     selectionIdentity: 2
   };
@@ -946,7 +986,7 @@ test(
     } = await import(outcomeModuleUrl);
     let identity = {
       source: {},
-      baseUrl: 'zarr://first/',
+      baseUrl: 'anndata://first/',
       datasetId: 'first',
       selectionIdentity: 1
     };
@@ -954,7 +994,7 @@ test(
     const older = coordinator.begin();
     identity = {
       ...identity,
-      baseUrl: 'zarr://second/',
+      baseUrl: 'anndata://second/',
       datasetId: 'second',
       selectionIdentity: 2
     };
@@ -1076,7 +1116,7 @@ test('reload owner adopts one committed identity before published-state success'
   const newSource = {};
   let identity = {
     source: oldSource,
-    baseUrl: 'zarr://old/',
+    baseUrl: 'anndata://old/',
     datasetId: 'old',
     selectionIdentity: null
   };
@@ -1088,7 +1128,7 @@ test('reload owner adopts one committed identity before published-state success'
 
   identity = {
     source: newSource,
-    baseUrl: 'zarr://new/',
+    baseUrl: 'anndata://new/',
     datasetId: 'new',
     selectionIdentity: null
   };
@@ -1125,7 +1165,7 @@ test('reload owner adopts one committed identity before published-state success'
 
   identity = {
     source: {},
-    baseUrl: 'zarr://reentrant-publication/',
+    baseUrl: 'anndata://reentrant-publication/',
     datasetId: 'reentrant-publication',
     selectionIdentity: null
   };
@@ -1201,7 +1241,7 @@ test('reload failure handling requires exact transaction and handler ownership',
       transaction,
       reportFailure: () => {}
     }),
-    /missing key.*cancel/i
+    /must contain exactly: .*\(missing: cancel\)/i
   );
   await assert.rejects(
     handleDatasetReloadFailure({
@@ -1220,7 +1260,7 @@ test('reload failure handling requires exact transaction and handler ownership',
       reportFailure: () => {},
       legacyRecovery: true
     }),
-    /unexpected key.*legacyRecovery/i
+    /\(unexpected: legacyRecovery\)/i
   );
 });
 
@@ -1318,7 +1358,7 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
       reportFailure() {},
       fallbackToOldUi: true
     }),
-    /unexpected key.*fallbackToOldUi/i
+    /must contain exactly: .*\(unexpected: fallbackToOldUi\)/i
   );
 });
 
@@ -1385,7 +1425,7 @@ test('dimension cache invalidation rejects delayed positions without republishin
     embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
   const oldPayload = deferred();
-  manager.loadLayout = () => oldPayload.promise;
+  loadsAsReader(manager, () => oldPayload.promise);
 
   const older = manager.getPositions('X_umap', { showProgress: false });
   manager.clearCache();
@@ -1420,12 +1460,11 @@ test('dimension metadata accepts only exact embedding items, defaults, and dimen
   mutate(metadata => { metadata.defaults['1d'] = 'X_umap'; });
   mutate(metadata => { metadata.defaults['2d'] = 'X_umap_3d'; });
   mutate(metadata => { metadata.defaults['2d'] = 'X_missing'; });
-  mutate(metadata => { metadata.items.X_umap.file = ''; });
+  mutate(metadata => { metadata.items.X_umap.path = ''; });
   mutate(metadata => { metadata.items.X_umap.label = ''; });
   mutate(metadata => { delete metadata.items.X_umap.source; });
   mutate(metadata => { metadata.items.X_umap.source.columns = [0]; });
   mutate(metadata => { metadata.items.X_umap.obsm_key = 'X_umap'; });
-  mutate(metadata => { metadata.files = { '2d': 'points_2d.bin' }; });
   for (const metadata of rejected) {
     assert.throws(
       () => new DimensionManager({ embeddingsMetadata: metadata }),
@@ -1433,23 +1472,12 @@ test('dimension metadata accepts only exact embedding items, defaults, and dimen
     );
   }
 
-  // Neither version-2 path map is read any more.
-  for (const legacy of [
-    { available_dimensions: [2], default_dimension: 2, files: { '2d': 'points_2d.bin' } },
-    { available_dimensions: [2], default_dimension: 2, obsm_keys: { '2d': 'X_umap' } },
-  ]) {
-    assert.throws(
-      () => new DimensionManager({ embeddingsMetadata: legacy }),
-      /exactly default_dimension, defaults, and items/
-    );
-  }
-
-  // A direct AnnData identity is an ordinary version-3 identity: its layout
-  // reads the item's file and records the obsm array it was read from.
+  // A layout reads the item's obsm route and records the obsm array it was
+  // read from.
   const direct = new DimensionManager({
     embeddingsMetadata: embeddingsMetadata([['X_umap', 2]]),
   });
-  assert.equal(direct.getLayout('X_umap').path, 'embeddings/0_2d.bin');
+  assert.equal(direct.getLayout('X_umap').path, 'obsm/0/0-1');
   assert.deepEqual(
     direct.getLayout('X_umap').provenance,
     { key: 'X_umap', columns: [0, 1] }
@@ -1475,53 +1503,7 @@ test('dimension metadata replacement validates completely before mutation', () =
   assert.equal(manager.hasLayout('X_umap_1d'), false);
   assert.deepEqual(
     manager.getLayoutsForDimension(3).map(layout => layout.path),
-    ['embeddings/0_3d.bin'],
-  );
-});
-
-test('dimension cache invalidation aborts fetch and dismisses stale progress', async t => {
-  const originalFetch = globalThis.fetch;
-  const fetchStarted = deferred();
-  const events = captureDownloadNotifications(t);
-  let requestSignal = null;
-
-  globalThis.fetch = (_url, options = {}) => {
-    requestSignal = options.signal ?? null;
-    fetchStarted.resolve();
-    return new Promise((_resolve, reject) => {
-      const rejectAbort = () => {
-        const error = new Error('synthetic fetch abort');
-        error.name = 'AbortError';
-        reject(error);
-      };
-      if (requestSignal?.aborted) {
-        rejectAbort();
-        return;
-      }
-      requestSignal?.addEventListener('abort', rejectAbort, { once: true });
-    });
-  };
-  t.after(() => {
-    if (originalFetch === undefined) delete globalThis.fetch;
-    else globalThis.fetch = originalFetch;
-  });
-
-  const manager = new DimensionManager({
-    baseUrl: 'https://cellucid.test/data/',
-    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]], { gzip: true })
-  });
-
-  const loading = manager.getPositions('X_umap', { showProgress: true });
-  await fetchStarted.promise;
-  manager.clearCache();
-
-  assert.ok(requestSignal, 'dimension fetch must receive an AbortSignal');
-  assert.equal(requestSignal.aborted, true);
-  await assert.rejects(loading, error => error?.name === 'AbortError');
-  assert.deepEqual(
-    events.filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind))
-      .map(event => event.kind),
-    ['start', 'dismiss']
+    ['obsm/0/0-1-2'],
   );
 });
 
@@ -1533,8 +1515,8 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
 
   installActiveAnnDataAdapter(t, {
     getEmbeddingPayload(path, dimension) {
-      // The layout's identity file and dimension name the payload.
-      assert.equal(path, 'embeddings/0_2d.bin');
+      // The layout's route and dimension name what is read.
+      assert.equal(path, 'obsm/0/0-1');
       assert.equal(dimension, 2);
       decoderCalls++;
       decoderStarted.resolve();
@@ -1547,12 +1529,12 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
 
   const events = captureDownloadNotifications(t);
   const manager = new DimensionManager({
-    baseUrl: 'h5ad://pending-direct-anndata/',
+    baseUrl: 'anndata://pending-direct-anndata/',
     embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
 
-  const first = manager.getPositions('X_umap', { showProgress: true });
-  const second = manager.getPositions('X_umap', { showProgress: true });
+  const first = manager.getPositions('X_umap');
+  const second = manager.getPositions('X_umap');
   const observe = promise => promise.then(
     value => ({ status: 'fulfilled', value }),
     error => ({ error, status: 'rejected' })
@@ -1564,12 +1546,13 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
   assert.equal(decoderCalls, 1, 'direct AnnData embedding decode must be shared');
   manager.clearCache();
 
-  const promptOutcome = await Promise.race([
-    Promise.all([firstObserved, secondObserved]),
-    new Promise(resolve => {
-      setTimeout(() => resolve('still-pending'), 50);
-    })
-  ]);
+  // Still pending once nothing but the held decoder is left to run (an idle
+  // event loop, not a while): the callers waited for it.
+  let promptOutcome = 'still-pending';
+  Promise.all([firstObserved, secondObserved]).then(outcome => {
+    promptOutcome = outcome;
+  });
+  await settle();
   assert.notEqual(
     promptOutcome,
     'still-pending',
@@ -1580,45 +1563,47 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
     assert.equal(outcome.error?.name, 'AbortError');
   }
 
+  // Positions read from an AnnData file are not a download (the file's reads
+  // are in the Transfers panel), so nothing is announced, before or after.
   const terminalKinds = () => events
     .filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind))
     .map(event => event.kind);
-  assert.deepEqual(terminalKinds(), ['start', 'dismiss']);
+  assert.deepEqual(terminalKinds(), []);
 
   decoderPayload.resolve(new Float32Array([0, 0, 1, 1]));
   await decoderFinished.promise;
   await Promise.resolve();
   assert.deepEqual(
     terminalKinds(),
-    ['start', 'dismiss'],
+    [],
     'late decoder completion must not publish success'
   );
   assert.equal(manager.normalizedPositionCache.size, 0);
   assert.equal(manager.normTransformCache.size, 0);
 });
 
-test('concurrent 2D position callers share one normalization and progress transaction', async t => {
+test('concurrent 2D position callers share one normalization transaction', async t => {
   const events = captureDownloadNotifications(t);
   const rawPositions = deferred();
   const loadStarted = deferred();
-  const loadOptions = [];
+  const loadKeys = [];
   let loadCalls = 0;
 
   const manager = new DimensionManager({
     embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
-  manager.loadLayout = (layoutKey, options) => {
+  loadsAsReader(manager, layoutKey => {
     loadCalls++;
-    loadOptions.push({ layoutKey, options });
+    loadKeys.push(layoutKey);
     loadStarted.resolve();
     return rawPositions.promise;
-  };
+  });
   t.after(() => {
     rawPositions.resolve(new Float32Array([0, 0, 2, 2]));
   });
 
-  const first = manager.getPositions('X_umap', { showProgress: true });
-  const second = manager.getPositions('X_umap', { showProgress: true });
+  const first = manager.getPositions('X_umap');
+  const second = manager.getPositions('X_umap');
   await loadStarted.promise;
   rawPositions.resolve(new Float32Array([0, 0, 2, 2]));
 
@@ -1629,16 +1614,12 @@ test('concurrent 2D position callers share one normalization and progress transa
     secondPositions,
     'all callers must receive the one normalized result'
   );
-  assert.equal(loadOptions[0].layoutKey, 'X_umap');
-  assert.equal(loadOptions[0].options.showProgress, false);
-  assert.equal(
-    loadOptions[0].options.progressTrackerId,
-    events.find(event => event.kind === 'start')?.id
-  );
+  assert.deepEqual(loadKeys, ['X_umap']);
+  // Positions are read from the AnnData file, not downloaded: no download
+  // progress is announced.
   assert.deepEqual(
-    events.filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind))
-      .map(event => event.kind),
-    ['start', 'complete']
+    events.filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind)),
+    []
   );
 });
 
@@ -1653,11 +1634,11 @@ test('position normalization admits every layout beyond the budget and keeps pin
     embeddingsMetadata: metadata,
     maxPositionBytes: 31
   });
-  overBudget.loadLayout = async layoutKey => (
+  loadsAsReader(overBudget, async layoutKey => (
     layoutKey === 'X_umap_3d'
       ? new Float32Array([0, 0, 0, 1, 1, 1])
       : new Float32Array([0, 0, 1, 1])
-  );
+  ));
   overBudget.pinLayout('X_umap_3d');
   await overBudget.getPositions('X_umap_3d', { showProgress: false });
   assert.equal(
@@ -1672,7 +1653,7 @@ test('position normalization admits every layout beyond the budget and keeps pin
     embeddingsMetadata: metadata,
     maxPositionBytes: 15
   });
-  shown.loadLayout = async () => new Float32Array([0, 0, 1, 1]);
+  loadsAsReader(shown, async () => new Float32Array([0, 0, 1, 1]));
   assert.equal((await shown.getPositions('X_umap', { showProgress: false })).byteLength, 16);
 
   const exact = new DimensionManager({
@@ -1680,7 +1661,7 @@ test('position normalization admits every layout beyond the budget and keeps pin
     maxPositionBytes: 16
   });
   const raw2D = new Float32Array([0, 0, 1, 1]);
-  exact.loadLayout = async () => raw2D;
+  loadsAsReader(exact, async () => raw2D);
   const normalized2D = await exact.getPositions('X_umap', { showProgress: false });
   assert.strictEqual(
     normalized2D,
@@ -1701,7 +1682,7 @@ test('position normalization admits every layout beyond the budget and keeps pin
     maxPositionBytes: shared3D.byteLength
   });
   noCopy.positionCache.set('X_umap_3d', shared3D);
-  noCopy.loadLayout = async () => shared3D;
+  loadsAsReader(noCopy, async () => shared3D);
   assert.strictEqual(
     await noCopy.getPositions('X_umap_3d', { showProgress: false }),
     shared3D,
@@ -1724,7 +1705,7 @@ test('position normalization evicts stale dimension buffers before exceeding the
     ['X_umap_1d', new Float32Array([0, 1])],
     ['X_umap', new Float32Array([0, 0, 1, 1])]
   ]);
-  manager.loadLayout = async layoutKey => rawByLayout.get(layoutKey);
+  loadsAsReader(manager, async layoutKey => rawByLayout.get(layoutKey));
 
   await manager.getPositions('X_umap_1d', { showProgress: false });
   assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap_1d']);
@@ -1744,7 +1725,7 @@ test('position normalization evicts stale dimension buffers before exceeding the
     embeddingsMetadata: embeddingsMetadata([['X_umap_1d', 1], ['X_umap', 2]]),
     maxPositionBytes: 20
   });
-  protectedManager.loadLayout = async layoutKey => rawByLayout.get(layoutKey);
+  loadsAsReader(protectedManager, async layoutKey => rawByLayout.get(layoutKey));
   await protectedManager.getPositions('X_umap_1d', { showProgress: false });
   protectedManager.setViewLayout('snapshot', 'X_umap_1d');
   // 24 bytes is over the 20-byte budget, but it is exactly what the views
@@ -1757,128 +1738,14 @@ test('position normalization evicts stale dimension buffers before exceeding the
   );
 });
 
-test('direct position loading fails before publishing success for malformed bytes', async t => {
-  const originalFetch = globalThis.fetch;
-  const events = captureDownloadNotifications(t);
-  const malformedGzip = gzipSync(Uint8Array.of(7));
-  globalThis.fetch = async () => new Response(malformedGzip, {
-    headers: { 'content-length': String(malformedGzip.byteLength) },
-    status: 200
-  });
-  t.after(() => {
-    if (originalFetch === undefined) delete globalThis.fetch;
-    else globalThis.fetch = originalFetch;
-  });
-
-  await assert.rejects(
-    loadPointsBinary(
-      'https://cellucid.test/data/embeddings/0_2d.bin.gz',
-      { dimension: 2, expectedBytes: null, showProgress: true }
-    ),
-    /byte length|multiple of 4|Float32Array/i
-  );
-  assert.deepEqual(
-    events.filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind))
-      .map(event => event.kind),
-    ['start', 'fail']
-  );
-});
-
-test('Fetch-decoded response progress never compares decoded bytes with encoded length', async t => {
-  const originalFetch = globalThis.fetch;
-  const events = captureDownloadNotifications(t);
-  const decoded = new Float32Array([0, 1, 2, 3, 4, 5]);
-  globalThis.fetch = async () => new Response(decoded.buffer, {
-    headers: {
-      'content-encoding': 'gzip',
-      'content-length': '8',
-    },
-    status: 200,
-  });
-  t.after(() => {
-    if (originalFetch === undefined) delete globalThis.fetch;
-    else globalThis.fetch = originalFetch;
-  });
-
-  const points = await loadPointsBinary(
-    'https://cellucid.test/data/embeddings/0_2d.bin',
-    { dimension: 2, expectedBytes: null, showProgress: true }
-  );
-
-  assert.deepEqual(Array.from(points), Array.from(decoded));
-  assert.deepEqual(
-    events.map(event => event.kind),
-    ['start', 'update', 'complete']
-  );
-  assert.deepEqual(
-    events.find(event => event.kind === 'update'),
-    {
-      id: 'download-1',
-      kind: 'update',
-      loadedBytes: decoded.byteLength,
-      totalBytes: null,
-    }
-  );
-});
-
-test('gzip loading requires its one native backend before any request', async t => {
-  const originalDescriptor = Object.getOwnPropertyDescriptor(
-    globalThis,
-    'DecompressionStream'
-  );
-  const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  Object.defineProperty(globalThis, 'DecompressionStream', {
-    value: undefined,
-    configurable: true,
-    writable: true,
-  });
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    throw new Error('gzip capability rejection must precede fetch');
-  };
-  t.after(() => {
-    if (originalDescriptor) {
-      Object.defineProperty(
-        globalThis,
-        'DecompressionStream',
-        originalDescriptor
-      );
-    } else {
-      delete globalThis.DecompressionStream;
-    }
-    if (originalFetch === undefined) delete globalThis.fetch;
-    else globalThis.fetch = originalFetch;
-  });
-
-  await assert.rejects(
-    loadPointsBinary(
-      'https://cellucid.test/data/embeddings/0_2d.bin.gz',
-      { dimension: 2, expectedBytes: null, showProgress: false }
-    ),
-    /gzip payload.*requires browser DecompressionStream support/i
-  );
-  assert.equal(fetchCalls, 0);
-});
-
-test('position loading takes its dimension from the caller, never from the path', async t => {
-  const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    throw new Error('a payload without a dimension must not be requested');
-  };
-  t.after(() => {
-    if (originalFetch === undefined) delete globalThis.fetch;
-    else globalThis.fetch = originalFetch;
-  });
-  // A path that names a dimension does not state it; only the caller does.
+test('position loading takes its dimension from the caller, never from the path', async () => {
+  // A route's column count does not state the dimension; only the caller does.
   for (const url of [
-    'https://cellucid.test/data/points_3d.bin',
-    'https://cellucid.test/data/embeddings/0_2d.bin',
+    'anndata://dataset/obsm/0/0-1',
+    'anndata://dataset/obsm/0/0-1-2',
   ]) {
     for (const dimension of [undefined, 0, 4, '2', 2.5, null]) {
-      const options = { expectedBytes: null };
+      const options = {};
       if (dimension !== undefined) options.dimension = dimension;
       await assert.rejects(
         loadPointsBinary(url, options),
@@ -1886,90 +1753,16 @@ test('position loading takes its dimension from the caller, never from the path'
       );
     }
   }
-  assert.equal(fetchCalls, 0);
 });
 
-test('prepared gzip loaders expose one exact decompression backend', async () => {
-  const dataLoadersSource = await readFile(
-    new URL('../assets/js/data/data-loaders.js', import.meta.url),
-    'utf8'
+test('position loading reads only an AnnData dataset, with exactly its own options', async () => {
+  await assert.rejects(
+    loadPointsBinary('https://cellucid.test/data/obsm/0/0-1', { dimension: 2 }),
+    /reads an AnnData dataset by its anndata:\/\/ URL/
   );
-  const localUserSource = await readFile(
-    new URL('../assets/js/data/local-user-source.js', import.meta.url),
-    'utf8'
-  );
-  for (const source of [dataLoadersSource, localUserSource]) {
-    assert.doesNotMatch(source, /\bpako\b|HAS_PAKO/i);
-  }
-
-  const progressStart = dataLoadersSource.indexOf(
-    'async function fetchBinaryWithProgressInternal'
-  );
-  const progressEnd = dataLoadersSource.indexOf(
-    '/**\n * Convert filename to safe version',
-    progressStart
-  );
-  const progressSource = dataLoadersSource.slice(
-    progressStart,
-    progressEnd
-  );
-  assert.ok(
-    progressSource.indexOf('requireGzipDecompressionStream(url)') <
-      progressSource.indexOf('resolveAnyUrl(')
-  );
-  // Decompression is delegated to the one bounded gzip codec, so the progress
-  // path constructs no decompression stream of its own.
-  assert.equal(
-    progressSource.match(/new GzipDecompressionStream\(/g),
-    null
-  );
-  assert.match(
-    dataLoadersSource,
-    /import \{ gzipDecompress \} from '\.\.\/app\/session\/codecs\/gzip\.js';/
-  );
-  assert.equal(
-    dataLoadersSource.match(/new GzipDecompressionStream\(/g),
-    null
-  );
-  assert.match(
-    localUserSource,
-    /requirePreparedGzipDecompressionStream\(filename, this\.type\)/
-  );
-});
-
-test('position normalization owns one outer progress transaction', async t => {
-  const createManager = () => new DimensionManager({
-    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
-  });
-
-  const silentManager = createManager();
-  const silentOptions = [];
-  silentManager.loadLayout = async (layoutKey, options) => {
-    silentOptions.push({ layoutKey, options });
-    return new Float32Array([0, 0, 1, 1]);
-  };
-  await silentManager.getPositions('X_umap', { showProgress: false });
-  assert.equal(silentOptions[0].layoutKey, 'X_umap');
-  assert.equal(silentOptions[0].options.showProgress, false);
-  assert.equal(silentOptions[0].options.progressTrackerId, null);
-
-  const events = captureDownloadNotifications(t);
-  const directManager = createManager();
-  const directOptions = [];
-  directManager.loadLayout = async (layoutKey, options) => {
-    directOptions.push({ layoutKey, options });
-    return new Float32Array([0, 0, 1, 1]);
-  };
-  await directManager.getPositions('X_umap');
-  assert.equal(directOptions[0].options.showProgress, false);
-  assert.equal(
-    directOptions[0].options.progressTrackerId,
-    events.find(event => event.kind === 'start')?.id
-  );
-  assert.deepEqual(
-    events.filter(event => ['start', 'complete', 'fail', 'dismiss'].includes(event.kind))
-      .map(event => event.kind),
-    ['start', 'complete']
+  await assert.rejects(
+    loadPointsBinary('anndata://dataset/obsm/0/0-1', { dimension: 2, expectedBytes: null }),
+    /may contain only: candidateAnnDataBinding, dimension, signal \(unexpected: expectedBytes\)/
   );
 });
 
@@ -2009,9 +1802,6 @@ test('in-place reload stages one generation before reversible publication', asyn
   const candidateBindingIndex = reloadSource.indexOf(
     'createCandidateAnnDataBinding('
   );
-  const stagedSourceIndex = reloadSource.indexOf(
-    'dataSourceManager.isCustomProtocolUrl('
-  );
   const ownerRecheckIndex = reloadSource.indexOf(
     'reloadTransaction.assertCurrent();',
     runtimeStageIndex
@@ -2037,9 +1827,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     selectionStageIndex >= 0 &&
     urlStageIndex > selectionStageIndex &&
     candidateBindingIndex > urlStageIndex &&
-    stagedSourceIndex > candidateBindingIndex &&
-    runtimeStageIndex > urlStageIndex &&
-    runtimeStageIndex > stagedSourceIndex &&
+    runtimeStageIndex > candidateBindingIndex &&
     ownerRecheckIndex > runtimeStageIndex &&
     priorStateSettlementIndex > ownerRecheckIndex &&
     publicationOwnerRecheckIndex > priorStateSettlementIndex &&
@@ -2047,7 +1835,7 @@ test('in-place reload stages one generation before reversible publication', asyn
   );
   assert.match(
     reloadSource.slice(runtimeStageIndex, stagingCatch),
-    /baseUrl:\s*selectionStage\.baseUrl[\s\S]*candidateAnnDataBinding,[\s\S]*expectedIdentityId:\s*selectionStage\.identityId[\s\S]*showProgress:\s*isStartupLoad[\s\S]*signal:\s*reloadTransaction\.signal,[\s\S]*stagedSource/
+    /baseUrl:\s*selectionStage\.baseUrl[\s\S]*candidateAnnDataBinding,[\s\S]*expectedIdentityId:\s*selectionStage\.identityId[\s\S]*signal:\s*reloadTransaction\.signal\s*\}/
   );
   assert.match(stagingCatchSource, /if \(runtimeStage !== null\)/);
   assert.equal(
@@ -2185,7 +1973,7 @@ test(
     requireBefore(
       emptyPublication,
       'requireRestorablePublication(restorationPublication)',
-      'ui?.prepareDatasetReplacement?.()',
+      'retireDatasetInteractions();',
       'empty-runtime restoration must reject a stale publication before mutation'
     );
     const datasetCommit = slice(
@@ -2195,17 +1983,17 @@ test(
     requireBefore(
       datasetCommit,
       'requireRestorablePublication(restorationPublication)',
-      'ui?.prepareDatasetReplacement?.()',
+      'retireDatasetInteractions();',
       'dataset restoration must reject a stale publication before mutation'
     );
     const syntheticCommit = slice(
       'function commitSyntheticRuntimeStage',
-      'function restoreRuntimeStage'
+      'function restorePreviousRuntime'
     );
     requireBefore(
       syntheticCommit,
       'requireRestorablePublication(restorationPublication)',
-      'ui?.prepareDatasetReplacement?.()',
+      'retireDatasetInteractions();',
       'synthetic restoration must reject a stale publication before mutation'
     );
     const publicationOwner = slice(
@@ -2225,11 +2013,25 @@ test(
       'async function synchronizePublishedDatasetUi',
       '// Startup publishes the empty runtime'
     );
+    // Kept views retire with the rest of the shown dataset's interactions,
+    // inside the synchronous commit, before the renderer receives the new
+    // points (retireDatasetInteractions); none is left for the UI settlement.
+    assert.doesNotMatch(uiSynchronization, /clearSnapshotViews|retireKeptViews/);
+    const retirement = slice(
+      'function retireDatasetInteractions',
+      'function publishEmptyDatasetRuntime'
+    );
     requireBefore(
-      uiSynchronization,
-      'retirePublishedDatasetSnapshotViews(publication)',
-      'await ui?.settleFieldInteractions?.()',
-      'published kept views must retire before the first asynchronous UI settlement'
+      retirement,
+      'retireKeptViews();',
+      'retireInProgressHighlightSelection();',
+      'kept views retire first, so the live view is focused when the rest retire'
+    );
+    requireBefore(
+      retirement,
+      'retireInProgressHighlightSelection();',
+      'connectivityRuntimeOwner.prepareDatasetReplacement();',
+      'the in-progress selection retires before the edges'
     );
     const fieldSettlementCheck = requireCheckAfter(
       uiSynchronization,
@@ -2295,7 +2097,7 @@ test(
     );
     assert.match(
       clear,
-      /emptyPublication\s*=\s*publishEmptyDatasetRuntime\(\{ clearViews: true \}\)/
+      /emptyPublication\s*=\s*publishEmptyDatasetRuntime\(\)/
     );
     const clearUiSettlement = clear.indexOf(
       'const synchronizationOutcome = await settlePublishedDatasetUi({'
@@ -2456,7 +2258,12 @@ test('scientific publication excludes fallible UI and global reset work', async 
     initialStart > synchronizeStart
   );
 
-  const commitSource = mainSource.slice(commitStart, synchronizeStart);
+  // The commit itself; the interactions it retires first are their own
+  // owners' (retireDatasetInteractions).
+  const commitSource = mainSource.slice(
+    commitStart,
+    mainSource.indexOf('function commitSyntheticRuntimeStage', commitStart)
+  );
   const synchronizeSource = mainSource.slice(
     synchronizeStart,
     initialStart
@@ -2468,7 +2275,7 @@ test('scientific publication excludes fallible UI and global reset work', async 
     "typeof connectivityRuntimeOwner.prepareDatasetReplacement !=="
   );
   const firstPublication = commitSource.indexOf(
-    'EXPORT_BASE_URL = stage.baseUrl'
+    'DATASET_BASE_URL = stage.baseUrl'
   );
 
   assert.ok(
@@ -2532,20 +2339,20 @@ test('connectivity edge publication has one abortable generation owner', async (
       ?.length,
     2
   );
-  // The graph in use is read from where its manifest was published: the
-  // dataset's own connectivity_manifest.json or a mapped graph's.
+  // The graph in use is read from where its summary was published: the
+  // dataset's own graph (`obsp`) or a mapped graph's (`obsp/{p}`).
   assert.match(
     connectivitySource,
-    /loadEdges\(\s*owner\.manifestUrl,\s*owner\.manifest,\s*\{ signal: owner\.controller\.signal \}/s
+    /loadEdges\(\s*owner\.url,\s*owner\.summary,\s*\{ signal: owner\.controller\.signal \}/s
   );
-  assert.match(connectivitySource, /manifestUrl: connectivityManifestUrl/);
-  assert.match(connectivitySource, /owner\.manifestUrl !== connectivityManifestUrl/);
+  assert.match(connectivitySource, /url: connectivityUrl/);
+  assert.match(connectivitySource, /owner\.url !== connectivityUrl/);
   assert.match(
     connectivitySource,
     /publicationGeneration: datasetPublicationGeneration/
   );
-  assert.match(connectivitySource, /manifest: connectivityManifest/);
-  assert.match(connectivitySource, /exportBaseUrl: EXPORT_BASE_URL/);
+  assert.match(connectivitySource, /summary: connectivitySummary/);
+  assert.match(connectivitySource, /datasetBaseUrl: DATASET_BASE_URL/);
   assert.match(
     connectivitySource,
     /sourceType,\s*datasetId,\s*identityId,\s*managerBaseUrl,/s
@@ -2609,7 +2416,13 @@ test('connectivity edge publication has one abortable generation owner', async (
   );
   assert.match(
     connectivitySource,
-    /viewer\.setEdgeVisibleTarget\(\s*Math\.min\(currentEdgeLimit, getTotalEdges\(\)\)\s*\)/s
+    /viewer\.setEdgeVisibleTarget\(currentEdgeLimit\(\)\)/s
+  );
+  // The default target is applied against the graph's count when it is
+  // used: a graph read from a file has no count until its edges are read.
+  assert.match(
+    connectivitySource,
+    /userEdgeLimit \?\? CONNECTIVITY_DEFAULT_VISIBLE_TARGET,\s*getTotalEdges\(\)/
   );
   assert.match(connectivitySource, /viewer\.onLodChanged\(event =>/);
   assert.match(
@@ -2680,8 +2493,8 @@ test('connectivity edge publication has one abortable generation owner', async (
   assert.match(failedPublicationCleanupSource, /viewer\.clearKnnEdges\(\)/);
   assert.match(failedPublicationCleanupSource, /edgesLoaded = false/);
   assert.match(failedPublicationCleanupSource, /loadedEdgeData = null/);
-  assert.match(failedPublicationCleanupSource, /edgeSources = null/);
-  assert.match(failedPublicationCleanupSource, /edgeDestinations = null/);
+  // The payload is the only owner of the endpoints (no second reference).
+  assert.doesNotMatch(connectivitySource, /edgeSources|edgeDestinations/);
   assert.match(
     failedPublicationCleanupSource,
     /activeConnectivityStatsViewId = null/
@@ -2806,7 +2619,7 @@ test('isolated local dataset candidates publish one truthful terminal outcome', 
       },
       {
         datasetId: 'local',
-        loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
+        loadMethod: DATA_LOAD_METHODS.LOCAL_FILE,
         sourceType: 'local-user',
       }
     );
@@ -2837,7 +2650,7 @@ test('local validation failures publish the validator error message exactly', as
     getType() {
       return 'local-user';
     },
-    async loadFromZarrArchive() {
+    async loadFromFile() {
       throw validationError;
     },
   };
@@ -2856,8 +2669,7 @@ test('local validation failures publish the validator error message exactly', as
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataZarrArchiveBtn: createButton(),
-      userDataZarrArchiveInput: input,
+      ...createOpenMenuDom({ fileInput: input }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -2875,9 +2687,10 @@ test('local validation failures publish the validator error message exactly', as
   ]);
 
   assert.deepEqual(
-    notificationEvents.filter(event => event.kind === 'fail'),
+    notificationEvents
+      .filter(event => event.kind === 'fail')
+      .map(({ kind, message }) => ({ kind, message })),
     [{
-      id: 'local-load',
       kind: 'fail',
       message: validationError.message,
     }]
@@ -2887,16 +2700,19 @@ test('local validation failures publish the validator error message exactly', as
 });
 
 test('connection analytics expose only exact current load methods', () => {
-  // The browser opens Zarr only as a ZIP archive; a directory method would
-  // name a load path that no longer exists.
+  // The browser opens a file, a ZIP archive or a folder, whatever format it holds.
   assert.equal(
-    DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
-    'local-user-zarr-zip'
+    DATA_LOAD_METHODS.LOCAL_ZIP,
+    'local-user-zip'
+  );
+  assert.equal(
+    DATA_LOAD_METHODS.LOCAL_FOLDER,
+    'local-user-folder'
   );
   assert.deepEqual(
     Object.keys(DATA_LOAD_METHODS)
-      .filter(key => key.startsWith('LOCAL_ZARR')),
-    ['LOCAL_ZARR_ZIP']
+      .filter(key => key.startsWith('LOCAL_')),
+    ['LOCAL_FILE', 'LOCAL_ZIP', 'LOCAL_FOLDER']
   );
   assert.equal(
     Object.values(DATA_LOAD_METHODS)
@@ -2908,39 +2724,32 @@ test('connection analytics expose only exact current load methods', () => {
 test('disconnect controls clear only their connection and never choose science', async t => {
   for (const connection of [
     {
-      connectButtonKey: 'remoteConnectBtn',
       disconnectButtonKey: 'remoteDisconnectBtn',
       disconnectContainerKey: 'remoteDisconnectContainer',
-      fieldKey: 'remoteServerUrl',
+      targetKey: 'remoteConnectionTarget',
       initialHref:
         'https://cellucid.test/?remote=https%3A%2F%2Fserver.test%2F',
       sourceType: 'remote',
     },
     {
-      connectButtonKey: 'githubConnectBtn',
-      disconnectButtonKey: 'githubDisconnectBtn',
-      disconnectContainerKey: 'githubDisconnectContainer',
-      fieldKey: 'githubRepoUrl',
-      initialHref: 'https://cellucid.test/?github=owner%2Frepository',
-      sourceType: 'github-repo',
+      disconnectButtonKey: 'dataLinkDisconnectBtn',
+      disconnectContainerKey: 'dataLinkDisconnectContainer',
+      targetKey: 'dataLinkConnectionTarget',
+      initialHref: 'https://cellucid.test/?data=gh%3Aowner%2Frepository',
+      sourceType: 'link',
     },
   ]) {
     await t.test(connection.sourceType, async t => {
       const browserState = installBrowserStubs(t, connection.initialHref);
       const notificationEvents = captureNotifications(t);
-      const connectButton = Object.assign(createButton(), {
-        disabled: false,
-        textContent: '',
-      });
       const disconnectButton = createButton();
       const disconnectContainer = { hidden: false };
-      const field = { disabled: false, value: '' };
+      const target = { textContent: '', title: '' };
       const dom = {
         select: { focus() {} },
-        [connection.connectButtonKey]: connectButton,
         [connection.disconnectButtonKey]: disconnectButton,
         [connection.disconnectContainerKey]: disconnectContainer,
-        [connection.fieldKey]: field,
+        [connection.targetKey]: target,
       };
       let disconnectCalls = 0;
       let populateCalls = 0;
@@ -2971,7 +2780,6 @@ test('disconnect controls clear only their connection and never choose science',
         async listDatasets() {
           return [];
         },
-        onConnectionLost() {},
       });
       const connectionSource = createConnectionSource(true);
       const sources = new Map([
@@ -3012,9 +2820,8 @@ test('disconnect controls clear only their connection and never choose science',
       await disconnectButton.activate();
 
       assert.equal(disconnectCalls, 1);
-      assert.equal(connectButton.textContent, 'Connect');
       assert.equal(disconnectContainer.hidden, true);
-      assert.equal(field.disabled, false);
+      assert.equal(target.textContent, '');
       assert.deepEqual(sourceLookups, [connection.sourceType]);
       assert.equal(clearCalls, 1);
       assert.equal(populateCalls, 1);
@@ -3036,11 +2843,11 @@ test('disconnect controls clear only their connection and never choose science',
   }
 });
 
-test('dedicated Zarr ZIP control opens and activates the portable archive input', async t => {
+test('File… opens the file input, and a Zarr ZIP picked there is read as an archive', async t => {
   installBrowserStubs(t);
   const notificationEvents = captureNotifications(t);
   const input = createFileInput();
-  const button = createButton();
+  const openMenu = createOpenMenuDom({ fileInput: input });
   const archive = { name: 'portable.zarr.zip' };
   let selectedFiles = null;
   let activation = null;
@@ -3053,7 +2860,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
     datasetId: 'portable',
     disconnect() {},
     getType: () => 'local-user',
-    async loadFromZarrArchive(file) {
+    async loadFromFile(file) {
       selectedFiles = [file];
       return metadata;
     }
@@ -3079,8 +2886,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataZarrArchiveBtn: button,
-      userDataZarrArchiveInput: input
+      ...openMenu
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -3097,14 +2903,14 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
       Object.freeze({ status: 'ready' }),
   });
 
-  button.activate();
+  openMenu.userDataFileItem.activate();
   assert.equal(input.pickerClicks, 1);
   await input.select([archive]);
 
   assert.deepEqual(selectedFiles, [archive]);
   assert.deepEqual(activation, {
     datasetId: 'portable',
-    loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
+    loadMethod: DATA_LOAD_METHODS.LOCAL_ZIP,
     source: userSource,
     sourceType: 'local-user',
   });
@@ -3120,44 +2926,26 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
 test('browser local-data wiring invokes only portable current transports', async t => {
   installBrowserStubs(t);
   captureNotifications(t);
-  const preparedInput = createFileInput();
-  const h5adInput = createFileInput();
-  const zarrInput = createFileInput();
-  const archiveInput = createFileInput();
+  const fileInput = createFileInput();
+  const folderInput = createFileInput();
   const calls = [];
   const activations = [];
   function createUserSource() {
+    const loaded = (kind, value, source) => {
+      calls.push([kind, value]);
+      source.datasetId = kind;
+      return { id: kind, name: kind, stats: { n_cells: 1 } };
+    };
     return {
       datasetId: null,
       createSelectionCandidate: createUserSource,
       disconnect() {},
       getType: () => 'local-user',
-      async loadFromPreparedDirectory(files) {
-        calls.push(['prepared', files]);
-        this.datasetId = 'prepared';
-        return {
-          id: this.datasetId,
-          name: 'Prepared',
-          stats: { n_cells: 1 },
-        };
+      async loadFromFile(file) {
+        return loaded(file.name.endsWith('.h5ad') ? 'h5ad' : 'zarr-archive', file, this);
       },
-      async loadFromH5adFile(file) {
-        calls.push(['h5ad', file]);
-        this.datasetId = 'h5ad';
-        return {
-          id: this.datasetId,
-          name: 'H5AD',
-          stats: { n_cells: 1 },
-        };
-      },
-      async loadFromZarrArchive(file) {
-        calls.push(['zarr-archive', file]);
-        this.datasetId = 'zarr-archive';
-        return {
-          id: this.datasetId,
-          name: 'Zarr archive',
-          stats: { n_cells: 1 },
-        };
+      async loadFromFolder(files) {
+        return loaded('zarr-folder', files, this);
       },
     };
   }
@@ -3182,13 +2970,7 @@ test('browser local-data wiring invokes only portable current transports', async
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
-      userDataBrowseBtn: createButton(),
-      userDataFileInput: preparedInput,
-      userDataH5adBtn: createButton(),
-      userDataH5adInput: h5adInput,
-      userDataZarrInput: zarrInput,
-      userDataZarrArchiveBtn: createButton(),
-      userDataZarrArchiveInput: archiveInput,
+      ...createOpenMenuDom({ fileInput, folderInput }),
     },
     dataSourceManager: {
       getCurrentSourceType: () => null,
@@ -3205,28 +2987,25 @@ test('browser local-data wiring invokes only portable current transports', async
     noneDatasetValue: '__none__',
   });
 
-  const preparedFiles = [
-    { name: 'dataset_identity.json', webkitRelativePath: 'named.zarr/dataset_identity.json' },
-    { name: 'stray.h5ad', webkitRelativePath: 'named.zarr/stray.h5ad' },
-  ];
   const h5adFile = { name: 'direct.h5ad' };
-  const zarrFiles = [
+  const folderFiles = [
     { name: '.zgroup', webkitRelativePath: 'direct.zarr/.zgroup' },
-    { name: 'stray.h5ad', webkitRelativePath: 'direct.zarr/stray.h5ad' },
+    { name: '.zattrs', webkitRelativePath: 'direct.zarr/obs/.zattrs' },
   ];
   const archiveFile = { name: 'direct.zarr.zip' };
 
-  await preparedInput.select(preparedFiles);
-  await h5adInput.select([h5adFile]);
-  await zarrInput.select(zarrFiles);
-  await archiveInput.select([archiveFile]);
+  // One file input takes both kinds of file; what was picked decides how it
+  // is read.
+  await fileInput.select([h5adFile]);
+  await folderInput.select(folderFiles);
+  await fileInput.select([archiveFile]);
 
   assert.deepEqual(
     calls.map(([kind]) => kind),
-    ['prepared', 'h5ad', 'zarr-archive']
+    ['h5ad', 'zarr-folder', 'zarr-archive']
   );
-  assert.equal(calls[0][1], preparedFiles);
-  assert.equal(calls[1][1], h5adFile);
+  assert.equal(calls[0][1], h5adFile);
+  assert.equal(calls[1][1], folderFiles);
   assert.equal(calls[2][1], archiveFile);
   assert.deepEqual(
     activations.map(({ datasetId, loadMethod }) => [
@@ -3234,9 +3013,9 @@ test('browser local-data wiring invokes only portable current transports', async
       loadMethod,
     ]),
     [
-      ['prepared', 'local-user-prepared'],
-      ['h5ad', 'local-user-h5ad'],
-      ['zarr-archive', 'local-user-zarr-zip'],
+      ['h5ad', 'local-user-file'],
+      ['zarr-folder', 'local-user-folder'],
+      ['zarr-archive', 'local-user-zip'],
     ]
   );
 });

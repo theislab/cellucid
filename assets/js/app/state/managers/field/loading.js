@@ -13,6 +13,8 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
+import { getReadActivityLog } from '../../../../data/read-activity-log.js';
+import { abortReasonOf as abortReason, awaitWithSignal } from '../../../jobs/cancellable-job.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { adoptScientificFieldDescriptors } from './descriptor-ownership.js';
@@ -64,6 +66,27 @@ function fetchSchedulerOf(state) {
   return entry.scheduler;
 }
 
+/** An `openExpressionMatrix` handle of the state's current dataset generation. */
+function requireOpenMatrix(state, matrix) {
+  if (
+    matrix === null || typeof matrix !== 'object' ||
+    !Array.isArray(matrix.fields) || typeof matrix.loader?.readSparseColumn !== 'function'
+  ) {
+    throw new TypeError('An expression matrix is read through its openExpressionMatrix() handle.');
+  }
+  if (matrix.generation !== readDatasetGeneration(state)) throw createDatasetFieldLoadSupersededError();
+  return matrix;
+}
+
+/** The descriptors of genes of an `openExpressionMatrix` handle, by position. */
+function matrixDescriptors(matrix, genes) {
+  return genes.map(gene => {
+    const descriptor = matrix.fields[gene];
+    if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
+    return descriptor;
+  });
+}
+
 function readDatasetGeneration(state) {
   const generation = state._datasetGeneration ?? 0;
   if (!Number.isSafeInteger(generation) || generation < 0) {
@@ -82,59 +105,16 @@ function requireAbortSignal(signal) {
   return signal;
 }
 
-function abortReason(signal) {
-  if (signal.reason instanceof Error) return signal.reason;
-  return new DOMException('Field loading was aborted.', 'AbortError');
-}
-
-function awaitWithSignal(task, signal) {
-  const loadTask = Promise.resolve(task);
-  if (signal === null) return loadTask;
-  if (signal.aborted) {
-    // Observe a loader that could not be canceled by its backend.
-    void loadTask.catch(() => {});
-    return Promise.reject(abortReason(signal));
-  }
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (settler, value) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener('abort', handleAbort);
-      settler(value);
-    };
-    const handleAbort = () => {
-      finish(reject, abortReason(signal));
-    };
-    signal.addEventListener('abort', handleAbort, { once: true });
-    loadTask.then(
-      value => finish(resolve, value),
-      error => finish(reject, error)
-    );
-  });
-}
-
-/**
- * A download progress callback that fills the loading notification's bar once
- * the download's size is known, a whole percent at a time.
- */
-function progressReporter(notifications, notifId) {
-  let lastPercent = -1;
-  return (loadedBytes, totalBytes) => {
-    if (!(totalBytes > 0)) return;
-    const percent = Math.min(100, Math.floor((loadedBytes / totalBytes) * 100));
-    if (percent === lastPercent) return;
-    lastPercent = percent;
-    notifications.updateProgress(notifId, percent);
-  };
-}
+/** Each shared load's key: its reads carry it, so a job joining the load adopts them. */
+let nextSharedLoadKey = 1;
 
 function createSharedLoadOwner() {
   return {
     controller: new AbortController(),
     settled: false,
     task: null,
-    waiters: new Set()
+    waiters: new Set(),
+    readKey: `field-load-${nextSharedLoadKey++}`
   };
 }
 
@@ -264,6 +244,29 @@ function validateLoadedLength(values, pointCount, message) {
   }
 }
 
+/**
+ * Give a categorical field the categories its first load found (an AnnData
+ * column publishes none until it is read: a string or boolean column's are
+ * its distinct values, a categorical's its stored dictionary), with the
+ * colours its file stores for them, shown under their display names. A field
+ * whose categories are known keeps them: the dataset codes a column one way
+ * for its whole life.
+ */
+function adoptFoundCategories(state, field, categories, palette = null) {
+  if (categories === undefined || field.categories !== null) return;
+  if (!Array.isArray(categories)) {
+    throw new TypeError(`Field "${field.key}" found categories must be an array.`);
+  }
+  if (Array.isArray(palette) && palette.length === categories.length) field.palette = palette;
+  field.categories = [...categories];
+  state._applyCategoryOverlay(
+    field,
+    FieldSource.OBS,
+    field._originalKey || field.key,
+    `obs field "${field.key}"`
+  );
+}
+
 export class FieldLoadingMethods {
   setFieldLoader(loaderFn) {
     this.fieldLoader = loaderFn;
@@ -277,17 +280,17 @@ export class FieldLoadingMethods {
     return readDatasetGeneration(this);
   }
 
-  initVarData(varManifest) {
-    if (!varManifest) return;
-    const manifestFields = varManifest?.fields || [];
-    this._varFieldDescriptors = adoptScientificFieldDescriptors(manifestFields);
-    const normalizedFields = manifestFields.map((field) => ({
+  initVarData(geneList) {
+    if (!geneList) return;
+    const geneFields = geneList?.fields || [];
+    this._varFieldDescriptors = adoptScientificFieldDescriptors(geneFields);
+    const normalizedFields = geneFields.map((field) => ({
       ...field,
       loaded: Boolean(field?.values),
       _loadingPromise: null,
       _loadingSignal: null
     }));
-    this.varData = { ...varManifest, fields: normalizedFields };
+    this.varData = { ...geneList, fields: normalizedFields };
     this._varFieldDataCache.clear();
   }
 
@@ -383,6 +386,7 @@ export class FieldLoadingMethods {
       if (cached.values) field.values = cached.values;
       if (cached.codes) field.codes = cached.codes;
       if (cached.outlierQuantiles) field.outlierQuantiles = cached.outlierQuantiles;
+      adoptFoundCategories(this, field, cached.categories, cached.palette);
       field.loaded = true;
       touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
@@ -453,6 +457,10 @@ export class FieldLoadingMethods {
         if (sharedSignal.aborted) throw abortReason(sharedSignal);
         requireCurrentSharedLoad(field, task);
         assertCurrentLoadOwner(this, owner);
+        // The categories a column has are found by its first load when its
+        // field list could not state them (data-loaders.js).
+        const foundCategories = loadedData?.categories;
+        adoptFoundCategories(this, field, foundCategories, loadedData?.palette ?? null);
         if (nextValues !== undefined) field.values = nextValues;
         if (nextCodes !== undefined) field.codes = nextCodes;
         if (nextOutlierQuantiles !== undefined) {
@@ -466,7 +474,10 @@ export class FieldLoadingMethods {
         this._fieldDataCache.set(cacheKey, {
           values: field.values,
           codes: field.codes,
-          outlierQuantiles: field.outlierQuantiles
+          outlierQuantiles: field.outlierQuantiles,
+          ...(foundCategories === undefined
+            ? {}
+            : { categories: foundCategories, palette: loadedData?.palette ?? null })
         });
         touchFieldResidency(this, FieldSource.OBS, cacheKey);
         if (notifId) notifications.complete(notifId, `Loaded field: ${field.key}`);
@@ -511,13 +522,18 @@ export class FieldLoadingMethods {
    *   the user chose and waits to see, `bulk` for one of a long run's genes,
    *   `low` for a prefetch. A caller joining a load already under way raises
    *   its priority.
+   * @param {string|null} [options.owner=null] - The job (an analysis's) a
+   *   load it starts is read for, whose notification shows it; a job joining
+   *   a load already under way adopts its reads
+   *   (`data/read-activity-log.js`, `adopt`)
    * @returns {Promise<Object>} The loaded field object
    */
   async ensureVarFieldLoaded(fieldIndex, options = {}) {
     const {
       signal: rawSignal = null,
       silent = false,
-      priority = 'normal'
+      priority = 'normal',
+      owner: readOwner = null
     } = options;
     requirePriority(priority);
     const signal = requireAbortSignal(rawSignal);
@@ -584,6 +600,9 @@ export class FieldLoadingMethods {
         // A gene prefetched, or queued by a long run, that the user now
         // waits for goes first.
         fetchSchedulerOf(this).raise(activeOwner, priority);
+        // A job joining a load a view started takes its reads as its own:
+        // one notification for the run, the job's.
+        if (readOwner !== null) getReadActivityLog().adopt(activeOwner.readKey, readOwner);
         return subscribeToSharedLoad(activeOwner, signal);
       }
       if (activeOwner?.task !== field._loadingPromise) {
@@ -636,9 +655,8 @@ export class FieldLoadingMethods {
             start: (downloadSignal, startPriority) => loader(loaderField, {
               signal: downloadSignal,
               priority: startPriority,
-              // A gene the user is waiting for shows how much of it has
-              // arrived (a percent per step, not a DOM update per chunk).
-              onProgress: notifId === null ? null : progressReporter(notifications, notifId)
+              owner: readOwner,
+              key: sharedOwner.readKey
             })
           }),
           sharedSignal
@@ -698,47 +716,274 @@ export class FieldLoadingMethods {
   }
 
   /**
-   * Download a gene's payload ahead of decoding it, for a long run that will
-   * ask for it soon: the bytes are kept by the dataset load's payload cache
-   * (data/payload-transfer-cache.js) and the later `ensureVarFieldLoaded`
-   * decodes them without a request.
-   *
-   * Two answers fetch nothing, and they mean different things to the run: a
-   * gene already loaded or loading, or a user-defined copy, needs nothing
-   * (`{resident: true}`; the run goes on downloading the genes after it),
-   * while a source with nothing to download ahead (a local file, a served
-   * AnnData) answers null, and the run stops downloading ahead.
+   * One gene's non-zero entries (`{length, indices, values}`), read from the
+   * source without installing anything in field state: what an analysis
+   * computes from. The caller owns the arrays. Null when the source cannot
+   * (no AnnData loader) or the field is a user-defined copy (its values are
+   * already loaded). Scheduled at `priority` (data/fetch-scheduler.js);
+   * `owner` is the job the read is for (`app/jobs/cancellable-job.js`).
    *
    * @param {number} fieldIndex
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<{kept: boolean, byteLength: number, budget: number}|{resident: true}|null>}
-   *   What the cache did with the download, that this gene needs none, or
-   *   null when the source downloads nothing ahead
+   * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
+   * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}|null>}
    */
-  async prefetchVarFieldPayload(fieldIndex, options = {}) {
+  async readVarSparseColumn(fieldIndex, options = {}) {
     const signal = requireAbortSignal(options.signal ?? null);
     if (signal?.aborted) throw abortReason(signal);
-    const field = this.varData?.fields?.[fieldIndex];
-    if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
-    if (field.loaded || field._loadingPromise || field._isUserDefined === true) {
-      return { resident: true };
-    }
-    const loaderField = this._varFieldDescriptors?.[fieldIndex];
     const loader = this.varFieldLoader;
-    if (!loaderField || !loader) return null;
-    const result = await fetchSchedulerOf(this).run({
+    const descriptor = this._varFieldDescriptors?.[fieldIndex];
+    if (
+      typeof loader?.readSparseColumn !== 'function' ||
+      !descriptor ||
+      this.varData?.fields?.[fieldIndex]?._isUserDefined === true
+    ) {
+      return null;
+    }
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: options.priority ?? 'normal',
+      signal,
+      start: downloadSignal => loader.readSparseColumn(descriptor, {
+        signal: downloadSignal,
+        owner: options.owner ?? null
+      })
+    });
+  }
+
+  /**
+   * One gene's non-zero entries from an expression matrix other than the
+   * mapped one (`openExpressionMatrix`), scheduled as `readVarSparseColumn`.
+   * The caller owns the arrays.
+   *
+   * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
+   * @param {number} gene - The gene's position in `matrix.fields`
+   * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
+   * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}>}
+   */
+  async readMatrixSparseColumn(matrix, gene, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const descriptor = requireOpenMatrix(this, matrix).fields[gene];
+    if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: options.priority ?? 'normal',
+      signal,
+      start: downloadSignal => matrix.loader.readSparseColumn(descriptor, {
+        signal: downloadSignal,
+        owner: options.owner ?? null
+      })
+    });
+  }
+
+  /**
+   * Some genes of an expression matrix other than the mapped one
+   * (`openExpressionMatrix`) in some cells, as `readVarCellSubset` reads them.
+   *
+   * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
+   * @param {number[]} genes - Distinct positions in `matrix.fields`
+   * @param {ArrayLike<number>} cells - Distinct cell positions
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
+   */
+  async readMatrixCellSubset(matrix, genes, cells, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const { fields } = requireOpenMatrix(this, matrix);
+    const descriptors = genes.map(gene => {
+      const descriptor = fields[gene];
+      if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
+      return descriptor;
+    });
+    return fetchSchedulerOf(this).run({
       key: {},
       priority: 'bulk',
       signal,
-      start: (downloadSignal, startPriority) => loader(loaderField, {
+      start: downloadSignal => matrix.loader.readCellSubset(descriptors, cells, {
         signal: downloadSignal,
-        priority: startPriority,
-        prefetchOnly: true
+        owner: options.owner ?? null
       })
     });
-    return result?.kept === undefined
-      ? null
-      : { kept: result.kept, byteLength: result.byteLength, budget: result.budget };
+  }
+
+  /**
+   * Some genes' values in some cells, as a gene-major block (`pointers`,
+   * `cellIndex` into `cells`, `values`), read by cell or by gene, whichever
+   * costs less (an AnnData source). Null when the source cannot, or when a
+   * field is a user-defined copy (which has no payload of its own). One of a
+   * long run's reads: the user's own loads go first (data/fetch-scheduler.js).
+   *
+   * @param {number[]} fieldIndices - Distinct var field positions
+   * @param {ArrayLike<number>} cells - Distinct cell positions
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   *   `owner`: the job the read is for
+   * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
+   */
+  async readVarCellSubset(fieldIndices, cells, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const loader = this.varFieldLoader;
+    if (typeof loader?.readCellSubset !== 'function') return null;
+    const descriptors = fieldIndices.map(index => this._varFieldDescriptors?.[index]);
+    if (
+      descriptors.some(descriptor => !descriptor) ||
+      fieldIndices.some(index => this.varData?.fields?.[index]?._isUserDefined === true)
+    ) {
+      return null;
+    }
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: 'bulk',
+      signal,
+      start: downloadSignal => loader.readCellSubset(descriptors, cells, {
+        signal: downloadSignal,
+        owner: options.owner ?? null
+      })
+    });
+  }
+
+  /**
+   * Whether this dataset's genes can be delivered to analysis workers over a
+   * gene route (`data/gene-delivery.js`): its reader runs in a worker. The
+   * genes an analysis computes in its workers then never cross this thread.
+   *
+   * @returns {boolean}
+   */
+  deliversGenes() {
+    const loader = this.varFieldLoader;
+    return typeof loader?.deliverSparseColumns === 'function' && loader.deliversGenes() === true;
+  }
+
+  /**
+   * Whether var field `fieldIndex` is read from the source, and so can be
+   * delivered: a user-defined copy has no payload of its own.
+   *
+   * @param {number} fieldIndex
+   * @returns {boolean}
+   */
+  isVarFieldDeliverable(fieldIndex) {
+    return Boolean(this._varFieldDescriptors?.[fieldIndex]) &&
+      this.varData?.fields?.[fieldIndex]?._isUserDefined !== true;
+  }
+
+  /**
+   * Open gene route `id` in this dataset's reader: `ports`, one per
+   * analysis worker, are the reader's ends of its channels.
+   *
+   * @param {string} id
+   * @param {MessagePort[]} ports
+   * @returns {Promise<void>}
+   */
+  openGeneRoute(id, ports) {
+    if (!this.deliversGenes()) throw new Error('This dataset cannot deliver genes to analysis workers.');
+    return this.varFieldLoader.openGeneRoute(id, ports);
+  }
+
+  /**
+   * The new port of route `id`'s worker `worker`, which the pool replaced.
+   *
+   * @returns {Promise<void>}
+   */
+  replaceGeneRoutePort(id, worker, port, generation) {
+    if (!this.deliversGenes()) throw new Error('This dataset cannot deliver genes to analysis workers.');
+    return this.varFieldLoader.replaceGeneRoutePort(id, worker, port, generation);
+  }
+
+  /**
+   * Let route `id` go; a dataset that no longer delivers holds none.
+   *
+   * @param {string} id
+   * @returns {Promise<void>}
+   */
+  async closeGeneRoute(id) {
+    if (!this.deliversGenes()) return;
+    await this.varFieldLoader.closeGeneRoute(id);
+  }
+
+  /**
+   * Some genes' non-zero entries delivered to analysis workers over a gene
+   * route (`data/gene-delivery.js`): what returns is only each gene's bytes.
+   * Scheduled at `priority` like `readVarSparseColumn`.
+   *
+   * @param {number[]} fieldIndices - Deliverable var fields (`isVarFieldDeliverable`)
+   * @param {Object} delivery
+   * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
+   * @returns {Promise<{bytes: number[]}>}
+   */
+  async deliverVarSparseColumns(fieldIndices, delivery, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    return this._deliverWith(this.varFieldLoader, this._deliverableDescriptors(fieldIndices), options, signal,
+      (loader, descriptors, downloadSignal, owner) => loader.deliverSparseColumns(descriptors, delivery, { signal: downloadSignal, owner }));
+  }
+
+  /**
+   * `deliverVarSparseColumns` from an expression matrix other than the
+   * mapped one (`openExpressionMatrix`).
+   *
+   * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
+   * @param {number[]} genes - Positions in `matrix.fields`
+   * @param {Object} delivery
+   * @param {{signal?: AbortSignal|null, priority?: string, owner?: string|null}} [options]
+   * @returns {Promise<{bytes: number[]}>}
+   */
+  async deliverMatrixSparseColumns(matrix, genes, delivery, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    return this._deliverWith(requireOpenMatrix(this, matrix).loader, matrixDescriptors(matrix, genes), options, signal,
+      (loader, descriptors, downloadSignal, owner) => loader.deliverSparseColumns(descriptors, delivery, { signal: downloadSignal, owner }));
+  }
+
+  /**
+   * Some genes in some cells (`readVarCellSubset`), each run of genes
+   * delivered to its analysis worker. One of a long run's reads.
+   *
+   * @param {number[]} fieldIndices - Deliverable var fields
+   * @param {ArrayLike<number>} cells
+   * @param {Object} delivery
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @returns {Promise<{bytes: number}>}
+   */
+  async deliverVarCellSubset(fieldIndices, cells, delivery, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    return this._deliverWith(this.varFieldLoader, this._deliverableDescriptors(fieldIndices), { ...options, priority: 'bulk' }, signal,
+      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner }));
+  }
+
+  /**
+   * `deliverVarCellSubset` from an expression matrix other than the mapped one.
+   *
+   * @returns {Promise<{bytes: number}>}
+   */
+  async deliverMatrixCellSubset(matrix, genes, cells, delivery, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    return this._deliverWith(requireOpenMatrix(this, matrix).loader, matrixDescriptors(matrix, genes), { ...options, priority: 'bulk' }, signal,
+      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner }));
+  }
+
+  /** The descriptors of deliverable var fields. @private */
+  _deliverableDescriptors(fieldIndices) {
+    return fieldIndices.map(index => {
+      if (!this.isVarFieldDeliverable(index)) {
+        throw new RangeError(`Var field ${index} has no payload of its own to deliver.`);
+      }
+      return this._varFieldDescriptors[index];
+    });
+  }
+
+  /** One delivery, through the download scheduler. @private */
+  _deliverWith(loader, descriptors, options, signal, start) {
+    if (typeof loader?.deliverSparseColumns !== 'function') {
+      throw new Error('This dataset cannot deliver genes to analysis workers.');
+    }
+    return fetchSchedulerOf(this).run({
+      key: {},
+      priority: options.priority ?? 'normal',
+      signal,
+      start: downloadSignal => start(loader, descriptors, downloadSignal, options.owner ?? null)
+    });
   }
 
   /**
@@ -830,10 +1075,13 @@ export class FieldLoadingMethods {
     }
 
     if (field.kind === 'continuous') {
-      this.updateColorsContinuous(field, { resetTransparency: true });
+      this.updateColorsContinuous(field);
       this.clearCentroids();
     } else {
       this.updateColorsCategorical(field);
+      // Its colours are now written whole; a recolour this batch still owes
+      // it (restored filter colours) is already in them.
+      if (this._batchMode === true) this._batchDirty.affectedFields.delete(field);
       this.buildCentroidsForField(field, {
         viewId: this.activeViewId,
         layoutKey: this.getViewLayoutKey(this.activeViewId)
@@ -877,7 +1125,7 @@ export class FieldLoadingMethods {
     }
 
     // Gene expression is always continuous
-    this.updateColorsContinuous(field, { resetTransparency: true });
+    this.updateColorsContinuous(field);
     this.clearCentroids();
 
     this._pushColorsToViewer();

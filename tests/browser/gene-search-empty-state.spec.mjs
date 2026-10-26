@@ -1,18 +1,18 @@
 import { expect, test } from './helpers/test.mjs';
-import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
-const PREPARED_DATASET_URL =
-  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
-  + '&dataset=current-ui-prepared'
+const CATALOG_DATASET_URL =
+  `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
+  + '&dataset=current-ui'
   + '&acceptance=gene-search-empty-state-ci';
 
 /* The fixture publishes exactly these six gene names. */
 const PUBLISHED_GENE_COUNT = 6;
 const GENE_PANEL_NOTE =
-  `This dataset publishes ${PUBLISHED_GENE_COUNT} gene names, chosen when it `
-  + 'was prepared and possibly a subset of the source data. '
+  `This dataset publishes ${PUBLISHED_GENE_COUNT} gene names, chosen when `
+  + 'its file was written and possibly a subset of the source data. '
   + 'Check for typos too.';
 const HELP_URL =
   'https://docs.cellucid.com/en/latest/user_guide/web_app/'
@@ -36,11 +36,11 @@ function observeProductErrors(page) {
 }
 
 async function openGeneSearch(page) {
-  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await page.goto(CATALOG_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
-    'Current UI prepared fixture'
+    'Current UI fixture'
   );
   await expect(page.locator('#gene-expression-container')).toBeVisible();
   await page.locator('#gene-expression-search').click();

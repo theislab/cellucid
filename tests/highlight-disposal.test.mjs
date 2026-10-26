@@ -375,6 +375,9 @@ test('highlight renderer disposal attempts all owners and retries only failures'
           );
         }
       },
+      // Nothing is current: no program is unbound before its deletion.
+      CURRENT_PROGRAM: 0x8b8d,
+      getParameter: () => null,
       deleteProgram(candidate) {
         assert.equal(candidate, program);
         programAttempts++;
@@ -433,6 +436,9 @@ test('highlight renderer context loss drops handles without WebGL deletion', () 
       deleteBuffer() {
         calls.push('deleteBuffer');
       },
+      // Nothing is current: no program is unbound before its deletion.
+      CURRENT_PROGRAM: 0x8b8d,
+      getParameter: () => null,
       deleteProgram() {
         calls.push('deleteProgram');
       },
@@ -548,7 +554,10 @@ test('highlight tools disposal fences callbacks and attempts every DOM/GPU owner
     highlightRenderer: renderer,
     highlightArray: new Uint8Array(1024),
     _transparencyGenerations: new Map([['live', 1]]),
-    knnAdjacencyList: new Map([[0, Uint32Array.from([1])]]),
+    knnGraph: { nCells: 2 },
+    _lassoHitTest: { query: {} },
+    _proximityHitTest: { query: {} },
+    _knnExpansion: { query: {} },
     mat4: {},
     vec3: {},
     gl: {},
@@ -570,7 +579,10 @@ test('highlight tools disposal fences callbacks and attempts every DOM/GPU owner
   assert.equal(tools.lassoCtx, null);
   assert.equal(tools.highlightRenderer, null);
   assert.equal(tools.highlightArray, null);
-  assert.equal(tools.knnAdjacencyList, null);
+  assert.equal(tools.knnGraph, null);
+  assert.equal(tools._lassoHitTest, null);
+  assert.equal(tools._proximityHitTest, null);
+  assert.equal(tools._knnExpansion, null);
   for (const callbackName of callbackNames) {
     assert.equal(tools[callbackName], null, callbackName);
   }

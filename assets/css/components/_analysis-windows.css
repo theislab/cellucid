@@ -1,0 +1,260 @@
+/* components/_analysis-windows.css - Floating analysis windows, their resize
+   handles, and the phone sheet layout. */
+
+/* The window's frame carries copy, maximize, close and the open/closed
+   chevron in its header action bar (`_accordion.css`); the summary keeps the
+   slot for all four. */
+.accordion-panel.analysis-window-frame {
+  --panel-action-size: 18px;
+  --panel-actions-width: calc(
+    3 * var(--panel-action-size) + 3 * var(--space-2) + var(--space-3)
+  );
+}
+
+.analysis-window-frame > .accordion-panel-actions {
+  font-family: inherit;
+  font-weight: var(--font-weight-regular);
+  font-size: var(--type-heading);
+  letter-spacing: normal;
+}
+
+.analysis-window-panel > summary {
+  box-sizing: border-box;
+  min-height: var(--space-8);
+  padding: var(--control-panel-summary-padding-y) var(--control-panel-summary-padding-x);
+  font-family: inherit;
+  font-weight: var(--font-weight-regular);
+  font-size: var(--type-heading);
+  text-transform: none;
+  letter-spacing: normal;
+  background: transparent;
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  color: var(--color-text-primary);
+}
+
+.analysis-window-panel > summary::before {
+  display: none;
+  content: none;
+}
+
+.analysis-window-panel > summary:hover,
+:where(.analysis-window-frame:has(> .accordion-panel-actions :hover)) > .analysis-window-panel > summary {
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+}
+
+.analysis-window-panel[open] > summary {
+  background: var(--color-surface-tertiary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+}
+
+.analysis-window-panel[open] > summary .disclosure-title {
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* A long title ends in an ellipsis; the full title is its tooltip. */
+.analysis-window-panel > summary .disclosure-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-window-frame:has(> .analysis-window-panel > summary:hover, > .accordion-panel-actions :hover)
+  > .accordion-panel-actions > .disclosure-chevron {
+  opacity: var(--opacity-70);
+}
+
+.analysis-window-frame:has(> .analysis-window-panel[open])
+  > .accordion-panel-actions > .disclosure-chevron {
+  transform: rotate(180deg);
+  opacity: var(--opacity-80);
+}
+
+.analysis-window-frame > .accordion-panel-actions > .accordion-copy-btn,
+.analysis-window-frame > .accordion-panel-actions > .accordion-maximize-btn,
+.analysis-window-frame > .accordion-panel-actions > .accordion-close-btn {
+  border-color: color-mix(in srgb, var(--color-border-strong) 25%, transparent);
+  box-shadow: none;
+  opacity: var(--opacity-60);
+  transition:
+    opacity var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard),
+    background-color var(--duration-fast) var(--easing-standard);
+}
+
+.analysis-window-frame:has(
+    > .analysis-window-panel > summary:hover,
+    > .analysis-window-panel > summary:focus,
+    > .accordion-panel-actions :hover,
+    > .accordion-panel-actions :focus
+  ) > .accordion-panel-actions > :is(.accordion-copy-btn, .accordion-maximize-btn, .accordion-close-btn) {
+  opacity: 1;
+  background: color-mix(in srgb, var(--color-surface-elevated) 80%, transparent);
+  border-color: color-mix(in srgb, var(--color-border-strong) 50%, transparent);
+}
+
+.analysis-window-frame.accordion-floating > .analysis-window-panel .accordion-content {
+  padding: var(--space-2) var(--space-2-5) var(--space-2-5);
+  background: var(--color-surface-secondary);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.analysis-window-frame > .accordion-panel-actions > :is(.accordion-copy-btn, .accordion-maximize-btn, .accordion-close-btn):focus-visible {
+  opacity: 1;
+}
+
+@media (pointer: coarse) {
+  .analysis-window-panel > summary {
+    min-height: var(--space-10);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .analysis-window-frame > .accordion-panel-actions > :is(.accordion-copy-btn, .accordion-maximize-btn, .accordion-close-btn) {
+    transition: none;
+  }
+}
+
+/* ========================================================================= */
+/* Phone sheets (dockable-accordions/sheets.js)                               */
+/* ========================================================================= */
+
+/* On a phone a window is a bottom sheet: full width, one of three heights,
+   a 24 px grip above its header and, with several windows, a tab strip
+   above the grip. Its own box (`--pos-*`) is kept for a wider screen. */
+.accordion-panel.accordion-floating.floating-sheet {
+  --sheet-grip: 24px;
+  --sheet-tabs: 0px;
+  left: 0;
+  right: 0;
+  top: auto;
+  bottom: 0;
+  width: 100%;
+  max-width: 100%;
+  height: var(--sheet-height, 75dvh);
+  max-height: 100dvh;
+  padding-top: calc(var(--sheet-grip) + var(--sheet-tabs));
+  box-sizing: border-box;
+  background: var(--color-surface-elevated);
+  border-top: var(--border-width-1) solid var(--color-border-default);
+  box-shadow: var(--shadow-floating);
+}
+
+.accordion-panel.accordion-floating.floating-sheet.has-sheet-tabs {
+  --sheet-tabs: var(--space-9);
+}
+
+/* Collapsed by a tap on its header, a sheet is its header. */
+.accordion-panel.accordion-floating.floating-sheet:has(> .accordion-section:not([open])) {
+  height: auto;
+}
+
+.accordion-panel.accordion-floating.floating-sheet:not(.sheet-active) {
+  display: none;
+}
+
+.floating-sheet > .accordion-section {
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  box-shadow: none;
+}
+
+.floating-sheet > .accordion-panel-actions {
+  top: calc(
+    var(--sheet-grip) + var(--sheet-tabs)
+    + var(--border-width-1) + var(--control-panel-summary-padding-y)
+  );
+}
+
+.floating-sheet > .accordion-section .accordion-content {
+  max-height: calc(
+    var(--sheet-height, 75dvh) - var(--sheet-grip) - var(--sheet-tabs)
+    - var(--floating-header-height, 0px) - 2 * var(--border-width-1)
+  );
+}
+
+.accordion-panel.accordion-floating.floating-sheet > .accordion-resize-handle,
+.accordion-panel.accordion-floating.floating-sheet > .floating-size-readout,
+.accordion-panel.accordion-floating.floating-sheet > .accordion-panel-actions > .accordion-maximize-btn {
+  display: none;
+}
+
+.floating-sheet-grip {
+  display: none;
+}
+
+.floating-sheet > .floating-sheet-grip {
+  display: flex;
+  position: absolute;
+  top: var(--sheet-tabs);
+  left: 0;
+  right: 0;
+  height: var(--sheet-grip);
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  cursor: ns-resize;
+}
+
+.floating-sheet > .floating-sheet-grip::before {
+  content: '';
+  width: var(--space-9);
+  height: var(--space-1);
+  border-radius: var(--radius-full);
+  background: var(--color-border-strong);
+  opacity: var(--opacity-50);
+}
+
+.floating-sheet > .floating-sheet-grip:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+.floating-sheet-tabs {
+  display: none;
+}
+
+.floating-sheet > .floating-sheet-tabs {
+  display: flex;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--sheet-tabs);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  background: var(--color-surface-secondary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+}
+
+.floating-sheet-tab {
+  flex: 0 1 auto;
+  min-width: var(--space-16);
+  max-width: 60%;
+  padding: 0 var(--space-3);
+  border: none;
+  border-right: var(--border-width-1) solid var(--color-border-light);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--type-label);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.floating-sheet-tab[aria-selected="true"] {
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+.floating-sheet-tab:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}

@@ -19,16 +19,42 @@ export const QUIET_WINDOW_MS = 500;
  * mutation invalidated however slowly a loaded runner produces frames.
  */
 export async function countDrawsDuring(page, milliseconds, { mutate = false } = {}) {
-  return countDraws(page, { duration: milliseconds, frames: null, mutate });
+  return countDraws(page, { duration: milliseconds, mutate });
 }
 
 /**
- * Count draw calls over the next `frames` animation frames. Unlike a
- * wall-clock window, this observes frames however far apart a slow renderer
- * draws them.
+ * Count the viewer's draw calls from now on, across polls: `count()` reads
+ * the total so far, `stop()` stops counting.
+ *
+ * A pulse paced to a slow renderer (`rendering/ambient-frame-pacing.js`)
+ * draws one frame and then leaves the main thread free for as long, so a
+ * window of a few animation frames falls between two pulse frames, and on
+ * the Linux CI runners it did every time: an observation that starts after
+ * a pulse frame is already in its wait. Polling a running count sees every
+ * frame the pulse draws, however far apart.
  */
-export async function countDrawsOverFrames(page, frames = 2) {
-  return countDraws(page, { duration: null, frames, mutate: false });
+export async function watchDraws(page) {
+  await page.evaluate(() => {
+    if (window.__drawWatch !== undefined) throw new Error('Draws are already watched.');
+    const gl = window._cellucidViewer.getGLContext();
+    const watch = window.__drawWatch = { count: 0, names: [] };
+    for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+      const original = gl[name];
+      watch.names.push(name);
+      gl[name] = function watchedDraw(...args) {
+        watch.count += 1;
+        return Reflect.apply(original, this, args);
+      };
+    }
+  });
+  return Object.freeze({
+    count: () => page.evaluate(() => window.__drawWatch.count),
+    stop: () => page.evaluate(() => {
+      const gl = window._cellucidViewer.getGLContext();
+      for (const name of window.__drawWatch.names) delete gl[name];
+      delete window.__drawWatch;
+    }),
+  });
 }
 
 /**
@@ -53,8 +79,8 @@ export async function sceneQuietness(page) {
   return draws === 0 ? 'quiet' : `drew ${draws} times after settling`;
 }
 
-async function countDraws(page, { duration, frames, mutate }) {
-  return page.evaluate(async ({ duration, frames, mutate: applyMutation }) => {
+async function countDraws(page, { duration, mutate }) {
+  return page.evaluate(async ({ duration, mutate: applyMutation }) => {
     const viewer = window._cellucidViewer;
     const gl = viewer.getGLContext();
     let draws = 0;
@@ -72,9 +98,9 @@ async function countDraws(page, { duration, frames, mutate }) {
     }
     try {
       if (applyMutation) viewer.setPointSize(3);
-      if (applyMutation || frames !== null) {
+      if (applyMutation) {
         await new Promise(resolve => {
-          let remaining = applyMutation ? 2 : frames;
+          let remaining = 2;
           const step = () => {
             remaining -= 1;
             if (remaining <= 0) resolve();
@@ -89,5 +115,5 @@ async function countDraws(page, { duration, frames, mutate }) {
       for (const name of Object.keys(originals)) delete gl[name];
     }
     return draws;
-  }, { duration, frames, mutate });
+  }, { duration, mutate });
 }
