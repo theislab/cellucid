@@ -25,6 +25,7 @@
 
 import { RdsFormatError } from './errors.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 const EMPTY = new Uint8Array(0);
 
@@ -154,7 +155,7 @@ export class XdrReader {
         throw new RdsFormatError('The R stream reader lost its place between two pieces.');
       }
       const take = Math.min(piece.bytes.length, n - remainder);
-      const joined = new Uint8Array(remainder + take);
+      const joined = allocateTypedArray(Uint8Array, remainder + take, 'An R value');
       joined.set(this.buf.subarray(this.pos));
       joined.set(piece.bytes.subarray(0, take), remainder);
       if (take < piece.bytes.length) this.queue.unshift({ bytes: piece.bytes.subarray(take), start: piece.start + take });

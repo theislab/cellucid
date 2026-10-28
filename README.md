@@ -15,7 +15,8 @@ turn an exploratory view into a reproducible figure or shared session.
 
 ## Features
 
-- Fast WebGL rendering with adaptive detail for million-cell atlases
+- Fast WebGL rendering with adaptive detail, up to 100 million cells in 3D on a 16 GB laptop
+- Subsampled reading: open a seeded share of the cells (uniform, storage-aligned blocks, stratified, spatial), downloading only the parts of the file that hold them; the same cells in Python, R, links and sessions; a dataset too large for the device opens a share that fits
 - Interactive gene-expression and cell-metadata coloring, filtering, and highlighting
 - Independent multiview comparisons with per-view colors and filter stacks
 - Animated RNA-velocity and drift overlays, KNN connectivity, and volumetric smoke

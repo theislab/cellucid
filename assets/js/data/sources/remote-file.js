@@ -9,8 +9,10 @@
  * requests serves only the whole file, and so does one that content-codes
  * the file even in a range (`contentCoded`: a part of it cannot be decoded,
  * `probeHttpResource`): its entry says so (`transport: 'download'`), and
- * the link source downloads it once, showing how much has arrived, then
- * reads it from memory (`downloadRemoteFile`). A host that does
+ * the link source downloads it once, showing how much has arrived, into
+ * this browser's storage as it arrives (never gathered in memory), kept for
+ * later visits like a transcoded store (`downloadRemoteFile`,
+ * `transcode/space.js`), then reads it from there. A host that does
  * not let other sites read its files (CORS) cannot be read at all, and the
  * refusal says so and what to do instead.
  *
@@ -19,8 +21,10 @@
 
 import { DataSourceError, DataSourceErrorCode, explainedFailure } from '../data-source.js';
 import { HEAD_BYTES, probeHttpResource } from '../../formats/io/byte-source.js';
+import { rememberedAnswer } from '../../formats/io/link.js';
 import { fileFormatOfName, inputFormat, openableNamesText, readsFromHead, titleOfName } from '../input-formats.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { keepDownload } from '../anndata/transcode/space.js';
 
 /**
  * The size and identity a host reports for one file, or the refusal that
@@ -57,6 +61,17 @@ async function probeRemoteFile(url, name, format, signal) {
       { url, status }
     );
   }
+}
+
+/**
+ * The version a host reported of a file, for its identity: its `ETag`, else
+ * its modification time (`modified:<Last-Modified>`), else only its size
+ * (`size:<bytes>`, which says nothing of a change under the same size).
+ */
+function versionOf(probed) {
+  if (typeof probed.etag === 'string' && probed.etag !== '') return probed.etag;
+  if (typeof probed.lastModified === 'string' && probed.lastModified !== '') return `modified:${probed.lastModified}`;
+  return `size:${probed.size}`;
 }
 
 /**
@@ -113,7 +128,7 @@ export async function describeRemoteFile({
   const known = Number.isSafeInteger(size) && size >= 0;
   if (!known) onStep?.(`Checking ${name} on ${new URL(url).host}`);
   const probed = known
-    ? { size, etag: null, rangeSupported: null, head }
+    ? { size, etag: head?.etag ?? null, lastModified: null, rangeSupported: null, head }
     : await probeRemoteFile(url, name, format, signal);
   return Object.freeze({
     id,
@@ -130,8 +145,16 @@ export async function describeRemoteFile({
       identity: Object.freeze({
         kind: 'remote',
         key: id,
-        version: version ?? probed.etag ?? `size:${probed.size}`,
+        version: version ?? versionOf(probed),
       }),
+      // What the host said of the version read, which every later answer
+      // must say again (`httpByteSource`): a change between this
+      // description and the first read is caught there.
+      ...(probed.lastModified == null ? {} : { lastModified: probed.lastModified }),
+      // How long its host took to answer here (the provider's own request,
+      // when the size came without a probe): the reader's stall timeout
+      // starts from it (`ResponseClock`).
+      ...(rememberedAnswer(url) === null ? {} : { answeredMs: rememberedAnswer(url) }),
       // The file's first bytes, read with the probe: opening starts from them.
       ...(probed.head == null ? {} : { head: Object.freeze({ ...probed.head }) }),
       // Sent content-coded: what arrives is decoded, its size known once it has.
@@ -173,7 +196,8 @@ export async function describeRemoteFileSet({ files, id, rootName, title, format
       url: file.url,
       size: probed.size,
       name: file.name,
-      identity: Object.freeze({ kind: 'remote', key: `${id}:${file.name}`, version: probed.etag ?? `size:${probed.size}` }),
+      identity: Object.freeze({ kind: 'remote', key: `${id}:${file.name}`, version: versionOf(probed) }),
+      ...(probed.lastModified == null ? {} : { lastModified: probed.lastModified }),
       // Sent content-coded: downloaded whole before the set opens.
       ...(probed.contentCoded === true ? { contentCoded: true } : {}),
     })];
@@ -234,15 +258,42 @@ export function chooseOpenableFile(names, requested, where, locatorFor) {
 /**
  * Download a whole file from a host that serves no part of it (it ignores
  * range requests, or content-codes the file), as a `File` the AnnData
- * reader then reads from memory. `onBytes(received)` hears each piece as it
- * arrives. A content-coded file arrives decoded, so its length is not the
- * size the host stated.
+ * reader then reads: written to this browser's storage as it arrives and
+ * kept there (`keepDownload`: for later visits when the file's identity
+ * names its version), or, without storage, joined into one Blob a batch at
+ * a time; never gathered in memory. `onBytes(received)` hears each piece as
+ * it arrives. When the browser refuses it for its quota part way and the
+ * files kept from earlier openings that no tab holds made room
+ * (`keepDownload`), it is downloaded once more. A content-coded file arrives decoded, so its length is not the
+ * size the host stated. With it come its page checksums when it is kept
+ * in storage (`checks`, `formats/io/page-checks.js`: every read of it is
+ * checked against them), null when it is in memory.
  *
- * @param {{url: string, name: string, size: number, contentCoded?: boolean}} resource
- * @param {{signal?: AbortSignal|null, onBytes?: (received: number) => void}} [options]
- * @returns {Promise<File>}
+ * @param {{url: string, name: string, size: number, identity?: Object, contentCoded?: boolean}} resource
+ * @param {{signal?: AbortSignal|null, onBytes?: (received: number) => void, environment?: Object}} [options]
+ *   `environment`: whose `navigator.storage` keeps it (the page's own)
+ * @returns {Promise<{file: File, checks: {pageBytes: number, sums: Uint32Array, directory: string}|null}>}
  */
-export async function downloadRemoteFile(resource, { signal = null, onBytes = () => {} } = {}) {
+export async function downloadRemoteFile(resource, { signal = null, onBytes = () => {}, environment = globalThis } = {}) {
+  // `onBytes` hears every byte that arrived, a second download's included.
+  let before = 0;
+  let arrived = 0;
+  const heard = received => {
+    arrived = before + received;
+    onBytes(arrived);
+  };
+  try {
+    return await downloadOnce(resource, { signal, onBytes: heard, environment });
+  } catch (error) {
+    // The browser refused it for its quota part way, and the kept files
+    // nobody holds made room: once more, from the start.
+    if (error?.details?.reason !== 'storage-full' || !(error.details.freed > 0)) throw error;
+    before = arrived;
+    return downloadOnce(resource, { signal, onBytes: heard, environment });
+  }
+}
+
+async function downloadOnce(resource, { signal, onBytes, environment }) {
   const host = new URL(resource.url).host;
   let response;
   try {
@@ -266,23 +317,39 @@ export async function downloadRemoteFile(resource, { signal = null, onBytes = ()
       { url: resource.url, status: response.status }
     );
   }
-  const parts = [];
   let received = 0;
   const reader = response.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    received += value.byteLength;
-    onBytes(received);
+  // A short or long answer fails the download before it is kept.
+  async function* pieces() {
+    let ended = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          ended = true;
+          break;
+        }
+        received += value.byteLength;
+        onBytes(received);
+        yield value;
+      }
+    } finally {
+      // Stopped early (a cancel, a refused write): the response is let go.
+      if (!ended) await reader.cancel().catch(() => {});
+    }
+    if (resource.contentCoded !== true && Number.isSafeInteger(resource.size) && received !== resource.size) {
+      throw new DataSourceError(
+        `${host} sent ${formatCountOf(received, 'byte')} of ${resource.name}, not the ${resource.size} it reported.`,
+        DataSourceErrorCode.NETWORK_ERROR,
+        'link',
+        { url: resource.url }
+      );
+    }
   }
-  if (resource.contentCoded !== true && Number.isSafeInteger(resource.size) && received !== resource.size) {
-    throw new DataSourceError(
-      `${host} sent ${formatCountOf(received, 'byte')} of ${resource.name}, not the ${resource.size} it reported.`,
-      DataSourceErrorCode.NETWORK_ERROR,
-      'link',
-      { url: resource.url }
-    );
-  }
-  return new File(parts, resource.name, { type: 'application/octet-stream' });
+  const { file, checks } = await keepDownload(resource.identity ?? null, pieces(), {
+    name: resource.name,
+    size: resource.contentCoded === true ? null : resource.size,
+    environment,
+  });
+  return { file, checks };
 }

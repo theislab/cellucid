@@ -20,6 +20,7 @@
 
 import { connectivityEdgesOf } from '../connectivity-edges.js';
 import { EmbeddingPayloads } from '../embedding-payload.js';
+import { DecodedChunks } from './decoded-chunks.js';
 import {
   DEFAULT_KNN_KEY,
   requireObsmColumnSelection,
@@ -30,7 +31,7 @@ import {
   combineDatasetLifecycleFailures,
   createDatasetReloadSupersededError,
 } from '../dataset-lifecycle-errors.js';
-import { allocateTypedArray } from '../sparse-column-index.js';
+import { allocateTypedArray, copyTypedArray, sparseColumnOf, sparseColumnOfDense } from '../sparse-column-index.js';
 import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
 import { createWorkerColumnStoreFactory } from '../column-store-placement.js';
 import { onAbort } from '../../formats/io/abort.js';
@@ -69,11 +70,27 @@ import {
   validateCodes,
 } from './dataframe.js';
 import { readSparseMatrix, sparseContract } from './sparse.js';
-import { openMatrixColumns, openMatrixRows, readCellSubset } from './matrix-access.js';
+import { columnIndexResidentBytes, geneReadCost, openMatrixColumns, openMatrixRows, readCellSubset, readsThroughRowIndex } from './matrix-access.js';
 import { SLAB_BYTES, readFloat32, readIntegers, readRowSlabs, readStored } from './values.js';
 import { currentLayoutView, isOlderAnnDataLayout } from './older-layouts.js';
 import { cellMapOf } from './views/modalities.js';
-import { formatCountOf } from '../../utils/format-units.js';
+import { cellSubsetView, CellRows, estimatedChunkShare, keptChunkShare, keptValueCount, readInducedGraph } from './views/cell-subset.js';
+import { resolveCellSubset } from './subsample-plan.js';
+import { firstViewCost, planProgressiveOpening } from './progressive-open.js';
+import {
+  carriedSegments,
+  entriesPerRow,
+  firstSegmentRows,
+  readRowPointers,
+  rowRangeMatrix,
+  segmentBounds,
+  segmentedColumns,
+  sharedBudgetFactory,
+} from './prefix-column-index.js';
+import { PRIORITY_ORIGINAL_COLUMN, readPrefixCounts, requirePrefixRows } from './priority-layout.js';
+import { findKeptRuns, fingerprintRows, keepRun, keptIndexGroup, orderKey, rowChecksums } from './kept-column-index.js';
+import { formatCount, formatCountOf } from '../../utils/format-units.js';
+import { SharedWork, sharedOnce } from '../../formats/io/abort.js';
 
 const OBS_KINDS = ['string', 'float', 'int', 'uint', 'bool'];
 
@@ -129,7 +146,7 @@ function requirePositions(values, extent, label) {
  */
 function placeColumn(column, rows, nObs) {
   if (rows === null) return column;
-  const placed = new Float32Array(nObs);
+  const placed = allocateTypedArray(Float32Array, nObs, 'Gene column');
   for (let cell = 0; cell < nObs; cell++) placed[cell] = rows[cell] < 0 ? Number.NaN : column[rows[cell]];
   return placed;
 }
@@ -141,7 +158,9 @@ function placeColumn(column, rows, nObs) {
  */
 function placeSparseColumn(column, rows, nObs, nRows) {
   if (rows === null) return column;
-  const byRow = new Float32Array(nRows);
+  const kept = keptRowsOf(rows);
+  if (kept !== null) return placeSparseThrough(column, rows, kept);
+  const byRow = allocateTypedArray(Float32Array, nRows, 'Gene column');
   for (let entry = 0; entry < column.indices.length; entry++) byRow[column.indices[entry]] = column.values[entry];
   const indices = [];
   const values = [];
@@ -154,6 +173,202 @@ function placeSparseColumn(column, rows, nObs, nRows) {
     }
   }
   return { length: nObs, indices: Uint32Array.from(indices), values: Float32Array.from(values) };
+}
+
+/**
+ * The stored rows a cell map reaches, ascending (`sorted`), with the cell of
+ * each (`cells`): made once per map, sized to its cells (8 bytes a cell), not
+ * to the stored rows -- a subsample of 10M cells of a 100M-cell file holds
+ * 80 MB here, where a lookup of every stored row held 400 MB. Null for a map
+ * that sends two cells to one row.
+ */
+const keptRowsByMap = new WeakMap();
+function keptRowsOf(rows) {
+  if (keptRowsByMap.has(rows)) return keptRowsByMap.get(rows);
+  let measured = 0;
+  for (let cell = 0; cell < rows.length; cell++) if (rows[cell] >= 0) measured++;
+  // The rows sorted natively, then each cell placed at its row's position
+  // (a comparator sort of a million cells took 160 ms).
+  const sorted = allocateTypedArray(Uint32Array, measured, 'Measured rows');
+  let at = 0;
+  for (let cell = 0; cell < rows.length; cell++) if (rows[cell] >= 0) sorted[at++] = rows[cell];
+  sorted.sort();
+  let kept = { sorted, cells: allocateTypedArray(Int32Array, measured, 'Measured cells') };
+  for (let i = 1; i < measured; i++) {
+    if (sorted[i] === sorted[i - 1]) {
+      kept = null;
+      break;
+    }
+  }
+  if (kept !== null) {
+    // Runs of consecutive rows (a blocks subsample's are its blocks): a
+    // column's entries are matched against the runs, not every kept row.
+    const starts = [];
+    const bases = [];
+    for (let i = 0; i < measured; i++) {
+      if (i === 0 || sorted[i] !== sorted[i - 1] + 1) {
+        starts.push(sorted[i]);
+        bases.push(i);
+      }
+    }
+    kept.runStarts = Float64Array.from(starts);
+    kept.runBases = Float64Array.from([...bases, measured]);
+    // Each cell's position: its run (searched among the runs, few for
+    // blocks) and its offset in it; cells in open order follow their runs,
+    // so the last run found is tried first.
+    const runStarts = kept.runStarts;
+    const runBases = kept.runBases;
+    let run = 0;
+    for (let cell = 0; cell < rows.length; cell++) {
+      const row = rows[cell];
+      if (row < 0) continue;
+      if (!(runStarts[run] <= row && row - runStarts[run] < runBases[run + 1] - runBases[run])) {
+        let low = 0;
+        let high = runStarts.length - 1;
+        while (low < high) {
+          const middle = (low + high + 1) >>> 1;
+          if (runStarts[middle] <= row) low = middle;
+          else high = middle - 1;
+        }
+        run = low;
+      }
+      kept.cells[runBases[run] + row - runStarts[run]] = cell;
+    }
+  }
+  keptRowsByMap.set(rows, kept);
+  return kept;
+}
+
+/**
+ * Where row `row` is in `sorted` from position `from` on (the first position
+ * holding `row` or more): galloping, so a column's ascending rows walk the
+ * kept rows once, in time of the column's entries and the gaps between them.
+ */
+function gallop(sorted, row, from) {
+  let low = from;
+  let step = 1;
+  let high = from;
+  while (high < sorted.length && sorted[high] < row) {
+    low = high + 1;
+    high += step;
+    step *= 2;
+  }
+  if (high > sorted.length) high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (sorted[middle] < row) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/**
+ * `placeSparseColumn` through the map's kept rows: each stored entry goes to
+ * its cell, in time of the column's entries and the cells it did not
+ * measure; a column's entries are ascending by row, so one galloping walk
+ * finds them all (a column out of order is searched entry by entry).
+ */
+function placeSparseThrough(column, rows, kept) {
+  const nObs = rows.length;
+  const { cells: cellOf, runStarts, runBases } = kept;
+  const runCount = runStarts.length;
+  const entries = column.indices.length;
+  // At most one cell an entry; typed, so a column of a million entries is
+  // placed without growing arrays.
+  let cells = allocateTypedArray(Uint32Array, entries, 'Gene column cells');
+  let values = allocateTypedArray(Float32Array, entries, 'Gene column values');
+  let count = 0;
+  let ascending = true;
+  // The run whose rows begin at or before the entry's row (galloped).
+  let run = 0;
+  let lastRow = -1;
+  for (let entry = 0; entry < entries; entry++) {
+    const row = column.indices[entry];
+    if (row < lastRow) run = 0;
+    lastRow = row;
+    // The next run or two by a step, a farther one by galloping.
+    if (run + 1 < runCount && runStarts[run + 1] <= row) {
+      run++;
+      if (run + 1 < runCount && runStarts[run + 1] <= row) run = gallop(runStarts, row + 1, run + 1) - 1;
+    }
+    if (run >= runCount || row < runStarts[run]) continue;
+    const offset = row - runStarts[run];
+    if (offset >= runBases[run + 1] - runBases[run]) continue;
+    const value = column.values[entry];
+    if (value === 0) continue;
+    const cell = cellOf[runBases[run] + offset];
+    if (count > 0 && cell < cells[count - 1]) ascending = false;
+    cells[count] = cell;
+    values[count++] = value;
+  }
+  cells = cells.subarray(0, count);
+  values = values.subarray(0, count);
+  // A subsample's cells are in priority order, not the file's: the entries
+  // are put in cell order by two passes of a radix sort (stable, so entries
+  // of one cell keep their order), not a comparator sort.
+  if (!ascending) ({ cells, values } = byCell(cells, values));
+  // Cells the map leaves unmeasured, counted once per map (not per column).
+  const unmeasured = nObs - kept.sorted.length;
+  if (unmeasured === 0) {
+    return {
+      length: nObs,
+      indices: copyTypedArray(Uint32Array, cells, 'Gene column cells'),
+      values: copyTypedArray(Float32Array, values, 'Gene column values'),
+    };
+  }
+  const indices = allocateTypedArray(Uint32Array, count + unmeasured, 'Gene column cells');
+  const out = allocateTypedArray(Float32Array, count + unmeasured, 'Gene column values');
+  let at = 0;
+  let next = 0;
+  for (let cell = 0; cell < nObs; cell++) {
+    if (rows[cell] >= 0) continue;
+    while (next < count && cells[next] < cell) {
+      indices[at] = cells[next];
+      out[at++] = values[next++];
+    }
+    indices[at] = cell;
+    out[at++] = Number.NaN;
+  }
+  for (; next < count; next++) {
+    indices[at] = cells[next];
+    out[at++] = values[next];
+  }
+  return { length: nObs, indices, values: out };
+}
+
+/** `cells` (uint32) and their `values`, stably sorted by cell: an LSD radix sort, 16 bits a pass. */
+function byCell(cells, values) {
+  const count = cells.length;
+  let keys = cells;
+  let payload = values;
+  let nextKeys = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+  let nextPayload = allocateTypedArray(Float32Array, count, 'Gene column values');
+  const buckets = new Uint32Array(1 << 16);
+  for (const shift of [0, 16]) {
+    buckets.fill(0);
+    for (let i = 0; i < count; i++) buckets[(keys[i] >>> shift) & 0xffff]++;
+    let sum = 0;
+    for (let b = 0; b < buckets.length; b++) {
+      const size = buckets[b];
+      buckets[b] = sum;
+      sum += size;
+    }
+    for (let i = 0; i < count; i++) {
+      const at = buckets[(keys[i] >>> shift) & 0xffff]++;
+      nextKeys[at] = keys[i];
+      nextPayload[at] = payload[i];
+    }
+    [keys, nextKeys] = [nextKeys, keys];
+    [payload, nextPayload] = [nextPayload, payload];
+  }
+  return { cells: keys, values: payload };
+}
+
+/** A placed sparse column as a dense one (zero where it lists no entry). */
+function denseOfSparse(column) {
+  const dense = allocateTypedArray(Float32Array, column.length, 'Gene column');
+  for (let entry = 0; entry < column.indices.length; entry++) dense[column.indices[entry]] = column.values[entry];
+  return dense;
 }
 
 /** The genes of one row inside a column window, renumbered from the window's start. */
@@ -185,9 +400,9 @@ function placeCellSubset(block, measured, cellCount) {
     else absent.push(position);
   }
   const total = block.cellIndex.length + genes * absent.length;
-  const pointers = new Float64Array(genes + 1);
-  const cellIndex = new Int32Array(total);
-  const values = new Float32Array(total);
+  const pointers = allocateTypedArray(Float64Array, genes + 1, 'Cell subset pointers');
+  const cellIndex = allocateTypedArray(Int32Array, total, 'Cell subset positions');
+  const values = allocateTypedArray(Float32Array, total, 'Cell subset values');
   let at = 0;
   for (let gene = 0; gene < genes; gene++) {
     pointers[gene] = at;
@@ -207,6 +422,126 @@ function placeCellSubset(block, measured, cellCount) {
   }
   pointers[genes] = at;
   return { pointers, cellIndex, values };
+}
+
+/**
+ * Some cells of sparse gene columns as a gene-major sparse block
+ * (`getMatrixCellSubset`'s): gene `g` has the cells of `cells` (by their
+ * position in it, ascending) that `columns[g]` lists. Each column's entries
+ * are matched to the cells in row order (the cells sorted once when they are
+ * not ascending), so it holds the cells and the entries, never a column of
+ * every cell.
+ *
+ * @param {Array<{indices: ArrayLike<number>, values: ArrayLike<number>}>} columns -
+ *   Each gene's entries on the first rows (`SparseColumn`, rows ascending)
+ * @param {ArrayLike<number>} cells - Distinct rows
+ * @returns {{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}}
+ */
+function cellSubsetOfSparseColumns(columns, cells) {
+  const n = cells.length;
+  let ascending = true;
+  for (let i = 1; i < n && ascending; i++) ascending = cells[i - 1] < cells[i];
+  // The cells by row: `rows[j]`, at position `positions[j]` of `cells`.
+  let positions = null;
+  let rows = cells;
+  if (!ascending) {
+    positions = allocateTypedArray(Uint32Array, n, 'Cell order');
+    for (let i = 0; i < n; i++) positions[i] = i;
+    positions.sort((a, b) => cells[a] - cells[b]);
+    rows = allocateTypedArray(Float64Array, n, 'Cell rows');
+    for (let i = 0; i < n; i++) rows[i] = cells[positions[i]];
+  }
+  const each = (column, visit) => {
+    const { indices } = column;
+    let j = 0;
+    for (let e = 0; e < indices.length && j < n; e++) {
+      const row = indices[e];
+      while (j < n && rows[j] < row) j++;
+      if (j < n && rows[j] === row) visit(e, j);
+    }
+  };
+  let count = 0;
+  for (const column of columns) each(column, () => { count++; });
+  const pointers = allocateTypedArray(Float64Array, columns.length + 1, 'Cell subset pointers');
+  const cellIndex = allocateTypedArray(Int32Array, count, 'Cell subset positions');
+  const values = allocateTypedArray(Float32Array, count, 'Cell subset values');
+  let at = 0;
+  columns.forEach((column, g) => {
+    const from = at;
+    each(column, (e, j) => {
+      cellIndex[at] = ascending ? j : positions[j];
+      values[at++] = column.values[e];
+    });
+    if (!ascending && at - from > 1) {
+      // Ascending by position within the gene, as every block lists them.
+      const order = allocateTypedArray(Uint32Array, at - from, 'Cell subset order');
+      for (let k = 0; k < order.length; k++) order[k] = from + k;
+      order.sort((a, b) => cellIndex[a] - cellIndex[b]);
+      const sortedCells = allocateTypedArray(Int32Array, order.length, 'Cell subset positions');
+      const sortedValues = allocateTypedArray(Float32Array, order.length, 'Cell subset values');
+      for (let k = 0; k < order.length; k++) {
+        sortedCells[k] = cellIndex[order[k]];
+        sortedValues[k] = values[order[k]];
+      }
+      cellIndex.set(sortedCells, from);
+      values.set(sortedValues, from);
+    }
+    pointers[g + 1] = at;
+  });
+  return { pointers, cellIndex, values };
+}
+
+/**
+ * The prefix a gene-major matrix is opened as, or null: the dataset's own
+ * `X` takes the opening's prefix `k`; a modality's, its kept rows' count `m`
+ * when they are its first `m` rows (as a priority-ordered file stores a
+ * modality: by its cells' priority).
+ */
+function openPrefixOf(prefix, keptRows, isModality) {
+  if (prefix === null) return null;
+  if (!isModality) return prefix;
+  const m = keptRows.length;
+  return m > 0 && keptRows[m - 1] === m - 1 ? m : null;
+}
+
+/**
+ * The prefix counts an opening of the first `k` rows of a priority-ordered
+ * file reads (`priority-layout.js`), started as it opens and awaited by the
+ * first gene: for the dataset's `X` and each modality's, the column of the
+ * smallest level holding `k` and the rows below that level (a modality's:
+ * its rows of the cells below it, from its cell map's first rows). Keyed by
+ * the matrix's path (`X`, `mod/<name>/X`); a matrix without counts is absent.
+ */
+function startPrefixReads(full, resolution, readOptions) {
+  const reads = new Map();
+  const { prefix: k, levels } = resolution;
+  if (k === null || k === undefined || !Array.isArray(levels)) return reads;
+  const level = levels.findIndex(size => size >= k);
+  if (level < 0) return reads;
+  const levelCells = levels[level];
+  const start = (key, group, rowsBelow) => {
+    const table = child(child(group, 'varm'), 'cellucid_prefix_counts');
+    if (table === null) return;
+    const read = rowsBelow.then(async levelRows => {
+      const counts = await readPrefixCounts(group, level, table.shape?.[0], readOptions, { levelRows });
+      return counts === null ? null : { counts, levelRows };
+    });
+    read.catch(() => {});
+    reads.set(key, read);
+  };
+  start('X', full, Promise.resolve(levelCells));
+  for (const modality of Array.isArray(full.modalities) ? full.modalities : []) {
+    const group = full.get(`mod/${modality.name}`);
+    const rowsBelow = modality.obsmap === null
+      ? Promise.resolve(levelCells)
+      : modality.obsmap.read([[0, levelCells]], readOptions).then(map => {
+        let rows = 0;
+        for (let i = 0; i < map.length; i++) if (Number(map[i]) > 0) rows++;
+        return rows;
+      });
+    start(`mod/${modality.name}/X`, group, rowsBelow);
+  }
+  return reads;
 }
 
 /**
@@ -439,9 +774,29 @@ export async function describeAnnDataStore(store, { format }, readOptions = {}) 
 }
 
 /**
+ * What a person reads while a cell-major matrix (CSR, or dense in row
+ * chunks) is read by gene: why one gene costs the whole matrix, and, when no
+ * index of it can be kept (`rescan`: why), that every gene scans it again
+ * and what makes the index fit.
+ *
+ * @param {string} label - `X`, `layers['counts']`, `raw.X`
+ * @param {string|null} rescan
+ * @returns {string}
+ */
+export function geneIndexActivityLabel(label, rescan) {
+  if (rescan === null) {
+    return `${label} by gene (stored cell by cell, so one gene reads every cell's entries; ` +
+      'genes after it read the index this builds)';
+  }
+  return `${label} again for the genes asked for (${rescan}, so each gene reads every cell's entries; ` +
+    'opening a subsample of the cells makes the index fit)';
+}
+
+/**
  * Describe one AnnData element from its metadata, for the data-mapping
  * catalog. Nothing is read and nothing is refused: an element this reader
- * cannot classify is storage `other`.
+ * cannot classify is storage `other`, and one whose metadata it cannot read
+ * carries the reason (`problem`), which the catalog shows.
  */
 function probeElement(key, node) {
   const other = { key, storage: 'other', shape: null, dtype: 'object', numeric: false, nnz: null };
@@ -460,6 +815,19 @@ function probeElement(key, node) {
     const declared = encodingType(node);
     if (declared === 'csr_matrix' || declared === 'csc_matrix') {
       const shape = shapeFromAttribute(attributeValue(node, 'shape'), key);
+      // A subsample's CSR matrix not read yet: its stored values are not
+      // known (its kept rows' pointers are read with the matrix).
+      if (node.rowPointersPending?.() === true) {
+        const stored = node.storedData();
+        return {
+          key,
+          storage: declared.slice(0, 3),
+          shape,
+          dtype: numpyDtypeName(stored),
+          numeric: isAnnDataNumericValueKind(valueKind(stored)),
+          nnz: null,
+        };
+      }
       const data = child(node, 'data');
       if (data?.kind !== 'array') return { ...other, storage: declared.slice(0, 3), shape };
       return {
@@ -483,10 +851,51 @@ function probeElement(key, node) {
         shape: rows === null || rows === undefined || columns === null ? null : [rows, columns],
       };
     }
-  } catch {
-    return other;
+  } catch (error) {
+    // Its metadata is malformed: the catalog lists it as unusable, saying why.
+    return { ...other, problem: error?.message ?? String(error) };
   }
   return other;
+}
+
+/**
+ * A matrix's cell map through a subsample's kept rows (`rows`): cell `i`'s
+ * row is the kept row of the row `modality` maps it to (its own position
+ * when there is no modality map). Null when there are no kept rows to go
+ * through; the modality's map alone then.
+ *
+ * @param {((options?: Object) => Promise<{rows: Int32Array|null, identity: boolean, measured: number}>)|null} modality
+ * @param {CellRows|null} rows
+ * @param {number} nCells - The cells the map is over (the reader's, or the modality's presented rows' owners)
+ */
+const composedMaps = new WeakMap();
+function composeCellMaps(modality, rows, nCells) {
+  if (rows === null) return modality;
+  // One map per subset and modality, whichever read asks: what is derived
+  // from it (`keptRowsOf`) is then made once, not once per read.
+  let byModality = composedMaps.get(rows);
+  if (byModality === undefined) {
+    byModality = new Map();
+    composedMaps.set(rows, byModality);
+  }
+  const known = byModality.get(modality);
+  if (known !== undefined) return known;
+  // Made once, shared by every read asking meanwhile (`sharedOnce`).
+  const map = sharedOnce(async options => {
+    const base = modality === null ? null : await modality(options);
+    const cells = base === null || base.rows === null ? null : base.rows;
+    const n = cells === null ? nCells : cells.length;
+    const mapped = allocateTypedArray(Int32Array, n, 'Modality rows');
+    let measured = 0;
+    for (let cell = 0; cell < n; cell++) {
+      const row = cells === null ? cell : cells[cell];
+      mapped[cell] = row < 0 ? -1 : rows.kept[row];
+      if (row >= 0) measured++;
+    }
+    return { rows: mapped, identity: false, measured };
+  });
+  byModality.set(modality, map);
+  return map;
 }
 
 /**
@@ -495,6 +904,15 @@ function probeElement(key, node) {
  */
 export class AnnDataReader {
   constructor() {
+    /**
+     * Whole decoded chunks the subsample view reads its kept rows through
+     * (`decoded-chunks.js`): the store's, kept within its decoded-chunk
+     * budget beside its own cache, carried to each opening of the same
+     * store (a progressive opening's steps copy their added rows out of
+     * chunks earlier steps decoded), let go with the store.
+     * @type {DecodedChunks|null}
+     */
+    this._decodedChunks = null;
     /**
      * Work on the reader thread someone waits for running now (a graph's
      * extraction), and what waits for there to be none: an index built
@@ -520,7 +938,6 @@ export class AnnDataReader {
      * them unique with the data-mapping rule (`makeUniqueNames`).
      * @type {string[]}
      */
-    this._varNames = [];
     /** @type {Map<string, Object>} Field types, categories, names */
     this._cache = new Map();
     /**
@@ -529,7 +946,7 @@ export class AnnDataReader {
      * is the last; a built gene index of an earlier one is kept while every
      * kept index fits the `columnIndex` memory budget, so switching back to
      * it reads nothing again (`_settleMatrices`).
-     * @type {Map<string, {element: string, columns: Object|null, loadPromise: Promise|null}>}
+     * @type {Map<string, {element: string, columns: Object|null, load: import('../../formats/io/abort.js').SharedWork|null}>}
      */
     this._matrices = new Map();
     /**
@@ -562,6 +979,60 @@ export class AnnDataReader {
      * @type {Map<string, Promise<ArrayLike<number>>>}
      */
     this._pointerReads = new Map();
+    /**
+     * The cells this reader presents (`subsample-plan.js`): every cell
+     * (`kept` null), or a subsample, whose view (`views/cell-subset.js`)
+     * is `_root`; `_fullRoot` is the store as stored, for what is read of
+     * every cell (a field's representation in the subsample).
+     * @type {(import('./subsample-plan.js').CellSubsetResolution & {rows: CellRows|null, keptValues: number|null})|null}
+     */
+    this._cellSubset = null;
+    this._fullRoot = null;
+    /**
+     * The prefix counts an opening of a priority-ordered file's first rows
+     * reads as it opens (`startPrefixReads`), by matrix path.
+     * @type {Map<string, Promise<{counts: Float64Array, levelRows: number}|null>>}
+     */
+    this._prefixReads = new Map();
+    /**
+     * The row pointers of the store's CSR matrices, by path, read whole:
+     * they do not depend on the cells open, so another opening of the same
+     * store takes them over (`open`'s `carry`).
+     * @type {Map<string, Float64Array>}
+     */
+    this._indptrs = new Map();
+    /** Kept rows' pointers an earlier subsample of the same store read (`cellSubsetView`). */
+    this._knownRowPointers = new Map();
+    /**
+     * Gene columns an earlier opening of the same store built that this
+     * one's cells keep (`_takeCarried`), by matrix element, until the matrix
+     * is first read: `{segments}` (a prefix of rows, `prefix-column-index.js`)
+     * or `{columns}` (the same rows, the whole access).
+     * @type {Map<string, {segments?: Array, columns?: Object}>}
+     */
+    this._carried = new Map();
+    /**
+     * Where the gene indexes of this store's cell-major matrices are kept in
+     * this browser across visits (`kept-column-index.js`): `{identity, tab,
+     * onStore, environment}`, the bytes' identity (`openDatasetStore`); null
+     * keeps none.
+     * @type {{identity: Object, tab?: string, onStore?: Function|null, environment: Object}|null}
+     */
+    this._keptIndexes = null;
+    /**
+     * The kept runs of each matrix's index found for this opening and not
+     * yet taken by its index (`_keptRunsOf`), by matrix element.
+     * @type {Map<string, Promise<import('./kept-column-index.js').KeptRun[]>>}
+     */
+    this._keptRuns = new Map();
+    /** @type {Set<Promise<void>>} Runs of built indexes being kept (`_keepRun`). */
+    this._keeping = new Set();
+    /**
+     * How much of each neighbour graph read the subsample keeps
+     * (`subsampleGraphShare`), by `obsp` key.
+     * @type {Map<string, {kept: number, of: number}>}
+     */
+    this._graphShares = new Map();
     this._generation = 0;
     this._openRequestId = 0;
     this._closed = false;
@@ -580,7 +1051,7 @@ export class AnnDataReader {
      */
     this._payloads = new EmbeddingPayloads(
       (key, columns, options) => this.readObsmColumns(key, columns, options),
-      () => this._generation
+      { cellCount: () => this._nObs, generation: () => this._generation }
     );
   }
 
@@ -644,7 +1115,12 @@ export class AnnDataReader {
    *
    * @param {Object} store - An opened store root (`openHdf5` / `openZarr`), with `close()`
    * @param {{format: import('./elements.js').AnnDataFormat, name: string, decodedChunkBytes?: number,
+   *   decodedBudget?: import('../../formats/io/decoded-budget.js').DecodedBudget|null,
    *   link?: import('../../formats/io/link.js').LinkMeter|null}} options
+   *   `decodedBudget`: the byte budget the store's own decoded-chunk cache
+   *   charges (`openDatasetStore`), which the whole chunks a subsample's
+   *   rows are read through share (`decoded-chunks.js`); without one they
+   *   keep `decodedChunkBytes` of their own.
    *   `link`: the link to the store, measured as it is read (`openDatasetStore`).
    *   Over a link that delivers bytes as fast as a disk (`link.readsAhead`), a
    *   cell-major matrix is indexed by gene as soon as it is prepared, values
@@ -655,8 +1131,23 @@ export class AnnDataReader {
    *   is read ahead.
    *   `activity`: the activity that opening the store started, which reading
    *   the AnnData structure continues (else it gets its own).
+   *   `carry`: the reader of an earlier opening of the same store (other
+   *   cells of it, read again in place): what it read that does not depend
+   *   on the cells (row pointers, a CSC matrix's column pointers), and the
+   *   gene indexes of the rows both openings share, are taken over
+   *   (`_takeCarried`) instead of read again. `previous`: the reader of an
+   *   earlier opening of the same dataset whose store could not be taken
+   *   over (`carry` null): an opening grown or cut in place still keeps its
+   *   embeddings' frame (`EmbeddingPayloads.adoptTransforms`). `signal`
+   *   stops the opening.
+   *   `keptIndexes`: `{identity, tab?, onStore?, environment?}`, what the
+   *   store's bytes are (`openDatasetStore`'s `identity`): the gene indexes
+   *   of its cell-major matrices are kept in this browser under it and found
+   *   again by a later opening of the same cells (`kept-column-index.js`);
+   *   `onStore({directory, state})` hears each kept directory as it is
+   *   written and completed (the page holds it for the tab's life).
    */
-  async open(store, { format, name, decodedChunkBytes = residencyBudgetBytes('decodedBlocks'), link = null, activity = null }) {
+  async open(store, { format, name, decodedChunkBytes = residencyBudgetBytes('decodedBlocks'), decodedBudget = null, link = null, activity = null, cellSubset = null, carry = null, previous = null, keptIndexes = null, signal = null }) {
     if (!isGroup(store)) throw new TypeError('An AnnData reader opens a store root group.');
     const requestId = ++this._openRequestId;
     const candidate = new AnnDataReader();
@@ -665,25 +1156,79 @@ export class AnnDataReader {
     candidate._store = store;
     candidate._decodedChunkBytes = decodedChunkBytes;
     candidate._link = link;
+    candidate._keptIndexes = keptIndexes?.identity == null ? null : {
+      identity: keptIndexes.identity,
+      // Kept for one tab only (an identity naming no version): the page's tab.
+      tab: keptIndexes.tab ?? undefined,
+      onStore: keptIndexes.onStore ?? null,
+      environment: keptIndexes.environment ?? globalThis,
+    };
     candidate.createActivity = this.createActivity;
     try {
       // A file written before anndata 0.8 is read through its current-layout
       // view; everything below reads one layout.
       candidate._root = isOlderAnnDataLayout(store) ? currentLayoutView(store) : store;
-      if (activity === null) {
-        await candidate._track('open', `the structure of ${name}`, options => candidate._readStructure(options));
-      } else {
-        await candidate._readStructure({ activity });
+      // The store's decoded chunks (`decoded-chunks.js`): an opening of the
+      // same store (a growth's next step) reads its added rows out of them,
+      // holding them beside the earlier opening (several may be live at
+      // once: a reopen in flight while another commits), so they go only
+      // once the last opening holding them closes.
+      candidate._decodedChunks = carry?._decodedChunks?.retain() ?? new DecodedChunks(decodedBudget ?? decodedChunkBytes);
+      if (carry !== null) {
+        for (const [path, pointers] of carry._indptrs) candidate._indptrs.set(path, pointers);
+        // The kept rows' pointers its subsample read: a raise or a lowering
+        // of the same store reads only the rows they do not hold.
+        candidate._knownRowPointers = carry._root?.knownRowPointers?.() ?? new Map();
+        for (const [element, pointers] of carry._pointerReads) {
+          if (!element.startsWith('mod/')) candidate._pointerReads.set(element, pointers);
+        }
+        // What was read of the store whatever its cells: the gene names of
+        // each var axis (the var index among them), and each categorical
+        // field's counts over every cell
+        // (`subsampleRepresentation`). A progressive opening reopens at each
+        // step; these are not read again.
+        for (const [key, value] of carry._cache) {
+          if (key.startsWith('var_names:') || key.startsWith('obs_counts:')) candidate._cache.set(key, value);
+        }
       }
+      const structure = async options => {
+        await candidate._openCells(cellSubset, options);
+        // The open cells' original positions (a priority-ordered file) are
+        // read beside the structure, not before it.
+        await Promise.all([candidate._readStructure(options, carry), candidate._settleOpenOrder()]);
+      };
+      if (activity === null) {
+        await candidate._track('open', `the structure of ${name}`, structure, signal);
+      } else {
+        await structure({ activity, signal });
+      }
+      // A cancelled opening takes nothing over from the earlier one, even
+      // when a read of it did not stop.
+      if (signal?.aborted) throw abortReason(signal);
       this._assertOpenRequest(requestId);
+      const earlier = carry ?? previous;
+      const shared = earlier === null ? 0 : candidate._sharedRows(earlier);
+      if (carry !== null) candidate._takeCarried(carry, shared);
       this._adopt(candidate);
-      console.log(`[AnnDataReader] Opened ${name}: ${formatCountOf(this._nObs, 'cell')}, ${formatCountOf(this._nVars, 'gene')}`);
+      // An opening grown or cut in place -- its first cells are all of the
+      // earlier one's, or its cells are all among the earlier one's first --
+      // shows every embedding in the frame those cells were shown in, so
+      // none of them moves (`EmbeddingPayloads.adoptTransforms`), whether or
+      // not the store itself could be taken over.
+      // The same cells in another order (a subsample grown from few chunks
+      // put in priority order, `progressive-open.js`) keep it likewise.
+      if (earlier !== null && ((shared > 0 && shared === Math.min(earlier._nObs, this._nObs)) || this._sameCells(earlier))) {
+        this._payloads.adoptTransforms(earlier._payloads);
+      }
+      const subset = this._cellSubset;
+      console.log(`[AnnDataReader] Opened ${name}: ${formatCountOf(this._nObs, 'cell')}${subset?.kept ? ` of ${subset.nObs}` : ''}, ${formatCountOf(this._nVars, 'gene')}`);
     } catch (error) {
       let terminal = error instanceof Error && error.message.length > 0
         ? error
         : new TypeError(`${format.file} opening must reject with a non-empty Error.`, { cause: error });
       try {
         candidate._store = null;
+        // Its hold on the decoded chunks goes; the earlier opening keeps its own.
         candidate.close();
       } catch (cleanupFailure) {
         terminal = combineDatasetLifecycleFailures(terminal, cleanupFailure, `${format.file} opening and candidate cleanup both failed.`);
@@ -693,17 +1238,572 @@ export class AnnDataReader {
   }
 
   _adopt(candidate) {
+    // This reader's hold on its decoded chunks goes; the candidate's becomes its own.
+    this._decodedChunks?.release();
+    this._decodedChunks = null;
     this._releaseCurrentState();
-    for (const key of ['_root', '_store', '_format', '_name', '_nObs', '_nVars', '_obsKeys', '_varNames', '_cache', '_matrices', '_decodedChunkBytes', '_title', '_cellucid', '_link', '_pointerReads', '_modalities', '_defaultModality']) {
+    for (const key of ['_root', '_store', '_format', '_name', '_nObs', '_nVars', '_obsKeys', '_cache', '_matrices', '_decodedChunkBytes', '_title', '_cellucid', '_link', '_pointerReads', '_modalities', '_defaultModality', '_cellSubset', '_fullRoot', '_indptrs', '_carried', '_graphShares', '_prefixReads', '_keptIndexes', '_keptRuns', '_decodedChunks']) {
       this[key] = candidate[key];
     }
     this._closed = false;
     candidate._root = null;
+    candidate._fullRoot = null;
     candidate._store = null;
+    candidate._decodedChunks = null;
   }
 
-  /** @private */
-  async _readStructure(readOptions = {}) {
+  /** The file row of open cell `i` (every row in file order when no subset is open). @private */
+  _fileRowAt(i) {
+    const rows = this._cellSubset?.fileRows ?? null;
+    return rows === null ? i : rows[i];
+  }
+
+  /**
+   * Take over from `previous` (an earlier opening of the same store, about
+   * to close) the gene columns of the dataset's own matrices that this
+   * opening's cells keep: open rows `[0, L)` are the same file rows in both
+   * (`L` their shared prefix; a larger or smaller subsample of the same
+   * method and seed shares all of the smaller one, `priorityOrder`). A
+   * matrix indexed in segments (`prefix-column-index.js`) keeps the segments
+   * within `L`; one indexed whole is kept when both open the same rows.
+   * What is not kept is `previous`'s to release. Returns `L`. @private
+   */
+  _takeCarried(previous, shared) {
+    const nPrevious = previous._nObs;
+    const sameRows = shared === nPrevious && shared === this._nObs;
+    for (const [element, state] of [...previous._matrices]) {
+      const columns = state.columns?.source ?? null;
+      if (columns === null || element.startsWith('mod/')) continue;
+      if (Array.isArray(columns.segments) && this._cellSubset?.ordered === true && previous._cellSubset?.ordered === true) {
+        if (shared === 0) continue;
+        previous._matrices.delete(element);
+        this._carried.set(element, { segments: carriedSegments(columns, shared) });
+      } else if (sameRows) {
+        previous._matrices.delete(element);
+        this._carried.set(element, { columns });
+      }
+    }
+    return shared;
+  }
+
+  /**
+   * Whether this opening and `previous` (an earlier opening of the same
+   * dataset) open the same cells, in any order. @private
+   */
+  _sameCells(previous) {
+    const mine = this._cellSubset?.kept ?? null;
+    const theirs = previous._cellSubset?.kept ?? null;
+    if (this._nObs !== previous._nObs || mine === null || theirs === null || mine.length !== theirs.length) return false;
+    for (let i = 0; i < mine.length; i++) if (mine[i] !== theirs[i]) return false;
+    return true;
+  }
+
+  /**
+   * How many of the first open rows this opening and `previous` (an earlier
+   * opening of the same dataset) share: the largest `L` such that open rows
+   * `[0, L)` are the same file rows in both. @private
+   */
+  _sharedRows(previous) {
+    const limit = Math.min(previous._nObs, this._nObs);
+    let shared = 0;
+    while (shared < limit && previous._fileRowAt(shared) === this._fileRowAt(shared)) shared++;
+    return shared;
+  }
+
+  /**
+   * Gene columns of a cell-major matrix whose rows are in priority order,
+   * indexed in segments (`prefix-column-index.js`): the segments an earlier
+   * opening carried over (`_carried`), then new ones to the last row. @private
+   */
+  async _segmentedColumns(resolved, readOptions) {
+    const { node: matrix, label, nRows, sourceVars, key: element } = resolved;
+    const pointers = await this._openRowPointers(matrix, readOptions);
+    const segments = [...(this._carried.get(element)?.segments ?? [])];
+    this._carried.delete(element);
+    // Each segment's store is placed with what the built ones before it left.
+    const storeFactory = sharedBudgetFactory(this.columnStoreFactory, () => segments
+      .filter(segment => segment.access.built?.() === true)
+      .reduce((sum, segment) => sum + (segment.access.residentBytes?.() ?? 0), 0));
+    let start = segments.length === 0 ? 0 : segments.at(-1).start + segments.at(-1).rows;
+    // Runs of the rows after those an earlier opening carried over, kept in
+    // this browser (a later visit, or another subsample of the same method
+    // and seed); the rest is built in doubling segments, each kept as it is.
+    const runs = await this._takeKeptRuns(resolved, () => Promise.resolve(pointers));
+    const first = firstSegmentRows(nRows, entriesPerRow(matrix, nRows));
+    try {
+      while (start < nRows) {
+        let run = runs.find(item => item.start === start) ?? null;
+        let end = run === null ? segmentBounds(start, nRows, first)[0] : start + run.rows;
+        const next = runs.find(item => item.start > start);
+        if (run === null && next !== undefined) end = Math.min(end, next.start);
+        const segmentStart = start;
+        const segment = rowRangeMatrix(matrix, start, end, pointers);
+        // A segment whose genes are read as stored (a dense one in strips
+        // the decoded-chunk budget holds) has no index: its run is let go.
+        if (run !== null && !readsThroughRowIndex(segment, { nObs: end - start, nVars: sourceVars, decodedChunkBytes: this._decodedChunkBytes })) {
+          runs.splice(runs.indexOf(run), 1);
+          run.kept.release();
+          run = null;
+        }
+        const access = await openMatrixColumns(segment, {
+          format: this._format,
+          label,
+          nObs: end - start,
+          nVars: sourceVars,
+          decodedChunkBytes: this._decodedChunkBytes,
+          indexOptions: {
+            ...this._indexOptions(),
+            storeFactory,
+            // Built by a pass (no run kept, or the kept run found damaged): kept,
+            // with the fingerprint the pass takes of its rows.
+            fingerprintRows: fingerprintRows(end - start),
+            onBuilt: (store, fingerprint) => this._keepRun(resolved, segmentStart, end, pointers, store, fingerprint),
+            ...(run === null ? {} : { kept: run.kept }),
+          },
+          onIndexStart: (indexLabel, { rescan = null } = {}) => this.createActivity?.({
+            kind: 'index',
+            label: geneIndexActivityLabel(label, rescan),
+            background: rescan === null,
+          }) ?? null,
+          readOptions: { activity: readOptions.activity ?? null },
+        });
+        // Its index holds it now, and lets it go when it is disposed.
+        if (run !== null) runs.splice(runs.indexOf(run), 1);
+        const residentBytes = columnIndexResidentBytes({
+          layout: isGroup(matrix) ? 'sparse' : 'dense',
+          nnz: pointers === null ? 0 : pointers[end] - pointers[start],
+          nObs: end - start,
+          nVars: sourceVars,
+          valuesOnDemand: !this._readsAhead(),
+        });
+        segments.push({ start, rows: end - start, access, residentBytes });
+        start = end;
+      }
+    } finally {
+      // Runs this opening did not use (they start inside rows carried over,
+      // or the segments failed to open).
+      for (const run of runs) run.kept.release();
+    }
+    // Unbuilt segments are built together when their indexes fit what the
+    // budget leaves beside the built ones (`storeFactory.memoryBudgetBytes`).
+    const together = unbuilt => unbuilt.reduce((sum, segment) => sum + (segment.residentBytes ?? Infinity), 0) <= storeFactory.memoryBudgetBytes;
+    return segmentedColumns({ nRows, segments, together });
+  }
+
+  /**
+   * The file rows of the open rows of a matrix whose index can be kept in
+   * this browser (`kept-column-index.js`): the dataset's own matrices read
+   * whole by their rows (all open rows, in the order they are open), and a
+   * modality's when every cell is open; null for any other (a column
+   * window, a subsample's gene-major matrix read through its rows, a
+   * modality's rows of a subsample). @private
+   */
+  _keptRowsOf(resolved) {
+    if (this._keptIndexes === null || resolved.start !== 0 || resolved.throughCells || (resolved.prefix ?? null) !== null) return null;
+    const fileRows = this._cellSubset?.fileRows ?? null;
+    if (resolved.key.startsWith('mod/') && fileRows !== null) return null;
+    return {
+      fileRows,
+      of: (start, end) => {
+        if (fileRows !== null) return fileRows.subarray(start, end);
+        const rows = allocateTypedArray(Uint32Array, end - start, 'File rows');
+        for (let i = 0; i < rows.length; i++) rows[i] = start + i;
+        return rows;
+      },
+    };
+  }
+
+  /** The group a matrix's kept index is filed under (`keptIndexGroup`). @private */
+  _keptGroup(resolved) {
+    const subset = (this._cellSubset?.fileRows ?? null) !== null;
+    return keptIndexGroup({
+      file: this._keptIndexes.identity,
+      element: resolved.key,
+      // The matrix as stored: every row of the file (a subsample keeps some).
+      shape: [resolved.key.startsWith('mod/') || !subset ? resolved.nRows : this._cellSubset.nObs, resolved.sourceVars],
+      order: orderKey(this._cellSubset?.spec ?? null, subset),
+    });
+  }
+
+  /**
+   * The kept runs of a matrix's index this opening can use
+   * (`findKeptRuns`), found once and held until its index takes them
+   * (`_takeKeptRuns`) or the opening ends. `pointers()`: the open rows' row
+   * pointers (read only when a kept run is checked). @private
+   */
+  _keptRunsOf(resolved, pointers) {
+    const rows = this._keptRowsOf(resolved);
+    if (rows === null) return Promise.resolve([]);
+    let found = this._keptRuns.get(resolved.key);
+    if (found === undefined) {
+      const { tab, environment } = this._keptIndexes;
+      found = findKeptRuns(this._keptGroup(resolved), {
+        nRows: resolved.nRows,
+        nCols: resolved.sourceVars,
+        fileRows: rows.of,
+        pointers: isGroup(resolved.node) ? pointers : null,
+        rowChecksums: this._keptRowChecksums(resolved, pointers),
+        label: resolved.label,
+      }, { environment, tab }).catch(() => []);
+      this._keptRuns.set(resolved.key, found);
+    }
+    return found;
+  }
+
+  /**
+   * The file's open rows of a matrix as they are now (`rowChecksums`), for
+   * the fingerprint of a kept run of a file whose identity does not name its
+   * content; null when the matrix cannot be read so. `pointers()`: the open
+   * rows' row pointers. @private
+   */
+  _keptRowChecksums(resolved, pointers) {
+    try {
+      return rowChecksums(resolved.node, { format: this._format, label: resolved.label, pointers });
+    } catch {
+      return null;
+    }
+  }
+
+  /** The kept runs of a matrix's index, taken by the index that starts from them (the caller releases what it does not use). @private */
+  async _takeKeptRuns(resolved, pointers) {
+    const runs = [...await this._keptRunsOf(resolved, pointers)];
+    this._keptRuns.delete(resolved.key);
+    return runs;
+  }
+
+  /**
+   * Keep the index of open rows `[start, end)` of a matrix, built by a pass
+   * (`RowMajorColumnIndex` `onBuilt`), for a later opening of the same rows:
+   * in the background, a piece at a time between the reader's other work.
+   * @private
+   */
+  _keepRun(resolved, start, end, pointers, store, fingerprint) {
+    const rows = this._keptRowsOf(resolved);
+    if (rows === null || typeof store?.keptParts !== 'function') return;
+    const kept = this._keptIndexes;
+    const group = this._keptGroup(resolved);
+    const job = (async () => {
+      const all = pointers ?? (isGroup(resolved.node) ? await this._openRowPointers(resolved.node) : null);
+      let rowPointers = null;
+      if (all !== null) {
+        rowPointers = allocateTypedArray(Float64Array, end - start + 1, 'Row pointers');
+        for (let i = 0; i < rowPointers.length; i++) rowPointers[i] = all[start + i] - all[start];
+      }
+      await keepRun(group, {
+        start,
+        fileRows: rows.fileRows === null ? null : copyTypedArray(Uint32Array, rows.fileRows.subarray(start, end), 'File rows'),
+        rowPointers,
+        parts: store.keptParts(),
+      }, {
+        file: kept.identity,
+        environment: kept.environment,
+        tab: kept.tab,
+        onStore: kept.onStore,
+        fingerprint,
+        yieldControl: () => this._yieldToForeground(false),
+      });
+    })().catch(() => {});
+    this._keeping.add(job);
+    void job.finally(() => this._keeping.delete(job));
+  }
+
+  /**
+   * Resolves once every run of a built index this reader is keeping in this
+   * browser is kept (or given up): a measurement, or a test, that opens the
+   * same cells next.
+   */
+  async whenIndexesKept() {
+    while (this._keeping.size > 0) await Promise.all([...this._keeping]);
+  }
+
+  /**
+   * How far the segments of a matrix indexed in segments are built: `done`,
+   * the rows of the built prefix of segments (its own, or those an earlier
+   * opening carried over); `next`, where the next segment ends (the cells the
+   * next gene shows on first); `pointers`, a CSR matrix's row pointers. @private
+   */
+  async _segmentProgress(resolved) {
+    const { node: matrix, nRows, key: element } = resolved;
+    const segments = this._matrices.get(element)?.columns?.segments ?? this._carried.get(element)?.segments ?? [];
+    let done = 0;
+    for (const segment of segments) {
+      if (segment.start !== done || segment.access.built?.() !== true) break;
+      done += segment.rows;
+    }
+    const pointers = await this._openRowPointers(matrix);
+    let runs = [];
+    if (this._matrices.get(element)?.columns == null) {
+      // Not opened yet: the runs kept in this browser are built too.
+      runs = await this._keptRunsOf(resolved, () => Promise.resolve(pointers));
+      for (const run of runs) if (run.start === done) done += run.rows;
+    }
+    const pending = segments.find(segment => segment.start === done);
+    const following = runs.find(run => run.start > done);
+    const next = pending !== undefined
+      ? done + pending.rows
+      : Math.min(segmentBounds(done, nRows, firstSegmentRows(nRows, entriesPerRow(matrix, nRows)))[0] ?? nRows, following?.start ?? nRows);
+    return { done, next, pointers };
+  }
+
+  /**
+   * The row pointers of a CSR matrix as open (null for a dense one): a
+   * subsample view's, in memory, else the stored ones, kept (they do not
+   * depend on the cells). @private
+   */
+  async _openRowPointers(matrix, readOptions = {}) {
+    if (!isGroup(matrix)) return null;
+    const stored = this._cellSubset?.fileRows === null;
+    const pointers = (stored ? this._indptrs.get(matrix.path) : undefined) ?? await readRowPointers(matrix, readOptions);
+    if (stored) this._indptrs.set(matrix.path, pointers);
+    return pointers;
+  }
+
+  /**
+   * Whether a matrix is read by gene through a row-major index (a CSR
+   * matrix, or a dense one not stored in gene strips the decoded-chunk
+   * budget holds: `openMatrixColumns`), and its rows are the open cells in
+   * priority order: then it is indexed in segments. @private
+   */
+  _indexedInSegments(resolved) {
+    if (this._cellSubset?.ordered !== true || resolved.throughCells || resolved.prefix !== null || resolved.cells !== null) return false;
+    if (resolved.key.startsWith('mod/') || resolved.start !== 0) return false;
+    return readsThroughRowIndex(resolved.node, { nObs: resolved.nRows, nVars: resolved.sourceVars, decodedChunkBytes: this._decodedChunkBytes });
+  }
+
+  /**
+   * Make a matrix of a subsample ready to be read: its kept rows' pointers,
+   * when it is a CSR matrix on the cell axis (`cellSubsetView`
+   * `readRowPointers`; nothing for any other matrix, or when every cell is
+   * open: null, so a read of every cell waits for nothing). `X`'s also
+   * give the subsample's kept values and the share of X's index chunks they
+   * lie in (`cellSubset`). @private
+   */
+  _readyRows(element, readOptions = {}) {
+    const root = this._root;
+    if (typeof root?.readRowPointers !== 'function' || typeof element !== 'string') return null;
+    return root.readRowPointers(element, readOptions).then(() => this._noteKeptValues(element, root));
+  }
+
+  /** `estimatedChunkShare` of a CSR X for the kept rows (null for another layout). @private */
+  _estimatedChunkShare(full, resolution) {
+    const X = child(full, 'X');
+    if (!isGroup(X) || encodingType(X) !== 'csr_matrix') return null;
+    const indices = X.get('indices');
+    const chunkElements = Array.isArray(indices?.chunks) && indices.partialChunks !== true ? indices.chunks[0] : null;
+    return chunkElements === null ? null : estimatedChunkShare(resolution.fileRows, resolution.nObs, indices.shape[0], chunkElements);
+  }
+
+  /** The subsample's kept values of X, once X's kept rows' pointers are read. @private */
+  _noteKeptValues(element, root) {
+    const subset = this._cellSubset;
+    if (element !== 'X' || subset === null || subset.keptValues !== null || root !== this._root) return;
+    // Exact from here on: the estimate made at opening is replaced.
+    const X = child(this._fullRoot, 'X');
+    const pointers = root.rowPointersOf('X');
+    if (!isGroup(X) || encodingType(X) !== 'csr_matrix' || pointers === null) return;
+    const indices = X.get('indices');
+    const chunkElements = Array.isArray(indices?.chunks) && indices.partialChunks !== true ? indices.chunks[0] : null;
+    subset.keptValues = keptValueCount(pointers, subset.fileRows);
+    subset.matrixChunkShare = chunkElements === null ? null : keptChunkShare(pointers, subset.fileRows, chunkElements, indices.shape[0]);
+  }
+
+  /** The link's merge gap now (0 without a link): what the subsample view joins reads within. @private */
+  _mergeGapBytes() {
+    return this._link?.mergeGapBytes ?? 0;
+  }
+
+  /**
+   * Resolve which cells to open (`resolveCellSubset`) and, for a subsample,
+   * present the store as its view (`cellSubsetView`): everything after
+   * this reads the kept cells only. @private
+   */
+  async _openCells(request, readOptions) {
+    const full = this._root;
+    const context = {
+      valuesOnDemand: !this._readsAhead(),
+      decodedChunkBytes: this._decodedChunkBytes ?? residencyBudgetBytes('decodedBlocks'),
+      readOptions,
+    };
+    let resolution = await resolveCellSubset(full, request, context);
+    // A first view smaller than the cells asked for, when reading them is
+    // measured to take long (`progressive-open.js`): the page grows it in
+    // place to them (`growth`).
+    let growth = null;
+    if (request?.progressive != null) {
+      const nObs = resolution.nObs;
+      const link = this._link?.snapshot?.() ?? null;
+      const asked = resolution;
+      const plan = await planProgressiveOpening(asked, {
+        nObs,
+        // Decoding is priced at a measured rate: before any chunk has been
+        // decoded here, the first view's first chunk is read to measure it
+        // where a read costs no round trip worth pricing.
+        costOf: target => firstViewCost(full, nObs, asked.fileRows ?? null, target, readOptions, { measureDecode: link?.readsAhead === true }),
+        link,
+        msPerCell: request.progressive.msPerCell ?? null,
+        targetMs: request.progressive.targetMs,
+      });
+      if (plan !== null) {
+        resolution = await resolveCellSubset(full, plan.first, context);
+        growth = plan.growth;
+      }
+    }
+    this._fullRoot = full;
+    if (resolution.fileRows === null) {
+      this._cellSubset = { ...resolution, rows: null, keptValues: null, matrixChunkShare: null, growth };
+      return;
+    }
+    // The view reads a CSR matrix's row pointers when the matrix is first
+    // read, and only the kept rows' (`readRowPointers`): opening a
+    // subsample reads none. Pointers read whole before (every cell open,
+    // then a subsample of the same store) serve it at once.
+    this._root = await cellSubsetView(full, {
+      nObs: resolution.nObs,
+      kept: resolution.fileRows,
+      mergeGapBytes: () => this._mergeGapBytes(),
+      readOptions,
+      indptrs: this._indptrs,
+      knownRowPointers: this._knownRowPointers,
+      chunks: this._decodedChunks,
+    });
+    this._prefixReads = startPrefixReads(full, resolution, readOptions);
+    this._cellSubset = {
+      ...resolution,
+      rows: new CellRows(resolution.fileRows, resolution.nObs),
+      // The stored values of the kept rows of a CSR X, known once X's kept
+      // row pointers are read (`_readyRows`); the share of its index chunks
+      // they lie in, estimated from its mean values a row until then (null
+      // for another layout, or one read byte by byte).
+      keptValues: null,
+      matrixChunkShare: this._estimatedChunkShare(full, resolution),
+      growth,
+    };
+  }
+
+  /**
+   * Settle a priority-ordered file's open order (`openOrderRead`,
+   * `subsample-plan.js`) into the cell subset. @private
+   */
+  async _settleOpenOrder() {
+    const subset = this._cellSubset;
+    const read = subset?.openOrderRead;
+    if (read === undefined) return;
+    const openOrder = await read;
+    const { openOrderRead: _settled, ...rest } = subset;
+    this._cellSubset = { ...rest, openOrder };
+  }
+
+  /**
+   * The cells this reader presents: `{nObs, kept, spec, autoFit,
+   * reproduced, note, keptValues, matrixChunkShare}` (`subsample-plan.js`);
+   * `kept` null when every cell is open. `keptValues` is the stored values
+   * of the kept rows of a cell-major `X` (what its gene index holds), and
+   * `matrixChunkShare` the share of its stored chunks they lie in; null for
+   * other layouts.
+   */
+  get cellSubset() {
+    const subset = this._cellSubset;
+    if (subset === null) return null;
+    const { rows: _rows, fileRows: _fileRows, ...plain } = subset;
+    return plain;
+  }
+
+  /**
+   * How much of a neighbour graph a subsample keeps, once the graph was
+   * read (`readInducedGraph`): `{kept, of}`, its stored entries between two
+   * open cells of those of the open cells (the others join an open cell to
+   * one left out); null before it is read, or when every cell is open.
+   *
+   * @param {string} key - The `obsp` key
+   * @returns {{kept: number, of: number}|null}
+   */
+  subsampleGraphShare(key) {
+    this._ensureOpen();
+    return this._graphShares.get(key) ?? null;
+  }
+
+  /**
+   * How the subsample represents a categorical obs field: each category's
+   * share of the kept cells against its share of every cell, read from the
+   * field's codes (a few bytes per cell), and the largest difference. Null
+   * when every cell is open.
+   *
+   * @param {string} key
+   * @returns {Promise<{field: string, largestDeviation: number, category: string|null,
+   *   shares: Array<{category: string, all: number, kept: number}>}|null>}
+   */
+  async subsampleRepresentation(key) {
+    this._ensureOpen();
+    const subset = this._cellSubset;
+    if (subset?.kept === null || subset === null) return null;
+    const column = child(child(this._fullRoot, 'obs'), key);
+    if (!isGroup(column) || encodingType(column) !== 'categorical') {
+      throw new Error(`obs['${key}'] is not a categorical field`);
+    }
+    const memo = `obs_representation:${key}`;
+    if (this._cache.has(memo)) return this._cache.get(memo);
+    const result = this._track('fields', `the representation of obs['${key}'] in the subsample`, async readOptions => {
+      // Every cell's counts are the store's, whatever cells are open: read
+      // once (`obs_counts`, carried to a later opening of the same store),
+      // then only the open cells' codes.
+      const countsKey = `obs_counts:${key}`;
+      const known = this._cache.get(countsKey) ?? null;
+      let names;
+      let all;
+      let kept;
+      const slotIn = count => code => (Number(code) >= 0 && Number(code) < count ? Number(code) : count);
+      if (known === null) {
+        const codesNode = column.get('codes');
+        const [codes, categories] = await Promise.all([
+          readStored(codesNode, 0, codesNode.shape[0], `obs['${key}'] codes`, readOptions),
+          readCategories(column.get('categories'), key, this._format, readOptions),
+        ]);
+        names = Array.from(categories, String);
+        all = allocateTypedArray(Float64Array, names.length + 1, `obs['${key}'] category sizes`);
+        kept = allocateTypedArray(Float64Array, names.length + 1, `obs['${key}'] category sizes`);
+        const slot = slotIn(names.length);
+        for (let cell = 0; cell < codes.length; cell++) all[slot(codes[cell])]++;
+        const rows = subset.fileRows ?? subset.kept;
+        for (let i = 0; i < rows.length; i++) kept[slot(codes[rows[i]])]++;
+        this._cache.set(countsKey, Object.freeze({ names, all }));
+      } else {
+        ({ names, all } = known);
+        const openCodes = child(child(this._root, 'obs'), key).get('codes');
+        const codes = await readStored(openCodes, 0, openCodes.shape[0], `obs['${key}'] codes`, readOptions);
+        kept = allocateTypedArray(Float64Array, names.length + 1, `obs['${key}'] category sizes`);
+        const slot = slotIn(names.length);
+        for (let i = 0; i < codes.length; i++) kept[slot(codes[i])]++;
+      }
+      const shares = [];
+      let largestDeviation = 0;
+      let category = null;
+      for (let c = 0; c <= names.length; c++) {
+        if (all[c] === 0) continue;
+        const entry = { category: c < names.length ? names[c] : null, all: all[c] / subset.nObs, kept: kept[c] / subset.kept.length };
+        shares.push(entry);
+        const deviation = Math.abs(entry.kept - entry.all);
+        if (deviation > largestDeviation) {
+          largestDeviation = deviation;
+          category = entry.category;
+        }
+      }
+      return { field: key, largestDeviation, category, shares };
+    });
+    this._cache.set(memo, result);
+    result.catch(() => {
+      if (this._cache.get(memo) === result) this._cache.delete(memo);
+    });
+    return result;
+  }
+
+  /**
+   * The store's structure, checked. The var index is checked (its length and
+   * kind) but its names are not read: no view waits for the gene names, and
+   * they are read when first asked for (`readVarNames`). `carry`: the reader
+   * of an earlier opening of the same store, whose title is this one's.
+   * @private
+   */
+  async _readStructure(readOptions = {}, carry = null) {
     const root = this._root;
     const format = this._format;
     const fileLabel = `${format.file} root`;
@@ -722,15 +1822,23 @@ export class AnnDataReader {
     if (hasX) {
       const X = root.get('X');
       if (isGroup(X)) {
-        const sparse = sparseContract(X, format, 'Sparse X');
-        [nObs, nVars] = sparse.shape;
-        if (sparse.format === 'csc') {
+        // A subsample's CSR X is checked as stored: its kept rows' arrays
+        // are made when it is first read (`_readyRows`), and only its shape
+        // is the view's.
+        const stored = this._fullRoot !== null && this._fullRoot !== root && X.rowPointersPending?.() === true
+          ? this._fullRoot.get('X')
+          : X;
+        const sparse = sparseContract(stored, format, 'Sparse X');
+        [nObs, nVars] = stored === X ? sparse.shape : shapeFromAttribute(attributeValue(X, 'shape'), 'Sparse X');
+        const element = X.path.replace(/^\/+/, '');
+        if (sparse.format === 'csc' && !this._pointerReads.has(element)) {
           // A gene of a CSC matrix reads its range of the pointers first:
           // read them now, beside the indexes, and the first gene is one
           // round trip. A failure reaches the first gene read, not opening.
+          // (An earlier opening of the store read them already: `carry`.)
           const pointers = readIntegers(sparse.indptrArray, 0, nVars + 1, 'Sparse X indptr', readOptions);
           pointers.catch(() => {});
-          this._pointerReads.set(X.path.replace(/^\/+/, ''), pointers);
+          this._pointerReads.set(element, pointers);
         }
       } else {
         validateArrayEncoding(X, format, 'Dense X', 'array');
@@ -744,14 +1852,15 @@ export class AnnDataReader {
     }
     // The title (one small read) is read beside the indexes: dataset
     // metadata then never waits a round trip for it.
-    this._title = readUnsTitle(root, readOptions);
+    this._title = carry?._title ?? readUnsTitle(root, readOptions);
     this._title.catch(() => {});
     // What the file says about itself for Cellucid is part of opening it: a
-    // malformed entry refuses the file, so it is read with the indexes.
+    // malformed entry refuses the file, so it is read with the indexes. (Of
+    // the open cells: a subsample's view gathers its per-cell entries.)
     const unsCellucid = child(child(root, 'uns'), 'cellucid');
     const [obsIndex, varIndex, cellucid] = await Promise.all([
       readDataFrameIndex(obs.get(obsSchema.indexKey), format, 'Observation index', hasX ? nObs : null, false, readOptions),
-      readDataFrameIndex(var_.get(varSchema.indexKey), format, 'Variable index', hasX ? nVars : null, true, readOptions),
+      readDataFrameIndex(var_.get(varSchema.indexKey), format, 'Variable index', hasX ? nVars : null, false, readOptions),
       unsCellucid === null ? null : readUnsCellucid(unsCellucid, readOptions),
     ]);
     this._cellucid = cellucid;
@@ -778,10 +1887,17 @@ export class AnnDataReader {
         }
       }
     }
-    this._obsKeys = [...obsSchema.columnOrder];
-    // A repeated name is kept as stored: the adapter makes the gene list
-    // unique with the data-mapping rule, as cellucid serve does.
-    this._varNames = varIndex.values;
+    // A priority-ordered file's original positions are how its cells are
+    // named (`priority-layout.js`, the cell identity), not a field: listed,
+    // they would be offered for colouring and filtering and written into
+    // exports, where a subset's positions no longer name its rows.
+    // So are each modality's own (a MuData in priority order: its rows
+    // follow their cells, `<modality>:cellucid_original_position`).
+    // Only a verified record (`priority-layout.js`): one that does not
+    // describe the cells leaves the column an ordinary one.
+    const priorityOrdered = this._cellSubset?.prioritySeed != null;
+    const positions = new Set([PRIORITY_ORIGINAL_COLUMN, ...[...(this._modalities?.keys() ?? [])].map(name => `${name}:${PRIORITY_ORIGINAL_COLUMN}`)]);
+    this._obsKeys = obsSchema.columnOrder.filter(key => !(priorityOrdered && positions.has(key)));
   }
 
   get nObs() { return this._nObs; }
@@ -789,8 +1905,6 @@ export class AnnDataReader {
   get nVars() { return this._nVars; }
 
   get obsKeys() { return [...this._obsKeys]; }
-
-  get varNames() { return [...this._varNames]; }
 
   /** Whether the dataset has an expression matrix (`X` may be absent). */
   get hasExpressionMatrix() { return this._root?.has('X') === true; }
@@ -822,11 +1936,21 @@ export class AnnDataReader {
         return { name: modality.name, nCells: modality.nCells, ...probe };
       }));
     }
+    // A subsample's graphs are stored on every cell and read as their induced
+    // subgraph on the open cells (`readInducedGraph`): listed as that graph,
+    // its stored entries unknown until it is read.
+    const subsetRows = this._cellSubset?.rows ?? null;
+    const openGraph = probe => (
+      subsetRows !== null && probe.shape?.length === 2
+        && probe.shape[0] === subsetRows.nOriginal && probe.shape[1] === subsetRows.nOriginal
+        ? { ...probe, shape: [this._nObs, this._nObs], nnz: null }
+        : probe
+    );
     return {
       nObs: this._nObs,
       nVars: this._nVars,
       obsm: mappingProbes('obsm'),
-      obsp: mappingProbes('obsp'),
+      obsp: mappingProbes('obsp').map(openGraph),
       varColumns: expression.varColumns,
       X: expression.X,
       layers: expression.layers,
@@ -1001,28 +2125,36 @@ export class AnnDataReader {
    * type (64-bit integers converted as `Number` does). Only the
    * selected columns' chunks are read: a selection spanning at most twice
    * its own width is read as one column range, otherwise column by column,
-   * every range at once. `signal` cancels the read.
+   * every range at once. `signal` cancels the read; `reason` says what the
+   * read is for (its activity's label).
    */
-  async readObsmColumns(key, columns, { signal = null } = {}) {
+  async readObsmColumns(key, columns, { signal = null, rows = null, reason = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
     const { array, shape, width, label } = this._obsmArray(key);
     const selected = requireObsmColumnSelection(columns, width, label);
-    return this._track('embedding', `${label} columns ${selected.join(', ')}`, readOptions =>
-      this._readObsmColumns(array, shape, selected, label, generation, readOptions), signal);
+    const asked = this._rowRange(rows, label);
+    const range = asked ?? { start: 0, end: shape[0] };
+    // The activity names the open cells read and what for, so a trace tells
+    // a growth step's added rows from a whole read.
+    const what = `${label} columns ${selected.join(', ')}`
+      + (asked === null ? `, every open cell` : `, open cells ${formatCount(asked.start)}–${formatCount(asked.end)}`)
+      + (reason === null ? '' : ` (${reason})`);
+    return this._track('embedding', what, readOptions =>
+      this._readObsmColumns(array, shape, selected, label, generation, readOptions, range), signal);
   }
 
   /** @private */
-  async _readObsmColumns(array, shape, selected, label, generation, readOptions) {
-    const nRows = shape[0];
+  async _readObsmColumns(array, shape, selected, label, generation, readOptions, { start: firstRow, end: endRow } = { start: 0, end: shape[0] }) {
+    const nRows = endRow - firstRow;
     const nColumns = selected.length;
     const stored32 = valueKind(array) === 'float' && array.dtype?.bytes === 4;
     const result = allocateTypedArray(stored32 ? Float32Array : Float64Array, nRows * nColumns, label);
     const toNumber = value => (typeof value === 'bigint' ? Number(value) : value);
     if (shape.length === 1) {
-      for await (const slab of readRowSlabs(array, 0, nRows, readOptions)) {
+      for await (const slab of readRowSlabs(array, firstRow, endRow, readOptions)) {
         const block = slab.values;
-        for (let row = 0; row < block.length; row++) result[slab.rowStart + row] = toNumber(block[row]);
+        for (let row = 0; row < block.length; row++) result[slab.rowStart - firstRow + row] = toNumber(block[row]);
       }
     } else {
       const first = Math.min(...selected);
@@ -1035,16 +2167,16 @@ export class AnnDataReader {
         // Every column of the range asked for, in order: a slab is already
         // laid out as the output is.
         const whole = blockWidth === nColumns && picks.every(([column, output], i) => column === from + i && output === i);
-        for await (const slab of readRowSlabs(array, 0, nRows, { ...readOptions, columns: [from, to] })) {
+        for await (const slab of readRowSlabs(array, firstRow, endRow, { ...readOptions, columns: [from, to] })) {
           const block = slab.values;
           if (whole && !(block instanceof BigInt64Array) && !(block instanceof BigUint64Array)) {
-            result.set(block, slab.rowStart * nColumns);
+            result.set(block, (slab.rowStart - firstRow) * nColumns);
             continue;
           }
           for (const [column, outputColumn] of picks) {
             const offset = column - from;
             for (let row = slab.rowStart; row < slab.rowEnd; row++) {
-              result[row * nColumns + outputColumn] = toNumber(block[(row - slab.rowStart) * blockWidth + offset]);
+              result[(row - firstRow) * nColumns + outputColumn] = toNumber(block[(row - slab.rowStart) * blockWidth + offset]);
             }
           }
         }
@@ -1062,12 +2194,16 @@ export class AnnDataReader {
    * @param {string} key
    * @param {ReadonlyArray<number>} columns
    * @param {boolean} normalize
-   * @param {{signal?: AbortSignal|null}} [options]
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null}} [options] -
+   *   `rows`: only rows `[start, end)` of the open cells, in the embedding's
+   *   frame (`EmbeddingPayloads.embedding`); `pieces`: where the
+   *   coordinates go as they are made (`EmbeddingPayloads.embedding`)
    * @returns {Promise<import('../embedding-payload.js').EmbeddingPayload>}
    */
-  readEmbedding(key, columns, normalize, { signal = null } = {}) {
+  readEmbedding(key, columns, normalize, { signal = null, rows = null, pieces = undefined } = {}) {
     this._ensureOpen();
-    return this._payloads.embedding(key, [...columns], normalize, { signal });
+    const range = this._rowRange(rows, `obsm['${key}']`);
+    return this._payloads.embedding(key, [...columns], normalize, { signal, rows: range === null ? null : [range.start, range.end], pieces });
   }
 
   /**
@@ -1079,17 +2215,19 @@ export class AnnDataReader {
    * @param {ReadonlyArray<number>} columns
    * @param {{key: string, columns: ReadonlyArray<number>}} embedding
    * @param {boolean} normalize
-   * @param {{signal?: AbortSignal|null}} [options]
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, pieces?: Function}} [options] -
+   *   `pieces`: where the vectors go as they are made (`EmbeddingPayloads.vectors`)
    * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>}
    */
-  readVectorField(key, columns, embedding, normalize, { signal = null } = {}) {
+  readVectorField(key, columns, embedding, normalize, { signal = null, rows = null, pieces = undefined } = {}) {
     this._ensureOpen();
+    const range = this._rowRange(rows, `obsm['${key}']`);
     return this._payloads.vectors(
       key,
       [...columns],
       { key: embedding.key, columns: [...embedding.columns] },
       normalize,
-      { signal }
+      { signal, rows: range === null ? null : [range.start, range.end], pieces }
     );
   }
 
@@ -1129,6 +2267,27 @@ export class AnnDataReader {
    * @param {string|null} column
    * @returns {Promise<{index: string[], values: Array<string|null>}>}
    */
+  /**
+   * The obs names of the open cells, in their order: the obs index, read
+   * whole when an export asks for it (a CSV or `.h5ad` names its cells by
+   * them). Opening reads only its length.
+   *
+   * @returns {Promise<string[]>}
+   */
+  async readObsNames() {
+    this._ensureOpen();
+    const cacheKey = 'obs_names';
+    if (this._cache.has(cacheKey)) return this._cache.get(cacheKey);
+    return this._track('names', 'obs names', async readOptions => {
+      const obs = this._root.get('obs');
+      const { indexKey } = validateDataFrame(obs, this._format, `${this._format.file} obs`);
+      const index = await readDataFrameIndex(obs.get(indexKey), this._format, 'Observation index', this._nObs, true, readOptions);
+      const names = Array.from(index.values, String);
+      this._cache.set(cacheKey, names);
+      return names;
+    });
+  }
+
   async readVarNames(axis, column) {
     this._ensureOpen();
     const cacheKey = `var_names:${axis}:${column === null ? '' : `column:${column}`}`;
@@ -1166,13 +2325,20 @@ export class AnnDataReader {
     const { frame, label, element, root } = this._varAxis(axis);
     let index;
     if (root) {
-      index = this._varNames;
+      // Read when first asked for (opening checks only its length). A
+      // repeated name is kept as stored: the adapter makes the gene list
+      // unique with the data-mapping rule, as cellucid serve does.
+      const { indexKey } = validateDataFrame(frame, format, `${format.file} ${label}`);
+      index = (await readDataFrameIndex(frame.get(indexKey), format, 'Variable index', this._nVars, true, readOptions)).values;
     } else {
+      // Its gene count from the matrix's shape as stored: a subsample's CSR
+      // matrix need not have its kept rows' pointers read (`_readyRows`)
+      // for its gene names.
       const matrixGroup = this._root.get(element.slice(0, element.lastIndexOf('/')) || '/');
       const matrixNode = matrixGroup?.get?.('X') ?? null;
       const nVars = matrixNode === null
         ? null
-        : (isGroup(matrixNode) ? sparseContract(matrixNode, format, label).shape[1] : shapeOf(matrixNode, label, 2)[1]);
+        : (isGroup(matrixNode) ? shapeFromAttribute(attributeValue(matrixNode, 'shape'), label)[1] : shapeOf(matrixNode, label, 2)[1]);
       const { indexKey } = validateDataFrame(frame, format, `${format.file} ${label}`);
       index = (await readDataFrameIndex(frame.get(indexKey), format, `${label} index`, nVars, true, readOptions)).values;
     }
@@ -1241,13 +2407,18 @@ export class AnnDataReader {
       throw new TypeError(`Unknown expression matrix '${String(element)}'`);
     }
     const shape = isGroup(node) ? sparseContract(node, format, label).shape : shapeOf(node, label, 2);
-    const window = node.columnWindow ?? null;
-    const source = window === null ? node : window.matrix;
-    const nRows = shape[0];
     const expectedRows = modality === null ? this._nObs : modality.modality.nCells;
-    if (nRows !== expectedRows) {
-      throw new Error(`${label} has ${formatCountOf(nRows, 'row')} for ${formatCountOf(expectedRows, 'cell')}`);
+    if (shape[0] !== expectedRows) {
+      throw new Error(`${label} has ${formatCountOf(shape[0], 'row')} for ${formatCountOf(expectedRows, 'cell')}`);
     }
+    // A gene-major (CSC) matrix of a subsample is read as stored, through
+    // the kept rows (`views/cell-subset.js`): its genes' entries are read
+    // whole and placed on the kept cells by the cell map.
+    const cellRows = node.cellRows ?? null;
+    const stored = cellRows === null ? node : cellRows.matrix;
+    const window = stored.columnWindow ?? null;
+    const source = window === null ? stored : window.matrix;
+    const nRows = cellRows === null ? shape[0] : cellRows.rows.nOriginal;
     return {
       node: source,
       label,
@@ -1257,7 +2428,85 @@ export class AnnDataReader {
       start: window === null ? 0 : window.start,
       // The matrix's path in the store: `X`, `layers/counts`, `mod/rna/X`.
       key: source.path.replace(/^\/+/, ''),
-      cells: modality === null ? null : modality.cells,
+      cells: composeCellMaps(modality === null ? null : modality.cells, cellRows === null ? null : cellRows.rows, expectedRows),
+      throughCells: cellRows !== null,
+      // The gene-major X of the dataset, or of a modality, opened as a prefix
+      // of a priority-ordered file: a gene's kept values are a prefix of its
+      // entries (a modality's rows follow their cells' priority, so its kept
+      // rows are its first ones).
+      prefix: cellRows !== null && rest === 'X' ? openPrefixOf(this._cellSubset?.prefix ?? null, cellRows.rows.kept, modality !== null) : null,
+    };
+  }
+
+  /**
+   * What reading a gene of one expression matrix costs now, before it is
+   * read (`geneReadCost`, `matrix-access.js`): whether the matrix is stored
+   * cell by cell (each gene spread over every cell), the stored bytes the
+   * first gene must read when it is and no index is built yet, the index that
+   * read builds and where it can be kept (`index.placement`: `memory`,
+   * `disk`, or null with the `refusal` saying why nothing can hold it, when
+   * every gene scans the matrix again), and the link's measured rate
+   * (bytes per second, null until measured or for a local file). Once the
+   * index is built, only `built: true` is said: a gene then reads only itself.
+   *
+   * @param {string} element
+   * @returns {Promise<Object>}
+   */
+  async geneReadPlan(element) {
+    this._ensureOpen();
+    await this._readyRows(element);
+    const matrix = this._requireMatrixElement(element);
+    // A matrix whose index is built reads only the gene: nothing to weigh.
+    // One indexed in segments (`prefix-column-index.js`) has what is left
+    // to read after the segments built (an earlier opening's, carried), and
+    // the gene shows on more cells after each segment.
+    const segments = this._indexedInSegments(matrix) ? await this._segmentProgress(matrix) : null;
+    // One indexed whole whose index is kept in this browser is built too.
+    const keptWhole = segments === null && this._matrices.get(matrix.key)?.columns == null &&
+      (await this._keptRunsOf(matrix, () => this._openRowPointers(matrix.node))).some(run => run.start === 0 && run.rows === matrix.nRows);
+    if (keptWhole || this._matrices.get(matrix.key)?.columns?.built?.() === true || (segments !== null && segments.done >= matrix.nRows)) {
+      return { label: matrix.label, cellMajor: null, layout: null, entries: null, built: true, scan: null, index: null, progressive: null, bytesPerSecond: null };
+    }
+    const valuesOnDemand = !this._readsAhead();
+    const retainIndicesBytes = residencyBudgetBytes('columnIndex');
+    const costOf = (node, nObs) => geneReadCost(node, {
+      format: this._format,
+      label: matrix.label,
+      nObs,
+      nVars: matrix.sourceVars,
+      decodedChunkBytes: this._decodedChunkBytes,
+      valuesOnDemand,
+      retainIndicesBytes,
+    });
+    const rest = segments === null || segments.done === 0
+      ? matrix.node
+      : rowRangeMatrix(matrix.node, segments.done, matrix.nRows, segments.pointers);
+    const cost = await costOf(rest, matrix.nRows - (segments?.done ?? 0));
+    let progressive = null;
+    if (segments !== null && (segments.done > 0 || segments.next < matrix.nRows)) {
+      const first = await costOf(rowRangeMatrix(matrix.node, segments.done, segments.next, segments.pointers), segments.next - segments.done);
+      progressive = { cells: matrix.nRows, done: segments.done, next: segments.next, nextStoredBytes: first.scan?.storedBytes ?? null };
+    }
+    let index = null;
+    if (cost.index !== null) {
+      const placed = valuesOnDemand && cost.index.passes === 1
+        ? { kind: 'memory', refusal: null }
+        : await this.columnStoreFactory.plan(cost.index.storeBytes);
+      index = { ...cost.index, placement: placed.kind, refusal: placed.refusal };
+    }
+    const link = this._link?.snapshot?.() ?? null;
+    return {
+      label: matrix.label,
+      cellMajor: cost.cellMajor,
+      layout: cost.layout,
+      entries: cost.entries,
+      built: !cost.cellMajor,
+      scan: cost.scan,
+      index,
+      progressive,
+      bytesPerSecond: link !== null && link.measured && !link.readsAhead && link.bytesPerMs !== null
+        ? link.bytesPerMs * 1000
+        : null,
     };
   }
 
@@ -1268,18 +2517,45 @@ export class AnnDataReader {
    * cell); `index` is the gene's position on that matrix's var axis. `signal` cancels the read;
    * a read for a job (`owner`, an analysis's) is a job read (kind `analysis`);
    * `keys` name the shared loads it reads for, which a job may join later.
+   * `onPartial(values, cells)`: while the gene index of a matrix indexed in
+   * segments is built (`prefix-column-index.js`), the gene on the first
+   * `cells` open cells (a sample of them: priority order) and NaN on the
+   * others, each time it has more of them, before the whole column.
+   * `rows` (`[start, end)` of the open cells): the gene on those cells only,
+   * reading only what they need where the layout allows
+   * (`_placedColumnRows`): the cells an opening grown in place appends, or
+   * an analysis's first pass on the first cells of priority order.
    */
-  async getMatrixColumn(element, index, { signal = null, owner = null, keys = null } = {}) {
+  async getMatrixColumn(element, index, { signal = null, owner = null, keys = null, onPartial = null, rows = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
+    const ready = this._readyRows(element, { signal });
+    if (ready !== null) {
+      await ready;
+      this._assertGeneration(generation, `reading ${element}`);
+    }
     const matrix = this._requireMatrixElement(element);
     const { label, nVars } = matrix;
     if (!Number.isSafeInteger(index) || index < 0 || index >= nVars) {
       throw new RangeError(`${label} has no gene column ${String(index)}`);
     }
+    const range = this._rowRange(rows, label);
+    if (range !== null) {
+      return this._track(owner === null ? 'genes' : 'analysis', `gene ${index} of ${label}, cells ${range.start}–${range.end}`, async readOptions => {
+        const [columns, cells] = await Promise.all([this._matrixColumns(matrix, generation, readOptions), this._cellsOf(matrix, readOptions)]);
+        const result = await this._placedColumnRows(matrix, columns, cells, matrix.start + index, range, readOptions);
+        this._assertGeneration(generation, `loading gene column ${index} of ${label}`);
+        return result;
+      }, signal, owner, keys);
+    }
     return this._track(owner === null ? 'genes' : 'analysis', `gene ${index} of ${label}`, async readOptions => {
       const [columns, cells] = await Promise.all([this._matrixColumns(matrix, generation, readOptions), this._cellsOf(matrix, readOptions)]);
-      const result = placeColumn(await columns.column(matrix.start + index, readOptions), cells, this._nObs);
+      const result = await this._placedColumn(matrix, columns, cells, matrix.start + index, onPartial === null ? readOptions : {
+        ...readOptions,
+        onPartial: (values, rows) => {
+          if (this._generation === generation) onPartial(values, rows);
+        },
+      });
       this._assertGeneration(generation, `loading gene column ${index} of ${label}`);
       return result;
     }, signal, owner, keys);
@@ -1292,24 +2568,206 @@ export class AnnDataReader {
    *
    * @param {string} element
    * @param {ReadonlyArray<number>} genes
-   * @param {{signal?: AbortSignal|null, owner?: string|null, keys?: string[]|null}} [options] -
+   * @param {{signal?: AbortSignal|null, owner?: string|null, keys?: string[]|null,
+   *   onPartial?: ((position: number, values: Float32Array, cells: number) => void)|null,
+   *   rows?: [number, number]|null}} [options] -
    *   `signal` cancels the read; `owner` is the job it is for and `keys` the
-   *   shared loads (as `getMatrixColumn`)
+   *   shared loads (as `getMatrixColumn`); `onPartial` as `getMatrixColumn`'s,
+   *   with the gene's position in `genes`; `rows` as `getMatrixColumn`'s
    * @returns {Promise<Float32Array[]>}
    */
-  async getMatrixColumns(element, genes, { signal = null, owner = null, keys = null } = {}) {
+  async getMatrixColumns(element, genes, { signal = null, owner = null, keys = null, onPartial = null, rows = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
+    const ready = this._readyRows(element, { signal });
+    if (ready !== null) {
+      await ready;
+      this._assertGeneration(generation, `reading ${element}`);
+    }
     const matrix = this._requireMatrixElement(element);
     const { label, nVars } = matrix;
     const positions = requirePositions(genes, nVars, `${label} gene column`);
-    return this._track(owner === null ? 'genes' : 'analysis', `${formatCountOf(positions.length, 'gene')} of ${label}`, async readOptions => {
+    const range = this._rowRange(rows, label);
+    return this._track(owner === null ? 'genes' : 'analysis', `${formatCountOf(positions.length, 'gene')} of ${label}${range === null ? '' : `, cells ${range.start}–${range.end}`}`, async readOptions => {
       const [columns, cells] = await Promise.all([this._matrixColumns(matrix, generation, readOptions), this._cellsOf(matrix, readOptions)]);
-      const result = (await Promise.all(positions.map(gene => columns.column(matrix.start + gene, readOptions))))
-        .map(column => placeColumn(column, cells, this._nObs));
+      const result = await Promise.all(positions.map((gene, position) => range !== null ? this._placedColumnRows(matrix, columns, cells, matrix.start + gene, range, readOptions) : this._placedColumn(matrix, columns, cells, matrix.start + gene, onPartial === null ? readOptions : {
+        ...readOptions,
+        onPartial: (values, rows) => {
+          if (this._generation === generation) onPartial(position, values, rows);
+        },
+      })));
       this._assertGeneration(generation, `loading ${positions.length} gene columns of ${label}`);
       return result;
     }, signal, owner, keys);
+  }
+
+  /**
+   * One gene column on open cells `[start, end)` only, reading no more than
+   * the layout needs for them: a cell-major matrix indexed in segments
+   * (`prefix-column-index.js`) reads the segments those cells lie in; the
+   * gene-major X of a priority-ordered file opened as a prefix reads the
+   * gene's entries between the prefix-count levels around the rows
+   * (`_prefixEntryRows`). Any other matrix is read whole and cut. @private
+   */
+  async _placedColumnRows(matrix, columns, cells, gene, { start, end }, readOptions) {
+    if (cells === null && Array.isArray(columns.segments)) {
+      // The segments the rows lie in, built or built now, and no other.
+      const out = allocateTypedArray(Float32Array, end - start, 'Gene column');
+      const touched = columns.segments.filter(segment => segment.start < end && segment.start + segment.rows > start);
+      const { onPartial: _onPartial, ...options } = readOptions;
+      const parts = await Promise.all(touched.map(segment => segment.access.column(gene, options)));
+      touched.forEach((segment, s) => {
+        const from = Math.max(start, segment.start);
+        const to = Math.min(end, segment.start + segment.rows);
+        out.set(parts[s].subarray(from - segment.start, to - segment.start), from - start);
+      });
+      return out;
+    }
+    // Open cell i is file row i (a priority-ordered file opened whole or by
+    // a prefix: the dataset's own X, whose cell map is then the first rows),
+    // and its gene-major X lists each gene's rows ascending.
+    const subset = this._cellSubset;
+    const fileRowsAreOpenRows = subset?.prioritySeed != null && (subset.fileRows === null || subset.prefix !== null);
+    if (matrix.key === 'X' && fileRowsAreOpenRows && columns.readEntries !== undefined) {
+      const rows = await this._prefixEntryRows(matrix, columns, gene, start, end, readOptions);
+      if (rows !== null) return denseOfSparse(rows);
+    }
+    const whole = await this._placedColumn(matrix, columns, cells, gene, readOptions);
+    return whole.slice(start, end);
+  }
+
+  /**
+   * Rows `[start, end)` of one gene as its entries there (`SparseColumn`,
+   * rows renumbered from `start`), the values `_placedColumnRows` gives bit
+   * for bit: from the segments of a cell-major matrix indexed in parts (each
+   * segment's entries), or from a priority-ordered file's gene-major X (the
+   * entries between its prefix counts); else the gene's column, kept as its
+   * entries. What it holds is the gene's entries, not a value of every row.
+   * @private
+   */
+  async _sparseColumnRows(matrix, columns, gene, { start, end }, readOptions) {
+    const { onPartial: _onPartial, ...options } = readOptions;
+    if (Array.isArray(columns.segments)) {
+      const touched = columns.segments.filter(segment => segment.start < end && segment.start + segment.rows > start);
+      const parts = await Promise.all(touched.map(segment => segment.access.sparseColumn(gene, options)));
+      let count = 0;
+      const inRange = (segment, part, visit) => {
+        for (let e = 0; e < part.indices.length; e++) {
+          const row = segment.start + part.indices[e];
+          if (row >= start && row < end) visit(row - start, part.values[e]);
+        }
+      };
+      touched.forEach((segment, s) => inRange(segment, parts[s], () => { count++; }));
+      const indices = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+      const values = allocateTypedArray(Float32Array, count, 'Gene column values');
+      let at = 0;
+      touched.forEach((segment, s) => inRange(segment, parts[s], (row, value) => {
+        indices[at] = row;
+        values[at++] = value;
+      }));
+      return { length: end - start, indices, values };
+    }
+    const subset = this._cellSubset;
+    const fileRowsAreOpenRows = subset?.prioritySeed != null && (subset.fileRows === null || subset.prefix !== null);
+    if (matrix.key === 'X' && fileRowsAreOpenRows && columns.readEntries !== undefined) {
+      const rows = await this._prefixEntryRows(matrix, columns, gene, start, end, readOptions);
+      if (rows !== null) return rows;
+    }
+    return sparseColumnOfDense((await this._placedColumn(matrix, columns, null, gene, options)).subarray(start, end));
+  }
+
+  /**
+   * Whether `_placedColumnRows` reads a gene's rows without reading it
+   * whole: a cell-major matrix indexed in segments, or the gene-major X of a
+   * priority-ordered file opened whole or by a prefix. @private
+   */
+  _readsColumnRows(matrix, columns) {
+    if (Array.isArray(columns.segments)) return true;
+    const subset = this._cellSubset;
+    return matrix.key === 'X' && columns.readEntries !== undefined &&
+      Array.isArray(subset?.levels) && subset.levels.length > 0 &&
+      subset.prioritySeed != null && (subset.fileRows === null || subset.prefix !== null);
+  }
+
+  /**
+   * Rows `[start, end)` of one gene of a priority-ordered file's gene-major
+   * X opened as a prefix: its entries are sorted by row, so the entries of
+   * those rows lie between the gene's prefix counts at the largest level at
+   * or below `start` and the smallest at or above `end`
+   * (`varm['cellucid_prefix_counts']`, one column a level, each read once
+   * per opening); those entries are read, checked and placed. Null when the
+   * file has no counts. The rows' entries (`SparseColumn`). @private
+   */
+  async _prefixEntryRows(matrix, columns, gene, start, end, readOptions) {
+    const levels = this._cellSubset?.levels ?? null;
+    if (!Array.isArray(levels) || levels.length === 0) return null;
+    const above = levels.findIndex(size => size >= end);
+    const below = levels.findLastIndex(size => size <= start);
+    const [upper, lower] = await Promise.all([
+      above < 0 ? null : this._prefixLevelCounts(matrix, above, readOptions),
+      below < 0 ? null : this._prefixLevelCounts(matrix, below, readOptions),
+    ]);
+    if ((above >= 0 && upper === null) || (below >= 0 && lower === null)) return null;
+    const first = columns.entryStart(gene);
+    const held = columns.entryCount(gene);
+    for (const [counts, level] of [[upper, above], [lower, below]]) {
+      if (counts !== null && counts[gene] > held) {
+        throw new Error(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene} at level ${level}, which holds ${held}; the file is damaged`);
+      }
+    }
+    const from = first + (lower === null ? 0 : lower[gene]);
+    // One value past the upper count, when the gene has one: its row shows
+    // the count holds every value below that level (`requirePrefixRows`).
+    const to = first + (upper === null ? held : Math.min(held, upper[gene] + 1));
+    if (to <= from) return { length: end - start, indices: new Uint32Array(0), values: new Float32Array(0) };
+    const [entryRows, values] = await columns.readEntries(from, to, readOptions);
+    const checked = columns.checkedEntries(entryRows, values, 0, entryRows.length, from);
+    if (upper !== null) {
+      requirePrefixRows(checked.rows, checked.count, upper[gene] - (lower === null ? 0 : lower[gene]), levels[above], gene);
+    }
+    if (lower !== null && checked.count > 0 && checked.rows[0] < levels[below]) {
+      throw new Error(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(lower[gene], 'value')} of gene ${gene} below ${formatCountOf(levels[below], 'row')}, and the next is at row ${checked.rows[0]}; the file is damaged`);
+    }
+    // The entries of rows `[start, end)` (ascending), renumbered from
+    // `start`, as a whole column holds them (duplicates summed in float32,
+    // in stored order; zeros left out).
+    let low = 0;
+    while (low < checked.count && checked.rows[low] < start) low++;
+    let high = low;
+    while (high < checked.count && checked.rows[high] < end) high++;
+    const rows = allocateTypedArray(Float64Array, high - low, 'Gene column cells');
+    for (let e = low; e < high; e++) rows[e - low] = checked.rows[e] - start;
+    return sparseColumnOf(rows, checked.values.subarray(low, high), high - low, end - start);
+  }
+
+  /**
+   * The prefix counts of one level of a priority-ordered file's gene-major
+   * X (`readPrefixCounts`), read once per opening; null without counts.
+   * @private
+   */
+  _prefixLevelCounts(matrix, level, readOptions) {
+    this._levelCounts ??= new Map();
+    const key = `${matrix.key}:${level}`;
+    let read = this._levelCounts.get(key);
+    if (read === undefined) {
+      const group = matrix.key === 'X' ? this._fullRoot ?? this._root : null;
+      read = group === null ? Promise.resolve(null) : readPrefixCounts(group, level, matrix.sourceVars, { signal: readOptions.signal ?? null, activity: readOptions.activity ?? null }, { levelRows: this._cellSubset.levels[level] });
+      read.catch(() => this._levelCounts?.delete(key));
+      this._levelCounts.set(key, read);
+    }
+    return read;
+  }
+
+  /**
+   * One gene column on the dataset's cells. A matrix read through a
+   * subsample's kept rows (`throughCells`) is read as its non-zero entries
+   * and made dense on the kept cells, never at its stored length. @private
+   */
+  async _placedColumn(matrix, columns, cells, gene, readOptions) {
+    if (matrix.throughCells) {
+      return denseOfSparse(placeSparseColumn(await columns.sparseColumn(gene, readOptions), cells, this._nObs, matrix.nRows));
+    }
+    return placeColumn(await columns.column(gene, readOptions), cells, this._nObs);
   }
 
   /**
@@ -1329,6 +2787,11 @@ export class AnnDataReader {
   async getMatrixColumnsSparse(element, genes, { signal = null, owner = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
+    const ready = this._readyRows(element, { signal });
+    if (ready !== null) {
+      await ready;
+      this._assertGeneration(generation, `reading ${element}`);
+    }
     const matrix = this._requireMatrixElement(element);
     const { label, nVars } = matrix;
     const positions = requirePositions(genes, nVars, `${label} gene column`);
@@ -1352,6 +2815,11 @@ export class AnnDataReader {
   async getMatrixRows(element, cells, { signal = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
+    const ready = this._readyRows(element, { signal });
+    if (ready !== null) {
+      await ready;
+      this._assertGeneration(generation, `reading ${element}`);
+    }
     const matrix = this._requireMatrixElement(element);
     const { label } = matrix;
     const positions = requirePositions(cells, this._nObs, `${label} cell row`);
@@ -1437,6 +2905,11 @@ export class AnnDataReader {
   async getMatrixCellSubset(element, cells, genes, { signal = null, owner = null } = {}) {
     this._ensureOpen();
     const generation = this._generation;
+    const ready = this._readyRows(element, { signal });
+    if (ready !== null) {
+      await ready;
+      this._assertGeneration(generation, `reading ${element}`);
+    }
     const matrix = this._requireMatrixElement(element);
     const { node, label, nVars } = matrix;
     const cellPositions = requirePositions(cells, this._nObs, `${label} cell row`);
@@ -1448,6 +2921,19 @@ export class AnnDataReader {
     }
     const byCell = !isGroup(node) || sparseContract(node, this._format, `Sparse ${label}`).format === 'csr';
     return this._track('analysis', `${formatCountOf(genePositions.length, 'gene')} in ${formatCountOf(cellPositions.length, 'cell')} of ${label}`, async readOptions => {
+      // Cells that all lie among the first open cells -- an analysis's
+      // first pass on a sample of them (`progressive-cells.js`) -- are read
+      // from those rows of each gene only, where the layout can read rows:
+      // each gene's entries there, never a column of every row.
+      const prefixEnd = cellPositions.reduce((max, cell) => Math.max(max, cell + 1), 0);
+      if (prefixEnd < this._nObs) {
+        const columns = await this._matrixColumns(matrix, generation, readOptions);
+        if (this._readsColumnRows(matrix, columns)) {
+          const parts = await Promise.all(genePositions.map(gene => this._sparseColumnRows(matrix, columns, matrix.start + gene, { start: 0, end: prefixEnd }, readOptions)));
+          this._assertGeneration(generation, `loading ${formatCountOf(genePositions.length, 'gene')} in ${formatCountOf(cellPositions.length, 'cell')} of ${label}`);
+          return cellSubsetOfSparseColumns(parts, cellPositions);
+        }
+      }
       const [columns, rows, map] = await Promise.all([
         this._matrixColumns(matrix, generation, readOptions),
         byCell ? this._matrixRows(matrix, readOptions.signal) : null,
@@ -1482,6 +2968,25 @@ export class AnnDataReader {
   /** Whether the store's link delivers bytes as fast as a disk (see `open`). @private */
   _readsAhead() {
     return this._link === null || this._link.readsAhead;
+  }
+
+  /**
+   * The index options of a matrix indexed whole by its rows: started from
+   * its index kept in this browser when one covers every open row, else
+   * kept once built (`kept-column-index.js`). @private
+   */
+  async _wholeIndexOptions(resolved) {
+    const options = this._indexOptions();
+    const { node: matrix, nRows } = resolved;
+    const byRows = this._keptRowsOf(resolved) !== null &&
+      readsThroughRowIndex(matrix, { nObs: nRows, nVars: resolved.sourceVars, decodedChunkBytes: this._decodedChunkBytes });
+    if (!byRows) return options;
+    const runs = await this._takeKeptRuns(resolved, () => this._openRowPointers(matrix));
+    const whole = runs.find(run => run.start === 0 && run.rows === nRows) ?? null;
+    for (const run of runs) if (run !== whole) run.kept.release();
+    return whole !== null
+      ? { ...options, kept: whole.kept }
+      : { ...options, fingerprintRows: fingerprintRows(nRows), onBuilt: (store, fingerprint) => this._keepRun(resolved, 0, nRows, store._rowPointers ?? null, store, fingerprint) };
   }
 
   /** Options of a background index (`RowMajorColumnIndex`), from the link as measured now. @private */
@@ -1528,11 +3033,13 @@ export class AnnDataReader {
   prepareMatrix(element) {
     this._ensureOpen();
     if (!this._readsAhead()) return;
-    const matrix = this._requireMatrixElement(element);
-    if (!isGroup(matrix.node)) return;
     const generation = this._generation;
-    this._matrixColumns(matrix, generation)
-      .then(columns => columns.prepare?.())
+    Promise.resolve(this._readyRows(element))
+      .then(() => {
+        if (generation !== this._generation) return null;
+        const matrix = this._requireMatrixElement(element);
+        return isGroup(matrix.node) ? this._matrixColumns(matrix, generation).then(columns => columns.prepare?.()) : null;
+      })
       .catch(() => {});
   }
 
@@ -1543,7 +3050,7 @@ export class AnnDataReader {
   _matrixState(element) {
     let state = this._matrices.get(element);
     const switched = state === undefined || [...this._matrices.keys()].at(-1) !== element;
-    if (state === undefined) state = { element, columns: null, loadPromise: null };
+    if (state === undefined) state = { element, columns: null, load: null };
     this._matrices.delete(element);
     this._matrices.set(element, state);
     if (switched) this._settleMatrices();
@@ -1574,36 +3081,65 @@ export class AnnDataReader {
 
   /**
    * The column access of one matrix, opened once and shared: concurrent first
-   * reads must not each start an index. Opening never takes a caller's
-   * signal: every concurrent reader of the matrix waits on it, so one caller
-   * cancelling must not fail the others.
+   * reads must not each start an index. Each caller waits with its own
+   * signal, and the opening's reads stop only once every caller withdrew
+   * (`SharedWork`), so one caller cancelling never fails the others.
    * @private
    */
   async _matrixColumns(resolved, generation, readOptions = {}) {
     const { node: matrix, label, nRows, sourceVars, key: element } = resolved;
     const state = this._matrixState(element);
     if (state.columns) return state.columns;
-    state.loadPromise ??= openMatrixColumns(matrix, {
-      format: this._format,
-      label,
-      nObs: nRows,
-      nVars: sourceVars,
-      decodedChunkBytes: this._decodedChunkBytes,
-      indexOptions: this._indexOptions(),
-      onIndexStart: indexLabel => this.createActivity?.({ kind: 'index', label: `${indexLabel}, indexed by gene`, background: true }) ?? null,
-      readOptions: { activity: readOptions.activity ?? null },
-      pointers: this._pointerReads.get(element) ?? null,
-    });
-    const loadPromise = state.loadPromise;
+    // Opened once and shared by every read asking meanwhile (`SharedWork`):
+    // what it reads (row pointers, the open cells' rows) stops only once
+    // every one of them withdrew, and is then opened anew by the next.
+    if (state.load === null || state.load.abandoned) {
+      const carried = this._carried.get(element)?.columns ?? null;
+      if (carried !== null) this._carried.delete(element);
+      const open = loadOptions => {
+        if (carried !== null) return Promise.resolve(carried);
+        if (this._indexedInSegments(resolved)) return this._segmentedColumns(resolved, loadOptions);
+        // A gene-major matrix read through a subsample's kept rows reads only
+        // their entries' values where that saves more than a round trip.
+        const keptRows = resolved.throughCells ? this._cellsOf(resolved, loadOptions).then(rows => (rows === null ? null : keptRowsOf(rows)?.sorted ?? null)) : null;
+        return Promise.all([this._wholeIndexOptions(resolved), keptRows]).then(([indexOptions, kept]) => openMatrixColumns(matrix, {
+          format: this._format,
+          label,
+          nObs: nRows,
+          nVars: sourceVars,
+          decodedChunkBytes: this._decodedChunkBytes,
+          indexOptions,
+          onIndexStart: (indexLabel, { rescan = null } = {}) => this.createActivity?.({
+            kind: 'index',
+            label: geneIndexActivityLabel(label, rescan),
+            background: rescan === null,
+          }) ?? null,
+          readOptions: { activity: loadOptions.activity ?? null },
+          pointers: this._pointerReads.get(element) ?? null,
+          keptRows: kept,
+          roundTripBytes: () => this._link?.roundTripBytes ?? 0,
+        })).then(columns => (resolved.prefix === null || resolved.prefix === undefined ? columns : this._prefixColumns(columns, resolved, loadOptions)));
+      };
+      state.load = new SharedWork(signal => open({ ...readOptions, signal }).then(columns => {
+        // Opened after every caller withdrew: nobody takes it, so it is let go.
+        if (signal.aborted) {
+          (columns.retire ?? columns.dispose)?.();
+          throw signal.reason;
+        }
+        return columns;
+      }));
+    }
+    const load = state.load;
     let columns;
     try {
-      columns = await loadPromise;
+      columns = await load.join(readOptions.signal ?? null);
     } catch (error) {
-      // Pointers read ahead that failed are read again by the next attempt.
-      this._pointerReads.delete(element);
+      // Pointers read ahead that failed are read again by the next attempt
+      // (not when this read was only cancelled).
+      if (!readOptions.signal?.aborted) this._pointerReads.delete(element);
       throw error;
     } finally {
-      if (state.loadPromise === loadPromise) state.loadPromise = null;
+      if (state.load === load && load.settled) state.load = null;
     }
     this._assertGeneration(generation, `loading ${label}`);
     if (this._matrices.get(element) !== state) {
@@ -1646,6 +3182,57 @@ export class AnnDataReader {
     return state.columns;
   }
 
+  /**
+   * A gene-major X of a priority-ordered file opened as the prefix of its
+   * first `prefix` rows: a gene reads only the first entries of its range
+   * (its rows ascend, so the kept rows' entries come first), as many as
+   * `varm['cellucid_prefix_counts']` says for the smallest level holding
+   * the prefix, and the next (its row shows the count holds every value
+   * below the level: `requirePrefixRows`), then keeps the rows below it.
+   * The access is the prefix's for every reader of it: `entryCount` is what
+   * a read of a gene takes, so a cell subset read in runs of genes
+   * (`subsetByColumns`, an analysis over every gene) reads those entries and
+   * checks them (`requireEntries`), never a gene whole. Without the counts
+   * the gene is read whole. @private
+   */
+  async _prefixColumns(columns, resolved, _readOptions) {
+    const read = this._prefixReads?.get(resolved.key) ?? null;
+    if (columns.readEntries === undefined || read === null) return columns;
+    // The counts of the opened level, read as the dataset opened (`startPrefixReads`).
+    const prefixRead = await read;
+    if (prefixRead === null) return columns;
+    const { counts, levelRows } = prefixRead;
+    if (counts.length !== resolved.sourceVars) {
+      throw new Error(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts.length, 'gene')} for ${resolved.sourceVars}; the file is damaged`);
+    }
+    const k = resolved.prefix;
+    /** The entries a read of gene `gene` takes: its counted ones and the next, when it has one. */
+    const counted = gene => {
+      const held = columns.entryCount(gene);
+      if (counts[gene] > held) {
+        throw new Error(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene}, which holds ${held}; the file is damaged`);
+      }
+      return Math.min(held, counts[gene] + 1);
+    };
+    const sparseColumn = async (gene, options = {}) => {
+      const start = columns.entryStart(gene);
+      const end = start + counted(gene);
+      const [rows, values] = end === start ? [new Int32Array(0), new Float32Array(0)] : await columns.readEntries(start, end, options);
+      const checked = columns.checkedEntries(rows, values, 0, rows.length, start);
+      requirePrefixRows(checked.rows, checked.count, counts[gene], levelRows, gene);
+      let kept = 0;
+      while (kept < checked.count && checked.rows[kept] < k) kept++;
+      return sparseColumnOf(checked.rows, checked.values, kept, resolved.nRows);
+    };
+    return {
+      ...columns,
+      sparseColumn,
+      column: async (gene, options = {}) => denseOfSparse(await sparseColumn(gene, options)),
+      entryCount: counted,
+      requireEntries: (gene, rows, from, to) => requirePrefixRows(rows.subarray(from, to), to - from, counts[gene], levelRows, gene),
+    };
+  }
+
   /** Release one matrix and any index it holds. @private */
   _releaseMatrixState(state) {
     if (this._matrices.get(state.element) === state) this._matrices.delete(state.element);
@@ -1665,6 +3252,19 @@ export class AnnDataReader {
       }
     }
     this._matrices.clear();
+    // Columns carried over from an earlier opening and never read go too.
+    for (const carried of this._carried.values()) {
+      try {
+        for (const segment of carried.segments ?? []) (segment.access.retire ?? segment.access.dispose)?.();
+        if (carried.columns) (carried.columns.retire ?? carried.columns.dispose)?.();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    this._carried.clear();
+    // Kept runs found and never taken: their locks go.
+    for (const found of this._keptRuns.values()) found.then(runs => runs.forEach(run => run.kept.release()), () => {});
+    this._keptRuns.clear();
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, 'Releasing the matrix indexes failed');
   }
@@ -1757,27 +3357,54 @@ export class AnnDataReader {
    * continuous values as float32, booleans and strings as values (null where
    * a nullable column is missing). `signal` cancels the read.
    */
-  async getObsField(key, { signal = null } = {}) {
+  /**
+   * One obs column on the open cells. `rows` (`[start, end)` of the open
+   * cells) reads only those rows -- what an opening grown in place appends
+   * (`AnnDataFileSource.resizeCells`) -- and is not cached; every row, cached,
+   * by default.
+   *
+   * @param {string} key
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null}} [options]
+   */
+  async getObsField(key, { signal = null, rows = null } = {}) {
     this._ensureOpen();
+    const range = this._rowRange(rows, `obs['${key}']`);
+    if (range !== null) {
+      return this._track('field', `obs['${key}'] rows ${range.start}–${range.end}`, readOptions => this._readObsField(key, null, readOptions, range), signal);
+    }
     const cacheKey = `obs:${key}`;
     if (this._cache.has(cacheKey)) return this._cache.get(cacheKey);
     return this._track('field', `obs['${key}']`, readOptions => this._readObsField(key, cacheKey, readOptions), signal);
   }
 
+  /**
+   * Rows `[start, end)` of the open cells as `{start, end}`, checked; null for
+   * every row (`rows` null, or exactly `[0, nObs)`). @private
+   */
+  _rowRange(rows, label) {
+    if (rows === null || rows === undefined) return null;
+    const [start, end] = Array.isArray(rows) && rows.length === 2 ? rows : [NaN, NaN];
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > this._nObs) {
+      throw new RangeError(`Rows of ${label} are [start, end) within the ${formatCountOf(this._nObs, 'open cell')}; got ${JSON.stringify(rows)}`);
+    }
+    return start === 0 && end === this._nObs ? null : { start, end };
+  }
+
   /** @private */
-  async _readObsField(key, cacheKey, readOptions) {
+  async _readObsField(key, cacheKey, readOptions, range = null) {
     const generation = this._generation;
     const format = this._format;
     const obs = this._obsColumn(key);
     const item = obs.get(key);
     const declared = validateColumnEncoding(item, format, `Observation field '${key}'`);
     const categorical = resolveCategoricalColumn(obs, key, format);
+    const start = range?.start ?? 0;
     let result;
     if (categorical) {
       const count = categoryCount(categorical.categories, key, format);
       const [categories, codes] = await Promise.all([
         this._categories(categorical, key, generation, readOptions),
-        readCodes(categorical.codes, count, key, format, this._nObs, readOptions),
+        readCodes(categorical.codes, count, key, format, this._nObs, readOptions, range),
       ]);
       result = {
         dtype: 'categorical',
@@ -1793,17 +3420,19 @@ export class AnnDataReader {
         },
       };
     } else if (NULLABLE_ENCODINGS.has(declared)) {
-      result = await readNullableValues(item, key, declared, format, this._nObs, null, readOptions);
+      result = await readNullableValues(item, key, declared, format, this._nObs, null, readOptions, range);
     } else {
       const label = `Observation field '${key}'`;
-      const length = validateOneDimensional(item, format, label, this._nObs);
+      const end = range?.end ?? validateOneDimensional(item, format, label, this._nObs);
+      if (range !== null) validateOneDimensional(item, format, label, this._nObs);
+      const length = end - start;
       const dtype = requirePrimitiveKind(item, label);
       if (!OBS_KINDS.includes(dtype)) throw new Error(`${label} uses an unsupported element type`);
       let values;
       if (dtype === 'float' || dtype === 'int' || dtype === 'uint') {
-        values = await readFloat32(item, 0, length, label, readOptions);
+        values = await readFloat32(item, start, end, label, readOptions);
       } else {
-        const raw = await readStored(item, 0, length, label, readOptions);
+        const raw = await readStored(item, start, end, label, readOptions);
         values = new Array(length);
         if (dtype === 'bool') {
           const message = `Observation field '${key}' contains a non-boolean value`;
@@ -1815,7 +3444,7 @@ export class AnnDataReader {
       result = { dtype, values };
     }
     this._assertGeneration(generation, `reading observation field '${key}'`);
-    this._cache.set(cacheKey, result);
+    if (cacheKey !== null) this._cache.set(cacheKey, result);
     return result;
   }
 
@@ -1873,17 +3502,20 @@ export class AnnDataReader {
       const obsp = requireMapping(this._root.get('obsp'), format, `${format.file} obsp mapping`);
       if (obsp.has(key)) {
         const conn = obsp.get(key);
+        // A subsample's graphs are stored on every cell; their induced
+        // subgraph is read (`readInducedGraph`).
+        const nStored = this._cellSubset?.rows?.nOriginal ?? this._nObs;
         if (isGroup(conn)) {
           const sparse = sparseContract(conn, format, 'Connectivity matrix');
-          if (sparse.shape[0] !== this._nObs || sparse.shape[1] !== this._nObs) {
-            throw new Error(`Connectivity matrix shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(this._nObs, 'cell')}`);
+          if (sparse.shape[0] !== nStored || sparse.shape[1] !== nStored) {
+            throw new Error(`Connectivity matrix shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
           }
           result = { kind: 'sparse', node: conn };
         } else {
           validateArrayEncoding(conn, format, 'Dense connectivity matrix', 'array');
           const shape = shapeOf(conn, 'Dense connectivity matrix', 2);
-          if (shape[0] !== this._nObs || shape[1] !== this._nObs) {
-            throw new Error(`Connectivity matrix shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(this._nObs, 'cell')}`);
+          if (shape[0] !== nStored || shape[1] !== nStored) {
+            throw new Error(`Connectivity matrix shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
           }
           if (!isAnnDataMatrixDataKind(valueKind(conn))) throw new Error('Dense connectivity matrix must use a numeric dtype');
           result = { kind: 'dense', node: conn, shape };
@@ -1913,13 +3545,24 @@ export class AnnDataReader {
     this._ensureOpen();
     const metadata = this._connectivityMetadata(key);
     if (metadata === null) return null;
-    return this._track('graph', `obsp['${key}']`, readOptions => this._readConnectivities(metadata, readOptions), signal);
+    return this._track('graph', `obsp['${key}']`, readOptions => this._readConnectivities(key, metadata, readOptions), signal);
   }
 
   /** @private */
-  async _readConnectivities(metadata, readOptions) {
+  async _readConnectivities(key, metadata, readOptions) {
     const generation = this._generation;
     let result;
+    const rows = this._cellSubset?.rows ?? null;
+    if (rows !== null) {
+      const { share, ...graph } = await readInducedGraph(metadata.node, rows, {
+        mergeGapBytes: () => this._mergeGapBytes(),
+        roundTripBytes: () => this._link?.roundTripBytes ?? 0,
+        readOptions,
+      });
+      this._assertGeneration(generation, 'loading connectivity data');
+      this._graphShares.set(key, share);
+      return graph.format === 'dense' ? graph : { cscData: null, ...graph };
+    }
     if (metadata.kind === 'dense') {
       const [nRows, nCols] = metadata.shape;
       // Every row, every column: a two-dimensional read, not a row range of
@@ -1983,12 +3626,23 @@ export class AnnDataReader {
   clearCache() {
     this._generation++;
     this._cache.clear();
+    this._decodedChunks?.clear();
     // Row access is released even when releasing a matrix fails.
     try {
       this._releaseMatrices();
     } finally {
       this._releaseRows();
     }
+  }
+
+  /**
+   * Let go of the store without closing it: a reader of another cell subset
+   * of the same bytes reads through it from now on (the reader worker's
+   * `open`), with its structure, chunk indexes and caches. Closing this
+   * reader afterwards releases its own state only.
+   */
+  releaseStore() {
+    this._store = null;
   }
 
   _releaseCurrentState() {
@@ -2007,6 +3661,9 @@ export class AnnDataReader {
       }
     }
     this._root = null;
+    this._fullRoot = null;
+    this._cellSubset = null;
+    this._prefixReads = new Map();
     try {
       this.clearCache();
     } catch (error) {
@@ -2015,7 +3672,6 @@ export class AnnDataReader {
     this._nObs = 0;
     this._nVars = 0;
     this._obsKeys = [];
-    this._varNames = [];
     if (failure !== null) throw failure;
   }
 
@@ -2024,6 +3680,10 @@ export class AnnDataReader {
     if (this._closed && !this._root && !this._store) return;
     this._openRequestId++;
     this._closed = true;
+    // Its hold on the store's decoded chunks goes: they go once no opening
+    // holds them (one that carried this one holds them still: `open`, `carry`).
+    this._decodedChunks?.release();
+    this._decodedChunks = null;
     this._releaseCurrentState();
   }
 }

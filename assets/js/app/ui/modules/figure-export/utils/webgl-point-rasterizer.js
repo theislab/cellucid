@@ -77,6 +77,7 @@ import {
 } from '../../../../../rendering/shaders/high-perf-shaders.js';
 import { writeFogUniforms } from '../../../../../rendering/shaders/fog-shaders.js';
 import { enterOpaquePointBlending } from '../../../../../rendering/high-perf/gl-point-draw-state.js';
+import { PointStore, SegmentedVertexArray } from '../../../../../rendering/high-perf/point-store-segments.js';
 import { assertCropRect01 } from './crop.js';
 import {
   describeShaderQualities,
@@ -89,6 +90,7 @@ import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
 } from './lod-membership.js';
+import { allocateLargeArray } from '../../../../../utils/large-arrays.js';
 const DEFAULT_ALPHA_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
 const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
 
@@ -133,8 +135,8 @@ function buildHighlightOverlayBuffers({
   }
   if (count <= 0) return null;
 
-  const outPos = new Float32Array(count * dimension);
-  const outCol = new Uint8Array(count * 4);
+  const outPos = allocateLargeArray(Float32Array, count * dimension);
+  const outCol = allocateLargeArray(Uint8Array, count * 4);
 
   let cursor = 0;
   for (
@@ -202,6 +204,44 @@ function buildHighlightOverlayBuffers({
  * @type {Map<boolean, {canvas: OffscreenCanvas, gl: WebGL2RenderingContext}>}
  */
 const rasterContexts = new Map();
+
+/**
+ * One pass's points on the GPU as the viewer holds them: segmented position
+ * and colour stores (`rendering/high-perf/point-store-segments.js`), one
+ * buffer a segment, drawn through one vertex array a segment, so no single
+ * buffer limits how many points a figure draws. Returns what to draw and
+ * delete.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {Float32Array} positions - `count * dimension` floats.
+ * @param {number} dimension
+ * @param {Uint8Array} colors - `count * 4` bytes.
+ * @param {number} count
+ * @param {string} label
+ * @returns {{positions: PointStore, colors: PointStore, arrays: SegmentedVertexArray}}
+ */
+function uploadPointPass(gl, positions, dimension, colors, count, label) {
+  const pass = {
+    positions: new PointStore(gl),
+    colors: new PointStore(gl),
+    arrays: new SegmentedVertexArray(gl),
+  };
+  // A store the GPU refuses fails the export by name, never draws nothing.
+  const allocate = (refusal, run) => {
+    run();
+    const code = gl.getError();
+    if (code !== gl.NO_ERROR) throw new RangeError(`${refusal} (WebGL error 0x${code.toString(16)}).`);
+  };
+  pass.positions.allocate(count, dimension * 4, gl.STATIC_DRAW, allocate, `${label} positions`, positions.subarray(0, count * dimension));
+  pass.colors.allocate(count, 4, gl.STATIC_DRAW, allocate, `${label} colours`, colors.subarray(0, count * 4));
+  pass.arrays.setStores(pass.positions, pass.colors, dimension);
+  return pass;
+}
+
+/** Draw every point of a pass, one draw a segment in order. */
+function drawPointPass(pass, count) {
+  pass.arrays.drawRange(0, count, () => {}, drawPointsInSegments);
+}
 
 /**
  * Put a reused context back into the state a new context starts in, for every
@@ -487,8 +527,8 @@ function packBuffers({
 
   const outPositions = admittedIndices === null
     ? positions
-    : new Float32Array(admittedCount * dimension);
-  const outColors = new Uint8Array(admittedCount * 4);
+    : allocateLargeArray(Float32Array, admittedCount * dimension);
+  const outColors = allocateLargeArray(Uint8Array, admittedCount * 4);
 
   const mutedAlpha = selectionMutedOpacity;
   let cursor = 0;
@@ -773,18 +813,8 @@ export function rasterizePointsWebgl({
   let program = null;
   /** @type {WebGLProgram|null} */
   let highlightProgram = null;
-  /** @type {WebGLBuffer|null} */
-  let positionBuffer = null;
-  /** @type {WebGLBuffer|null} */
-  let colorBuffer = null;
-  /** @type {WebGLBuffer|null} */
-  let highlightPosBuffer = null;
-  /** @type {WebGLBuffer|null} */
-  let highlightColorBuffer = null;
-  /** @type {WebGLBuffer|null} */
-  let overlayPosBuffer = null;
-  /** @type {WebGLBuffer|null} */
-  let overlayColorBuffer = null;
+  /** The passes' segmented stores and vertex arrays (`uploadPointPass`). */
+  const passes = [];
   /** @type {WebGLTexture|null} */
   let dummyAlphaTex = null;
   /** @type {WebGLTexture|null} */
@@ -838,27 +868,9 @@ export function rasterizePointsWebgl({
       gl.viewport(0, 0, outW, outH);
     }
 
-    // Buffers (separate position + color to keep packing simple).
-    positionBuffer = gl.createBuffer();
-    colorBuffer = gl.createBuffer();
-    if (!positionBuffer || !colorBuffer) {
-      throw new Error('Figure-export point-buffer allocation failed.');
-    }
-
-    const packedPositions = packed.positions.subarray(
-      0,
-      packed.count * packed.dimension
-    );
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, packedPositions, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, packed.dimension, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, packed.colors, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+    // Positions and colours as separate segmented stores.
+    const pointPass = uploadPointPass(gl, packed.positions, packed.dimension, packed.colors, packed.count, 'Figure-export point');
+    passes.push(pointPass);
 
     // Uniform helpers.
     const u = (name) => gl.getUniformLocation(program, name);
@@ -912,7 +924,7 @@ export function rasterizePointsWebgl({
     // for u_lodIndexTex. If both samplers default to texture unit 0, WebGL throws:
     // "Two textures of different types use the same sampler location"
     setI1(u('u_useAlphaTex'), 0);
-    setI1(u('u_useLodIndexTex'), 0);
+    setI1(u('u_orderedSlots'), 0);
 
     // Create and bind dummy textures to separate texture units to prevent type conflicts.
     // IMPORTANT: Configure filters/wraps so textures are "complete" (no mipmaps required),
@@ -971,7 +983,7 @@ export function rasterizePointsWebgl({
       setF1(u('u_coverageFloor'), multisampled ? 0 : 0.5);
     }
 
-    drawPointsInSegments(gl, 0, packed.count);
+    drawPointPass(pointPass, packed.count);
 
     // Optional overlay pass (e.g., centroid points rendered larger on top).
     if (overlayPoints !== null) {
@@ -1010,25 +1022,11 @@ export function rasterizePointsWebgl({
         alphaThreshold: overlayPoints.alphaThreshold ?? DEFAULT_ALPHA_THRESHOLD,
       });
       if (overlayPacked.count > 0) {
-        overlayPosBuffer = gl.createBuffer();
-        overlayColorBuffer = gl.createBuffer();
-        if (!overlayPosBuffer || !overlayColorBuffer) {
-          throw new Error('Figure-export overlay-buffer allocation failed.');
-        }
-        const overlayPositions = overlayPacked.positions.subarray(0, overlayPacked.count * 3);
-        gl.bindBuffer(gl.ARRAY_BUFFER, overlayPosBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, overlayPositions, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, overlayColorBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, overlayPacked.colors, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
-
+        const overlayPass = uploadPointPass(gl, overlayPacked.positions, 3, overlayPacked.colors, overlayPacked.count, 'Figure-export overlay');
+        passes.push(overlayPass);
         setF1(u('u_pointSize'), overlayPoints.pointSizePx);
         setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
-        drawPointsInSegments(gl, 0, overlayPacked.count);
+        drawPointPass(overlayPass, overlayPacked.count);
       }
     }
 
@@ -1052,28 +1050,11 @@ export function rasterizePointsWebgl({
       highlightProgram = createProgram(gl, HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT);
       gl.useProgram(highlightProgram);
 
-      highlightPosBuffer = gl.createBuffer();
-      highlightColorBuffer = gl.createBuffer();
-      if (!highlightPosBuffer || !highlightColorBuffer) {
-        throw new Error('Figure-export highlight-buffer allocation failed.');
-      }
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, highlightPosBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.positions, gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(
-        0,
-        highlightOverlay.dimension,
-        gl.FLOAT,
-        false,
-        0,
-        0
+      const highlightPass = uploadPointPass(
+        gl, highlightOverlay.positions, highlightOverlay.dimension, highlightOverlay.colors,
+        highlightOverlay.count, 'Figure-export highlight'
       );
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, highlightColorBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.colors, gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(1);
-      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+      passes.push(highlightPass);
 
       const hu = (name) => gl.getUniformLocation(highlightProgram, name);
       const setHMat4 = (loc, mat) => { if (loc) gl.uniformMatrix4fv(loc, false, mat); };
@@ -1107,7 +1088,7 @@ export function rasterizePointsWebgl({
       configureStraightAlphaBlending(gl);
       try {
         gl.depthMask(false);
-        drawPointsInSegments(gl, 0, highlightOverlay.count);
+        drawPointPass(highlightPass, highlightOverlay.count);
       } finally {
         gl.depthMask(true);
       }
@@ -1135,12 +1116,13 @@ export function rasterizePointsWebgl({
     }
   };
   cleanup('array-buffer unbind', () => gl.bindBuffer(gl.ARRAY_BUFFER, null));
-  if (positionBuffer) cleanup('position-buffer deletion', () => gl.deleteBuffer(positionBuffer));
-  if (colorBuffer) cleanup('color-buffer deletion', () => gl.deleteBuffer(colorBuffer));
-  if (overlayPosBuffer) cleanup('overlay-position-buffer deletion', () => gl.deleteBuffer(overlayPosBuffer));
-  if (overlayColorBuffer) cleanup('overlay-color-buffer deletion', () => gl.deleteBuffer(overlayColorBuffer));
-  if (highlightPosBuffer) cleanup('highlight-position-buffer deletion', () => gl.deleteBuffer(highlightPosBuffer));
-  if (highlightColorBuffer) cleanup('highlight-color-buffer deletion', () => gl.deleteBuffer(highlightColorBuffer));
+  cleanup('vertex-array unbind', () => gl.bindVertexArray(null));
+  // Vertex arrays before the buffers they reference.
+  for (const pass of passes) cleanup('point vertex-array deletion', () => pass.arrays.delete());
+  for (const pass of passes) {
+    cleanup('position-buffer deletion', () => pass.positions.delete());
+    cleanup('color-buffer deletion', () => pass.colors.delete());
+  }
   if (dummyAlphaTex) cleanup('alpha-texture deletion', () => deleteTextureTracked(gl, dummyAlphaTex));
   if (dummyLodIndexTex) cleanup('LOD-index-texture deletion', () => deleteTextureTracked(gl, dummyLodIndexTex));
   if (highlightProgram) cleanup('highlight-program deletion', () => deleteProgramReleasingUse(gl, highlightProgram));

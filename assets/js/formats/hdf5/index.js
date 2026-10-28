@@ -50,7 +50,8 @@ const MiB = 1024 * 1024;
 /**
  * @typedef {Object} OpenOptions
  * @property {AbortSignal|null} [signal]
- * @property {number} [decodedChunkCacheBytes] - Budget of the decoded-chunk cache (default 64 MiB)
+ * @property {number|import('../io/decoded-budget.js').DecodedBudget} [decodedChunkCacheBytes] - Budget of the
+ *   decoded-chunk cache (default 64 MiB), or one shared with the other caches of the file's decoded chunks
  * @property {boolean} [verifyChecksums] - Check newer-format metadata checksums (default true)
  * @property {import('../io/activity.js').ReadActivity|null} [activity] - Counts what opening reads
  */

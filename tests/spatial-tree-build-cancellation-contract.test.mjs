@@ -7,6 +7,7 @@
  * posting the old positions' slices, and the build's closures kept the old
  * positions alive until the worker answered.
  */
+import { DEFAULT_CELL_PRIORITY } from '../assets/js/data/cell-priority.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -45,7 +46,7 @@ function makeRenderer(positions) {
 function build(renderer, positions) {
   const outcome = { done: 0, failed: 0, cancelled: 0 };
   renderer._buildSpatialTreeJob(
-    positions, 3, true,
+    positions, 3, true, DEFAULT_CELL_PRIORITY,
     () => { outcome.done += 1; },
     () => { outcome.failed += 1; },
     () => { outcome.cancelled += 1; },

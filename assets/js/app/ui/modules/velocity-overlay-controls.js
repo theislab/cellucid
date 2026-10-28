@@ -720,6 +720,9 @@ export function initVelocityOverlayControls(options) {
       syncAvailability();
     } catch (error) {
       if (!isOperationOwnerCurrent(owner)) return;
+      // A read superseded (another dataset, or the open cells changed and
+      // the field is read again for them) is not a failure.
+      if (error !== null && typeof error === 'object' && error.name === 'AbortError') return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -773,6 +776,9 @@ export function initVelocityOverlayControls(options) {
       syncAvailability();
     } catch (error) {
       if (!isOperationOwnerCurrent(owner)) return;
+      // A read superseded (another dataset, or the open cells changed and
+      // the field is read again for them) is not a failure.
+      if (error !== null && typeof error === 'object' && error.name === 'AbortError') return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -811,6 +817,9 @@ export function initVelocityOverlayControls(options) {
       syncAvailability();
     } catch (error) {
       if (!isOperationOwnerCurrent(owner)) return;
+      // A read superseded (another dataset, or the open cells changed and
+      // the field is read again for them) is not a failure.
+      if (error !== null && typeof error === 'object' && error.name === 'AbortError') return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -897,6 +906,9 @@ export function initVelocityOverlayControls(options) {
 
   state.on('vectorFields:changed', onVectorFieldsChanged);
   state.on('view:representation-changed', onDimChanged);
+  // The open cells grew or were cut in place (`app/open-cells-resize.js`):
+  // the field shown is drawn again on them, as after a layout change.
+  state.on('vectorFields:cells-changed', onDimChanged);
 
   // Initialize UI state.
   for (const slider of VELOCITY_SLIDERS) readSlider(slider);
@@ -920,6 +932,7 @@ export function initVelocityOverlayControls(options) {
       () => sliderFrames.forEach(frame => frame.cancel()),
       () => state.off('vectorFields:changed', onVectorFieldsChanged),
       () => state.off('view:representation-changed', onDimChanged),
+      () => state.off('vectorFields:cells-changed', onDimChanged),
     ]) {
       try {
         cleanup();

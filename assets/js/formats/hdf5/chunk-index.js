@@ -28,6 +28,8 @@ import { readExtensibleArray } from './extensible-array.js';
 import { readFixedArray } from './fixed-array.js';
 import { formatError } from './errors.js';
 import { ReadActivity } from '../io/activity.js';
+import { SharedWork } from '../io/abort.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 /**
  * @typedef {Object} ChunkTable
@@ -37,9 +39,14 @@ import { ReadActivity } from '../io/activity.js';
  * @property {Float64Array} size
  * @property {Uint32Array} mask
  * @property {number} count - Chunks written (read so far, for a table read as it is needed)
- * @property {(first: number, last: number, reader?: Object) => Promise<unknown>} [cover] - Read the
+ * @property {(first: number, last: number, reader?: Object, signal?: AbortSignal|null) => Promise<unknown>} [cover] - Read the
  *   index entries of chunks `first..last` (grid numbers) before they are looked up, for a table read
- *   as it is needed
+ *   as it is needed, waiting with `signal` (a leaf read stops once every read waiting for it withdrew)
+ * @property {(first: number, last: number) => boolean} [covered] - Whether the entries of chunks
+ *   `first..last` are read (a table read as it is needed)
+ * @property {(linear: number) => number} [storedSizeOf] - A chunk's stored size without reading
+ *   more of the index: exact once its entry is read, else its index node's first chunk's size
+ *   (a table read as it is needed)
  */
 
 /** Chunks per dimension for `dims` (a dimension of unlimited maximum has none: null). */
@@ -49,9 +56,9 @@ export function chunkGrid(dims, chunkDims) {
 
 /** A table over every chunk of the grid. */
 function denseTable(grid, count) {
-  const address = new Float64Array(count).fill(-1);
-  const size = new Float64Array(count);
-  const mask = new Uint32Array(count);
+  const address = allocateTypedArray(Float64Array, count, 'HDF5 chunk index').fill(-1);
+  const size = allocateTypedArray(Float64Array, count, 'HDF5 chunk index');
+  const mask = allocateTypedArray(Uint32Array, count, 'HDF5 chunk index');
   return {
     grid,
     address,
@@ -246,7 +253,10 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
       leaves = [];
       for (const node of nodes) {
         for (const { keyOffset, child } of node.entries) {
-          leaves.push({ address: child, start: keyLinear(node.bytes, keyOffset).linear });
+          // A parent's key of a leaf is the key of the leaf's first chunk:
+          // its number and its stored size.
+          const { linear, key } = keyLinear(node.bytes, keyOffset);
+          leaves.push({ address: child, start: linear, firstSize: key.size });
         }
       }
     } else {
@@ -290,30 +300,63 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
   const leafBytes = 24 + (2 * file.btreeK.chunk + 1) * (8 + 8 * (rank + 1)) + 2 * file.btreeK.chunk * file.offsetSize;
   const loading = new Array(leaves.length).fill(null);
   /** Leaves read ahead in the background, and leaves placed in the table. */
-  const ahead = new Uint8Array(leaves.length);
-  const placed = new Uint8Array(leaves.length);
-  /**
-   * Read the leaves holding chunks `first..last` (grid numbers) that are not
-   * read yet, all at once, through `reader` (the file as the read sees it).
-   */
-  table.cover = (first, last, reader = file) => {
-    // The last leaf starting at or before `first`.
+  const ahead = allocateTypedArray(Uint8Array, leaves.length, 'HDF5 chunk index leaves');
+  const placed = allocateTypedArray(Uint8Array, leaves.length, 'HDF5 chunk index leaves');
+  /** The last leaf starting at or before chunk `linear` (the first leaf for one before it). */
+  const leafOf = linear => {
     let low = 0;
     let high = leaves.length - 1;
     while (low < high) {
       const middle = (low + high + 1) >>> 1;
-      if (leaves[middle].start <= first) low = middle;
+      if (leaves[middle].start <= linear) low = middle;
       else high = middle - 1;
     }
-    // A leaf wanted now: not read yet, or being read ahead in the background
-    // (which a read waiting for it must not wait behind: it is read again in
-    // the read's own right, a request of a few kilobytes).
+    return low;
+  };
+  table.covered = (first, last) => {
+    for (let i = leafOf(first); i < leaves.length && leaves[i].start <= last; i++) if (!placed[i]) return false;
+    return true;
+  };
+  /**
+   * A chunk's stored size without reading its leaf: once the leaf is read,
+   * its entry's (0 when it was never written); before, the size of the
+   * leaf's first chunk, which its parent's key holds. What a whole dataset
+   * stores is then known from the levels read at open (one key in every 2K
+   * chunks; the chunks of one dataset compress alike), not from a request
+   * for every leaf: the 12,382 leaves of a 2.3M-cell atlas's `X`, 850 KB
+   * apart, are as many round trips.
+   */
+  table.storedSizeOf = linear => {
+    const slot = table.find(linear);
+    if (slot >= 0) return table.size[slot];
+    const i = leafOf(linear);
+    return placed[i] ? 0 : leaves[i].firstSize;
+  };
+  /** Where the reads of this table have reached in leaf order (the last leaf a read covered). */
+  let scanEnd = -1;
+  /** Whether leaf `i` is being read, or was, for reads that may still wait for it. */
+  const asked = i => loading[i] !== null && !loading[i].abandoned;
+  /**
+   * Read the leaves holding chunks `first..last` (grid numbers) that are not
+   * read yet, all at once, through `reader` (the file as the read sees it),
+   * waiting with `signal`. A leaf read is shared by every read waiting for
+   * it (`SharedWork`): it stops only once every one of them withdrew, and is
+   * read again by the next read that needs it.
+   */
+  table.cover = (first, last, reader = file, signal = null) => {
+    const low = leafOf(first);
+    const high = leafOf(last);
+    // A leaf wanted now: not read yet, or, for a read a view waits for,
+    // being read ahead in the background (which it must not wait behind: it
+    // is read again in the read's own right, a request of a few kilobytes).
+    // Background work waits for a leaf read ahead, never asks for it twice.
     const wanted = [];
-    for (let i = low; i < leaves.length && leaves[i].start <= last; i++) {
-      if (loading[i] === null || (ahead[i] && !placed[i])) wanted.push(i);
+    for (let i = low; i <= high; i++) {
+      if (!asked(i) || (ahead[i] && !placed[i] && reader.background !== true)) wanted.push(i);
     }
-    const readLeaves = (indices, through = reader, background = false) => {
-      const read = readBtreeV1Nodes(through, indices.map(i => ({ address: leaves[i].address, level: 0 })), 1, { rank })
+    /** `unwaited`: read ahead of need, to the end whether or not a read comes to wait for it. */
+    const readLeaves = (indices, through = reader, background = false, unwaited = false) => {
+      const read = new SharedWork(leafSignal => readBtreeV1Nodes(through, indices.map(i => ({ address: leaves[i].address, level: 0 })), 1, { rank, signal: leafSignal })
         .then(nodes => {
           // A leaf read twice (ahead, then for a read) is placed once.
           const fresh = nodes.filter((node, k) => !placed[indices[k]]);
@@ -321,12 +364,13 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
           indices.forEach(i => {
             placed[i] = true;
           });
-        });
+        }));
+      if (unwaited) read.hold();
       indices.forEach(i => {
         loading[i] = read;
         ahead[i] = background;
       });
-      read.catch(() => {
+      read.promise.catch(() => {
         // A failed read is asked for again by the next read that needs it.
         indices.forEach(i => {
           if (loading[i] === read) loading[i] = null;
@@ -344,25 +388,88 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
       // read a view waits for (the next gene's chunks) is never queued behind
       // them; a read that needs one of them before it lands reads it in its
       // own right.
-      const needed = Promise.all(wanted.map(i => loading[i]));
+      const needed = Promise.all(wanted.map(i => loading[i].promise));
       needed.then(() => setTimeout(() => {
         const unread = [];
-        for (let i = 0; i < leaves.length; i++) if (loading[i] === null) unread.push(i);
+        for (let i = 0; i < leaves.length; i++) if (!asked(i)) unread.push(i);
         // One read per leaf (planned together, so fetched together): a later
         // read waits for its own leaf, not for all of them.
         const link = file.reader?.link;
         if (unread.length > 0 && unread.length * leafBytes <= roundTripBytes(file) &&
             unread.length <= (link?.backgroundConcurrency ?? 0)) {
           const through = file.withActivity(new ReadActivity({ kind: 'index', label: 'chunk index leaves, read ahead', background: true }));
-          for (const i of unread) readLeaves([i], through, true);
+          for (const i of unread) readLeaves([i], through, true, true);
         }
       }, 0), () => {});
     }
-    const pending = new Set();
-    for (let i = low; i < leaves.length && leaves[i].start <= last; i++) pending.add(loading[i]);
-    return Promise.all(pending);
+    const leafReads = new Set();
+    for (let i = low; i <= high; i++) if (!placed[i]) leafReads.add(loading[i]);
+    const pending = new Set([...leafReads].map(read => read.join(signal)));
+    // Every read asked for in this task waits for the leaves of all of them
+    // (`indexBurst`): their chunks then go out together, as one plan the
+    // byte reader merges, not wave by wave as each read's own leaves land
+    // (a burst of 100 Loom genes: 44 leaf requests, then each read's few
+    // chunks alone, ~36 requests in seven turns).
+    const covered = pending.size === 0 ? Promise.resolve() : indexBurst(file, reader.background === true, pending);
+    // A read that goes on where the last one ended (rows in file order: a
+    // matrix read slab by slab, the kept rows of a subsample wave by wave)
+    // has the leaves after its own read ahead, as many as it needed: the
+    // next read's chunk addresses are then known when it starts, and it
+    // waits one round trip for its chunks, not two. They are asked for now,
+    // with this read's own leaves and as its own (not as background work):
+    // background requests wait while any other request waits, so leaves
+    // asked for behind this read's chunks came only once those chunks had
+    // arrived, and every slab of a scan waited a round trip more for its
+    // index (a CSR matrix's first gene over 150 ms at 5 MB/s: a 10 MB scan
+    // took 3.1 s, its floor 2.2 s). A leaf is a few kilobytes: going out
+    // first, it holds a connection one round trip. A read elsewhere (a gene
+    // of a gene-major matrix) reads nothing ahead.
+    if (low <= scanEnd + 1 && high > scanEnd && scanEnd >= 0) {
+      const count = high - low + 1;
+      const next = [];
+      for (let i = high + 1; i < leaves.length && i <= high + count; i++) if (!asked(i)) next.push(i);
+      for (const i of next) readLeaves([i], reader, false, true);
+    }
+    // A read within what was covered leaves the scan where it was.
+    scanEnd = low > scanEnd + 1 ? high : Math.max(high, scanEnd);
+    return covered;
   };
   return table;
+}
+
+/**
+ * Run `callback` on a later macrotask: after the current task and every
+ * promise continuation of it, so every read asked for in one task (the
+ * genes of one call, the arrays of one sparse gene) has joined the burst.
+ */
+const scheduleMacrotask = typeof setImmediate === 'function' ? callback => setImmediate(callback) : callback => setTimeout(callback, 0);
+
+/**
+ * The chunk index leaves the reads asked for in one task wait for, together:
+ * every read of the task (of any dataset of the file; reads a view waits for
+ * apart from background work) resolves when the leaves of all of them are
+ * placed. `pending` are this read's leaf reads (joined with its signal);
+ * the result rejects as soon as one of them fails.
+ */
+function indexBurst(file, background, pending) {
+  const root = file.unscoped ?? file;
+  root.indexBursts ??= new Map();
+  let burst = root.indexBursts.get(background);
+  if (burst === undefined) {
+    burst = { reads: new Set(), done: null };
+    root.indexBursts.set(background, burst);
+    const closing = burst;
+    closing.done = new Promise(resolve => scheduleMacrotask(() => {
+      if (root.indexBursts.get(background) === closing) root.indexBursts.delete(background);
+      resolve(Promise.allSettled(closing.reads));
+    }));
+  }
+  for (const read of pending) burst.reads.add(read);
+  const own = Promise.all(pending);
+  const together = burst.done.then(() => own);
+  // A read whose own leaves fail (it withdrew: its signal aborted) learns it
+  // at once, not once the other reads' leaves are in.
+  return Promise.race([together, own.then(() => together)]);
 }
 
 /**

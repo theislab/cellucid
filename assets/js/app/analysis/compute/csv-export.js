@@ -106,6 +106,31 @@ function requirePages(pages) {
 }
 
 /**
+ * A page of a per-cell CSV as it is written: its cells named by original
+ * position, the cell's row in the dataset in its original order, as every
+ * export and the notebook name a cell, and its rows ascending by it (the
+ * dataset's own row order), each value with its cell. Inside the app a cell
+ * is its open position; a subsample, or a file stored in priority order,
+ * opens cells at other positions and in another order, translated by the
+ * open dataset's cell identity (`CellIdentity.originalValues`). A page
+ * without indices holds every open cell, in open order; written, its
+ * `cellIndices` are null when that is every cell of the dataset (the rows
+ * are numbered as they are).
+ *
+ * @template {{values: ArrayLike<unknown>, cellIndices?: ArrayLike<number>|null}} P
+ * @param {P} page
+ * @param {import('../../../data/cell-identity.js').CellIdentity} identity
+ * @returns {P & {values: ArrayLike<unknown>, cellIndices: ArrayLike<number>|null}}
+ */
+export function pageInOriginalOrder(page, identity) {
+  if (typeof identity?.originalValues !== 'function') {
+    throw new TypeError("A per-cell CSV needs the open dataset's cell identity");
+  }
+  const { cells, values } = identity.originalValues(page.cellIndices ?? null, page.values);
+  return { ...page, values, cellIndices: cells };
+}
+
+/**
  * The header line of a per-cell CSV layout.
  *
  * @param {'page-data'|'signature-scores'} layout
@@ -232,21 +257,42 @@ export function splitPerCellRows(pages, parts) {
 }
 
 /**
+ * The gene columns of an analysis table (DE, markers): `names`, each gene's
+ * identifier -- the var index, `adata.var_names`, as every boundary names a
+ * gene (`geneIdentities`) and as scanpy's `rank_genes_groups_df` writes it --
+ * then `symbols`, the name the viewer shows, when any of them differs (a
+ * CELLxGENE file: Ensembl ids, symbols shown).
+ *
+ * @param {string[]} genes - The names the viewer shows
+ * @param {string[]} ids - Each gene's identifier
+ * @returns {{header: string, cells: (index: number) => string}}
+ */
+export function geneNameColumns(genes, ids) {
+  if (ids.length !== genes.length) throw new RangeError('Every gene of an analysis table needs its identifier');
+  const symbols = ids.some((id, i) => String(id) !== String(genes[i]));
+  return {
+    header: symbols ? 'names,symbols' : 'names',
+    cells: index => (symbols ? `${toCSVCell(ids[index])},${toCSVCell(genes[index])}` : toCSVCell(ids[index])),
+  };
+}
+
+/**
  * Every gene of every group of a marker run, one line each (long format),
  * with scanpy's `rank_genes_groups_df` column names plus `auroc`,
  * `small_group` and `tested`; fractions are 0–1 as scanpy writes them. Each
- * group's genes are in the run's gene order.
+ * group's genes are in the run's gene order, named by `geneNameColumns`.
  *
- * @param {{genes: string[], groups: Array<{name: string, tested: boolean, small: boolean}>,
+ * @param {{genes: string[], ids: string[], groups: Array<{name: string, tested: boolean, small: boolean}>,
  *   scores: Float32Array[], logfoldchanges: Float32Array[], pvals: Float64Array[],
  *   pvalsAdj: Float64Array[], pctIn: Float32Array[], pctRef: Float32Array[], auroc: Float32Array[]}} markers
  * @returns {Blob} With its header line
  */
 export function markerStatisticsCSV(markers) {
-  const { genes, groups, scores, logfoldchanges, pvals, pvalsAdj, pctIn, pctRef, auroc } = markers;
+  const { genes, ids, groups, scores, logfoldchanges, pvals, pvalsAdj, pctIn, pctRef, auroc } = markers;
   const writer = new CsvBlobWriter();
-  writer.line('group,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');
-  const names = genes.map(gene => toCSVCell(gene));
+  const columns = geneNameColumns(genes, ids);
+  writer.line(`group,${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested`);
+  const names = genes.map((_, i) => columns.cells(i));
   groups.forEach((group, g) => {
     const groupCell = toCSVCell(group.name);
     const small = group.small ? 'true' : 'false';

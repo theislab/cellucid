@@ -34,6 +34,8 @@ import {
   throwIfFigureExportAborted,
 } from './figure-export-contract.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { describeSubsampleMethod } from '../../../../data/subsample.js';
+import { allocateLargeArray } from '../../../../utils/large-arrays.js';
 
 const LIVE_VIEW_ID = 'live';
 const userNotifiedFailures = new WeakSet();
@@ -212,7 +214,8 @@ function cloneLodMembership(membership, pointCount, dimensionLevel, context) {
 function cloneTypedOwner(owner, cache, Type) {
   const existing = cache.get(owner);
   if (existing !== undefined) return existing;
-  const clone = new Type(owner);
+  const clone = allocateLargeArray(Type, owner.length);
+  clone.set(owner);
   cache.set(owner, clone);
   return clone;
 }
@@ -278,7 +281,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    *   datasetSourceName: string|null,
    *   datasetSourceUrl: string|null,
    *   datasetSourceCitation: string|null,
-   *   datasetUserPath: string|null
+   *   datasetUserPath: string|null,
+   *   datasetCells: {open: number, of: number, method: string, digest: string}|null
    * }}
   */
   function getDatasetIdentity() {
@@ -309,6 +313,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetSourceUrl: null,
         datasetSourceCitation: null,
         datasetUserPath: null,
+        datasetCells: openCellsOf(null, null),
       };
     }
     for (const methodName of [
@@ -344,6 +349,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const datasetSourceUrl = meta?.source?.url ?? null;
     const datasetSourceCitation = meta?.source?.citation ?? null;
     const datasetUserPath = dataSourceSnapshot.userPath ?? null;
+    const datasetCells = openCellsOf(sourceType, datasetId);
 
     return {
       datasetName,
@@ -354,6 +360,25 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetSourceUrl,
       datasetSourceCitation,
       datasetUserPath,
+      datasetCells,
+    };
+  }
+
+  /**
+   * The open cells when they are a subsample (`readProvenanceCells`): their
+   * count, the dataset's, how they were chosen and their cell-set digest;
+   * null when every cell is open.
+   */
+  function openCellsOf(sourceType, datasetId) {
+    const identity = state.cellIdentity;
+    if (!identity?.isSubset) return null;
+    const annData = sourceType === null ? null : dataSourceManager?.getSource?.(sourceType)?.getAnnDataSource?.(datasetId) ?? null;
+    const spec = typeof annData?.getCellSubset === 'function' ? annData.getCellSubset()?.spec ?? null : null;
+    return {
+      open: identity.n,
+      of: identity.nOriginal,
+      method: spec === null ? 'subsample' : describeSubsampleMethod(spec),
+      digest: identity.digest,
     };
   }
 
@@ -721,6 +746,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetSourceUrl,
       datasetSourceCitation,
       datasetUserPath,
+      datasetCells,
     } = getDatasetIdentity();
     throwIfFigureExportAborted(signal);
     const activeViewId = state.getActiveViewId();
@@ -910,6 +936,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetSourceUrl,
         datasetSourceCitation,
         datasetUserPath,
+        datasetCells,
         views: provenanceViews,
       },
       selection: {

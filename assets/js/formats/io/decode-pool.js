@@ -37,8 +37,9 @@
  *   to start. A task a worker took and could not finish (the worker stopped)
  *   is decoded here from the caller's bytes; only a worker that has answered
  *   before is given bytes by transfer, and should it stop, those tasks fail.
- * - **Lifetime**: workers are made on the first chunk worth sending, or
- *   ahead of it when a store opens (`warmDecodePool()`), up to
+ * - **Lifetime**: workers are made as chunks worth sending queue for them
+ *   (one is made ahead of the first when a store opens: `warmDecodePool()`),
+ *   up to
  *   `navigator.hardwareConcurrency - 2` (a core each for the reader thread
  *   and the page) and to as many as the pool's memory holds (`memoryBytes`,
  *   at `DECODE_WORKER_BYTES` each), and terminated once none has had work
@@ -351,12 +352,16 @@ class DecodePool {
     return holder;
   }
 
-  /** Make every worker the pool may run now, ahead of the first chunk. */
+  /**
+   * Make one worker ahead of the first chunk (its start is then not on the
+   * first chunk's path); the others are made as chunks queue for them
+   * (`pump`). A worker is a JavaScript engine of its own: warming every one
+   * the pool may run held six of them from opening on, for a file whose
+   * chunks one decodes. @private
+   */
   warm() {
-    if (this.noWorkers) return;
-    while (this.workers.length < this.size) {
-      if (this.spawn() === null) return;
-    }
+    if (this.noWorkers || this.workers.length > 0 || this.size === 0) return;
+    if (this.spawn() === null) return;
     this.scheduleIdle();
   }
 
@@ -512,6 +517,9 @@ class DecodePool {
   stats() {
     return {
       workers: this.workers.length,
+      // Chunks decoded at once: the workers the pool may run (one, this
+      // thread, without workers).
+      size: this.noWorkers ? 1 : this.size,
       running: this.workers.reduce((sum, holder) => sum + [...holder.jobs.values()].flat().length, 0),
       // Cancelled jobs stay in the queue until it reaches them; they do not wait.
       queued: this.queues.reduce((count, queue) => count + queue.reduce((n, job) => n + (job.settled ? 0 : 1), 0), 0),
@@ -629,10 +637,11 @@ export function releaseIdleDecodeWorkers() {
 
 /**
  * Workers, tasks under way and tasks waiting, for diagnostics and tests, and
- * how fast chunks decode (`decodedBytesPerMs`, null until one has).
+ * how fast chunks decode (`decodedBytesPerMs`, null until one has) and how
+ * many at once (`size`; 0 before the pool is made).
  */
 export function decodePoolStats() {
-  return pool === null ? { workers: 0, running: 0, queued: 0, inThreadOnly: false, decodedBytesPerMs } : pool.stats();
+  return pool === null ? { workers: 0, size: 0, running: 0, queued: 0, inThreadOnly: false, decodedBytesPerMs } : pool.stats();
 }
 
 /**
@@ -640,7 +649,8 @@ export function decodePoolStats() {
  * (`memoryBytes`, which sizes the pool; the app gives its decode-worker
  * budget), or for tests and benchmarks a worker factory over
  * `node:worker_threads`, a pool size, a threshold. The current pool's
- * workers are terminated; the next chunk makes a new pool.
+ * workers are terminated; the next chunk makes a new pool, and how fast
+ * chunks decode is measured again.
  *
  * @param {{createWorker?: (() => Worker)|null, size?: number, memoryBytes?: number, idleMs?: number, minBytes?: number}} [options]
  */
@@ -648,4 +658,6 @@ export function configureDecodePool(options = {}) {
   pool?.terminate();
   pool = null;
   settings = { ...options };
+  // Its workers are others: how fast they decode is measured afresh.
+  decodedBytesPerMs = null;
 }

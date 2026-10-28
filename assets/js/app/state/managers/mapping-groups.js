@@ -47,6 +47,7 @@ import {
   modalityNames,
   modalityScope,
   geneNamesRoute,
+  geneNamesVarAxis,
   latentCandidateReason,
   mappingGeneListPath,
   mappingGraphPath,
@@ -58,10 +59,13 @@ import {
 } from '../../../data/data-mapping-candidates.js';
 import {
   createVarFieldLoader,
+  guessMappingGeneNames,
   loadConnectivitySummary,
   loadGeneList,
   varLoaderMappingOf,
 } from '../../../data/data-loaders.js';
+import { MAPPING_CANDIDATES_ROUTE } from '../../../data/dataset-mapping.js';
+import { cellsSteady, trackCellWork } from '../../../data/open-cells-work.js';
 import { createDatasetFieldLoadSupersededError } from './field/loading.js';
 import {
   describeMappingGroupValue,
@@ -601,6 +605,8 @@ export class DataStateMappingGroupMethods {
     if (!this.canChangeMappingGroup('expression')) {
       throw new Error('This dataset reads only its mapped expression matrix.');
     }
+    // Named as the mapping names its genes: once they are read.
+    await this.whenGenesListed();
     const candidates = this.getMappingCandidates();
     const axisRoute = expressionAxisRoute(candidates, expression, this.dataMapping.modality ?? null);
     if (axisRoute === null) {
@@ -671,8 +677,9 @@ export class DataStateMappingGroupMethods {
 
   /**
    * The expression groups a mapping takes when it moves to `modality`: that
-   * modality's default expression matrix (`defaultExpression`), its var
-   * index for names, its recorded log1p, and its highly variable column
+   * modality's default expression matrix (`defaultExpression`), its gene
+   * names (its var column of symbols when its index holds identifiers, else
+   * the index), its recorded log1p, and its highly variable column
    * (each as a dataset opening with that modality would).
    *
    * @param {string} modality
@@ -696,7 +703,59 @@ export class DataStateMappingGroupMethods {
     const { highlyVariable } = expression === null
       ? { highlyVariable: null }
       : defaultHighlyVariable(expression === 'raw' ? scope.raw.var.columns : scope.var.columns);
-    return { expression, geneNames: 'index', log1p, highlyVariable };
+    // That axis's gene-name default: null while it is not guessed yet
+    // (`guessGeneNames`), never the index in its place.
+    const geneNames = expression === null ? 'index' : this.geneNamesDefault(modality, expression);
+    return { expression, geneNames, log1p, highlyVariable };
+  }
+
+  /**
+   * The gene-name default of the genes of one expression matrix (of
+   * `modality`, a multimodal dataset's): its var column of symbols when its
+   * index holds identifiers (`inferGeneNameColumn`), else `index`; null
+   * while that axis is not guessed yet (`guessGeneNames`).
+   *
+   * @param {string|null} modality
+   * @param {string} expression - `X`, `raw` or `layer:<name>`
+   * @returns {string|null} `index`, `column:<name>`, or null (pending)
+   */
+  geneNamesDefault(modality, expression) {
+    const columns = this.getMappingCandidates()?.geneNameColumns ?? {};
+    const axis = geneNamesVarAxis(modality ?? null, expression);
+    if (!Object.hasOwn(columns, axis)) return null;
+    return columns[axis] === null ? 'index' : `column:${columns[axis]}`;
+  }
+
+  /**
+   * Guess the gene names of one expression matrix's axis (of `modality`),
+   * when it is first chosen (`BaseAnnDataAdapter.guessGeneNames`; the shown
+   * axis is guessed when its genes are listed): the catalog then states its
+   * default (`geneNamesDefault`), and `mapping:choices-changed` is emitted.
+   * Work on the open cells, as listing the genes is.
+   *
+   * @param {string|null} modality
+   * @param {string} expression
+   * @returns {Promise<string>} The default: `index` or `column:<name>`
+   */
+  async guessGeneNames(modality, expression) {
+    const known = this.geneNamesDefault(modality, expression);
+    if (known !== null) return known;
+    const generation = this._datasetGeneration;
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
+    const runtime = this._requireMappingRuntime();
+    const axis = geneNamesVarAxis(modality ?? null, expression);
+    const candidates = await trackCellWork(
+      guessMappingGeneNames(`${runtime.getBaseUrl()}${MAPPING_CANDIDATES_ROUTE}`, axis, {})
+    );
+    if (this._datasetGeneration !== generation || this.dataMapping === null) throw createDatasetFieldLoadSupersededError();
+    // The catalog shown gains the guess; everything else it states stays.
+    this._mappingCandidates = Object.freeze({
+      ...this._mappingCandidates,
+      geneNameColumns: Object.freeze({ ...this._mappingCandidates.geneNameColumns, [axis]: candidates.geneNameColumns[axis] }),
+    });
+    this.emit('mapping:choices-changed');
+    return this.geneNamesDefault(modality, expression);
   }
 
   /** The modality expression choices are read from now: the pending one, else the mapping's. @private */

@@ -423,11 +423,12 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       );
       const snapshotTexture = snapshot.alphaTexture;
       const initialAcceptedAlphaOwner =
-        snapshot.alphaTexData;
+        snapshot.alphas;
       const snapshotMirror =
         textureMirrors.get(snapshotTexture);
 
-      gl.bindVertexArray(snapshot.vao);
+      // Stores are segmented (point-store-segments.js): one segment here.
+      gl.bindVertexArray(snapshot.vao.vaos[0]);
       const colorAttribute = {
         buffer: gl.getVertexAttrib(
           1,
@@ -461,13 +462,20 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
           Math.round(value * 255)
         );
       const ownership = {
-        acceptedBytesExact:
-          snapshot.alphaTexData instanceof Uint8Array &&
-          snapshot.alphaTexData.length ===
-            snapshot.alphaTexWidth * snapshot.alphaTexHeight &&
-          expectedInitialBytes.every(
-            (value, index) =>
-              snapshot.alphaTexData[index] === value,
+        // The published transparency is kept by reference and is what the
+        // texture holds: no CPU copy of the R8 image, per view or shared.
+        acceptedTransparencyByReference:
+          snapshot.alphas === initialAlphas,
+        noCpuImageCopy:
+          !Object.hasOwn(snapshot, 'alphaTexData') &&
+          !Object.hasOwn(renderer, '_snapshotAlphaStagingData') &&
+          !Object.values(snapshot).some(
+            value =>
+              ArrayBuffer.isView(value) &&
+              value !== snapshot.alphas &&
+              value !== snapshot.colors &&
+              value !== snapshot.positions &&
+              value.length >= pointCount,
           ),
         alphaTextureDistinctFromLive:
           snapshotTexture !== renderer.getAlphaTexture(),
@@ -492,20 +500,17 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
           controlledMaxTextureSize,
           controlledMaxTextureSize + 1,
         ].every(index =>
-          snapshot.alphaTexData[index] ===
-            expectedInitialBytes[index] &&
           snapshotMirror?.bytes[index] ===
             expectedInitialBytes[index]
         ),
         paddedTailOpaque:
-          snapshot.alphaTexData
-            .subarray(pointCount)
-            .every(value => value === 255) &&
-          snapshotMirror?.bytes
+          snapshotMirror?.bytes.length ===
+            snapshot.alphaTexWidth * snapshot.alphaTexHeight &&
+          snapshotMirror.bytes
             .subarray(pointCount)
             .every(value => value === 255),
         colorAttribute: {
-          bufferMatches: colorAttribute.buffer === snapshot.buffer,
+          bufferMatches: colorAttribute.buffer === snapshot.buffer.segments[0].buffer,
           normalized: colorAttribute.normalized,
           offset: colorAttribute.offset,
           size: colorAttribute.size,
@@ -703,7 +708,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       gl.bindVertexArray(legacyVao);
       gl.bindBuffer(
         gl.ARRAY_BUFFER,
-        geometry.positionBuffer,
+        geometry.positionBuffer.segments[0].buffer,
       );
       gl.enableVertexAttribArray(0);
       // The shared geometry store holds the 2D positions: two components.
@@ -765,8 +770,8 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
             gl.uniform1i(uniforms.u_lodIndexTex, 1);
           }
         }
-        if (uniforms.u_useLodIndexTex !== null) {
-          gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+        if (uniforms.u_orderedSlots !== null) {
+          gl.uniform1i(uniforms.u_orderedSlots, 0);
         }
       };
       gl.clear(gl.COLOR_BUFFER_BIT);
@@ -850,7 +855,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         );
       };
       // Warm shaders, texture sampling, and both attribute layouts.
-      await measure(configureProduction, snapshot.vao);
+      await measure(configureProduction, snapshot.vao.vaos[0]);
       await measure(configureLegacy, legacyVao);
       const timingSamples = {
         legacyRgbaBakedMs: [],
@@ -862,7 +867,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
               [
                 'snapshotRgbR8Ms',
                 configureProduction,
-                snapshot.vao,
+                snapshot.vao.vaos[0],
               ],
               [
                 'legacyRgbaBakedMs',
@@ -879,7 +884,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
               [
                 'snapshotRgbR8Ms',
                 configureProduction,
-                snapshot.vao,
+                snapshot.vao.vaos[0],
               ],
             ];
         for (const [key, configure, vao] of order) {
@@ -955,17 +960,17 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         beforeChanged,
         captureCounts(),
       );
-      const changedOwner = snapshot.alphaTexData;
+      const changedOwner = snapshot.alphas;
       const changedBytes =
         Uint8Array.from(changedAlphas, value =>
           Math.round(value * 255)
         );
       const changedPublication = {
         acceptedOwnerAdvanced:
-          changedOwner !== initialAcceptedAlphaOwner,
+          changedOwner !== initialAcceptedAlphaOwner &&
+          changedOwner === changedAlphas,
         bytesExact: changedBytes.every(
           (value, index) =>
-            snapshot.alphaTexData[index] === value &&
             textureMirrors.get(snapshot.alphaTexture)
               ?.bytes[index] === value,
         ),
@@ -1005,9 +1010,9 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       failureCandidate[3] = 0;
       failureCandidate[4] = 0;
       const acceptedBeforeFailure =
-        snapshot.alphaTexData;
+        snapshot.alphas;
       const acceptedBytesBeforeFailure =
-        snapshot.alphaTexData.slice();
+        Uint8Array.from(acceptedBeforeFailure, value => value * 255);
       const beforeFailure = captureCounts();
       injectedTexture = snapshot.alphaTexture;
       let failure = null;
@@ -1030,12 +1035,11 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         acceptedBytesRestored:
           acceptedBytesBeforeFailure.every(
             (value, index) =>
-              snapshot.alphaTexData[index] === value &&
               textureMirrors.get(snapshot.alphaTexture)
                 ?.bytes[index] === value,
           ),
         acceptedOwnerPreserved:
-          snapshot.alphaTexData === acceptedBeforeFailure,
+          snapshot.alphas === acceptedBeforeFailure,
         failure,
         resourcesStable:
           snapshot.alphaTexture ===
@@ -1061,11 +1065,10 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         );
       const retryPublication = {
         acceptedOwnerAdvanced:
-          snapshot.alphaTexData !==
-            acceptedBeforeFailure,
+          snapshot.alphas !== acceptedBeforeFailure &&
+          snapshot.alphas === failureCandidate,
         bytesExact: retryBytes.every(
           (value, index) =>
-            snapshot.alphaTexData[index] === value &&
             textureMirrors.get(snapshot.alphaTexture)
               ?.bytes[index] === value,
         ),
@@ -1082,7 +1085,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       const alphaTextureBeforePositions =
         snapshot.alphaTexture;
       const alphaOwnerBeforePositions =
-        snapshot.alphaTexData;
+        snapshot.alphas;
       const vaoBeforePositions = snapshot.vao;
       const generationBeforePositions =
         snapshot.geometryGeneration;
@@ -1106,7 +1109,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       });
       const positionPublication = {
         alphaOwnerPreserved:
-          snapshot.alphaTexData === alphaOwnerBeforePositions,
+          snapshot.alphas === alphaOwnerBeforePositions,
         alphaTexturePreserved:
           snapshot.alphaTexture ===
             alphaTextureBeforePositions,
@@ -1130,15 +1133,18 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         vaoReplaced: snapshot.vao !== vaoBeforePositions,
       };
 
+      // The GL objects of the segmented store and vertex arrays
+      // (point-store-segments.js), named before they are deleted.
       const retiredSnapshot = {
         alphaTexture: snapshot.alphaTexture,
-        buffer: snapshot.buffer,
-        vao: snapshot.vao,
+        buffer: snapshot.buffer.segments[0].buffer,
+        vao: snapshot.vao.vaos[0],
       };
       const retiredGeometry = renderer._snapshotGeometryPools.get(
         snapshot.geometryGeneration,
       );
-      const retiredPositionBuffer = retiredGeometry.positionBuffer;
+      const retiredPositionStore = retiredGeometry.positionBuffer;
+      const retiredPositionBuffer = retiredPositionStore.segments[0].buffer;
       const lifecycleStart = lifecycle.length;
       // Colour stores the view kept for other draw orders go with it.
       const keptColorStores = snapshot.colorCache?.size ?? 0;
@@ -1193,7 +1199,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
           positionBufferDeleted(retirementEvents),
         positionBufferHeld:
           retiredGeometry.positionBuffer ===
-            retiredPositionBuffer,
+            retiredPositionStore,
         refCount: retiredGeometry.refCount,
         retained: retiredGeometry.retained,
       };
@@ -1278,7 +1284,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
 
   expect(proof.supported).toBe(true);
   expect(proof.ownership).toEqual({
-    acceptedBytesExact: true,
+    acceptedTransparencyByReference: true,
     alphaTextureDistinctFromLive: true,
     alphaTextureMirrored: true,
     alphaTextureShapeExact: true,
@@ -1293,6 +1299,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
     },
     colorBytesExact: true,
     noPerSnapshotColorCopy: true,
+    noCpuImageCopy: true,
     noPerSnapshotFloatAlphaOwner: true,
     paddedTailOpaque: true,
     noPointSizedColorScratch: true,

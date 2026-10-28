@@ -28,7 +28,8 @@
  * reads of the file. Cancel stops it where it is. The reader worker starts
  * loading as the link is resolved, so it is ready when the file is found.
  * A host that ignores range requests serves only the whole file: it is
- * downloaded once, with its progress shown, and read from memory.
+ * downloaded once into this browser's storage, said up front with its size
+ * and progress, and kept for later visits (`whole-download.js`).
  */
 
 import {
@@ -44,7 +45,9 @@ import {
   CATALOG_FILENAME,
   fetchAnnDataCatalog,
 } from './sources/anndata-catalog.js';
-import { downloadRemoteFile } from './sources/remote-file.js';
+import { afterWholeFileOpened, downloadReason, wholeFileOf } from './whole-download.js';
+import { keptStoreManifest } from './anndata/transcode/space.js';
+import { matrixMarketSetIdentity } from './anndata/transcode/matrix-market.js';
 import { createAnnDataFileSource } from './anndata-file-source.js';
 import { getTransferLog } from './transfer-log.js';
 import { prewarmAnnDataReaderWorker } from './anndata-reader-client.js';
@@ -158,28 +161,6 @@ async function openZarrFolder(store, signal) {
     source.clear();
     throw error;
   }
-}
-
-/**
- * Download one remote file whole, its bytes counted into the Transfers log
- * as they arrive (the opening shows how much has arrived of it).
- */
-function downloadWhole(resource, signal) {
-  let counted = 0;
-  return downloadRemoteFile(resource, {
-    signal,
-    onBytes: received => {
-      getTransferLog().record(resource.url, { bytes: received - counted, requests: counted === 0 ? 1 : 0 });
-      counted = received;
-    },
-  });
-}
-
-/** Why a remote file is downloaded whole (`transport: 'download'`), in a few words. */
-function downloadReason(resource, host = new URL(resource.url).host) {
-  return resource.contentCoded === true
-    ? `${host} sends it compressed for transfer (Content-Encoding), which leaves no part of it readable on its own`
-    : `${host} does not serve parts of files`;
 }
 
 export class LinkDataSource {
@@ -324,27 +305,30 @@ export class LinkDataSource {
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.files) {
-      // A member its host content-codes is downloaded whole first (the rest are read in place).
+      // A member its host content-codes is downloaded whole first (the rest
+      // are read once each, from the start), or opens from its kept copy;
+      // none is, when the set's own store is kept.
+      const setIdentity = matrixMarketSetIdentity(opening.files.files);
+      const kept = setIdentity === null ? null : await keptStoreManifest(setIdentity);
+      const storeKept = kept !== null && kept.whole !== false;
       const files = new Map();
       for (const [name, member] of opening.files.files) {
-        if (member.contentCoded !== true) {
-          files.set(name, member);
-          continue;
-        }
-        progress.step(`Downloading ${name}: ${downloadReason(member)}`);
-        files.set(name, await downloadWhole(member, signal));
+        files.set(name, member.contentCoded === true && !storeKept
+          ? await wholeFileOf(member, { signal, opening: { ...progress, step: text => progress.step(`${name}: ${text}`) } })
+          : member);
       }
       const annData = await openRemoteFileSet({ ...opening.files, files }, signal);
+      await afterWholeFileOpened(files.values(), annData.source.describeStorage()?.conversion ?? null);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.file) {
       let resource = opening.file.resource;
-      if (opening.file.transport === 'download') {
-        // The host serves no part of the file: all of it, once.
-        progress.step(`Downloading the whole file: ${downloadReason(resource)}`);
-        resource = await downloadWhole(resource, signal);
-      }
+      const format = opening.file.format?.format ?? null;
+      // The host serves no part of the file: all of it, once (or what an
+      // earlier visit kept of it).
+      if (opening.file.transport === 'download') resource = await wholeFileOf(resource, { format, signal, opening: progress });
       const annData = await openAnnDataFile({ ...opening.file, resource }, signal);
+      if (opening.file.transport === 'download') await afterWholeFileOpened([resource], annData.source.describeStorage()?.conversion ?? null);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     throw new TypeError('A provider opening must hold a catalog, a file, a store or a file set.');

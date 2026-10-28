@@ -231,7 +231,7 @@ function userDefinedGene(key) {
   };
 }
 
-function mountGeneSelector(varFields, { onLoad = null } = {}) {
+function mountGeneSelector(varFields, { onLoad = null, geneNames = null, listing = { pending: false, failure: null } } = {}) {
   const ownerDocument = createFakeDocument();
   const dom = {
     geneContainer: ownerDocument.createElement('div'),
@@ -249,6 +249,7 @@ function mountGeneSelector(varFields, { onLoad = null } = {}) {
   const state = {
     activeFieldSource: null,
     activeVarFieldIndex: -1,
+    varData: geneNames === null ? null : { fields: varFields, geneNames },
     duplicateField() {
       throw new Error('not exercised');
     },
@@ -259,6 +260,10 @@ function mountGeneSelector(varFields, { onLoad = null } = {}) {
       return new Promise(() => {});
     },
     getDatasetGeneration: () => 1,
+    // The gene list of a dataset just shown is read after its first view
+    // (`DataState.listPublishedGenes`).
+    areGenesPending: () => listing.pending,
+    getGeneListFailure: () => listing.failure,
     getVarFields: () => varFields,
     getVisibleFields: source => {
       assert.equal(source, FieldSource.VAR);
@@ -292,7 +297,7 @@ function mountGeneSelector(varFields, { onLoad = null } = {}) {
     },
   });
   api.initGeneExpressionDropdown();
-  return { api, dom, obsDom };
+  return { api, dom, obsDom, listing };
 }
 
 function search(dom, query) {
@@ -606,4 +611,67 @@ test('a long gene list builds only the options near the active one', () => {
   keydown('Enter');
   assert.deepEqual(loaded, [150]);
   assert.equal(dom.geneSearch.value, 'G150');
+});
+
+/** Genes of the dataset's own gene list, each at its route `var/{g}`. */
+function listedGenes(...keys) {
+  return keys.map((key, gene) => ({ key, kind: 'continuous', path: `var/${gene}` }));
+}
+
+test('genes named by symbols are found by symbol and by their identifier, shown beside the symbol', () => {
+  const ids = ['ENSG00000168484', 'ENSG00000119888', 'ENSG00000234690'];
+  const { dom } = mountGeneSelector(listedGenes('SFTPC', 'EPCAM', 'EPCAM-DT'), {
+    geneNames: { source: 'feature_name', filledFromIndex: 0, renamed: [], ids },
+  });
+  const shown = () => dom.geneDropdown.children
+    .filter(child => child.classList.contains('dropdown-item'))
+    .map(option => option.readText());
+  search(dom, 'epcam');
+  assert.deepEqual(shown(), ['EPCAM ENSG00000119888', 'EPCAM-DT ENSG00000234690']);
+  search(dom, 'ENSG00000168484');
+  assert.deepEqual(shown(), ['SFTPC ENSG00000168484'], 'an identifier finds its gene');
+  search(dom, '00000119');
+  assert.deepEqual(shown(), ['EPCAM ENSG00000119888'], 'part of an identifier too');
+});
+
+test('genes named by identifiers say so when a symbol finds nothing, and how to name them by symbols', () => {
+  const { dom } = mountGeneSelector(listedGenes('ENSG00000168484', 'ENSG00000119888'), {
+    geneNames: { source: null, filledFromIndex: 0, renamed: [], ids: null },
+  });
+  search(dom, 'SFTPC');
+  const text = emptyState(dom).readText();
+  assert.match(text, /This dataset's 2 gene names are identifiers such as ENSG00000168484, not symbols: search by identifier, or choose the var column that holds the symbols as the gene names in Session › Data mapping\./);
+  assert.doesNotMatch(text, /chosen when its file was written/);
+});
+
+test('while the gene names are read after the first view, the search says so and is not searchable', () => {
+  const listing = { pending: true, failure: null };
+  const { api, dom } = mountGeneSelector([], { listing });
+  // Shown, waiting: never hidden as if the dataset had no genes.
+  assert.equal(dom.geneContainer.hidden, false);
+  assert.equal(dom.geneSearch.disabled, true);
+  assert.equal(dom.geneSearch.placeholder, 'Reading gene names…');
+  assert.equal(dom.geneContainer.getAttribute('aria-busy'), 'true');
+  // A list that could not be read says why.
+  listing.pending = false;
+  listing.failure = new Error('the var index could not be read');
+  api.initGeneExpressionDropdown();
+  assert.equal(dom.geneContainer.hidden, false);
+  assert.equal(dom.geneSearch.disabled, true);
+  assert.equal(dom.geneSearch.placeholder, 'Gene names could not be read');
+  assert.equal(dom.geneSearch.title, 'the var index could not be read');
+});
+
+test('once the gene names are listed, the search lists them', () => {
+  const listing = { pending: true, failure: null };
+  const fields = exportedGenes('CD3E', 'MS4A1');
+  const mounted = mountGeneSelector([], { listing });
+  assert.equal(mounted.dom.geneSearch.disabled, true);
+  // The refresh after `genes:listed` re-reads the inventory.
+  const listed = mountGeneSelector(fields, { listing: { pending: false, failure: null } });
+  assert.equal(listed.dom.geneContainer.hidden, false);
+  assert.equal(listed.dom.geneSearch.disabled, false);
+  assert.equal(listed.dom.geneSearch.placeholder, 'Search genes…');
+  search(listed.dom, 'cd3');
+  assert.equal(emptyState(listed.dom), null);
 });

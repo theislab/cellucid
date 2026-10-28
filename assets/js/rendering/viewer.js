@@ -5,7 +5,7 @@
  * Keeps smoke, grid, studio backdrop, and line rendering.
  */
 
-import { glStateOf } from './gl-state-shadow.js';
+import { primeGlState } from './gl-state-shadow.js';
 import { GRID_VS_SOURCE, GRID_FS_SOURCE } from './shaders/edge-grid-shaders.js';
 import { createConnectivityEdgeLayer } from './connectivity-edge-layer.js';
 import {
@@ -37,6 +37,7 @@ import { createBackdropLookRenderer } from './backdrops/backdrop-look-renderer.j
 import { backdropLookSurface01, isBackdropLook } from './backdrops/backdrop-looks.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
+import { LOD_FULL_DETAIL_ADMISSION_LEVEL, lodLadder } from './high-perf/draw-order.js';
 import { isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
@@ -242,6 +243,7 @@ export {
   runSynchronousBorrowedViewDataCallback,
   selectPresentedCameraState
 } from './viewer/presented-view-layout.js';
+import { copyLargeArray } from '../utils/large-arrays.js';
 
 /**
  * Release dataset-sized owners held by a stable per-frame render descriptor.
@@ -457,10 +459,10 @@ export function createViewer({
   if (!gl) {
     throw new Error('WebGL2 is required but not supported in this browser.');
   }
-  // Installed before anything changes the state, so the one read it takes
-  // reads the defaults; every renderer sharing this context reads its
+  // Installed before anything changes the state, and read whole now, while
+  // nothing is queued: every renderer sharing this context reads its
   // fixed-function state from here instead of asking the GPU.
-  glStateOf(gl);
+  primeGlState(gl);
 
   // Starts off, with nothing allocated. `render-controls.js` is the one owner of
   // the preference and publishes it before `start()` draws the first frame, so
@@ -7446,62 +7448,104 @@ export function createViewer({
     return pane === null ? null : pane.viewId;
   }
 
-  // === Public API ===
-  const publicApi = {
-    setData(payload) {
-      const {
-        positions,
-        colors,
-        transparency,
-        dimensionLevel,
-        layoutKey,
-        pointCount: nextPointCount
-      } = assertViewerDataPayload(payload);
-      // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
-      // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree)
+  /**
+   * Publish the live points (`setData`, `resizeLiveCells`). `keepView`: the
+   * same dataset with cells added or removed in place, its first cells
+   * unchanged and where they were (`app/open-cells-resize.js`): the camera
+   * and navigation stay; a new dataset starts from its dimension's default
+   * framing.
+   */
+  function publishLiveData(payload, { keepView }) {
+    const {
+      positions,
+      colors,
+      transparency,
+      dimensionLevel,
+      layoutKey,
+      pointCount: nextPointCount
+    } = assertViewerDataPayload(payload);
+    if (keepView && dimensionLevel !== getPublishedDimensionLevel(LIVE_VIEW_ID)) {
+      throw new RangeError('Cells added or removed in place keep the dimension the live view shows.');
+    }
+    // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
+    // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree).
+    // Cells added or removed in place keep the stores of the cells kept
+    // (`HighPerfRenderer#resizeLiveCells`): only added cells go up.
+    if (keepView) {
+      hpRenderer.resizeLiveCells(positions, colors, {
+        alphaValues: transparency,
+        dimensionLevel
+      });
+    } else {
       hpRenderer.loadData(positions, colors, {
         alphaValues: transparency,
         dimensionLevel
       });
+    }
 
-      // The renderer generation is authoritative once loadData returns. The
-      // connectivity graph and every pane's edge records belong to the
-      // superseded dataset, so they go before any later viewer work can
-      // render or throw.
-      edgeLayer.clear();
-      useInstancedEdges = false;
+    // The renderer generation is authoritative once loadData returns. The
+    // connectivity graph and every pane's edge records belong to the
+    // superseded dataset, so they go before any later viewer work can
+    // render or throw.
+    edgeLayer.clear();
+    useInstancedEdges = false;
 
-      highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
-      cancelPendingProjectileBuild(
-        'Projectile preparation was cancelled because the dataset changed.'
-      );
-      projectileSystem.setEnabled(false);
-      pointCount = nextPointCount;
-      positionsArray = positions;
-      colorsArray = colors;
-      transparencyArray = new Uint8Array(transparency);
-      hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
-      computePointBoundsFromPositions(positions, dimensionLevel);
-      viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
-      viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
-      publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
-      publishViewDataGeneration(LIVE_VIEW_ID);
-      // A pose belongs to the cells it framed. The outgoing dataset's camera
-      // (its own preset's close-up, say) says nothing about the incoming
-      // cells, and kept as it was it framed a 28,000-cell 2D file from
-      // inside the cloud a 562,000-cell 3D preset had placed it in: a canvas
-      // of giant points. A new scene starts from the default framing of its
-      // dimension, which fits every normalized embedding; a session or a
-      // published preset replayed afterwards still sets its own camera.
+    highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
+    cancelPendingProjectileBuild(
+      'Projectile preparation was cancelled because the dataset changed.'
+    );
+    projectileSystem.setEnabled(false);
+    pointCount = nextPointCount;
+    positionsArray = positions;
+    colorsArray = colors;
+    transparencyArray = new Uint8Array(transparency);
+    hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
+    computePointBoundsFromPositions(positions, dimensionLevel);
+    viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
+    viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
+    publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
+    publishViewDataGeneration(LIVE_VIEW_ID);
+    // A pose belongs to the cells it framed. The outgoing dataset's camera
+    // (its own preset's close-up, say) says nothing about the incoming
+    // cells, and kept as it was it framed a 28,000-cell 2D file from
+    // inside the cloud a 562,000-cell 3D preset had placed it in: a canvas
+    // of giant points. A new scene starts from the default framing of its
+    // dimension, which fits every normalized embedding; a session or a
+    // published preset replayed afterwards still sets its own camera.
+    // Cells added or removed in place keep the pose: the cells shown
+    // before are where they were.
+    if (!keepView) {
       resetViewCameraForDimension(LIVE_VIEW_ID, dimensionLevel);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
-      vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
-      // The smoke volume is the replaced dataset's: its 3D textures and the
-      // copies of its colours and visibility it was built from go now (in
-      // smoke mode the owner builds the new one), instead of staying
-      // resident until the next build.
-      smokeRenderer.clearVolume();
-      publishSmokeSourceChange();
+    }
+    vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
+    // The smoke volume is the replaced dataset's: its 3D textures and the
+    // copies of its colours and visibility it was built from go now (in
+    // smoke mode the owner builds the new one), instead of staying
+    // resident until the next build.
+    smokeRenderer.clearVolume();
+    publishSmokeSourceChange();
+  }
+
+  // === Public API ===
+  const publicApi = {
+    setData(payload) {
+      publishLiveData(payload, { keepView: false });
+    },
+
+    /**
+     * The live points of the dataset shown, with cells added or removed in
+     * place (`app/open-cells-resize.js`): its first cells are the ones shown
+     * before, where they were. As `setData`, but the camera and navigation
+     * stay. No kept view may be published (they are re-made after).
+     *
+     * @param {Object} payload - As `setData`'s
+     */
+    resizeLiveCells(payload) {
+      if (snapshotViews.length > 0) {
+        throw new Error('Cells cannot be added or removed in place while kept views are published.');
+      }
+      publishLiveData(payload, { keepView: true });
     },
 
     updateColors(colors) {
@@ -7655,7 +7699,7 @@ export function createViewer({
     getPositions() {
       return positionsArray === null
         ? null
-        : new Float32Array(positionsArray);
+        : copyLargeArray(positionsArray);
     },
 
     /**
@@ -7939,7 +7983,7 @@ export function createViewer({
      * @returns {Float32Array} Positions array
      */
     getViewPositions(viewId) {
-      return new Float32Array(getExactViewPositions(viewId));
+      return copyLargeArray(getExactViewPositions(viewId));
     },
 
     /**
@@ -9446,7 +9490,10 @@ export function createViewer({
       // assertSnapshotConfig). Transparency is published from the caller's
       // array and copied into the view's own owner (made at creation) only
       // once the publication succeeded, so a failed one leaves the accepted
-      // generation intact without a new array per update.
+      // generation intact without a new array per update. The renderer keeps
+      // the accepted transparency by reference (it holds no copy of the
+      // view's R8 image), so it is handed the view's owner back at once: the
+      // caller's array is application state, rewritten in place.
       const nextColors = colorsChanged
         ? assertExactUint8Array(
             attrs.colors,
@@ -9570,7 +9617,10 @@ export function createViewer({
       }
 
       snap.colors = nextColors;
-      if (transparencyChanged) snap.transparency.set(nextTransparency);
+      if (transparencyChanged) {
+        snap.transparency.set(nextTransparency);
+        hpRenderer._adoptSnapshotAlphasOwner(exactId, snap.transparency);
+      }
       if (visibilityMoved && edgeLayer.hasView(exactId)) {
         edgeLayer.publishVisibility(
           exactId,
@@ -10457,15 +10507,29 @@ export function createViewer({
         assertExactBoolean(enabled, 'Frustum culling')
       );
     },
+    /**
+     * The priority of the published cells: the order every LOD level admits
+     * them in (`HighPerfRenderer.setCellPriority`).
+     */
+    setCellPriority(priority) {
+      hpRenderer.setCellPriority(priority);
+    },
     setAdaptiveLOD(enabled) {
       hpRenderer.setAdaptiveLOD(
         assertExactBoolean(enabled, 'Adaptive LOD')
       );
     },
+    // A level of the ladder (`rendering/high-perf/draw-order.js`
+    // `lodLadder`), -1 for Auto; one past the cells shown draws the last.
     setForceLOD(level) {
       hpRenderer.setForceLOD(
-        assertIntegerInRange(level, -1, 17, 'Forced LOD level')
+        assertIntegerInRange(level, -1, LOD_FULL_DETAIL_ADMISSION_LEVEL - 1, 'Forced LOD level')
       );
+    },
+    // Levels of detail of the live cells (the forced-level slider's range):
+    // the ladder of their count, whether or not they are drawn yet.
+    getLODLevelCount() {
+      return pointCount > 0 ? lodLadder(pointCount).length : 0;
     },
     hasRendererStats(viewId) {
       return hpRenderer.hasStats(assertKnownViewId(viewId));

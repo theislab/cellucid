@@ -34,6 +34,13 @@
  * is one step of a larger publication, and the interface refreshes from the
  * dataset-publication path once the whole dataset is in place.
  *
+ * A dataset is published before its gene names are read: its mapping's
+ * `geneNames` is null until its gene list is installed (`var-axis.js`
+ * `listPublishedGenes`), which emits `mapping:changed` with `cause:
+ * 'genes-listed'` and the publication's origin. A change waits for that
+ * first (`applyDataMapping`), so every mapping it compares, stages and
+ * publishes names its genes.
+ *
  * @module state/managers/mapping-manager
  */
 
@@ -130,8 +137,9 @@ export class DataStateMappingMethods {
       this._resetMappingGroups();
       return;
     }
+    // Gene names may be pending (null): read after the first view.
     const canonical = Object.freeze(
-      validateDataMapping(mapping, { label: 'Dataset data mapping' })
+      validateDataMapping(mapping, { label: 'Dataset data mapping', pendingGeneNames: true })
     );
     if (candidates !== null && candidates.kind !== ANNDATA_KIND) {
       throw new TypeError('A data-mapping candidate catalog must be of kind "anndata".');
@@ -149,6 +157,23 @@ export class DataStateMappingMethods {
     this._mappingPublicationOrigin = origin;
     this._unusableEmbeddings = new Map();
     this._resetMappingGroups();
+  }
+
+  /**
+   * The candidate catalog of the dataset shown, its cells grown or cut in
+   * place (`app/open-cells-resize.js`): the same arrays and choices, listed
+   * at the cells open now (an `obsp` graph's shape is the open count). The
+   * mapping in use and what was found unusable stay.
+   *
+   * @param {Object} candidates
+   */
+  adoptResizedMappingCandidates(candidates) {
+    if (this.dataMapping === null) return;
+    if (candidates === null || candidates.kind !== ANNDATA_KIND) {
+      throw new TypeError('A data-mapping candidate catalog must be of kind "anndata".');
+    }
+    this._mappingCandidates = candidates;
+    this.emit('mapping:choices-changed');
   }
 
   /**
@@ -204,7 +229,8 @@ export class DataStateMappingMethods {
   /**
    * The groups the current mapping took from the best guess and still shows:
    * embedding slots (`'embeddings.2d'`), for a file without `X` the
-   * `'expression'` matrix chosen in its place, the matrices' `'log1p'` (read
+   * `'expression'` matrix chosen in its place, the `'geneNames'` column of
+   * symbols beside an index of identifiers, the matrices' `'log1p'` (read
    * from Scanpy's `uns['log1p']`) and the `'highlyVariable'` column, each until
    * it is changed.
    *
@@ -214,7 +240,7 @@ export class DataStateMappingMethods {
     const candidates = this.getMappingCandidates();
     if (candidates === null || this.dataMapping === null) return [];
     return candidates.guessed.filter(group => {
-      if (group === 'expression' || group === 'log1p' || group === 'highlyVariable') {
+      if (group === 'expression' || group === 'geneNames' || group === 'log1p' || group === 'highlyVariable') {
         return sameJson(this.dataMapping[group], candidates.defaults[group]);
       }
       const slot = group.replace(/^embeddings\./, '');
@@ -565,6 +591,12 @@ export class DataStateMappingMethods {
   async applyDataMapping(next, { origin }) {
     requireOrigin(origin);
     const canonical = validateDataMapping(next, { label: 'Requested data mapping' });
+    // The mapping shown names its genes first (`var-axis.js`): a change is
+    // compared with, and rolls back to, a complete mapping. A gene list that
+    // could not be read can still be replaced by another one.
+    await this.whenGenesListed().catch(error => {
+      if (error !== this.getGeneListFailure()) throw error;
+    });
     const refusal = this.describeDataMappingRefusal(canonical);
     if (refusal !== null) throw new RangeError(refusal);
     const generation = this.getDatasetGeneration();

@@ -6,7 +6,7 @@
  * a file.
  *
  * Protocol (every request carries a numeric `id`, echoed in its reply):
- * - `{id, method: 'open', args: [{source, expect, fromLink}]}` opens a dataset
+ * - `{id, method: 'open', args: [{source, expect, fromLink, cellSubset}]}` opens a dataset
  *   (`openDatasetStore` in `anndata/open.js`): `source` is one file
  *   `{file}` (a `File` or a remote file `{url, size, name, identity}`), a
  *   picked folder `{files: Map<path, File>, rootName}` (or remote files that
@@ -14,8 +14,15 @@
  *   a web host `{url, name}`; `expect` (or null) is what the caller was told
  *   it is (`{format, layout}`). What it is is decided from its content.
  *   `fromLink` says it was opened from a link (else from this computer), so
- *   a refusal's advice is what can be done from there. The
- *   reply is the reader's snapshot (`nObs`, `nVars`, `obsKeys`, `varNames`,
+ *   a refusal's advice is what can be done from there. `cellSubset` is
+ *   which cells to open (`anndata/subsample-plan.js`; null: every cell);
+ *   the reply's `cellSubset` says which were (`AnnDataReader.cellSubset`).
+ *   Opening the source already open again (other cells of it: the page's
+ *   `AnnDataReaderClient.reopenCells`) reads through the store it holds and
+ *   takes over what the open reader built that the new cells keep (gene
+ *   indexes of the rows both share, row pointers); a cancel stops it and
+ *   leaves the open dataset as it was. The
+ *   reply is the reader's snapshot (`nObs`, `nVars`, `obsKeys`,
  *   `hasExpressionMatrix`, `isOpen`) with `name`, `format` (the input format
  *   id, `data/input-formats.js`), `layout`, `zarrVersion`, `conversion`
  *   (where a format read once is kept, and what was not read; null
@@ -30,16 +37,24 @@
  *   `readStoredOutlierQuantiles` reads the ones a file stores for one field;
  *   `describeLatentOutliers` says what computing them costs (whether the
  *   latent space is kept already, its stored and value bytes).
- * - `{id, method: 'readEmbedding', args: [key, columns, normalize]}` answers
- *   one embedding's display coordinates, its display transform and bounds;
- *   `{id, method: 'readVectorField', args: [key, columns, {key, columns},
- *   normalize]}` a vector field scaled by that embedding's transform, with
- *   its largest magnitude (`embedding-payload.js`).
+ * - `{id, method: 'readEmbedding', args: [key, columns, normalize, rows?]}`
+ *   answers one embedding's display coordinates, its display transform and
+ *   bounds; `{id, method: 'readVectorField', args: [key, columns, {key,
+ *   columns}, normalize, rows?]}` a vector field scaled by that embedding's
+ *   transform, with its largest magnitude (`embedding-payload.js`). `rows`
+ *   (`[start, end)` of the open cells) reads only those cells: what an
+ *   opening grown in place appends, in the frame its cells are shown in.
  * - `getConnectivityEdges` answers a graph's edges, render strengths and
  *   k-NN adjacency (`ConnectivityEdges`, `connectivity-edges.js`).
  * - `getObsField` answers a categorical field with its codes already narrowed
- *   to the storage the page keeps (`narrowCategoricalCodes`).
- * - `getMatrixColumns` answers dense float32 gene columns,
+ *   to the storage the page keeps (`narrowCategoricalCodes`); with `rows`,
+ *   only those open cells' values.
+ * - `getMatrixColumn` / `getMatrixColumns` answer dense float32 gene columns
+ *   (with `rows`, on open cells `[start, end)` only, reading what those
+ *   cells need: `AnnDataReader.getMatrixColumn`);
+ *   asked `progressive`, a gene of a matrix indexed in segments is posted
+ *   first on the cells read so far (`{event: 'partial', id, position,
+ *   values, cells}`: NaN on the others), each time it has more;
  *   `getMatrixColumnsSparse` their non-zero entries (`{length, indices,
  *   values}`), `getMatrixCellSubset` some genes in some cells as a gene-major
  *   block (read by cell or by gene, whichever costs less).
@@ -57,11 +72,23 @@
  * - `{id, method, args}` for every other reader method; the reply is
  *   `{id, result}` with typed arrays transferred, or `{id, error}`. Every
  *   typed array of a reply owns its whole buffer (a view is copied out
- *   first), so nothing is cloned on the way.
+ *   first), so nothing is cloned on the way. An array that cannot move by
+ *   transfer (larger than the engine's `ArrayBuffer` cap, so held in a
+ *   WebAssembly memory: `utils/large-arrays.js`) is posted in pieces before
+ *   the reply, `{event: 'piece', id, array, type, length, offset, values}`
+ *   (`values` transferred, at most `ARRAY_PIECE_BYTES`), and the reply
+ *   carries `{arrayPieces: array}` in its place; the client assembles it.
+ *   Embedding coordinates and vector fields are posted the same way as each
+ *   piece of at most `COORDINATE_PIECE_CELLS` cells is made
+ *   (`embedding-payload.js`), so the worker never holds them whole.
  * - `{cancel: id}` cancels request `id`: its reads stop (a request the
  *   network has not sent is never sent), it stops waiting for shared work (a
  *   gene index other reads still need goes on), and it replies with an
  *   `AbortError`. Nothing replies to the cancel itself.
+ * - `{hostRequesterPort}` (a `MessagePort`, before any request) is how a
+ *   notebook widget's viewer reads its host: requests to
+ *   `EMBEDDED_HOST_ORIGIN` go through the page (`formats/io/host-fetch.js`).
+ *   Nothing replies to it.
  * - `{event: 'link', latencyMs, bytesPerMs, backgroundConcurrency, protocol}`
  *   whenever the measured link of the open dataset changes
  *   (`linkMeasurementOf`: a local source reports latency 0 and its decode
@@ -78,7 +105,10 @@
  *   into a store kept for the tab's life (`anndata/transcode/`):
  *   `{event: 'transcoded', directory, state}` says where (`writing` when
  *   the pass starts, `complete` when its store is whole), so the page keeps
- *   a complete store and removes an unfinished one. A file holding several
+ *   a complete store and removes an unfinished one; the page answers a
+ *   complete one with `{storeHeld: directory}` once it holds it, and a gene
+ *   index run kept in this browser (`anndata/kept-column-index.js`) keeps
+ *   the worker's hold until then. A file holding several
  *   objects asks the page which to open with `{event: 'choose', request,
  *   question, options}`, answered `{choice: request, index}` or
  *   `{choice: request, error}`.
@@ -105,10 +135,13 @@
 import { AnnDataReader, describeAnnDataStore } from './anndata/reader.js';
 import { explainFormatError, openDatasetStore } from './anndata/open.js';
 import { ReadActivity } from '../formats/io/activity.js';
+import { adoptHostRequesterPort } from '../formats/io/host-fetch.js';
+import { adoptRangeCachePort, rangeCacheKey } from '../formats/io/range-cache.js';
 import { LatentOutlierReader } from './latent-outliers-stream.js';
 import { residencyBudgetBytes } from './memory-budget.js';
 import { configureDecodePool, decodePoolStats, warmDecodePool } from '../formats/io/decode-pool.js';
 import { narrowCategoricalCodes } from './categorical-storage-contract.js';
+import { PieceSender, canTransfer, isMemoryBacked, placeArrays } from '../utils/large-arrays.js';
 import {
   requireColumnDelivery,
   requireRunDelivery,
@@ -172,6 +205,8 @@ function accessError(record) {
 export function ownedBuffers(value, depth = 0) {
   if (value === null || typeof value !== 'object' || depth > 4) return value;
   if (ArrayBuffer.isView(value)) {
+    // A memory's array crosses in pieces (`placeArrays`), never copied whole.
+    if (isMemoryBacked(value)) return value;
     const whole = value.byteOffset === 0 && value.byteLength === value.buffer.byteLength;
     return whole || value instanceof DataView || !(value.buffer instanceof ArrayBuffer) ? value : value.slice();
   }
@@ -203,11 +238,7 @@ export function ownedBuffers(value, depth = 0) {
 function transferables(value, into = new Set(), depth = 0) {
   if (value === null || typeof value !== 'object' || depth > 4) return into;
   if (ArrayBuffer.isView(value)) {
-    if (value.buffer instanceof ArrayBuffer &&
-        value.byteOffset === 0 &&
-        value.byteLength === value.buffer.byteLength) {
-      into.add(value.buffer);
-    }
+    if (canTransfer(value)) into.add(value.buffer);
     return into;
   }
   if (Array.isArray(value)) {
@@ -227,9 +258,23 @@ function snapshotOf(reader) {
     nObs: reader.nObs,
     nVars: reader.nVars,
     obsKeys: reader.obsKeys,
-    varNames: reader.varNames,
     hasExpressionMatrix: reader.hasExpressionMatrix,
     isOpen: reader.isOpen,
+  };
+}
+
+/**
+ * The cells the open dataset presents (`AnnDataReader.cellSubset`), as the
+ * reply carries it: the kept positions copied, since a reply's arrays are
+ * transferred and the reader keeps its own.
+ */
+function cellSubsetOf(reader) {
+  const subset = reader.cellSubset;
+  if (subset === null) return null;
+  return {
+    ...subset,
+    kept: subset.kept === null ? null : subset.kept.slice(),
+    openOrder: subset.openOrder === null ? null : subset.openOrder.slice(),
   };
 }
 
@@ -249,6 +294,55 @@ function requestConcurrencyOf(source, link) {
 function isRemoteSource(source) {
   if (source?.files instanceof Map) return typeof source.files.values().next().value?.url === 'string';
   return typeof source?.url === 'string' || typeof source?.file?.url === 'string';
+}
+
+/**
+ * What identifies the bytes of a source, so that opening it again (another
+ * cell subset) reuses its opened store: a local file by its name, size and
+ * modification time; a remote file by its identity (key and the version its
+ * host reported) or its URL, size and `ETag` (`rangeCacheKey`); a set of
+ * files (a picked folder: a Zarr store, a Cell Ranger `outs/` or
+ * MatrixMarket folder; files of one dataset) by every file's path and key,
+ * so a file added, removed or rewritten is another source. Null for a
+ * source whose bytes cannot be told apart from a later version (a remote
+ * file known only by its size, or a set holding one): those are opened
+ * anew. A store folder on a web host has no key before it is opened: read
+ * again with other cells, it is taken over while its metadata's validator
+ * is unchanged (`open`, `httpStore.unchanged`).
+ */
+export function sourceKey(source) {
+  if (source?.files instanceof Map) {
+    if (source.files.size === 0) return null;
+    const keys = [];
+    for (const path of [...source.files.keys()].sort()) {
+      const key = sourceKey({ file: source.files.get(path) });
+      if (key === null) return null;
+      keys.push([path, key]);
+    }
+    return JSON.stringify(['files', source.rootName ?? '', keys]);
+  }
+  const file = source?.file ?? null;
+  if (typeof Blob !== 'undefined' && file instanceof Blob) {
+    return Number.isFinite(file.lastModified) ? JSON.stringify(['file', file.name ?? '', file.size, file.lastModified]) : null;
+  }
+  if (file !== null && typeof file === 'object' && typeof file.url === 'string' && Number.isSafeInteger(file.size)) {
+    // Named exactly as the page keeps its bytes (`formats/io/range-cache.js`):
+    // a file known only by its size may change under it, and is opened anew.
+    return rangeCacheKey(file);
+  }
+  return null;
+}
+
+/** A store folder source's URL as its store names it (ending in `/`), or null. */
+function folderUrlOf(source) {
+  if (typeof source?.url !== 'string' || source.file !== undefined) return null;
+  try {
+    const url = new URL(source.url);
+    if (!url.pathname.endsWith('/')) url.pathname += '/';
+    return url.href;
+  } catch {
+    return null;
+  }
 }
 
 /** The name a source is shown by: its file name, folder or URL. */
@@ -328,7 +422,7 @@ export function linkMeasurementOf(source, link) {
  * Create the message handler of one reader worker.
  *
  * @param {Object} [options]
- * @param {(message: Object) => void} [options.post] - Posts events
+ * @param {(message: Object, transfer?: ArrayBuffer[]) => void} [options.post] - Posts events (the buffers of `transfer` moved with them)
  * @returns {(message: Object) => Promise<{reply: Object, transfer: ArrayBuffer[]}|null>}
  *   The reply to post, or null for a cancel message
  */
@@ -382,9 +476,17 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   // The page's answers to `choose` events, by request.
   const choices = new Map();
   let nextChoice = 1;
+  /** Complete kept directories the page is to hold, by name: what resolves when it says it does (`{storeHeld}`). */
+  const heldByPage = new Map();
   const transcoding = {
     createActivity,
-    onStore: ({ directory, state }) => post({ event: 'transcoded', directory, state }),
+    onStore: ({ directory, state }) => {
+      post({ event: 'transcoded', directory, state });
+      if (state !== 'complete') return undefined;
+      return new Promise(resolve => heldByPage.set(directory, resolve));
+    },
+    // Said up front: the file cannot be read in parts (`data/whole-read-notice.js`).
+    onWholeRead: read => post({ event: 'whole-read', ...read }),
     choose: ({ question, options }) => new Promise((resolve, reject) => {
       const request = nextChoice++;
       choices.set(request, { resolve, reject });
@@ -395,6 +497,21 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   let latent = null;
   /** The input format id of the open dataset, for the messages of its later reads. */
   let format = null;
+  /**
+   * The opened store of the open dataset and what identifies its bytes
+   * (`sourceKey`): opening the same bytes again (another cell subset of
+   * them) reads them through the same store, whose structure, chunk indexes,
+   * cached metadata and decoded chunks, and measured link stay; only the
+   * cells change. `{key, opened}`, or null.
+   */
+  let held = null;
+  /**
+   * The newest opening asked for: only it may become the open dataset. A
+   * newer one stops it (its reads end), and one that completes all the same
+   * (a read that did not stop) is closed, never kept.
+   * @type {{stop: AbortController}|null}
+   */
+  let newestOpening = null;
 
   /**
    * The open gene routes, by id: each analysis worker's port and its
@@ -422,7 +539,12 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   // Every method takes the request's context (`signal`, aborted by a cancel
   // message) first, then the arguments the client sent.
   const methods = {
-    async open(_context, { source, expect = null, fromLink = false }) {
+    async open({ signal: requestSignal }, { source, expect = null, fromLink = false, cellSubset = null, tab = null, reopen = false }) {
+      // Only the newest opening is kept: one asked for before it stops now.
+      const opening = { stop: new AbortController() };
+      newestOpening?.stop.abort(new DOMException('A newer opening of the dataset superseded this one.', 'AbortError'));
+      newestOpening = opening;
+      const signal = requestSignal == null ? opening.stop.signal : AbortSignal.any([requestSignal, opening.stop.signal]);
       // Decode workers start while the structure is read, not on the first chunk.
       warmDecodePool();
       // One activity for the whole opening: the file's structure, then the
@@ -430,6 +552,18 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       const activity = createActivity({ kind: 'open', label: `the structure of ${sourceName(source)}` });
       let opened;
       const next = new AnnDataReader();
+      const key = sourceKey(source);
+      // The same bytes: a file by its key; a store folder on a web host read
+      // again with other cells by its URL, while its version is unchanged
+      // (one `HEAD` of its metadata, `httpStore`).
+      const reuse = reader !== null && held !== null && (key !== null
+        ? held.key === key
+        : reopen && held.folder !== null && held.folder.url === folderUrlOf(source) && held.folder.version !== null &&
+          await held.folder.unchanged({ signal }).catch(error => {
+            // A version that cannot be asked again is not known to be the same.
+            if (signal?.aborted) throw error;
+            return false;
+          }));
       // A remote source's running totals carry how many requests its link
       // answers at once now, which the page's download scheduler follows.
       let link = null;
@@ -440,42 +574,76 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         if (!arriving && retrying === null) postLink();
       };
       try {
-        opened = await openDatasetStore({ source, expect, fromLink }, {
+        opened = reuse ? held.opened : await openDatasetStore({ source, expect, fromLink }, {
           decodedChunkCacheBytes: residencyBudgetBytes('decodedBlocks'),
           onTransfer,
           activity,
           sourceAccess,
-          transcoding,
+          transcoding: { ...transcoding, tab },
+          signal,
         });
         link = opened.link ?? null;
         // From here on, the link this dataset is read over is reported as it
-        // is measured (`{event: 'link'}`).
-        measured = { source, link };
-        lastMeasurement = null;
-        postLink();
+        // is measured (`{event: 'link'}`), unless a newer opening came.
+        if (newestOpening === opening) {
+          measured = { source, link };
+          lastMeasurement = null;
+          postLink();
+        }
         next.createActivity = createActivity;
         try {
           await next.open(opened.root, {
             format: opened.readerFormat,
             name: opened.name,
             decodedChunkBytes: residencyBudgetBytes('decodedBlocks'),
+            // The chunks a growth keeps share the store's decoded-chunk budget.
+            decodedBudget: opened.decodedBudget,
             link: opened.link,
             activity,
+            cellSubset,
+            // The same bytes opened again with other cells: what the open
+            // reader read that the new cells keep is taken over, not read
+            // again (`AnnDataReader.open`, `carry`).
+            carry: reuse ? reader : null,
+            // The open dataset read again with other cells (`reopenCells`):
+            // cells grown or cut in place keep their frame even when its
+            // store cannot be taken over.
+            previous: reopen && !reuse ? reader : null,
+            // Gene indexes of cell-major matrices kept in this browser, under
+            // what the bytes are (`anndata/kept-column-index.js`); the page
+            // holds what is kept for the tab's life, as a transcoded store.
+            keptIndexes: opened.identity == null ? null : { identity: opened.identity, tab, onStore: transcoding.onStore },
+            signal,
           });
         } catch (error) {
-          opened.root.close?.();
+          // A reused store stays the open dataset's.
+          if (!reuse) opened.root.close?.();
           throw explainFormatError(error, opened.format);
+        }
+        if (newestOpening !== opening || signal.aborted) {
+          // Cancelled or superseded, yet completed (a read that did not
+          // stop): closed, never kept; a store the open dataset reads
+          // through stays its.
+          if (reuse) next.releaseStore();
+          next.close();
+          throw signal.reason ?? new DOMException('The opening was cancelled.', 'AbortError');
         }
         activity.finish();
       } catch (error) {
         activity.finish(error);
         throw error;
+      } finally {
+        if (newestOpening === opening) newestOpening = null;
       }
       const previous = reader;
       reader = next;
       format = opened.format;
       latent = new LatentOutlierReader(next);
+      // The store goes on to the new reader: the previous one lets it go
+      // without closing it.
+      if (reuse) previous.releaseStore();
       previous?.close();
+      held = key !== null || opened.folder != null ? { key, folder: opened.folder ?? null, opened } : null;
       // What the store was read as (the Dataset box names it): its format,
       // layout and, for Zarr, the version; for a format read once, where it
       // is kept and what was not read.
@@ -487,6 +655,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         zarrVersion: opened.zarrVersion,
         conversion: opened.conversion ?? null,
         requestConcurrency: requestConcurrencyOf(source, link),
+        cellSubset: cellSubsetOf(reader),
       };
     },
     /**
@@ -494,7 +663,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
      * metadata and `uns` only. The store is closed again; the open dataset,
      * if any, is untouched.
      */
-    async describe({ signal }, { source, expect = null }) {
+    async describe({ signal }, { source, expect = null, tab = null }) {
       // A catalog's files are on a web host: its refusals advise as a link's.
       const opened = await openDatasetStore({ source, expect, fromLink: true }, {
         decodedChunkCacheBytes: 0,
@@ -506,7 +675,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         signal,
         // A catalog listing has no one to ask: a file of several objects is
         // described by its first, and kept for the opening that follows.
-        transcoding: { onStore: transcoding.onStore, choose: () => Promise.resolve(0) },
+        transcoding: { onStore: transcoding.onStore, onWholeRead: transcoding.onWholeRead, tab, choose: () => Promise.resolve(0) },
       });
       try {
         return await describeAnnDataStore(opened.root, { format: opened.readerFormat }, { signal });
@@ -517,11 +686,15 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       }
     },
     probeMapping: () => reader.probeMapping(),
+    // How the open subsample represents a categorical field (null at every cell).
+    subsampleRepresentation: (_context, key) => reader.subsampleRepresentation(key),
+    // How much of a neighbour graph read the subsample keeps (null before it is read).
+    subsampleGraphShare: (_context, key) => reader.subsampleGraphShare(key),
     // Display coordinates and bound vectors, checked and scaled here
     // (`embedding-payload.js`): the page draws them as they arrive.
-    readEmbedding: ({ signal }, key, columns, normalize) => reader.readEmbedding(key, columns, normalize, { signal }),
-    readVectorField: ({ signal }, key, columns, embedding, normalize) =>
-      reader.readVectorField(key, columns, embedding, normalize, { signal }),
+    readEmbedding: ({ signal, pieces }, key, columns, normalize, rows = null) => reader.readEmbedding(key, columns, normalize, { signal, rows, pieces }),
+    readVectorField: ({ signal, pieces }, key, columns, embedding, normalize, rows = null) =>
+      reader.readVectorField(key, columns, embedding, normalize, { signal, rows, pieces }),
     latentOutlierQuantiles: ({ signal }, key, width, fields, minPoints) =>
       latent.quantiles(key, width, fields, minPoints, { signal }),
     readStoredOutlierQuantiles: ({ signal }, fieldKey) => reader.readStoredOutlierQuantiles(fieldKey, { signal }),
@@ -532,11 +705,29 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       return { held, kept: held || latent.wouldHold(width), ...cost };
     },
     readVarNames: (_context, axis, column) => reader.readVarNames(axis, column),
+    readObsNames: () => reader.readObsNames(),
+    readObsmColumns: ({ signal }, key, columns) => reader.readObsmColumns(key, columns, { signal, reason: 'export' }),
     readVarFlags: (_context, axis, column) => reader.readVarFlags(axis, column),
-    getMatrixColumn: ({ signal }, element, index, owner = null, keys = null) =>
-      reader.getMatrixColumn(element, index, { signal, owner, keys }),
-    getMatrixColumns: ({ signal }, element, genes, owner = null, keys = null) =>
-      reader.getMatrixColumns(element, genes, { signal, owner, keys }),
+    geneReadPlan: (_context, element) => reader.geneReadPlan(element),
+    // `progressive`: the gene is posted on more cells as its index is built
+    // (`{event: 'partial', id, position, values, cells}`), before the reply.
+    // `rows`: only open cells `[start, end)` of each gene.
+    getMatrixColumn: ({ signal, partial }, element, index, owner = null, keys = null, progressive = false, rows = null) =>
+      reader.getMatrixColumn(element, index, {
+        signal,
+        owner,
+        keys,
+        rows,
+        onPartial: progressive ? (values, cells) => partial({ position: 0, values, cells }) : null,
+      }),
+    getMatrixColumns: ({ signal, partial }, element, genes, owner = null, keys = null, progressive = false, rows = null) =>
+      reader.getMatrixColumns(element, genes, {
+        signal,
+        owner,
+        keys,
+        rows,
+        onPartial: progressive ? (position, values, cells) => partial({ position, values, cells }) : null,
+      }),
     getMatrixColumnsSparse: ({ signal }, element, genes, owner = null) =>
       reader.getMatrixColumnsSparse(element, genes, { signal, owner }),
     getMatrixRows: ({ signal }, element, cells) => reader.getMatrixRows(element, cells, { signal }),
@@ -606,11 +797,12 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     prepareMatrix: (_context, element) => reader.prepareMatrix(element),
     getObsFieldInfo: (_context, key) => reader.getObsFieldInfo(key),
     getObsFieldKind: (_context, key) => reader.getObsFieldKind(key),
-    async getObsField({ signal }, key) {
-      const field = await reader.getObsField(key, { signal });
+    async getObsField({ signal }, key, rows = null) {
+      const field = await reader.getObsField(key, { signal, rows });
       // The payload is transferred to the caller, which owns it from now on;
-      // the reader keeps nothing that would be detached.
-      reader.detachObsField(key, field);
+      // the reader keeps nothing that would be detached (a read of some rows
+      // is never cached).
+      if (rows === null) reader.detachObsField(key, field);
       if (field.dtype === 'categorical') {
         // Narrowed here, off the page's thread: the page keeps this array.
         return {
@@ -634,6 +826,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       const current = reader;
       reader = null;
       latent = null;
+      held = null;
       current?.close();
     },
   };
@@ -660,6 +853,11 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       }
       return null;
     }
+    if (message?.storeHeld !== undefined) {
+      heldByPage.get(message.storeHeld)?.();
+      heldByPage.delete(message.storeHeld);
+      return null;
+    }
     if (message?.sourceUnreadable !== undefined) {
       const waiting = accessRequests.get(message.sourceUnreadable);
       accessRequests.delete(message.sourceUnreadable);
@@ -675,6 +873,16 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
       running.get(message.cancel)?.abort(new DOMException('The request was cancelled.', 'AbortError'));
       return null;
     }
+    if (message?.hostRequesterPort !== undefined) {
+      // The page's notebook host, reached through the page (`formats/io/host-fetch.js`).
+      adoptHostRequesterPort(message.hostRequesterPort);
+      return null;
+    }
+    if (message?.rangeCachePort !== undefined) {
+      // The page's bytes of remote files (`formats/io/range-cache.js`).
+      adoptRangeCachePort(message.rangeCachePort);
+      return null;
+    }
     const id = message?.id;
     const controller = new AbortController();
     running.set(id, controller);
@@ -687,7 +895,21 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
           message.method !== 'clearCache' && message.method !== 'closeRoute' && reader === null) {
         throw new Error('No AnnData file is open in the reader.');
       }
-      const result = ownedBuffers(await method({ signal: controller.signal }, ...(Array.isArray(message.args) ? message.args : [])));
+      // What a request posts before its reply (a gene on more cells: `partial`).
+      // Arrays posted in pieces before the reply or partial answer that
+      // names them (`utils/large-arrays.js`): made piece by piece
+      // (`pieces`), or too large to transfer.
+      const sender = new PieceSender((piece, transfer) => {
+        if (!controller.signal.aborted) post({ event: 'piece', id, ...piece }, transfer);
+      });
+      const partial = payload => {
+        if (controller.signal.aborted) return;
+        const placed = placeArrays(payload, view => sender.send(view));
+        post({ event: 'partial', id, ...placed }, canTransfer(placed.values) ? [placed.values.buffer] : []);
+      };
+      const pieces = (ArrayType, length) => sender.begin(ArrayType, length);
+      const answer = await method({ signal: controller.signal, partial, pieces }, ...(Array.isArray(message.args) ? message.args : []));
+      const result = placeArrays(ownedBuffers(answer), view => sender.send(view));
       return { reply: { id, result }, transfer: [...transferables(result)] };
     } catch (error) {
       // Opening explains its own failures (`openDatasetStore`); a later
@@ -710,7 +932,7 @@ if (
   // Decode workers are as many as the cores and their memory budget allow.
   configureDecodePool({ memoryBytes: residencyBudgetBytes('decodeWorkers') });
   const handle = createAnnDataReaderHandler({
-    post: message => self.postMessage(message),
+    post: (message, transfer = []) => self.postMessage(message, transfer),
   });
   // Requests interleave at the reader's await points: a field read never
   // waits for a gene index, and reads asked for together are planned

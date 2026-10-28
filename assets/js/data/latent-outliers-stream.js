@@ -112,7 +112,7 @@ export class LatentOutlierReader {
     const rowsFor = (rowStart, rowEnd) => {
       if (kept !== null) return kept.subarray(rowStart * width, rowEnd * width);
       const length = (rowEnd - rowStart) * width;
-      if (scratch === null || scratch.length < length) scratch = new Float32Array(length);
+      if (scratch === null || scratch.length < length) scratch = allocateTypedArray(Float32Array, length, label);
       return scratch.subarray(0, length);
     };
     const read = (visit, pass) => this._loader.forEachObsmRowSlab(key, visit, {

@@ -10,6 +10,7 @@
  * do (`viewer-protocol.json`).
  */
 import assert from 'node:assert/strict';
+import { orderedCellIdentity } from './helpers/ordered-cell-identity.mjs';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -92,7 +93,7 @@ Object.defineProperty(globalThis, 'fetch', {
 
 /** The binary frame of a host's highlight of `cells`, in red. */
 function highlightFrame(cells) {
-  return encodeViewerBinaryCommand({ type: 'highlight', color: '#ff0000' }, Uint32Array.from(cells));
+  return encodeViewerBinaryCommand({ type: 'highlight', color: '#ff0000', label: null }, Uint32Array.from(cells));
 }
 
 function cellsOf(body) {
@@ -105,11 +106,13 @@ function installWindow(search) {
   globalThis.window = { location: new URL(href) };
 }
 
-async function connectedSource() {
+async function connectedSource(identity = orderedCellIdentity({ nObs: 100_000 })) {
   installWindow('?viewer=true&viewerId=viewer-1&viewerToken=secret-1');
   globalThis.fetch = async () => viewerHostHealthResponse();
   const source = new ViewerHostDataSource(getViewerHostConfig());
   assert.equal(await source.initialize(), true);
+  source.setCellIdentityProvider(() => identity);
+  source.setShownDatasetProvider(() => 'example');
   return { source, socket: lastSocket() };
 }
 
@@ -886,7 +889,7 @@ test('a host that answers HTTP but not the WebSocket names the proxy as the caus
   const source = new ViewerHostDataSource(getViewerHostConfig());
   await assert.rejects(
     source.initialize(),
-    /session is running, but this viewer cannot open its channel \(ws:\/\/127\.0\.0\.1:8765\/viewer\/_cellucid\/ws\).*must pass WebSockets/,
+    /session is running, but this viewer cannot open its channel \(ws:\/\/127\.0\.0\.1:8765\/viewer\/_cellucid\/ws\).*does not pass WebSockets/,
   );
   assert.equal(source.isConnected(), false);
 });
@@ -988,7 +991,7 @@ test('host commands are checked against their exact keys before any handler', as
   source.onMessage(message => visibility.push(message));
   // A frame of the right shape whose values are wrong reaches no handler,
   // and the host is told; the channel stays open.
-  socket.hostSendBinary(encodeViewerBinaryCommand({ type: 'highlight', color: 'red' }, Uint32Array.of(1)));
+  socket.hostSendBinary(encodeViewerBinaryCommand({ type: 'highlight', color: 'red', label: null }, Uint32Array.of(1)));
   assert.equal(highlightCalls, 0);
   assert.equal(raised.length, 1);
   socket.hostSendBinary(highlightFrame([1, 2]));
@@ -1021,14 +1024,14 @@ test('a command that names cells is a binary frame, checked as exactly as the ho
     { text: { type: 'highlight', cells: [1, 2], color: '#ff0000' } },
     { text: { type: 'setVisibility', cells: null, visible: true } },
     // Commands carry no credentials: the channel is the viewer's.
-    { binary: frame('{"type":"highlight","color":"#ff0000","viewerId":"viewer-1","viewerToken":"secret-1"}') },
+    { binary: frame('{"type":"highlight","color":"#ff0000","label":null,"viewerId":"viewer-1","viewerToken":"secret-1"}') },
     { binary: frame('{"type":"highlight"}') },
     { binary: frame('{"type":"setColorBy","field":"x"}') },
-    { binary: frame('{"type":"highlight","color":"#ff0000"}', [2, 1]) },
-    { binary: frame('{"type":"highlight","color":"#ff0000"}', [3, 3]) },
-    { binary: frame('{"type":"highlight","color":"#ff0000"}', []) },
-    { binary: Uint8Array.of(...frame('{"type":"highlight","color":"#ff0000"}', [1]), 0) },
-    { binary: frame('{"type":"highlight","color":"#ff0000"}', [1], 400) },
+    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [2, 1]) },
+    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [3, 3]) },
+    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', []) },
+    { binary: Uint8Array.of(...frame('{"type":"highlight","color":"#ff0000","label":null}', [1]), 0) },
+    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [1], 400) },
     { binary: frame('{"type":"setVisibility","visible":true,"all":true}', [1]) },
     { binary: frame('{"type":"setVisibility","visible":"yes","all":false}', [1]) },
     { binary: Uint8Array.of(2, 0, 0, 0, 0xff, 0xfe) },
@@ -1066,23 +1069,28 @@ test('a frame the viewer cannot read ends the channel as a protocol violation', 
 });
 
 test('events go out as exact frames without credentials, binary ones zero-copy', async () => {
-  const { source, socket } = await connectedSource();
+  // A subsample, open in another order than the original one (open cells
+  // 0, 1, 2, ... are original positions 140000, 0, 139998, 2, ...): cells go
+  // out as their original positions, a cell set ascending.
+  const kept = new Uint32Array(70_001);
+  for (let index = 0; index < kept.length; index++) kept[index] = index * 2;
+  const { source, socket } = await connectedSource(orderedCellIdentity({ nObs: 140_002, kept }));
   await source.notifySelection(Uint32Array.of(1, 2, 70000), 'lasso');
   await source.notifyHover(1, { x: 1, y: 2, z: 3 });
   await source.notifyHover(null, null);
   await source.notifyClick(2, { button: 0, shift: false, ctrl: true });
-  await source.notifyReady({ nCells: 120, dimensions: 2 });
+  await source.notifyReady({ dimensions: 2 });
   const bundle = new Blob([new TextEncoder().encode('CELLUCID_SESSION\n')]);
   assert.equal(source.sendSessionBundle('request-1', bundle), true);
 
   const frames = await decodeFrames(socket.frames);
   assert.deepEqual(frames[0].header, { type: 'selection', source: 'lasso' });
-  assert.deepEqual(cellsOf(frames[0].body), [1, 2, 70000]);
+  assert.deepEqual(cellsOf(frames[0].body), [0, 70000, 139998]);
   assert.deepEqual(frames.slice(1, 5), [
-    { type: 'hover', cell: 1, position: { x: 1, y: 2, z: 3 } },
+    { type: 'hover', cell: 0, position: { x: 1, y: 2, z: 3 } },
     { type: 'hover', cell: null, position: null },
-    { type: 'click', cell: 2, button: 0, shift: false, ctrl: true },
-    { type: 'ready', n_cells: 120, dimensions: 2 },
+    { type: 'click', cell: 139998, button: 0, shift: false, ctrl: true },
+    { type: 'ready', n_cells: 70_001, n_obs: 140_002, dimensions: 2 },
   ]);
   assert.deepEqual(frames[5].header, { type: 'session_bundle', requestId: 'request-1' });
   assert.equal(new TextDecoder().decode(frames[5].body), 'CELLUCID_SESSION\n');
@@ -1093,13 +1101,29 @@ test('events go out as exact frames without credentials, binary ones zero-copy',
   }
 
   const sentBefore = socket.frames.length;
-  await assert.rejects(source.notifyReady({}), /nCells.*dimensions/i);
+  await assert.rejects(source.notifyReady({}), /dimensions/i);
   await assert.rejects(source.notifySelection(Uint32Array.of(1, 2)), /source/i);
   await assert.rejects(source.notifySelection(Uint32Array.of(2, 1), 'lasso'), /ascending/);
   await assert.rejects(source.notifyClick(2, { button: '0', shift: false, ctrl: false }), /button/i);
   await assert.rejects(source.notifyHover(2, { x: 1, y: Number.NaN, z: 3 }), /finite/i);
   assert.throws(() => source.sendSessionBundle('request-2', new Blob([])), /non-empty Blob/);
   assert.equal(socket.frames.length, sentBefore);
+  source.disconnect();
+});
+
+test('no event names cells while the viewer shows a dataset the host did not open', async () => {
+  const { source, socket } = await connectedSource(orderedCellIdentity({ nObs: 10 }));
+  let shown = null;
+  source.setShownDatasetProvider(() => shown);
+  const before = socket.frames.length;
+  assert.equal(await source.notifySelection(Uint32Array.of(1, 2), 'lasso'), false);
+  assert.equal(await source.notifyHover(1, { x: 1, y: 2, z: 3 }), false);
+  assert.equal(await source.notifyClick(2, { button: 0, shift: false, ctrl: false }), false);
+  assert.equal(socket.frames.length, before);
+  shown = 'example';
+  assert.equal(await source.notifySelection(Uint32Array.of(1, 2), 'lasso'), true);
+  assert.equal(socket.frames.length, before + 1);
+  assert.throws(() => source.setShownDatasetProvider('example'), /function/);
   source.disconnect();
 });
 
@@ -1175,7 +1199,10 @@ test('a dropped channel reopens at once and sends what waited, in order, with th
   const { source, socket } = await connectedSource();
   source.acceptCommands();
   const ends = [];
+  let reopened = 0;
   source.onChannelEnd(end => ends.push(end));
+  // The app sends its results snapshot again on each reopen.
+  source.onChannelReopen(() => { reopened += 1; });
   socket.hostClose(1006);
   // While it reconnects, events wait.
   await source.notifyHover(1, { x: 1, y: 1, z: 1 });
@@ -1187,10 +1214,12 @@ test('a dropped channel reopens at once and sends what waited, in order, with th
   const again = lastSocket();
   assert.deepEqual(again.hello, { type: 'hello', viewerId: 'viewer-1', viewerToken: 'secret-1' });
   const frames = await decodeFrames(again.frames);
-  assert.deepEqual(frames[0], { type: 'hover', cell: 3, position: { x: 3, y: 3, z: 3 } });
+  // Open cell 3 is original position 1 (`orderedCellIdentity`).
+  assert.deepEqual(frames[0], { type: 'hover', cell: 1, position: { x: 3, y: 3, z: 3 } });
   assert.deepEqual(frames[1].type, 'click');
   assert.deepEqual(frames[2].header, { type: 'selection', source: 'knn' });
   assert.deepEqual(ends, []);
+  assert.equal(reopened, 1);
   assert.equal(source.isConnected(), true);
   // Commands keep arriving on the new socket; the old one is ignored.
   const seen = [];
@@ -1221,7 +1250,7 @@ test('a replaced, stopped or unreachable channel ends once, without reopening', 
 test('a reopen that fails is told apart by one health request', async t => {
   silenceNotifications(t);
   for (const [healthy, kind, message] of [
-    [true, 'unreachable', /must pass WebSockets/],
+    [true, 'unreachable', /does not pass WebSockets/],
     [false, 'stopped', /no longer answers/],
   ]) {
     const { source, socket } = await connectedSource();

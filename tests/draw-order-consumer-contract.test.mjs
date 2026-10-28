@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
+import { StoreOrder } from '../assets/js/rendering/high-perf/store-order.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RENDERER = 'assets/js/rendering/high-perf-renderer.js';
@@ -58,7 +59,7 @@ test('nothing outside the renderer reaches its draw-ordered point stores', () =>
   // (dev tools) or `ctx._hpRenderer` (overlays).
   assert.deepEqual(
     hits(
-      /\b(?:hpRenderer|_hpRenderer|renderer)\??\.(?:buffers|snapshotBuffers|vao|_liveOrder|_liveColorOrder|_snapshotGeometryPools|_writeOrdered\w+|_createDrawOrderRecord)\b/,
+      /\b(?:hpRenderer|_hpRenderer|renderer)\??\.(?:buffers|snapshotBuffers|vao|_liveOrder|_liveColorOrder|_snapshotGeometryPools|_writeOrdered\w+|_createStoreOrder\w*)\b/,
       { except: [RENDERER] },
     ),
     [],
@@ -76,7 +77,7 @@ test('the point shader maps a stored slot back to its source index before any pe
   assert.ok(lookups.length > 0);
   // Every per-cell alpha lookup is preceded by the permutation fetch.
   const routed = shaders.match(
-    /int origIdx = u_useLodIndexTex\s*\? int\(texelFetch\(u_lodIndexTex, linearTexel\(gl_VertexID, u_lodIndexLayout\), 0\)\.r\)\s*: gl_VertexID;\s*alpha = texelFetch\(u_alphaTex, linearTexel\(origIdx, u_alphaLayout\), 0\)/g,
+    /int slot = u_slotBase \+ gl_VertexID;\s*int origIdx = slot < u_orderedSlots\s*\? int\(texelFetch\(u_lodIndexTex, linearTexel\(slot, u_lodIndexLayout\), 0\)\.r\)\s*: slot;\s*alpha = texelFetch\(u_alphaTex, linearTexel\(origIdx, u_alphaLayout\), 0\)/g,
   ) ?? [];
   assert.equal(routed.length, lookups.length);
   // No other shader indexes a per-cell texture by gl_VertexID.
@@ -86,11 +87,11 @@ test('the point shader maps a stored slot back to its source index before any pe
   for (const line of elsewhere) {
     assert.doesNotMatch(line, /texelFetch|u_alphaTex|u_lodIndexTex/, line);
   }
-  // The renderer binds the order's permutation whenever the per-cell alpha
-  // texture is read from a draw-ordered store.
+  // The renderer binds the store order's slot map whenever the per-cell
+  // alpha texture is read from a store holding any slot out of source order.
   const bind = HighPerfRenderer.prototype._bindPointAlpha.toString();
-  assert.match(bind, /alphaTexture !== null && order !== null \? order : null/);
-  assert.match(bind, /u_useLodIndexTex, permutation !== null \? 1 : 0/);
+  assert.match(bind, /alphaTexture !== null && order !== null && order\.orderedSlots > 0 \? order : null/);
+  assert.match(bind, /u_orderedSlots, permutation !== null \? permutation\.orderedSlots : 0/);
 });
 
 function silenceCalculationNotifications(t) {
@@ -120,17 +121,26 @@ test('per-cell CPU read-backs are source-order: positions, LOD membership and th
   }
   const tree = new SpatialIndex(positions, null, 2, 32, 8, { buildLOD: true });
   const drawOrder = tree.drawOrder;
-  const level = 4;
+  // The ladder of 2,000 cells: 1,000, 1,250, 1,562, 1,952 and all of them.
+  const level = 2;
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     currentDimensionLevel: 2,
     pointCount,
     snapshotBuffers: new Map(),
     spatialIndices: new Map([[2, tree]]),
     _liveGeometryGeneration: 1,
-    _liveOrder: { drawOrder, texture: {}, width: pointCount, height: 1, byteLength: pointCount * 4 },
+    _liveOrder: new StoreOrder({
+      pointCount,
+      target: drawOrder,
+      adopted: pointCount,
+      base: null,
+      baseEnd: pointCount,
+      map: { texture: {}, plan: null, byteLength: pointCount * 4 },
+      ranked: false,
+    }),
     _lodSequentialMemberships: new WeakMap(),
     _lodSpatialOwnerTokens: new WeakMap(),
-    _perViewState: new Map([['live', { lastLodLevel: level }]]),
+    _perViewState: new Map([['live', { lastLodLevel: level, lodLevels: tree }]]),
     _positions: positions,
     _snapshotGeometryPools: new Map(),
   });

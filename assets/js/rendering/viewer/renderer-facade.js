@@ -12,6 +12,8 @@
  * `(renderer, getTerminalState)` pair it is called with.
  */
 
+import { copyLargeArray } from '../../utils/large-arrays.js';
+
 function createViewerDisposedError(methodName) {
   const error = new Error(
     `Viewer method "${methodName}" is unavailable after dispose(); ` +
@@ -371,7 +373,7 @@ export function createViewerRendererFacade(
             value.byteOffset + value.byteLength
           ));
         } else {
-          copy = new value.constructor(value);
+          copy = copyLargeArray(value);
         }
         guardedReadOnlyBufferCopies.set(value, copy);
       }

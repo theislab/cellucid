@@ -166,6 +166,9 @@ export const MAPPING_CANDIDATES_ROUTE = 'candidates';
 /**
  * The mapping an AnnData dataset is shown with, read from its candidate
  * catalog, and checked against the dataset identity published beside it.
+ * Its `geneNames` is null while the catalog's default is (the gene names of
+ * the shown matrix are read after the first view; `validateDataMapping`'s
+ * `pendingGeneNames`).
  *
  * @param {unknown} candidates - The candidate catalog (`candidates`).
  * @param {Object} identity - The validated dataset identity.
@@ -183,6 +186,7 @@ export function resolveAnnDataMapping(candidates, identity) {
   }
   const mapping = validateDataMapping(candidates.defaults, {
     label: 'AnnData data mapping',
+    pendingGeneNames: true,
   });
   requireMappingModality(
     mapping,

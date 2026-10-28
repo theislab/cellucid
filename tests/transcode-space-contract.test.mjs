@@ -70,7 +70,10 @@ test('one pass writes one kept directory whose store reads as the store kept in 
   assert.equal(directory, events[0].directory);
   const files = readdirSync(path.join(disk.root, TRANSCODED_DIRECTORY, directory)).sort();
   const manifest = JSON.parse(readFileSync(path.join(disk.root, TRANSCODED_DIRECTORY, directory, 'manifest.json'), 'utf8'));
-  assert.deepEqual(files, [...manifest.blobs, 'manifest.json'].sort(), 'only what the store refers to is kept');
+  // Each file it refers to, with its page checksums (`formats/io/page-checks.js`).
+  const blobs = Object.keys(manifest.blobs);
+  assert.deepEqual(Object.keys(manifest.checks.files).sort(), blobs.sort(), 'every kept file is checked');
+  assert.deepEqual(files, [...blobs, ...blobs.map(name => `${name}.sums`), 'manifest.json', 'used'].sort(), 'only what the store refers to is kept');
   assert.deepEqual(await allKeys(kept.store), await allKeys(memory.store));
 });
 

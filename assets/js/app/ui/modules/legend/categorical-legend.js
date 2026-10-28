@@ -31,7 +31,7 @@ import {
   createButton,
   createIconButton
 } from '../../components/controls.js';
-import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatOpenCells } from '../../../../utils/format-units.js';
 import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
@@ -246,6 +246,20 @@ function formatCategoryCount(visibleCount, availableCount) {
     return `${formatCount(visibleCount)} / ${formatCountOf(availableCount, 'cell')}`;
   }
   return `${formatCountOf(visibleCount, 'cell')}`;
+}
+
+/**
+ * What the legend's counts are of, said only on a subsample: the open cells
+ * of every cell of the dataset (`formatOpenCells`); '' when every cell is
+ * open.
+ *
+ * @param {{pointCount?: number, cellIdentity?: {nOriginal?: number}|null}} state
+ * @returns {string}
+ */
+export function describeCountedCells(state) {
+  const open = state.pointCount ?? 0;
+  const total = state.cellIdentity?.nOriginal ?? open;
+  return total === open ? '' : `Counted on the ${formatOpenCells(open, total)} open.`;
 }
 
 /** Write text only when it changed, so an unchanged row is not relaid out. */
@@ -574,6 +588,8 @@ export function initCategoricalLegend(options) {
   // scrolling shows the same counts as the rows already drawn.
   let renderedModel = null;
   let renderedAnnotating = false;
+  // The line saying what the counts are of (a subsample's open cells).
+  let renderedCellsNote = null;
 
   const syncCategoryHighlightButtons = () => {
     if (isRendering) return;
@@ -736,6 +752,7 @@ export function initCategoricalLegend(options) {
         syncCategoryHighlightButton(entry.highlightBtn, idx, visible > 0);
       }
     }
+    if (renderedCellsNote !== null) setTextIfChanged(renderedCellsNote, describeCountedCells(state));
     if (annotationAvailabilityChanged) {
       renderCategoricalLegend(activeField, model);
       return;
@@ -750,9 +767,10 @@ export function initCategoricalLegend(options) {
     closeTransientInteractions();
     isRendering = true;
     try {
-      const { section, rows, annotating, mount } = _doRenderCategoricalLegend(field, model);
+      const { section, rows, annotating, mount, cellsNote } = _doRenderCategoricalLegend(field, model);
       legendEl.replaceChildren(section);
       mount();
+      renderedCellsNote = cellsNote;
       renderedRows = rows;
       renderedField = field;
       renderedModel = model;
@@ -928,6 +946,11 @@ export function initCategoricalLegend(options) {
       })
     );
     catSection.appendChild(controlsDiv);
+    // On a subsample the counts are of the open cells, and the legend says so.
+    const cellsNote = ownerDocument.createElement('p');
+    cellsNote.className = 'status-line legend-cells-note';
+    cellsNote.textContent = describeCountedCells(state);
+    catSection.appendChild(cellsNote);
 
     const categories = model.categories;
     const labels = categories.map(formatCategoryLabel);
@@ -1121,7 +1144,7 @@ export function initCategoricalLegend(options) {
     });
 
     catSection.appendChild(itemsContainer);
-    return { section: catSection, rows, annotating, mount };
+    return { section: catSection, rows, annotating, mount, cellsNote };
   }
 
   /**
@@ -1647,6 +1670,7 @@ export function initCategoricalLegend(options) {
     renderedField = null;
     renderedModel = null;
     renderedAnnotating = false;
+    renderedCellsNote = null;
   }
 
   return {

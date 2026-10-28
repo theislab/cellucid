@@ -9,7 +9,7 @@ import test from 'node:test';
 import { constants, zstdCompressSync } from 'node:zlib';
 
 import { ZarrFormatError } from '../assets/js/formats/zarr/errors.js';
-import { zstdDecompress } from '../assets/js/formats/zarr/codecs/zstd.js';
+import { BackwardBits, zstdDecompress } from '../assets/js/formats/zarr/codecs/zstd.js';
 import { lz4DecodeBlockInto, numcodecsLz4Decode } from '../assets/js/formats/zarr/codecs/lz4.js';
 import { bloscDecode } from '../assets/js/formats/zarr/codecs/blosc.js';
 import { crc32c, crc32cDecode } from '../assets/js/formats/zarr/codecs/crc32c.js';
@@ -40,6 +40,35 @@ function samples() {
   return out;
 }
 
+test('a backward bit stream reads every count up to 31 bits at every position, past its start included, as integers', () => {
+  // The reference: the stream as one BigInt (RFC 8878 4.1: read from the
+  // last byte's highest set bit down; bits before the stream are zero).
+  const bytes = Uint8Array.from({ length: 23 }, (_, i) => (i * 151 + 0x5a) & 0xff);
+  bytes[bytes.length - 1] = 0x80 | 0x35; // its end marker is the top bit
+  let whole = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) whole = (whole << 8n) | BigInt(bytes[i]);
+  const startBits = (bytes.length - 1) * 8 + 7;
+  for (let count = 0; count <= 31; count++) {
+    // From the top down to well past the start: every position, positive,
+    // zero and negative, and every count meets the largest value it can hold.
+    for (let first = 0; first <= startBits + 40; first += 3) {
+      const bits = new BackwardBits(bytes, 0, bytes.length);
+      bits.position = startBits - first;
+      const value = bits.read(count);
+      const position = startBits - first - count;
+      const expected = count === 0 ? 0n : position >= 0
+        ? (whole >> BigInt(position)) & ((1n << BigInt(count)) - 1n)
+        : (whole & ((1n << BigInt(Math.max(0, position + count))) - 1n)) << BigInt(-position);
+      assert.equal(BigInt(value), expected, `${count} bits at ${position}`);
+      assert.ok(Number.isInteger(value) && value >= 0 && value < 2 ** 31, 'a non-negative 31-bit integer');
+    }
+  }
+  // The largest a read one bit past the start can give: 30 ones, shifted.
+  const ones = new BackwardBits(Uint8Array.of(0xff, 0xff, 0xff, 0xff), 0, 4);
+  ones.position = 30;
+  assert.equal(ones.read(31), 0x7ffffffe);
+});
+
 test('Zstandard: every frame Node writes, at every level, decodes exactly', () => {
   let frames = 0;
   for (const data of samples()) {
@@ -65,6 +94,20 @@ test('Zstandard: frames with checksums, without content size, and several frames
   // A skippable frame is skipped.
   const skippable = Uint8Array.of(0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3);
   assert.deepEqual(zstdDecompress(new Uint8Array([...skippable, ...checked]), data.length), data);
+});
+
+test('Zstandard: a match more than 2^25 bytes back (an offset code above 24) decodes exactly', () => {
+  // Offset codes above 24 carry more extra bits than one refill of the
+  // sequence bit stream guarantees and take their own branch.
+  const next = random(5);
+  const block = Uint8Array.from({ length: 1 << 16 }, () => Math.floor(next() * 256));
+  const gap = (1 << 25) + 12_345;
+  const data = new Uint8Array(2 * block.length + gap);
+  data.set(block, 0);
+  data.set(block, block.length + gap);
+  const frame = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_windowLog]: 27 } }));
+  assert.ok(frame.length < block.length + 4096, `${frame.length} bytes: the repeated block is one match, not literals`);
+  assert.deepEqual(zstdDecompress(frame, data.length), data);
 });
 
 test('Zstandard: damaged frames are refused, never decoded short, long or out of bounds', () => {
@@ -121,6 +164,31 @@ test('Blosc: headers that contradict the frame are refused', async () => {
   await assert.rejects(bloscDecode(header, 8), /decodes to 0 bytes, not the 8/);
   header[0] = 3;
   await assert.rejects(bloscDecode(header, null), error => error.name === 'ZarrUnsupportedError');
+  // The delta filter (flag 0x08, c-blosc2's): undone after the blocks are
+  // decoded, never read as if absent. Two blocks of two 4-byte elements,
+  // stored as is: [1, 2] as [1, 1 ^ 2], then [5, 6] as [5 ^ 1, 6 ^ 2]
+  // (the first block's running XOR; later blocks against the first).
+  const delta = new Uint8Array(16 + 2 * 4 + 2 * (4 + 8));
+  const deltaView = new DataView(delta.buffer);
+  delta.set([2, 1, 0x08 | 0x10 | (1 << 5), 4]);
+  deltaView.setUint32(4, 16, true);
+  deltaView.setUint32(8, 8, true);
+  deltaView.setUint32(12, delta.length, true);
+  deltaView.setUint32(16, 24, true);
+  deltaView.setUint32(20, 36, true);
+  [[24, [1, 3]], [36, [4, 4]]].forEach(([at, words]) => {
+    deltaView.setInt32(at, 8, true);
+    words.forEach((word, i) => deltaView.setUint32(at + 4 + 4 * i, word, true));
+  });
+  assert.deepEqual([...new Uint32Array((await bloscDecode(delta, 16)).buffer)], [1, 2, 5, 6]);
+  // A plain-copy frame is its bytes, whatever its filters say (c-blosc2 too).
+  const copied = new Uint8Array(16 + 8);
+  copied.set([2, 1, 0x08 | 0x02 | 0x01, 4]);
+  new DataView(copied.buffer).setUint32(4, 8, true);
+  new DataView(copied.buffer).setUint32(8, 8, true);
+  new DataView(copied.buffer).setUint32(12, 24, true);
+  copied.set([9, 8, 7, 6, 5, 4, 3, 2], 16);
+  assert.deepEqual([...await bloscDecode(copied, 8)], [9, 8, 7, 6, 5, 4, 3, 2]);
 });
 
 test('CRC-32C matches its reference value, and a damaged chunk is refused', () => {

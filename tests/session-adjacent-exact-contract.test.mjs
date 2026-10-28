@@ -886,6 +886,8 @@ test('session controls treat exact cancel and supersession as silent no-ops', as
         whenSettled: async () => {},
       },
       currentDatasetIdentityId: () => null,
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
       openDatasetSource: async () => false,
       sessionSerializer: serializer,
       onAfterLoad() {

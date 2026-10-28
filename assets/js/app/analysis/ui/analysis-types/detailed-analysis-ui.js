@@ -35,6 +35,7 @@ import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
 import { PLACES } from '../../../ui/place-names.js';
+import { runProgressively } from '../../shared/progressive-cells.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -153,6 +154,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // The running, cancelled or failed state of the plot's job.
     this._container.appendChild(this._getJobStatusView().root);
+
+    // The cells the shown plot used (a first pass's sample, or all).
+    this._container.appendChild(this._getCellsUsedLine().root);
 
     // Preview container
     this._previewContainer = document.createElement('div');
@@ -551,10 +555,44 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    */
   async _runAnalysis(requestId, job) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
-    await this._whileBusy(
-      this._previewContainer,
-      () => this._runPreviewAnalysis(requestId, job)
-    );
+    const openCells = this.dataLayer.state?.pointCount ?? 0;
+    const isCurrent = () => this._isCurrentAnalysisRequest(requestId);
+    const progress = { shown: null };
+    try {
+      // A first pass on a uniform sample of the open cells, when it answers
+      // sooner by enough to be worth its cost (measured on this device);
+      // each pass draws its plot.
+      const done = await this._whileBusy(
+        this._previewContainer,
+        () => runProgressively({
+          kind: this._getJobTitle(),
+          dataLayer: this.dataLayer,
+          job,
+          isCurrent,
+          progress,
+          pass: async sample => {
+            await this._runPreviewAnalysis(requestId, job, sample);
+            return isCurrent() ? true : null;
+          },
+          onFirstPass: async (_drawn, sample) => {
+            this._showCellsUsed(sample, openCells, 'refining');
+            // Cancelled or superseded while refining: the first pass stays
+            // on screen, saying it is one.
+            this._registerAnalysisInvalidationCleanup(requestId, () => {
+              if (progress.shown === sample) this._showCellsUsed(sample, openCells, 'stopped');
+            });
+          }
+        })
+      );
+      if (done !== null && isCurrent()) {
+        progress.shown = null;
+        this._showCellsUsed(null, openCells, null, true);
+      }
+      else if (progress.shown !== null && isCurrent()) this._showCellsUsed(progress.shown, openCells, 'stopped');
+    } catch (error) {
+      if (progress.shown !== null && isCurrent()) this._showCellsUsed(progress.shown, openCells, 'stopped');
+      throw error;
+    }
   }
 
   /** @override */
@@ -563,9 +601,10 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   /** @private */
-  async _runPreviewAnalysis(requestId, job) {
+  async _runPreviewAnalysis(requestId, job, sample = null) {
     const config = structuredClone(this._currentConfig);
-    const pageIds = [...this._selectedPages];
+    // A first pass reads each page's cells in the sample (`progressive-cells.js`).
+    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const customColors = new Map(
       this._pageSelector?.getCustomColors?.() || []
     );
@@ -591,9 +630,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       job.step('Drawing the plot');
       // Missing categories are excluded per variable, before any plot,
       // summary table or categorical test sees the page.
-      const pageData = config.dataSource.type === 'categorical_obs'
+      const pageDataOfCells = config.dataSource.type === 'categorical_obs'
         ? excludeMissingCategoricalValues(fetchedPageData)
         : fetchedPageData;
+      // A sample's pages are named and coloured as their pages.
+      const pageData = sample === null
+        ? pageDataOfCells
+        : pageDataOfCells.map(page => ({ ...page, pageId: sample.basePageId(page.pageId) }));
 
       if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (pageData.length === 0) {
@@ -762,6 +805,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this._actionsContainer) {
       this._actionsContainer.hidden = true;
     }
+    this._showCellsUsed(null);
     return true;
   }
 

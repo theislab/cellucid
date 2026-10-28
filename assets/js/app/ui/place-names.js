@@ -33,6 +33,7 @@ export const PLACES = Object.freeze({
   benchmark: place('Benchmark', { panel: 'benchmark-section' }),
   // Blocks of the Session panel.
   dataset: place('Dataset', { heading: 'dataset-facts-title' }),
+  openData: place('Open data', { heading: 'open-data-title' }),
   dataMapping: place('Data mapping', { heading: 'data-mapping-title' }),
   sessionFile: place('Session file', { heading: 'session-state-title' }),
   // Blocks of the Visualization panel.

@@ -28,6 +28,7 @@
  * @module ui/modules/render-controls
  */
 
+import { lodLadder } from '../../../rendering/high-perf/draw-order.js';
 import { parseFiniteNumberInRange } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { formatDecimal } from '../components/display-format.js';
@@ -132,6 +133,7 @@ const VIEWER_METHODS = Object.freeze([
   'setShaderQuality',
   'setAdaptiveLOD',
   'setForceLOD',
+  'getLODLevelCount',
   'setFrustumCulling',
   'setAntialiasing',
   'getAntialiasing',
@@ -139,9 +141,13 @@ const VIEWER_METHODS = Object.freeze([
 ]);
 
 
-/** The forced-LOD slider range, matching `index.html` and the renderer. */
+/**
+ * The forced-LOD slider's lowest value (-1: Auto). Its highest is the last
+ * level of the ladder of the cells shown (`rendering/high-perf/draw-order.js`
+ * `lodLadder`: fixed counts, so its length follows the cell count), set
+ * whenever the slider is shown or touched (`syncForcedLodRange`).
+ */
 const FORCED_LOD_MINIMUM = -1;
-const FORCED_LOD_MAXIMUM = 17;
 
 function assertMethod(owner, method, label) {
   if (typeof owner[method] !== 'function') {
@@ -191,12 +197,10 @@ function assertForcedLodControl(control, label) {
   assertEventControl(control, label);
   if (
     control.min !== String(FORCED_LOD_MINIMUM)
-    || control.max !== String(FORCED_LOD_MAXIMUM)
     || control.step !== '1'
   ) {
     throw new TypeError(
-      `${label} requires exact range attributes min="${FORCED_LOD_MINIMUM}", `
-      + `max="${FORCED_LOD_MAXIMUM}", step="1".`
+      `${label} requires exact range attributes min="${FORCED_LOD_MINIMUM}", step="1".`
     );
   }
   return assertForcedLodLevel(control.value, label);
@@ -207,11 +211,9 @@ function assertForcedLodLevel(value, label) {
   if (
     !Number.isInteger(level)
     || level < FORCED_LOD_MINIMUM
-    || level > FORCED_LOD_MAXIMUM
   ) {
     throw new RangeError(
-      `${label} must be an integer from ${FORCED_LOD_MINIMUM} `
-      + `through ${FORCED_LOD_MAXIMUM}.`
+      `${label} must be an integer from ${FORCED_LOD_MINIMUM} on.`
     );
   }
   return level;
@@ -947,7 +949,26 @@ export function initRenderControls(options) {
     return level < 0 ? 'Auto' : String(level);
   }
 
+  // The slider reaches the last level of the cells shown; the renderer
+  // draws a level past it as the last (full detail).
+  function syncForcedLodRange() {
+    hpLodForceInput.max = String(Math.max(0, viewer.getLODLevelCount() - 1));
+  }
+
+  /**
+   * The forced-level slider's range for a dataset of `cellCount` cells, set
+   * as it is published and before any saved state is replayed (a session's
+   * level must find its level there, not the previous dataset's range).
+   */
+  function applyDatasetLodRange(cellCount) {
+    if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
+      throw new RangeError('The forced-level range requires one positive safe integer cell count.');
+    }
+    hpLodForceInput.max = String(lodLadder(cellCount).length - 1);
+  }
+
   function syncForcedLodUi() {
+    syncForcedLodRange();
     hpLodForceContainer.hidden = !acceptedLodEnabled;
     hpLodForceDisplay.textContent = formatForcedLodLevel(
       assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
@@ -1043,6 +1064,9 @@ export function initRenderControls(options) {
       );
     }
   });
+
+  listen(hpLodForceInput, 'pointerdown', syncForcedLodRange);
+  listen(hpLodForceInput, 'focus', syncForcedLodRange);
 
   listen(hpLodForceInput, 'input', () => {
     const previousForcedValue = acceptedForcedLodValue;
@@ -1236,6 +1260,7 @@ export function initRenderControls(options) {
     applyPointSizeFromSlider,
     applyAutomaticPointSize,
     applyDatasetAntialiasing,
+    applyDatasetLodRange,
     applyViewDimensionAntialiasing,
     pointSizeSliderPositionForCellCount,
     pointSizeToSlider: pointSizeToSliderPosition,

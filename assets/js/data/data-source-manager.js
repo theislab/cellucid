@@ -1022,6 +1022,27 @@ export class DataSourceManager {
   }
 
   /**
+   * The dataset shown, its cells grown or cut in place
+   * (`app/open-cells-resize.js`): the same dataset of the same source, its
+   * metadata (cell count) as the source now states it. A new selection
+   * revision, since what was derived from the earlier cells (marker caches)
+   * no longer holds.
+   *
+   * @param {DatasetMetadata} metadata
+   */
+  adoptResizedMetadata(metadata) {
+    if (!this.activeSource || !this.activeDatasetId) {
+      throw new Error('No dataset is shown to resize.');
+    }
+    validateDatasetIdentity(metadata, this.activeDatasetId, readSourceType(this.activeSource, 'Active data source'));
+    if (metadata.id !== this.activeIdentityId) {
+      throw new Error(`A dataset resized in place keeps its identity "${this.activeIdentityId}", not "${metadata.id}".`);
+    }
+    this.activeDatasetMetadata = metadata;
+    this._selectionRevision += 1;
+  }
+
+  /**
    * Get metadata for the current dataset
    * @returns {DatasetMetadata|null}
    */

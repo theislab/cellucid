@@ -18,6 +18,7 @@ import {
   RETRY_DELAYS_MS,
   fetchOnce,
   isTransientStatus,
+  spreadOf,
   transientStatusError,
   withRetries,
   worthAskingAgain,
@@ -499,7 +500,7 @@ export async function fetchWhenNotBusy(url, init = {}) {
       }
     }
     return answer;
-  }, { signal });
+  }, { signal, random: spreadOf(url) });
   const bodiless = [101, 103, 204, 205, 304].includes(response.status);
   const answered = new Response(bodiless ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
   // The final address after redirects, as `fetch` reports it.

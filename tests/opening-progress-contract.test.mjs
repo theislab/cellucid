@@ -197,6 +197,28 @@ test('reads are named as people say them', () => {
   assert.equal(describeOpeningRead({ kind: 'graph', label: "obsp['connectivities']" }), 'Reading the neighbour graph');
 });
 
+test('a file read whole is said up front, by a layer or by the reader, and the note lasts while the opening runs', () => {
+  const { progress, seen } = harness();
+  assert.equal(describeOpeningRead({ kind: 'transcode', label: 'seu.rds' }), 'Reading seu.rds whole, once');
+  progress.notice('ignored: nothing is opening');
+  const link = progress.begin({ title: 'geo:GSE1/seu.rds', step: 'Finding the file' });
+  assert.equal(seen.at(-1).note, null);
+  link.notice('ftp.ncbi.nlm.nih.gov serves this file only whole.');
+  assert.equal(seen.at(-1).note, 'ftp.ncbi.nlm.nih.gov serves this file only whole.');
+  // The reader, which holds no handle, replaces it once the file is read whole.
+  progress.notice('An R object (.rds) cannot be read in parts.');
+  link.step('Reading the file');
+  assert.equal(seen.at(-1).note, 'An R object (.rds) cannot be read in parts.');
+  const before = seen.length;
+  progress.notice('An R object (.rds) cannot be read in parts.');
+  assert.equal(seen.length, before, 'the same note again changes nothing');
+  link.end();
+  assert.equal(seen.at(-1).state, 'done');
+  progress.notice('too late');
+  assert.equal(seen.at(-1).note, 'An R object (.rds) cannot be read in parts.');
+  assert.equal(progress.begin({ title: 'next.h5ad' }) && seen.at(-1).note, null, 'a new opening starts with none');
+});
+
 test('a stoppable layer stops on Cancel or on its signal, and rejects with why', () => {
   let stops = 0;
   const cancelled = stoppableOpening({ title: 'a.h5ad', stop: () => { stops += 1; } });

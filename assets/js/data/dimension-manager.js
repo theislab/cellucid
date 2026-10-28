@@ -45,9 +45,11 @@
 import { loadPointsBinary } from './data-loaders.js';
 import { MappingLoadError } from './data-mapping-candidates.js';
 import { normalizePositions } from '../rendering/gl-utils.js';
-import { publishPositionBounds } from '../rendering/position-layout.js';
+import { publishPositionBounds, readPositionBounds } from '../rendering/position-layout.js';
 import { residencyBudgetBytes } from './memory-budget.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { cellsSteady, trackCellWork } from './open-cells-work.js';
+import { allocateTypedArray } from './sparse-column-index.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 const LAYOUT_ORIGINS = new Set(['identity', 'mapping']);
@@ -1044,6 +1046,10 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} Raw position data
    */
   async loadLayout(layoutKey) {
+    // The open cells being changed in place: read for the cells after it
+    // (`open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const generation = this._generation;
     const layout = this.getLayout(layoutKey);
     const key = layout.layoutKey;
@@ -1091,7 +1097,7 @@ class DimensionManager {
           this.loadingPromises.delete(key);
         }
       });
-      this.loadingPromises.set(key, produced);
+      this.loadingPromises.set(key, trackCellWork(produced));
       return produced;
     }
     const url = `${this.baseUrl}${layout.path}`;
@@ -1158,7 +1164,7 @@ class DimensionManager {
         }
       });
 
-    this.loadingPromises.set(key, promise);
+    this.loadingPromises.set(key, trackCellWork(promise));
     return promise;
   }
 
@@ -1170,6 +1176,8 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} Normalized positions (n_cells * dim)
    */
   async getPositions(layoutKey) {
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const generation = this._generation;
     const key = this.getLayout(layoutKey).layoutKey;
 
@@ -1198,7 +1206,7 @@ class DimensionManager {
         this.normalizedLoadingPromises.delete(key);
       }
     });
-    this.normalizedLoadingPromises.set(key, promise);
+    this.normalizedLoadingPromises.set(key, trackCellWork(promise));
     return promise;
   }
 
@@ -1601,6 +1609,111 @@ class DimensionManager {
       this.loadingPromises.size > 0 ||
       this.normalizedLoadingPromises.size > 0
     );
+  }
+
+  /**
+   * The layouts whose positions are resident (`getResidentPositions`), with
+   * their dimension and route: what an opening grown in place reads the
+   * added cells of (`app/open-cells-resize.js`).
+   *
+   * @returns {Array<{layoutKey: string, dimension: number, path: string|null}>}
+   */
+  residentLayouts() {
+    return [...this.normalizedPositionCache.keys()].map(layoutKey => {
+      const layout = this.getLayout(layoutKey);
+      return { layoutKey, dimension: layout.dimension, path: layout.path };
+    });
+  }
+
+  /**
+   * The cell axis grown or cut in place (`app/open-cells-resize.js`): open
+   * cells `[0, min(nCells, n))` are the same cells before and after. Every
+   * resident layout keeps those cells' positions and takes `added`'s for the
+   * cells after them (`{positions, bounds}` of rows `[nCells, n)`, in the
+   * layout's display frame), or is cut to them; a layout growing without
+   * added positions is let go, and so is every load under way (it reads the
+   * earlier cells), each read again when next asked for. Pins and views
+   * stay; the transforms stay (the frame does not move).
+   *
+   * @param {number} n
+   * @param {Map<string, {positions: Float32Array, bounds: {min: number[], max: number[]}|null}>} [added]
+   * @returns {Map<string, Float32Array>} The resized positions by layout
+   */
+  resizeCells(n, added = new Map()) {
+    if (!Number.isSafeInteger(n) || n < 1) {
+      throw new TypeError(`A cell axis is resized to a positive count, not ${n}.`);
+    }
+    const from = this.nCells;
+    for (const controller of this.loadingControllers.values()) controller.abort();
+    this.loadingControllers.clear();
+    this.loadingPromises.clear();
+    this.normalizedLoadingPromises.clear();
+    this.positionCache.clear();
+    this.loadedTransformCache.clear();
+    const resized = new Map();
+    for (const [layoutKey, positions] of [...this.normalizedPositionCache]) {
+      const dim = this.getLayout(layoutKey).dimension;
+      const rows = added.get(layoutKey) ?? null;
+      if (n > from && rows === null) {
+        this._evictLayout(layoutKey);
+        continue;
+      }
+      const next = allocateTypedArray(Float32Array, n * dim, `Layout "${layoutKey}" positions`);
+      next.set(positions.subarray(0, Math.min(from, n) * dim));
+      if (n > from) {
+        if (!(rows.positions instanceof Float32Array) || rows.positions.length !== (n - from) * dim) {
+          throw new RangeError(`The cells added to layout "${layoutKey}" must hold ${formatCountOf((n - from) * dim, 'value')}; got ${rows.positions?.length}.`);
+        }
+        next.set(rows.positions, from * dim);
+      }
+      // Bounds of the kept cells (cut) or of both parts (grown), exactly.
+      const kept = readPositionBounds(n > from ? positions : next, dim);
+      const bounds = n > from && rows.bounds !== null
+        ? { min: kept.min.map((v, axis) => Math.min(v, rows.bounds.min[axis])), max: kept.max.map((v, axis) => Math.max(v, rows.bounds.max[axis])) }
+        : kept;
+      publishPositionBounds(next, dim, bounds);
+      this.normalizedPositionCache.set(layoutKey, next);
+      this._residencyListener?.onEvict?.(positions);
+      resized.set(layoutKey, next);
+    }
+    this.nCells = n;
+    return resized;
+  }
+
+  /**
+   * The same open cells in another order (`app/open-cells-resize.js`): open
+   * cell `j` after is open cell `order[j]` before. Every resident layout's
+   * positions move with their cells (the frame does not move); loads under
+   * way, which read the earlier order, are let go.
+   *
+   * @param {Uint32Array} order
+   * @returns {Map<string, Float32Array>} The reordered positions by layout
+   */
+  reorderCells(order) {
+    const n = this.nCells;
+    if (!(order instanceof Uint32Array) || order.length !== n) {
+      throw new TypeError(`An order of the ${formatCountOf(n, 'open cell')} names each once.`);
+    }
+    for (const controller of this.loadingControllers.values()) controller.abort();
+    this.loadingControllers.clear();
+    this.loadingPromises.clear();
+    this.normalizedLoadingPromises.clear();
+    this.positionCache.clear();
+    this.loadedTransformCache.clear();
+    const reordered = new Map();
+    for (const [layoutKey, positions] of [...this.normalizedPositionCache]) {
+      const dim = this.getLayout(layoutKey).dimension;
+      const next = allocateTypedArray(Float32Array, n * dim, `Layout "${layoutKey}" positions`);
+      for (let j = 0; j < n; j++) {
+        const from = order[j] * dim;
+        for (let axis = 0; axis < dim; axis++) next[j * dim + axis] = positions[from + axis];
+      }
+      publishPositionBounds(next, dim, readPositionBounds(next, dim));
+      this.normalizedPositionCache.set(layoutKey, next);
+      this._residencyListener?.onEvict?.(positions);
+      reordered.set(layoutKey, next);
+    }
+    return reordered;
   }
 
   /**

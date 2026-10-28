@@ -141,3 +141,89 @@ test('cancelling remote opens and reads at any moment leaves no unhandled reject
   }
   assert.deepEqual(unhandled.map(error => `${error?.name}: ${error?.message}`), []);
 });
+
+test('a store with mirrors spreads its requests over their hosts and drops a mirror that fails, reading every value', async () => {
+  const entries = await corpusEntries('anndata/v3.zarr');
+  const asked = [];
+  const served = hostFetch(entries);
+  const fetch = (url, init) => {
+    const host = new URL(url).host;
+    asked.push(host);
+    if (host === 'broken.test') return Promise.reject(new TypeError('Failed to fetch'));
+    // Each host serves the same folder under its own path.
+    return served(url.replace(/^https:\/\/[^/]+\/(mirror|host)\//, 'https://own.test/host/'), init);
+  };
+  const plain = await openZarr(httpStore('https://own.test/host/', { fetch: hostFetch(entries) }));
+  const store = httpStore('https://own.test/host/', {
+    fetch,
+    concurrency: 18,
+    mirrors: ['https://other.test/mirror/', 'https://broken.test/mirror/'],
+  });
+  // Objects asked for at once go to each address in turn.
+  const keys = [...entries.keys()].slice(0, 9);
+  const objects = await store.getMany(keys);
+  objects.forEach((bytes, i) => assert.deepEqual(bytes, entries.get(keys[i])));
+  const burst = asked.length;
+  // The failing mirror was given its share of the burst, and then no more.
+  assert.equal(asked.filter(host => host === 'broken.test').length, 3);
+  const mirrored = await openZarr(store);
+  const expected = await plain.get('obs/_index').read();
+  assert.deepEqual(await mirrored.get('obs/_index').read(), expected);
+  const reads = ['X', 'obsm/X_umap'].filter(path => plain.get(path)?.kind === 'array');
+  for (const path of reads) assert.deepEqual(await mirrored.get(path).read(), await plain.get(path).read());
+  const hosts = new Set(asked);
+  assert.ok(hosts.has('own.test') && hosts.has('other.test'), `requests went to ${[...hosts].join(', ')}`);
+  assert.ok(!asked.slice(burst).includes('broken.test'), 'a dropped mirror is not asked again');
+  assert.throws(() => httpStore('https://own.test/host/', { mirrors: ['ftp://x/'] }), /mirrors/);
+});
+
+test('a store refuses a range answered as another range', async () => {
+  const bytes = new Uint8Array(64).map((_, i) => i);
+  const fetch = async (url, init) => {
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    return new Response(bytes.slice(Number(start) + 1, Number(end) + 2), {
+      status: 206,
+      headers: { 'Content-Range': `bytes ${Number(start) + 1}-${Number(end) + 1}/64` },
+    });
+  };
+  const store = httpStore('https://own.test/host/', { fetch });
+  await assert.rejects(store.getRanges('shard', [{ offset: 8, length: 8 }]), { code: 'range-ignored' });
+});
+
+test('cancelling one read of a merged range leaves the others waiting for it; the request stops once all withdrew', async () => {
+  const data = new Uint8Array(100_000).map((_, i) => i & 255);
+  let aborted = 0;
+  const pending = [];
+  const fetch = (url, init) => new Promise((resolve, reject) => {
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    init.signal?.addEventListener('abort', () => {
+      aborted++;
+      reject(init.signal.reason);
+    }, { once: true });
+    pending.push(() => resolve(new Response(data.slice(Number(start), Number(end) + 1), { status: 206 })));
+  });
+  const store = httpStore('https://example.org/store.zarr/', { fetch });
+  const a = new AbortController();
+  const b = new AbortController();
+  const readA = store.getRanges('X/0', [{ offset: 0, length: 100 }], { signal: a.signal });
+  const readB = store.getRanges('X/0', [{ offset: 200, length: 100 }], { signal: b.signal });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(pending.length, 1, 'the two ranges are one request');
+  a.abort(new DOMException('gene A no longer wanted', 'AbortError'));
+  await assert.rejects(readA, /gene A no longer wanted/);
+  assert.equal(aborted, 0, 'the request goes on for B');
+  pending[0]();
+  assert.deepEqual((await readB)[0], data.subarray(200, 300));
+  // Both withdraw: the request is cancelled.
+  const c = new AbortController();
+  const d = new AbortController();
+  const readC = store.getRanges('X/1', [{ offset: 0, length: 100 }], { signal: c.signal });
+  const readD = store.getRanges('X/1', [{ offset: 200, length: 100 }], { signal: d.signal });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  c.abort();
+  d.abort();
+  await assert.rejects(readC);
+  await assert.rejects(readD);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(aborted, 1, 'the shared request stopped once nobody waited');
+});

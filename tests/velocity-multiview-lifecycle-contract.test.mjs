@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 import {
   VelocityOverlay,
@@ -209,15 +210,13 @@ test('velocity disposal retries notification ownership without deleting detached
     notificationId: 'spawn-loading',
     ready: true,
     textureInfo: {
-      height: 1,
       texture: spawnTexture,
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
     version: 1,
     visibilityTextureInfo: {
-      height: 1,
       texture: visibilityTexture,
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
   });
 
@@ -270,10 +269,9 @@ test('velocity disposal detaches vector texture descriptors into the retry queue
   const entry = {
     cellCount: 2,
     components: 3,
-    height: 1,
     maxMagnitude: 1,
     texture: vectorTexture,
-    width: 2,
+    plan: planLinearTexture(2, 4096, 256),
   };
   overlay._fieldsById.set(
     'field-a',
@@ -340,6 +338,7 @@ function createSimulationGl() {
     endTransformFeedback() {},
     uniform1f() {},
     uniform1i() {},
+    uniform2i() {},
     useProgram() {},
   };
   return { draws, gl };
@@ -570,14 +569,14 @@ function createSimulationOverlay(gl) {
       u_dt: {},
       u_forceRespawn: {},
       u_lifetime: {},
-      u_positionTexWidth: {},
+      u_positionLayout: {},
       u_spawnTableSize: {},
-      u_spawnTableWidth: {},
+      u_spawnTableLayout: {},
       u_speedMultiplier: {},
       u_time: {},
       u_turbulence: {},
       u_velocityBlend: {},
-      u_velocityTexWidth: {},
+      u_velocityLayout: {},
     },
     config: {
       dropRate: 0,
@@ -594,13 +593,12 @@ test('velocity simulation advances each view-owned ping-pong generation at most 
   const overlay = createSimulationOverlay(fixture.gl);
   const live = createParticleState('live');
   const snapshot = createParticleState('snapshot');
-  const field = { texture: {}, width: 2 };
-  const positions = { texture: {}, width: 2 };
+  const field = { texture: {}, plan: planLinearTexture(2, 4096, 256) };
+  const positions = { texture: {}, plan: planLinearTexture(2, 4096, 256) };
   const spawn = {
     generation: 1,
     tableSize: 2,
-    tableWidth: 2,
-    textureInfo: { texture: {} },
+    textureInfo: { texture: {}, plan: planLinearTexture(2, 4096, 256) },
   };
 
   overlay._simulate(
@@ -898,9 +896,8 @@ test('a positive particle-count change force-initializes every active slot and c
     generation: 1,
     ready: true,
     tableSize: 1,
-    tableWidth: 1,
     textureInfo: { texture: {} },
-    visibilityTextureInfo: { texture: {}, width: 1 },
+    visibilityTextureInfo: { texture: {}, plan: planLinearTexture(1, 4096, 256) },
   };
   const disposed = [];
   const trails = { trailClearPending: false };
@@ -917,7 +914,7 @@ test('a positive particle-count change force-initializes every active slot and c
       syncWithLOD: false,
     },
     _ensureParticleState: () => particle,
-    _ensurePositionTexture: () => ({ texture: {}, width: 1 }),
+    _ensurePositionTexture: () => ({ texture: {}, plan: planLinearTexture(1, 4096, 256) }),
     _ensureSpawnTable: () => spawn,
     _disposeFBOs: viewId => disposed.push(viewId),
     _updateCameraMotion() {},
@@ -1034,7 +1031,7 @@ test('field transitions reuse exact same-cell spawn ownership and inactive publi
 test('velocity field replacement publishes before retrying a delete-then-throw retirement', t => {
   const fixture = createPositionTextureGl();
   const existingTexture = fixture.gl.createTexture();
-  fixture.gl.bindTexture(fixture.gl.TEXTURE_2D, existingTexture);
+  fixture.gl.bindTexture(fixture.gl.TEXTURE_2D_ARRAY, existingTexture);
   const originalDeleteTexture = fixture.gl.deleteTexture;
   let failExistingOnce = true;
   fixture.gl.deleteTexture = texture => {
@@ -1059,10 +1056,9 @@ test('velocity field replacement publishes before retrying a delete-then-throw r
         {
           cellCount: 2,
           components: 3,
-          height: 1,
           maxMagnitude: 1,
           texture: existingTexture,
-          width: 2,
+          plan: planLinearTexture(2, 4096, 256),
         },
       ]])],
     ]),
@@ -1112,9 +1108,8 @@ test('null velocity field retires derived view textures and same-null publicatio
     source: positions,
     textureInfo: {
       components: 3,
-      height: 1,
       texture: positionTexture,
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
   };
   const spawn = {
@@ -1125,18 +1120,15 @@ test('null velocity field retires derived view textures and same-null publicatio
     notificationId: null,
     ready: true,
     tableSize: 1,
-    tableWidth: 1,
     textureInfo: {
-      height: 1,
       texture: spawnTexture,
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
     version: 2,
     visibilityTextureInfo: {
       components: 1,
-      height: 1,
       texture: visibilityTexture,
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
   };
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
@@ -1219,8 +1211,9 @@ function createPositionTextureGl() {
     RGB: 0x1907,
     RGBA32F: 0x8814,
     RGBA: 0x1908,
-    TEXTURE_2D: 0x0de1,
-    TEXTURE_BINDING_2D: 0x8069,
+    TEXTURE_2D_ARRAY: 0x8c1a,
+    TEXTURE_BINDING_2D_ARRAY: 0x8c1d,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_WRAP_S: 0x2802,
@@ -1231,7 +1224,8 @@ function createPositionTextureGl() {
       pixelUnpackBuffer = value;
     },
     bindTexture(target, value) {
-      assert.equal(target, this.TEXTURE_2D);
+      // Per-cell textures are linear textures (2D arrays).
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
       textureBinding = value;
     },
     createTexture() {
@@ -1245,7 +1239,8 @@ function createPositionTextureGl() {
     },
     getParameter(parameter) {
       if (parameter === this.MAX_TEXTURE_SIZE) return 4096;
-      if (parameter === this.TEXTURE_BINDING_2D) return textureBinding;
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
+      if (parameter === this.TEXTURE_BINDING_2D_ARRAY) return textureBinding;
       if (parameter === this.UNPACK_ALIGNMENT) return unpackAlignment;
       if (parameter === this.PIXEL_UNPACK_BUFFER_BINDING) {
         return pixelUnpackBuffer;
@@ -1259,20 +1254,24 @@ function createPositionTextureGl() {
       assert.equal(parameter, this.UNPACK_ALIGNMENT);
       unpackAlignment = value;
     },
-    texImage2D() {},
+    texStorage3D() {},
     texParameteri() {},
-    texSubImage2D(
+    texSubImage3D(
       _target,
       _level,
       _x,
       _y,
-      _width,
-      _height,
-      _format,
+      _layer,
+      width,
+      rows,
+      _depth,
+      format,
       _type,
-      row,
+      data,
+      srcOffset = 0,
     ) {
-      uploadedRows.push(Array.from(row));
+      const components = format === this.RGB ? 3 : format === this.RG ? 2 : format === this.RGBA ? 4 : 1;
+      uploadedRows.push(Array.from(data.subarray(srcOffset, srcOffset + width * rows * components)));
     },
   };
   return {
@@ -1395,9 +1394,8 @@ test('geometry retirement failure remains byte-accounted and retryable without a
   const positions = new Float32Array([0, 1, 2, 3, 4, 5]);
   const textureInfo = {
     components: 3,
-    height: 1,
+    plan: planLinearTexture(2, 4096, 256),
     texture: { id: 'retained-position' },
-    width: 2,
   };
   const entry = {
     refs: 1,
@@ -1454,15 +1452,13 @@ test('view disposal detaches derived state while retaining failed texture owners
     notificationId: null,
     ready: true,
     textureInfo: {
-      height: 1,
       texture: spawnTexture,
-      width: 2,
+      plan: planLinearTexture(2, 4096, 256),
     },
     version: 1,
     visibilityTextureInfo: {
-      height: 1,
       texture: visibilityTexture,
-      width: 2,
+      plan: planLinearTexture(2, 4096, 256),
     },
   };
   let failOnce = true;
@@ -1519,9 +1515,8 @@ test('disable retires every derived view texture exactly and retries failed dele
     source: new Float32Array(6),
     textureInfo: {
       components: 3,
-      height: 1,
       texture: positionTexture,
-      width: 2,
+      plan: planLinearTexture(2, 4096, 256),
     },
   };
   const spawn = {
@@ -1531,18 +1526,15 @@ test('disable retires every derived view texture exactly and retries failed dele
     notificationId: null,
     ready: true,
     tableSize: 2,
-    tableWidth: 2,
     textureInfo: {
-      height: 1,
       texture: spawnTexture,
-      width: 2,
+      plan: planLinearTexture(2, 4096, 256),
     },
     version: 1,
     visibilityTextureInfo: {
       components: 1,
-      height: 1,
       texture: visibilityTexture,
-      width: 2,
+      plan: planLinearTexture(2, 4096, 256),
     },
   };
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
@@ -1666,7 +1658,7 @@ test('dirty or empty visibility generations cannot render stale velocity particl
         ready: true,
         tableSize: 12,
         textureInfo: { texture: {} },
-        visibilityTextureInfo: { texture: {}, width: 4 },
+        visibilityTextureInfo: { texture: {}, plan: planLinearTexture(4, 4096, 256) },
         version: 3,
       }],
     ]),
@@ -1742,7 +1734,7 @@ test('committed empty visibility retires the prior full-resolution trail generat
       this._particleByView.delete(viewId);
     },
     _ensurePositionTexture() {
-      return { texture: {}, width: 1 };
+      return { texture: {}, plan: planLinearTexture(1, 4096, 256) };
     },
     _ensureSpawnTable() {
       return spawn;
@@ -1810,12 +1802,11 @@ test('velocity context loss fences pending idle spawn publication without GL chu
     notificationId: null,
     ready: true,
     tableSize: 1,
-    tableWidth: 1,
     textureInfo: { texture: { id: 'old-spawn' } },
     version: 1,
     visibilityTextureInfo: {
       texture: { id: 'old-visibility' },
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
   };
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
@@ -1895,7 +1886,6 @@ test('velocity context loss fences every spawn owner even when one notification 
     notificationId,
     ready: true,
     tableSize: 2,
-    tableWidth: 2,
     textureInfo: { texture: {} },
     version: 1,
     visibilityTextureInfo: { texture: {} },

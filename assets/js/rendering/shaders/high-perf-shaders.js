@@ -96,11 +96,16 @@ ${FOG_GLSL}
 uniform lowp sampler2DArray u_alphaTex;
 uniform ivec2 u_alphaLayout;
 uniform bool u_useAlphaTex;
-// The draw order's permutation (slot -> source point), R32UI, so the alpha of
-// a point drawn from a reordered store is found exactly at any index.
+// The store order's slot map (slot -> source point), R32UI, so the alpha of
+// a point drawn from a reordered store is found exactly at any index. Slots
+// from u_orderedSlots on hold their own point (rendering/high-perf/
+// store-order.js); 0 for a store in source order.
 uniform highp usampler2DArray u_lodIndexTex;
 uniform ivec2 u_lodIndexLayout;
-uniform bool u_useLodIndexTex;
+uniform int u_orderedSlots;
+// The first slot of the store segment drawn: gl_VertexID counts from it
+// (rendering/high-perf/point-store-segments.js).
+uniform int u_slotBase;
 ${LINEAR_TEXEL_GLSL}
 
 flat out vec3 v_color;
@@ -122,9 +127,10 @@ void main() {
   float alpha;
   if (u_useAlphaTex) {
     // Integer addressing throughout: a float index loses exactness at 2^24.
-    int origIdx = u_useLodIndexTex
-      ? int(texelFetch(u_lodIndexTex, linearTexel(gl_VertexID, u_lodIndexLayout), 0).r)
-      : gl_VertexID;
+    int slot = u_slotBase + gl_VertexID;
+    int origIdx = slot < u_orderedSlots
+      ? int(texelFetch(u_lodIndexTex, linearTexel(slot, u_lodIndexLayout), 0).r)
+      : slot;
     alpha = texelFetch(u_alphaTex, linearTexel(origIdx, u_alphaLayout), 0).r;
   } else {
     alpha = a_color.a;
@@ -299,11 +305,16 @@ uniform float u_pointScale;
 uniform lowp sampler2DArray u_alphaTex;
 uniform ivec2 u_alphaLayout;
 uniform bool u_useAlphaTex;
-// The draw order's permutation (slot -> source point), R32UI, so the alpha of
-// a point drawn from a reordered store is found exactly at any index.
+// The store order's slot map (slot -> source point), R32UI, so the alpha of
+// a point drawn from a reordered store is found exactly at any index. Slots
+// from u_orderedSlots on hold their own point (rendering/high-perf/
+// store-order.js); 0 for a store in source order.
 uniform highp usampler2DArray u_lodIndexTex;
 uniform ivec2 u_lodIndexLayout;
-uniform bool u_useLodIndexTex;
+uniform int u_orderedSlots;
+// The first slot of the store segment drawn: gl_VertexID counts from it
+// (rendering/high-perf/point-store-segments.js).
+uniform int u_slotBase;
 ${LINEAR_TEXEL_GLSL}
 
 flat out vec3 v_color;
@@ -323,9 +334,10 @@ void main() {
   float alpha;
   if (u_useAlphaTex) {
     // Integer addressing throughout: a float index loses exactness at 2^24.
-    int origIdx = u_useLodIndexTex
-      ? int(texelFetch(u_lodIndexTex, linearTexel(gl_VertexID, u_lodIndexLayout), 0).r)
-      : gl_VertexID;
+    int slot = u_slotBase + gl_VertexID;
+    int origIdx = slot < u_orderedSlots
+      ? int(texelFetch(u_lodIndexTex, linearTexel(slot, u_lodIndexLayout), 0).r)
+      : slot;
     alpha = texelFetch(u_alphaTex, linearTexel(origIdx, u_alphaLayout), 0).r;
   } else {
     alpha = a_color.a;

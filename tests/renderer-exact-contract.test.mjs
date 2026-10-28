@@ -1,3 +1,4 @@
+import { StoreOrder } from '../assets/js/rendering/high-perf/store-order.js';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -41,6 +42,8 @@ import {
   SyntheticDataGenerator,
 } from '../assets/js/dev/benchmark.js';
 import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
+import { bufferOf, pointStoreOver } from './helpers/point-stores.mjs';
+import { SegmentedVertexArray } from '../assets/js/rendering/high-perf/point-store-segments.js';
 
 const renderingRoot = new URL('../assets/js/rendering/', import.meta.url);
 const figureExportRoot = new URL(
@@ -292,7 +295,6 @@ test('an exact empty scene publishes empty alpha state without a synthetic textu
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     pointCount: 0,
     _alphaTexture: null,
-    _alphaTexData: new Uint8Array(),
     _alphaTexWidth: 0,
     _alphaTexHeight: 0,
     _useAlphaTexture: false,
@@ -333,7 +335,11 @@ test('recoloring preserves the exact alpha generation through a position publica
     createVertexArray() { const handle = { id: nextId++, vao: true }; live.add(handle); return handle; },
     bindBuffer(_target, buffer) { bound = buffer; },
     bindVertexArray() {},
-    bufferData(_target, data) { uploads.push({ buffer: bound, data }); },
+    // A store made holding its bytes, or sized and then written.
+    bufferData(_target, data) { if (typeof data !== 'number') uploads.push({ buffer: bound, data }); },
+    bufferSubData(_target, _offset, data, srcOffset = 0, length = data.length - srcOffset) {
+      uploads.push({ buffer: bound, data: data.subarray(srcOffset, srcOffset + length) });
+    },
     enableVertexAttribArray() {},
     vertexAttribPointer() {},
     getError() { return 0; },
@@ -341,9 +347,11 @@ test('recoloring preserves the exact alpha generation through a position publica
     deleteVertexArray(handle) { live.delete(handle); deleted.push(handle); },
     deleteTexture(handle) { live.delete(handle); deleted.push(handle); },
   };
-  const colorBuffer = gl.createBuffer();
-  const positionBuffer = gl.createBuffer();
-  const vao = gl.createVertexArray();
+  const colorBuffer = pointStoreOver(gl, gl.createBuffer(), 2, 4);
+  const positionBuffer = pointStoreOver(gl, gl.createBuffer(), 2, 12);
+  const vao = new SegmentedVertexArray(gl);
+  vao.setStores(positionBuffer, colorBuffer, 3);
+  const [vaoHandle] = vao.vaos;
   const alphaTexture = { id: 'alpha-texture' };
   const previousPositions = Float32Array.from([-1, 0, 0, 1, 0, 0]);
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
@@ -403,11 +411,11 @@ test('recoloring preserves the exact alpha generation through a position publica
   assert.equal(renderer.currentDimensionLevel, 2);
   assert.notEqual(renderer.buffers.positions, positionBuffer);
   assert.deepEqual(uploads.map(upload => upload.data), [nextPositions]);
-  assert.equal(deleted.includes(colorBuffer), false);
+  assert.equal(deleted.includes(bufferOf(colorBuffer)), false);
   assert.equal(deleted.includes(alphaTexture), false);
-  assert.equal(deleted.includes(vao), true);
+  assert.equal(deleted.includes(vaoHandle), true);
   // The 3D geometry the live view left is retained for reuse.
-  assert.equal(deleted.includes(positionBuffer), false);
+  assert.equal(deleted.includes(bufferOf(positionBuffer)), false);
   const retained = renderer._snapshotGeometryPools.get(1);
   assert.equal(retained.positions, previousPositions);
   assert.equal(retained.positionBuffer, positionBuffer);
@@ -457,6 +465,15 @@ test('a recolor is gathered into the live draw order once, at its flush, retryin
     30, 31, 32, 33,
   ]);
   const drawOrder = Object.freeze({ indices: Uint32Array.from([2, 0, 1]), pointCount: 3 });
+  const liveOrder = new StoreOrder({
+    pointCount: 3,
+    target: drawOrder,
+    adopted: 3,
+    base: null,
+    baseEnd: 3,
+    map: { texture: { id: 'live-order' }, plan: null, byteLength: 12 },
+    ranked: false,
+  });
   const colorBuffer = { id: 'live-colors' };
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
@@ -466,8 +483,8 @@ test('a recolor is gathered into the live draw order once, at its flush, retryin
     _colorGpuByteLength: colors.byteLength,
     _colors: new Uint8Array(colors.length),
     _colorsDirty: false,
-    _liveOrder: { drawOrder, texture: { id: 'live-order' }, width: 3, height: 1 },
-    _liveColorOrder: drawOrder,
+    _liveOrder: liveOrder,
+    _liveColorOrder: liveOrder,
     spatialIndices: new Map(),
   });
   renderer._permuter = createCpuPermuter(gl);
@@ -496,7 +513,7 @@ test('a recolor is gathered into the live draw order once, at its flush, retryin
     ],
   }]);
   assert.equal(renderer._colorsDirty, false);
-  assert.strictEqual(renderer._liveColorOrder, drawOrder);
+  assert.strictEqual(renderer._liveColorOrder, liveOrder);
 
   // Already in order and clean: the next frame uploads nothing.
   renderer._ensureLiveColorsInOrder();
@@ -530,8 +547,8 @@ test('full-detail recolor reads no error back, and a lost context refuses it bef
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
     buffers: {
-      colors: { id: 'full-detail-colors' },
-      positions: { id: 'full-detail-positions' },
+      colors: pointStoreOver(gl, { id: 'full-detail-colors' }, 2, 4),
+      positions: pointStoreOver(gl, { id: 'full-detail-positions' }, 2, 12),
     },
     pointCount: 2,
     _liveOrder: null,
@@ -684,7 +701,7 @@ test('a draw order adopted after a recolor gathers the latest renderer color gen
     Array.from(stores.get(colorBuffer)),
     [60, 61, 62, 63, 50, 51, 52, 53],
   );
-  assert.strictEqual(renderer._liveColorOrder, drawOrder);
+  assert.strictEqual(renderer._liveColorOrder, record);
   assert.equal(renderer._colorsDirty, false);
 });
 

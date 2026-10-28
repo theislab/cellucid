@@ -31,6 +31,7 @@ import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { createSlicedYield } from '../../shared/concurrency-utils.js';
 import { CancellableJob, isCancellation } from '../../../jobs/cancellable-job.js';
+import { runProgressively } from '../../shared/progressive-cells.js';
 
 /**
  * Finite values from which Quick's quartiles and median are selected by an
@@ -541,48 +542,77 @@ export class QuickInsights extends BaseAnalysisUI {
     const signal = job.signal;
 
     this._renderLoading(job);
+    const openCells = this.dataLayer.state?.pointCount ?? 0;
+    // The first pass on screen, if any (`runProgressively`).
+    const progress = { shown: null };
+    const isCurrent = () => requestId === this._currentRequestId && job.running;
 
     try {
-      const insights = await this._computeInsights(filteredPageIds, signal);
+      // A first pass on a uniform sample of the open cells, when it answers
+      // sooner by enough to be worth its cost (measured on this device), as
+      // every analysis takes one (`shared/progressive-cells.js`).
+      const insights = await runProgressively({
+        kind: 'Quick insights',
+        dataLayer: this.dataLayer,
+        job,
+        isCurrent,
+        progress,
+        pass: sample => this._computeInsights(filteredPageIds, signal, sample),
+        onFirstPass: async (first, sample) => {
+          if (!this._showInsights(first, filteredPageIds)) return false;
+          this._showCellsUsed(sample, openCells, 'refining');
+          return true;
+        },
+      });
 
       // Check if this request is still current (prevents stale renders)
-      if (requestId !== this._currentRequestId || !job.running) {
+      if (insights === null || !isCurrent()) {
         debug('QuickInsights', 'Discarding stale result for request', requestId);
+        if (progress.shown !== null && requestId === this._currentRequestId) this._showCellsUsed(progress.shown, openCells, 'stopped');
         return;
       }
       job.succeed();
       if (this._job === job) this._job = null;
-
-      // Final validation before render - ensure pages still exist
-      const currentPages = this.dataLayer.getPages();
-      const currentPageIds = new Set(currentPages.map(p => p.id));
-      const stillValidPages = insights.pages?.filter(p => currentPageIds.has(p.id)) || [];
-
-      if (stillValidPages.length === 0 && filteredPageIds.length > 0) {
-        // Pages were removed during computation
-        debug('QuickInsights', 'Pages removed during computation, re-rendering empty');
-        this._renderEmpty();
-        return;
+      if (this._showInsights(insights, filteredPageIds) && progress.shown !== null) {
+        this._showCellsUsed(null, openCells, null, true);
       }
-
-      // Update insights with only valid pages
-      insights.pages = stillValidPages;
-      insights.totalCells = stillValidPages.reduce((sum, p) => sum + (p.cellCount || 0), 0);
-
-      this._renderInsights(insights);
     } catch (err) {
       // Only show error if this is still the current request
       if (requestId !== this._currentRequestId) return;
       if (this._job === job) this._job = null;
       if (isCancellation(err)) {
-        // Cancelled, never a failure.
+        // Cancelled, never a failure; a first pass shown stays, said to be one.
         job.cancel();
+        if (progress.shown !== null) this._showCellsUsed(progress.shown, openCells, 'stopped');
         return;
       }
       console.error('[QuickInsights] Failed to compute insights:', err);
       job.fail(err);
       this._renderJobOutcome(job);
     }
+  }
+
+  /**
+   * Draw `insights` for the pages still there (a page removed while they
+   * were computed leaves them), with the line saying which cells they used.
+   * @returns {boolean} Whether insights were drawn
+   * @private
+   */
+  _showInsights(insights, requestedPageIds) {
+    const currentPageIds = new Set(this.dataLayer.getPages().map(p => p.id));
+    const stillValidPages = insights.pages?.filter(p => currentPageIds.has(p.id)) || [];
+    if (stillValidPages.length === 0 && requestedPageIds.length > 0) {
+      // Pages were removed during computation
+      debug('QuickInsights', 'Pages removed during computation, re-rendering empty');
+      this._renderEmpty();
+      return false;
+    }
+    insights.pages = stillValidPages;
+    insights.totalCells = stillValidPages.reduce((sum, p) => sum + (p.cellCount || 0), 0);
+    this._renderInsights(insights);
+    this._showCellsUsed(null);
+    this._contentContainer?.append(this._getCellsUsedLine().root);
+    return true;
   }
 
   /**
@@ -643,7 +673,7 @@ export class QuickInsights extends BaseAnalysisUI {
    * @param {string[]} pageIds - Page IDs to analyze
    * @param {AbortSignal} [signal] - Abort signal for cancellation
    */
-  async _computeInsights(pageIds, signal) {
+  async _computeInsights(pageIds, signal, sample = null) {
     const insights = {
       pages: [],
       totalCells: 0,
@@ -673,7 +703,9 @@ export class QuickInsights extends BaseAnalysisUI {
         throw new Error(`Quick Insights page not found: ${pageId}`);
       }
 
-      const cellCount = this.dataLayer.getCellCountForPageId(pageId);
+      // A first pass reads each page's cells in the sample
+      // (`createCellSample`), under the page's sample id.
+      const cellCount = this.dataLayer.getCellCountForPageId(sample === null ? pageId : sample.pageId(pageId));
       if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
         throw new TypeError(
           `Quick Insights page "${pageId}" cell count must be a non-negative safe integer`
@@ -751,8 +783,9 @@ export class QuickInsights extends BaseAnalysisUI {
     }
 
     this._job?.step(`Reading ${obsFields.length} observation ${countNoun(obsFields.length, 'field')}`);
+    const queryPageIds = sample === null ? validPageIds : sample.pageIds(validPageIds);
     const bulkData = await this.dataLayer.fetchBulkObsFields({
-      pageIds: validPageIds,
+      pageIds: queryPageIds,
       obsFields,
       subsetPages: false,
       signal
@@ -787,7 +820,7 @@ export class QuickInsights extends BaseAnalysisUI {
         );
       }
       const fieldData = bulkData.fields[fieldKey];
-      const summary = await this._summarizeCategoricalAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
+      const summary = await this._summarizeCategoricalAcrossPages(fieldKey, fieldData, queryPageIds, bulkData.pageData, signal);
       if (summary) insights.categoricalSummaries.push(summary);
     }
 
@@ -798,7 +831,7 @@ export class QuickInsights extends BaseAnalysisUI {
         );
       }
       const fieldData = bulkData.fields[fieldKey];
-      const summary = await this._summarizeContinuousAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
+      const summary = await this._summarizeContinuousAcrossPages(fieldKey, fieldData, queryPageIds, bulkData.pageData, signal);
       if (summary) insights.continuousSummaries.push(summary);
     }
 

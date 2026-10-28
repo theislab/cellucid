@@ -80,6 +80,32 @@ export function collectDOMReferences(root) {
       dataLinkConnectionTarget: byId('data-link-connection-target'),
     },
 
+    subsample: {
+      root: byId('subsample-block'),
+      slider: byId('subsample-slider'),
+      percent: byId('subsample-percent'),
+      count: byId('subsample-count'),
+      settings: byId('subsample-settings'),
+      method: byId('subsample-method'),
+      seed: byId('subsample-seed'),
+      fieldRow: byId('subsample-field-row'),
+      field: byId('subsample-field'),
+      balanced: byId('subsample-balanced'),
+      embeddingRow: byId('subsample-embedding-row'),
+      embedding: byId('subsample-embedding'),
+      actions: byId('subsample-actions'),
+      apply: byId('subsample-apply'),
+      notice: byId('subsample-notice'),
+      openAll: byId('subsample-open-all'),
+      copyLink: byId('subsample-copy-link'),
+    },
+
+    keptStores: {
+      root: byId('kept-stores-line'),
+      text: byId('kept-stores-text'),
+      clear: byId('kept-stores-clear-btn'),
+    },
+
     session: {
       saveBtn: byId('save-state-btn'),
       loadBtn: byId('load-state-btn'),
@@ -130,6 +156,17 @@ export function collectDOMReferences(root) {
     filter: {
       countEl: byId('filter-count'),
       activeFiltersEl: byId('active-filters'),
+    },
+
+    // The exports of the highlighted cells and of the selected fields
+    // (ui/modules/cell-exports-ui.js).
+    cellExports: {
+      highlightsCsvButton: byId('export-highlights-csv'),
+      highlightsH5adButton: byId('export-highlights-h5ad'),
+      categoricalExportButton: byId('export-categorical-field'),
+      continuousExportButton: byId('export-continuous-field'),
+      categoricalSelect: byId('categorical-field'),
+      continuousSelect: byId('continuous-field'),
     },
 
     // The Highlighting panel and the selection bar over the plot (#select-bar)

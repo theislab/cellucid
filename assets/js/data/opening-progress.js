@@ -64,8 +64,9 @@ export function describeOpeningRead(activity) {
     case 'open':
       return "Reading the file's structure";
     case 'transcode':
-      // A single-stream file read once from the start (`anndata/transcode/`).
-      return `Reading ${activity.label} once into this browser's storage`;
+      // A single-stream file read once from the start (`anndata/transcode/`);
+      // the opening's note says why and what becomes of it.
+      return `Reading ${activity.label} whole, once`;
     case 'embedding': {
       const key = /obsm\['([^']+)'\]/.exec(activity.label)?.[1] ?? null;
       return key === null ? 'Reading the embedding' : `Reading embedding ${key}`;
@@ -96,6 +97,10 @@ export function openingCancelledError(title) {
  *   ended with nothing to say (superseded by a newer choice)
  * @property {string} step - What is happening now (`Reading embedding X_umap`)
  * @property {string|null} detail - How far: bytes, rate, time left; or why a request is made again
+ * @property {string|null} note - How the opening reads its data, when the
+ *   person should know it up front (a file that cannot be read in parts:
+ *   how much is read whole, that it is kept for next time, what is read in
+ *   parts instead), or null
  * @property {boolean} retrying - Whether a request is being made again
  * @property {number|null} percent - 0–100 when known
  * @property {number} bytes - Bytes the opening's reads fetched
@@ -142,6 +147,12 @@ class Opening {
     this.firstByteAt = null;
     /** @type {string|null} Why a request is being made again */
     this.retrying = null;
+    /**
+     * @type {string|null} What the person should know of how this opening
+     * reads its data, said up front and kept while it runs (a file that
+     * cannot be read in parts: `whole-read-notice.js`)
+     */
+    this.note = null;
     /** @type {{bytes: number, total: number|null}|null} A whole-file read under way (a host that serves no ranges) */
     this.wholeFileRead = null;
     /** Transfers log keys that were active before the opening began. */
@@ -285,6 +296,7 @@ export class OpeningProgress {
    *   joined: boolean,
    *   step: (text: string) => void,
    *   rename: (title: string) => void,
+   *   notice: (text: string|null) => void,
    *   onCancel: (cancel: () => void) => () => void,
    *   readonly cancelled: boolean,
    *   end: (message?: string) => void,
@@ -335,6 +347,7 @@ export class OpeningProgress {
         holder.title = text.trim();
         this._publish();
       },
+      notice: text => this._notice(opening, text),
       onCancel: cancel => this._addCancel(opening, cancel),
       // The file holds several objects (an `.rda` of several Seurat
       // objects): the opening waits for the person to pick one, shown with
@@ -416,6 +429,38 @@ export class OpeningProgress {
     return this.active && activity?.background !== true && OPENING_READ_KINDS.has(activity?.kind);
   }
 
+  /**
+   * Say how the opening under way reads its data (`OpeningSnapshot.note`),
+   * from a layer that holds no handle of it (the reader, told by its
+   * worker); nothing without one. `null` clears it.
+   *
+   * @param {string|null} text
+   */
+  notice(text) {
+    if (this.active) this._notice(this._current, text);
+  }
+
+  /**
+   * Say the step of the opening under way, from a layer that holds no
+   * handle of it (a dataset catalog downloading a file whole); nothing
+   * without one.
+   *
+   * @param {string} text
+   */
+  step(text) {
+    const opening = this._current;
+    if (!this.active || typeof text !== 'string' || text === '' || opening.step === text) return;
+    opening.step = text;
+    this._publish();
+  }
+
+  _notice(opening, text) {
+    if (opening.state !== 'running' || (text !== null && (typeof text !== 'string' || text === ''))) return;
+    if (opening.note === text) return;
+    opening.note = text;
+    this._publish();
+  }
+
   /** Cancel the opening under way: every layer's part stops. */
   cancel() {
     const opening = this._current;
@@ -487,6 +532,7 @@ export class OpeningProgress {
       state: opening.state,
       step: retrying ? 'Retrying' : step,
       detail: retrying ? opening.retrying : stalled ?? parts.join(' · '),
+      note: opening.note,
       stalled,
       retrying,
       percent,
@@ -722,6 +768,21 @@ export function getOpeningProgress() {
   return progress;
 }
 
+/** The handle of work not shown on the opening progress (`stoppableOpening`, `quiet`). */
+const QUIET_OPENING = Object.freeze({
+  id: null,
+  joined: false,
+  step() {},
+  rename() {},
+  notice() {},
+  onCancel: () => () => {},
+  choose: () => Promise.reject(new Error('Work not shown on the opening progress cannot ask the person.')),
+  cancelled: false,
+  end() {},
+  fail() {},
+  dismiss() {},
+});
+
 /**
  * Begin opening `title` on the page's opening progress, or join the one
  * under way (`OpeningProgress.begin`).
@@ -738,12 +799,15 @@ export function beginOpening(options) {
  * ends the layer's work at once (a file loader closes its reader, which ends
  * its worker and every request it had open); the layer then rejects with
  * `outcome(error)`: why it was stopped, not the error stopping it caused.
+ * `quiet`: work on an opening already shown (a progressive opening growing
+ * in place, `app/open-cells-resize.js`, which says its own progress), not
+ * shown on the opening progress; only `signal` stops it.
  *
- * @param {{title: string, step?: string, signal?: AbortSignal|null, stop: () => void}} options
+ * @param {{title: string, step?: string, signal?: AbortSignal|null, stop: () => void, quiet?: boolean}} options
  */
-export function stoppableOpening({ title, step, signal = null, stop }) {
+export function stoppableOpening({ title, step, signal = null, stop, quiet = false }) {
   if (typeof stop !== 'function') throw new TypeError('A stoppable opening needs stop().');
-  const handle = beginOpening({ title, ...(step === undefined ? {} : { step }) });
+  const handle = quiet ? QUIET_OPENING : beginOpening({ title, ...(step === undefined ? {} : { step }) });
   let reason = null;
   const halt = why => {
     if (reason !== null) return;

@@ -14,7 +14,10 @@
 
 import { getNotificationCenter } from '../../../notification-center.js';
 import { getReadActivityLog } from '../../../../data/read-activity-log.js';
+import { describeGeneReadPlan } from '../../../../data/gene-read-plan.js';
+import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { abortReasonOf as abortReason, awaitWithSignal } from '../../../jobs/cancellable-job.js';
+import { cellsSteady, trackCellWork } from '../../../../data/open-cells-work.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { adoptScientificFieldDescriptors } from './descriptor-ownership.js';
@@ -44,6 +47,20 @@ export function createDatasetFieldLoadSupersededError() {
 
 export function isDatasetFieldLoadSupersededError(error) {
   return error?.code === DATASET_FIELD_LOAD_SUPERSEDED_CODE;
+}
+
+const FIELD_LOAD_CANCELLED_CODE = 'CELLUCID_FIELD_LOAD_CANCELLED';
+
+/** The person cancelled loading a field (its notification's Cancel). */
+export function createFieldLoadCancelledError(key) {
+  const error = new Error(`Loading "${key}" was cancelled.`);
+  error.name = 'AbortError';
+  error.code = FIELD_LOAD_CANCELLED_CODE;
+  return error;
+}
+
+export function isFieldLoadCancelledError(error) {
+  return error?.code === FIELD_LOAD_CANCELLED_CODE;
 }
 
 /** @type {WeakMap<object, {generation: number, scheduler: FetchScheduler}>} */
@@ -114,6 +131,8 @@ function createSharedLoadOwner() {
     settled: false,
     task: null,
     waiters: new Set(),
+    // Who hears a gene on more cells as they are read (`onPartial`).
+    partials: new Set(),
     readKey: `field-load-${nextSharedLoadKey++}`
   };
 }
@@ -308,9 +327,24 @@ export class FieldLoadingMethods {
     } = options;
     const signal = requireAbortSignal(rawSignal);
     if (signal?.aborted) throw abortReason(signal);
+    // The open cells being changed in place: loaded on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await awaitWithSignal(steady, signal);
     const field = this.obsData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Obs field ${fieldIndex} is not available.`);
     const cacheKey = field._originalKey || field.key || String(fieldIndex);
+
+    // A field that holds its own values (a pushed column) has nothing to
+    // read: its values come with it, or with its session chunk.
+    if (
+      field.loaded !== true &&
+      field._isUserDefined === true &&
+      field.kind === FieldKind.CONTINUOUS &&
+      field._sourceField === null
+    ) {
+      throw new Error(`The values of "${field.key}" were not restored with the session.`);
+    }
 
     // User-defined continuous aliases are materialized by copying from their source field.
     if (
@@ -412,6 +446,7 @@ export class FieldLoadingMethods {
     const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
 
     const sharedOwner = createSharedLoadOwner();
+    if (typeof onPartial === 'function') sharedOwner.partials.add(onPartial);
     const sharedSignal = sharedOwner.controller.signal;
     let task;
     task = Promise.resolve()
@@ -507,7 +542,7 @@ export class FieldLoadingMethods {
     sharedOwner.task = task;
     sharedLoadOwners.set(field, sharedOwner);
     observeSharedLoad(field, sharedOwner);
-    field._loadingPromise = task;
+    field._loadingPromise = trackCellWork(task);
     field._loadingSignal = sharedSignal;
     return subscribeToSharedLoad(sharedOwner, signal);
   }
@@ -526,6 +561,11 @@ export class FieldLoadingMethods {
    *   load it starts is read for, whose notification shows it; a job joining
    *   a load already under way adopts its reads
    *   (`data/read-activity-log.js`, `adopt`)
+   * @param {((values: Float32Array, cells: number) => void)|null} [options.onPartial=null] -
+   *   While the gene index of a matrix indexed in segments is built (a
+   *   subsample's: `anndata/prefix-column-index.js`), the gene on the first
+   *   `cells` open cells (a sample of them) and NaN on the rest, each time it
+   *   has more; the field itself loads only whole (`showPartialVarField`)
    * @returns {Promise<Object>} The loaded field object
    */
   async ensureVarFieldLoaded(fieldIndex, options = {}) {
@@ -533,11 +573,14 @@ export class FieldLoadingMethods {
       signal: rawSignal = null,
       silent = false,
       priority = 'normal',
-      owner: readOwner = null
+      owner: readOwner = null,
+      onPartial = null
     } = options;
     requirePriority(priority);
     const signal = requireAbortSignal(rawSignal);
     if (signal?.aborted) throw abortReason(signal);
+    const steady = cellsSteady();
+    if (steady !== null) await awaitWithSignal(steady, signal);
     const field = this.varData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
     const cacheKey = field._originalKey || field.key || String(fieldIndex);
@@ -603,6 +646,7 @@ export class FieldLoadingMethods {
         // A job joining a load a view started takes its reads as its own:
         // one notification for the run, the job's.
         if (readOwner !== null) getReadActivityLog().adopt(activeOwner.readKey, readOwner);
+        if (typeof onPartial === 'function') activeOwner.partials.add(onPartial);
         return subscribeToSharedLoad(activeOwner, signal);
       }
       if (activeOwner?.task !== field._loadingPromise) {
@@ -634,12 +678,30 @@ export class FieldLoadingMethods {
       source: FieldSource.VAR
     });
 
-    // Show loading notification for gene expression (unless silent mode for batch operations)
-    const notifications = getNotificationCenter();
-    const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
-
     const sharedOwner = createSharedLoadOwner();
     const sharedSignal = sharedOwner.controller.signal;
+    // Show loading notification for gene expression (unless silent mode for
+    // batch operations), with Cancel: a gene of a matrix stored cell by cell
+    // may read the whole matrix, and the person who waits decides.
+    const notifications = getNotificationCenter();
+    const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, {
+      category: 'data',
+      onCancel: () => sharedOwner.controller.abort(createFieldLoadCancelledError(field.key))
+    });
+    // What the read costs is said before it runs, when it is the whole matrix.
+    if (notifId !== null && typeof loader.readPlan === 'function') {
+      Promise.resolve()
+        .then(() => loader.readPlan(loaderField))
+        .then((plan) => {
+          const cost = describeGeneReadPlan(plan);
+          if (cost === null || sharedOwner.settled || !notifications.hasNotification(notifId)) return;
+          notifications.loading(`Loading gene: ${field.key}. ${cost}`, { id: notifId, category: 'data' });
+        })
+        .catch((error) => {
+          // The read itself reports what failed; the plan only describes it.
+          console.warn(`Could not tell what loading gene "${field.key}" costs:`, error);
+        });
+    }
     let task;
     task = Promise.resolve()
       .then(() => {
@@ -656,7 +718,19 @@ export class FieldLoadingMethods {
               signal: downloadSignal,
               priority: startPriority,
               owner: readOwner,
-              key: sharedOwner.readKey
+              key: sharedOwner.readKey,
+              // The gene on more cells as they are read: said on its
+              // notification, and handed to whoever asked to see it.
+              onPartial: (values, cells) => {
+                if (sharedOwner.settled || sharedSignal.aborted || values.length !== owner.pointCount) return;
+                if (notifId !== null && notifications.hasNotification(notifId)) {
+                  notifications.loading(
+                    `Loading gene: ${field.key}. Shown on ${formatCount(cells)} of ${formatCountOf(owner.pointCount, 'cell')} so far (a sample of them); the others show as missing until read.`,
+                    { id: notifId, category: 'data' }
+                  );
+                }
+                for (const listener of sharedOwner.partials) listener(values, cells);
+              }
             })
           }),
           sharedSignal
@@ -691,8 +765,15 @@ export class FieldLoadingMethods {
           field._loadingPromise = null;
           field._loadingSignal = null;
         }
-        if (notifId) {
-          if (
+        // Cancelled by the person: every waiter learns it was, whatever the
+        // read stopped with.
+        const cancelled = sharedSignal.aborted && isFieldLoadCancelledError(sharedSignal.reason)
+          ? sharedSignal.reason
+          : null;
+        if (notifId && notifications.hasNotification(notifId)) {
+          if (cancelled !== null || isFieldLoadCancelledError(err)) {
+            notifications.complete(notifId, `Stopped loading gene: ${field.key}`);
+          } else if (
             sharedSignal.aborted
             || isDatasetFieldLoadSupersededError(err)
           ) {
@@ -700,17 +781,17 @@ export class FieldLoadingMethods {
           } else {
             notifications.fail(
               notifId,
-              `Failed to load gene: ${field.key}`
+              `Failed to load gene: ${field.key}: ${err?.message ?? String(err)}`
             );
           }
         }
-        throw err;
+        throw cancelled ?? err;
       });
 
     sharedOwner.task = task;
     sharedLoadOwners.set(field, sharedOwner);
     observeSharedLoad(field, sharedOwner);
-    field._loadingPromise = task;
+    field._loadingPromise = trackCellWork(task);
     field._loadingSignal = sharedSignal;
     return subscribeToSharedLoad(sharedOwner, signal);
   }
@@ -1140,6 +1221,36 @@ export class FieldLoadingMethods {
       pointCount: this.pointCount,
       centroidInfo: ''
     };
+  }
+
+  /**
+   * Colour the view by a gene's values on the cells read so far, while its
+   * gene index is built (`ensureVarFieldLoaded`'s `onPartial`): the cells
+   * not read yet are NaN and show as missing. Only the colours change -- the
+   * gene is not loaded, so nothing else (filters, analysis, sessions) ever
+   * sees partial values -- and once it is loaded whole, showing it
+   * (`setActiveVarField`) writes every colour again.
+   *
+   * @param {number} fieldIndex
+   * @param {Float32Array} values - One per open cell
+   * @returns {boolean} Whether the colours were written
+   */
+  showPartialVarField(fieldIndex, values) {
+    const field = this.varData?.fields?.[fieldIndex];
+    if (!field || field.loaded === true || !(values instanceof Float32Array) || values.length !== this.pointCount) return false;
+    this.updateColorsContinuous({ ...field, values });
+    this._pushColorsToViewer();
+    return true;
+  }
+
+  /**
+   * Write the colours of the field shown again: a gene's partial colours
+   * (`showPartialVarField`) were drawn and its load stopped or failed.
+   */
+  restoreActiveFieldColors() {
+    if (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0) return this.setActiveVarField(this.activeVarFieldIndex);
+    if (this.activeFieldSource === 'obs' && this.activeFieldIndex >= 0) return this.setActiveField(this.activeFieldIndex);
+    return this.clearActiveField();
   }
 
   getContinuousFieldRef(fieldIndex) {

@@ -200,6 +200,9 @@ function makeViewer({
     setAdaptiveLOD(value) {
       calls.push(['setAdaptiveLOD', value]);
     },
+    getLODLevelCount() {
+      return 18;
+    },
     setForceLOD(value) {
       calls.push(['setForceLOD', value]);
     },

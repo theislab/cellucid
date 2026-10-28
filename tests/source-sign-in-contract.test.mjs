@@ -357,7 +357,8 @@ test('Google: not configured, or on an origin Google does not know, says so befo
   assert.equal(empty.whyNoSignIn(), 'Signing in to Google is not configured on this site yet.');
   const at = (origin, top = null) => createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ origin, top }).win });
   // The registered origins: a public file and a sign-in both work, in a tab
-  // or in a notebook on port 8765.
+  // or framed in a notebook widget (the app from www.cellucid.com, or a copy
+  // on port 8765).
   for (const google of [at('https://www.cellucid.com'), at('http://localhost:8765'), at('http://127.0.0.1:8765', 'http://localhost:8888')]) {
     assert.equal(google.whyNoPublicAccess(), null);
     assert.equal(google.whyNoSignIn(), null);
@@ -369,8 +370,8 @@ test('Google: not configured, or on an origin Google does not know, says so befo
       'Google Drive works on a local cellucid serve only on its default port, 8765 (this page is http://127.0.0.1:9000). ' +
       'Start it without --port, or open www.cellucid.com.'],
     [at('http://127.0.0.1:53124', 'http://localhost:8888'),
-      'Google Drive works in a notebook viewer only on port 8765 (this one is http://127.0.0.1:53124). ' +
-      'Another server held 8765 when it started: stop that one and show the data again, or open www.cellucid.com.'],
+      'Google Drive works in a notebook viewer that loads the app from www.cellucid.com (the default web_source_url), ' +
+      'or from a copy served at port 8765; this one loads it from http://127.0.0.1:53124.'],
     [at('http://192.168.1.20:8765'), 'Google Drive works on www.cellucid.com, not on http://192.168.1.20:8765.'],
     [at('https://hub.example.org', 'https://hub.example.org'), 'Google Drive works on www.cellucid.com, not on https://hub.example.org.'],
   ]);

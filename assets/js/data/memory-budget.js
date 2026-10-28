@@ -73,8 +73,14 @@ export const RESIDENCY_SHARES = Object.freeze({
   adapterCache: 1 / 16,
   /** A latent space the reader worker holds for outlier quantiles. */
   latentHold: 1 / 16,
-  /** Decoded dense chunk blocks shared by the genes of one chunk strip. */
-  decodedBlocks: 1 / 16,
+  /**
+   * Decoded chunks of the open store, every cache of them together (`formats/io/decoded-budget.js`):
+   * the store's own (dense strips shared by their genes, chunks read in part) and the whole chunks a
+   * subsample is read through (`anndata/decoded-chunks.js`).
+   */
+  decodedBlocks: 1 / 32,
+  /** Bytes of remote files the page keeps for its reader workers, whichever worker fetched them (`byte-range-cache.js`). */
+  fetchedRanges: 1 / 32,
   /** Decode workers while they decompress chunks (`formats/io/decode-pool.js`). */
   decodeWorkers: 1 / 32,
   /** Earlier selection steps a highlight tool can undo to (every tool together). */

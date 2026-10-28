@@ -26,6 +26,7 @@ import { getNotificationCenter } from '../app/notification-center.js';
 import {
   configureStraightAlphaBlending,
   deleteGlObject,
+  isGlObjectAlive,
   drawPointsInSegments,
   restorableTexture,
 } from './gl-utils.js';
@@ -46,7 +47,10 @@ import {
 } from './high-perf/calculation-notifications.js';
 import {
   CONTEXT_LOST_ERROR_NAME,
+  cancelDeferredWebGLErrorChecks,
   contextLostError,
+  deferWebGLErrorCheck,
+  isContextLostError,
   requireCleanWebGLState,
   requireLiveContext,
 } from './gl-errors.js';
@@ -56,23 +60,29 @@ import {
   settlePointDraw,
 } from './high-perf/gl-point-draw-state.js';
 import { SpatialIndex } from './high-perf/spatial-index.js';
-import {
-  alphaEncodingWords,
-  encodeAlphaSpan,
-  firstNonBinaryByte,
-} from './alpha-visibility.js';
+import { StoreOrder } from './high-perf/store-order.js';
+import { RankLevels } from './high-perf/lod-levels.js';
+import { bandStartAtOrBelow } from './high-perf/draw-order.js';
+import { firstNonBinaryByte } from './alpha-visibility.js';
 import { buildSpatialTreeJob, decodeSpatialTreeJobResult } from './high-perf/spatial-tree-job.js';
 import { GpuPermuter } from './high-perf/gpu-permute.js';
+import {
+  POINT_STORE_SEGMENT_POINTS,
+  PointStore,
+  SegmentedVertexArray,
+  splitRangesBySegment,
+} from './high-perf/point-store-segments.js';
 import { spatialTreeWorkerScript } from '../../workers/scripts.js';
+import { DEFAULT_CELL_PRIORITY, requireCellPriority } from '../data/cell-priority.js';
 import { startWorker } from '../workers/worker-script.js';
 import {
   allocateLinearTexture,
   planLinearTextureFor,
   setLinearLayoutUniform,
+  writeLinearTextureItems,
   writeLinearTextureRows,
 } from './linear-texture.js';
 import {
-  bindPositionAttribute,
   positionByteLength,
   readPositionBounds,
   requirePositionArray,
@@ -215,8 +225,9 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  *
  * A store in source order is the published Float32 position array
  * (`dimension` components a point, never padded to three) and the published
- * RGBA8 colour array, each handed to `bufferData` / `bufferSubData` as-is, so
- * the renderer never holds a client-side copy of either. A store in a tree's
+ * RGBA8 colour array, each handed to `bufferData` / `bufferSubData` as-is (a
+ * range of it a store segment), so the renderer never holds a client-side
+ * copy of either. A store in a tree's
  * draw order -- slot `k` holds point `indices[k]` -- is gathered on the GPU
  * (`GpuPermuter`), so no client allocation proportional to the point count
  * exists for it either.
@@ -231,16 +242,23 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  *
  * WebGL's per-buffer caps are byte caps. They were measured on all three
  * engines by bisecting to the exact refusing byte count -- Chromium 2^31 - 2^21,
- * WebKit 2^32 - 1, Firefox 2^31 - 1 -- and the largest store is the position
- * stream, 12 bytes a point for a 3-D embedding: 178,782,208 points on
- * Chromium, 178,956,970 on Firefox, 357,913,941 on WebKit. Per-point textures
- * (alpha, permutation, the permute source) are linear textures
- * (`linear-texture.js`): layers of `MAX_TEXTURE_SIZE` rows, so they bind no
- * lower than the position stream on any engine, including those that report
- * an 8192 texture size (Firefox). Every point draw is split into calls of at
- * most 2^24 vertices (`drawPointsInSegments`), under Firefox's 30,000,000
- * vertices a call. Those are engine and API caps; the host's own memory is a
- * separate and much lower practical bound.
+ * WebKit 2^32 - 1, Firefox 2^31 - 1 -- so one buffer of 3-D positions (12
+ * bytes a point) would stop at 178,782,208 points on Chromium. Every
+ * per-point vertex store is therefore segmented (`PointStore`,
+ * `high-perf/point-store-segments.js`): consecutive runs of at most 2^24
+ * slots, one buffer each (192 MiB of 3-D positions), drawn through one VAO a
+ * segment (`SegmentedVertexArray`) with one draw a segment in slot order, the
+ * point shader adding the segment's first slot (`u_slotBase`) to
+ * `gl_VertexID`. So no buffer cap binds at any count, a refused allocation is
+ * one segment, and a store of up to 16,777,216 points is one buffer exactly
+ * as before. Per-point textures (alpha, permutation, the permute source) are
+ * linear textures (`linear-texture.js`): layers of `MAX_TEXTURE_SIZE` rows,
+ * addressed by signed 32-bit shader integers, so they hold up to 2^31 - 1
+ * items on any engine, including those that report an 8192 texture size
+ * (Firefox). Every point draw is split into calls of at most 2^24 vertices
+ * (`drawPointsInSegments`), under Firefox's 30,000,000 vertices a call. Those
+ * are engine and API caps; the host's own memory is a separate and much lower
+ * practical bound.
  */
 /**
  * Most draw ranges one frustum-culled draw issues where each range is its
@@ -251,6 +269,25 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  * engines, against 21-31 ms for the per-point index path they replace.
  */
 const MAX_CULLED_DRAW_RANGES = 256;
+
+/**
+ * Points a frame puts in a tree's draw order, across every store, while a
+ * store takes the order band by band (see "STORE ORDERS"): the frames meanwhile
+ * keep drawing every level of detail. At least one band moves a frame (a band
+ * holds at most `DRAW_BAND_POINTS`, the same count). Measured with 8M 3D cells
+ * (Apple M1 Pro): 8M in one frame held the main thread 29 ms (Chromium), 54 ms
+ * (Firefox) and 104 ms (WebKit), mostly writing the slot map's texels; at
+ * this count a frame of the adoption takes a median 12.5 / 3 / 23 ms (the
+ * first, which allocates the map and the source, up to 22 / 40 / 65 ms).
+ */
+const STORE_ORDER_POINTS_PER_FRAME = 2 ** 21;
+
+/**
+ * What a colour store holds after its store's order was given up mid-way
+ * (`_storeOrderWriteFailed`): no order at all, so it is written again when
+ * next drawn.
+ */
+const STALE_STORE_ORDER = Object.freeze({ stale: true });
 /**
  * The range budget where one `multiDrawArraysWEBGL` call draws them all: a
  * range costs about 0.2 us there, so a finer cut draws fewer hidden points.
@@ -276,7 +313,9 @@ const LIVE_STORE = Object.freeze({ kind: 'live' });
  * 20 MiB without it, so the build *retains* 27.9 B a point plus 4 MiB. The
  * transient term is the scratch that is live simultaneously during the build
  * and enumerable from the code: three `Uint32Array(pointCount)` in the
- * hierarchical ordering pass (12 B), the leaves and the geometric child chain
+ * ordering pass at calibration time (12 B; the priority order that replaced it,
+ * `data/cell-priority.js`, holds at most 8 B for a dataset opened whole and 16 B
+ * for a `blocks` subsample), the leaves and the geometric child chain
  * `_buildNode` holds (~8.6 B), and 16 B that at calibration time was a
  * point-count-sized packing scratch. Stores are now gathered on the GPU, so
  * that scratch no longer exists; the 16 B stays in the projection as margin
@@ -291,14 +330,28 @@ const LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT = 27.9;
 const LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT = 36.6;
 const LOD_BUILD_HEAP_FIXED_BYTES = 4 * 1024 * 1024;
 
-/** Peak JS heap a level-of-detail build adds for `pointCount` points. */
-function projectLodBuildHeapBytes(pointCount) {
-  return Math.ceil(
-    pointCount * (
-      LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT +
-      LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT
-    ) + LOD_BUILD_HEAP_FIXED_BYTES
-  );
+/**
+ * JS objects a level-of-detail build run in the tree worker adds to this
+ * thread: only the decoded tree's nodes, about one per thousand points. The
+ * rest of what comes back (the draw order, the leaves' ids) are typed arrays,
+ * whose bytes live outside the JS heap and are not what `jsHeapSizeLimit`
+ * bounds (Chromium accepted 15 GiB of `ArrayBuffer`s with a 4.1 GiB limit,
+ * plans/scale-50m-100m.md §3.1); the build's scratch is the worker's.
+ * Measured in V8 (Node 26, 3D, 1,000 points a leaf): 1.06 B a point at 2M
+ * and 1.53 B at 10M, retained after a collection; rounded up.
+ */
+const LOD_WORKER_RESULT_HEAP_BYTES_PER_POINT = 2;
+
+/**
+ * Peak JS heap a level-of-detail build adds to this thread for `pointCount`
+ * points: the whole build when it runs here, the decoded result when it runs
+ * in the tree worker.
+ */
+function projectLodBuildHeapBytes(pointCount, inWorker = false) {
+  const perPoint = inWorker
+    ? LOD_WORKER_RESULT_HEAP_BYTES_PER_POINT
+    : LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT + LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT;
+  return Math.ceil(pointCount * perPoint + LOD_BUILD_HEAP_FIXED_BYTES);
 }
 
 function describeHeapMebibytes(bytes) {
@@ -336,7 +389,7 @@ function spatialIndexHasLod(index) {
   return Array.isArray(index?.lodLevels) && index.lodLevels.length > 0;
 }
 
-function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
+function requireLodBuildHeapHeadroom(pointCount, buildLOD, label, { inWorker = false } = {}) {
   if (buildLOD !== true) return;
   if (!Number.isFinite(pointCount) || pointCount <= 0) return;
   const memory =
@@ -354,7 +407,7 @@ function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
   ) {
     return;
   }
-  const projectedBytes = projectLodBuildHeapBytes(pointCount);
+  const projectedBytes = projectLodBuildHeapBytes(pointCount, inWorker);
   if (usedBytes + projectedBytes <= limitBytes) return;
   const affordableBytes =
     limitBytes - usedBytes - LOD_BUILD_HEAP_FIXED_BYTES;
@@ -362,8 +415,9 @@ function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
     0,
     Math.floor(
       affordableBytes / (
-        LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT +
-        LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT
+        inWorker
+          ? LOD_WORKER_RESULT_HEAP_BYTES_PER_POINT
+          : LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT + LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT
       )
     )
   );
@@ -398,20 +452,143 @@ function requireWordAlignedColors(colors) {
 }
 
 /**
- * A colour store is written in a draw order only when that order places
+ * A colour store is written in a store order only when that order places
  * every point: one slot a colour.
  *
- * @param {{drawOrder: {indices: Uint32Array}}|null} order
+ * @param {StoreOrder|null} order
  * @param {Uint8Array} colors
  * @param {string} owner
  */
 function requireOrderCoversColors(order, colors, owner) {
   if (order === null) return;
-  const slots = order.drawOrder.indices.length;
+  const slots = order.pointCount;
   const count = colors.length >>> 2;
   if (slots !== count) {
     throw new RangeError(`${owner} has a draw order of ${slots} slots for ${formatCountOf(count, 'colour')}.`);
   }
+}
+
+/** Whether two word arrays hold the same words. */
+function sameWords(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Bytes of the scratch live alpha rows are encoded into before upload: the
+ * texture's image is never held on the CPU, only this many bytes of it at a
+ * time (at least one row).
+ */
+const ALPHA_ROW_SCRATCH_BYTES = 1 << 20;
+
+/** Whether any cell of `[from, to)` differs between `alphas` and `accepted` (null: every cell 1). */
+function rowMoved(alphas, accepted, from, to) {
+  if (accepted === null) {
+    for (let i = from; i < to; i++) if (alphas[i] !== 1) return true;
+    return false;
+  }
+  for (let i = from; i < to; i++) if (alphas[i] !== accepted[i]) return true;
+  return false;
+}
+
+/**
+ * Write rows `[rowStart, rowEnd)` of an R8 alpha linear texture bound to the
+ * active unit: 255 for a cell whose value is 1 (or every cell, for null
+ * `alphas`), 0 for 0, and 255 past the last cell (the image's padding, as a
+ * whole-row upload always wrote it). Rows go up a chunk at a time through
+ * `scratch`, never crossing a layer.
+ */
+function writeAlphaRows(gl, plan, alphas, pointCount, rowStart, rowEnd, scratch) {
+  const width = plan.width;
+  const chunkRows = Math.max(1, Math.floor(scratch.length / width));
+  const buffer = scratch.length >= width ? scratch : new Uint8Array(width);
+  let row = rowStart;
+  while (row < rowEnd) {
+    const layer = Math.floor(row / plan.rowsPerLayer);
+    const end = Math.min(rowEnd, row + chunkRows, (layer + 1) * plan.rowsPerLayer);
+    const first = row * width;
+    const count = (end - row) * width;
+    for (let i = 0; i < count; i++) {
+      const cell = first + i;
+      buffer[i] = cell >= pointCount || alphas === null ? 255 : alphas[cell] * 255;
+    }
+    gl.texSubImage3D(
+      gl.TEXTURE_2D_ARRAY, 0, 0, row - layer * plan.rowsPerLayer, layer, width, end - row, 1,
+      gl.RED, gl.UNSIGNED_BYTE, buffer, 0
+    );
+    row = end;
+  }
+}
+
+/**
+ * Whether a tree built under `built` priority (with levels when
+ * `buildLOD`) is stale now that the cells have `current`: its levels admit
+ * cells by the earlier priority, or the cells are now in priority order and
+ * its order is not banded by open position (built under a seed), so a store
+ * holding it could neither draw levels by rank nor take the next order band
+ * by band -- it would take this order, and the next, whole in one frame.
+ * The rule `HighPerfRenderer#setCellPriority` applies to the trees it holds.
+ *
+ * @param {{seed: number|null}} built
+ * @param {boolean} buildLOD
+ * @param {{seed: number|null}} current
+ * @returns {boolean}
+ */
+function builtUnderStalePriority(built, buildLOD, current) {
+  if (built === current) return false;
+  return buildLOD || (current.seed === null && built.seed !== null);
+}
+
+/**
+ * For each slot of `[first, end)`, the slot of the store holding the cell
+ * `indices` puts there, when the band's slots hold its own cells (ranks
+ * `[first, end)`) in another order: below `baseEnd` an earlier tree's
+ * order (`base`, the cell of each slot: a store kept in it below a cut or
+ * below the cells added, `StoreOrder#base`), from `baseEnd` on each its own
+ * cell. A gather through these slots (`GpuPermuter#writeWordsRange` from the
+ * store itself) puts the band in the new order without reading page memory.
+ *
+ * @param {Uint32Array} base - The cell of each slot below `baseEnd`, indexed by slot.
+ * @param {number} baseEnd
+ * @param {Uint32Array} indices - The new order's cell of each slot.
+ * @param {number} first
+ * @param {number} end
+ * @returns {Uint32Array} `end - first` slots, the first for slot `first`.
+ */
+export function earlierSlotsOf(base, baseEnd, indices, first, end) {
+  const count = end - first;
+  const slotOf = new Uint32Array(count);
+  for (let slot = first; slot < end; slot++) {
+    const held = slot < baseEnd ? base[slot] : slot;
+    const cell = held - first;
+    if (!(cell >= 0 && cell < count)) {
+      throw new RangeError(`Slot ${slot} of an earlier order holds cell ${held}, outside its band [${first}, ${end}).`);
+    }
+    slotOf[cell] = slot;
+  }
+  const slots = new Uint32Array(count);
+  for (let slot = first; slot < end; slot++) {
+    const cell = indices[slot] - first;
+    if (!(cell >= 0 && cell < count)) {
+      throw new RangeError(`Slot ${slot} of a draw order holds cell ${indices[slot]}, outside its band [${first}, ${end}).`);
+    }
+    slots[slot - first] = slotOf[cell];
+  }
+  return slots;
+}
+
+/**
+ * Whether two store orders are steps of one store taking one order (they
+ * share a slot map): a colour store a step behind is rewritten in place, not
+ * swapped for another.
+ *
+ * @param {StoreOrder|null} a
+ * @param {StoreOrder|null} b
+ * @returns {boolean}
+ */
+function sameStoreOrders(a, b) {
+  return a !== null && b !== null && a.map === b.map;
 }
 
 /**
@@ -475,6 +652,11 @@ export const RendererConfig = {
   // LOD settings
   LOD_MAX_POINTS_PER_NODE: 1000,
   LOD_MAX_DEPTH: 8,
+
+  // Points a segment of a per-point vertex store holds
+  // (`high-perf/point-store-segments.js`); tests set a small one to draw
+  // through several segments at sizes that fit (`setStoreSegmentPoints`).
+  STORE_SEGMENT_POINTS: POINT_STORE_SEGMENT_POINTS,
 };
 
 /**
@@ -517,8 +699,8 @@ export class HighPerfRenderer {
     this.uniformLocations = new Map();
 
     // Full-detail vertex streams: Float32 positions with the live dimension's
-    // components (attribute 0) and RGBA8 (attribute 1), one buffer each,
-    // bound into `this.vao`.
+    // components (attribute 0) and RGBA8 (attribute 1), each a segmented
+    // store (`PointStore`), bound into `this.vao` (one VAO a segment).
     this.buffers = {
       positions: null,
       colors: null,
@@ -530,13 +712,11 @@ export class HighPerfRenderer {
     this._colorGpuByteLength = 0;
 
     // Alpha texture for efficient alpha-only updates (avoids full buffer rebuild)
-    // Using a texture allows updating alpha with texSubImage2D instead of bufferData
+    // Using a texture allows updating alpha by rows (texSubImage3D) instead of bufferData
     this._alphaTexture = null;
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
     this._alphaTexPlan = null;
-    this._alphaTexData = null; // Uint8Array for texture upload
-    this._alphaTexStagingData = null;
     // Scratch for the region-addressed alpha upload: one dirty flag per texture
     // row, and the interleaved (rowStart, rowCount) pairs derived from it. Both
     // are re-derived on every publication and sized against the current
@@ -547,11 +727,11 @@ export class HighPerfRenderer {
     this._currentAlphas = null;
     this._alphaTextureByteLength = 0;
 
-    // The draw order the live position store holds (see "DRAW ORDER"):
-    // null while it holds source order, else `{ drawOrder, texture, width,
-    // height, byteLength }`, the texture mapping a stored slot back to its
-    // source index. `_liveColorOrder` is the draw order the live colour store
-    // holds; it follows `_liveOrder` at the next render.
+    // The order the live position store holds (see "STORE ORDERS"): null
+    // while it holds source order, else a `StoreOrder`
+    // (`high-perf/store-order.js`), whose texture maps a stored slot back to
+    // its source index. `_liveColorOrder` is the store order the live colour
+    // store holds; it follows `_liveOrder` at the next render.
     this._liveOrder = null;
     this._liveColorOrder = null;
     // Live colour stores kept per draw order (see "COLOUR STORES KEPT PER
@@ -575,6 +755,9 @@ export class HighPerfRenderer {
 
     // LOD system - dimension-aware spatial indexing
     this.spatialIndices = new Map();  // Per-dimension spatial indices: Map<dimensionLevel, SpatialIndex>
+    // The order LOD levels admit the published cells in
+    // (`data/cell-priority.js`, `setCellPriority`).
+    this._cellPriority = DEFAULT_CELL_PRIORITY;
     this.currentDimensionLevel = 3;  // Current active dimension level for live view
 
     // State
@@ -593,17 +776,17 @@ export class HighPerfRenderer {
     // snapshot color owner's buffer.
     // Map<snapshotId, { vao, colorOwner, alphaTexture, pointCount, ... }>
     this.snapshotBuffers = new Map();
-    // Snapshot point publications are synchronous. One renderer-wide R8
-    // staging owner therefore serves every view without retaining another N
-    // bytes per snapshot.
-    this._snapshotAlphaStagingData = null;
+    // A kept view's R8 texture holds its published transparency (`alphas`,
+    // kept by reference), so no CPU copy of any view's image is held: an
+    // update marks the rows that moved here and sends them through the
+    // bounded row scratch (`_alphaRowScratch`), as the live view does.
     this._snapshotAlphaDirtyRows = null;
     this._snapshotAlphaUploadRegions = null;
     // The views the viewer presents this frame (`setPresentedViews`); null
     // until it says, which keeps every view resident. A kept view that is not
     // presented gives up its colour store and R8 texture when an allocation
     // is refused (`_releaseDormantSnapshotStores`) and gets them back from
-    // its own colours and alpha bytes when it is next drawn or edited.
+    // its published colours and transparency when it is next drawn or edited.
     this._presentedViewIds = null;
     // The kept view a public operation is working on: never released under it.
     this._snapshotInOperation = null;
@@ -712,14 +895,9 @@ export class HighPerfRenderer {
       // Create shader programs
       this._createPrograms();
 
-      // Create VAOs
-      const candidateVao = gl.createVertexArray();
-      if (!candidateVao) {
-        throw new Error(
-          'HighPerfRenderer could not allocate its vertex array.'
-        );
-      }
-      this.vao = candidateVao;
+      // The live vertex arrays: one VAO a store segment, made when stores
+      // are bound into them.
+      this.vao = new SegmentedVertexArray(gl);
 
       // GL state
       gl.enable(gl.DEPTH_TEST);
@@ -815,6 +993,8 @@ export class HighPerfRenderer {
         cull: createCullState(),
         prevLodLevel: undefined,         // For logging LOD changes
         lastLodLevel: -1,                // For per-view LOD hysteresis
+        // The levels `lastLodLevel` is one of (`_selectDrawLevels`).
+        lodLevels: null,
         lodConverging: false,            // Adaptive LOD still stepping toward its target level
         lastDimensionLevel: undefined,   // For cache invalidation on dimension change
         // Per-view frustum planes to avoid shared state issues in multi-view rendering
@@ -858,6 +1038,7 @@ export class HighPerfRenderer {
     viewState.lastFrustumBounds = undefined;
     viewState.lastDimensionLevel = undefined;
     viewState.lastLodLevel = -1;
+    viewState.lodLevels = null;
     viewState.lodConverging = false;
     viewState.prevLodLevel = undefined;
     viewState.statsPublished = false;
@@ -1103,7 +1284,7 @@ export class HighPerfRenderer {
    * Create a dummy one-texel R32UI linear texture to bind when no permutation
    * is in use. Required because a usampler2DArray uniform must have a valid
    * unsigned integer texture bound even when the shader does not read it
-   * (u_useLodIndexTex = false).
+   * (u_orderedSlots = 0).
    * @private
    */
   _createDummyLodIndexTexture() {
@@ -1280,7 +1461,10 @@ export class HighPerfRenderer {
       // Alpha texture uniforms for efficient alpha-only updates
       'u_alphaTex', 'u_alphaLayout', 'u_useAlphaTex',
       // LOD index texture uniforms (for mapping LOD vertex to original index)
-      'u_lodIndexTex', 'u_lodIndexLayout', 'u_useLodIndexTex'
+      'u_lodIndexTex', 'u_lodIndexLayout', 'u_orderedSlots',
+      // The first slot of the store segment drawn (`gl_VertexID` counts from
+      // the segment's start)
+      'u_slotBase'
     ];
 
     for (const name of uniformNames) {
@@ -1542,13 +1726,12 @@ export class HighPerfRenderer {
       alphaTexWidth: this._alphaTexWidth,
       alphaTexHeight: this._alphaTexHeight,
       alphaTexPlan: this._alphaTexPlan,
-      alphaTexData: this._alphaTexData,
-      alphaTexStagingData: this._alphaTexStagingData,
       useAlphaTexture: this._useAlphaTexture,
       currentAlphas: this._currentAlphas,
       liveOrder: this._liveOrder,
       liveColorOrder: this._liveColorOrder,
       spatialIndices: this.spatialIndices,
+      cellPriority: this._cellPriority,
       perViewState: this._perViewState,
       currentDimensionLevel: this.currentDimensionLevel,
       liveGeometryGeneration: this._liveGeometryGeneration,
@@ -1564,13 +1747,7 @@ export class HighPerfRenderer {
   }
 
   _installCandidateDataPublication(previous) {
-    const candidateVao = this.gl.createVertexArray();
-    if (!candidateVao) {
-      throw new Error(
-        'HighPerfRenderer could not allocate the candidate data vertex array.'
-      );
-    }
-    this.vao = candidateVao;
+    this.vao = new SegmentedVertexArray(this.gl);
     this.buffers = {
       positions: null,
       colors: null,
@@ -1582,8 +1759,6 @@ export class HighPerfRenderer {
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
     this._alphaTexPlan = null;
-    this._alphaTexData = null;
-    this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
@@ -1591,6 +1766,9 @@ export class HighPerfRenderer {
     this._liveOrder = null;
     this._liveColorOrder = null;
     this.spatialIndices = new Map();
+    // A new dataset's cells: ranked under the default seed until
+    // `setCellPriority` says how they are ordered.
+    this._cellPriority = DEFAULT_CELL_PRIORITY;
     this._perViewState = new Map();
     this.currentDimensionLevel = 3;
     this._liveGeometryGeneration = 0;
@@ -1616,14 +1794,12 @@ export class HighPerfRenderer {
     this._alphaTexWidth = publication.alphaTexWidth;
     this._alphaTexHeight = publication.alphaTexHeight;
     this._alphaTexPlan = publication.alphaTexPlan ?? null;
-    this._alphaTexData = publication.alphaTexData;
-    this._alphaTexStagingData =
-      publication.alphaTexStagingData ?? null;
     this._useAlphaTexture = publication.useAlphaTexture;
     this._currentAlphas = publication.currentAlphas;
     this._liveOrder = publication.liveOrder ?? null;
     this._liveColorOrder = publication.liveColorOrder ?? null;
     this.spatialIndices = publication.spatialIndices;
+    this._cellPriority = publication.cellPriority;
     this._perViewState = publication.perViewState;
     this.currentDimensionLevel = publication.currentDimensionLevel;
     this._liveGeometryGeneration =
@@ -1683,27 +1859,23 @@ export class HighPerfRenderer {
     };
     this._preparedDataStores = prepared;
     try {
-      const positions = gl.createBuffer();
-      const colors = gl.createBuffer();
+      const positions = this._newPointStore();
+      const colors = this._newPointStore();
       prepared.buffers = { positions, colors };
-      if (!positions || !colors) {
-        throw new Error('HighPerfRenderer could not allocate the point buffers.');
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, positions);
-      prepared.positionGpuByteLength = this._allocateVertexStore(
-        positionByteLength(pointCount, exactDimension),
-        gl.STATIC_DRAW,
+      prepared.positionGpuByteLength = this._allocatePointStore(
+        positions,
+        positionByteLength(1, exactDimension),
         pointCount,
+        gl.STATIC_DRAW,
         'HighPerfRenderer point-position upload'
       );
-      gl.bindBuffer(gl.ARRAY_BUFFER, colors);
-      prepared.colorGpuByteLength = this._allocateVertexStore(
-        pointCount * 4,
-        gl.DYNAMIC_DRAW,
+      prepared.colorGpuByteLength = this._allocatePointStore(
+        colors,
+        4,
         pointCount,
+        gl.DYNAMIC_DRAW,
         'HighPerfRenderer point-color upload'
       );
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
       const texture = gl.createTexture();
       if (!texture) {
         throw new Error('HighPerfRenderer could not allocate the required alpha texture.');
@@ -1800,9 +1972,7 @@ export class HighPerfRenderer {
   _flushPendingPositionUpload() {
     if (this._positionsUploadPending !== true) return;
     const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this._positions);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    this.buffers.positions.write(this._positions);
     // Bytes written into an accepted store: only a lost context refuses them.
     requireLiveContext(gl, 'HighPerfRenderer point-position upload');
     this._positionsUploadPending = false;
@@ -2187,12 +2357,10 @@ export class HighPerfRenderer {
           this._releaseEpoch = (this._releaseEpoch ?? 0) + 1;
         } catch (error) {
           let stillAlive = true;
-          if (typeof gl[livenessMethod] === 'function') {
-            try {
-              stillAlive = gl[livenessMethod](handle);
-            } catch {
-              stillAlive = true;
-            }
+          try {
+            stillAlive = isGlObjectAlive(gl, livenessMethod, handle);
+          } catch {
+            stillAlive = true;
           }
           if (stillAlive) {
             failures.push(error);
@@ -2347,23 +2515,16 @@ export class HighPerfRenderer {
       this.gl,
       `${owner} position-buffer publication`
     );
-    const positionBuffer = this.gl.createBuffer();
-    if (!positionBuffer) {
-      throw new Error(
-        `${owner} could not allocate its shared position buffer.`
-      );
-    }
+    const positionBuffer = this._newPointStore();
     staging.positionBuffer = positionBuffer;
-    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, positionBuffer);
-    this._allocateGpu(`${owner} could not allocate its position buffer`, () => {
-      this.gl.bufferData(
-        this.gl.ARRAY_BUFFER,
-        geometry.positions,
-        this.gl.STATIC_DRAW
-      );
-    });
-    staging.positionBufferByteLength =
-      geometry.positions.byteLength;
+    staging.positionBufferByteLength = this._allocatePointStore(
+      positionBuffer,
+      positionByteLength(1, geometry.dimension),
+      geometry.positions.length / geometry.dimension,
+      this.gl.STATIC_DRAW,
+      `${owner} position store`,
+      geometry.positions
+    );
 
     // Publish only after allocation, upload, and the exact GL error fence all
     // succeed. From this point the geometry pool, rather than the staging
@@ -2638,7 +2799,7 @@ export class HighPerfRenderer {
       return 0;
     }
     const orderBytes = geometry.order?.texture ? geometry.order.byteLength : 0;
-    this._retireDrawOrderRecord(geometry.order ?? null);
+    this._retireStoreOrder(geometry.order ?? null, null);
     geometry.order = null;
     const bytes = (geometry.positionBufferByteLength ?? 0) + orderBytes;
     this._queueDataRetirement({
@@ -2873,20 +3034,9 @@ export class HighPerfRenderer {
   }
 
   /**
-   * The draw order a geometry's position store holds, or null for source
-   * order. A geometry the live view shows holds the live store's order.
-   *
-   * @param {object} geometry - A pool record.
-   * @returns {object|null}
-   * @private
-   */
-  _geometryDrawOrder(geometry) {
-    return this._geometryOrderRecord(geometry)?.drawOrder ?? null;
-  }
-
-  /**
-   * The draw-order record (order plus permutation texture) of a geometry's
-   * position store, or null for source order.
+   * The store order (`StoreOrder`) of a geometry's position store, or null
+   * for source order. A geometry the live view shows holds the live store's
+   * order.
    *
    * @param {object} geometry - A pool record.
    * @returns {object|null}
@@ -2899,7 +3049,7 @@ export class HighPerfRenderer {
     return geometry.order ?? null;
   }
 
-  _createSnapshotColorOwner(buffer, byteLength, drawOrder = null) {
+  _createSnapshotColorOwner(buffer, byteLength, order = null) {
     if (
       !buffer ||
       !Number.isSafeInteger(byteLength) ||
@@ -2914,8 +3064,8 @@ export class HighPerfRenderer {
       byteLength,
       pointCount: this.pointCount,
       refCount: 1,
-      // The draw order the colours are stored in (null: source order).
-      order: drawOrder,
+      // The store order the colours are in (null: source order).
+      order,
     };
   }
 
@@ -2997,12 +3147,10 @@ export class HighPerfRenderer {
         retirement[property] = null;
       } catch (error) {
         let stillAlive = true;
-        if (typeof this.gl[livenessMethod] === 'function') {
-          try {
-            stillAlive = this.gl[livenessMethod](handle);
-          } catch {
-            stillAlive = true;
-          }
+        try {
+          stillAlive = isGlObjectAlive(this.gl, livenessMethod, handle);
+        } catch {
+          stillAlive = true;
         }
         if (stillAlive) {
           failures.push(error);
@@ -3327,10 +3475,9 @@ export class HighPerfRenderer {
       // The R8 texture is made holding these values: one encoding and one
       // upload, and no staging generation.
       this._createAlphaTexture(this.pointCount, alphaValues, prepared);
-      if (alphaValues !== null) {
-        this._useAlphaTexture = true;
-        this._currentAlphas = alphaValues;
-      }
+      // The bytes the texture holds (null: every cell shown).
+      this._currentAlphas = alphaValues;
+      if (alphaValues !== null) this._useAlphaTexture = true;
 
       if (prepared === null) {
         requireCleanWebGLState(
@@ -3405,7 +3552,154 @@ export class HighPerfRenderer {
     // or reject the valid candidate.
     this._retireDataPublication(previousPublication);
     this._cancelStaleSpatialTreeBuilds();
+    // Bands of the replaced stores still waiting for their error check are
+    // of stores no view draws: their checks go, with their source texture.
+    if (this._permuter) {
+      cancelDeferredWebGLErrorChecks(gl, this._permuter);
+      this._permuter.releaseRangeSource();
+    }
     return this.stats;
+  }
+
+  /**
+   * The live cells, with cells added or removed in place
+   * (`app/open-cells-resize.js`): the first `min(n, n')` cells are the cells
+   * shown now, at the same positions, so their bytes on the GPU are kept.
+   *
+   * - Added cells (`n' > n`) are appended to the position and colour stores
+   *   (`PointStore#resize`, then `write` of the new slots only), in rank
+   *   order behind whatever order the stores hold (`StoreOrder#resized`).
+   * - Removed cells (`n' < n`) are cut from the end. Where the stores hold a
+   *   tree's order past the cut, the band the cut falls in is rewritten in
+   *   rank order (at most `DRAW_BAND_POINTS` slots: `bandStartAtOrBelow`), so
+   *   the first `n'` slots hold exactly the first `n'` cells; a store whose
+   *   order is not by rank (cells not opened in priority order) is rewritten
+   *   from slot 0.
+   *
+   * Nothing else is uploaded or reordered: the levels of detail of a store in
+   * rank order are the ladder's counts over `n'` at once (`RankLevels`), and
+   * the tree of the new positions is built in the worker and adopted band by
+   * band like any other (`_ensureStoreDrawOrder`). Colours are compared with
+   * the published ones over the kept cells, and re-published whole only if
+   * they differ (a colour scale over every open cell can change); the R8
+   * alpha texture (one byte a cell) is made anew for `n'`. The camera is the
+   * caller's.
+   *
+   * @param {Float32Array} positions - Every live cell, `dimensionLevel` a cell.
+   * @param {Uint8Array} colors - RGBA8, word-aligned, every live cell.
+   * @param {{dimensionLevel: number, alphaValues?: Uint8Array}} options - The
+   *   dimension shown now, and the transparency of every live cell.
+   * @returns {{appended: number, removed: number, rewritten: number, storeBytes: number, alphaBytes: number}}
+   *   What changed on the GPU: cells appended and removed, slots rewritten
+   *   at a cut, and the bytes sent to the point stores and to the alpha
+   *   texture.
+   */
+  resizeLiveCells(positions, colors, options = {}) {
+    this._assertOperational('resize the live cells');
+    const gl = this.gl;
+    if (!(positions instanceof Float32Array)) {
+      throw new TypeError('HighPerfRenderer positions must be a Float32Array.');
+    }
+    if (!(colors instanceof Uint8Array)) {
+      throw new TypeError('HighPerfRenderer colors must be an RGBA Uint8Array.');
+    }
+    requireWordAlignedColors(colors);
+    if (options === null || typeof options !== 'object' || Object.keys(options).some(key => key !== 'dimensionLevel' && key !== 'alphaValues')) {
+      throw new TypeError('HighPerfRenderer resize options accept exactly dimensionLevel and optional alphaValues.');
+    }
+    const dimension = requireDimensionLevel(options.dimensionLevel, 'HighPerfRenderer resizeLiveCells dimensionLevel');
+    if (dimension !== this.currentDimensionLevel) {
+      throw new RangeError('Cells added or removed in place keep the dimension the live view shows.');
+    }
+    if (this.snapshotBuffers.size > 0) {
+      throw new Error('Cells cannot be added or removed in place while kept views are published.');
+    }
+    const previousCount = this.pointCount;
+    const pointCount = requirePositionArray(positions, dimension, 'HighPerfRenderer positions');
+    if (previousCount === 0 || !this.buffers.positions || !this.buffers.colors) {
+      throw new Error('HighPerfRenderer resizes published cells; publish a dataset first (loadData).');
+    }
+    if (colors.length !== pointCount * 4) {
+      throw new RangeError(`HighPerfRenderer colors must contain exactly ${pointCount * 4} RGBA bytes for ${formatCountOf(pointCount, 'point')}; received ${colors.length}.`);
+    }
+    const alphaValues = Object.hasOwn(options, 'alphaValues') ? options.alphaValues : null;
+    if (alphaValues !== null) {
+      if (!(alphaValues instanceof Uint8Array) || alphaValues.length !== pointCount) {
+        throw new TypeError(`HighPerfRenderer alphaValues must be a Uint8Array with exactly ${formatCountOf(pointCount, 'entry', 'entries')}.`);
+      }
+      const index = firstNonBinaryByte(alphaValues);
+      if (index >= 0) throw new RangeError(`HighPerfRenderer alphaValues entry ${index} must be finite and in [0, 1].`);
+    }
+    planLinearTextureFor(gl, pointCount);
+    this._flushPendingPositionUpload();
+    // Geometry retained for other representations and colour stores kept
+    // for other orders hold the previous cells.
+    this._clearKeptColorStores(this._liveColorCache);
+    this.evictRetainedGeometry(Infinity);
+
+    const keep = Math.min(previousCount, pointCount);
+    const order = this._liveOrder;
+    const colorsInStep = !this._colorsDirty && this._liveColorOrder === order;
+    const keptColors = colorsInStep && sameWords(colorWordsOf(this._colors).subarray(0, keep), colorWordsOf(colors).subarray(0, keep));
+    // The slots from `rewriteFrom` on are written in rank order: the added
+    // ones, and at a cut the band it falls in.
+    let rewriteFrom = keep;
+    let nextOrder = order;
+    if (order !== null) {
+      if (pointCount < previousCount && order.orderedSlots > pointCount) {
+        rewriteFrom = order.ranked ? bandStartAtOrBelow(pointCount) : 0;
+      }
+      nextOrder = order.resized(pointCount, Math.min(order.orderedSlots, rewriteFrom));
+      // Nothing left out of source order: the slot map goes.
+      if (nextOrder.orderedSlots === 0) nextOrder = null;
+    }
+    const label = 'HighPerfRenderer live cells resized in place';
+    const allocate = (refusal, run) => this._allocateGpu(refusal, run);
+    let storeBytes = 0;
+    this._positionGpuByteLength = this.buffers.positions.resize(
+      pointCount, gl.STATIC_DRAW, allocate, `${label}: positions`
+    );
+    this._colorGpuByteLength = this.buffers.colors.resize(
+      pointCount, gl.DYNAMIC_DRAW, allocate, `${label}: colours`
+    );
+    if (rewriteFrom < pointCount) {
+      this.buffers.positions.write(positions.subarray(rewriteFrom * dimension), rewriteFrom);
+      storeBytes += (pointCount - rewriteFrom) * dimension * 4;
+      if (keptColors) {
+        this.buffers.colors.write(colors.subarray(rewriteFrom * 4), rewriteFrom);
+        storeBytes += (pointCount - rewriteFrom) * 4;
+      }
+    }
+    requireLiveContext(gl, label);
+    this.vao.setStores(this.buffers.positions, this.buffers.colors, dimension);
+    this._retireStoreOrder(order, nextOrder);
+    this._liveOrder = nextOrder;
+    this._liveColorOrder = keptColors ? nextOrder : this._liveColorOrder;
+    // Colours that changed over the kept cells go up whole at the next frame.
+    this._colorsDirty = !keptColors;
+    this.pointCount = pointCount;
+    this._positions = positions;
+    this._colors = colors;
+    this._liveGeometryGeneration = this._allocateGeometryGeneration();
+    this._boundingSphere = this._computeBoundingSphere(positions, dimension);
+    // Trees and levels of the previous positions: the new tree is built in
+    // the worker when a frame needs it.
+    this.spatialIndices = new Map();
+    this._cancelStaleSpatialTreeBuilds();
+    this._createAlphaTexture(pointCount, alphaValues);
+    // The bytes the texture holds (null: every cell shown).
+    this._currentAlphas = alphaValues;
+    if (alphaValues !== null) this._useAlphaTexture = true;
+    this._drainDataRetirements();
+    this._refreshGpuMemoryStats();
+    this.onAsyncTreeReady?.();
+    return {
+      appended: Math.max(0, pointCount - previousCount),
+      removed: Math.max(0, previousCount - pointCount),
+      rewritten: Math.max(0, Math.min(previousCount, pointCount) - rewriteFrom),
+      storeBytes,
+      alphaBytes: this._alphaTexPlan?.texels ?? 0,
+    };
   }
 
   _getOrBuildSpatialIndexForDimension(
@@ -3501,6 +3795,7 @@ export class HighPerfRenderer {
           buildLOD: needsLOD,
           prebuiltTree,
           prebuiltOrder,
+          priority: this._cellPriority,
         }
       );
 
@@ -3600,8 +3895,6 @@ export class HighPerfRenderer {
       this._alphaTexWidth = previous.alphaTexWidth;
       this._alphaTexHeight = previous.alphaTexHeight;
       this._alphaTexPlan = previous.alphaTexPlan;
-      this._alphaTexData = previous.alphaTexData;
-      this._alphaTexStagingData = previous.alphaTexStagingData;
       this._useAlphaTexture = previous.useAlphaTexture;
       this._currentAlphas = previous.currentAlphas;
       this._colors = previous.colors;
@@ -3628,19 +3921,16 @@ export class HighPerfRenderer {
         this._liveGeometryGeneration = donor.generation;
         this._liveOrder = donor.order ?? null;
       } else {
-        uploadedPositionBuffer = gl.createBuffer();
-        if (!uploadedPositionBuffer) {
-          throw new Error('HighPerfRenderer could not allocate the point position buffer.');
-        }
-        gl.bindBuffer(gl.ARRAY_BUFFER, uploadedPositionBuffer);
+        uploadedPositionBuffer = this._newPointStore();
         this._liveOrder = null;
-        this._positionGpuByteLength = this._allocateVertexStore(
-          positions,
-          gl.STATIC_DRAW,
+        this._positionGpuByteLength = this._allocatePointStore(
+          uploadedPositionBuffer,
+          positionByteLength(1, newDimLevel),
           this.pointCount,
-          'HighPerfRenderer point-position upload'
+          gl.STATIC_DRAW,
+          'HighPerfRenderer point-position upload',
+          positions
         );
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
         this.buffers.positions = uploadedPositionBuffer;
         this._liveGeometryGeneration = donor !== null
           ? donor.generation
@@ -3649,9 +3939,7 @@ export class HighPerfRenderer {
       // The moved colour store keeps the order it holds; the next render
       // regathers it into the new geometry's order when they differ.
       this._liveColorOrder = previous.liveColorOrder ?? null;
-      gl.bindVertexArray(this.vao);
-      this._bindPointAttributes(this.buffers.positions, this.buffers.colors, newDimLevel);
-      gl.bindVertexArray(null);
+      this.vao.setStores(this.buffers.positions, this.buffers.colors, newDimLevel);
       this._boundingSphere = donor?.boundingSphere
         ?? this._computeBoundingSphere(positions, newDimLevel);
       requireCleanWebGLState(gl, 'HighPerfRenderer candidate position publication');
@@ -3835,35 +4123,20 @@ export class HighPerfRenderer {
       this._colorGpuByteLength = prepared.colorGpuByteLength;
       prepared.buffers = { positions: null, colors: null };
     } else {
-      if (!this.buffers.positions) {
-        this.buffers.positions = gl.createBuffer();
-        if (!this.buffers.positions) {
-          throw new Error(
-            'HighPerfRenderer could not allocate the point position buffer.'
-          );
-        }
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
-      this._positionGpuByteLength = this._allocateVertexStore(
-        positions.byteLength,
-        gl.STATIC_DRAW,
+      this.buffers.positions ??= this._newPointStore();
+      this._positionGpuByteLength = this._allocatePointStore(
+        this.buffers.positions,
+        positionByteLength(1, dimension),
         pointCount,
+        gl.STATIC_DRAW,
         'HighPerfRenderer point-position upload'
       );
-
-      if (!this.buffers.colors) {
-        this.buffers.colors = gl.createBuffer();
-        if (!this.buffers.colors) {
-          throw new Error(
-            'HighPerfRenderer could not allocate the point color buffer.'
-          );
-        }
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.colors);
-      this._colorGpuByteLength = this._allocateVertexStore(
-        colors.byteLength,
-        gl.DYNAMIC_DRAW,
+      this.buffers.colors ??= this._newPointStore();
+      this._colorGpuByteLength = this._allocatePointStore(
+        this.buffers.colors,
+        4,
         pointCount,
+        gl.DYNAMIC_DRAW,
         'HighPerfRenderer point-color upload'
       );
     }
@@ -3871,13 +4144,7 @@ export class HighPerfRenderer {
     this._liveColorOrder = null;
     this._colorsDirty = true;
 
-    gl.bindVertexArray(this.vao);
-    this._bindPointAttributes(
-      this.buffers.positions,
-      this.buffers.colors,
-      dimension
-    );
-    gl.bindVertexArray(null);
+    this.vao.setStores(this.buffers.positions, this.buffers.colors, dimension);
     if (prepared === null) {
       requireCleanWebGLState(
         gl,
@@ -3890,27 +4157,67 @@ export class HighPerfRenderer {
 
 
   /**
-   * Allocate the bound `ARRAY_BUFFER` store, either from `data` (a typed array,
-   * uploaded as-is) or as `data` zero-filled bytes.
+   * A new, empty per-point vertex store of this renderer's segment size
+   * (`high-perf/point-store-segments.js`).
+   * @returns {PointStore}
+   * @private
+   */
+  _newPointStore() {
+    return new PointStore(this.gl, this._storeSegmentPoints());
+  }
+
+  /** Points a store segment holds (`RendererConfig.STORE_SEGMENT_POINTS`). @private */
+  _storeSegmentPoints() {
+    return this.options?.STORE_SEGMENT_POINTS ?? POINT_STORE_SEGMENT_POINTS;
+  }
+
+  /**
+   * Allocate `store` for `pointCount` points of `bytesPerPoint` bytes, one
+   * buffer a segment, holding `data` when given (a typed array, uploaded
+   * as-is) and zero-filled otherwise.
    *
    * WebGL 2 leaves the previous store untouched when the allocation is
    * refused, so a refusal is reported here, naming the dataset, before any
-   * caller writes into a store that does not exist.
+   * caller writes into a store that does not exist. A refused segment is
+   * retried once after memory kept only for speed is released
+   * (`_allocateGpu`); the store is left empty when it is refused again.
    *
-   * @param {ArrayBufferView|number} data
-   * @param {number} usage
+   * @param {PointStore} store
+   * @param {number} bytesPerPoint
    * @param {number} pointCount
+   * @param {number} usage
    * @param {string} owner
+   * @param {ArrayBufferView|null} [data]
    * @returns {number} the accepted store's byte length
+   * @private
    */
-  _allocateVertexStore(data, usage, pointCount, owner) {
-    const gl = this.gl;
-    const byteLength = typeof data === 'number' ? data : data.byteLength;
-    this._allocateGpu(
-      `${owner} could not allocate ${formatCountOf(byteLength, 'byte')} of point storage for ${formatCountOf(pointCount, 'point')}`,
-      () => gl.bufferData(gl.ARRAY_BUFFER, data, usage)
+  _allocatePointStore(store, bytesPerPoint, pointCount, usage, owner, data = null) {
+    return store.allocate(
+      pointCount,
+      bytesPerPoint,
+      usage,
+      (refusal, run) => this._allocateGpu(refusal, run),
+      `${owner} could not allocate ${formatCountOf(pointCount * bytesPerPoint, 'byte')} of point storage for ${formatCountOf(pointCount, 'point')}`,
+      data
     );
-    return byteLength;
+  }
+
+  /**
+   * Use per-point vertex stores of `points` points a segment from the next
+   * store allocated on (the next publication), and gather in chunks of at
+   * most that many points. For tests: a small segment draws and gathers
+   * through many segments at sizes that fit, and must give the same pixels
+   * and store bytes as one segment.
+   *
+   * @param {number} points
+   */
+  setStoreSegmentPoints(points) {
+    if (!Number.isSafeInteger(points) || points <= 0 || points > POINT_STORE_SEGMENT_POINTS) {
+      throw new RangeError(`HighPerfRenderer store segments hold 1 to ${POINT_STORE_SEGMENT_POINTS} points, not ${points}.`);
+    }
+    this.options.STORE_SEGMENT_POINTS = points;
+    this._permuter?.dispose();
+    this._permuter = null;
   }
 
   /**
@@ -3958,9 +4265,12 @@ export class HighPerfRenderer {
       index.dimensionLevel === dimensionLevel &&
       (!needsLOD || spatialIndexHasLod(index)) &&
       index.drawOrder !== null &&
-      order !== null &&
-      order !== undefined &&
-      order.drawOrder === index.drawOrder
+      (
+        (order !== null && order !== undefined && order.drawOrder === index.drawOrder) ||
+        // An order its store could not adopt was reported, and the view
+        // draws its final picture at full detail (`_ensureStoreDrawOrder`).
+        this._adoptionFailed(index.drawOrder)
+      )
     );
     if (
       this._positions instanceof Float32Array &&
@@ -4019,7 +4329,7 @@ export class HighPerfRenderer {
   /**
    * Release the colour store, kept colour stores and R8 texture of every
    * dormant kept view (not presented, not being worked on, its store its
-   * own). The view keeps its colours and alpha bytes, its geometry and its
+   * own). The view keeps its published colours and transparency, its geometry and its
    * vertex array, so `_restoreSnapshotStores` rebuilds exactly what it drew.
    * @returns {number} Bytes released.
    * @private
@@ -4033,10 +4343,7 @@ export class HighPerfRenderer {
       released += snapshot.colorOwner.byteLength + (snapshot.alphaTextureByteLength ?? 0);
       if (snapshot.colorCache instanceof Map) this._clearKeptColorStores(snapshot.colorCache);
       // A vertex array keeps a deleted buffer alive while it references it.
-      gl.bindVertexArray(snapshot.vao);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-      gl.bindVertexArray(null);
+      snapshot.vao.setColors(null);
       this._queueSnapshotRetirement(snapshot, {
         releaseAlpha: true,
         releaseColor: true,
@@ -4062,7 +4369,7 @@ export class HighPerfRenderer {
 
   /**
    * Rebuild a released kept view's colour store (in its geometry's current
-   * order) and R8 texture from its own colours and alpha bytes, and point
+   * order) and R8 texture from its published colours and transparency, and point
    * its vertex array at the new store. A failure leaves it released.
    * @private
    */
@@ -4079,17 +4386,10 @@ export class HighPerfRenderer {
     let buffer = null;
     let byteLength = 0;
     try {
-      buffer = gl.createBuffer();
-      if (!buffer) throw new Error(`${label} could not allocate its colour store.`);
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      buffer = this._newPointStore();
       byteLength = this._uploadSnapshotColors(buffer, snapshot.colors, label, order);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      this._uploadNewSnapshotAlphaTexture(snapshot.alphaTexData, snapshot.alphaTexPlan, label, alpha);
-      gl.bindVertexArray(snapshot.vao);
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-      gl.bindVertexArray(null);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      this._uploadNewSnapshotAlphaTexture(snapshot.alphas, snapshot.alphaTexPlan, label, alpha);
+      snapshot.vao.setColors(buffer);
     } catch (error) {
       gl.bindVertexArray(null);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -4101,7 +4401,7 @@ export class HighPerfRenderer {
       this._snapshotInOperation = previousOperation;
       throw error;
     }
-    snapshot.colorOwner = this._createSnapshotColorOwner(buffer, byteLength, order?.drawOrder ?? null);
+    snapshot.colorOwner = this._createSnapshotColorOwner(buffer, byteLength, order ?? null);
     snapshot.buffer = buffer;
     snapshot.bufferByteLength = byteLength;
     snapshot.alphaTexture = alpha.alphaTexture;
@@ -4125,8 +4425,23 @@ export class HighPerfRenderer {
    * @param {() => void} allocate
    * @private
    */
-  _allocateGpu(refusal, allocate) {
+  _allocateGpu(refusal, allocate, { onError = null } = {}) {
     const gl = this.gl;
+    // A refusal for memory is acted on only by evicting what the renderer
+    // keeps by choice (below), which needs the answer now. With nothing to
+    // evict it can only be reported, so a caller that recovers from a failed
+    // allocation later (`onError`) has it checked in a later frame instead:
+    // reading the error queue now waits for every command before it, a
+    // whole 100M-point frame and more (0.7 s at a 100M 3D adoption's start).
+    if (onError !== null && this.getRetainedGeometryBytes() + this.getKeptColorBytes() + this._dormantSnapshotStoreBytes() === 0) {
+      allocate();
+      deferWebGLErrorCheck(gl, {
+        label: refusal,
+        owner: this,
+        onError: error => onError(new RangeError(`${refusal} (${describeError(error)}).`)),
+      });
+      return;
+    }
     allocate();
     let code = gl.getError();
     // Only a refusal for memory is retried. Any other code is a defect (this
@@ -4152,27 +4467,6 @@ export class HighPerfRenderer {
     if (code === gl.NO_ERROR) return;
     if (typeof gl.isContextLost === 'function' && gl.isContextLost()) throw contextLostError(refusal);
     throw new RangeError(`${refusal} (WebGL error 0x${code.toString(16)}).`);
-  }
-
-  /**
-   * Point the bound vertex array's two point attributes at their streams:
-   * location 0 is tightly packed Float32 with `dimension` components per
-   * point, location 1 tightly packed RGBA8 normalized to [0, 1].
-   *
-   * The shader declares `a_position` as a `vec3`; WebGL fills the components
-   * a 1-D or 2-D stream does not supply with 0, which is exactly the value of
-   * an axis the embedding does not have.
-   *
-   * @param {WebGLBuffer} positionBuffer
-   * @param {WebGLBuffer} colorBuffer
-   * @param {number} dimension - Components per position (1, 2 or 3).
-   */
-  _bindPointAttributes(positionBuffer, colorBuffer, dimension) {
-    const gl = this.gl;
-    bindPositionAttribute(gl, positionBuffer, dimension);
-    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
   }
 
   /**
@@ -4202,8 +4496,6 @@ export class HighPerfRenderer {
     if (pointCount === 0) {
       this._alphaTexture = null;
       this._alphaTextureByteLength = 0;
-      this._alphaTexData = new Uint8Array();
-      this._alphaTexStagingData = new Uint8Array();
       this._alphaTexWidth = 0;
       this._alphaTexHeight = 0;
       this._alphaTexPlan = null;
@@ -4230,35 +4522,18 @@ export class HighPerfRenderer {
     // Stage every fallible CPU/GL operation before changing the accepted
     // publication. This also keeps capability/texture failures from erasing a
     // live alpha generation.
-    const requiredSize = candidateWidth * candidateHeight;
-    let candidateData = this._alphaTexData;
     if (alphas !== null) {
       if (!(alphas instanceof Uint8Array) || alphas.length !== pointCount) {
         throw new TypeError(
           'HighPerfRenderer alpha texture values must be one Uint8Array a point.'
         );
       }
-      // Its own owner (never the accepted one, which stays as it is until
-      // this texture is accepted): the values encoded, the padding opaque.
-      candidateData = new Uint8Array(requiredSize);
-      candidateData.fill(255, pointCount);
-      const encoded = encodeAlphaSpan(
-        alphas,
-        candidateData,
-        candidateData,
-        alphaEncodingWords(alphas, candidateData, candidateData),
-        0,
-        pointCount
-      );
-      if (encoded < 0) {
+      const index = firstNonBinaryByte(alphas);
+      if (index >= 0) {
         throw new RangeError(
-          `HighPerfRenderer alpha value at index ${-encoded - 1} must be exactly 0 or 1.`
+          `HighPerfRenderer alpha value at index ${index} must be exactly 0 or 1.`
         );
       }
-    } else if (!candidateData || candidateData.length !== requiredSize) {
-      candidateData = new Uint8Array(requiredSize);
-      // Initialize to fully opaque
-      candidateData.fill(255);
     }
     const adoptedTexture = prepared !== null ? prepared.alphaTexture : null;
     if (prepared !== null) prepared.alphaTexture = null;
@@ -4283,7 +4558,7 @@ export class HighPerfRenderer {
               allocateLinearTexture(gl, gl.R8, candidatePlan);
             });
           }
-          writeLinearTextureRows(gl, candidatePlan, gl.RED, gl.UNSIGNED_BYTE, candidateData, 1);
+          writeAlphaRows(gl, candidatePlan, alphas, pointCount, 0, candidatePlan.rows, this._alphaRowScratch());
           if (adoptedTexture === null) {
             requireCleanWebGLState(
               gl,
@@ -4326,8 +4601,6 @@ export class HighPerfRenderer {
 
     this._alphaTexture = candidateTexture;
     this._alphaTextureByteLength = candidateTextureByteLength;
-    this._alphaTexData = candidateData;
-    this._alphaTexStagingData = null;
     this._alphaTexWidth = candidateWidth;
     this._alphaTexHeight = candidateHeight;
     this._alphaTexPlan = candidatePlan;
@@ -4345,20 +4618,18 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Publish full-row regions of an accepted alpha texture (the live view's or
-   * a snapshot's), laid out as `plan`.
+   * Write full-row regions of an accepted alpha texture (the live view's or
+   * a kept view's), laid out as `plan`, from its published transparency
+   * (`alphas`, 0/1 a cell; null: every cell shown). No CPU image of the
+   * texture exists: rows are encoded into the bounded row scratch a chunk at
+   * a time (`writeAlphaRows`).
    *
    * `regions` is an interleaved `(rowStart, rowCount)` Int32Array holding
    * `regionCount` pairs in strictly increasing, non-overlapping row order. All
    * of them are sent inside one unpack transaction; rows written into accepted
    * storage read no error back (`requireLiveContext`).
-   *
-   * Rows are complete, so `UNPACK_ROW_LENGTH` stays neutral and the source
-   * range for a region is exactly `rowStart * width` through
-   * `(rowStart + rowCount) * width` — addressed with `srcOffset` rather than a
-   * subarray so a publication allocates nothing.
    */
-  _uploadAlphaRegions(texture, plan, data, regions, regionCount, label) {
+  _writeAlphaRegions(texture, plan, alphas, regions, regionCount, label) {
     const gl = this.gl;
     const width = plan?.width;
     const height = plan?.rows;
@@ -4368,8 +4639,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(height) ||
       width <= 0 ||
       height <= 0 ||
-      !(data instanceof Uint8Array) ||
-      data.length !== width * height ||
+      (alphas !== null && (!(alphas instanceof Uint8Array) || alphas.length !== this.pointCount)) ||
       !(regions instanceof Int32Array) ||
       !Number.isSafeInteger(regionCount) ||
       regionCount <= 0 ||
@@ -4402,12 +4672,10 @@ export class HighPerfRenderer {
         1,
         label,
         () => {
+          const scratch = this._alphaRowScratch();
           for (let index = 0; index < regionCount; index++) {
             const rowStart = regions[index * 2];
-            const rowCount = regions[index * 2 + 1];
-            writeLinearTextureRows(
-              gl, plan, gl.RED, gl.UNSIGNED_BYTE, data, 1, rowStart, rowStart + rowCount
-            );
+            writeAlphaRows(gl, plan, alphas, this.pointCount, rowStart, rowStart + regions[index * 2 + 1], scratch);
           }
           requireLiveContext(gl, label);
         }
@@ -4421,9 +4689,9 @@ export class HighPerfRenderer {
   /**
    * Update the alpha texture with new alpha values.
    *
-   * The accepted R8 owner is never overwritten before WebGL accepts the new
-   * generation. A one-byte-per-texel staging owner keeps transient failures
-   * retryable without retaining another Float32 point array.
+   * The accepted array (`_currentAlphas`) stays accepted until WebGL accepts
+   * the new generation, and a failed write restores the rows it touched from
+   * it, so no CPU copy of the texture's image is needed for a retry.
    *
    * Only the rows whose bytes moved are sent. Every other byte of the resident
    * texture is, by the comparison that decided it, already the byte this
@@ -4439,35 +4707,35 @@ export class HighPerfRenderer {
   _updateAlphaTexture(alphas) {
     const width = this._alphaTexWidth;
     const height = this._alphaTexHeight;
+    const plan = this._alphaTexPlan;
     if (
       !(alphas instanceof Uint8Array) ||
       alphas.length !== this.pointCount ||
       !this._alphaTexture ||
-      !(this._alphaTexData instanceof Uint8Array) ||
       !Number.isSafeInteger(width) ||
       !Number.isSafeInteger(height) ||
       width <= 0 ||
       height <= 0 ||
-      this._alphaTexData.length !== width * height
+      plan?.rows !== height
     ) {
       throw new Error(
         'HighPerfRenderer alpha texture update received incomplete exact state.'
       );
     }
     const n = this.pointCount;
-    const accepted = this._alphaTexData;
-    const requiredSize = accepted.length;
-    let candidate = this._alphaTexStagingData;
-    if (
-      !(candidate instanceof Uint8Array) ||
-      candidate.length !== requiredSize
-    ) {
-      candidate = new Uint8Array(requiredSize);
-      candidate.fill(255);
+    const index = firstNonBinaryByte(alphas);
+    if (index >= 0) {
+      throw new RangeError(
+        `HighPerfRenderer alpha value at index ${index} must be exactly 0 or 1; received ${alphas[index]}.`
+      );
     }
-    // Scratch owned by this method alone. Both are re-derived from scratch on
-    // every call and sized against the current texture, so they carry nothing
-    // across a texture replacement and stay out of the publication transaction.
+    // The texture holds the accepted bytes (`_currentAlphas`: the published
+    // 0/1 values, or every cell shown when none were published), so no CPU
+    // copy of its image is kept: the rows whose bytes moved are found by
+    // comparing with them, and only those are encoded and sent.
+    const accepted = this._currentAlphas instanceof Uint8Array && this._currentAlphas.length === n
+      ? this._currentAlphas
+      : null;
     let dirtyRows = this._alphaDirtyRows;
     if (!(dirtyRows instanceof Uint8Array) || dirtyRows.length !== height) {
       dirtyRows = new Uint8Array(height);
@@ -4480,60 +4748,29 @@ export class HighPerfRenderer {
       regions = new Int32Array(height * 2);
       this._alphaUploadRegions = regions;
     }
-
-    // Row-major traversal that records which rows moved without a division
-    // per point, four cells a word (`encodeAlphaSpan`): a cell's byte is 255
-    // for 1 and 0 for 0, and a value above 1 is rejected naming the first
-    // such cell. Every row starts on a word boundary: a texture of more than
-    // one row is a power of two at least 2048 texels wide (`linear-texture.js`).
-    const words = alphaEncodingWords(alphas, candidate, accepted);
     let dirtyRowCount = 0;
     for (let y = 0; y < height; y++) {
       const rowStart = y * width;
       if (rowStart >= n) break;
-      const rowEnd = rowStart + width < n ? rowStart + width : n;
-      const moved = encodeAlphaSpan(alphas, candidate, accepted, words, rowStart, rowEnd);
-      if (moved < 0) {
-        const i = -moved - 1;
-        throw new RangeError(
-          `HighPerfRenderer alpha value at index ${i} must be exactly 0 or 1; received ${alphas[i]}.`
-        );
-      }
-      if (moved !== 0) {
+      const rowEnd = Math.min(n, rowStart + width);
+      if (rowMoved(alphas, accepted, rowStart, rowEnd)) {
         dirtyRows[y] = 1;
         dirtyRowCount++;
       }
     }
-
     if (dirtyRowCount === 0) {
-      this._alphaTexStagingData = candidate;
+      this._currentAlphas = alphas;
       this._useAlphaTexture = true;
       return false;
     }
-
     const regionCount = collectAlphaUploadRegions(dirtyRows, height, regions);
-
     try {
-      this._uploadAlphaRegions(
-        this._alphaTexture,
-        this._alphaTexPlan,
-        candidate,
-        regions,
-        regionCount,
-        'HighPerfRenderer alpha-value publication'
-      );
+      this._writeAlphaRegions(this._alphaTexture, this._alphaTexPlan, alphas, regions, regionCount, 'HighPerfRenderer alpha-value publication');
     } catch (publicationError) {
       try {
-        // Exactly the regions the failed publication could have touched, so
-        // restoring them restores the whole accepted image.
-        this._uploadAlphaRegions(
-          this._alphaTexture,
-          this._alphaTexPlan,
-          accepted,
-          regions,
-          regionCount,
-          'HighPerfRenderer alpha-value restoration'
-        );
+        // Exactly the regions the failed publication could have touched,
+        // from the accepted bytes, so the whole accepted image is restored.
+        this._writeAlphaRegions(this._alphaTexture, this._alphaTexPlan, accepted, regions, regionCount, 'HighPerfRenderer alpha-value restoration');
       } catch (restorationError) {
         const failedTexture = this._alphaTexture;
         const failedTextureByteLength =
@@ -4557,11 +4794,15 @@ export class HighPerfRenderer {
       }
       throw publicationError;
     }
-
-    this._alphaTexData = candidate;
-    this._alphaTexStagingData = accepted;
+    this._currentAlphas = alphas;
     this._useAlphaTexture = true;
     return true;
+  }
+
+  /** The bounded scratch alpha rows are encoded into before they are sent. @private */
+  _alphaRowScratch() {
+    this._alphaRows ??= new Uint8Array(ALPHA_ROW_SCRATCH_BYTES);
+    return this._alphaRows;
   }
 
   updateColors(colors) {
@@ -4577,6 +4818,11 @@ export class HighPerfRenderer {
     }
     requireWordAlignedColors(colors);
 
+    // The same colours in another array (a field made again after cells
+    // were added or removed in place, `resizeLiveCells`): nothing to send.
+    // The same array is always sent again: its owner may have rewritten it.
+    const unchanged = colors !== this._colors && this._colors instanceof Uint8Array
+      && !this._colorsDirty && sameWords(colorWordsOf(this._colors), colorWordsOf(colors));
     this._colors = colors;
     for (const spatialIndex of this.spatialIndices.values()) {
       // Spatial indices own geometry/sample order, but their color generation
@@ -4588,6 +4834,7 @@ export class HighPerfRenderer {
       }
     }
 
+    if (unchanged) return;
     // Publication is deferred to the next render, so back-to-back recolors
     // upload once. Stores kept for other orders hold the old colours.
     this._colorsDirty = true;
@@ -4630,6 +4877,8 @@ export class HighPerfRenderer {
     let createdTexture = false;
     if (!this._alphaTexture) {
       this._createAlphaTexture(this.pointCount);
+      // A new texture shows every cell.
+      this._currentAlphas = null;
       createdTexture = true;
     }
     const changed = this._updateAlphaTexture(alphas);
@@ -4702,14 +4951,14 @@ export class HighPerfRenderer {
     }
     // The store is accepted; a gather allocates through `_allocateGpu`.
     requireLiveContext(gl, 'HighPerfRenderer full-detail color publication preflight');
-    const drawOrder = this._liveOrder?.drawOrder ?? null;
+    const order = this._liveOrder ?? null;
     this._writeOrderedColors(
       this.buffers.colors,
       colors,
       this._liveOrder,
       'HighPerfRenderer full-detail color publication'
     );
-    this._liveColorOrder = drawOrder;
+    this._liveColorOrder = order;
     this._colorsDirty = false;
   }
 
@@ -4915,7 +5164,9 @@ export class HighPerfRenderer {
     const dz = maxZ - minZ;
     const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
 
-    return { center: [centerX, centerY, centerZ], radius };
+    // The box too: levels of detail drawn before a tree exists measure the
+    // camera distance against it (`RankLevels`).
+    return { center: [centerX, centerY, centerZ], radius, bounds: { minX, maxX, minY, maxY, minZ, maxZ } };
   }
 
   /**
@@ -5126,68 +5377,29 @@ export class HighPerfRenderer {
       this.setQuality(quality);
     }
 
-    // Get the correct spatial index for this view's dimension level
-    // Each dimension (1D, 2D, 3D) needs its own spatial index for correct LOD/frustum culling
-    // A tree still building in a worker leaves the view at full detail (or
-    // with the tree it has) until it lands; nothing is built here.
+    // The view's tree (built in a worker; nothing is built here), and the
+    // order its store holds: the tree's order is adopted band by band
+    // (`_ensureStoreDrawOrder`) whenever the tree exists (a hover tree counts
+    // too), since the order alone draws a 10M full-detail frame about 3x
+    // faster in 2D and in 3D.
     const needsSpatialIndex = this._needsSpatialIndex(forceLOD);
+    const needsLOD = this._needsLodResources(forceLOD);
     const spatialIndex = needsSpatialIndex
-      ? this._liveSpatialIndexForDraw(dimensionLevel, this._needsLodResources(forceLOD))
+      ? this._liveSpatialIndexForDraw(dimensionLevel, needsLOD)
       : null;
-    // Select LOD level based on whether LOD is enabled
-    // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
-    // This ensures disabling LOD always returns to full detail (unless explicitly overridden per-render)
-    let lodLevel;
-    viewState.lodConverging = false;
-    if (this.useAdaptiveLOD) {
-      // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
-      lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
-      if (lodLevel < 0 && spatialIndex) {
-        // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
-        lodLevel = spatialIndex.getLODLevel(
-          cameraDistance,
-          viewState.lastLodLevel,
-          dimensionLevel,
-          overrideBounds
-        );
-        viewState.lodConverging = spatialIndex.getLODLevel(
-          cameraDistance,
-          lodLevel,
-          dimensionLevel,
-          overrideBounds
-        ) !== lodLevel;
-      }
-    } else {
-      // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
-      lodLevel = forceLOD >= 0 ? forceLOD : -1;
-    }
-
-    if (lodLevel >= 0 && !spatialIndexHasLod(spatialIndex)) {
-      // The levels are still building: full detail until they land.
-      lodLevel = -1;
-    }
-    if (
-      lodLevel >= 0 &&
-      (!Number.isInteger(lodLevel) || !spatialIndex?.lodLevels?.[lodLevel])
-    ) {
-      throw new RangeError(
-        `HighPerfRenderer LOD level ${String(lodLevel)} is unavailable for ${dimensionLevel}D view "${viewId}".`
-      );
-    }
-
-    // The live geometry is stored in the draw order of its tree whenever the
-    // tree exists (a hover tree counts too): the order alone draws a 10M
-    // full-detail frame about 3x faster in 2D and in 3D. The store adopts
-    // that order in this frame, before it draws.
     const orderTree = spatialIndex ?? this._currentLiveTree();
     const order = orderTree !== null
       ? this._ensureStoreDrawOrder(LIVE_STORE, orderTree)
       : this._liveOrder;
-    const ordered = spatialIndex !== null && order?.drawOrder === spatialIndex.drawOrder;
-    if (!ordered) lodLevel = -1;
-    // Always update per-view LOD level for highlight rendering and other
-    // consumers: the level actually drawn.
-    viewState.lastLodLevel = lodLevel;
+    const { levels, lodLevel, ordered } = this._selectDrawLevels(viewState, {
+      tree: spatialIndex,
+      order,
+      rankLevels: needsLOD ? () => this._rankLevelsOf(LIVE_STORE) : null,
+      forceLOD,
+      cameraDistance,
+      dimensionLevel,
+      overrideBounds,
+    });
     this._ensureLiveColorsInOrder();
     const cull = this.useFrustumCulling && ordered;
     if (!cull) {
@@ -5219,6 +5431,7 @@ export class HighPerfRenderer {
         pointCount: this.pointCount,
         order,
         tree: spatialIndex,
+        levels,
         lodLevel,
         cull,
         frustumChanged,
@@ -5612,61 +5825,70 @@ export class HighPerfRenderer {
    */
 
   // ==========================================================================
-  // DRAW ORDER
+  // STORE ORDERS
   //
   // A geometry's points are stored on the GPU in the draw order of the tree
-  // over them (`SpatialIndex#drawOrder`): grouped by LOD band, then by tree
-  // leaf, then by ascending source index. Every reduced LOD level is a prefix
-  // of that order and every run of tree leaves is one contiguous range per
-  // band, so a reduced level is one `drawArrays` prefix and frustum culling
-  // draws node ranges -- no per-point index ever leaves the CPU after the
-  // order is built. Neighbouring points are also neighbours in memory and on
-  // screen, which is what makes the stored order faster to draw at full
-  // detail than source order (10M points: 18 ms against 68 ms on Chromium,
-  // 15 against 57 on WebKit, 14 against 57 on Firefox).
+  // over them (`SpatialIndex#drawOrder`): grouped by band (a fixed run of
+  // priority ranks, `draw-order.js`), then by tree leaf, then by ascending
+  // source index. Every level of detail is a prefix of that order and every
+  // run of tree leaves is one contiguous range per band, so a reduced level
+  // is one `drawArrays` prefix and frustum culling draws node ranges -- no
+  // per-point index ever leaves the CPU after the order is built. Neighbouring
+  // points are also neighbours in memory and on screen, which is what makes
+  // the stored order faster to draw at full detail than source order (10M
+  // points: 18 ms against 68 ms on Chromium, 15 against 57 on WebKit, 14
+  // against 57 on Firefox).
   //
   // Positions are per geometry, so each geometry carries its order; colours
   // are per view and are gathered into the order of the geometry the view
-  // draws. Alpha stays in source order, read through the order's R32UI
-  // permutation texture (`u_useLodIndexTex`). Before a tree exists a geometry
-  // is stored in source order and draws at full detail only.
+  // draws. Alpha stays in source order, read through the order's R32UI slot
+  // map (`u_orderedSlots`). What a store holds is a `StoreOrder`
+  // (`high-perf/store-order.js`), or null for source order.
+  //
+  // When the open cells are in priority order (`data/cell-priority.js`,
+  // `OPEN_ORDER_PRIORITY`: a priority-ordered file, any cell-level
+  // subsample), a store in source order holds them by rank, and its levels
+  // of detail are drawn at once as prefixes (`RankLevels`): no tree, no
+  // permutation, no gather. Its tree is built in the worker meanwhile, and
+  // the store then takes the tree's order **one band at a time**, a bounded
+  // number of points a frame (`STORE_ORDER_POINTS_PER_FRAME`), each band
+  // gathered in place from its own cells; every prefix that ends on a band
+  // boundary holds its own cells at every step, so every level draws the same
+  // cells throughout, and culling starts once every band is in order. Cells
+  // added in place are appended in rank order behind whatever order the
+  // store holds, and the next tree's order replaces it the same way
+  // (`resizeLiveCells`). A store of cells not in priority order takes its
+  // tree's order whole, in one frame, and draws levels from then on.
   // ==========================================================================
 
   /**
-   * Create the permutation texture of one draw order: texel `k` holds the
-   * source index of the point stored in slot `k`.
+   * Allocate the slot map of a store order (`StoreOrder#map`): an R32UI
+   * linear texture of `pointCount` texels, written band by band
+   * (`_writeStoreOrderMap`).
    *
-   * @param {Readonly<{indices: Uint32Array, pointCount: number}>} drawOrder
+   * @param {number} pointCount
    * @param {string} owner
-   * @returns {{drawOrder: object, texture: WebGLTexture, plan: object, byteLength: number}}
+   * @returns {{texture: WebGLTexture, plan: object, byteLength: number}}
    * @private
    */
-  _createDrawOrderRecord(drawOrder, owner) {
+  _createStoreOrderMap(pointCount, owner, onError = null) {
     const gl = this.gl;
-    const indices = drawOrder?.indices;
-    if (!(indices instanceof Uint32Array) || indices.length !== drawOrder.pointCount) {
-      throw new TypeError(`${owner} requires an exact draw order.`);
-    }
-    const plan = planLinearTextureFor(gl, indices.length);
+    const plan = planLinearTextureFor(gl, pointCount);
     const byteLength = plan.texels * Uint32Array.BYTES_PER_ELEMENT;
-    // The allocation below is checked by `_allocateGpu`; the rows written
+    // The allocation below is checked by `_allocateGpu`; the texels written
     // into it need no read-back.
-    requireLiveContext(gl, `${owner} draw-order preflight`);
+    requireLiveContext(gl, `${owner} slot map preflight`);
     const texture = gl.createTexture();
     if (!texture) {
-      throw new Error(`${owner} could not allocate its draw-order texture.`);
+      throw new Error(`${owner} could not allocate its slot map.`);
     }
     try {
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
-      this._withNeutralTextureUnpackState(4, `${owner} draw order`, () => {
-        // Immutable storage: no zero-fill pass before the rows are written.
-        this._allocateGpu(`${owner} could not allocate its draw-order texture`, () => {
-          allocateLinearTexture(gl, gl.R32UI, plan);
-        });
-        writeLinearTextureRows(gl, plan, gl.RED_INTEGER, gl.UNSIGNED_INT, indices, 1);
-      });
+      // Immutable storage: no zero-fill pass before the texels are written.
+      this._allocateGpu(`${owner} could not allocate its slot map`, () => {
+        allocateLinearTexture(gl, gl.R32UI, plan);
+      }, { onError });
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
-      requireLiveContext(gl, `${owner} draw-order upload`);
     } catch (error) {
       try {
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
@@ -5676,49 +5898,117 @@ export class HighPerfRenderer {
       this._queueDataRetirement({ textures: [{ handle: texture, byteLength }] });
       const failures = this._drainDataRetirements();
       if (failures.length > 0) {
-        throw new AggregateError([error, ...failures], `${owner} draw-order upload failed with cleanup errors.`);
+        throw new AggregateError([error, ...failures], `${owner} slot map allocation failed with cleanup errors.`);
       }
       throw error;
     }
-    return { drawOrder, texture, plan, byteLength };
+    return { texture, plan, byteLength };
   }
 
   /**
-   * Queue one draw-order record's texture for deletion.
-   * @param {object|null} record
+   * The store order of a store holding `drawOrder` whole: its slot map made
+   * and written in full. A failure retires the map and leaves nothing.
+   *
+   * @param {{indices: Uint32Array, pointCount: number, ranked?: boolean}} drawOrder
+   * @param {string} owner
+   * @returns {StoreOrder}
    * @private
    */
-  _retireDrawOrderRecord(record) {
-    if (record === null || record === undefined || !record.texture) return;
+  _createStoreOrder(drawOrder, owner) {
+    const indices = drawOrder?.indices;
+    if (!(indices instanceof Uint32Array) || indices.length !== drawOrder.pointCount) {
+      throw new TypeError(`${owner} requires an exact draw order.`);
+    }
+    const map = this._createStoreOrderMap(drawOrder.pointCount, owner);
+    try {
+      this._writeStoreOrderMap(map, indices, 0, drawOrder.pointCount, owner);
+      return new StoreOrder({
+        pointCount: drawOrder.pointCount,
+        target: drawOrder,
+        adopted: drawOrder.pointCount,
+        base: null,
+        baseEnd: drawOrder.pointCount,
+        map,
+        ranked: drawOrder.ranked === true,
+      });
+    } catch (error) {
+      this._queueDataRetirement({ textures: [{ handle: map.texture, byteLength: map.byteLength }] });
+      const failures = this._drainDataRetirements();
+      if (failures.length > 0) {
+        throw new AggregateError([error, ...failures], `${owner} slot map upload failed with cleanup errors.`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the texels of slots `[first, end)` of a slot map from `sources`
+   * (the cell of each slot, indexed by slot from `sourcesFirst`).
+   * @private
+   */
+  _writeStoreOrderMap(map, sources, first, end, owner, sourcesFirst = 0) {
+    if (end <= first) return;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, map.texture);
+    try {
+      this._withNeutralTextureUnpackState(4, `${owner} slot map`, () => {
+        writeLinearTextureItems(gl, map.plan, gl.RED_INTEGER, gl.UNSIGNED_INT, sources, 1, first, end, sourcesFirst);
+      });
+    } finally {
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+    }
+    requireLiveContext(gl, `${owner} slot map upload`);
+  }
+
+  /**
+   * A store's order moved from `previous` to `next`: retire `previous`'s
+   * slot map unless `next` reads the same one, and the colour stores kept
+   * for any order of that map (no store holds one any more).
+   *
+   * @param {StoreOrder|null} previous
+   * @param {StoreOrder|null} next
+   * @private
+   */
+  _retireStoreOrder(previous, next) {
+    if (previous === null || previous === undefined) return;
+    const map = previous.map;
+    if (next?.map === map || !map.texture) return;
     this._queueDataRetirement({
-      textures: [{ handle: record.texture, byteLength: record.byteLength }],
+      textures: [{ handle: map.texture, byteLength: map.byteLength }],
     });
-    record.texture = null;
-    // Colour stores kept for this order can never be drawn again: no store
-    // holds it any more.
-    for (const [cache, drawOrder, entry] of this._keptColorStores()) {
-      if (drawOrder !== record.drawOrder) continue;
-      cache.delete(drawOrder);
+    map.texture = null;
+    this._dropKeptColorStoresOf(map);
+  }
+
+  /** Retire the colour stores kept for any order of slot map `map` (no store will hold one again). @private */
+  _dropKeptColorStoresOf(map) {
+    for (const [cache, order, entry] of this._keptColorStores()) {
+      if (order?.map !== map) continue;
+      cache.delete(order);
       this._retireBuffer(entry.buffer, entry.byteLength);
     }
   }
 
   /** @private */
   _getPermuter() {
-    this._permuter ??= new GpuPermuter(this.gl, (refusal, allocate) => this._allocateGpu(refusal, allocate));
+    // Gather chunks are never larger than a store segment: a forced small
+    // segment (`setStoreSegmentPoints`) exercises the chunked gather too.
+    this._permuter ??= new GpuPermuter(this.gl, (refusal, allocate, options) => this._allocateGpu(refusal, allocate, options), {
+      chunkPoints: this._storeSegmentPoints(),
+    });
     return this._permuter;
   }
 
   /**
    * Rewrite an RGBA8 colour store (already sized) with one view's colours in
-   * the order of draw-order record `order`, or in source order when `order`
-   * is null. A draw order is gathered on the GPU through its permutation
-   * texture (`GpuPermuter`): the CPU uploads the source-order colours
-   * once, as a source-order store would, and never reads them at random.
+   * store order `order`, or in source order when `order` is null. A store
+   * order is gathered on the GPU through its slot map (`GpuPermuter`): the
+   * CPU uploads the source-order colours once, as a source-order store
+   * would, and never reads them at random.
    *
-   * @param {WebGLBuffer} buffer
+   * @param {PointStore} buffer
    * @param {Uint8Array} colors - Word-aligned RGBA8, 4 bytes a point.
-   * @param {{texture: WebGLTexture, width: number}|null} order
+   * @param {StoreOrder|null} order
    * @param {string} owner
    * @private
    */
@@ -5726,19 +6016,12 @@ export class HighPerfRenderer {
     const gl = this.gl;
     requireOrderCoversColors(order, colors, owner);
     if (order === null) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      try {
-        gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
-      } finally {
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      }
+      buffer.write(colors);
     } else {
       this._getPermuter().writeWords(buffer, colorWordsOf(colors), order, 1);
     }
     requireLiveContext(gl, owner);
   }
-
-
 
   /**
    * The live tree of the live view's current positions, or null.
@@ -5751,39 +6034,75 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Bring one position store to `tree`'s draw order, in the frame that first
-   * needs it: the permutation is uploaded, then the store's positions and
-   * the colours of every view that draws it are gathered on the GPU
-   * (`GpuPermuter`), in place, before the frame draws. The CPU only uploads
-   * the source-order words; it never reads them at random.
+   * Bring one position store toward `tree`'s draw order: the bands this
+   * frame's budget allows when the store holds its cells by rank (see
+   * "STORE ORDERS"), else the whole order at once. The colours of every view
+   * presented on the store follow it at each step. The CPU only uploads the
+   * source-order words; it never reads them at random. While bands remain,
+   * a frame is asked for (`onAsyncTreeReady`), so the store keeps moving
+   * without blocking any frame.
    *
-   * Returns the record the store holds now.
+   * Returns the order the store holds now.
    *
    * @param {{kind: 'live'}|{kind: 'geometry', geometry: object}} store
    * @param {SpatialIndex} tree
-   * @returns {object}
+   * @returns {StoreOrder|null}
    * @private
    */
   _ensureStoreDrawOrder(store, tree) {
     const drawOrder = tree.ensureDrawOrder();
     const current = this._storeOrder(store);
     if (current?.drawOrder === drawOrder) return current;
-    // One adoption a frame: when several trees land together (four panes of
-    // four representations), each store adopts in its own frame instead of
-    // all in one long frame. A deferred store draws as it is this frame.
-    if (this._frameAdoptions !== undefined && this._frameAdoptions >= 1) {
+    // An order this store could not adopt is not tried again every frame:
+    // only once LOD or culling is toggled (or a new tree replaces it).
+    if (this._adoptionFailed(drawOrder)) return current;
+    // Each frame moves at most `STORE_ORDER_POINTS_PER_FRAME` points into
+    // order, across every store: when several trees land together (four
+    // panes of four representations), the stores move in turn instead of
+    // all in one long frame. A store that waits draws as it is.
+    const budget = this._frameAdoptionPoints === undefined
+      ? Infinity
+      : STORE_ORDER_POINTS_PER_FRAME - this._frameAdoptionPoints;
+    if (budget <= 0) {
       this.onAsyncTreeReady?.();
       return current;
     }
-    if (this._frameAdoptions !== undefined) this._frameAdoptions += 1;
-    return this._adoptDrawOrder(store, drawOrder);
+    try {
+      const { order: next, moved } = this._advanceStoreOrder(store, current, drawOrder, budget);
+      if (this._frameAdoptionPoints !== undefined) this._frameAdoptionPoints += moved;
+      if (next?.drawOrder !== drawOrder) this.onAsyncTreeReady?.();
+      return next;
+    } catch (error) {
+      if (isContextLostError(error)) throw error;
+      // Never silent: the view goes on with the order it holds (levels of
+      // detail by rank where its slots hold them), and says what is off.
+      this._adoptionFailures ??= new WeakSet();
+      this._adoptionFailures.add(drawOrder);
+      const byRank = this._rankLevelsOf(store) !== null;
+      getNotificationCenter().error(
+        `${byRank ? 'Culling is' : 'Levels of detail and culling are'} off for the ${store.kind === 'live' ? 'live view' : 'kept views of a representation'}: `
+          + `its ${formatCountOf(drawOrder.pointCount, 'point')} could not be put in draw order on the GPU (${describeError(error)}). `
+          + (byRank ? 'Its levels of detail are drawn in rank order, without culling.' : 'It is drawn at full detail.')
+      );
+      return this._storeOrder(store);
+    }
   }
 
   /**
-   * Start one frame (every pane): resets the per-frame adoption budget.
+   * Whether the store showing `drawOrder` failed to adopt it since LOD or
+   * culling was last toggled.
+   * @private
+   */
+  _adoptionFailed(drawOrder) {
+    return this._adoptionFailures?.has(drawOrder) === true;
+  }
+
+  /**
+   * Start one frame (every pane): resets the per-frame budget of points put
+   * in order (`_ensureStoreDrawOrder`).
    */
   beginFrame() {
-    this._frameAdoptions = 0;
+    this._frameAdoptionPoints = 0;
     this._snapshotInOperation = null;
   }
 
@@ -5792,6 +6111,228 @@ export class HighPerfRenderer {
     return store.kind === 'live'
       ? 'HighPerfRenderer live draw order'
       : `HighPerfRenderer geometry ${store.geometry.generation} draw order`;
+  }
+
+  /** The slots a store holds. @private */
+  _storePointCount(store) {
+    return store.kind === 'live' ? this.pointCount : store.geometry.positions.length / store.geometry.dimension;
+  }
+
+  /**
+   * The levels of detail a store can draw before (or without) its tree's
+   * order: `RankLevels` when its slots hold the open cells by rank (the open
+   * cells are in priority order and the store holds source order or a
+   * ranked order), else null. Made once per order the store holds.
+   *
+   * @param {{kind: 'live'}|{kind: 'geometry', geometry: object}} store
+   * @param {object|null} bounds - The geometry's box (null: the live one's).
+   * @returns {RankLevels|null}
+   * @private
+   */
+  _rankLevelsOf(store, bounds = null) {
+    if (this._cellPriority.seed !== null) return null;
+    const order = this._storeOrder(store);
+    if (order !== null && !order.ranked) return null;
+    const positions = store.kind === 'live' ? this._positions : store.geometry.positions;
+    const pointCount = this._storePointCount(store);
+    if (!(positions instanceof Float32Array) || pointCount === 0) return null;
+    const key = order ?? positions;
+    this._rankLevels ??= new WeakMap();
+    let levels = this._rankLevels.get(key);
+    if (levels === undefined || levels.pointCount !== pointCount || levels.priority !== this._cellPriority) {
+      const box = bounds ?? this._boundingSphere?.bounds;
+      if (!box) return null;
+      levels = new RankLevels(
+        pointCount,
+        store.kind === 'live' ? this.currentDimensionLevel : store.geometry.dimension,
+        box,
+        () => (order === null ? null : order.slotSources())
+      );
+      levels.priority = this._cellPriority;
+      this._rankLevels.set(key, levels);
+    }
+    return levels;
+  }
+
+  /**
+   * Move a store toward `drawOrder` by up to `budget` points (at least one
+   * band), or adopt it whole when the store cannot change order by bands.
+   * @returns {{order: StoreOrder, moved: number}} The order the store holds
+   *   now, and the points put in order.
+   * @private
+   */
+  _advanceStoreOrder(store, current, drawOrder, budget) {
+    if (store.kind === 'live') this._flushPendingPositionUpload();
+    const pointCount = this._storePointCount(store);
+    const byBands = drawOrder.ranked === true && drawOrder.pointCount === pointCount && (current === null || current.ranked);
+    if (!byBands) {
+      return { order: this._adoptDrawOrder(store, drawOrder), moved: pointCount };
+    }
+    const label = this._storeLabel(store);
+    const buffer = store.kind === 'live' ? this.buffers.positions : store.geometry.positionBuffer;
+    // A failed band, or a failed allocation checked in a later frame, puts
+    // the store back in source order and says so (`_storeOrderWriteFailed`).
+    const onError = error => this._storeOrderWriteFailed(store, buffer, drawOrder, error);
+    // The bands' checks are read once, when the store holds the order whole
+    // or has given it up: each read waits for a whole frame of commands in
+    // Chromium (`deferWebGLErrorCheck`, `readAfter`).
+    const readAfter = () => {
+      const held = this._storeOrder(store);
+      return held === null || held.target !== drawOrder || held.complete;
+    };
+    let state = current;
+    if (state === null || state.target !== drawOrder) {
+      // The slots the store holds in an earlier order keep it (`base`) until
+      // their bands are taken. The earlier order's slot map holds exactly
+      // that mapping below its `orderedSlots`, so it is taken over when it
+      // is large enough (a store cut, or taking a new tree's order); else a
+      // new map is made and the earlier mapping written into it.
+      const baseEnd = current?.orderedSlots ?? 0;
+      const base = baseEnd > 0 ? current.slotSources() : null;
+      const reuse = current !== null && current.map.texture !== null && current.map.plan.itemCount >= pointCount;
+      const map = reuse ? current.map : this._createStoreOrderMap(pointCount, label, onError);
+      let started;
+      try {
+        if (!reuse && baseEnd > 0) this._writeStoreOrderMap(map, base, 0, baseEnd, label);
+        started = new StoreOrder({ pointCount, target: drawOrder, adopted: 0, base, baseEnd, map, ranked: true });
+      } catch (error) {
+        if (!reuse) {
+          this._queueDataRetirement({ textures: [{ handle: map.texture, byteLength: map.byteLength }] });
+          this._drainDataRetirements();
+        }
+        throw error;
+      }
+      // Colour stores kept for the earlier orders of a map taken over hold
+      // orders no store will take again.
+      if (reuse) this._dropKeptColorStoresOf(map);
+      // The slots hold what they held: the colour stores in step with the
+      // store are in step with the new description too.
+      for (const target of this._colorTargetsOf(store)) {
+        if (target.order === current) target.follow(started);
+      }
+      this._setStoreOrder(store, started);
+      this._retireStoreOrder(current, started);
+      state = started;
+    }
+    const positions = store.kind === 'live' ? this._positions : store.geometry.positions;
+    const dimension = store.kind === 'live' ? this.currentDimensionLevel : store.geometry.dimension;
+    const positionWords = new Uint32Array(positions.buffer, positions.byteOffset, positions.length);
+    const bandEnds = drawOrder.bandEnds;
+    // One source texture for every band of the adoption, allocated (and its
+    // allocation read back) once; each band's errors are read on a later
+    // frame (`deferWebGLErrorCheck`), so no band waits for the GPU.
+    let widestBand = 0;
+    for (let index = 0, previous = 0; index < bandEnds.length; previous = bandEnds[index], index++) {
+      widestBand = Math.max(widestBand, bandEnds[index] - previous);
+    }
+    const permuter = this._getPermuter();
+    permuter.holdRangeSource(widestBand * Math.max(dimension, 1), { onError });
+    let band = 0;
+    let moved = 0;
+    while (state.adopted < pointCount && moved < budget) {
+      const first = state.adopted;
+      while (bandEnds[band] <= first) band++;
+      const end = bandEnds[band];
+      // Every band is gathered from the store itself (copied on the GPU, one
+      // pass: a band is at most `DRAW_BAND_POINTS`, under a segment) when
+      // its slots hold its own cells: in rank order, or in an earlier
+      // order's (`base`, a tree's order kept below a cut), whose band holds
+      // the same ranks. Only a band wider than one pass reads page memory.
+      const inStore = end - first <= this._storeSegmentPoints();
+      const inBase = inStore && first < state.baseEnd;
+      // The gather reads each slot's source through the map: for a band in
+      // an earlier order it names, for the gather only, the slot of that
+      // order holding the cell the new order puts there (`gather`), and
+      // the cell itself once the band is written (below).
+      const earlierSlots = inBase ? earlierSlotsOf(state.base, state.baseEnd, drawOrder.indices, first, end) : null;
+      this._writeStoreOrderMap(state.map, earlierSlots ?? drawOrder.indices, first, end, label, inBase ? first : 0);
+      const next = new StoreOrder({
+        pointCount,
+        target: drawOrder,
+        adopted: end,
+        base: state.base,
+        baseEnd: state.baseEnd,
+        map: state.map,
+        ranked: true,
+      });
+      const gather = earlierSlots === null ? next : {
+        texture: state.map.texture,
+        plan: state.map.plan,
+        orderedSlots: next.orderedSlots,
+        sourceOf: slot => (slot >= first && slot < end ? earlierSlots[slot - first] : next.sourceOf(slot)),
+      };
+      // The band's cells are its own ranks: each gather reads only them.
+      permuter.writeWordsRange(
+        buffer, first, end,
+        inStore ? { buffer } : positionWords.subarray(first * dimension, end * dimension),
+        gather, dimension, { onError, readAfter }
+      );
+      for (const target of this._colorTargetsOf(store)) {
+        if (target.order !== state) continue;
+        permuter.writeWordsRange(
+          target.buffer, first, end,
+          inStore ? { buffer: target.buffer } : colorWordsOf(target.source).subarray(first, end),
+          gather, 1, { onError, readAfter }
+        );
+        target.follow(next);
+      }
+      if (earlierSlots !== null) this._writeStoreOrderMap(state.map, drawOrder.indices, first, end, label);
+      this._setStoreOrder(store, next);
+      state = next;
+      moved += end - first;
+    }
+    this._drainDataRetirements();
+    if (state.complete) {
+      permuter.releaseRangeSource();
+      this._refreshGpuMemoryStats();
+    }
+    return { order: state, moved };
+  }
+
+  /**
+   * A band of a store taking a draw order failed on the GPU, read a frame or
+   * more after it was written (`writeWordsRange`'s deferred check). If the
+   * store is still the one written, its slots may hold anything there: the
+   * store is written again in source order from page memory (its positions;
+   * the colours follow at the next frame), the order is given up (said
+   * once, not tried again until LOD or culling is toggled) and the view draws
+   * as a store in source order does.
+   * @private
+   */
+  _storeOrderWriteFailed(store, buffer, drawOrder, error) {
+    if (this._disposed === true || this._contextLost === true) return;
+    const stillWritten = store.kind === 'live'
+      ? this.buffers.positions === buffer
+      : store.geometry.positionBuffer === buffer;
+    if (!stillWritten) return;
+    this._adoptionFailures ??= new WeakSet();
+    this._adoptionFailures.add(drawOrder);
+    const positions = store.kind === 'live' ? this._positions : store.geometry.positions;
+    const previous = this._storeOrder(store);
+    buffer.write(positions);
+    this._setStoreOrder(store, null);
+    this._retireStoreOrder(previous, null);
+    if (store.kind === 'live') this._colorsDirty = true;
+    for (const target of this._colorTargetsOf(store)) {
+      if (target.key !== this) target.follow(STALE_STORE_ORDER);
+    }
+    this._permuter?.releaseRangeSource();
+    this._drainDataRetirements();
+    getNotificationCenter().error(
+      `Culling and the tree's draw order are off for the ${store.kind === 'live' ? 'live view' : 'kept views of a representation'}: `
+        + `putting its ${formatCountOf(drawOrder.pointCount, 'point')} in draw order failed on the GPU (${describeError(error)}). `
+        + 'It is drawn in source order.'
+    );
+    this.onAsyncTreeReady?.();
+  }
+
+  /** @private */
+  _setStoreOrder(store, order) {
+    if (store.kind === 'live') {
+      this._liveOrder = order;
+    } else {
+      store.geometry.order = order;
+    }
   }
 
   /**
@@ -5810,9 +6351,13 @@ export class HighPerfRenderer {
   /**
    * The colour streams that must follow a store's order: the live colours
    * and every kept view of the live geometry for the live store; every kept
-   * view of a pooled geometry for that geometry.
+   * view of a pooled geometry for that geometry. Each names the order its
+   * store holds now (`order`; undefined for live colours waiting to be
+   * published, which are written whole in the store's order then) and
+   * records a new one (`follow`).
    *
-   * @returns {Array<{key: object, source: Uint8Array, buffer: WebGLBuffer, byteLength: number}>}
+   * @returns {Array<{key: object, source: Uint8Array, buffer: PointStore, byteLength: number,
+   *   order: StoreOrder|null|undefined, follow: (order: StoreOrder) => void}>}
    * @private
    */
   _colorTargetsOf(store) {
@@ -5823,6 +6368,10 @@ export class HighPerfRenderer {
         source: this._colors,
         buffer: this.buffers.colors,
         byteLength: this._colorGpuByteLength,
+        order: this._colorsDirty ? undefined : this._liveColorOrder,
+        follow: order => {
+          this._liveColorOrder = order;
+        },
       });
     }
     for (const snapshot of this.snapshotBuffers.values()) {
@@ -5842,57 +6391,57 @@ export class HighPerfRenderer {
         source: snapshot.colors,
         buffer: owner.buffer,
         byteLength: owner.byteLength,
+        order: owner.order ?? null,
+        follow: order => {
+          owner.order = order;
+        },
       });
     }
     return targets;
   }
 
   /**
-   * Re-order a store and every colour stream of its views in place, now.
-   * Each stream records its own order as it is written, so a failure part
-   * way leaves every stream consistent with the order it says it holds (a
-   * colour store left behind is regathered by the next frame).
+   * Put a store and every colour stream of its views in `drawOrder` whole,
+   * now: a store whose slots do not hold its cells by rank (see "STORE
+   * ORDERS"). Each stream records its own order as it is written, so a
+   * failure part way leaves every stream consistent with the order it says
+   * it holds (a colour store left behind is regathered by the next frame).
+   * @returns {StoreOrder}
    * @private
    */
   _adoptDrawOrder(store, drawOrder) {
     const label = this._storeLabel(store);
     const previous = this._storeOrder(store);
-    const record = this._createDrawOrderRecord(drawOrder, label);
+    const record = this._createStoreOrder(drawOrder, label);
     const positions = store.kind === 'live' ? this._positions : store.geometry.positions;
     const dimension = store.kind === 'live' ? this.currentDimensionLevel : store.geometry.dimension;
     const buffer = store.kind === 'live' ? this.buffers.positions : store.geometry.positionBuffer;
     const targets = this._colorTargetsOf(store);
-    // The gather rewrites the whole store. A store still in source order and
-    // written is its own source, copied on the GPU; a live store
-    // whose upload is still pending is not uploaded first, its words go
-    // straight to the gather; a store in another draw order takes its words
-    // from page memory.
-    const uploadPending = store.kind === 'live' && this._positionsUploadPending === true;
-    const source = previous === null && !uploadPending
-      ? { buffer, words: positions.length }
-      : new Uint32Array(positions.buffer, positions.byteOffset, positions.length);
+    // The gather rewrites the whole store. A store still in source order is
+    // its own source, copied on the GPU; a store in another order takes its
+    // words from page memory. Above one gather chunk every source is read
+    // from page memory a chunk at a time (`GpuPermuter#writeWords`).
+    const pageWords = new Uint32Array(positions.buffer, positions.byteOffset, positions.length);
+    const source = previous === null
+      ? { buffer, words: positions.length, page: pageWords }
+      : pageWords;
     try {
       this._getPermuter().writeWords(buffer, source, record, dimension);
       // A gather into the accepted position store: nothing to read back.
       requireLiveContext(this.gl, `${label} positions`);
     } catch (error) {
-      this._retireDrawOrderRecord(record);
+      this._retireStoreOrder(record, null);
       this._drainDataRetirements();
       throw error;
     }
-    if (uploadPending) this._positionsUploadPending = false;
-    if (store.kind === 'live') {
-      this._liveOrder = record;
-    } else {
-      store.geometry.order = record;
-    }
-    this._retireDrawOrderRecord(previous);
+    this._setStoreOrder(store, record);
+    this._retireStoreOrder(previous, record);
     for (const target of targets) {
-      if (target.key === this && this._liveColorOrder === null && !this._colorsDirty) {
+      if (target.key === this && target.order === null) {
         // The live colours, written in source order: copied on the GPU.
         this._getPermuter().writeWords(
           target.buffer,
-          { buffer: target.buffer, words: target.source.length / 4 },
+          { buffer: target.buffer, words: target.source.length / 4, page: colorWordsOf(target.source) },
           record,
           1
         );
@@ -5900,12 +6449,8 @@ export class HighPerfRenderer {
       } else {
         this._writeTargetColors(target, target.buffer, record, label);
       }
-      if (target.key === this) {
-        this._liveColorOrder = drawOrder;
-        this._colorsDirty = false;
-      } else {
-        target.key.order = drawOrder;
-      }
+      target.follow(record);
+      if (target.key === this) this._colorsDirty = false;
     }
     this._drainDataRetirements();
     this._refreshGpuMemoryStats();
@@ -6009,10 +6554,10 @@ export class HighPerfRenderer {
   _swapColorStore(cache, current, order, label) {
     const gl = this.gl;
     const now = performance.now();
-    const drawOrder = order?.drawOrder ?? null;
-    let entry = cache.get(drawOrder) ?? null;
+    const wanted = order ?? null;
+    let entry = cache.get(wanted) ?? null;
     if (entry !== null && entry.source !== current.source) {
-      cache.delete(drawOrder);
+      cache.delete(wanted);
       this._retireBuffer(entry.buffer, entry.byteLength);
       entry = null;
     }
@@ -6025,21 +6570,12 @@ export class HighPerfRenderer {
     });
     let buffer;
     if (entry !== null) {
-      cache.delete(drawOrder);
+      cache.delete(wanted);
       buffer = entry.buffer;
     } else {
-      buffer = gl.createBuffer();
-      if (!buffer) {
-        cache.delete(current.order);
-        throw new Error(`${label} could not allocate a colour store.`);
-      }
+      buffer = this._newPointStore();
       try {
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-        try {
-          this._allocateVertexStore(current.byteLength, gl.DYNAMIC_DRAW, current.byteLength / 4, label);
-        } finally {
-          gl.bindBuffer(gl.ARRAY_BUFFER, null);
-        }
+        this._allocatePointStore(buffer, 4, current.byteLength / 4, gl.DYNAMIC_DRAW, label);
         this._writeTargetColors({ source: current.source }, buffer, order, label);
       } catch (error) {
         cache.delete(current.order);
@@ -6059,9 +6595,9 @@ export class HighPerfRenderer {
    * @private
    */
   _ensureLiveColorsInOrder() {
-    const drawOrder = this._liveOrder?.drawOrder ?? null;
-    if (this._liveColorOrder === drawOrder && !this._colorsDirty) return;
-    if (this._liveColorOrder !== drawOrder && !this._colorsDirty) {
+    const order = this._liveOrder ?? null;
+    if (this._liveColorOrder === order && !this._colorsDirty) return;
+    if (this._liveColorOrder !== order && !this._colorsDirty && !sameStoreOrders(this._liveColorOrder, order)) {
       // The live view now shows another geometry: keep the store it leaves,
       // and draw with the one kept for this order (or a new one).
       const gl = this.gl;
@@ -6077,17 +6613,15 @@ export class HighPerfRenderer {
         'HighPerfRenderer live colour store'
       );
       this.buffers = { ...this.buffers, colors: buffer };
-      gl.bindVertexArray(this.vao);
-      this._bindPointAttributes(this.buffers.positions, buffer, this.currentDimensionLevel);
-      gl.bindVertexArray(null);
-      this._liveColorOrder = drawOrder;
+      this.vao.setColors(buffer);
+      this._liveColorOrder = order;
       return;
     }
     this._publishLiveColors();
   }
 
   /**
-   * The draw-order record of the geometry a snapshot draws now: the live
+   * The store order of the geometry a snapshot draws now: the live
    * store's for a snapshot of the live geometry, else its pooled geometry's,
    * re-ordered into `tree`'s order first when given.
    *
@@ -6111,13 +6645,18 @@ export class HighPerfRenderer {
   /**
    * Make one snapshot's colour store follow the order of its geometry.
    * @param {object} snapshot
-   * @param {object|null} order - The geometry's draw-order record.
+   * @param {StoreOrder|null} order - The order the geometry's store holds.
    * @private
    */
   _ensureSnapshotColorsInOrder(snapshot, order) {
     const owner = this._ensureSnapshotColorOwner(snapshot);
-    const drawOrder = order?.drawOrder ?? null;
-    if ((owner.order ?? null) === drawOrder) return;
+    if ((owner.order ?? null) === (order ?? null)) return;
+    if (sameStoreOrders(owner.order ?? null, order ?? null)) {
+      // An earlier step of the same store's order: rewritten in place.
+      this._writeOrderedColors(owner.buffer, snapshot.colors, order, `HighPerfRenderer view "${snapshot.id}" colour store`);
+      owner.order = order;
+      return;
+    }
     if (!(snapshot.colorCache instanceof Map)) snapshot.colorCache = new Map();
     // The view now shows another geometry: keep the store it leaves, and
     // draw with the one kept for this order (or a new one).
@@ -6134,25 +6673,21 @@ export class HighPerfRenderer {
       `HighPerfRenderer view "${snapshot.id}" colour store`
     );
     owner.buffer = buffer;
-    owner.order = drawOrder;
+    owner.order = order ?? null;
     snapshot.buffer = buffer;
-    gl.bindVertexArray(snapshot.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-    gl.bindVertexArray(null);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    snapshot.vao.setColors(buffer);
   }
 
   /**
-   * Bind the source-order alpha texture and, when the points are stored in a
-   * draw order, the permutation that maps a stored slot back to its source
-   * index (texture unit 1); otherwise the dummy R32UI texture.
+   * Bind the source-order alpha texture and, when the points are stored in
+   * another order, the slot map that gives a stored slot's source index
+   * below `orderedSlots` (texture unit 1); otherwise the dummy R32UI texture.
    *
    * @param {WebGL2RenderingContext} gl
    * @param {object} uniforms
    * @param {WebGLTexture|null} alphaTexture - null: per-vertex alpha.
    * @param {object|null} alphaPlan - Linear-texture layout of `alphaTexture`.
-   * @param {object|null} order - Draw-order record of the drawn geometry.
+   * @param {StoreOrder|null} order - The order the drawn store holds.
    * @private
    */
   _bindPointAlpha(gl, uniforms, alphaTexture, alphaPlan, order) {
@@ -6164,13 +6699,13 @@ export class HighPerfRenderer {
     if (uniforms.u_alphaTex !== null) gl.uniform1i(uniforms.u_alphaTex, 0);
     if (alphaTexture !== null) setLinearLayoutUniform(gl, uniforms.u_alphaLayout, alphaPlan);
     if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, alphaTexture !== null ? 1 : 0);
-    const permutation = alphaTexture !== null && order !== null ? order : null;
+    const permutation = alphaTexture !== null && order !== null && order.orderedSlots > 0 ? order : null;
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, permutation !== null ? permutation.texture : this._dummyLodIndexTexture);
     if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
     if (permutation !== null) setLinearLayoutUniform(gl, uniforms.u_lodIndexLayout, permutation.plan);
-    if (uniforms.u_useLodIndexTex !== null) {
-      gl.uniform1i(uniforms.u_useLodIndexTex, permutation !== null ? 1 : 0);
+    if (uniforms.u_orderedSlots !== null) {
+      gl.uniform1i(uniforms.u_orderedSlots, permutation !== null ? permutation.orderedSlots : 0);
     }
   }
 
@@ -6263,6 +6798,56 @@ export class HighPerfRenderer {
   }
 
   /**
+   * Choose the levels of detail a view draws with and its level this frame.
+   *
+   * The tree's levels, with culling, once the store holds the tree's order
+   * whole (`ordered`); before that, `rankLevels()` when the store's slots
+   * hold the cells by rank (`RankLevels`: the same cells a level, drawn as a
+   * prefix of the store as it is); else full detail. The forced level (the
+   * slider, or `forceLOD`) is clamped to the ladder, whose length follows
+   * the cell count. The view records the level drawn and the levels it came
+   * from (`lodLevels`), which every reader of the current level asks
+   * (`_lodLevelsForView`).
+   *
+   * @returns {{levels: SpatialIndex|RankLevels|null, lodLevel: number, ordered: boolean}}
+   * @private
+   */
+  _selectDrawLevels(viewState, { tree, order, rankLevels, forceLOD, cameraDistance, dimensionLevel, overrideBounds }) {
+    const ordered = tree !== null && order?.drawOrder === tree.drawOrder;
+    let levels = null;
+    if (ordered && spatialIndexHasLod(tree)) levels = tree;
+    else if (rankLevels !== null) levels = rankLevels();
+    viewState.lodConverging = false;
+    let lodLevel;
+    if (this.useAdaptiveLOD) {
+      // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
+      lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
+      if (lodLevel < 0 && levels !== null) {
+        // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
+        lodLevel = levels.getLODLevel(cameraDistance, viewState.lastLodLevel, dimensionLevel, overrideBounds);
+        viewState.lodConverging =
+          levels.getLODLevel(cameraDistance, lodLevel, dimensionLevel, overrideBounds) !== lodLevel;
+      }
+    } else {
+      // LOD disabled: only an explicit per-render forceLOD, otherwise full detail.
+      lodLevel = forceLOD >= 0 ? forceLOD : -1;
+    }
+    if (!Number.isInteger(lodLevel) || lodLevel < -1) {
+      throw new RangeError(`HighPerfRenderer selected an invalid LOD level ${String(lodLevel)}.`);
+    }
+    if (levels === null) {
+      // The levels are not there yet: full detail until they are.
+      lodLevel = -1;
+    } else if (lodLevel >= levels.lodLevels.length) {
+      lodLevel = levels.lodLevels.length - 1;
+    }
+    // Every consumer reads the level actually drawn.
+    viewState.lastLodLevel = lodLevel;
+    viewState.lodLevels = lodLevel >= 0 ? levels : null;
+    return { levels, lodLevel, ordered };
+  }
+
+  /**
    * Draw one view's points from a vertex array holding them in `order`.
    *
    * Full detail without culling draws every stored point; a reduced level
@@ -6273,11 +6858,12 @@ export class HighPerfRenderer {
    * @param {object} draw
    * @param {object} draw.params - The render contract.
    * @param {object} draw.viewState
-   * @param {WebGLVertexArrayObject} draw.vao
+   * @param {SegmentedVertexArray} draw.vao - One VAO a store segment.
    * @param {number} draw.pointCount
    * @param {object|null} draw.order - Draw-order record of the geometry.
-   * @param {SpatialIndex|null} draw.tree - The tree `order` comes from.
-   * @param {number} draw.lodLevel - -1 or a level of `tree`.
+   * @param {SpatialIndex|null} draw.tree - The tree culled ranges come from.
+   * @param {SpatialIndex|RankLevels|null} draw.levels - The levels `lodLevel` is one of.
+   * @param {number} draw.lodLevel - -1 or a level of `levels`.
    * @param {boolean} draw.cull - Whether frustum culling applies.
    * @param {boolean} draw.frustumChanged
    * @param {WebGLTexture|null} draw.alphaTexture
@@ -6287,14 +6873,19 @@ export class HighPerfRenderer {
    */
   _drawPoints(draw) {
     const gl = this.gl;
-    const { params, viewState, order, tree, lodLevel, cull } = draw;
-    const level = lodLevel >= 0 ? tree?.lodLevels?.[lodLevel] ?? null : null;
+    const { params, viewState, order, tree, levels, lodLevel, cull } = draw;
+    const level = lodLevel >= 0 ? levels?.lodLevels?.[lodLevel] ?? null : null;
     if (lodLevel >= 0 && level === null) {
       throw new RangeError(`${draw.label} has no LOD level ${lodLevel}.`);
     }
     const reduced = level !== null && level.isFullDetail !== true;
-    if ((reduced || cull) && (order === null || tree === null || order.drawOrder !== tree.drawOrder)) {
-      throw new Error(`${draw.label} draws a reduced level or culled ranges without its tree's draw order.`);
+    if (cull && (order === null || tree === null || order.drawOrder !== tree.drawOrder)) {
+      throw new Error(`${draw.label} draws culled ranges without its tree's draw order.`);
+    }
+    if (reduced && (levels === tree
+      ? order === null || order.drawOrder !== tree.drawOrder
+      : order !== null && !order.ranked)) {
+      throw new Error(`${draw.label} draws a reduced level from a store that does not hold its cells.`);
     }
     const sizeMultiplier = reduced ? requireFiniteNumber(level.sizeMultiplier, `${draw.label} LOD size`) : 1;
     const drawn = reduced ? level.pointCount : draw.pointCount;
@@ -6302,7 +6893,7 @@ export class HighPerfRenderer {
     let ranges = null;
     if (cull) {
       const state = viewState.cull;
-      const lastBand = reduced ? lodLevel : order.drawOrder.bandCount - 1;
+      const lastBand = tree.lastBandOf(reduced ? lodLevel : -1);
       const treeChanged = state.tree !== tree || state.drawOrder !== order.drawOrder;
       if (draw.frustumChanged || treeChanged) {
         this._validateSpatialOwnerOnce(tree);
@@ -6335,19 +6926,32 @@ export class HighPerfRenderer {
     let operationError = null;
     try {
       this._bindPointAlpha(gl, uniforms, draw.alphaTexture, draw.alphaPlan, order);
-      gl.bindVertexArray(draw.vao);
+      // One draw (or one multi-draw) a store segment, in slot order: the
+      // same points in the same order as one draw over one buffer.
+      const vertexArrays = draw.vao;
+      const setSlotBase = first => {
+        if (uniforms.u_slotBase !== null) gl.uniform1i(uniforms.u_slotBase, first);
+      };
       if (ranges === null) {
-        drawCalls = drawPointsInSegments(gl, 0, drawn);
+        drawCalls = vertexArrays.drawRange(0, drawn, setSlotBase, drawPointsInSegments);
       } else if (ranges.rangeCount > 0) {
         const multiDraw = this._getMultiDraw();
-        if (multiDraw !== null) {
-          multiDraw.multiDrawArraysWEBGL(gl.POINTS, ranges.starts, 0, ranges.counts, 0, ranges.rangeCount);
-          drawCalls = 1;
-        } else {
-          for (let range = 0; range < ranges.rangeCount; range++) {
-            drawCalls += drawPointsInSegments(gl, ranges.starts[range], ranges.counts[range]);
+        this._segmentRanges ??= {};
+        splitRangesBySegment(
+          vertexArrays.segments, ranges.starts, ranges.counts, ranges.rangeCount, this._segmentRanges,
+          (segment, starts, counts, rangeCount) => {
+            gl.bindVertexArray(vertexArrays.vaos[segment]);
+            setSlotBase(vertexArrays.segments[segment].first);
+            if (multiDraw !== null) {
+              multiDraw.multiDrawArraysWEBGL(gl.POINTS, starts, 0, counts, 0, rangeCount);
+              drawCalls += 1;
+            } else {
+              for (let range = 0; range < rangeCount; range++) {
+                drawCalls += drawPointsInSegments(gl, starts[range], counts[range]);
+              }
+            }
           }
-        }
+        );
       }
     } catch (error) {
       operationError = error;
@@ -6395,8 +6999,10 @@ export class HighPerfRenderer {
 
     // Nothing is built here: each view's levels are built off the main
     // thread when it next draws (`_requestSpatialIndex`), and the view draws
-    // full detail until they land. A build that failed is retried.
+    // full detail until they land. A build or an adoption that failed is
+    // retried.
     this._treeBuildFailures = new WeakMap();
+    this._adoptionFailures = new WeakSet();
     this.useAdaptiveLOD = enabled;
     if (!enabled && this.forceLODLevel >= 0) {
       this.forceLODLevel = -1;
@@ -6427,7 +7033,12 @@ export class HighPerfRenderer {
       useFrustumCulling: this.useFrustumCulling,
       forceLODLevel: this.forceLODLevel,
       lodLevelCount: spatialIndex?.lodLevels?.length ?? 0,
-      drawOrder: this._liveOrder === null ? 'source' : `${this._liveOrder.drawOrder.bandCount} bands`,
+      drawOrder: this._liveOrder === null
+        ? 'source'
+        : this._liveOrder.complete
+          ? `${formatCountOf(this._liveOrder.target.bandCount, 'band')}, ${formatCountOf(this._liveOrder.target.leafCount, 'unit')}`
+          : `taking an order: ${formatCount(this._liveOrder.adopted)} of ${formatCountOf(this.pointCount, 'slot')}`,
+      drawOrderComplete: this._liveOrder?.complete === true,
       spatialIndicesCount: this.spatialIndices.size,
       hasSpatialIndex: !!spatialIndex,
       spatialIndexPointCount: spatialIndex?.pointCount,
@@ -6462,6 +7073,7 @@ export class HighPerfRenderer {
 
     // As for LOD: trees are built off the main thread when views next draw.
     this._treeBuildFailures = new WeakMap();
+    this._adoptionFailures = new WeakSet();
     this.useFrustumCulling = enabled;
     for (const viewState of this._perViewState.values()) {
       this._invalidateViewStateRecord(viewState);
@@ -6484,6 +7096,59 @@ export class HighPerfRenderer {
       'HighPerfRenderer hasSpatialIndex dimensionLevel'
     );
     return this.spatialIndices.has(dim);
+  }
+
+  /**
+   * The priority of the published cells (`data/cell-priority.js`): the order
+   * every LOD level admits them in, so that each level is a uniform random
+   * sample of them. A dataset's cells are ranked under the default seed
+   * until this is set; its source says otherwise (a priority-ordered file, a
+   * subsample opened in its priority order) right after it is published.
+   * Levels built under another priority are dropped and built again by the
+   * next frame that needs them; trees without levels do not depend on it.
+   *
+   * @param {Readonly<{seed: number|null, originals: Uint32Array|null}>} priority
+   */
+  setCellPriority(priority) {
+    this._assertOperational('set the cell priority');
+    const exact = requireCellPriority(priority, this.pointCount);
+    if (exact === this._cellPriority) return;
+    this._cellPriority = exact;
+    // Levels admit cells by the priority, so trees with levels go; so do
+    // trees whose order is not banded by open position when the cells are
+    // now in priority order: a store holding one could neither draw levels
+    // by rank nor take the next order band by band.
+    const inPriorityOrder = exact.seed === null;
+    const keep = index => !spatialIndexHasLod(index)
+      && !(inPriorityOrder && index.drawOrder !== null && index.drawOrder.ranked !== true);
+    let dropped = false;
+    const live = new Map();
+    for (const [dimension, index] of this.spatialIndices) {
+      if (keep(index)) live.set(dimension, index);
+      else dropped = true;
+    }
+    if (dropped) this.spatialIndices = live;
+    for (const snapshot of this.snapshotBuffers.values()) {
+      if (snapshot.spatialIndex != null && !keep(snapshot.spatialIndex)) {
+        snapshot.spatialIndex = null;
+        dropped = true;
+      }
+    }
+    for (const geometry of this._snapshotGeometryPools?.values?.() ?? []) {
+      if (!(geometry?.spatialIndices instanceof Map)) continue;
+      for (const [key, index] of geometry.spatialIndices) {
+        if (!keep(index)) {
+          geometry.spatialIndices.delete(key);
+          dropped = true;
+        }
+      }
+    }
+    if (dropped) this.onAsyncTreeReady?.();
+  }
+
+  /** The priority LOD levels admit the published cells in (`setCellPriority`). */
+  getCellPriority() {
+    return this._cellPriority;
   }
 
   // ==========================================================================
@@ -6636,8 +7301,10 @@ export class HighPerfRenderer {
     }
     this._treeBuilds ??= new WeakMap();
     this._treeBuildFailures ??= new WeakMap();
+    const priority = this._cellPriority;
     const inflight = this._treeBuilds.get(positions);
-    if (inflight && (inflight.needsLOD || !needsLOD)) {
+    if (inflight && (inflight.needsLOD || !needsLOD) && (!needsLOD || inflight.priority === priority)
+      && !builtUnderStalePriority(inflight.priority, inflight.needsLOD, priority)) {
       if (settled) inflight.settled.push(settled);
       return;
     }
@@ -6656,14 +7323,18 @@ export class HighPerfRenderer {
     const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
     const label = target.kind === 'live' ? 'live view' : 'a kept view';
     const notifications = getNotificationCenter();
-    const build = { needsLOD, settled: settled ? [settled] : [] };
+    const build = { needsLOD, priority, settled: settled ? [settled] : [] };
     const finish = (installed, error = null) => {
       if (this._treeBuilds?.get(positions) === build) this._treeBuilds.delete(positions);
       for (const callback of build.settled) callback(installed, error);
     };
     let notifId = null;
     try {
-      requireLodBuildHeapHeadroom(pointCount, needsLOD, `HighPerfRenderer ${dimensionLevel}D ${label}`);
+      // The build runs in the tree worker wherever there is one
+      // (`_buildSpatialTreeJob`): this thread then only receives its result.
+      requireLodBuildHeapHeadroom(pointCount, needsLOD, `HighPerfRenderer ${dimensionLevel}D ${label}`, {
+        inWorker: typeof Worker === 'function',
+      });
     } catch (error) {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
       notifications.error(describeError(error));
@@ -6690,9 +7361,17 @@ export class HighPerfRenderer {
       finish(false);
     };
     try {
-      this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
+      this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, priority, result => {
         if (this._disposed === true || this._contextLost === true) {
           finish(false);
+          return;
+        }
+        // A tree built under a priority the cells no longer have, whose
+        // levels or order that priority decided (`builtUnderStalePriority`):
+        // the next frame that needs one asks again.
+        if (builtUnderStalePriority(priority, needsLOD, this._cellPriority)) {
+          cancelBuild();
+          this.onAsyncTreeReady?.();
           return;
         }
         let installed = false;
@@ -6742,12 +7421,15 @@ export class HighPerfRenderer {
    * longer drawn (`_cancelStaleSpatialTreeBuilds`).
    * @private
    */
-  _buildSpatialTreeJob(positions, dimensionLevel, buildLOD, onDone, onError, onCancel) {
+  _buildSpatialTreeJob(positions, dimensionLevel, buildLOD, priority, onDone, onError, onCancel) {
     const request = {
       dimensionLevel,
       buildLOD,
       maxPointsPerNode: this.options.LOD_MAX_POINTS_PER_NODE,
       maxDepth: this.options.LOD_MAX_DEPTH,
+      // The order LOD levels admit cells in; a ranked priority's original
+      // positions are copied to the worker with the build request.
+      priority: { seed: priority.seed, originals: buildLOD ? priority.originals : null },
     };
     if (typeof Worker !== 'function') {
       let result;
@@ -7046,7 +7728,7 @@ export class HighPerfRenderer {
   getViewDrawOrder(viewId) {
     const exactViewId = requireViewId(viewId, 'HighPerfRenderer draw-order viewId');
     if (exactViewId === 'live') {
-      return this._liveOrder?.drawOrder.indices ?? null;
+      return this._liveOrder?.slotSources() ?? null;
     }
     const snapshot = this.snapshotBuffers.get(exactViewId);
     if (!snapshot) {
@@ -7056,7 +7738,7 @@ export class HighPerfRenderer {
     if (geometry === undefined) {
       throw new Error(`HighPerfRenderer view "${exactViewId}" has no geometry owner.`);
     }
-    return this._geometryDrawOrder(geometry)?.indices ?? null;
+    return this._geometryOrderRecord(geometry)?.slotSources() ?? null;
   }
 
   /**
@@ -7069,18 +7751,16 @@ export class HighPerfRenderer {
    */
   /**
    * The position store a view draws from, as it is on the GPU now: its
-   * buffer, the components a point, the positions it holds, and the source
-   * point of each slot (`slotSources`, the store's draw order; null when it
-   * holds source order). Null while its bytes are not on the GPU yet. A
+   * buffer, the components a point, the positions it holds, and the order it
+   * holds them in (`order`, a `StoreOrder`; null for source order: slot `s`
+   * holds point `s`). Null while its bytes are not on the GPU yet. A
    * consumer that draws from the store keys what it derived on `buffer` and
-   * `slotSources`: a store re-ordered in place keeps its buffer and changes
-   * its order.
+   * `order`: a store re-ordered in place keeps its buffer and changes its
+   * order.
    *
    * @param {string} viewId
-   * `order` is the store's draw-order record (its permutation texture), or
-   * null.
-   *
-   * @returns {{buffer: WebGLBuffer, dimension: number, positions: Float32Array, slotSources: Uint32Array|null, order: object|null}|null}
+   * @returns {{buffer: PointStore, dimension: number, positions: Float32Array, order: StoreOrder|null}|null}
+   *   `buffer` is the segmented store (`high-perf/point-store-segments.js`).
    */
   getViewPointStore(viewId) {
     const exactViewId = requireViewId(viewId, 'HighPerfRenderer point-store viewId');
@@ -7092,7 +7772,6 @@ export class HighPerfRenderer {
         buffer: this.buffers.positions,
         dimension: this.currentDimensionLevel,
         positions: this._positions,
-        slotSources: this._liveOrder?.drawOrder.indices ?? null,
         order: this._liveOrder ?? null,
       };
     }
@@ -7102,7 +7781,6 @@ export class HighPerfRenderer {
       buffer: geometry.positionBuffer,
       dimension: geometry.dimension,
       positions: geometry.positions,
-      slotSources: geometry.order?.drawOrder.indices ?? null,
       order: geometry.order ?? null,
     };
   }
@@ -7189,16 +7867,25 @@ export class HighPerfRenderer {
       return this.isAlphaTextureActive();
     }
     const snapshot = this.snapshotBuffers.get(exactViewId);
+    // The texture holds the view's accepted transparency (null: every cell
+    // shown), one texel a cell in the plan it was made with.
     return Boolean(
       snapshot?.alphaTexture &&
-      snapshot?.alphaTexData instanceof Uint8Array &&
+      (
+        snapshot.alphas === null ||
+        (
+          snapshot.alphas instanceof Uint8Array &&
+          snapshot.alphas.length === snapshot.pointCount
+        )
+      ) &&
       Number.isSafeInteger(snapshot.alphaTexWidth) &&
       snapshot.alphaTexWidth > 0 &&
       Number.isSafeInteger(snapshot.alphaTexHeight) &&
       snapshot.alphaTexHeight > 0 &&
-      snapshot.alphaTexData.length ===
-        snapshot.alphaTexWidth * snapshot.alphaTexHeight &&
-      snapshot.alphaTextureByteLength === snapshot.alphaTexPlan?.texels
+      snapshot.alphaTexPlan?.width === snapshot.alphaTexWidth &&
+      snapshot.alphaTexPlan.rows === snapshot.alphaTexHeight &&
+      snapshot.alphaTexPlan.itemCount === snapshot.pointCount &&
+      snapshot.alphaTextureByteLength === snapshot.alphaTexPlan.texels
     );
   }
 
@@ -7238,6 +7925,22 @@ export class HighPerfRenderer {
   }
 
   /**
+   * The levels one view drew its current level from (`_selectDrawLevels`):
+   * its tree's, or the levels its store draws by rank (`RankLevels`); the
+   * view's tree when it has drawn no reduced level.
+   *
+   * @param {string} viewId
+   * @param {number} dimensionLevel
+   * @returns {SpatialIndex|RankLevels|null}
+   * @private
+   */
+  _lodLevelsForView(viewId, dimensionLevel) {
+    const drawn = this._perViewState.get(viewId)?.lodLevels ?? null;
+    if (drawn !== null && drawn.dimensionLevel === dimensionLevel) return drawn;
+    return this._getSpatialIndexForViewGeneration(viewId, dimensionLevel);
+  }
+
+  /**
    * Get the original point indices included in the current LOD level for a view.
    * Returns null when LOD is inactive (lodLevel < 0) or unavailable.
    *
@@ -7262,10 +7965,7 @@ export class HighPerfRenderer {
     if (lodLevel < 0) return null;
 
     const snapshot = this.snapshotBuffers.get(exactViewId);
-    const spatialIndex = this._getSpatialIndexForViewGeneration(
-      exactViewId,
-      dim
-    );
+    const spatialIndex = this._lodLevelsForView(exactViewId, dim);
 
     if (!spatialIndex) {
       if (
@@ -7326,10 +8026,7 @@ export class HighPerfRenderer {
     if (lodLevel < 0) return null;
 
     const snapshot = this.snapshotBuffers.get(exactViewId);
-    const spatialIndex = this._getSpatialIndexForViewGeneration(
-      exactViewId,
-      dim
-    );
+    const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     if (!spatialIndex) {
       if (
         snapshot !== undefined &&
@@ -7398,10 +8095,7 @@ export class HighPerfRenderer {
     );
     const lodLevel = this.getCurrentLODLevel(exactViewId);
     if (lodLevel < 0) return null;
-    const spatialIndex = this._getSpatialIndexForViewGeneration(
-      exactViewId,
-      dim
-    );
+    const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     const level = spatialIndex?.lodLevels?.[lodLevel];
     if (!level) {
       throw new Error(
@@ -7446,10 +8140,7 @@ export class HighPerfRenderer {
     );
     const lodLevel = this.getCurrentLODLevel(exactViewId);
     if (lodLevel < 0) return null;
-    const spatialIndex = this._getSpatialIndexForViewGeneration(
-      exactViewId,
-      dim
-    );
+    const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     const level = spatialIndex?.lodLevels?.[lodLevel];
     if (!level) {
       throw new Error(
@@ -7504,7 +8195,9 @@ export class HighPerfRenderer {
     );
     if (dim !== this.currentDimensionLevel) return 0;
     const tree = this._currentLiveTree();
-    return Array.isArray(tree?.lodLevels) ? tree.lodLevels.length : 0;
+    if (tree?.lodLevels?.length > 0) return tree.lodLevels.length;
+    // Before (or without) a tree, the levels the store draws by rank.
+    return this._rankLevelsOf(LIVE_STORE)?.lodLevels.length ?? 0;
   }
 
   /**
@@ -7532,8 +8225,15 @@ export class HighPerfRenderer {
    */
   getViewLODLevelCount(viewId, dimensionLevel) {
     this._assertOperational('get a view LOD level count');
-    const spatialIndex = this._getSpatialIndexForViewGeneration(viewId, dimensionLevel);
-    return Array.isArray(spatialIndex?.lodLevels) ? spatialIndex.lodLevels.length : 0;
+    const exactViewId = requireViewId(viewId, 'HighPerfRenderer view LOD level count viewId');
+    const spatialIndex = this._getSpatialIndexForViewGeneration(exactViewId, dimensionLevel);
+    if (spatialIndex?.lodLevels?.length > 0) return spatialIndex.lodLevels.length;
+    // Before (or without) a tree, the levels the store draws by rank.
+    const snapshot = this.snapshotBuffers.get(exactViewId);
+    const store = snapshot === undefined || this._snapshotUsesLiveGeometry(snapshot)
+      ? LIVE_STORE
+      : { kind: 'geometry', geometry: this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions) };
+    return this._rankLevelsOf(store, snapshot?.bounds ?? null)?.lodLevels.length ?? 0;
   }
 
   /**
@@ -7573,10 +8273,7 @@ export class HighPerfRenderer {
     );
     const lodLevel = this.getCurrentLODLevel(exactViewId);
     if (lodLevel < 0) return 1.0;
-    const spatialIndex = this._getSpatialIndexForViewGeneration(
-      exactViewId,
-      dim
-    );
+    const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     const level = spatialIndex?.lodLevels?.[lodLevel];
     if (!level) {
       throw new Error(
@@ -7613,7 +8310,6 @@ export class HighPerfRenderer {
     return {
       height: plan.rows,
       plan,
-      requiredSize: plan.width * plan.rows,
       width: plan.width,
     };
   }
@@ -7644,187 +8340,53 @@ export class HighPerfRenderer {
       colors,
       owner
     );
-    const byteLength = this.pointCount * 4;
-    this._allocateGpu(`${owner} could not allocate its color buffer`, () => {
-      gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.STATIC_DRAW);
-    });
+    const byteLength = this._allocatePointStore(buffer, 4, this.pointCount, gl.STATIC_DRAW, `${owner} colour store`);
     this._writeOrderedColors(
       buffer,
       exactColors,
       order,
       `${owner} color-buffer upload`
     );
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     return byteLength;
   }
 
 
   /**
-   * Encode one snapshot R8 generation into `target` and report whether any
-   * byte differs from `accepted` (or from `target` itself when null). With
-   * `dirtyRows` (one entry a row of `rowWidth` texels, cleared by the caller)
-   * the rows that differ are marked, so only they are uploaded.
+   * A kept view's published transparency: exactly 0 or 1 a cell, or null
+   * for every cell shown. It is kept by reference (`snapshot.alphas`) and is
+   * what the view's R8 texture holds, so no CPU copy of the image exists.
+   *
+   * @param {Uint8Array|null} alphas
+   * @param {string} owner
+   * @returns {Uint8Array|null}
    */
-  _encodeSnapshotAlphaData(
-    target,
-    colors,
-    alphas,
-    owner,
-    accepted = null,
-    dirtyRows = null,
-    rowWidth = 0
-  ) {
-    if (
-      !(target instanceof Uint8Array) ||
-      target.length < this.pointCount
-    ) {
-      throw new TypeError(
-        `${owner} R8 target must contain at least one byte per point.`
-      );
-    }
-    if (
-      accepted !== null &&
-      (
-        !(accepted instanceof Uint8Array) ||
-        accepted.length !== target.length
-      )
-    ) {
-      throw new TypeError(
-        `${owner} accepted R8 owner must match the padded target length.`
-      );
-    }
-    const exactColors = alphas === null
-      ? requireSnapshotColors(
-          this.pointCount,
-          colors,
-          owner
-        )
-      : null;
-    const exactAlphas = alphas === null
-      ? null
-      : requireSnapshotAlphas(
-        this.pointCount,
-        alphas,
-        owner
-      );
-    if (dirtyRows !== null) {
-      if (
-        accepted === null ||
-        !Number.isSafeInteger(rowWidth) ||
-        rowWidth <= 0 ||
-        !(dirtyRows instanceof Uint8Array) ||
-        dirtyRows.length * rowWidth !== target.length
-      ) {
-        throw new TypeError(
-          `${owner} dirty-row tracking needs the accepted owner and its exact row layout.`
-        );
-      }
-    }
-    // Row-major, so a moved row is marked without a division per point.
-    // Texels past the last point are padding, 255. Neither loop branches per
-    // cell: a colour's alpha byte is copied, and a 0/1 transparency byte
-    // becomes 0 or 255 four cells a word (`encodeAlphaSpan`, which names the
-    // first value above 1); every moved bit is ORed. Rows start on a word
-    // boundary (one row, or a power of two at least 2048 texels wide).
-    const reference = accepted === null ? target : accepted;
-    const pointCount = this.pointCount;
-    const width = dirtyRows === null ? target.length : rowWidth;
-    const words = exactAlphas === null
-      ? null
-      : alphaEncodingWords(exactAlphas, target, reference);
-    let changed = false;
-    for (let rowStart = 0, row = 0; rowStart < target.length; rowStart += width, row++) {
-      const rowEnd = Math.min(rowStart + width, target.length);
-      const pointEnd = Math.max(rowStart, Math.min(rowEnd, pointCount));
-      let moved = 0;
-      if (exactAlphas === null) {
-        for (let index = rowStart; index < pointEnd; index++) {
-          const byte = exactColors[index * 4 + 3];
-          moved |= byte ^ reference[index];
-          target[index] = byte;
-        }
-      } else {
-        const encoded = encodeAlphaSpan(exactAlphas, target, reference, words, rowStart, pointEnd);
-        if (encoded < 0) {
-          throw new RangeError(
-            `${owner} alpha value at index ${-encoded - 1} must be exactly 0 or 1.`
-          );
-        }
-        moved = encoded;
-      }
-      for (let index = pointEnd; index < rowEnd; index++) {
-        moved |= 255 ^ reference[index];
-        target[index] = 255;
-      }
-      if (moved !== 0) {
-        changed = true;
-        if (dirtyRows !== null) dirtyRows[row] = 1;
-      }
-    }
-    return changed;
-  }
-
-  _acquireSnapshotAlphaStaging(requiredSize) {
-    if (
-      !Number.isSafeInteger(requiredSize) ||
-      requiredSize < this.pointCount
-    ) {
+  _requireSnapshotTransparency(alphas, owner) {
+    if (alphas === null) return null;
+    requireSnapshotAlphas(this.pointCount, alphas, owner);
+    const index = firstNonBinaryByte(alphas);
+    if (index >= 0) {
       throw new RangeError(
-        'HighPerfRenderer snapshot alpha staging requires an exact padded texture size.'
+        `${owner} alpha value at index ${index} must be exactly 0 or 1.`
       );
     }
-    let staging = this._snapshotAlphaStagingData;
-    this._snapshotAlphaStagingData = null;
-    if (
-      !(staging instanceof Uint8Array) ||
-      staging.length !== requiredSize
-    ) {
-      staging = new Uint8Array(requiredSize);
-      staging.fill(255);
-    }
-    for (const snapshot of this.snapshotBuffers.values()) {
-      if (snapshot.alphaTexData === staging) {
-        throw new Error(
-          'HighPerfRenderer snapshot alpha staging aliases an accepted view owner.'
-        );
-      }
-    }
-    return staging;
+    return alphas;
   }
 
-  _donateSnapshotAlphaStaging(data) {
-    if (!(data instanceof Uint8Array)) return;
-    for (const snapshot of this.snapshotBuffers.values()) {
-      if (snapshot.alphaTexData === data) return;
-    }
-    if (
-      !(this._snapshotAlphaStagingData instanceof Uint8Array) ||
-      this._snapshotAlphaStagingData.length !== data.length
-    ) {
-      this._snapshotAlphaStagingData = data;
-    }
-  }
-
-  _releaseSnapshotScratchIfUnused() {
-    if (
-      !(this.snapshotBuffers instanceof Map) ||
-      this.snapshotBuffers.size !== 0
-    ) {
-      return;
-    }
-    this._snapshotAlphaStagingData = null;
-  }
-
+  /**
+   * Allocate a kept view's R8 texture into `staging` and write it whole from
+   * `alphas` (null: every cell shown), through the bounded row scratch.
+   * @private
+   */
   _uploadNewSnapshotAlphaTexture(
-    data,
+    alphas,
     plan,
     label,
     staging
   ) {
     if (
-      !(data instanceof Uint8Array) ||
+      (alphas !== null && (!(alphas instanceof Uint8Array) || alphas.length !== this.pointCount)) ||
       !plan ||
-      data.length !== plan.width * plan.rows ||
+      plan.itemCount !== this.pointCount ||
       !staging ||
       staging.alphaTexture !== null ||
       staging.alphaTextureByteLength !== 0
@@ -7848,7 +8410,7 @@ export class HighPerfRenderer {
         this._allocateGpu(`${label} could not allocate its R8 texture`, () => {
           allocateLinearTexture(gl, gl.R8, plan);
         });
-        writeLinearTextureRows(gl, plan, gl.RED, gl.UNSIGNED_BYTE, data, 1);
+        writeAlphaRows(gl, plan, alphas, this.pointCount, 0, plan.rows, this._alphaRowScratch());
         requireCleanWebGLState(gl, `${label} upload`);
       });
       staging.alphaTextureByteLength = plan.texels;
@@ -7866,7 +8428,8 @@ export class HighPerfRenderer {
    * geometry generation's shared immutable position VBO through its VAO.
    * @param {string} id - Unique snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
-   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency or null to use RGBA alpha.
+   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency, kept by
+   *   reference and never written (null: every cell shown).
    * @param {Float32Array} viewPositions - Exact positions owned by this view.
    * @param {number} dimensionLevel - Exact published view dimension.
    * @param {string} sourceViewId - Exact view that owns viewPositions.
@@ -7906,32 +8469,14 @@ export class HighPerfRenderer {
     const owner = `HighPerfRenderer snapshot "${exactId}"`;
     const alphaLayout =
       this._getSnapshotAlphaTextureLayout(n, owner);
-    const alphaData = this._acquireSnapshotAlphaStaging(
-      alphaLayout.requiredSize
+    const transparency = this._requireSnapshotTransparency(
+      pointData.alphas,
+      owner
     );
-    try {
-      this._encodeSnapshotAlphaData(
-        alphaData,
-        pointData.colors,
-        pointData.alphas,
-        owner
-      );
-    } catch (error) {
-      this._donateSnapshotAlphaStaging(alphaData);
-      this._releaseSnapshotScratchIfUnused();
-      throw error;
-    }
-    let geometry;
-    try {
-      geometry = this._acquireSnapshotGeometryFromSource(
-        sourceViewId,
-        pointData.positions
-      );
-    } catch (error) {
-      this._donateSnapshotAlphaStaging(alphaData);
-      this._releaseSnapshotScratchIfUnused();
-      throw error;
-    }
+    const geometry = this._acquireSnapshotGeometryFromSource(
+      sourceViewId,
+      pointData.positions
+    );
     // `requireSnapshotPointData` proved the source holds exactly
     // `exactDimensionLevel` components a point, so the geometry it names is
     // that dimension's.
@@ -7987,13 +8532,7 @@ export class HighPerfRenderer {
           `HighPerfRenderer snapshot "${exactId}"`,
           positionStaging
         );
-      colorBuffer = gl.createBuffer();
-      if (!colorBuffer) {
-        throw new Error(
-          `HighPerfRenderer could not allocate snapshot "${exactId}" color resources.`
-        );
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+      colorBuffer = this._newPointStore();
       colorBufferByteLength = this._uploadSnapshotColors(
         colorBuffer,
         pointData.colors,
@@ -8002,30 +8541,19 @@ export class HighPerfRenderer {
       );
 
       this._uploadNewSnapshotAlphaTexture(
-        alphaData,
+        transparency,
         alphaLayout.plan,
         `HighPerfRenderer snapshot "${exactId}" alpha`,
         alphaStaging
       );
 
-      vao = gl.createVertexArray();
-      if (!vao) {
-        throw new Error(
-          `HighPerfRenderer could not allocate snapshot "${exactId}" vertex resources.`
-        );
-      }
-      gl.bindVertexArray(vao);
-      bindPositionAttribute(gl, positionBuffer, geometry.dimension);
-      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-      gl.enableVertexAttribArray(1);
+      vao = new SegmentedVertexArray(gl);
+      vao.setStores(positionBuffer, colorBuffer, geometry.dimension);
       colorOwner = this._createSnapshotColorOwner(
         colorBuffer,
         colorBufferByteLength,
-        this._geometryDrawOrder(geometry)
+        this._geometryOrderRecord(geometry)
       );
-      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-      gl.bindVertexArray(null);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
       requireCleanWebGLState(
         gl,
         `HighPerfRenderer candidate snapshot "${exactId}" publication`
@@ -8067,15 +8595,11 @@ export class HighPerfRenderer {
       );
       rollback(() => gl.getError());
       if (rollbackFailures.length > 0) {
-        this._donateSnapshotAlphaStaging(alphaData);
-        this._releaseSnapshotScratchIfUnused();
         throw new AggregateError(
           [error, ...rollbackFailures],
           `HighPerfRenderer snapshot "${exactId}" creation failed with ${rollbackFailures.length} rollback error(s).`
         );
       }
-      this._donateSnapshotAlphaStaging(alphaData);
-      this._releaseSnapshotScratchIfUnused();
       throw error;
     }
 
@@ -8084,7 +8608,11 @@ export class HighPerfRenderer {
       // is never written (a recolor publishes a new one), and it is what the
       // colour store is gathered from when its geometry's draw order changes.
       colors: pointData.colors,
-      alphaTexData: alphaData,
+      // The published transparency, kept by reference for the same reason
+      // (null: every cell shown). It is what the R8 texture holds, so the
+      // rows an update moves are found by comparing with it, and a released
+      // texture is rebuilt from it: no CPU copy of the image is kept.
+      alphas: transparency,
       alphaTexHeight: alphaLayout.height,
       alphaTexPlan: alphaLayout.plan,
       alphaTexWidth: alphaLayout.width,
@@ -8129,7 +8657,8 @@ export class HighPerfRenderer {
    * owners while retaining unchanged publications by exact reference count.
    * @param {string} id - Snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
-   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency or null.
+   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency, kept by
+   *   reference (null: every cell shown).
    * @param {Float32Array} viewPositions - Exact positions owned by this view.
    * @param {number} dimensionLevel - Exact published view dimension.
    * @param {boolean} [forceGeometryPublication=false] - Treat even the same
@@ -8188,7 +8717,7 @@ export class HighPerfRenderer {
         `${owner} positions must be a Float32Array with exactly ${formatCountOf(n * exactDimensionLevel, 'value')} (${exactDimensionLevel} per point).`
       );
     }
-    let alphaData = null;
+    let transparency = null;
     let alphaLayout = null;
     if (replaceColor) {
       requireSnapshotColors(n, colors, owner);
@@ -8198,20 +8727,7 @@ export class HighPerfRenderer {
         n,
         owner
       );
-      alphaData = this._acquireSnapshotAlphaStaging(
-        alphaLayout.requiredSize
-      );
-      try {
-        this._encodeSnapshotAlphaData(
-          alphaData,
-          colors,
-          alphas,
-          owner
-        );
-      } catch (error) {
-        this._donateSnapshotAlphaStaging(alphaData);
-        throw error;
-      }
+      transparency = this._requireSnapshotTransparency(alphas, owner);
     }
     const acceptedColorOwner =
       this._ensureSnapshotColorOwner(snapshot);
@@ -8219,29 +8735,23 @@ export class HighPerfRenderer {
     const positionsChanged =
       forceGeometryPublication ||
       viewPositions !== snapshot.positions;
-    let candidateGeometry;
-    try {
-      // A forced publication re-uploads its own copy; otherwise a view
-      // switched to a representation another view shows (or showed lately)
-      // shares that geometry.
-      candidateGeometry = !positionsChanged
-        ? this._acquireSnapshotGeometryFromSource(
-            exactId,
-            viewPositions
+    // A forced publication re-uploads its own copy; otherwise a view
+    // switched to a representation another view shows (or showed lately)
+    // shares that geometry.
+    const candidateGeometry = !positionsChanged
+      ? this._acquireSnapshotGeometryFromSource(
+          exactId,
+          viewPositions
+        )
+      : forceGeometryPublication
+        ? this._acquireIndependentSnapshotGeometry(
+            viewPositions,
+            exactDimensionLevel
           )
-        : forceGeometryPublication
-          ? this._acquireIndependentSnapshotGeometry(
-              viewPositions,
-              exactDimensionLevel
-            )
-          : this._acquireSnapshotGeometryForPositions(
-              viewPositions,
-              exactDimensionLevel
-            );
-    } catch (error) {
-      this._donateSnapshotAlphaStaging(alphaData);
-      throw error;
-    }
+        : this._acquireSnapshotGeometryForPositions(
+            viewPositions,
+            exactDimensionLevel
+          );
     // The length check above proved `viewPositions` holds exactly
     // `exactDimensionLevel` components a point, so unchanged positions keep
     // the snapshot's dimension: the published dimension is the position
@@ -8300,13 +8810,7 @@ export class HighPerfRenderer {
           positionStaging
         );
       if (replaceColor) {
-        candidateBuffer = gl.createBuffer();
-        if (!candidateBuffer) {
-          throw new Error(
-            `HighPerfRenderer could not allocate candidate snapshot "${exactId}" color resources.`
-          );
-        }
-        gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
+        candidateBuffer = this._newPointStore();
         candidateBufferByteLength = this._uploadSnapshotColors(
           candidateBuffer,
           colors,
@@ -8320,41 +8824,23 @@ export class HighPerfRenderer {
       }
       if (replaceAlpha) {
         this._uploadNewSnapshotAlphaTexture(
-          alphaData,
+          transparency,
           alphaLayout.plan,
           `HighPerfRenderer candidate snapshot "${exactId}" alpha`,
           candidateAlpha
         );
       }
-      candidateVao = gl.createVertexArray();
-      if (!candidateVao) {
-        throw new Error(
-          `HighPerfRenderer could not allocate candidate snapshot "${exactId}" vertex resources.`
-        );
-      }
-      gl.bindVertexArray(candidateVao);
-      bindPositionAttribute(gl, positionBuffer, candidateGeometry.dimension);
-      gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
-      gl.enableVertexAttribArray(1);
+      candidateVao = new SegmentedVertexArray(gl);
+      candidateVao.setStores(positionBuffer, candidateBuffer, candidateGeometry.dimension);
       candidateColorOwner = replaceColor
         ? this._createSnapshotColorOwner(
             candidateBuffer,
             candidateBufferByteLength,
-            this._geometryDrawOrder(candidateGeometry)
+            this._geometryOrderRecord(candidateGeometry)
           )
         : this._retainSnapshotColorOwner(
             acceptedColorOwner
           );
-      gl.vertexAttribPointer(
-        1,
-        4,
-        gl.UNSIGNED_BYTE,
-        true,
-        4,
-        0
-      );
-      gl.bindVertexArray(null);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
       requireCleanWebGLState(
         gl,
         `HighPerfRenderer candidate snapshot "${exactId}" publication`
@@ -8399,13 +8885,11 @@ export class HighPerfRenderer {
       );
       rollback(() => gl.getError());
       if (rollbackFailures.length > 0) {
-        this._donateSnapshotAlphaStaging(alphaData);
         throw new AggregateError(
           [error, ...rollbackFailures],
           `HighPerfRenderer snapshot "${exactId}" publication failed with ${rollbackFailures.length} rollback error(s).`
         );
       }
-      this._donateSnapshotAlphaStaging(alphaData);
       throw error;
     }
 
@@ -8421,7 +8905,6 @@ export class HighPerfRenderer {
       geometryGeneration: snapshot.geometryGeneration,
       positions: snapshot.positions,
     };
-    const previousAlphaData = snapshot.alphaTexData;
     if (replaceColor) {
       snapshot.colors = colors;
       // Stores kept for other orders hold the old colours.
@@ -8434,7 +8917,7 @@ export class HighPerfRenderer {
     snapshot.positions = positions;
     snapshot.geometryGeneration = nextGeometryGeneration;
     if (replaceAlpha) {
-      snapshot.alphaTexData = alphaData;
+      snapshot.alphas = transparency;
       snapshot.alphaTexHeight = alphaLayout.height;
       snapshot.alphaTexPlan = alphaLayout.plan;
       snapshot.alphaTexWidth = alphaLayout.width;
@@ -8454,9 +8937,6 @@ export class HighPerfRenderer {
         releaseVao: true,
       }
     );
-    if (replaceAlpha) {
-      this._donateSnapshotAlphaStaging(previousAlphaData);
-    }
 
     if (geometryChanged) {
       this.invalidateViewState(exactId);
@@ -8522,7 +9002,7 @@ export class HighPerfRenderer {
         ).order ?? null);
     if (
       owner.refCount === 1 &&
-      (owner.order ?? null) === (orderRecord?.drawOrder ?? null)
+      (owner.order ?? null) === (orderRecord ?? null)
     ) {
       const label = `HighPerfRenderer snapshot "${exactId}" recolour`;
       requireSnapshotColors(this.pointCount, colors, label);
@@ -8545,8 +9025,17 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Replace only one snapshot's source-order R8 alpha publication. The
-   * accepted CPU bytes remain authoritative across failed GPU writes.
+   * Publish one kept view's source-order transparency (exactly 0 or 1 a
+   * cell). The view keeps the accepted array by reference (`snapshot.alphas`;
+   * null: every cell shown), never a CPU copy of its R8 image: the rows
+   * whose bytes move are found by comparing with it, and only they are
+   * encoded and sent through the bounded row scratch. A failed write
+   * restores exactly those rows from the accepted array.
+   *
+   * @param {string} id
+   * @param {Uint8Array} alphas - Not written while it is the accepted array
+   *   (the viewer adopts its own owner, `_adoptSnapshotAlphasOwner`).
+   * @returns {boolean} Whether any accepted R8 byte moved.
    */
   updateSnapshotAlphas(id, alphas) {
     this._assertOperational('update snapshot alpha values');
@@ -8568,17 +9057,19 @@ export class HighPerfRenderer {
     // introduce a synchronous driver capability query.
     const width = snapshot.alphaTexWidth;
     const height = snapshot.alphaTexHeight;
-    const requiredSize = width * height;
-    const layout = { height, plan: snapshot.alphaTexPlan, requiredSize, width };
     const plan = snapshot.alphaTexPlan;
+    const accepted = snapshot.alphas;
+    const n = this.pointCount;
     if (
-      snapshot.pointCount !== this.pointCount ||
+      snapshot.pointCount !== n ||
       !plan ||
-      plan.itemCount !== this.pointCount ||
+      plan.itemCount !== n ||
       width !== plan.width ||
       height !== plan.rows ||
-      !(snapshot.alphaTexData instanceof Uint8Array) ||
-      snapshot.alphaTexData.length !== requiredSize ||
+      (
+        accepted !== null &&
+        (!(accepted instanceof Uint8Array) || accepted.length !== n)
+      ) ||
       (
         snapshot.alphaTexture === null
           ? snapshot.alphaTextureByteLength !== 0
@@ -8592,11 +9083,8 @@ export class HighPerfRenderer {
         `${owner} found inconsistent accepted R8 ownership.`
       );
     }
+    this._requireSnapshotTransparency(alphas, owner);
 
-    const accepted = snapshot.alphaTexData;
-    const candidate = this._acquireSnapshotAlphaStaging(
-      layout.requiredSize
-    );
     // Scratch owned by this method alone, re-derived on every call.
     let dirtyRows = this._snapshotAlphaDirtyRows;
     if (!(dirtyRows instanceof Uint8Array) || dirtyRows.length !== height) {
@@ -8610,28 +9098,23 @@ export class HighPerfRenderer {
       regions = new Int32Array(height * 2);
       this._snapshotAlphaUploadRegions = regions;
     }
-    let changed;
-    try {
-      changed = this._encodeSnapshotAlphaData(
-        candidate,
-        null,
-        alphas,
-        owner,
-        accepted,
-        dirtyRows,
-        width
-      );
-    } catch (error) {
-      this._donateSnapshotAlphaStaging(candidate);
-      throw error;
+    // Texels past the last cell are padding, 255 in every generation, so
+    // only rows holding cells can move.
+    let dirtyRowCount = 0;
+    for (let y = 0; y < height; y++) {
+      const rowStart = y * width;
+      if (rowStart >= n) break;
+      if (rowMoved(alphas, accepted, rowStart, Math.min(n, rowStart + width))) {
+        dirtyRows[y] = 1;
+        dirtyRowCount++;
+      }
     }
 
     if (snapshot.storesReleased === true) {
-      // Nothing on the GPU to rewrite: the accepted bytes move, and the view
-      // is rebuilt from them when it is next drawn.
-      snapshot.alphaTexData = candidate;
-      this._donateSnapshotAlphaStaging(accepted);
-      return changed;
+      // Nothing on the GPU to rewrite: the view is rebuilt from the accepted
+      // array when it is next drawn.
+      snapshot.alphas = alphas;
+      return dirtyRowCount > 0;
     }
 
     if (snapshot.alphaTexture === null) {
@@ -8642,7 +9125,7 @@ export class HighPerfRenderer {
       try {
         this._uploadNewSnapshotAlphaTexture(
           accepted,
-          snapshot.alphaTexPlan,
+          plan,
           `${owner} recovery`,
           recovery
         );
@@ -8660,7 +9143,6 @@ export class HighPerfRenderer {
         });
         const failures =
           this._drainSnapshotRetirements(exactId);
-        this._donateSnapshotAlphaStaging(candidate);
         if (failures.length > 0) {
           throw new AggregateError(
             [error, ...failures],
@@ -8679,10 +9161,10 @@ export class HighPerfRenderer {
       this._drainSnapshotRetirements(exactId);
     }
 
-    if (!changed) {
+    if (dirtyRowCount === 0) {
       // No byte moved, so no consumer of the visibility boundary can see a
       // difference: the caller skips its highlight and edge work.
-      this._donateSnapshotAlphaStaging(candidate);
+      snapshot.alphas = alphas;
       return false;
     }
 
@@ -8690,18 +9172,19 @@ export class HighPerfRenderer {
     // texture already holds the bytes this generation would write.
     const regionCount = collectAlphaUploadRegions(dirtyRows, height, regions);
     try {
-      this._uploadAlphaRegions(
+      this._writeAlphaRegions(
         snapshot.alphaTexture,
         plan,
-        candidate,
+        alphas,
         regions,
         regionCount,
         `${owner} publication`
       );
     } catch (publicationError) {
       try {
-        // Exactly the regions the failed publication could have touched.
-        this._uploadAlphaRegions(
+        // Exactly the regions the failed publication could have touched,
+        // from the accepted array, so the whole accepted image is restored.
+        this._writeAlphaRegions(
           snapshot.alphaTexture,
           plan,
           accepted,
@@ -8728,7 +9211,6 @@ export class HighPerfRenderer {
         });
         const retirementFailures =
           this._drainSnapshotRetirements(exactId);
-        this._donateSnapshotAlphaStaging(candidate);
         throw new AggregateError(
           [
             publicationError,
@@ -8738,13 +9220,36 @@ export class HighPerfRenderer {
           `${owner} failed and its accepted GPU bytes could not be restored.`
         );
       }
-      this._donateSnapshotAlphaStaging(candidate);
       throw publicationError;
     }
 
-    snapshot.alphaTexData = candidate;
-    this._donateSnapshotAlphaStaging(accepted);
+    snapshot.alphas = alphas;
     return true;
+  }
+
+  /**
+   * Adopt an equal caller-private owner for one kept view's accepted
+   * transparency after its generation has been accepted. No GPU work: the
+   * viewer severs the alias to a mutable application-state array, as
+   * `_adoptCurrentAlphasOwner` does for the live view.
+   */
+  _adoptSnapshotAlphasOwner(id, alphas) {
+    const exactId = requireViewId(id, 'HighPerfRenderer snapshot id');
+    const snapshot = this.snapshotBuffers.get(exactId);
+    if (!snapshot) {
+      throw new Error(
+        `HighPerfRenderer snapshot "${exactId}" does not exist.`
+      );
+    }
+    if (
+      !(alphas instanceof Uint8Array) ||
+      alphas.length !== this.pointCount
+    ) {
+      throw new TypeError(
+        'HighPerfRenderer snapshot alpha owner must be one exact Uint8 point array.'
+      );
+    }
+    snapshot.alphas = alphas;
   }
 
   /**
@@ -8810,10 +9315,6 @@ export class HighPerfRenderer {
       // completed.
       this.snapshotBuffers.delete(exactId);
       this._cancelStaleSpatialTreeBuilds();
-      this._donateSnapshotAlphaStaging(
-        snapshot.alphaTexData
-      );
-      this._releaseSnapshotScratchIfUnused();
       this._queueSnapshotRetirement(snapshot, {
         releaseAlpha: true,
         releaseColor: true,
@@ -8840,7 +9341,6 @@ export class HighPerfRenderer {
     this._assertOperational('delete all snapshot buffers');
     const snapshots = Array.from(this.snapshotBuffers.values());
     this.snapshotBuffers.clear();
-    this._releaseSnapshotScratchIfUnused();
     for (const snapshot of snapshots) {
       this._queueSnapshotRetirement(snapshot, {
         releaseAlpha: true,
@@ -9015,6 +9515,7 @@ export class HighPerfRenderer {
             buildLOD: needsLOD,
             prebuiltTree,
             prebuiltOrder,
+            priority: this._cellPriority,
           }
         );
         this._publishPooledSnapshotSpatialIndex(
@@ -9170,41 +9671,9 @@ export class HighPerfRenderer {
     // A custom-position view draws with its own geometry's tree.
     const lodSpatialIndex = hasCustomPositions ? customSpatialIndex : mainSpatialIndex;
 
-    // Select LOD level based on whether LOD is enabled (consistent with render())
-    // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
-    let lodLevel;
-    viewState.lodConverging = false;
-    if (this.useAdaptiveLOD) {
-      // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
-      lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
-      if (lodLevel < 0 && lodSpatialIndex) {
-        // The view's own dimension and bounds decide the level of its tree.
-        lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
-        viewState.lodConverging =
-          lodSpatialIndex.getLODLevel(cameraDistance, lodLevel, effectiveDimLevel, snapshot.bounds) !== lodLevel;
-      }
-    } else {
-      // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
-      lodLevel = forceLOD >= 0 ? forceLOD : -1;
-    }
-    if (!Number.isInteger(lodLevel) || lodLevel < -1) {
-      throw new Error(
-        `HighPerfRenderer selected an invalid LOD level for snapshot "${exactId}".`
-      );
-    }
-    if (lodLevel >= 0 && !spatialIndexHasLod(lodSpatialIndex)) {
-      // The levels are still building: full detail until they land.
-      lodLevel = -1;
-    }
-    if (lodLevel >= 0 && !lodSpatialIndex?.lodLevels?.[lodLevel]) {
-      throw new RangeError(
-        `HighPerfRenderer snapshot "${exactId}" has no LOD level ${lodLevel} for ${effectiveDimLevel}D.`
-      );
-    }
-
     // The geometry is stored in the draw order of its tree whenever one
-    // exists, and the view's colours follow it. Until the store has adopted
-    // that order the frame draws full detail from it as it is.
+    // exists, and the view's colours follow it; until the store holds that
+    // order whole, it draws levels by rank (or full detail) as it is.
     const orderTree = lodSpatialIndex ?? (
       hasCustomPositions
         ? (snapshot.spatialIndex?.positions === snapshot.positions ? snapshot.spatialIndex : null)
@@ -9212,9 +9681,19 @@ export class HighPerfRenderer {
     );
     const order = this._ensureSnapshotDrawOrder(snapshot, orderTree);
     this._ensureSnapshotColorsInOrder(snapshot, order);
-    const ordered = lodSpatialIndex !== null && order?.drawOrder === lodSpatialIndex.drawOrder;
-    if (!ordered) lodLevel = -1;
-    viewState.lastLodLevel = lodLevel;
+    const rankStore = hasCustomPositions
+      ? { kind: 'geometry', geometry: this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions) }
+      : LIVE_STORE;
+    // The view's own dimension and bounds decide the level of its tree.
+    const { levels, lodLevel, ordered } = this._selectDrawLevels(viewState, {
+      tree: lodSpatialIndex,
+      order,
+      rankLevels: needsLOD ? () => this._rankLevelsOf(rankStore, hasCustomPositions ? snapshot.bounds : null) : null,
+      forceLOD,
+      cameraDistance,
+      dimensionLevel: effectiveDimLevel,
+      overrideBounds: snapshot.bounds,
+    });
     const cull = this.useFrustumCulling && ordered;
     if (!cull) {
       this.stats.frustumCulled = false;
@@ -9244,6 +9723,7 @@ export class HighPerfRenderer {
         pointCount: snapshot.pointCount,
         order,
         tree: lodSpatialIndex,
+        levels,
         lodLevel,
         cull,
         frustumChanged,
@@ -9321,8 +9801,6 @@ export class HighPerfRenderer {
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
     this._alphaTexPlan = null;
-    this._alphaTexData = null;
-    this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
@@ -9364,7 +9842,8 @@ export class HighPerfRenderer {
     this._preparedDataStores = null;
     this._firstRenderDone = false;
 
-    this._snapshotAlphaStagingData = null;
+    this._snapshotAlphaDirtyRows = null;
+    this._snapshotAlphaUploadRegions = null;
     this._validatedSpatialIndices = new WeakSet();
     this._lodSpatialOwnerTokens = new WeakMap();
     this._lodSequentialMemberships = new WeakMap();
@@ -9427,8 +9906,6 @@ export class HighPerfRenderer {
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
     this._alphaTexPlan = null;
-    this._alphaTexData = null;
-    this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
@@ -9453,7 +9930,6 @@ export class HighPerfRenderer {
 
     const snapshots = Array.from(this.snapshotBuffers.values());
     this.snapshotBuffers.clear();
-    this._releaseSnapshotScratchIfUnused();
     for (const snapshot of snapshots) {
       this._queueSnapshotRetirement(snapshot, {
         releaseAlpha: true,

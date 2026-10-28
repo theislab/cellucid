@@ -192,6 +192,66 @@ export function writeLinearTextureRows(
 }
 
 /**
+ * Write items `[first, end)` from `data` (which holds every item from item
+ * `dataFirst`, 0 by default, `componentsPerTexel` elements an item) into the `TEXTURE_2D_ARRAY`
+ * bound to the active unit: a partial first row, the whole rows, a partial
+ * last row, each at its exact width. The caller sets the unpack state as for
+ * `writeLinearTextureRows`.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {ReturnType<typeof planLinearTexture>} plan
+ * @param {number} format
+ * @param {number} type
+ * @param {ArrayBufferView} data
+ * @param {number} componentsPerTexel
+ * @param {number} first
+ * @param {number} end
+ * @param {number} [dataFirst=0] - The item `data[0]` holds.
+ * @returns {number} Bytes written.
+ */
+export function writeLinearTextureItems(gl, plan, format, type, data, componentsPerTexel, first, end, dataFirst = 0) {
+  if (!(Number.isSafeInteger(first) && Number.isSafeInteger(end) && first >= 0 && end >= first && end <= plan.itemCount)) {
+    throw new RangeError(`Linear texture items [${first}, ${end}) are outside its ${plan.itemCount}.`);
+  }
+  if (!(Number.isSafeInteger(dataFirst) && dataFirst >= 0 && dataFirst <= first && (end - dataFirst) * componentsPerTexel <= data.length)) {
+    throw new RangeError(`Linear texture items [${first}, ${end}) are not all in data holding items from ${dataFirst}.`);
+  }
+  const width = plan.width;
+  let bytes = 0;
+  let item = first;
+  const writeRun = (from, count) => {
+    const row = Math.floor(from / width);
+    const layer = Math.floor(row / plan.rowsPerLayer);
+    gl.texSubImage3D(
+      gl.TEXTURE_2D_ARRAY, 0, from - row * width, row - layer * plan.rowsPerLayer, layer, count, 1, 1,
+      format, type, data, (from - dataFirst) * componentsPerTexel
+    );
+    bytes += count * componentsPerTexel * data.BYTES_PER_ELEMENT;
+  };
+  // The partial first row.
+  if (item % width !== 0 && item < end) {
+    const count = Math.min(end, (Math.floor(item / width) + 1) * width) - item;
+    writeRun(item, count);
+    item += count;
+  }
+  // Whole rows, a layer at a time.
+  while (end - item >= width) {
+    const row = item / width;
+    const layer = Math.floor(row / plan.rowsPerLayer);
+    const rows = Math.min(Math.floor((end - item) / width), (layer + 1) * plan.rowsPerLayer - row);
+    gl.texSubImage3D(
+      gl.TEXTURE_2D_ARRAY, 0, 0, row - layer * plan.rowsPerLayer, layer, width, rows, 1,
+      format, type, data, (item - dataFirst) * componentsPerTexel
+    );
+    bytes += rows * width * componentsPerTexel * data.BYTES_PER_ELEMENT;
+    item += rows * width;
+  }
+  // The partial last row.
+  if (item < end) writeRun(item, end - item);
+  return bytes;
+}
+
+/**
  * Set the `ivec2` layout uniform of a linear texture.
  *
  * @param {WebGL2RenderingContext} gl

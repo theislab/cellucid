@@ -109,6 +109,11 @@ function buildOverlay(documentOwner, onCancel) {
   bar.appendChild(fill);
   const detail = documentOwner.createElement('p');
   detail.className = 'opening-detail tabular-nums';
+  // How the opening reads its data, when the person should know it up front
+  // (a file that cannot be read in parts).
+  const note = documentOwner.createElement('p');
+  note.className = 'opening-note';
+  note.hidden = true;
   const cancel = createButton({ label: 'Cancel', className: 'btn-compact opening-cancel', onClick: onCancel });
   // A failed opening: the failure's own message, folded (the brand card's
   // Details, components/_welcome.css), and the ways on.
@@ -121,9 +126,9 @@ function buildOverlay(documentOwner, onCancel) {
   failure.append(failureSummary, failureText);
   const actions = documentOwner.createElement('div');
   actions.className = 'opening-actions';
-  panel.append(title, step, bar, detail, failure, actions, cancel);
+  panel.append(title, step, bar, detail, note, failure, actions, cancel);
   root.appendChild(panel);
-  return { root, panel, title, step, bar, fill, detail, cancel, failure, failureText, actions };
+  return { root, panel, title, step, bar, fill, detail, note, cancel, failure, failureText, actions };
 }
 
 /**
@@ -154,7 +159,13 @@ export function showOpeningProgress({
   let tick = null;
 
   function notificationMessage(snapshot) {
-    return snapshot.detail ? `${stepText(snapshot)} ${snapshot.detail}` : stepText(snapshot);
+    const running = snapshot.detail ? `${stepText(snapshot)} ${snapshot.detail}` : stepText(snapshot);
+    return snapshot.note ? `${running}\n${snapshot.note}` : running;
+  }
+
+  function drawNote(snapshot) {
+    overlay.note.textContent = snapshot.note ?? '';
+    overlay.note.hidden = !snapshot.note;
   }
 
   /** The person's pick among a file's objects, in the panel, whatever the mode. */
@@ -201,6 +212,7 @@ export function showOpeningProgress({
       overlay.title.textContent = `Opening ${snapshot.title}`;
       overlay.step.textContent = stepText(snapshot);
       overlay.detail.textContent = snapshot.detail ?? '';
+      drawNote(snapshot);
       const percent = snapshot.percent;
       overlay.bar.classList.toggle('indeterminate', percent === null);
       overlay.fill.style.width = percent === null ? '' : `${percent}%`;

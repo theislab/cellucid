@@ -29,6 +29,9 @@
  *
  * Messages: `{ id, op, session, uploads, args }` is answered with
  * `{ id, result }` or `{ id, error }`; `{ op: 'close', session }` has no reply.
+ * An upload larger than one ArrayBuffer (a WebAssembly memory's on the
+ * page, `utils/large-arrays.js`) arrives first in pieces, `{ session, piece }`
+ * (no reply), and `uploads` holds its placeholder.
  *
  * Where a worker cannot create a WebGL2 context (WebKitGTK, WPE; `webgl2`
  * answers false), the page runs this same handler for the point passes
@@ -47,6 +50,7 @@ import {
   webgl2RasterAvailable,
 } from './webgl-point-rasterizer.js';
 import { embedPngTextChunks } from './png-metadata.js';
+import { PieceReceiver } from '../../../../../utils/large-arrays.js';
 import { writeSvgPointMarkup } from '../renderers/svg-point-markup.js';
 
 /**
@@ -214,11 +218,27 @@ const operations = {
 export function createFigureExportWorkerHandler() {
   /** @type {Map<number, Map<number, ArrayBufferView>>} */
   const sessions = new Map();
+  /**
+   * The pieces of arrays too large to clone, by session, for the request
+   * that follows them (`utils/large-arrays.js`).
+   * @type {Map<number, PieceReceiver>}
+   */
+  const pieces = new Map();
 
   return async function handle(message) {
     const { id, op, session } = message;
+    if (message.piece !== undefined) {
+      let receiver = pieces.get(session);
+      if (receiver === undefined) {
+        receiver = new PieceReceiver();
+        pieces.set(session, receiver);
+      }
+      receiver.receive(message.piece);
+      return null;
+    }
     if (op === 'close') {
       sessions.delete(session);
+      pieces.delete(session);
       return null;
     }
     try {
@@ -227,7 +247,10 @@ export function createFigureExportWorkerHandler() {
         arrays = new Map();
         sessions.set(session, arrays);
       }
-      for (const [arrayId, array] of message.uploads) arrays.set(arrayId, array);
+      const receiver = pieces.get(session);
+      pieces.delete(session);
+      const uploads = receiver === undefined ? message.uploads : receiver.resolve(message.uploads);
+      for (const [arrayId, array] of uploads) arrays.set(arrayId, array);
       const operation = Object.hasOwn(operations, op) ? operations[op] : undefined;
       if (operation === undefined) {
         throw new TypeError(`Figure-export worker has no operation "${op}".`);

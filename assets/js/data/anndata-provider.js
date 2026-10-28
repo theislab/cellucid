@@ -16,6 +16,7 @@
  * for, and a URL of any other dataset is refused.
  */
 
+import { cellPriorityOf } from './cell-priority.js';
 import { getDataSourceManager } from './data-source-manager.js';
 import { ANNDATA_SOURCE_TYPE } from './anndata-file-source.js';
 import { parseMappingGraphPath } from './data-mapping-candidates.js';
@@ -150,6 +151,35 @@ function requireCandidateAnnDataSource(url, candidateSource) {
     parsed,
     source: directSource,
   });
+}
+
+/**
+ * Which of a dataset's cells its source opened (`cell-identity.js`): a
+ * subsample's, or every cell; null when the dataset is not read by a direct
+ * AnnData source (a synthetic scene).
+ *
+ * @param {string} url - The dataset's `anndata://` base
+ * @param {Object|null} [candidateBinding] - A staged candidate (`createCandidateAnnDataBinding`)
+ * @returns {import('./cell-identity.js').CellIdentity|null}
+ */
+export function anndataCellIdentity(url, candidateBinding = null) {
+  if (parseAnnDataUrl(url) === null) return null;
+  const { source } = getAnnDataBinding(url, candidateBinding);
+  return typeof source.getCellIdentity === 'function' ? source.getCellIdentity() : null;
+}
+
+/**
+ * The priority of the open cells of an AnnData URL (`cell-priority.js`),
+ * from the cells its source opened; null when the URL is not an AnnData one.
+ *
+ * @param {string} url
+ * @param {Object|null} [candidateBinding]
+ * @returns {Readonly<{seed: number|null, originals: Uint32Array|null}>|null}
+ */
+export function anndataCellPriority(url, candidateBinding = null) {
+  if (parseAnnDataUrl(url) === null) return null;
+  const { source } = getAnnDataBinding(url, candidateBinding);
+  return typeof source.getCellSubset === 'function' ? cellPriorityOf(source.getCellSubset()) : null;
 }
 
 /**
@@ -321,6 +351,33 @@ export function anndataGetMappingCandidates(
 }
 
 /**
+ * The data-mapping candidate catalog of an AnnData source once the gene
+ * names of one var axis are guessed (`BaseAnnDataAdapter.guessGeneNames`).
+ *
+ * @param {string} url - Explicit direct AnnData URL (its `candidates` route)
+ * @param {string} axis - `X`, `raw`, `mod/<name>` or `mod/<name>/raw`
+ * @param {{signal?: AbortSignal|null}} [options]
+ * @returns {Promise<Object>}
+ */
+export async function anndataGuessGeneNames(
+  url,
+  axis,
+  options = {},
+  candidateBinding = null
+) {
+  const signal = getMetadataLoadSignal(options, 'Direct AnnData gene-name guess');
+  throwIfMetadataAborted(signal, 'Direct AnnData gene-name guess');
+  const { adapter } = getAnnDataBinding(url, candidateBinding);
+  const candidates = await waitForMetadata(
+    adapter.guessGeneNames(axis),
+    signal,
+    'Direct AnnData gene-name guess'
+  );
+  throwIfMetadataAborted(signal, 'Direct AnnData gene-name guess');
+  return candidates;
+}
+
+/**
  * The obs field list of an AnnData source (its `obs` route).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]
@@ -415,7 +472,8 @@ export async function anndataLoadObsField(
  * Load one gene's values from an AnnData source, by its URL: `var/{g}` for
  * the file's own gene list, or `var/{axis}/{names}/{g}` for a mapped one.
  * @param {string} url - Explicit direct AnnData URL of the gene
- * @param {{signal?: AbortSignal|null}} [options] - Cancels the read
+ * @param {{signal?: AbortSignal|null, onPartial?: ((values: Float32Array, cells: number) => void)|null}} [options] -
+ *   Cancels the read; `onPartial` hears the gene on more cells as they are read (`getGeneValues`)
  * @returns {Promise<Float32Array>}
  */
 export async function anndataLoadGeneValues(
@@ -428,7 +486,47 @@ export async function anndataLoadGeneValues(
     signal: options.signal ?? null,
     owner: options.owner ?? null,
     key: options.key ?? null,
+    onPartial: options.onPartial ?? null,
   });
+}
+
+/**
+ * Rows `[start, end)` of the open cells of one dataset part, by its URL --
+ * what an opening grown in place appends (`app/open-cells-resize.js`) and
+ * an analysis's first pass reads on the first cells of priority order:
+ * `kind` `embedding` (`obsm/{i}/{cols}`, `options.dimension`), `vectors`
+ * (`vectors/...`, `options.dimension`), `obs` (`obs`, `options.key` and
+ * the field's loaded `options.categories`) or `gene` (`var/...`). Each is,
+ * bit for bit, the whole read's rows (`BaseAnnDataAdapter`, "Rows of the
+ * open cells").
+ *
+ * @param {'embedding'|'vectors'|'obs'|'gene'} kind
+ * @param {string} url
+ * @param {[number, number]} rows
+ * @param {{signal?: AbortSignal|null, owner?: string|null, dimension?: number, key?: string,
+ *   categories?: ReadonlyArray<string|number|boolean>|null}} [options]
+ * @param {Object|null} [candidateBinding]
+ */
+export async function anndataLoadRows(kind, url, rows, options = {}, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  const signal = options.signal ?? null;
+  if (kind === 'embedding') return adapter.getEmbeddingRows(parsed.path, options.dimension, rows, { signal });
+  if (kind === 'vectors') return adapter.getVectorRows(parsed.path, options.dimension, rows, { signal });
+  if (kind === 'obs') return adapter.getObsFieldRows(options.key, rows, { categories: options.categories ?? null, signal });
+  if (kind === 'gene') return adapter.getGeneValueRows(parsed.path, rows, { signal, owner: options.owner ?? null });
+  throw new TypeError(`No rows of a dataset part of kind '${String(kind)}'.`);
+}
+
+/**
+ * What reading the gene at `url` costs now (`getGeneReadPlan`), or null
+ * when the source cannot tell.
+ *
+ * @param {string} url - Explicit direct AnnData URL of the gene
+ * @returns {Promise<Object|null>}
+ */
+export async function anndataGeneReadPlan(url, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getGeneReadPlan?.(parsed.path) ?? null;
 }
 
 /**

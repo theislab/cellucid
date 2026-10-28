@@ -16,6 +16,18 @@
  *   viewer's events (selection, hover, click, ready, data mapping, …) back.
  *   The page reaches the host at the address it was loaded from, so a
  *   notebook proxy that carries the page carries the channel too.
+ *
+ * A notebook widget (`cellucid.Widget`) opens this page instead with
+ * `?viewer=embedded` inside its own output, and the host is reached through
+ * the widget: the viewer channel and every request run over the port the
+ * widget hands the page (`viewer-embed.js`), with the host named by
+ * `EMBEDDED_HOST_ORIGIN` (`formats/io/host-fetch.js`). Everything above the
+ * transport -- the documents, the store reads, the protocol -- is the same.
+ *
+ * Every cell crossing the channel is an original position (a row of the
+ * dataset's `obs`): the app hands this source cells in subset positions (the
+ * cells open now), and it names them by original position with the open
+ * dataset's cell identity (`setCellIdentityProvider`, `data/cell-identity.js`).
  */
 
 import { INPUT_FORMATS, isInputFormatId } from './input-formats.js';
@@ -32,6 +44,8 @@ import { getNotificationCenter } from '../app/notification-center.js';
 import { createDeadline } from '../utils/deadline.js';
 import { validateDataMapping } from './data-mapping.js';
 import { ViewerChannel } from './viewer-channel.js';
+import { connectEmbeddedHost, isEmbeddedViewerAddress } from './viewer-embed.js';
+import { routedFetch } from '../formats/io/host-fetch.js';
 import {
   VIEWER_CHANNEL_PATH,
   VIEWER_HOST_RUNTIMES,
@@ -39,7 +53,10 @@ import {
   VIEWER_PAGE_PARAMETERS,
   VIEWER_COMMAND_ERROR_REASON_LIMIT,
   VIEWER_DATA_MAPPING_ORIGINS,
+  VIEWER_RESULT_META_FIELDS,
+  isViewerResultEpoch,
   encodeViewerCells,
+  encodeViewerResult,
   viewerBinaryCommandTypes,
   viewerCommandTypes,
 } from './viewer-protocol.js';
@@ -79,8 +96,16 @@ function requireSingleViewerHostParameter(params, key) {
 }
 
 /**
- * The viewer host configuration from URL parameters
- * @returns {ViewerHostConfig|null}
+ * The configuration of a viewer a notebook widget embeds (`?viewer=embedded`):
+ * its credentials and the host's address arrive from the widget
+ * (`connectEmbeddedHost`), never in the page address.
+ */
+export const EMBEDDED_VIEWER_HOST = Object.freeze({ embedded: true });
+
+/**
+ * The viewer host configuration from URL parameters: a served viewer's
+ * exact routing fields, `EMBEDDED_VIEWER_HOST` for a widget's viewer, or null.
+ * @returns {ViewerHostConfig|typeof EMBEDDED_VIEWER_HOST|null}
  */
 export function getViewerHostConfig() {
   const params = new URLSearchParams(window.location.search);
@@ -88,6 +113,9 @@ export function getViewerHostConfig() {
   const modeValues = params.getAll(VIEWER_PAGE_MODE_PARAMETER);
   if (modeValues.length === 0) {
     return null;
+  }
+  if (isEmbeddedViewerAddress(params)) {
+    return EMBEDDED_VIEWER_HOST;
   }
   const annDataValues = params.getAll('anndata');
   if (
@@ -316,7 +344,7 @@ async function requestViewerHostDocument(config, route, label, signal = null) {
     ? deadline.signal
     : AbortSignal.any([signal, deadline.signal]);
   try {
-    const response = await fetch(url, {
+    const response = await routedFetch(url, {
       cache: 'no-store',
       signal: requestSignal,
     });
@@ -493,7 +521,7 @@ async function requestViewerHostProtocol(config, signal = null) {
     ? deadline.signal
     : AbortSignal.any([signal, deadline.signal]);
   try {
-    const response = await fetch(protocolUrl, {
+    const response = await routedFetch(protocolUrl, {
       cache: 'no-store',
       signal: requestSignal,
     });
@@ -641,10 +669,18 @@ export function describeViewerHostCommandFailure(commandType, error) {
  */
 export class ViewerHostDataSource {
   constructor(config = getViewerHostConfig()) {
-    /** @type {ViewerHostConfig|null} */
-    this._declaredConfig = config === null
-      ? null
+    /** @type {ViewerHostConfig|typeof EMBEDDED_VIEWER_HOST|null} */
+    this._declaredConfig = config === null || config === EMBEDDED_VIEWER_HOST
+      ? config
       : captureViewerHostRuntimeConfig(config);
+
+    /**
+     * How the host is reached: its configuration and the WebSocket class the
+     * viewer channel opens (the browser's, or the embedding widget's port,
+     * `viewer-embed.js`). Set by `connectHost()`.
+     * @type {{config: ViewerHostConfig, WebSocketImpl: typeof WebSocket|undefined}|null}
+     */
+    this._hostConnection = null;
 
     /** @type {ViewerHostConfig|null} */
     this._config = null;
@@ -671,6 +707,9 @@ export class ViewerHostDataSource {
 
     /** @type {Set<Function>} */
     this._endCallbacks = new Set();
+
+    /** @type {Set<Function>} Run when a dropped channel was opened again. */
+    this._reopenCallbacks = new Set();
 
     /** @type {boolean} */
     this._connected = false;
@@ -717,7 +756,70 @@ export class ViewerHostDataSource {
     /** @type {string|null} The program serving the viewer (`VIEWER_HOST_RUNTIMES`) */
     this._runtime = null;
 
+    /**
+     * The open dataset's cell identity (`data/cell-identity.js`), asked for
+     * each event that names cells.
+     * @type {(() => import('./cell-identity.js').CellIdentity)|null}
+     */
+    this._cellIdentityProvider = null;
+
+    /**
+     * The id of the host's dataset the viewer shows, or null when the person
+     * opened another one in it (`setShownDatasetProvider`).
+     * @type {(() => string|null)|null}
+     */
+    this._shownDatasetProvider = null;
+
     this.type = 'jupyter';
+  }
+
+  /**
+   * Say which of the host's datasets the viewer shows: `provider` returns its
+   * id (`/_cellucid/datasets`), or null while the viewer shows a dataset the
+   * host did not serve. Events that name cells (a selection, a hover, a
+   * click) are sent only while it names one: the host's cell positions
+   * describe its own dataset.
+   *
+   * @param {() => string|null} provider
+   */
+  setShownDatasetProvider(provider) {
+    if (typeof provider !== 'function') {
+      throw new TypeError('Viewer host shown-dataset provider must be a function');
+    }
+    this._shownDatasetProvider = provider;
+  }
+
+  /** The id of the host's dataset the viewer shows, or null (another dataset). */
+  getShownHostDataset() {
+    if (this._shownDatasetProvider === null) {
+      throw new Error('Viewer host events name cells only once the app said which dataset it shows');
+    }
+    const id = this._shownDatasetProvider();
+    if (id !== null && (typeof id !== 'string' || id.length === 0)) {
+      throw new TypeError('Viewer host shown dataset must be a dataset id or null');
+    }
+    return id;
+  }
+
+  /**
+   * Name cells by original position from now on: `provider` returns the open
+   * dataset's cell identity.
+   *
+   * @param {() => import('./cell-identity.js').CellIdentity} provider
+   */
+  setCellIdentityProvider(provider) {
+    if (typeof provider !== 'function') {
+      throw new TypeError('Viewer host cell identity provider must be a function');
+    }
+    this._cellIdentityProvider = provider;
+  }
+
+  /** The open dataset's cell identity. */
+  _cellIdentity() {
+    if (this._cellIdentityProvider === null) {
+      throw new Error('Viewer host events name cells only once the app gave it the dataset\'s cell identity');
+    }
+    return this._cellIdentityProvider();
   }
 
   /**
@@ -855,6 +957,20 @@ export class ViewerHostDataSource {
     this._endCallbacks.add(callback);
   }
 
+  /**
+   * Register what runs when the viewer channel, dropped (the network, a
+   * proxy restarting), was opened again: the viewer sends the host its
+   * results snapshot again.
+   *
+   * @param {() => void} callback
+   */
+  onChannelReopen(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Viewer host channel-reopen callback must be a function');
+    }
+    this._reopenCallbacks.add(callback);
+  }
+
   _channelEnded(channel, end) {
     if (this._channel !== channel) return;
     this._connected = false;
@@ -942,15 +1058,49 @@ export class ViewerHostDataSource {
   }
 
   /**
+   * Whether a notebook widget embeds this viewer (`?viewer=embedded`).
+   * @returns {boolean}
+   */
+  isEmbedded() {
+    return this._declaredConfig === EMBEDDED_VIEWER_HOST;
+  }
+
+  /**
+   * Reach the host: at once for a served viewer, whose address names it;
+   * for an embedded one, once the widget that embeds the page connected it
+   * (`connectEmbeddedHost`), which waits for nothing but the notebook: the
+   * kernel answers the widget between cells, so this has no deadline.
+   *
+   * @returns {Promise<void>}
+   */
+  async connectHost() {
+    this._assertAlive();
+    if (this._hostConnection !== null || this._declaredConfig === null) return;
+    if (this.isEmbedded()) {
+      const { config, WebSocketImpl } = await connectEmbeddedHost();
+      this._assertAlive();
+      this._hostConnection = { config: captureViewerHostRuntimeConfig(config), WebSocketImpl };
+      return;
+    }
+    this._hostConnection = { config: this._declaredConfig, WebSocketImpl: undefined };
+  }
+
+  /**
    * Initialize from URL parameters
    * @returns {Promise<boolean>} True if successfully initialized
    */
   async initialize() {
     this._assertAlive();
-    const config = this._declaredConfig;
-    if (config === null) {
+    if (this._declaredConfig === null) {
       return false;
     }
+    // A served viewer's requests start at once; an embedded one waits for
+    // the widget (`main.js` connects it first, outside any deadline).
+    if (this._hostConnection === null) {
+      if (this.isEmbedded()) await this.connectHost();
+      else this._hostConnection = { config: this._declaredConfig, WebSocketImpl: undefined };
+    }
+    const { config, WebSocketImpl } = this._hostConnection;
 
     const revision = ++this._lifecycleRevision;
     const previousController = this._initializationController;
@@ -989,10 +1139,21 @@ export class ViewerHostDataSource {
         viewerId: config.viewerId,
         viewerToken: config.viewerToken,
         channelPath: protocol.channel,
+        WebSocketImpl,
         onCommand: command => {
           if (this._channel === channel) this._observeCommand(command);
         },
         onEnd: end => this._channelEnded(channel, end),
+        onReopen: () => {
+          if (this._channel !== channel) return;
+          for (const callback of [...this._reopenCallbacks]) {
+            try {
+              callback();
+            } catch (error) {
+              console.error('[ViewerHost] channel-reopen handler failed:', error);
+            }
+          }
+        },
         isHostAlive: async () => {
           try {
             await requestViewerHostHealth(config);
@@ -1222,6 +1383,34 @@ export class ViewerHostDataSource {
         );
         return deliverCallbacks(this._messageCallbacks, [data]);
 
+      case 'setGeneSet': {
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'name', 'description', 'genes'],
+          'Viewer host set-gene-set message'
+        );
+        requireExactText(data.requestId, 'Viewer host set-gene-set requestId');
+        requireExactText(data.name, 'Viewer host gene set name', { allowWhitespace: true });
+        if (typeof data.description !== 'string') {
+          throw new TypeError('Viewer host gene set description must be text');
+        }
+        if (!Array.isArray(data.genes)) {
+          throw new TypeError('Viewer host gene set genes must be a list');
+        }
+        data.genes.forEach((gene, index) => requireExactText(gene, `Viewer host gene set gene ${index}`));
+        return deliverCallbacks(this._messageCallbacks, [data]);
+      }
+
+      case 'setField':
+        // Decoded and checked by the channel (`decodeViewerBinaryCommand`):
+        // the header, the cells and the values.
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'key', 'kind', 'categories', 'nObs', 'cells', 'values'],
+          'Viewer host set-field message'
+        );
+        return deliverCallbacks(this._messageCallbacks, [data]);
+
       default:
         // The type is not echoed: it is the host's text, and this message
         // reaches the person watching.
@@ -1239,10 +1428,13 @@ export class ViewerHostDataSource {
   _handleHighlight(data) {
     requireExactKeys(
       data,
-      ['type', 'cells', 'color'],
+      ['type', 'cells', 'color', 'label'],
       'Viewer host highlight message'
     );
-    const { cells, color } = data;
+    const { cells, color, label } = data;
+    if (label !== null) {
+      requireExactText(label, 'Viewer host highlight label', { allowWhitespace: true });
+    }
     requireCommandCells(cells, 'Viewer host highlight cells');
     if (
       typeof color !== 'string' ||
@@ -1252,7 +1444,7 @@ export class ViewerHostDataSource {
         'Viewer host highlight color must be an exact six-digit hex color'
       );
     }
-    return deliverCallbacks(this._highlightCallbacks, [cells, color]);
+    return deliverCallbacks(this._highlightCallbacks, [cells, color, label]);
   }
 
   /**
@@ -1303,7 +1495,7 @@ export class ViewerHostDataSource {
    * @private
    */
   _handleClearHighlights() {
-    return deliverCallbacks(this._highlightCallbacks, [null, null]);
+    return deliverCallbacks(this._highlightCallbacks, [null, null, null]);
   }
 
   /**
@@ -1371,15 +1563,22 @@ export class ViewerHostDataSource {
   // These methods send events to the host on the viewer channel.
   /**
    * Notify Python of cell selection change
-   * @param {number[]} cellIndices - Selected cell indices: unique non-negative
-   *   integers in any order, at least one. Python receives them ascending.
+   * @param {Uint32Array} cellIndices - Selected cells in subset positions,
+   *   ascending, at least one. The host receives their original positions.
    * @param {string} source - Selection source ('lasso', 'knn', 'proximity', 'annotation')
    */
   async notifySelection(cellIndices, source) {
     if (!this._connected) {
       throw new Error('Viewer host event source is not connected');
     }
-    const body = encodeViewerCells(cellIndices, 'Viewer host selection cells');
+    encodeViewerCells(cellIndices, 'Viewer host selection cells');
+    if (this.getShownHostDataset() === null) return false;
+    // Open cells in another order than their original one (a priority-ordered
+    // dataset) are named ascending, as the protocol names a cell set.
+    const body = encodeViewerCells(
+      this._cellIdentity().toOriginal(cellIndices).sort(),
+      'Viewer host selection cells'
+    );
     requireExactText(source, 'Viewer host selection source');
     this._captureConnection('Viewer host selection delivery');
     if (!this._protocol.events.has('selection')) return false;
@@ -1402,6 +1601,8 @@ export class ViewerHostDataSource {
     if (cellIndex !== null) {
       requireNonNegativeInteger(cellIndex, 'Viewer host hover cell');
     }
+    if (this.getShownHostDataset() === null) return false;
+    const cell = cellIndex === null ? null : this._cellIdentity().toOriginal([cellIndex])[0];
     if (position !== null) {
       requireExactKeys(
         position,
@@ -1418,7 +1619,7 @@ export class ViewerHostDataSource {
     }
     return this._sendEvent({
       type: 'hover',
-      cell: cellIndex,
+      cell,
       position
     });
   }
@@ -1458,9 +1659,10 @@ export class ViewerHostDataSource {
         'Viewer host click shift and ctrl must be booleans'
       );
     }
+    if (this.getShownHostDataset() === null) return false;
     const event = {
       type: 'click',
-      cell: cellIndex,
+      cell: this._cellIdentity().toOriginal([cellIndex])[0],
       button: options.button,
       shift: options.shift,
       ctrl: options.ctrl
@@ -1512,8 +1714,8 @@ export class ViewerHostDataSource {
   /**
    * Notify Python that viewer is ready with dataset info
    * @param {Object} info - Dataset info
-   * @param {number} info.nCells - Number of cells
    * @param {number} info.dimensions - Embedding dimensions (1, 2, or 3)
+   *   The cells open and in the dataset come from the cell identity.
    */
   async notifyReady(info) {
     if (!this._connected) {
@@ -1521,10 +1723,10 @@ export class ViewerHostDataSource {
     }
     requireExactKeys(
       info,
-      ['nCells', 'dimensions'],
+      ['dimensions'],
       'Viewer host ready info'
     );
-    requireNonNegativeInteger(info.nCells, 'Viewer host ready nCells');
+    const identity = this._cellIdentity();
     if (
       info.dimensions !== 1 &&
       info.dimensions !== 2 &&
@@ -1536,10 +1738,110 @@ export class ViewerHostDataSource {
     }
     const event = {
       type: 'ready',
-      n_cells: info.nCells,
+      n_cells: identity.n,
+      n_obs: identity.nOriginal,
       dimensions: info.dimensions
     };
     return this._sendEvent(event);
+  }
+
+  /**
+   * Send one result (`encodeViewerResult`), when the host accepts results.
+   * Its cells are already original positions: the results publisher
+   * (`app/viewer-host-results.js`) names them.
+   *
+   * @param {Parameters<typeof encodeViewerResult>[0]} result
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResult(result) {
+    this._captureConnection('Viewer host result delivery');
+    const { header, body } = encodeViewerResult(result);
+    if (!this._protocol.events.has('result')) return false;
+    this._channel.sendBinary(header, new Blob(body));
+    return true;
+  }
+
+  /**
+   * Say a result is gone.
+   *
+   * @param {{epoch: string, revision: number, kind: string, id: string}} removal
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResultRemoved(removal) {
+    requireExactKeys(removal, ['epoch', 'revision', 'kind', 'id'], 'Viewer host result removal');
+    if (!isViewerResultEpoch(removal.epoch)) throw new TypeError('Viewer host result removal epoch must be an epoch');
+    requireNonNegativeInteger(removal.revision, 'Viewer host result removal revision');
+    if (!Object.hasOwn(VIEWER_RESULT_META_FIELDS, removal.kind)) {
+      throw new TypeError('Viewer host result removal kind must be a result kind');
+    }
+    requireExactText(removal.id, 'Viewer host result removal id', { allowWhitespace: true });
+    return this._sendEvent({
+      type: 'result_removed',
+      epoch: removal.epoch,
+      revision: removal.revision,
+      kind: removal.kind,
+      id: removal.id
+    });
+  }
+
+  /**
+   * Send the inventory of every result of `epoch` at `revision`: the end of
+   * a snapshot (a dataset opened, the channel opened again). `dataset` is the
+   * host's dataset they describe, or null (the viewer shows another dataset,
+   * and `items` is empty).
+   *
+   * @param {{epoch: string, dataset: string|null, revision: number, nObs: number,
+   *   items: Array<{kind: string, id: string, revision: number}>}} inventory
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResults(inventory) {
+    requireExactKeys(inventory, ['epoch', 'dataset', 'revision', 'nObs', 'items'], 'Viewer host results inventory');
+    if (!isViewerResultEpoch(inventory.epoch)) throw new TypeError('Viewer host results epoch must be an epoch');
+    if (inventory.dataset !== null) requireExactText(inventory.dataset, 'Viewer host results dataset');
+    requireNonNegativeInteger(inventory.revision, 'Viewer host results revision');
+    requireNonNegativeInteger(inventory.nObs, 'Viewer host results nObs');
+    if (!Array.isArray(inventory.items)) throw new TypeError('Viewer host results items must be a list');
+    if (inventory.dataset === null && inventory.items.length > 0) {
+      throw new TypeError('Viewer host results of another dataset list nothing');
+    }
+    for (const item of inventory.items) {
+      requireExactKeys(item, ['kind', 'id', 'revision'], 'Viewer host results item');
+    }
+    return this._sendEvent({
+      type: 'results',
+      epoch: inventory.epoch,
+      dataset: inventory.dataset,
+      revision: inventory.revision,
+      nObs: inventory.nObs,
+      items: inventory.items
+    });
+  }
+
+  /**
+   * Say which field the viewer colours by now.
+   *
+   * @param {{field: string|null, source: 'obs'|'var'|null, label: string|null}} colorBy
+   *   `field` a gene's identifier (the var index) or an obs key; `label` the
+   *   name the viewer shows for it (a gene's symbol)
+   * @returns {boolean} Whether it was sent
+   */
+  notifyColorBy(colorBy) {
+    requireExactKeys(colorBy, ['field', 'source', 'label'], 'Viewer host colour-by report');
+    const { field, source, label } = colorBy;
+    if ((field === null) !== (source === null) || (field === null) !== (label === null)) {
+      throw new TypeError('Viewer host colour-by names a field, its source and its label, or none');
+    }
+    if (field !== null) {
+      requireExactText(field, 'Viewer host colour-by field', { allowWhitespace: true });
+      requireExactText(label, 'Viewer host colour-by label', { allowWhitespace: true });
+      if (source !== 'obs' && source !== 'var') throw new TypeError('Viewer host colour-by source must be obs or var');
+    }
+    return this._sendEvent({
+      type: 'color_by',
+      field,
+      source,
+      label
+    });
   }
 
   // =========================================================================
@@ -1548,9 +1850,10 @@ export class ViewerHostDataSource {
 
   /**
    * Register callback for highlight commands from the host
-   * @param {Function} callback - Called with (cells, color): the ascending
-   *   Uint32Array of a highlight and its colour, or (null, null) to clear
-   *   every highlight
+   * @param {Function} callback - Called with (cells, color, label): the
+   *   ascending Uint32Array of a highlight's original positions, its colour
+   *   and its label (null: the viewer names it), or (null, null, null) to
+   *   clear every highlight
    */
   onHighlight(callback) {
     if (typeof callback !== 'function') {
@@ -1604,7 +1907,7 @@ export class ViewerHostDataSource {
     };
 
     try {
-      const response = await fetch(
+      const response = await routedFetch(
         `${owner.config.serverUrl}/_cellucid/datasets`,
         { signal: catalogOwner.controller.signal }
       );

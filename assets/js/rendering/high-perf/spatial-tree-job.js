@@ -5,16 +5,35 @@
  * worker can take the job (`createInlineSpatialTreeBuilder`).
  */
 import { buildSpatialTree, decodeSpatialTree, encodeSpatialTree } from './spatial-tree.js';
-import { computeTreeDrawOrder, drawOrderTransferList } from './draw-order.js';
+import { computeTreeDrawOrder, drawOrderTransferList, dropDerivableLeafIds, leafIdsFollowDrawOrder } from './draw-order.js';
+import { DEFAULT_CELL_PRIORITY, reviveCellPriority } from '../../data/cell-priority.js';
 
 /**
- * @param {{positions: Float32Array, dimensionLevel: number, maxPointsPerNode: number, maxDepth: number, buildLOD: boolean}} request
+ * @param {{positions: Float32Array|null, dimensionLevel: number, maxPointsPerNode: number, maxDepth: number, buildLOD: boolean,
+ *   priority?: {seed: number|null, originals: Uint32Array|null}}} request - `priority`: the cells'
+ *   priority (`data/cell-priority.js`), the order LOD levels admit them in; by default every
+ *   point ranked under the default seed.
+ * @param {{releasePositions?: boolean}} [options] - `releasePositions`: set
+ *   the request's `positions` to null once the tree is built (for a caller
+ *   whose request is their only holder).
  * @returns {{tree: {bounds: object, root: object}, order: object}}
  */
-export function buildSpatialTreeJob({ positions, dimensionLevel, maxPointsPerNode, maxDepth, buildLOD }) {
-  const tree = buildSpatialTree(positions, dimensionLevel, maxPointsPerNode, maxDepth);
-  packLeafIndices(tree, positions.length / dimensionLevel);
-  const order = computeTreeDrawOrder(positions, tree, dimensionLevel, buildLOD === true);
+export function buildSpatialTreeJob(request, { releasePositions = false } = {}) {
+  const { dimensionLevel, maxPointsPerNode, maxDepth, buildLOD, priority = DEFAULT_CELL_PRIORITY } = request;
+  const pointCount = request.positions.length / dimensionLevel;
+  const tree = buildSpatialTree(request.positions, dimensionLevel, maxPointsPerNode, maxDepth);
+  // Nothing after the tree reads a position. With `releasePositions` (the
+  // tree worker, whose request alone holds its copy) the request lets go of
+  // them, so that copy (12 bytes a point in 3D, 1.2 GB at 100M) is not held
+  // through the leaf packing and the draw order, the build's peak.
+  if (releasePositions) request.positions = null;
+  // A tree whose leaf ids its draw order holds (3D) lets them go once the
+  // order is made (`dropDerivableLeafIds`): 4 bytes a point neither
+  // crosses to the page nor stays there. Any other packs them for the reply.
+  const derivable = leafIdsFollowDrawOrder(dimensionLevel);
+  if (!derivable) packLeafIndices(tree, pointCount);
+  const order = computeTreeDrawOrder(pointCount, tree, dimensionLevel, buildLOD === true, reviveCellPriority(priority));
+  if (derivable) dropDerivableLeafIds(tree.root, dimensionLevel);
   return { tree, order };
 }
 

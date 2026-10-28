@@ -243,11 +243,13 @@ test('a saved session restores to the exact state it recorded', async (
   // device capability, does not).
   await page.locator('#theme-select').selectOption('dark');
   await setControl(page, 'hp-lod-enabled', false);
-  await setControl(page, 'hp-lod-force', '5');
+  // A forced level of the ladder of the cells open (draw-order.js
+  // `lodLadder`): this dataset's 120 cells have one level, 0, and -1 is Auto.
+  await setControl(page, 'hp-lod-force', '0');
   await setControl(page, 'hp-frustum-culling', false);
   await setControl(page, 'toggle-centroid-labels', true);
   await setControl(page, 'smoke-density', '71');
-  await expect(page.locator('#hp-lod-force')).toHaveValue('5');
+  await expect(page.locator('#hp-lod-force')).toHaveValue('0');
 
   // Figure-export settings: the panel is outside the generic control
   // inventory, so its own record is what the session carries.

@@ -22,14 +22,14 @@ import { HoverContext } from '../components/hover-context.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
 import { downloadBlob } from '../../../utils/download.js';
-import { toCSVCell } from '../../compute/csv-export.js';
+import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { DEFAULTS } from '../../genes-panel/constants.js';
 import { MARKER_OPTIONS } from '../../options/marker-options.js';
 import { defineOptions } from '../../options/option-schema.js';
 import { renderOptionsForm } from '../../options/render-options-form.js';
-import { countGeneFamilies } from '../../shared/gene-sets.js';
+import { countGeneFamilies, formatGmt, geneIdentities } from '../../shared/gene-sets.js';
 import { createSegmented } from '../../../ui/components/controls.js';
 import {
   createResultEnvelope,
@@ -41,6 +41,8 @@ import { formatDuration, formatCount, formatCountOf } from '../../../../utils/fo
 
 /** A marker group in a session: its category, by value. */
 const GROUP_KEY_PREFIX = 'category:';
+/** The description of a marker gene set, in a GMT file and to a notebook. */
+const MARKER_GENE_SET_DESCRIPTION = 'Cellucid marker genes';
 
 /** The Wilcoxon p-value conventions as the form names them. */
 const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
@@ -228,6 +230,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return this._ensureController().plan(options, described).blocker;
   }
 
+  /** Another set of open cells: the groups are described again on them. @override */
+  _onOpenCellsChanged() {
+    this._groupState = { key: null, described: null, pending: null };
+  }
+
   onHighlightChanged() {
     super.onHighlightChanged();
     if (this._options !== null && this._options.cells !== 'all') this._loadGroups(this._options);
@@ -244,9 +251,14 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return this._controller;
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const controller = this._ensureController();
-    const run = await controller.runAnalysis({ options, job });
+    const run = await controller.runAnalysis({ options, job, sample });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
     return this._buildResult(run.stats, run.metadata, options, job?.signal ?? null);
   }
@@ -736,13 +748,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _exportModalCSV() {
     const result = this._lastResult;
     if (!result?.selection) return;
-    const lines = ['group,rank,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group'];
+    // Genes by identifier, the shown name beside it (`geneNameColumns`).
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
+    const shown = result.selection.groups.flatMap(({ markers }) => markers.map(marker => marker.gene));
+    const columns = geneNameColumns(shown, shown.map(gene => idOf(gene)));
+    const lines = [`group,rank,${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group`];
+    let at = 0;
     for (const { group, markers } of result.selection.groups) {
       for (const marker of markers) {
         lines.push([
           toCSVCell(String(group.groupName)),
           marker.rank,
-          toCSVCell(marker.gene),
+          columns.cells(at++),
           toCSVCell(marker.score),
           toCSVCell(marker.log2FoldChange),
           toCSVCell(marker.pValue),
@@ -759,6 +776,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** Every gene of every group (long), written by the analysis workers. */
   async _exportAllGenesCSV() {
+    if (this._refuseStaleExport('CSV')) return;
     const stats = this._lastResult?.stats;
     if (!stats) return;
     try {
@@ -768,6 +786,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
           layout: 'marker-statistics',
           markers: {
             genes: stats.genes,
+            ids: stats.genes.map(gene => geneIdentities(this.dataLayer.state?.varData).idOf(gene)),
             groups: stats.groups.map(group => ({ name: String(group.groupName), tested: group.tested, small: group.small })),
             scores: stats.scoresByGroup.map(lane => lane.slice()),
             logfoldchanges: stats.log2FoldChangeByGroup.map(lane => lane.slice()),
@@ -788,13 +807,32 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** The shown markers of each group as a GMT file. */
   _exportGMT() {
+    if (this._refuseStaleExport('GMT')) return;
     const sets = this.getMarkerGeneSets();
-    const text = sets.map(set => [set.name.replace(/\t/g, ' '), 'Cellucid marker genes', ...set.genes].join('\t')).join('\n');
+    // Genes leave by their identifier (the var index), as every boundary names them.
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
     try {
-      downloadBlob(new Blob([`${text}\n`], { type: 'text/plain' }), 'marker_genes.gmt');
+      downloadBlob(
+        new Blob([formatGmt(sets.map(set => ({
+          ...set,
+          genes: set.genes.map(gene => idOf(gene)),
+          description: MARKER_GENE_SET_DESCRIPTION,
+        })))], { type: 'text/plain' }),
+        'marker_genes.gmt'
+      );
     } catch (error) {
       this._notifications.error(`GMT export failed: ${error.message}`, { category: 'download' });
     }
+  }
+
+  /** The shown markers reach the dataset's derived results (and a notebook) as gene sets. */
+  _publishDerivedResults(result) {
+    const state = this.dataLayer?.state;
+    if (state === null || state === undefined) return;
+    const geneSets = result === null
+      ? []
+      : this.getMarkerGeneSets().map(set => ({ ...set, description: MARKER_GENE_SET_DESCRIPTION }));
+    state.getDerivedResults().replaceOwned('markers', { geneSets });
   }
 
   /**
@@ -902,7 +940,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * columns), its groups named by category value, and its metadata. The
    * shown markers, heatmap and clustering are rebuilt from them.
    */
-  exportResult() {
+  _exportResult() {
     const result = this._lastResult;
     if (!result?.stats) return null;
     const { stats, metadata } = result;

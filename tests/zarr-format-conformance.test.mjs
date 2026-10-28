@@ -27,8 +27,8 @@ import {
 import { isArrayNode, isGroup } from '../assets/js/formats/store.js';
 
 import { ZARR_CORPUS as FIXTURES, corpusEntries, corpusFolder } from './helpers/zarr-corpus.mjs';
-const STORES = ['v2/cases.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr',
-  'anndata/v2-uncompressed.zarr', 'anndata/v3-uncompressed.zarr'];
+const STORES = ['v2/cases.zarr', 'v2/blosc-delta.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr', 'anndata/v3-sharded-shapes.zarr',
+  'anndata/v2-uncompressed.zarr', 'anndata/v3-uncompressed.zarr', 'anndata/v2-defaults.zarr', 'anndata/v3-defaults.zarr'];
 
 // ---------------------------------------------------------------------------
 // Opening a corpus store through each backend.
@@ -508,6 +508,36 @@ test('storedBytes is the stored size of the chunks a selection touches', async (
   assert.equal(await remote.get('sharding/end_index').storedBytes([[0, 4], [0, 5]]),
     await local.get('sharding/end_index').storedBytes([[0, 4], [0, 5]]));
   assert.ok(await local.get('sharding/end_index').storedBytes([[0, 4], [0, 5]]) > 0);
+});
+
+test('what a sharded array of many shards stores costs at most one shard index read', async () => {
+  const entries = await corpusEntries('v3/cases.zarr');
+  const serve = hostFetch(entries);
+  const asked = [];
+  const remote = await openZarr(httpStore('https://example.test/host/', {
+    fetch: (url, init) => {
+      asked.push(new URL(url).pathname);
+      return serve(url, init);
+    },
+  }));
+  const local = await openFolder('v3/cases.zarr');
+  const array = remote.get('sharding/end_index');
+  const exact = await local.get('sharding/end_index').storedBytes();
+  asked.length = 0;
+  // Six shards: one index is read, the other five are estimated from it.
+  const estimate = await array.storedBytes();
+  assert.equal(asked.length, 1, asked.join(', '));
+  assert.ok(Math.abs(estimate - exact) <= 0.3 * exact, `estimate ${estimate}, stored ${exact}`);
+  // A selection within one shard is exact; once every index is in hand, so
+  // is the whole array.
+  const localArray = local.get('sharding/end_index');
+  for (let row = 0; row < 24; row += 8) {
+    for (let column = 0; column < 20; column += 10) {
+      const shard = [[row, row + 8], [column, column + 10]];
+      assert.equal(await array.storedBytes(shard), await localArray.storedBytes(shard));
+    }
+  }
+  assert.equal(await array.storedBytes(), exact);
 });
 
 test('activity hears about fetched and decoded chunks', async () => {

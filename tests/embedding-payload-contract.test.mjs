@@ -111,7 +111,7 @@ function payloadsOver(arrays) {
     const { values, width } = arrays[key];
     return Float64Array.from({ length: (values.length / width) * columns.length }, (_, index) =>
       values[Math.floor(index / columns.length) * width + columns[index % columns.length]]);
-  }, () => generation);
+  }, { cellCount: () => 3, generation: () => generation });
   return { payloads, reads, advance: () => { generation++; } };
 }
 

@@ -23,6 +23,7 @@ import { resolveVectorBinding } from './data-mapping-candidates.js';
 import { markProvenFiniteFloat32Array } from '../rendering/position-layout.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { cellsSteady, trackCellWork } from './open-cells-work.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -164,7 +165,11 @@ export class VectorFieldManager {
       this._bindings.set(fieldId, bound);
     }
 
-    /** @type {Map<string, Map<string, Promise<object>>>} */
+    /**
+     * Loads under way, by field and layout, with the open cell count each
+     * reads for: a load is shared only by callers of the same cells.
+     * @type {Map<string, Map<string, {cells: number, promise: Promise<object>}>>}
+     */
     this._loading = new Map();
 
     /** Owns every download this manager starts; aborted by dispose(). */
@@ -250,6 +255,10 @@ export class VectorFieldManager {
       layoutKey,
       'VectorFieldManager layoutKey'
     );
+    // The open cells being changed in place: read for the cells after it
+    // (`open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (this._lifetime.signal.aborted) throw this._lifetime.signal.reason;
     const entry = this._fields.get(id);
     if (entry === undefined) {
@@ -267,18 +276,20 @@ export class VectorFieldManager {
       perField = new Map();
       this._loading.set(id, perField);
     }
+    const cells = this.dimensionManager.nCells;
     const activeLoad = perField.get(key);
-    if (activeLoad !== undefined) {
-      return activeLoad;
+    if (activeLoad !== undefined && activeLoad.cells === cells) {
+      return activeLoad.promise;
     }
 
-    const promise = this._loadExactField(id, entry, key, dim);
-    perField.set(key, promise);
+    const promise = trackCellWork(this._loadExactField(id, entry, key, dim));
+    const own = { cells, promise };
+    perField.set(key, own);
     try {
       return await promise;
     } finally {
-      perField.delete(key);
-      if (perField.size === 0) {
+      if (perField.get(key) === own) perField.delete(key);
+      if (perField.size === 0 && this._loading.get(id) === perField) {
         this._loading.delete(id);
       }
     }
@@ -308,8 +319,10 @@ export class VectorFieldManager {
       currentBinding.adapter !== binding.adapter ||
       currentBinding.source !== binding.source
     ) {
-      throw new Error(
-        `VectorFieldManager.loadField: direct AnnData ownership changed while loading field "${id}".`
+      // Read for a dataset (or open cells) no longer shown: superseded.
+      throw new DOMException(
+        `The vector field "${id}" was read for a dataset no longer shown.`,
+        'AbortError'
       );
     }
     if (

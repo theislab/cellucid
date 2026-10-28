@@ -114,11 +114,12 @@ export function nullableContract(item, key, declared, format, expectedLength = n
 }
 
 /** A boolean mask as 0/1 bytes; any other stored value is refused. */
-export async function readBooleanMask(maskArray, length, label, options) {
-  const raw = await readStored(maskArray, 0, length, label, options);
+export async function readBooleanMask(maskArray, length, label, options, range = null) {
+  const { start, end } = range ?? { start: 0, end: length };
+  const raw = await readStored(maskArray, start, end, label, options);
   const message = `${label} must contain only boolean values`;
-  const mask = raw instanceof Uint8Array ? raw : allocateTypedArray(Uint8Array, length, label);
-  for (let i = 0; i < length; i++) {
+  const mask = raw instanceof Uint8Array ? raw : allocateTypedArray(Uint8Array, end - start, label);
+  for (let i = 0; i < end - start; i++) {
     const value = raw[i];
     if (value === 0 || value === 1) mask[i] = value;
     else mask[i] = decodeAnnDataBoolean(value, message) ? 1 : 0;
@@ -128,14 +129,17 @@ export async function readBooleanMask(maskArray, length, label, options) {
 
 /**
  * A nullable column's values: integers as float32 with NaN where missing,
- * booleans and strings as values with null where missing.
+ * booleans and strings as values with null where missing. `range`
+ * (`{start, end}`) reads only those rows; every row by default.
  */
-export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}) {
-  const { maskArray, valuesArray, valuesKind, valuesLength } =
+export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}, range = null) {
+  const { maskArray, valuesArray, valuesKind, valuesLength: storedLength } =
     contract ?? nullableContract(item, key, declared, format, expectedLength);
+  const { start, end } = range ?? { start: 0, end: storedLength };
+  const valuesLength = end - start;
   const [mask, rawValues] = await Promise.all([
-    readBooleanMask(maskArray, valuesLength, `Nullable mask for '${key}'`, options),
-    readStored(valuesArray, 0, valuesLength, `Nullable values for '${key}'`, options),
+    readBooleanMask(maskArray, storedLength, `Nullable mask for '${key}'`, options, { start, end }),
+    readStored(valuesArray, start, end, `Nullable values for '${key}'`, options),
   ]);
   if (declared === 'nullable-integer') {
     // Only present values are checked: what a writer leaves under the mask
@@ -277,10 +281,14 @@ export function validateCodes(codes, key, format, nRows) {
   return length;
 }
 
-/** A categorical column's codes as int32, each a category or -1 (missing). */
-export async function readCodes(codes, nCategories, key, format, nRows, options = {}) {
+/**
+ * A categorical column's codes as int32, each a category or -1 (missing);
+ * `range` (`{start, end}`) reads only those rows, every row by default.
+ */
+export async function readCodes(codes, nCategories, key, format, nRows, options = {}, range = null) {
   const length = validateCodes(codes, key, format, nRows);
-  const values = await readInt32(codes, 0, length, `Categorical code for '${key}'`, options);
+  const { start, end } = range ?? { start: 0, end: length };
+  const values = await readInt32(codes, start, end, `Categorical code for '${key}'`, options);
   for (let i = 0; i < values.length; i++) {
     const code = values[i];
     if (code < -1 || code >= nCategories) {
@@ -346,7 +354,7 @@ export async function readBooleanColumn(frame, key, format, label, nRows, option
       readBooleanMask(contract.maskArray, contract.valuesLength, `Nullable mask for '${key}'`, options),
       readBooleanMask(contract.valuesArray, contract.valuesLength, label, options),
     ]);
-    const flags = new Uint8Array(contract.valuesLength);
+    const flags = allocateTypedArray(Uint8Array, contract.valuesLength, label);
     for (let row = 0; row < flags.length; row++) flags[row] = values[row] === 1 && mask[row] === 0 ? 1 : 0;
     return flags;
   }

@@ -133,7 +133,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
   await expect(retry).toBeEnabled();
 
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
-  await expect(page.locator('#stats')).toHaveText('Points: 0 • Field: None');
+  await expect(page.locator('#stats')).toHaveText('0 cells • Field: None');
   await expect(page.locator('iframe')).toHaveCount(0);
   expect(
     await page.evaluate(() => window._cellucidViewer.getPointCount()),

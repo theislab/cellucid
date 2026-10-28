@@ -164,6 +164,11 @@ export class CompositionUI extends FormBasedAnalysisUI {
     });
   }
 
+  /** Another set of open cells: the categories' counts are counted again on them. @override */
+  _onOpenCellsChanged() {
+    this._fieldGroups.reset();
+  }
+
   _getTitle() {
     return 'Composition';
   }
@@ -235,7 +240,12 @@ export class CompositionUI extends FormBasedAnalysisUI {
     return mask;
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const signal = job.signal;
     job.setPlan('Counts every cell once');
     job.step('Reading the fields');
@@ -265,7 +275,8 @@ export class CompositionUI extends FormBasedAnalysisUI {
     const conditionNames = conditionField === null ? [] : conditionField.categories.map(String);
     const conditionFieldState = conditionField === null ? null : fieldOf(options.condition);
     const cellCount = typeField.codes.length;
-    const scope = this._scopeMask(options.cells, cellCount);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this._scopeMask(options.cells, cellCount) : sample.mask(this._scopeMask(options.cells, cellCount));
 
     job.step('Counting cells');
     const counted = await getComputeManager().execute(
@@ -499,6 +510,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
 
   /** The counts, one row per cell type and one column per sample (or condition). */
   _downloadCounts() {
+    if (this._refuseStaleExport('CSV')) return;
     const composition = this._lastResult?.composition;
     if (!composition) return;
     const { types, units, counts } = composition;
@@ -542,7 +554,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
 
   // ---------------------------------------------------------------- Sessions
 
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('composition', this._lastResult);
   }

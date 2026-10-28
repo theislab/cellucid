@@ -24,6 +24,7 @@
  */
 
 import { delimiterOf, forEachLine, lineText, splitFields, textPieces } from '../../../formats/text/lines.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 const MISSING = new Set(['', 'NA', 'NaN', 'nan', 'N/A', 'null', 'NULL']);
 const CELL_COLUMN = /^(barcodes?|cells?|cell[_ .-]?(id|name|barcode)s?|obs[_ ]?names|index)$/i;
@@ -83,7 +84,7 @@ function isNumberText(text) {
 
 /** A text column's values as numbers, or null when it is not numeric. */
 export function numericColumn(values) {
-  const out = new Float64Array(values.length);
+  const out = allocateTypedArray(Float64Array, values.length, 'A numeric text column');
   let seen = false;
   for (let i = 0; i < values.length; i++) {
     const text = values[i].trim();
@@ -153,7 +154,7 @@ export function joinTable(table, cells, { prefix = '' } = {}) {
     if (index === key || inEmbedding.has(index) || name.trim() === '') return;
     const label = `${prefix}${name.trim()}`;
     if (numeric[index] !== null && !isClusteringColumn(name)) {
-      const values = new Float64Array(cells.length).fill(NaN);
+      const values = allocateTypedArray(Float64Array, cells.length, label).fill(NaN);
       rowOf.forEach((row, r) => { if (row >= 0) values[row] = numeric[index][r]; });
       columns.push({ name: label, column: { kind: 'numbers', values } });
       return;
@@ -166,12 +167,12 @@ export function joinTable(table, cells, { prefix = '' } = {}) {
     const categories = [...new Set(placed.filter(value => value !== null))]
       .sort((a, b) => (numeric[index] !== null ? Number(a) - Number(b) : a < b ? -1 : a > b ? 1 : 0));
     const code = new Map(categories.map((value, i) => [value, i]));
-    const codes = categories.length < 128 ? new Int8Array(cells.length) : categories.length < 32768 ? new Int16Array(cells.length) : new Int32Array(cells.length);
+    const codes = allocateTypedArray(categories.length < 128 ? Int8Array : categories.length < 32768 ? Int16Array : Int32Array, cells.length, label);
     placed.forEach((value, i) => { codes[i] = value === null ? -1 : code.get(value); });
     columns.push({ name: label, column: { kind: 'categorical', codes, categories, ordered: false } });
   });
   const obsm = embeddings.map(({ name, columns: members }) => {
-    const values = new Float64Array(cells.length * members.length).fill(NaN);
+    const values = allocateTypedArray(Float64Array, cells.length * members.length, `obsm['${name}']`).fill(NaN);
     members.forEach((column, c) => {
       rowOf.forEach((row, r) => { if (row >= 0) values[c * cells.length + row] = numeric[column][r]; });
     });

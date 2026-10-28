@@ -3,12 +3,15 @@
  * - a gene the user waits for (`high`) starts at once, and a long run's next
  *   read (`bulk`) waits until it has arrived;
  * - a prefetch the user then chooses is raised, not read twice;
- * - a replaced dataset releases every read it held.
+ * - a replaced dataset releases every read it held;
+ * - a gene of a matrix stored cell by cell is said to cost the whole matrix
+ *   before it is read, and the person can stop it; a failed gene says why.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { FieldLoadingMethods } from '../assets/js/app/state/managers/field/loading.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { FieldLoadingMethods, isFieldLoadCancelledError } from '../assets/js/app/state/managers/field/loading.js';
 
 function deferred() {
   let resolve;
@@ -123,4 +126,71 @@ test('a replaced dataset releases every download it held, even one that never se
   // The stalled download was aborted, and its waiter released.
   assert.equal(stalled.signal.aborted, true);
   await assert.rejects(waiting);
+});
+
+/** The notification center, recorded: every call and its arguments, and the cancel handlers given. */
+function recordNotifications(t) {
+  const notifications = getNotificationCenter();
+  const names = ['loading', 'complete', 'fail', 'dismiss', 'hasNotification'];
+  const originals = new Map(names.map(name => [name, notifications[name]]));
+  const calls = [];
+  const live = new Set();
+  let next = 0;
+  notifications.loading = (message, options = {}) => {
+    const id = options.id ?? `n${++next}`;
+    live.add(id);
+    calls.push({ name: 'loading', id, message, options });
+    return id;
+  };
+  for (const name of ['complete', 'fail', 'dismiss']) {
+    notifications[name] = (id, message) => {
+      live.delete(id);
+      calls.push({ name, id, message });
+    };
+  }
+  notifications.hasNotification = id => live.has(id);
+  t.after(() => {
+    for (const [name, method] of originals) notifications[name] = method;
+  });
+  return calls;
+}
+
+test('a gene stored cell by cell is said to cost the whole matrix before it is read, and Cancel stops its read', async t => {
+  const calls = recordNotifications(t);
+  const reads = [];
+  const loader = (descriptor, options) => {
+    const read = deferred();
+    reads.push({ signal: options.signal, read });
+    options.signal.addEventListener('abort', () => read.reject(options.signal.reason));
+    return read.promise;
+  };
+  loader.readPlan = async () => ({
+    label: 'X',
+    cellMajor: true,
+    built: false,
+    scan: { storedBytes: 4.7 * 2 ** 30, valueBytes: 1 },
+    index: { passes: 1, placement: 'memory', refusal: null, secondPassStoredBytes: null },
+    bytesPerSecond: 2 ** 20,
+  });
+  const state = geneState(['SFTPC'], loader);
+  const load = state.ensureVarFieldLoaded(0, { priority: 'high' });
+  load.catch(() => {});
+  await tick();
+  await tick();
+  const [first, plan] = calls.filter(call => call.name === 'loading');
+  assert.equal(first.message, 'Loading gene: SFTPC');
+  assert.equal(typeof first.options.onCancel, 'function', 'the load can be cancelled');
+  assert.equal(plan.id, first.id, 'the cost is said in the same notification');
+  assert.match(plan.message, /^Loading gene: SFTPC\. X is stored cell by cell, so the first gene reads every cell's entries: 4\.7 GB \(~1 h 20 min at the measured 1\.0 MB\/s\)\. Later genes read the gene index it builds\.$/);
+  first.options.onCancel();
+  await assert.rejects(load, error => isFieldLoadCancelledError(error));
+  assert.equal(reads[0].signal.aborted, true, 'the read itself was stopped');
+  assert.deepEqual(calls.at(-1), { name: 'complete', id: first.id, message: 'Stopped loading gene: SFTPC' });
+});
+
+test('a gene that cannot be read says why, in its notification', async t => {
+  const calls = recordNotifications(t);
+  const state = geneState(['EPCAM'], () => Promise.reject(new Error('Sparse X indices chunk 12 could not be decoded: incorrect header check')));
+  await assert.rejects(state.ensureVarFieldLoaded(0, { priority: 'high' }), /incorrect header check/);
+  assert.deepEqual(calls.at(-1).message, 'Failed to load gene: EPCAM: Sparse X indices chunk 12 could not be decoded: incorrect header check');
 });

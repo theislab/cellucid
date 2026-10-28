@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 
 import { openDatasetStore } from '../../assets/js/data/anndata/open.js';
 import { AnnDataReader } from '../../assets/js/data/anndata/reader.js';
+import { readPrefixCounts, readPriorityLayout, requirePrefixRows } from '../../assets/js/data/anndata/priority-layout.js';
 
 const CACHE_BYTES = 64 * 1024 * 1024;
 
@@ -38,14 +39,17 @@ function sameNumber(actual, expected) {
   return actual === expected;
 }
 
-/** An expected R column against the stored one. */
-async function assertColumn(node, expected, where) {
+/**
+ * An expected R column against the stored one; `rowOf[i]` is the stored row
+ * of the object's cell `i` (the store keeps its cells in priority order).
+ */
+async function assertColumn(node, expected, where, rowOf) {
   assert.ok(node !== null, `${where} is stored`);
   if (expected.kind === 'categorical') {
     const codes = await node.get('codes').read();
     const categories = await node.get('categories').read();
     assert.deepEqual([...categories], expected.categories, `${where}: categories`);
-    assert.deepEqual(Array.from(codes), expected.codes, `${where}: codes`);
+    assert.deepEqual(Array.from(rowOf, row => codes[row]), expected.codes, `${where}: codes`);
     assert.equal(node.attrs.ordered === true, expected.ordered === true, `${where}: ordered`);
     return;
   }
@@ -60,33 +64,35 @@ async function assertColumn(node, expected, where) {
   }
   assert.equal(values.length, expected.values.length, `${where}: length`);
   expected.values.forEach((want, i) => {
+    const row = rowOf[i];
     if (want === null && mask !== null) {
-      assert.equal(mask[i], 1, `${where}[${i}] is missing`);
+      assert.equal(mask[row], 1, `${where}[${i}] is missing`);
       return;
     }
-    if (mask !== null) assert.equal(mask[i], 0, `${where}[${i}] is not missing`);
-    const got = typeof want === 'boolean' ? values[i] === 1 : Number(values[i]);
-    assert.ok(typeof want === 'boolean' ? got === want : sameNumber(got, want), `${where}[${i}]: ${values[i]} where R read ${want}`);
+    if (mask !== null) assert.equal(mask[row], 0, `${where}[${i}] is not missing`);
+    const got = typeof want === 'boolean' ? values[row] === 1 : Number(values[row]);
+    assert.ok(typeof want === 'boolean' ? got === want : sameNumber(got, want), `${where}[${i}]: ${values[row]} where R read ${want}`);
   });
 }
 
-/** The first cells' rows of a cells × features matrix against R's. */
-async function assertMatrix(node, expected, where, { float32 = false } = {}) {
+/** The first cells' rows of a cells × features matrix against R's (`rowOf`: as for `assertColumn`). */
+async function assertMatrix(node, expected, where, rowOf, { float32 = false } = {}) {
   const shape = node.attrs.shape ?? node.shape;
   assert.deepEqual([...shape], expected.shape, `${where}: shape`);
   const convert = float32 ? Math.fround : value => value;
   if (node.kind === 'array') {
-    const dense = await node.read([[0, Math.min(3, shape[0])]]);
+    const dense = await node.read();
     for (const row of expected.rows) {
-      const values = dense.subarray(row.cell * shape[1], (row.cell + 1) * shape[1]);
+      const stored = rowOf[row.cell];
+      const values = dense.subarray(stored * shape[1], (stored + 1) * shape[1]);
       row.indices.forEach((index, k) => assert.equal(values[index], convert(row.values[k]), `${where}[${row.cell}, ${index}]`));
       const nonZero = Array.from(values).filter(value => value !== 0).length;
       assert.equal(nonZero, row.indices.length, `${where}: row ${row.cell} non-zeros`);
     }
     return;
   }
-  // Stored as the entries arrived: by cell (csr_matrix), or by feature
-  // (csc_matrix, a kb-python or alevin-fry matrix).
+  // X stored by feature (csc_matrix); a layer as the object holds it
+  // (csr_matrix for a dgCMatrix), its rows in priority order.
   const encoding = node.attrs['encoding-type'];
   assert.ok(encoding === 'csr_matrix' || encoding === 'csc_matrix', `${where} is ${encoding}`);
   const indptr = await node.get('indptr').read();
@@ -99,15 +105,16 @@ async function assertMatrix(node, expected, where, { float32 = false } = {}) {
   assert.ok(Math.abs(sum - expected.sum) <= 1e-9 * Math.max(1, Math.abs(expected.sum)), `${where}: sum ${sum} where R summed ${expected.sum}`);
   for (const row of expected.rows) {
     let entries;
+    const stored = rowOf[row.cell];
     if (encoding === 'csr_matrix') {
-      const start = Number(indptr[row.cell]);
-      const end = Number(indptr[row.cell + 1]);
+      const start = Number(indptr[stored]);
+      const end = Number(indptr[stored + 1]);
       entries = Array.from({ length: end - start }, (_, k) => ({ feature: indices[start + k], value: data[start + k] }));
     } else {
       entries = [];
       for (let feature = 0; feature < shape[1]; feature++) {
         for (let k = Number(indptr[feature]); k < Number(indptr[feature + 1]); k++) {
-          if (indices[k] === row.cell) entries.push({ feature, value: data[k] });
+          if (indices[k] === stored) entries.push({ feature, value: data[k] });
         }
       }
     }
@@ -116,6 +123,55 @@ async function assertMatrix(node, expected, where, { float32 = false } = {}) {
     assert.deepEqual(entries.map(entry => entry.value), row.values.map(convert), `${where}: row ${row.cell} values`);
   }
   return encoding;
+}
+
+/**
+ * The store's priority layout, checked as the reader checks it: rows in
+ * rank order under the seed, every original position once, and each
+ * gene's prefix counts (read for every level) holding exactly its values
+ * below the level. Returns the stored row of each original cell.
+ */
+async function assertPriorityLayout(root, nObs, ordered) {
+  const { layout, notice } = await readPriorityLayout(root, nObs);
+  if (!ordered) {
+    // An uncompressed R file is read in place: its cells as the object holds them.
+    assert.equal(layout, null, 'an uncompressed file keeps its order');
+    assert.equal(notice, null, 'and records none');
+    return Uint32Array.from({ length: nObs }, (_, i) => i);
+  }
+  assert.ok(layout !== null, `the store is in priority order${notice === null ? '' : `: ${notice}`}`);
+  assert.equal(layout.seed, 0, 'under the default seed');
+  // The order the reader computes from the seed, and the stored column whole.
+  const originals = await layout.order();
+  const stored = await root.get('obs').get('cellucid_original_position').read();
+  assert.deepEqual(Array.from(stored, Number), Array.from(originals), 'the stored column is the seed\'s order');
+  const rowOf = new Uint32Array(nObs);
+  const seen = new Uint8Array(nObs);
+  originals.forEach((position, row) => {
+    assert.equal(seen[position], 0, `original position ${position} once`);
+    seen[position] = 1;
+    rowOf[position] = row;
+  });
+  const X = root.get('X');
+  if (X !== null && X.attrs?.['encoding-type'] === 'csc_matrix') {
+    const nVars = X.attrs.shape[1];
+    const indptr = await X.get('indptr').read();
+    const indices = await X.get('indices').read();
+    for (let level = 0; level < layout.levels.length; level++) {
+      const counts = await readPrefixCounts(root, level, nVars, {}, {
+        levelRows: layout.levels[level],
+        entryCounts: gene => Number(indptr[gene + 1]) - Number(indptr[gene]),
+      });
+      assert.ok(counts !== null, 'prefix counts beside a gene-major X');
+      for (let gene = 0; gene < nVars; gene++) {
+        const start = Number(indptr[gene]);
+        const rows = indices.subarray(start, Number(indptr[gene + 1]));
+        for (let k = 1; k < rows.length; k++) assert.ok(rows[k - 1] < rows[k], `X gene ${gene}: rows ascending`);
+        requirePrefixRows(rows, rows.length, counts[gene], layout.levels[level], gene);
+      }
+    }
+  }
+  return rowOf;
 }
 
 /**
@@ -158,9 +214,13 @@ export async function checkCorpusEntry(access, corpus, name, expected) {
       return;
     }
     assert.equal(reader.nObs, expected.nObs);
-    assert.deepEqual([...await root.get('obs/_index').read()], expected.obsNames, 'obs names');
+    // Every store is in priority order but an uncompressed R file's, read in place.
+    const ordered = !/_none\.rds$/.test(name);
+    const rowOf = await assertPriorityLayout(root, expected.nObs, ordered);
+    const names = await root.get('obs/_index').read();
+    assert.deepEqual(Array.from(rowOf, row => names[row]), expected.obsNames, 'obs names');
     for (const [column, values] of Object.entries(expected.obs)) {
-      await assertColumn(root.get(`obs/${column}`), values, `obs['${column}']`);
+      await assertColumn(root.get(`obs/${column}`), values, `obs['${column}']`, rowOf);
     }
     for (const [key, values] of Object.entries(expected.obsm)) {
       const node = root.get(`obsm/${key}`);
@@ -170,7 +230,7 @@ export async function checkCorpusEntry(access, corpus, name, expected) {
       assert.equal(rows * columns, values.length, `obsm['${key}'] size`);
       for (let c = 0; c < columns; c++) {
         for (let r = 0; r < rows; r++) {
-          assert.ok(sameNumber(stored[r * columns + c], values[c * rows + r]), `obsm['${key}'][${r}, ${c}]`);
+          assert.ok(sameNumber(stored[rowOf[r] * columns + c], values[c * rows + r]), `obsm['${key}'][${r}, ${c}]`);
         }
       }
     }
@@ -191,12 +251,12 @@ export async function checkCorpusEntry(access, corpus, name, expected) {
     const main = modalities[0];
     const float32 = corpus === 'mtx';
     assert.deepEqual([...await root.get('var/_index').read()], main.varNames, 'var names');
-    const stored = await assertMatrix(root.get('X'), main.X, 'X', { float32 });
-    // A matrix whose entries arrive by feature (kb-python) is kept as it
-    // arrived, by feature; one that arrives by cell, by cell.
-    if (name === 'kb') assert.equal(stored, 'csc_matrix', 'kb-python, sorted by gene, is kept by feature');
-    if (name === 'cellranger3' || name === 'cellranger2') assert.equal(stored, 'csr_matrix');
-    if (main.counts) await assertMatrix(root.get('layers/counts'), main.counts, "layers['counts']");
+    const stored = await assertMatrix(root.get('X'), main.X, 'X', rowOf, { float32 });
+    // X is kept by feature, a gene one contiguous range, whichever order its
+    // entries arrived in (an uncompressed R file's, read in place, keeps the
+    // file's).
+    if (stored !== undefined && ordered) assert.equal(stored, 'csc_matrix', 'X is kept by feature');
+    if (main.counts) await assertMatrix(root.get('layers/counts'), main.counts, "layers['counts']", rowOf);
     for (const [column, values] of Object.entries(expected.varColumns ?? {})) {
       const node = root.get(`var/${column}`);
       const codes = await node.get('codes').read();
@@ -207,6 +267,14 @@ export async function checkCorpusEntry(access, corpus, name, expected) {
       for (const [key, value] of Object.entries(expected.uns.cellucid)) {
         assert.equal(await root.get(`uns/cellucid/${key}`).read(), value, `uns['cellucid']['${key}']`);
       }
+    }
+    // A subsample under the store's seed opens as its prefix (the store is
+    // closed with the first reader, below).
+    if (ordered && expected.nObs > 1) {
+      const k = Math.max(1, Math.floor(expected.nObs / 3));
+      const subsampled = new AnnDataReader();
+      await subsampled.open(root, { format: opened.readerFormat, name: opened.name, link: opened.link, cellSubset: { mode: 'subsample', method: 'uniform', k } });
+      assert.equal(subsampled.cellSubset.prefix, k, 'a subsample is the first rows');
     }
     reader.close();
   } finally {

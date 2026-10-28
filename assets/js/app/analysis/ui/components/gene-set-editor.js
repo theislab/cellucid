@@ -2,7 +2,8 @@
  * @fileoverview Named gene sets, edited as chips: type a gene (the dataset's
  * genes are suggested as you type), paste a list (commas, semicolons,
  * spaces, tabs or new lines), import a file (`.txt`, `.csv`, `.tsv`,
- * `.gmt`), or take the markers of a marker genes result.
+ * `.gmt`), take the markers of a marker genes result or the sets a notebook
+ * pushed, and export the sets as a GMT file.
  *
  * Each set is a collapsible row: its name, its gene count, and an amber
  * "2 not found" chip naming the genes the dataset does not have. Those are
@@ -27,18 +28,26 @@ import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { createWindowedListbox } from '../../../ui/components/windowed-listbox.js';
 import {
   createGeneIndex,
+  formatGmt,
   parseGeneFile,
   parseGeneText,
   resolveGenes
 } from '../../shared/gene-sets.js';
+import { downloadBlob } from '../../../utils/download.js';
 
 /**
  * @param {object} options
  * @param {Array<{name: string, genes: string[]}>} [options.value]
  * @param {() => string[]} options.getGenes - The dataset's gene names
+ * @param {(() => ReturnType<typeof import('../../shared/gene-sets.js').geneIdentities>)|null} [options.getIdentities] -
+ *   Their identifiers (`geneIdentities`): genes are matched by either, and
+ *   exported by identifier
  * @param {(() => Array<{name: string, genes: string[]}>|null)|null} [options.getMarkerSets] -
  *   The sets "From markers" adds (one per group of the last marker result),
  *   or null while there is none; without it the action is not offered
+ * @param {(() => Array<{name: string, genes: string[]}>|null)|null} [options.getNotebookSets] -
+ *   The sets "From notebook" adds (the gene sets a notebook pushed to the
+ *   viewer), or null while there is none; without it the action is not offered
  * @param {(value: Array<{name: string, genes: string[]}>) => void} [options.onChange]
  * @returns {{ root: HTMLDivElement, getValue: () => object[], setValue: (value: object[]) => void,
  *   refresh: () => void, destroy: () => void }}
@@ -46,12 +55,17 @@ import {
 export function createGeneSetEditor({
   value: initialValue = [],
   getGenes,
+  getIdentities = null,
   getMarkerSets = null,
+  getNotebookSets = null,
   onChange = null,
 }) {
   if (typeof getGenes !== 'function') throw new TypeError('A gene set editor needs getGenes()');
   if (getMarkerSets !== null && typeof getMarkerSets !== 'function') {
     throw new TypeError('Gene set editor getMarkerSets must be a function or null');
+  }
+  if (getNotebookSets !== null && typeof getNotebookSets !== 'function') {
+    throw new TypeError('Gene set editor getNotebookSets must be a function or null');
   }
   const abort = new AbortController();
   const { signal } = abort;
@@ -79,7 +93,8 @@ export function createGeneSetEditor({
     const names = getGenes();
     if (index === null || !sameNames(names)) {
       geneNames = names;
-      index = createGeneIndex(names);
+      // A gene is matched by its identifier or its name (`geneIdentities`).
+      index = createGeneIndex(names, getIdentities?.() ?? null);
     }
     return index;
   };
@@ -353,29 +368,45 @@ export function createGeneSetEditor({
       rowsEl.querySelectorAll('.gene-set-input input')[sets.length - 1]?.focus();
     }),
     linkButton('Import', () => fileInput.click(), 'A gene list (.txt), a table (.csv, .tsv) or a GMT file'),
+    linkButton('Export', () => {
+      const filled = sets.filter(set => set.genes.length > 0);
+      if (filled.length === 0) return;
+      // Genes leave by their identifier (the var index), as every boundary names them.
+      const idOf = getIdentities?.()?.idOf ?? (gene => gene);
+      const exported = filled.map(set => ({ ...set, genes: set.genes.map(gene => idOf(gene)) }));
+      downloadBlob(new Blob([formatGmt(exported)], { type: 'text/plain' }), 'gene_sets.gmt');
+    }, 'These gene sets as a GMT file (Python read_gmt, R cellucid_read_gmt)'),
     fileInput
   );
-  let fromMarkers = null;
-  if (getMarkerSets !== null) {
-    fromMarkers = linkButton('From markers', () => {
-      const markerSets = getMarkerSets();
-      if (!Array.isArray(markerSets) || markerSets.length === 0) return;
+  /** An action that adds every set `getSets` offers, shown only while it offers some. */
+  const setsActions = [];
+  const addSetsAction = (getSets, text, title) => {
+    if (getSets === null) return;
+    const button = linkButton(text, () => {
+      const offered = getSets();
+      if (!Array.isArray(offered) || offered.length === 0) return;
       if (sets.length === 1 && sets[0].genes.length === 0) sets = [];
-      for (const set of markerSets) sets.push({ name: uniqueSetName(set.name), genes: [...set.genes] });
+      for (const set of offered) sets.push({ name: uniqueSetName(set.name), genes: [...set.genes] });
       openRows = new Set();
       render();
       emit();
-    }, 'One set per group of the last marker genes result');
-    footer.appendChild(fromMarkers);
-  }
+    }, title);
+    footer.appendChild(button);
+    setsActions.push({ button, getSets });
+  };
+  addSetsAction(getMarkerSets, 'From markers', 'One set per group of the last marker genes result');
+  addSetsAction(getNotebookSets, 'From notebook', 'The gene sets the notebook sent to this viewer');
+  const showSetsActions = () => {
+    for (const { button, getSets } of setsActions) {
+      const available = getSets();
+      button.hidden = !Array.isArray(available) || available.length === 0;
+    }
+  };
 
   function render() {
     const focusedIndex = [...rowsEl.querySelectorAll('.gene-set-input input')].indexOf(document.activeElement);
     rowsEl.replaceChildren(...sets.map(buildRow));
-    if (fromMarkers !== null) {
-      const available = getMarkerSets();
-      fromMarkers.hidden = !Array.isArray(available) || available.length === 0;
-    }
+    showSetsActions();
     if (focusedIndex >= 0) rowsEl.querySelectorAll('.gene-set-input input')[focusedIndex]?.focus();
   }
 
@@ -406,10 +437,7 @@ export function createGeneSetEditor({
      * a row being edited keeps its focus.
      */
     refresh() {
-      if (fromMarkers !== null) {
-        const available = getMarkerSets();
-        fromMarkers.hidden = !Array.isArray(available) || available.length === 0;
-      }
+      showSetsActions();
       if (index !== null && sameNames(getGenes())) return;
       index = null;
       render();

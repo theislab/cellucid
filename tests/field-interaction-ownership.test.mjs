@@ -1625,13 +1625,15 @@ test(
       ),
       'utf8',
     );
+    // Each waits first for the gene list of a dataset just shown (read
+    // after its first view), then holds the shared field owner.
     assert.match(
       coordinatorSource,
-      /sessionSerializer\.setCaptureSettlement\(\s*fieldSelector\.acquireSessionCaptureOperation\s*\)/,
+      /sessionSerializer\.setCaptureSettlement\(async \(\) => \{\s*await state\.whenGenesListed\(\);\s*return fieldSelector\.acquireSessionCaptureOperation\(\);\s*\}\)/,
     );
     assert.match(
       coordinatorSource,
-      /sessionSerializer\.setRestoreSettlement\(\s*fieldSelector\.acquireSessionRestoreOperation\s*\)/,
+      /sessionSerializer\.setRestoreSettlement\(async \(\) => \{\s*await state\.whenGenesListed\(\);\s*return fieldSelector\.acquireSessionRestoreOperation\(\);\s*\}\)/,
     );
     assert.match(
       coordinatorSource,

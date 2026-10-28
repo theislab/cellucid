@@ -45,12 +45,12 @@ test('the statistics line names the active field of the view being shown', async
   );
 
   const stats = page.locator('#stats');
-  await expect(stats).toHaveText('Points: 120 • Field: None');
+  await expect(stats).toHaveText('120 cells • Field: None');
 
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await expect(stats).toHaveText(
-    'Points: 120 • Field: cell_type (category) • Centroids: 3',
+    '120 cells • Field: cell_type (category) • Centroids: 3',
   );
 
   // Keep the coloured view. The kept view becomes active and carries the field
@@ -60,7 +60,7 @@ test('the statistics line names the active field of the view being shown', async
   await expect.poll(() => activeViewId(page)).toBe('snap_1');
   await expect(page.locator('.split-badge')).toHaveCount(2);
   await expect(stats).toHaveText(
-    'Points: 120 • Field: cell_type (category) • Centroids: 3',
+    '120 cells • Field: cell_type (category) • Centroids: 3',
   );
 
   // Back to the live view and colour it with a different field, so the two
@@ -68,7 +68,7 @@ test('the statistics line names the active field of the view being shown', async
   await page.locator('.split-badge').first().click();
   await expect.poll(() => activeViewId(page)).toBe('live');
   await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await expect(stats).toHaveText('Points: 120 • Field: score (continuous)');
+  await expect(stats).toHaveText('120 cells • Field: score (continuous)');
 
   // Switching back must re-announce the kept view's own field. Publishing the
   // legend without the line beside it is what left this reading "score" over a
@@ -77,14 +77,14 @@ test('the statistics line names the active field of the view being shown', async
   await expect.poll(() => activeViewId(page)).toBe('snap_1');
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await expect(stats).toHaveText(
-    'Points: 120 • Field: cell_type (category) • Centroids: 3',
+    '120 cells • Field: cell_type (category) • Centroids: 3',
   );
 
   // And once more in the other direction, so the assertion above cannot pass by
   // the line simply never changing.
   await page.locator('.split-badge').first().click();
   await expect.poll(() => activeViewId(page)).toBe('live');
-  await expect(stats).toHaveText('Points: 120 • Field: score (continuous)');
+  await expect(stats).toHaveText('120 cells • Field: score (continuous)');
 
   expect(browserErrors).toEqual([]);
 });

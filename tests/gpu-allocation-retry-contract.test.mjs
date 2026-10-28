@@ -96,10 +96,10 @@ test('no allocation path evicts kept memory ahead of a refusal', () => {
     assert.match(call, /evictRetainedGeometry\((|Infinity|headroomBytes = 0)\)/, call);
   }
   for (const site of [
-    'could not allocate its position buffer',
+    // Every per-point vertex store (`_allocatePointStore`).
+    'of point storage for',
     'could not allocate the alpha texture',
-    'could not allocate its draw-order texture',
-    'could not allocate its color buffer',
+    'could not allocate its slot map',
     'could not allocate its R8 texture',
   ]) {
     assert.ok(source.includes(site), site);
@@ -128,7 +128,7 @@ test('a failed tree build is retried once memory has been released, not before',
     snapshotBuffers: new Map(),
   });
   let builds = 0;
-  renderer._buildSpatialTreeJob = (_positions, _dimension, _lod, _onDone, onError) => {
+  renderer._buildSpatialTreeJob = (_positions, _dimension, _lod, _priority, _onDone, onError) => {
     builds += 1;
     onError(new Error('the worker could not allocate the tree'));
   };
@@ -145,32 +145,33 @@ test('a failed tree build is retried once memory has been released, not before',
   assert.match(source, /deleteGlObject\(gl, deleteMethod, handle\);\n\s*entry\.handle = null;[\s\S]{0,200}this\._releaseEpoch = /);
 });
 
-test('a frame adopts at most one new draw order; the rest wait for the next frame', () => {
-  const adopted = [];
+test('a frame puts a bounded number of points in order; the stores beyond it wait for the next frame', () => {
+  const moved = [];
   let frames = 0;
   const orders = new Map();
+  // Each store moves 2^20 points a call (half a band): two stores fill
+  // a frame's 2^21 (`STORE_ORDER_POINTS_PER_FRAME`).
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     onAsyncTreeReady: () => { frames += 1; },
     _storeOrder: store => orders.get(store) ?? null,
-    _adoptDrawOrder(store, drawOrder) {
-      adopted.push(store);
-      const record = { drawOrder };
-      orders.set(store, record);
-      return record;
+    _advanceStoreOrder(store, _current, drawOrder, budget) {
+      assert.ok(budget > 0);
+      moved.push(store);
+      const order = { drawOrder };
+      orders.set(store, order);
+      return { order, moved: 2 ** 20 };
     },
   });
   const tree = name => ({ ensureDrawOrder: () => name });
   const stores = ['a', 'b', 'c'];
   renderer.beginFrame();
   const first = stores.map(store => renderer._ensureStoreDrawOrder(store, tree(`order-${store}`)));
-  assert.deepEqual(adopted, ['a']);
-  assert.deepEqual(first.map(record => record?.drawOrder ?? null), ['order-a', null, null]);
-  assert.equal(frames, 2, 'each deferred store asks for another frame');
+  assert.deepEqual(moved, ['a', 'b']);
+  assert.deepEqual(first.map(record => record?.drawOrder ?? null), ['order-a', 'order-b', null]);
+  assert.equal(frames, 1, 'the store that waits asks for another frame');
   renderer.beginFrame();
   stores.forEach(store => renderer._ensureStoreDrawOrder(store, tree(`order-${store}`)));
-  renderer.beginFrame();
-  stores.forEach(store => renderer._ensureStoreDrawOrder(store, tree(`order-${store}`)));
-  assert.deepEqual(adopted, ['a', 'b', 'c']);
+  assert.deepEqual(moved, ['a', 'b', 'c']);
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   assert.match(viewer, /function renderSceneFrame\(\) \{\n\s*hpRenderer\.beginFrame\(\);/);
 });

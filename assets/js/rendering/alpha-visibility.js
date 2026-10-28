@@ -48,10 +48,9 @@ export function requirePointTransparency(values, pointCount, label) {
 /*
  * Per-cell 0/1 byte arrays are read four cells to a 32-bit word where the
  * bytes start on a word boundary: a byte is 0 or 1 iff its upper seven bits
- * are clear (`word & 0xfefefefe` is 0 for four such bytes), and `word * 255`
- * turns four 0/1 bytes into four 0/255 bytes with no carry between them
- * (each product is at most 255). Both hold in either byte order. The word
- * loops are functions of their own so each is compiled for its loop alone.
+ * are clear (`word & 0xfefefefe` is 0 for four such bytes), in either byte
+ * order. The word loop is a function of its own so it is compiled for its
+ * loop alone.
  */
 
 /** Index of the first word of `words[from, to)` holding a byte above 1, or -1. */
@@ -88,88 +87,4 @@ export function firstNonBinaryByte(bytes) {
     if (bytes[i] > 1) return i;
   }
   return -1;
-}
-
-/**
- * Four 0/1 transparency bytes a word as their R8 bytes (0 or 255) into
- * `target[from, to)`, compared with `reference` (read before `target` is
- * written, so the two may be one array). Returns 1 when any byte
- * differs from `reference`, 0 when none does, and -1 when a source byte is
- * above 1 (the caller names it).
- */
-function encodeAlphaWords(source, target, reference, from, to) {
-  let seen = 0;
-  let moved = 0;
-  for (let i = from; i < to; i++) {
-    const value = source[i];
-    seen |= value;
-    const encoded = Math.imul(value, 255);
-    moved |= encoded ^ reference[i];
-    target[i] = encoded;
-  }
-  if ((seen & 0xfefefefe) !== 0) return -1;
-  return moved !== 0 ? 1 : 0;
-}
-
-/**
- * Word views over the byte arrays an R8 alpha encoding reads and writes, or
- * null when one of them does not start on a word boundary.
- *
- * @param {Uint8Array} alphas - Transparency, exactly 0 or 1 a cell.
- * @param {Uint8Array} target - R8 bytes written.
- * @param {Uint8Array} reference - R8 bytes compared with.
- * @returns {{source: Uint32Array, target: Uint32Array, reference: Uint32Array}|null}
- */
-export function alphaEncodingWords(alphas, target, reference) {
-  if (
-    (alphas.byteOffset & 3) !== 0 ||
-    (target.byteOffset & 3) !== 0 ||
-    (reference.byteOffset & 3) !== 0
-  ) {
-    return null;
-  }
-  const words = array => new Uint32Array(array.buffer, array.byteOffset, array.length >>> 2);
-  return { source: words(alphas), target: words(target), reference: words(reference) };
-}
-
-/**
- * Encode the transparency of cells `[from, to)` as R8 bytes, `alpha * 255`
- * (exactly `Math.round(value * 255)` for 0 and 1), into `target`, and
- * compare them with `reference`.
- *
- * @param {Uint8Array} alphas - Transparency, exactly 0 or 1 a cell.
- * @param {Uint8Array} target
- * @param {Uint8Array} reference
- * @param {{source: Uint32Array, target: Uint32Array, reference: Uint32Array}|null} words
- *   `alphaEncodingWords` of the three arrays; null encodes byte by byte.
- * @param {number} from - First cell; a multiple of 4 when `words` is given.
- * @param {number} to - End cell (exclusive), at most `alphas.length`.
- * @returns {number} 1 when a byte moved, 0 when none did, or `-(index + 1)`
- *   naming the first cell whose value is above 1.
- */
-export function encodeAlphaSpan(alphas, target, reference, words, from, to) {
-  let wordEnd = from;
-  let result = 0;
-  if (words !== null) {
-    const wordFrom = from >>> 2;
-    const wordTo = to >>> 2;
-    if (wordTo > wordFrom) {
-      result = encodeAlphaWords(words.source, words.target, words.reference, wordFrom, wordTo);
-      if (result < 0) {
-        let index = from;
-        while (alphas[index] <= 1) index++;
-        return -(index + 1);
-      }
-      wordEnd = wordTo * 4;
-    }
-  }
-  let moved = 0;
-  for (let i = wordEnd; i < to; i++) {
-    const value = alphas[i];
-    if (value > 1) return -(i + 1);
-    const encoded = -value & 255;
-    moved |= encoded ^ reference[i];
-    target[i] = encoded;
-  }
-  return result !== 0 || moved !== 0 ? 1 : 0;
 }

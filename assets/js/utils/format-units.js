@@ -86,6 +86,31 @@ export function formatCells(value) {
   return formatCountOf(value, 'cell');
 }
 
+/**
+ * A count of the open cells, said against every cell of the dataset when
+ * only some are open (a subsample): `"1,200 cells"`, or `"300 of 1,200
+ * cells"`. The one way a shown count of the open cells is written, so a
+ * subsample's counts are never read as the whole dataset's: the filter
+ * line, the legend, the status line, the category builder, the dataset
+ * picker. The noun agrees with the count it follows last.
+ *
+ * @param {number} open - The open cells
+ * @param {number|null|undefined} total - Every cell of the dataset (`cellIdentity.nOriginal`); none, or
+ *   `open`, when every cell is open
+ * @param {(value: number) => string} [format] - How each number is written (`formatCount`, or a
+ *   compact form)
+ * @returns {string}
+ */
+export function formatOpenCells(open, total, format = formatCount) {
+  requireCount(open);
+  if (total === null || total === undefined || Number(total) === Number(open)) {
+    return `${format(open)} ${countNoun(open, 'cell')}`;
+  }
+  requireCount(total);
+  if (Number(total) < Number(open)) throw new RangeError('The open cells are some of the dataset\'s cells, never more');
+  return `${format(open)} of ${format(total)} ${countNoun(total, 'cell')}`;
+}
+
 /** A value below 10 of its unit keeps one decimal; larger ones none. */
 function roundForUnit(value, unit) {
   if (unit > 0 && value < 9.95) return Math.round(value * 10) / 10;

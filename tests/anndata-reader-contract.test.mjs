@@ -395,7 +395,7 @@ test('the structure must be the one current AnnData layout, and a failed open pu
     const { reader } = await openReader(validRoot());
     assert.equal(reader.nObs, 1);
     assert.equal(reader.nVars, 1);
-    assert.deepEqual(reader.varNames, ['gene']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['gene']);
   });
 
   await t.test('rejects an unversioned primitive dataframe index', async () => {
@@ -409,7 +409,7 @@ test('the structure must be the one current AnnData layout, and a failed open pu
     root.children.var.attrs['column-order'] = [];
     const { reader } = await openReader(root);
     assert.equal(reader.nVars, 1);
-    assert.deepEqual(reader.varNames, ['gene']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['gene']);
   });
 
   const invalidCases = [
@@ -488,7 +488,7 @@ test('the structure must be the one current AnnData layout, and a failed open pu
     assert.equal(reader.nObs, 2);
     assert.equal(reader.nVars, 1);
     assert.deepEqual(reader.obsKeys, ['old_obs']);
-    assert.deepEqual(reader.varNames, ['old_gene']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['old_gene']);
     assert.equal(reader.isOpen, true);
   });
 });
@@ -544,7 +544,7 @@ test('opening enforces the X axes and keeps variable names as stored', async t =
       var: frame(['duplicate', 'duplicate']),
     }));
     assert.equal(reader.nVars, 2);
-    assert.deepEqual(reader.varNames, ['duplicate', 'duplicate']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['duplicate', 'duplicate']);
     const names = await reader.readVarNames('X', null);
     assert.deepEqual([...names.index], ['duplicate', 'duplicate']);
     assert.deepEqual([...names.values], ['duplicate', 'duplicate']);
@@ -558,7 +558,7 @@ test('opening enforces the X axes and keeps variable names as stored', async t =
     }));
     assert.equal(reader.nObs, 2);
     assert.equal(reader.nVars, 2);
-    assert.deepEqual(reader.varNames, ['gene-a', 'gene-b']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['gene-a', 'gene-b']);
   });
 
   await t.test('a nullable dataframe index cannot contain missing names', async () => {
@@ -598,7 +598,7 @@ test('a file without X does not advertise gene expression', async () => {
   }));
   assert.equal(reader.hasExpressionMatrix, false);
   assert.equal(reader.nVars, 2);
-  assert.deepEqual(reader.varNames, ['A', 'B']);
+  assert.deepEqual((await reader.readVarNames('X', null)).index, ['A', 'B']);
 
   const adapter = new BaseAnnDataAdapter(reader);
   await adapter.initialize();
@@ -789,6 +789,8 @@ test('a cell subset of a row-major matrix is read by cell, gene-major, and equal
     indices: new Int32Array([0, 2, 2, 2, 1, 3, 0, 1]),
     indptr: new Int32Array([0, 2, 4, 6, 7, 8]),
     shape: [5, 4],
+    // Stored as a written file's: a chunk is decoded whole.
+    compressed: true,
   });
   const { reader, reads } = await openReader(treeWithX(X, 5, 4));
   const columns = await reader.getMatrixColumns('X', [0, 1, 2, 3]);
@@ -1877,7 +1879,6 @@ function fakeClientOpen({ pendingByName = new Map(), records = new Map() } = {})
       nObs: 2,
       nVars: 0,
       obsKeys: [],
-      varNames: [],
       hasExpressionMatrix: false,
       isOpen: true,
     };

@@ -13,6 +13,7 @@
 
 import { formatError } from './errors.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 /** The library's default collection size, for callers that cannot count. */
 const DEFAULT_COLLECTION_BYTES = 4096;
@@ -151,23 +152,27 @@ export async function loadCollections(file, needs, { cache = false, complete = f
       continue;
     }
     // Never past the next collection asked for: requests do not overlap. At
-    // least what one round trip of the link is worth is read (its bytes take
-    // no longer than the round trip a second read would cost): the rest of a
-    // collection then comes with the bytes the elements need, instead of a
-    // second, dependent round trip when an object lies past them.
+    // least a collection's smallest size is read (`DEFAULT_COLLECTION_BYTES`,
+    // the HDF5 minimum, the size libhdf5 gives every collection of small
+    // objects): a collection of that size comes whole with the bytes its
+    // elements need, so an object lying past them costs no second round trip.
+    // Not more: an object's attributes, a dataframe's columns and a string
+    // array's collections are each read at once, and padding each read to a
+    // round trip's worth of the link (bandwidth x latency) fetched that many
+    // times the link's round trip -- on CELLxGENE's HLCA (S3), 3.4 MB of the
+    // 20 MB an opening read, for 4 KB collections. A larger collection whose
+    // object lies past what was read is completed by a second read.
     // Bytes held already (a file's head) are read only as far as they go
-    // when they hold what the elements need: reading on for a round trip's
-    // worth would cost the round trip it saves.
+    // when they hold what the elements need.
     const next = i + 1 < sorted.length ? sorted[i + 1] : Infinity;
     const need = Math.max(wanted.get(address), 8 + file.lengthSize);
-    const roundTrip = file.reader.link?.roundTripBytes ?? file.shaping.mergeGapBytes;
     const held = (file.reader.cachedEnd?.(file.absolute(address)) ?? 0) - file.absolute(address);
-    const length = Math.min(next - address, held >= need ? held : Math.max(need, Math.floor(roundTrip)));
+    const length = Math.min(next - address, held >= need ? held : Math.max(need, DEFAULT_COLLECTION_BYTES));
     const memoKey = complete ? `${key}:complete` : key;
     // A collection read in part before: only its remaining bytes are fetched.
     const partial = cached !== undefined && !cached.complete ? cached : null;
-    loads.push(file.once(memoKey, () => loadCollection(file, address, length, cache, complete, signal, partial)).then(collection => {
-      file.memo.delete(memoKey);
+    // One load however many reads ask, stopped once every one of them withdrew.
+    loads.push(file.loading.run(memoKey, load => loadCollection(file, address, length, cache, complete, load.signal, partial), { signal }).then(collection => {
       file.cache.set(key, collection, collection.bytes.length + 64);
       result.set(address, collection);
     }));
@@ -208,7 +213,7 @@ async function loadCollection(file, address, length, cache, complete, signal, pa
   if (!complete) return parseCollection(file, first.slice(), address, false);
   file.requireRange(address, size, what);
   const rest = await read(address + first.length, size - first.length);
-  const bytes = new Uint8Array(size);
+  const bytes = allocateTypedArray(Uint8Array, size, 'HDF5 global heap collection');
   bytes.set(first, 0);
   bytes.set(rest, first.length);
   return parseCollection(file, bytes, address, true);

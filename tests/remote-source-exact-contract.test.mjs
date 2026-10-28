@@ -150,6 +150,7 @@ function servedAnnDataEntry(overrides = {}) {
         kind: 'h5ad',
         layout: 'file',
         size: 1024,
+        etag: '"400-1"',
       },
       defaults: { knn: 'connectivities', normalizeEmbeddings: true },
     },
@@ -191,7 +192,7 @@ test('an AnnData catalog entry is closed and checked before anything is read', a
     ['a prepared-export directory', [{ ...servedAnnDataEntry(), path: '/' }], /must contain exactly: anndata, id, name \(unexpected: path\)/],
     ['two datasets', [servedAnnDataEntry(), servedAnnDataEntry({ id: 'other' })], /exactly one dataset/],
     ['store outside the route', [servedAnnDataEntry({
-      anndata: { file: { url: '/etc/passwd', kind: 'h5ad', layout: 'file', size: 1 }, defaults: {} },
+      anndata: { file: { url: '/etc/passwd', kind: 'h5ad', layout: 'file', size: 1, etag: '"1"' }, defaults: {} },
     })], /route under _cellucid\/anndata\//],
     ['a folder without its slash', [servedAnnDataEntry({
       anndata: { file: { url: '_cellucid/anndata/cells.zarr', kind: 'zarr', layout: 'folder' }, defaults: {} },
@@ -200,7 +201,7 @@ test('an AnnData catalog entry is closed and checked before anything is read', a
       anndata: { file: { url: '_cellucid/anndata/cells.zarr/', kind: 'zarr', layout: 'folder', size: 3 }, defaults: {} },
     })], /\.file must contain exactly: kind, layout, url \(unexpected: size\)/],
     ['an h5ad in a zip', [servedAnnDataEntry({
-      anndata: { file: { url: '_cellucid/anndata/cells.zip', kind: 'h5ad', layout: 'zip', size: 3 }, defaults: {} },
+      anndata: { file: { url: '_cellucid/anndata/cells.zip', kind: 'h5ad', layout: 'zip', size: 3, etag: '"3"' }, defaults: {} },
     })], /h5ad file, a zipped Zarr store or a Zarr store folder/],
     ['an unknown launch default', [servedAnnDataEntry({
       anndata: { file: servedAnnDataEntry().anndata.file, defaults: { knnKey: 'connectivities' } },

@@ -18,7 +18,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { glStateOf } from '../assets/js/rendering/gl-state-shadow.js';
+import { glStateOf, primeGlState } from '../assets/js/rendering/gl-state-shadow.js';
 
 function fakeContext() {
   const queries = [];
@@ -58,12 +58,19 @@ function fakeContext() {
   return { gl, queries };
 }
 
-test('a value is asked of the context at most once, and setters keep it after', () => {
+test('a value is asked of the context at most once (all at once where the context is made), and setters keep it after', () => {
   const { gl, queries } = fakeContext();
+  primeGlState(gl);
   const shadow = glStateOf(gl);
+  const installed = [...queries];
+  assert.ok(installed.includes(`isEnabled:${gl.DEPTH_TEST}`), 'read where the context is made');
   assert.equal(shadow.isEnabled(gl.DEPTH_TEST), true);
   assert.equal(shadow.isEnabled(gl.DEPTH_TEST), true);
-  assert.deepEqual(queries, [`isEnabled:${gl.DEPTH_TEST}`]);
+  assert.deepEqual(queries, installed, 'nothing is asked after');
+  // A generic vertex attribute is never asked: the initial value, or the last set.
+  assert.deepEqual([...shadow.genericAttribute(1)], [0, 0, 0, 1]);
+  gl.vertexAttribI4ui?.(1, 0, 0, 0, 0);
+  if (typeof gl.vertexAttribI4ui === 'function') assert.ok(shadow.genericAttribute(1) instanceof Uint32Array);
 
   gl.disable(gl.DEPTH_TEST);
   gl.enable(gl.BLEND);
@@ -75,7 +82,7 @@ test('a value is asked of the context at most once, and setters keep it after', 
   assert.equal(shadow.activeTexture, gl.TEXTURE0 + 2);
   assert.deepEqual([...shadow.viewport], [1, 2, 30, 40]);
   assert.deepEqual(shadow.blendFunc, { srcRgb: gl.ONE, dstRgb: gl.ZERO, srcAlpha: gl.ZERO, dstAlpha: gl.ONE });
-  assert.deepEqual(queries, [`isEnabled:${gl.DEPTH_TEST}`], 'nothing else was asked of the context');
+  assert.deepEqual(queries, installed, 'nothing else was asked of the context');
   // A copy: the caller cannot change the shadow.
   shadow.viewport[0] = 99;
   assert.equal(shadow.viewport[0], 1);
@@ -105,10 +112,10 @@ test('no renderer asks the context for state the shadow keeps', () => {
   assert.deepEqual(offenders, []);
 });
 
-test('the viewer installs the shadow on its context before drawing', () => {
+test('the viewer installs the shadow on its context, read whole, before drawing', () => {
   const viewer = readFileSync(path.join(RENDERING, 'viewer.js'), 'utf8');
   const created = viewer.indexOf("canvas.getContext('webgl2'");
-  const installed = viewer.indexOf('glStateOf(gl);', created);
+  const installed = viewer.indexOf('primeGlState(gl);', created);
   const firstState = viewer.indexOf('createSceneMsaaTarget(gl)', created);
   assert.ok(created > 0 && installed > created && installed < firstState);
 });

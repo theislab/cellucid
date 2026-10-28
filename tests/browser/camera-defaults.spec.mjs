@@ -3,6 +3,8 @@ import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { drawBands, lodLadder } from '../../assets/js/rendering/high-perf/draw-order.js';
+import { formatCountOf } from '../../assets/js/utils/format-units.js';
 
 const SYNTHETIC_3D_ROOT = appUrl('/tests/browser/fixtures/generated-3d/');
 const DATASET_ID = 'deterministic-orbit-3d';
@@ -562,18 +564,25 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     const { createInMemoryDimensionManager } = await import(
       '/assets/js/data/dimension-manager.js'
     );
+    const { buildPriorityOrder, DEFAULT_CELL_PRIORITY } = await import(
+      '/assets/js/data/cell-priority.js'
+    );
+    const { lodLadder } = await import(
+      '/assets/js/rendering/high-perf/draw-order.js'
+    );
     const pointCount = 24_000;
     const positions = new Float32Array(pointCount * 3);
     const colors = new Uint8Array(pointCount * 4);
 
-    // Both candidates lie on the exact planar-camera ray. Source 0 is almost
-    // one world unit closer, but its Morton priority excludes it from LOD 0;
-    // source 1 is the first member of the actual reduced prefix.
-    positions.set([
-      -0.994, -0.994, 0,
-      -0.994, -0.994, -0.994,
-    ]);
-    for (let cellIndex = 2; cellIndex < pointCount; cellIndex++) {
+    // Both candidates lie on the exact planar-camera ray. The closer one is
+    // almost one world unit nearer, but its priority rank (the scene's cells
+    // are ranked under the default seed) is the first past the coarsest
+    // level; the farther one is the first cell of that level.
+    const order = buildPriorityOrder(pointCount, DEFAULT_CELL_PRIORITY);
+    const coarsestCount = lodLadder(pointCount)[0];
+    const closer = order[coarsestCount];
+    const farther = order[0];
+    for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
       const angle =
         (cellIndex * 2.399963229728653) % (Math.PI * 2);
       const positionOffset = cellIndex * 3;
@@ -582,6 +591,8 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
       positions[positionOffset + 2] =
         (cellIndex & 1) === 0 ? 1 : -1;
     }
+    positions.set([-0.994, -0.994, 0], closer * 3);
+    positions.set([-0.994, -0.994, -0.994], farther * 3);
     for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
       const colorOffset = cellIndex * 4;
       colors[colorOffset] = 48;
@@ -693,12 +704,12 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
       paneCenters.centerY,
     );
     const summarizeMembership = membership => ({
-      closerAdmission: membership.admissionLevels[0],
-      fartherAdmission: membership.admissionLevels[1],
+      closerAdmission: membership.admissionLevels[closer],
+      fartherAdmission: membership.admissionLevels[farther],
       dimensionLevel: membership.dimensionLevel,
       indexCount: membership.indices.length,
-      includesCloser: membership.indices.includes(0),
-      includesFarther: membership.indices.includes(1),
+      includesCloser: membership.indices.includes(closer),
+      includesFarther: membership.indices.includes(farther),
       lodLevel: membership.lodLevel,
       pointCount: membership.pointCount,
       frozen: Object.isFrozen(membership),
@@ -712,6 +723,9 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     };
 
     return {
+      closer,
+      farther,
+      coarsestCount,
       fullDetail: {
         cellIndex: fullDetailRecord?.cellIndex ?? -1,
         viewId: fullDetailRecord?.viewId ?? null,
@@ -735,16 +749,17 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     };
   });
 
+  expect(proof.closer).not.toBe(proof.farther);
   expect(proof.fullDetail).toEqual({
-    cellIndex: 0,
+    cellIndex: proof.closer,
     viewId: 'live',
   });
   for (const renderedView of [proof.live, proof.snapshot]) {
-    expect(renderedView.cellIndex).toBe(1);
+    expect(renderedView.cellIndex).toBe(proof.farther);
     expect(renderedView.currentLodLevel).toBe(0);
     expect(renderedView.membership).toMatchObject({
       dimensionLevel: 3,
-      indexCount: 1000,
+      indexCount: proof.coarsestCount,
       includesCloser: false,
       includesFarther: true,
       lodLevel: 0,
@@ -755,7 +770,7 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     expect(renderedView.membership.fartherAdmission).toBe(0);
     expect(renderedView.stats).toEqual({
       lodLevel: 0,
-      visiblePoints: 1000,
+      visiblePoints: proof.coarsestCount,
     });
   }
   expect(proof.live.viewId).toBe('live');
@@ -1414,8 +1429,11 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
     spatialIndicesCount: 1,
     webglError: 0,
   });
-  // LOD keeps no GPU copy: its levels are prefixes of the one stored order.
-  expect(result.lodLevelCount).toBeGreaterThan(1);
-  expect(result.drawOrder).toBe(`${result.lodLevelCount} bands`);
+  // LOD keeps no GPU copy: its levels are prefixes of the one stored order,
+  // the renderer's ladder for this many cells (twelve cells are below its
+  // first rung, so their one level is every cell).
+  expect(result.lodLevelCount).toBe(lodLadder(CELL_COUNT).length);
+  // The live store holds the tree's whole order, in its fixed bands.
+  expect(result.drawOrder.split(', ')[0]).toBe(formatCountOf(drawBands(CELL_COUNT).bandEnds.length, 'band'));
   expect(productErrors).toEqual([]);
 });

@@ -19,9 +19,11 @@
  */
 
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
+import { createCellIdentity } from './cell-identity.js';
 import { BaseAnnDataAdapter, requireAnnDataLaunchDefaults } from './base-anndata-adapter.js';
 import { AnnDataReaderClient } from './anndata-reader-client.js';
 import { stoppableOpening } from './opening-progress.js';
+import { requestOfOpenCells } from './cell-subset-policy.js';
 import { describeAnnDataStorage } from './anndata-storage.js';
 import { defaultDatasetIdOf, inputFormat, titleOfName } from './input-formats.js';
 import {
@@ -68,6 +70,34 @@ export function folderSourceFromFileList(fileList) {
 /** The adapter of an AnnData file source (`BaseAnnDataAdapter`). */
 class AnnDataFileAdapter extends BaseAnnDataAdapter {
   static sourceType = ANNDATA_SOURCE_TYPE;
+}
+
+/**
+ * How many of the first open cells two openings of the same dataset share:
+ * the largest `L` such that open cells `[0, L)` are the same original
+ * positions in both. When `L` is the smaller opening's cell count, one
+ * opening is the other grown or cut in place (a larger or smaller uniform
+ * or blocks subsample with the same seed, which open in priority order; a
+ * priority-ordered file opened whole and by a prefix): every per-cell array
+ * of the smaller is the larger's first rows (`app/open-cells-resize.js`).
+ *
+ * @param {import('./cell-identity.js').CellIdentity} a
+ * @param {import('./cell-identity.js').CellIdentity} b
+ * @returns {number}
+ */
+export function sharedOpenCells(a, b) {
+  if (a.nOriginal !== b.nOriginal) return 0;
+  const limit = Math.min(a.n, b.n);
+  // Each opening's original positions in open order, read directly (a
+  // comparison of millions of cells): null when open cell `i` is `i`.
+  const first = a.openOrder ?? a.kept;
+  const second = b.openOrder ?? b.kept;
+  if (first === null && second === null) return limit;
+  let shared = 0;
+  if (first === null) while (shared < limit && second[shared] === shared) shared++;
+  else if (second === null) while (shared < limit && first[shared] === shared) shared++;
+  else while (shared < limit && first[shared] === second[shared]) shared++;
+  return shared;
 }
 
 /**
@@ -139,11 +169,6 @@ export class AnnDataFileSource {
     const {
       signal = null,
       defaults = {},
-      datasetId = null,
-      defaultDatasetId = null,
-      name = null,
-      preferFileName = false,
-      description = '',
       source: identitySource = null,
       expect = null,
     } = options;
@@ -161,29 +186,10 @@ export class AnnDataFileSource {
       const opened = await candidateReader.open(source, { expect, fromLink, choose: choice => opening.handle.choose(choice) });
       opening.throwIfStopped();
       this._assertLoadRequest(requestId);
-      candidateAdapter = new AnnDataFileAdapter(candidateReader, { defaults: launchDefaults });
-      await candidateAdapter.initialize();
-      opening.throwIfStopped();
-      this._assertLoadRequest(requestId);
-
-      const candidateDatasetId =
-        datasetId ??
-        candidateAdapter.getFileMetadata().id ??
-        defaultDatasetId ??
-        defaultDatasetIdOf(opened.format, opened.name);
-      const candidateMetadata =
-        await candidateAdapter.finalizeDirectIdentity({
-          id: candidateDatasetId,
-          name: name ?? titleOfName(opened.name),
-          preferFileName,
-          description,
-          // Named by its format; a file also by its file name.
-          source: identitySource ?? {
-            name: inputFormat(opened.format).label,
-            ...(source.file === undefined ? {} : { filename: opened.name }),
-          },
-        });
-      this._assertLoadRequest(requestId);
+      const identified = await this._identify(candidateReader, opened, source, options, { opening, requestId, launchDefaults });
+      candidateAdapter = identified.adapter;
+      const candidateDatasetId = identified.datasetId;
+      const candidateMetadata = identified.metadata;
 
       const candidateStorage = describeAnnDataStorage(source, opened);
       this._releaseCurrentSource();
@@ -194,6 +200,9 @@ export class AnnDataFileSource {
       this.format = opened.format;
       this.datasetId = candidateDatasetId;
       this._metadata = candidateMetadata;
+      // What reading it again with other cells takes (`reopenCells`): the
+      // same source and options, without the signal of this opening.
+      this._lastLoad = { source, options: { ...options, signal: null }, title, step };
       adopted = true;
 
       console.log(
@@ -229,6 +238,52 @@ export class AnnDataFileSource {
       }
       opening.handle.fail(terminalError);
       throw terminalError;
+    }
+  }
+
+  /**
+   * The adapter of a reader that opened `source`, initialized, and the
+   * dataset's identity (`options` as `loadFile`'s). `geneNameGuesses`: the
+   * gene-name guesses of an earlier reading of the same store, kept. @private
+   */
+  async _identify(reader, opened, source, options, { opening, requestId, launchDefaults, firstView = true, geneNameGuesses = undefined }) {
+    const {
+      datasetId = null,
+      defaultDatasetId = null,
+      name = null,
+      preferFileName = false,
+      description = '',
+      source: identitySource = null,
+    } = options;
+    const adapter = new AnnDataFileAdapter(reader, {
+      defaults: launchDefaults,
+      ...(geneNameGuesses === undefined ? {} : { geneNameGuesses }),
+    });
+    try {
+      await adapter.initialize({ firstView });
+      opening.throwIfStopped();
+      this._assertLoadRequest(requestId);
+      const id =
+        datasetId ??
+        adapter.getFileMetadata().id ??
+        defaultDatasetId ??
+        defaultDatasetIdOf(opened.format, opened.name);
+      const metadata = await adapter.finalizeDirectIdentity({
+        id,
+        name: name ?? titleOfName(opened.name),
+        preferFileName,
+        description,
+        // Named by its format; a file also by its file name.
+        source: identitySource ?? {
+          name: inputFormat(opened.format).label,
+          ...(source.file === undefined ? {} : { filename: opened.name }),
+        },
+      });
+      this._assertLoadRequest(requestId);
+      return { adapter, datasetId: id, metadata };
+    } catch (error) {
+      adapter.release();
+      throw error;
     }
   }
 
@@ -524,6 +579,142 @@ export class AnnDataFileSource {
    */
   describeStorage() {
     return this._storage;
+  }
+
+  /**
+   * Read the open dataset again, in place, with the cells `cellSubset`
+   * asks for (a cell subset request, `cell-subset-policy.js`): the same
+   * file, link or folder, the same identity. The dataset stays open until
+   * the new reading is complete; a failed one leaves it as it was.
+   *
+   * `resized` says when the new cells are the open ones grown or cut in
+   * place (`sharedOpenCells`: a larger or smaller uniform or blocks
+   * subsample with the same seed, or a priority-ordered file's prefix and
+   * the whole file): `{from, to}`, the open cell counts before and after.
+   * Every per-cell array of the smaller opening is then the larger's first
+   * rows, so the app keeps what it shows and reads only the cells added
+   * (`app/open-cells-resize.js`); the first view's embedding is not read
+   * again. Null otherwise: other cells, shown as a new reading.
+   * `reordered`: the same cells as before in another order (each cell's
+   * arrays move with it, `app/open-cells-resize.js`).
+   *
+   * @param {{cellSubset: Object, signal?: AbortSignal|null, step?: string, quiet?: boolean}} options -
+   *   `step` names the opening's step; `quiet` reads without the opening
+   *   progress (a growth step of a progressive opening, shown by its own line)
+   * @returns {Promise<{metadata: Object, resized: {from: number, to: number}|null, reordered: boolean}>}
+   */
+  async reopenCells({ cellSubset, signal = null, step = 'Reading the chosen cells', quiet = false }) {
+    const last = this._lastLoad ?? null;
+    const loader = this._loader;
+    if (last === null || loader === null) throw new Error('No dataset is open to read again.');
+    const requestId = ++this._loadRequestId;
+    const launchDefaults = requireAnnDataLaunchDefaults(last.options.defaults ?? {});
+    // Read again in the same reader worker (`AnnDataReaderClient.reopenCells`):
+    // what the open reading built that the new cells keep is not read again.
+    const stop = new AbortController();
+    const opening = stoppableOpening({ title: last.title, step, signal, stop: () => stop.abort(), quiet });
+    const before = loader.cellSubset;
+    const shownBefore = this.getCellIdentity();
+    try {
+      await loader.reopenCells({ cellSubset, signal: stop.signal });
+      opening.throwIfStopped();
+      this._assertLoadRequest(requestId);
+      const after = loader.cellSubset;
+      const shownAfter = after === null ? null : createCellIdentity({ nObs: after.nObs, kept: after.kept, openOrder: after.openOrder ?? null });
+      const shared = shownBefore === null || shownAfter === null ? 0 : sharedOpenCells(shownBefore, shownAfter);
+      const resized = shared > 0 && shared === Math.min(shownBefore.n, shownAfter.n) && shownBefore.n !== shownAfter.n
+        ? Object.freeze({ from: shownBefore.n, to: shownAfter.n })
+        : null;
+      // The same cells in another order (a subsample grown from few chunks
+      // put in priority order): shown in place too, each cell moved.
+      const reordered = resized === null && shownBefore !== null && shownAfter !== null &&
+        shownBefore.n === shownAfter.n && shownBefore.digest === shownAfter.digest;
+      const opened = { name: this.filename, format: this.format };
+      // The var axes are the same whatever cells are open: the gene names
+      // already guessed are kept.
+      const { adapter, datasetId, metadata } = await this._identify(loader, opened, last.source, last.options, {
+        opening,
+        requestId,
+        launchDefaults,
+        firstView: resized === null && !reordered,
+        geneNameGuesses: this._adapter?.geneNameGuesses(),
+      });
+      // The reader stays; the adapter of the earlier reading lets go of
+      // what it holds without closing it.
+      this._adapter?.release();
+      this._adapter = adapter;
+      this.datasetId = datasetId;
+      this._metadata = metadata;
+      // The identity of the cells now open is the one made above (once:
+      // an identity of millions of cells takes a while to check).
+      this._cellIdentity = after === null ? null : { subset: after, identity: shownAfter };
+      opening.release();
+      opening.handle.end();
+      return { metadata, resized, reordered };
+    } catch (thrown) {
+      opening.release();
+      const error = opening.outcome(thrown);
+      // The cells open before are read again, so the dataset on screen and
+      // its reader agree (what they share is carried, nothing is fetched):
+      // a reading cancelled as its reply came may have been taken already.
+      // A newer reading of the file (superseding this one) is left to stand.
+      if (this._loader === loader && this._loadRequestId === requestId) {
+        await loader.reopenCells({ cellSubset: requestOfOpenCells(before) }).catch(restoreFailure => {
+          console.error('[AnnDataFileSource] The cells open before could not be read again:', restoreFailure);
+        });
+      }
+      opening.handle.fail(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Which of the dataset's cells were opened (`anndata/subsample-plan.js`):
+   * `{nObs, kept, spec, autoFit, reproduced, keptValues, note}`, `kept` null
+   * when every cell is; null when nothing is open.
+   *
+   * @returns {Object|null}
+   */
+  getCellSubset() {
+    return this._loader?.cellSubset ?? null;
+  }
+
+  /**
+   * The open cells' identity (`cell-identity.js`), made once per opening.
+   *
+   * @returns {import('./cell-identity.js').CellIdentity|null}
+   */
+  getCellIdentity() {
+    const subset = this.getCellSubset();
+    if (subset === null) return null;
+    if (this._cellIdentity?.subset !== subset) {
+      this._cellIdentity = { subset, identity: createCellIdentity({ nObs: subset.nObs, kept: subset.kept, openOrder: subset.openOrder ?? null }) };
+    }
+    return this._cellIdentity.identity;
+  }
+
+  /**
+   * How the open subsample represents a categorical obs field
+   * (`AnnDataReader.subsampleRepresentation`); null when every cell is open.
+   *
+   * @param {string} key
+   */
+  subsampleRepresentation(key) {
+    if (this.getCellSubset()?.kept == null) return Promise.resolve(null);
+    return this._loader.subsampleRepresentation(key);
+  }
+
+  /**
+   * How much of the neighbour graph `obsp[key]` the open subsample keeps,
+   * once it was read (`AnnDataReader.subsampleGraphShare`): `{kept, of}`;
+   * null when every cell is open or the graph was not read.
+   *
+   * @param {string|null} key
+   * @returns {Promise<{kept: number, of: number}|null>}
+   */
+  subsampleGraphShare(key) {
+    if (this.getCellSubset()?.kept == null || typeof key !== 'string') return Promise.resolve(null);
+    return this._loader.subsampleGraphShare(key);
   }
 
   /**

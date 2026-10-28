@@ -306,8 +306,10 @@ test('a view showing another dimension navigates by its recorded choice or that 
 });
 
 test('viewer applies dimension-derived defaults only at data and dimension-changing embedding boundaries', () => {
-  const setDataStart = viewerSource.indexOf('setData(payload)');
-  const setDataEnd = viewerSource.indexOf('\n    updateColors(', setDataStart);
+  // The live points are published by one function (`setData`, and cells
+  // added or removed in place, `resizeLiveCells`, which keep the camera).
+  const setDataStart = viewerSource.indexOf('\n  function publishLiveData(');
+  const setDataEnd = viewerSource.indexOf('\n  }\n', setDataStart);
   const setViewEmbeddingStart = viewerSource.indexOf('setViewEmbedding(viewId, embedding)');
   const setViewEmbeddingEnd = viewerSource.indexOf('\n    /**', setViewEmbeddingStart + 1);
   const setNavigationStart = viewerSource.indexOf('setNavigationMode(mode)');
@@ -319,8 +321,10 @@ test('viewer applies dimension-derived defaults only at data and dimension-chang
 
   assert.match(
     viewerSource.slice(setDataStart, setDataEnd),
-    /applyDimensionNavigationDefault\(LIVE_VIEW_ID,\s*dimensionLevel\)/
+    /if \(!keepView\) \{\s*resetViewCameraForDimension\(LIVE_VIEW_ID, dimensionLevel\);\s*applyDimensionNavigationDefault\(LIVE_VIEW_ID,\s*dimensionLevel\);\s*\}/
   );
+  assert.match(viewerSource, /setData\(payload\) \{\s*publishLiveData\(payload, \{ keepView: false \}\);/);
+  assert.match(viewerSource, /resizeLiveCells\(payload\) \{[\s\S]*?publishLiveData\(payload, \{ keepView: true \}\);/);
   // Every layout is normalized to the same extent, so switching between two
   // representations of one dimension keeps the camera and its navigation
   // mode; a dimension change applies the view's choice for, or the default

@@ -1,8 +1,8 @@
 /**
- * The origin-private file system and Web Locks a dedicated worker has, for
- * Node: directories and files on disk under one temporary folder, files
- * written through synchronous access handles, and shared/exclusive locks
- * with `ifAvailable`. Enough for the transcode space
+ * The origin-private file system and Web Locks a dedicated worker (or a
+ * page) has, for Node: directories and files on disk under one temporary
+ * folder, files written through synchronous access handles (a worker) or
+ * writable streams (a page), and shared/exclusive locks with `ifAvailable`. Enough for the transcode space
  * (`assets/js/data/anndata/transcode/space.js`) to run as it does in a
  * browser.
  */
@@ -14,8 +14,30 @@ function notFound(name) {
   return new DOMException(`'${name}' was not found.`, 'NotFoundError');
 }
 
-function fileHandle(file, name) {
+/** A writable stream over one file, as a page's `createWritable()` gives. */
+function writableStream(file) {
+  const fd = openSync(file, 'r+');
+  ftruncateSync(fd, 0);
+  let at = 0;
+  let closed = false;
   return {
+    async write(data) {
+      const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+      at += writeSync(fd, view, 0, view.length, at);
+    },
+    async close() {
+      if (!closed) closeSync(fd);
+      closed = true;
+    },
+    async abort() {
+      if (!closed) closeSync(fd);
+      closed = true;
+    },
+  };
+}
+
+function fileHandle(file, name, handles) {
+  const handle = {
     kind: 'file',
     name,
     async createSyncAccessHandle() {
@@ -45,12 +67,20 @@ function fileHandle(file, name) {
     },
     async getFile() {
       const blob = await openAsBlob(file);
-      return new File([blob], name);
+      return new File([blob], name, { lastModified: statSync(file).mtimeMs });
+    },
+    async createWritable() {
+      return writableStream(file);
     },
   };
+  // A worker has synchronous access handles; a page writable streams; a
+  // page of Safari before 26 neither.
+  if (handles !== 'worker') delete handle.createSyncAccessHandle;
+  if (handles !== 'page') delete handle.createWritable;
+  return handle;
 }
 
-function directoryHandle(folder, name) {
+function directoryHandle(folder, name, handles) {
   return {
     kind: 'directory',
     name,
@@ -63,7 +93,7 @@ function directoryHandle(folder, name) {
         if (!create) throw notFound(child);
         mkdirSync(target);
       }
-      return directoryHandle(target, child);
+      return directoryHandle(target, child, handles);
     },
     async getFileHandle(child, { create = false } = {}) {
       const target = path.join(folder, child);
@@ -73,7 +103,7 @@ function directoryHandle(folder, name) {
         if (!create) throw notFound(child);
         closeSync(openSync(target, 'w'));
       }
-      return fileHandle(target, child);
+      return fileHandle(target, child, handles);
     },
     async removeEntry(child, { recursive = false } = {}) {
       rmSync(path.join(folder, child), { recursive, force: false });
@@ -81,7 +111,7 @@ function directoryHandle(folder, name) {
     async *entries() {
       for (const entry of readdirSync(folder, { withFileTypes: true })) {
         const target = path.join(folder, entry.name);
-        yield [entry.name, entry.isDirectory() ? directoryHandle(target, entry.name) : fileHandle(target, entry.name)];
+        yield [entry.name, entry.isDirectory() ? directoryHandle(target, entry.name, handles) : fileHandle(target, entry.name, handles)];
       }
     },
   };
@@ -133,18 +163,34 @@ export function createLocks() {
 /**
  * An environment whose `navigator` has OPFS (on disk) and Web Locks.
  *
+ * @param {{handles?: 'worker'|'page'|'none', root?: string|null}} [options] - How its files are
+ *   written: synchronous access handles (a dedicated worker, the default),
+ *   writable streams (a page), or neither (a page of Safari before 26);
+ *   `root`: the folder the storage is in (else a new temporary one)
  * @returns {{environment: Object, root: string, cleanup: () => void}}
  */
-export function opfsOnDisk() {
-  const root = mkdtempSync(path.join(tmpdir(), 'cellucid-opfs-'));
+export function opfsOnDisk({ handles = 'worker', root: given = null } = {}) {
+  // A folder given is kept (a later process opens the same storage: a later visit).
+  const root = given ?? mkdtempSync(path.join(tmpdir(), 'cellucid-opfs-'));
+  mkdirSync(root, { recursive: true });
   const environment = {
     navigator: {
       storage: {
-        getDirectory: async () => directoryHandle(root, ''),
+        getDirectory: async () => directoryHandle(root, '', handles),
         estimate: async () => ({ quota: 1e12, usage: 0 }),
       },
       locks: createLocks(),
     },
   };
-  return { environment, root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  // The same storage and locks as another context sees them: the page and
+  // its reader worker write the same files, one way each.
+  const as = other => ({
+    navigator: {
+      storage: { ...environment.navigator.storage, getDirectory: async () => directoryHandle(root, '', other) },
+      get locks() {
+        return environment.navigator.locks;
+      },
+    },
+  });
+  return { environment, root, as, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }

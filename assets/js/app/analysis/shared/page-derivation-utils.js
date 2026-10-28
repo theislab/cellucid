@@ -13,7 +13,7 @@
 // Derived page IDs MUST NOT include these characters.
 
 /**
- * @typedef {'rest_of'} DerivedPageKind
+ * @typedef {'rest_of'|'sample'} DerivedPageKind
  */
 
 /**
@@ -48,6 +48,59 @@ export function isRestOfPageId(pageId) {
 export function getBasePageIdFromRestOf(restOfPageId) {
   if (!isRestOfPageId(restOfPageId)) return null;
   return restOfPageId.slice(REST_OF_PAGE_PREFIX.length);
+}
+
+/**
+ * Prefix for derived "sample" pages: a page's cells among the first `m` of
+ * the open cells' priority order (`data/cell-priority.js`), a uniform random
+ * sample of them. A progressive analysis's first pass reads these
+ * (`shared/progressive-cells.js`); they are never offered for selection.
+ * @type {string}
+ */
+const SAMPLE_PAGE_PREFIX = 'sample__';
+const SAMPLE_PAGE_PATTERN = /^sample__(\d+)__(.+)$/;
+
+/**
+ * The derived page of `basePageId`'s cells among the first `m` cells of the
+ * priority order (`basePageId` may itself be derived: a rest-of page).
+ * @param {string} basePageId
+ * @param {number} m
+ * @returns {string}
+ */
+export function createSamplePageId(basePageId, m) {
+  if (!Number.isSafeInteger(m) || m < 0) throw new RangeError(`A sample page keeps a whole number of cells; got ${m}.`);
+  if (typeof basePageId !== 'string' || basePageId.length === 0) throw new TypeError('A sample page needs its base page id.');
+  return `${SAMPLE_PAGE_PREFIX}${m}__${basePageId}`;
+}
+
+/**
+ * Check if a page ID is a derived "sample" page ID.
+ * @param {string} pageId
+ * @returns {boolean}
+ */
+export function isSamplePageId(pageId) {
+  return typeof pageId === 'string' && SAMPLE_PAGE_PATTERN.test(pageId);
+}
+
+/**
+ * The base page and sample size of a derived "sample" page ID, or null.
+ * @param {string} pageId
+ * @returns {{baseId: string, m: number}|null}
+ */
+export function parseSamplePageId(pageId) {
+  if (typeof pageId !== 'string') return null;
+  const match = SAMPLE_PAGE_PATTERN.exec(pageId);
+  return match === null ? null : { baseId: match[2], m: Number(match[1]) };
+}
+
+/**
+ * Whether a page ID is derived from another (rest-of or sample): it has no
+ * version of its own, only its base page's.
+ * @param {string} pageId
+ * @returns {boolean}
+ */
+export function isDerivedPageId(pageId) {
+  return isRestOfPageId(pageId) || isSamplePageId(pageId);
 }
 
 /**

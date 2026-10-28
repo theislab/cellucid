@@ -115,6 +115,8 @@ const PINNED_LINKS = [
   'b_data_loading/13_data_mapping#genes-and-expression',
   'b_data_loading/13_data_mapping#latent-space',
   'b_data_loading/13_data_mapping#vector-fields',
+  'b_data_loading/21_subsampled_loading#cells-to-open',
+  'b_data_loading/21_subsampled_loading#how-the-cells-are-chosen',
   'f_highlighting_selection/02_selection_tools_document_each_tool#tool-4-knn-drag-alt-click-drag-degree',
   'a_orientation/03_quick_tour_60_seconds#fast-path-click-by-click',
   'b_data_loading/01_loading_options_overview#at-a-glance',

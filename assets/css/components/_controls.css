@@ -593,6 +593,30 @@ input[type="checkbox"]:disabled,
   color: var(--color-text-secondary);
 }
 
+/* A readout the user can also type (an exact share): a narrow number box in
+   place of the text readout, its spin buttons dropped so the digits get the
+   width, and an optional unit after it. */
+.slider-row > .slider-number {
+  flex: none;
+  width: calc(7ch + 2 * var(--control-padding-x));
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.slider-row > .slider-number::-webkit-inner-spin-button,
+.slider-row > .slider-number::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.slider-unit {
+  flex: none;
+  font-size: var(--type-readout);
+  color: var(--color-text-secondary);
+}
+
 /* ------------------------------------------------------------------------
    Chips: a page, group or category the user can select
    --------------------------------------------------------------------- */

@@ -60,14 +60,18 @@ test('a CITE-seq MuData opens with RNA; its proteins are a modality read through
     assert.deepEqual(candidates.modalities.map(item => [item.name, item.n_cells, item.var.n_vars]), [['prot', 36, 5], ['rna', 44, 28]]);
     assert.equal(candidates.defaults.modality, 'rna', 'the gene-expression modality opens first');
     assert.deepEqual(Object.keys(candidates.defaults).slice(0, 5), ['kind', 'embeddings', 'knn', 'modality', 'geneNames']);
-    const mapping = validateDataMapping(candidates.defaults);
+    // Its gene names are read after the first view: pending at opening.
+    const mapping = validateDataMapping(candidates.defaults, { pendingGeneNames: true });
     assert.equal(mapping.modality, 'rna');
     assert.equal(mapping.expression, 'X');
+    assert.equal(mapping.geneNames, null);
 
-    // The dataset's own gene list is RNA's.
+    // The dataset's own gene list is RNA's, its names guessed for RNA alone.
     const own = await adapter.getGeneList('var');
     assert.equal(own.fields.length, 28);
     assert.equal(own.fields[0].key, 'GENE0');
+    assert.equal(adapter.getMappingCandidates().defaults.geneNames, 'index');
+    assert.deepEqual(Object.keys(adapter.getMappingCandidates().geneNameColumns), ['mod/rna']);
 
     // The proteins, by their route.
     const route = expressionAxisRoute(candidates, 'X', 'prot');
@@ -116,7 +120,7 @@ test('a file of one feature space has no modality, and its mapping may name none
     const candidates = adapter.getMappingCandidates();
     assert.equal(candidates.modalities, null);
     assert.equal(Object.hasOwn(candidates.defaults, 'modality'), false);
-    const mapping = validateDataMapping(candidates.defaults);
+    const mapping = validateDataMapping(candidates.defaults, { pendingGeneNames: true });
     assert.equal(Object.hasOwn(mapping, 'modality'), false);
     assert.throws(
       () => requireMappingModality({ ...mapping, modality: 'rna' }, null),

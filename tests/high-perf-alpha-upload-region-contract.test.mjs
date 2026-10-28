@@ -173,9 +173,8 @@ function createAlphaRenderer(pointCount, maxTextureSize) {
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
       _alphaTexHeight: 0,
-      _alphaTexStagingData: null,
+      _currentAlphas: null,
       _alphaTexWidth: 0,
       _alphaTexture: null,
       _alphaTextureByteLength: 0,
@@ -260,11 +259,9 @@ test('every filter shape leaves a byte-identical alpha texture', () => {
         Array.from(expectedImage(catalogue[to], width, height)),
         `resident image after ${from} -> ${to}`,
       );
-      assert.deepEqual(
-        Array.from(renderer._alphaTexData),
-        Array.from(expectedImage(catalogue[to], width, height)),
-        `accepted CPU generation after ${from} -> ${to}`,
-      );
+      // The accepted generation is the published bytes themselves: no CPU
+      // copy of the texture's image is kept.
+      assert.strictEqual(renderer._currentAlphas, catalogue[to], `accepted generation after ${from} -> ${to}`);
     }
   }
 });
@@ -383,7 +380,7 @@ test('a failed multi-region publication restores the accepted image exactly', ()
 
   renderer._updateAlphaTexture(catalogue.nothing);
   renderer._updateAlphaTexture(catalogue.contiguousRun);
-  const accepted = renderer._alphaTexData;
+  const accepted = renderer._currentAlphas;
   const acceptedBytes = Array.from(accepted);
   const residentBefore = Array.from(gl._image(renderer._alphaTexture));
   assert.deepEqual(
@@ -399,8 +396,8 @@ test('a failed multi-region publication restores the accepted image exactly', ()
   );
   gl._fail.texSubImageAt = null;
 
-  assert.strictEqual(renderer._alphaTexData, accepted);
-  assert.deepEqual(Array.from(renderer._alphaTexData), acceptedBytes);
+  assert.strictEqual(renderer._currentAlphas, accepted);
+  assert.deepEqual(Array.from(renderer._currentAlphas), acceptedBytes);
   assert.deepEqual(
     Array.from(gl._image(renderer._alphaTexture)),
     residentBefore,

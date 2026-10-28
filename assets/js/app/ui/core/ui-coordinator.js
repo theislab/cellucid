@@ -23,6 +23,7 @@ import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
 import { initHighlightControls } from '../modules/highlight-controls.js';
 import { initFieldSelector } from '../modules/field-selector.js';
+import { initCellExportsUi } from '../modules/cell-exports-ui.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { initViewControls } from '../modules/view-controls.js';
 import { initRepresentationControls } from '../modules/representation-controls.js';
@@ -30,6 +31,9 @@ import { initDataMappingControls } from '../modules/data-mapping-controls.js';
 import { modalityScope } from '../../../data/data-mapping-candidates.js';
 import { initDatasetControls } from '../modules/dataset-controls.js';
 import { initDatasetCard } from '../modules/dataset-card.js';
+import { initKeptStoresLine } from '../modules/kept-stores-line.js';
+import { initSubsampleControl } from '../modules/subsample-control.js';
+import { getNotificationCenter } from '../../notification-center.js';
 import { initSessionControls } from '../modules/session-controls.js';
 import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
@@ -210,6 +214,8 @@ function publishDataSourceReadiness(documentOwner) {
  * @param {import('../../../data/data-source-manager.js').DataSourceManager | null} [options.dataSourceManager]
  * @param {(transaction: Object) => Promise<boolean>} options.clearActiveDataset
  * @param {(selection: Object) => Promise<boolean>} options.reloadActiveDataset
+ * @param {(options: {annData: Object, cellSubset: Object, signal: AbortSignal|null}) => Promise<{inPlace: boolean}>} options.resizeOpenCells
+ *   The open cells grown or cut in place (`app/open-cells-resize.js`)
  * @param {object} options.datasetChanges The dataset-change coordinator every
  *   dataset change begins its transaction with
  *   (`createLatestDatasetReloadCoordinator`).
@@ -223,6 +229,7 @@ export function initUI({
   dataSourceManager = null,
   clearActiveDataset,
   reloadActiveDataset = null,
+  resizeOpenCells,
   datasetChanges,
   sessionSerializer = null,
   viewerHostSource = null
@@ -364,6 +371,7 @@ export function initUI({
     return {
       field: field || null,
       pointCount: state.pointCount || 0,
+      cellTotal: state.cellIdentity?.nOriginal ?? null,
       centroidInfo
     };
   }
@@ -457,6 +465,12 @@ export function initUI({
       onActiveFieldChanged: handleActiveFieldChanged
     }
   });
+  const cellExports = initCellExportsUi({
+    state,
+    dom: dom.cellExports,
+    getAnnDataSource: activeAnnDataSource,
+    notifications: getNotificationCenter()
+  });
   if (sessionSerializer !== null) {
     if (
       typeof sessionSerializer.setCaptureSettlement !== 'function'
@@ -466,12 +480,18 @@ export function initUI({
         'Session serializer must implement capture and restore settlement.'
       );
     }
-    sessionSerializer.setCaptureSettlement(
-      fieldSelector.acquireSessionCaptureOperation
-    );
-    sessionSerializer.setRestoreSettlement(
-      fieldSelector.acquireSessionRestoreOperation
-    );
+    // A dataset just shown reads its genes after its first view
+    // (`DataState.listPublishedGenes`): a session records them (its
+    // mapping's gene names, its gene count, its gene colourings), so a
+    // capture or a restore waits for them before it holds the fields.
+    sessionSerializer.setCaptureSettlement(async () => {
+      await state.whenGenesListed();
+      return fieldSelector.acquireSessionCaptureOperation();
+    });
+    sessionSerializer.setRestoreSettlement(async () => {
+      await state.whenGenesListed();
+      return fieldSelector.acquireSessionRestoreOperation();
+    });
   }
 
   viewControls = initViewControls({
@@ -522,9 +542,20 @@ export function initUI({
       dataSourceManager?.getCurrentIdentityId() ?? null,
     // The dataset controls are made below; a session is only loaded later.
     openDatasetSource: record => datasetControls.openDatasetSource(record),
+    currentCellIdentity: () => (dataSourceManager?.getCurrentDatasetId?.() == null ? null : state.cellIdentity),
+    reopenDataset: cellSubset => datasetControls.reopenOpenDataset(cellSubset),
     onAfterLoad: refreshUiAfterStateLoad
   });
   const { showSessionStatus } = sessionControls;
+
+  /** The direct AnnData source of the open dataset, or null. */
+  function activeAnnDataSource() {
+    const sourceType = dataSourceManager?.getCurrentSourceType?.() ?? null;
+    const datasetId = dataSourceManager?.getCurrentDatasetId?.() ?? null;
+    if (sourceType === null || datasetId === null) return null;
+    const source = dataSourceManager.getSource(sourceType);
+    return typeof source?.getAnnDataSource === 'function' ? source.getAnnDataSource(datasetId) : null;
+  }
 
   // The Dataset box describes the open dataset from its identity, where it
   // is stored, and what its data mapping uses.
@@ -539,6 +570,23 @@ export function initUI({
         ? annData.describeStorage()
         : null;
     },
+    describeCells: (sourceType, datasetId) => {
+      const source = dataSourceManager?.getSource(sourceType) ?? null;
+      const annData = typeof source?.getAnnDataSource === 'function'
+        ? source.getAnnDataSource(datasetId)
+        : null;
+      return typeof annData?.getCellSubset === 'function' ? annData.getCellSubset() : null;
+    },
+    // How much of the graph in use a subsample keeps, once it was read.
+    describeGraphShare: (sourceType, datasetId) => {
+      const source = dataSourceManager?.getSource(sourceType) ?? null;
+      const annData = typeof source?.getAnnDataSource === 'function'
+        ? source.getAnnDataSource(datasetId)
+        : null;
+      return typeof annData?.subsampleGraphShare === 'function'
+        ? annData.subsampleGraphShare(state.getDataMapping()?.knn ?? null)
+        : Promise.resolve(null);
+    },
     describeHost: sourceType => {
       const source = dataSourceManager?.getSource(sourceType) ?? null;
       return typeof source?.getHostLabel === 'function' ? source.getHostLabel() : null;
@@ -552,7 +600,9 @@ export function initUI({
         .filter(choice => choice.enabled && choice.usable)
         .map(choice => `${choice.name} ${choice.dimension}D`);
       return {
-        genes: state.getVarAxisGeneCount(),
+        // While the gene list is read after the first view, the count the
+        // identity published from metadata stands (null here).
+        genes: state.areGenesPending() ? null : state.getVarAxisGeneCount(),
         graph: state.getConnectivityGraphFact(),
         embeddings: {
           shown,
@@ -569,12 +619,15 @@ export function initUI({
       };
     }
   });
+  // Files read whole and kept in this browser, with Clear (Open data).
+  const keptStoresLine = initKeptStoresLine(dom.keptStores);
   const datasetControls = initDatasetControls({
     dom: dom.dataset,
     datasetCard,
     dataSourceManager,
     clearDataset: clearActiveDataset,
     reloadDataset: reloadActiveDataset,
+    resizeOpenCells,
     datasetChanges,
     callbacks: {
       renderFieldSelects: fieldSelector.renderFieldSelects,
@@ -596,11 +649,39 @@ export function initUI({
   const shareDialog = dataSourceManager === null
     ? null
     : initShareDialog({ ownerDocument: document, dataSourceManager });
+  // How much of a dataset is read, and how (Open data, Cells to open).
+  const subsampleControl = initSubsampleControl({
+    dom: dom.subsample,
+    state,
+    getCellSubset: () => activeAnnDataSource()?.getCellSubset?.() ?? null,
+    reopen: cellSubset => datasetControls.reopenOpenDataset(cellSubset),
+    notify: text => getNotificationCenter().info(text, { category: 'data' }),
+    representation: key => activeAnnDataSource()?.subsampleRepresentation?.(key) ?? Promise.resolve(null),
+    // Cameras, fields, filters and analysis windows stay across a re-read.
+    viewCarry: sessionSerializer === null
+      ? null
+      : {
+          capture: () => sessionSerializer.captureViewCarry(),
+          // The dataset read again lists its genes after its first view: a
+          // view coloured by a gene is given back once they are listed.
+          restore: async carry => {
+            await state.whenGenesListed();
+            return sessionSerializer.restoreViewCarry(carry);
+          },
+        },
+  });
+  // The dataset shown, its cells grown or cut in place: what says how many
+  // cells are open, and nothing the person set up.
+  function refreshOpenCells(metadata) {
+    datasetControls.refreshOpenCells(metadata);
+    subsampleControl.showOpenCells();
+  }
   // A newly published dataset decides whether there is anything to share.
   function refreshDatasetUI(...args) {
     const result = refreshDatasetControls(...args);
     shareDialog?.refresh();
     dataMappingControls.datasetPublished();
+    subsampleControl.refresh();
     return result;
   }
 
@@ -679,6 +760,12 @@ export function initUI({
   // listed, searched and shown exactly as after a session load.
   const unsubscribeVarAxis = state.on(
     'var-axis:changed',
+    () => refreshUiAfterStateLoad()
+  );
+  // The gene list of a dataset just shown, read after its first view (or
+  // why it could not be): everything that showed it loading lists it now.
+  const unsubscribeGenesListed = state.on(
+    'genes:listed',
     () => refreshUiAfterStateLoad()
   );
   // Another latent space adds or removes outlier filters.
@@ -815,6 +902,7 @@ export function initUI({
       unsubscribeDimension,
       unsubscribeMapping,
       unsubscribeVarAxis,
+      unsubscribeGenesListed,
       unsubscribeLatentSpace,
       () => renderControls.destroy(),
       () => cameraControls.destroy(),
@@ -824,6 +912,7 @@ export function initUI({
       () => legend.destroy(),
       () => filterControls.destroy(),
       () => highlightControls.destroy(),
+      () => cellExports.destroy(),
       () => sessionControls.destroy(),
       () => visualizationReset.destroy(),
       () => {
@@ -857,6 +946,8 @@ export function initUI({
       () => dataMappingControls.destroy(),
       () => datasetControls.destroy(),
       () => datasetCard.destroy(),
+      () => keptStoresLine.destroy(),
+      () => subsampleControl.destroy(),
       () => {
         if (typeof figureExportControls.destroy === 'function') {
           return figureExportControls.destroy();
@@ -910,6 +1001,7 @@ export function initUI({
   function applyDatasetRenderDefaults(cellCount, dimension) {
     const pointSize = renderControls.applyAutomaticPointSize(cellCount);
     const antialiasing = renderControls.applyDatasetAntialiasing(cellCount, dimension);
+    renderControls.applyDatasetLodRange(cellCount);
     visualizationReset.captureInitialState();
     return { pointSize, antialiasing };
   }
@@ -919,12 +1011,15 @@ export function initUI({
     colorByGene: fieldSelector.colorByGene,
     applyRenderMode: renderControls.applyRenderMode,
     applyDatasetRenderDefaults,
+    // A progressive opening's growth: `{cells, target}`, or null when done.
+    showOpenCellsGrowth: progress => subsampleControl.showGrowth(progress),
     loadStartupDataset: datasetControls.loadStartupDataset,
     prepareDatasetReplacement: fieldSelector.prepareDatasetReplacement,
     publishCellPresence,
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    refreshOpenCells,
     showLoadedConnectivityEdges: datasetControls.showLoadedConnectivityEdges,
     refreshDataMapping: dataMappingControls.datasetPublished,
     cycleRepresentation: representationControls.cycle,

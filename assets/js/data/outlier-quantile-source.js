@@ -16,6 +16,12 @@
  *   computed in the same passes, and the worker keeps the latent space while
  *   it fits its memory budget, so every later field reads nothing.
  *
+ * Under a subsample (decision F-K7) stored quantiles describe the whole
+ * dataset: they are the file's, gathered for the open cells, so a subsample
+ * never changes which cells are outliers. Computed ones can use only the
+ * open cells: they are an estimate, and `outlierQuantilesEstimate` says so
+ * (`{open, of}`), for the outlier control to tell.
+ *
  * `describe` says which it will be and what it costs before anything is read,
  * so the outlier control can say so; `quantiles` gets them. Both are
  * cancellable through their signals: a computation stops once no caller
@@ -25,6 +31,21 @@
  */
 
 import { storedQuantilesDefect } from './latent-outliers.js';
+
+/** Quantiles computed on the open cells of a subsample: `{open, of}`. */
+const ESTIMATES = new WeakMap();
+
+/**
+ * Whether quantiles were computed on the open cells of a subsample only
+ * (`{open, of}`: an estimate of the whole dataset's), or describe every
+ * cell of the file (null: stored, or every cell open).
+ *
+ * @param {Float32Array} quantiles - As `OutlierQuantileSource.quantiles` gave them
+ * @returns {{open: number, of: number}|null}
+ */
+export function outlierQuantilesEstimate(quantiles) {
+  return ESTIMATES.get(quantiles) ?? null;
+}
 
 /** An `AbortError` for a caller whose signal aborted. */
 function abortError(signal) {
@@ -56,6 +77,11 @@ export class OutlierQuantileSource {
     /** The worker computation running in each latent space. */
     this._running = new Map();
     this._closed = false;
+  }
+
+  /** The file's cell count: more than the open cells under a subsample. @private */
+  _nOriginal() {
+    return this._loader.cellSubset?.nObs ?? this._loader.nObs;
   }
 
   /** The latent space the file stores quantiles for, when they apply to this rule; else null. */
@@ -114,7 +140,7 @@ export class OutlierQuantileSource {
     if (signal?.aborted) throw abortError(signal);
     if (this.isStored(latentKey, fieldKey)) {
       const stored = await this._loader.readStoredOutlierQuantiles(fieldKey, { signal });
-      const defect = storedQuantilesDefect(stored, codes, nCategories, this.minPoints);
+      const defect = storedQuantilesDefect(stored, codes, nCategories, this.minPoints, { nOriginal: this._nOriginal() });
       if (defect === null) return stored;
       // Written for other categories than the file's obs holds now.
       this._unfit.set(fieldKey, defect);
@@ -123,7 +149,10 @@ export class OutlierQuantileSource {
         `do not fit its categories (${defect}); they are computed from obsm['${latentKey}'] instead.`
       );
     }
-    return this._compute({ latentKey, width, codes, nCategories, signal });
+    const computed = await this._compute({ latentKey, width, codes, nCategories, signal });
+    const of = this._nOriginal();
+    if (of > codes.length) ESTIMATES.set(computed, { open: codes.length, of });
+    return computed;
   }
 
   /**

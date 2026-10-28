@@ -12,8 +12,9 @@
  *   a failure: it is not logged as one, not shown as one, and leaves nothing
  *   half-applied (the feature applies a result only once its job is done).
  * - **Shared work.** `awaitWithSignal` lets one caller stop waiting while the
- *   work goes on for others; `SharedWork` runs one piece of work for many
- *   callers and stops it only when the last of them has gone.
+ *   work goes on for others; one piece of work run for many callers is a
+ *   `SharedWork` (`formats/io/abort.js`), stopped only when the last of
+ *   them has gone.
  * - **States.** `running` (with the cost, when it was known before starting:
  *   `plan`), then `done`, `failed` (with why) or `cancelled` (the view offers
  *   Run again). A job that has not started is the feature's own state.
@@ -32,6 +33,7 @@
 import { getNotificationCenter } from '../notification-center.js';
 import { describeReadProgress, getReadActivityLog } from '../../data/read-activity-log.js';
 import { formatBytes, formatDuration, formatRemaining, formatCount } from '../../utils/format-units.js';
+import { trackCellWork } from '../../data/open-cells-work.js';
 
 /**
  * Read kinds a job owns (`ReadActivity.kind`): an analysis's gene reads, the
@@ -113,52 +115,6 @@ export function awaitWithSignal(task, signal) {
       }
     );
   });
-}
-
-/**
- * One piece of work many callers wait for, stopped only when every caller
- * has stopped waiting: a caller whose signal aborts is answered at once, and
- * the work's own signal aborts when no caller is left.
- */
-export class SharedWork {
-  /**
-   * @param {(signal: AbortSignal) => Promise<*>} start - Starts the work
-   */
-  constructor(start) {
-    this._controller = new AbortController();
-    this._waiting = 0;
-    this.promise = start(this._controller.signal);
-    // A rejection nobody waits for any more is not unhandled.
-    this.promise.catch(() => {});
-  }
-
-  /** Whether the work was stopped because nobody waits for it. */
-  get abandoned() {
-    return this._controller.signal.aborted;
-  }
-
-  /**
-   * Wait for the work as one caller.
-   *
-   * @param {AbortSignal|null} [signal] - Ends this caller's wait
-   * @returns {Promise<*>}
-   */
-  join(signal = null) {
-    if (signal?.aborted) return Promise.reject(abortReasonOf(signal));
-    this._waiting += 1;
-    let left = false;
-    const leave = () => {
-      if (left) return;
-      left = true;
-      this._waiting -= 1;
-      if (this._waiting === 0 && signal?.aborted) {
-        this._controller.abort(abortReasonOf(signal));
-      }
-    };
-    const waited = awaitWithSignal(this.promise, signal);
-    waited.then(leave, leave);
-    return waited;
-  }
 }
 
 /**
@@ -277,6 +233,9 @@ export class CancellableJob {
     this._notifyTimer = Number.isFinite(notifyAfterMs)
       ? setTimeout(() => this._notify(), notifyAfterMs)
       : null;
+    // A job works on the open cells: changing them in place waits for it
+    // to end (`data/open-cells-work.js`).
+    trackCellWork(new Promise(resolve => { this._ended = resolve; }));
   }
 
   /** Aborts when the job is cancelled: pass it to every read and task. */
@@ -449,6 +408,7 @@ export class CancellableJob {
   _end(state) {
     this.state = state;
     this.endedAt = performance.now();
+    this._ended();
     clearTimeout(this._notifyTimer);
     this._notifyTimer = null;
     this._unsubscribeReads?.();

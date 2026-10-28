@@ -6,6 +6,7 @@
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -337,4 +338,81 @@ test('an opening stops once no caller wants it, and stays once it has opened', a
   await assert.rejects(stopped, error => error?.name === 'AbortError');
   const again = await owner.open('tiny-ready', new AbortController().signal);
   assert.equal(again.metadata.id, 'tiny-ready');
+});
+
+test('a catalog file on a host that serves only whole files is never downloaded by the listing; an opening downloads it', async t => {
+  quiet(t);
+  const bytes = new Uint8Array(readFileSync(new URL('ready.h5ad', FIXTURES)));
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input instanceof Request ? input.url : input);
+    const method = init.method ?? 'GET';
+    requests.push({ url, method });
+    if (init.signal?.aborted) throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    // Ranges ignored: every answer is the whole file.
+    const headers = { 'Content-Length': String(bytes.length), ETag: '"whole-1"' };
+    return new Response(method === 'HEAD' ? null : bytes.slice(), { status: 200, headers });
+  };
+  t.after(() => { globalThis.fetch = original; });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'tiny-ready', path: 'ready.h5ad' }]), BASE, 'link'),
+    sourceType: 'link',
+    sourceName: 'catalog.test',
+  });
+  t.after(() => owner.close());
+  await assert.rejects(owner.describe(null), error => /serves ready\.h5ad only whole .* cannot read what it holds without downloading all of it/.test(error.message));
+  const downloads = () => requests.filter(request => request.method === 'GET').length;
+  // The probe reads the head once (and stops); no whole download follows.
+  assert.ok(downloads() <= 2, `${downloads()} GETs`);
+  const before = downloads();
+  const { metadata } = await owner.open('tiny-ready');
+  assert.equal(metadata.id, 'tiny-ready');
+  assert.equal(downloads(), before + 1, 'the opening downloads it, once');
+});
+
+test('a listed file that changed on an ETag-less host after it was described fails as changed, and opening it again describes it anew', async t => {
+  quiet(t);
+  // Larger than the head read beside the probe: opening reads past it.
+  const bytes = new Uint8Array(readFileSync(new URL('./browser/fixtures/uint32-categories.h5ad', import.meta.url)));
+  let modified = 'Mon, 26 Oct 2026 10:00:00 GMT';
+  let probes = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const headers = { 'Last-Modified': modified, 'Accept-Ranges': 'bytes' };
+    if (!url.endsWith('/ready.h5ad')) return new Response(null, { status: 404 });
+    if ((init.method ?? 'GET') === 'HEAD') {
+      probes++;
+      return new Response(null, { status: 206, headers: { ...headers, 'Content-Length': String(bytes.length), 'Content-Range': `bytes 0-${bytes.length - 1}/${bytes.length}` } });
+    }
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers?.Range ?? init.headers?.get?.('Range') ?? '');
+    const last = Math.min(bytes.length - 1, Number(end));
+    return new Response(bytes.slice(Number(start), last + 1), { status: 206, headers: { ...headers, 'Content-Range': `bytes ${start}-${last}/${bytes.length}` } });
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'uint32-categories', path: 'ready.h5ad' }]), BASE, 'link'),
+    sourceType: 'link',
+    sourceName: 'catalog.test',
+  });
+  t.after(() => owner.close());
+  // Described (its probe and head), then replaced on the host before the
+  // rest of it is read.
+  const changing = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const answer = await changing(input, init);
+    if ((init.method ?? 'GET') !== 'HEAD' && probes > 0) modified = 'Tue, 27 Oct 2026 10:00:00 GMT';
+    return answer;
+  };
+  await assert.rejects(owner.open('uint32-categories'), /changed on the host/);
+  const described = probes;
+  globalThis.fetch = changing;
+  const { metadata } = await owner.open('uint32-categories');
+  assert.equal(metadata.id, 'uint32-categories');
+  assert.ok(probes > described, 'the file was described again');
 });

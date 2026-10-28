@@ -183,7 +183,7 @@ test('a host that ignores ranges is downloaded whole, with its progress', async 
   assert.equal(opened.file.transport, 'download');
   assert.equal(opened.file.resource.size, 10);
   const received = [];
-  const file = await downloadRemoteFile(opened.file.resource, { onBytes: bytes => received.push(bytes) });
+  const { file } = await downloadRemoteFile(opened.file.resource, { onBytes: bytes => received.push(bytes) });
   assert.equal(file.size, 10);
   assert.equal(file.name, 'a.h5ad');
   assert.equal(received.at(-1), 10);
@@ -207,7 +207,7 @@ test('an R file its host content-codes even in ranges is downloaded whole, decod
   assert.deepEqual(opened.file.format, { format: 'rds', layout: 'file' });
   assert.equal(opened.file.transport, 'download');
   assert.equal(opened.file.resource.contentCoded, true);
-  const file = await downloadRemoteFile(opened.file.resource);
+  const { file } = await downloadRemoteFile(opened.file.resource);
   assert.equal(file.size, decoded.length, 'the decoded file, whatever size the host stated');
   assert.deepEqual(new Uint8Array(await file.arrayBuffer()), decoded);
 });

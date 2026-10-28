@@ -47,10 +47,12 @@ import {
   EmbeddingLoadError,
   MappingLoadError,
   assembleAnnDataCandidates,
+  axisGeneCount,
   axisScope,
   axisVarColumns,
   expressionAxisRoute,
   geneNamesRoute,
+  geneNamesVarAxis,
   modalityNames,
   modalityScope,
   parseAxisRoute,
@@ -75,6 +77,7 @@ import {
 } from './data-mapping-candidates.js';
 import { validateConnectivitySummary } from './connectivity-summary-contract.js';
 import { requireCellucidFileMetadata } from './anndata-cellucid-metadata.js';
+import { inferGeneNameColumn } from './gene-names.js';
 import { OutlierQuantileSource } from './outlier-quantile-source.js';
 import {
   getMetadataLoadSignal,
@@ -93,6 +96,8 @@ import { scanpyCategoryPalette } from './palettes.js';
 import { onAbort } from '../formats/io/abort.js';
 import { getReadActivityLog } from './read-activity-log.js';
 import { formatCountOf, countNoun } from '../utils/format-units.js';
+import { copyLargeArray } from '../utils/large-arrays.js';
+import { allocateTypedArray, copyTypedArray } from './sparse-column-index.js';
 
 /** Each shared gene read's key, for a job that joins it to adopt it (`getGeneValues`). */
 let nextGeneReadKey = 1;
@@ -401,6 +406,67 @@ export function requireAnnDataLaunchDefaults(value) {
 }
 
 /**
+ * The gene-name guesses of one opened store, by var axis (`X`, `raw`,
+ * `mod/<name>`, `mod/<name>/raw`; `inferGeneNameColumn`): the var column
+ * that names an axis's genes by symbol, or null for its index. An axis is
+ * guessed once, when its genes are first listed -- the shown axis's right
+ * after the first view, any other when it is first chosen -- never by the
+ * first view. A reading of the same store with other cells
+ * (`AnnDataFileSource.reopenCells`) keeps them: a var axis does not depend
+ * on which cells are open.
+ */
+export class GeneNameGuesses {
+  constructor() {
+    /** @type {Map<string, string|null>} */
+    this._settled = new Map();
+    /** @type {Map<string, Promise<string|null>>} */
+    this._inFlight = new Map();
+  }
+
+  /** How many axes are guessed. */
+  get size() {
+    return this._settled.size;
+  }
+
+  /**
+   * The settled guesses, by var axis.
+   * @returns {Record<string, string|null>}
+   */
+  settled() {
+    return Object.fromEntries(this._settled);
+  }
+
+  /**
+   * The guess of one axis: settled, joined while under way, else started by
+   * `run`. A guess that fails (its index cannot be read) is not kept: the
+   * next ask tries again.
+   *
+   * @param {string} axis
+   * @param {() => Promise<string|null>} run
+   * @returns {Promise<string|null>}
+   */
+  guess(axis, run) {
+    if (this._settled.has(axis)) return Promise.resolve(this._settled.get(axis));
+    let pending = this._inFlight.get(axis);
+    if (pending === undefined) {
+      pending = Promise.resolve().then(run).then(
+        column => {
+          this._settled.set(axis, column);
+          this._inFlight.delete(axis);
+          return column;
+        },
+        error => {
+          this._inFlight.delete(axis);
+          throw error;
+        }
+      );
+      this._inFlight.set(axis, pending);
+    }
+    return pending;
+  }
+}
+
+/**
  * Base adapter class for AnnData file formats
  * @abstract
  */
@@ -411,10 +477,32 @@ export class BaseAnnDataAdapter {
    * @param {Object} [options]
    * @param {number} [options.cacheBudgetBytes] - Residency budget of the coordinate and obs caches
    * @param {Object} [options.defaults] - Launch defaults (`requireAnnDataLaunchDefaults`)
+   * @param {GeneNameGuesses} [options.geneNameGuesses] - The guesses of an
+   *   earlier reading of the same store, kept (`AnnDataFileSource.reopenCells`)
    */
   constructor(loader, options = {}) {
     /** @protected */
     this._loader = loader;
+
+    /**
+     * The gene-name guess of each var axis, made when its genes are first
+     * listed (`guessGeneNames`).
+     * @type {GeneNameGuesses}
+     */
+    this._geneNameGuesses = options.geneNameGuesses ?? new GeneNameGuesses();
+    if (!(this._geneNameGuesses instanceof GeneNameGuesses)) {
+      throw new TypeError('AnnData adapter gene-name guesses must be a GeneNameGuesses.');
+    }
+
+    /**
+     * What `initialize()` described and resolved, kept to assemble the
+     * catalog again as gene-name guesses settle.
+     * @type {{described: Object, resolution: Object}|null}
+     */
+    this._catalogInputs = null;
+
+    /** @type {number} How many guesses the catalog was assembled with */
+    this._candidatesGuessCount = 0;
 
     /**
      * The launch defaults the caller named (a server's): they override the
@@ -939,7 +1027,16 @@ export class BaseAnnDataAdapter {
     return this._fileMetadata;
   }
 
-  async initialize() {
+  /**
+   * Read what the dataset is: its metadata, embeddings, fields and mapping
+   * candidates, and the embedding the first view draws. `firstView: false`
+   * leaves that embedding unread: an opening grown or cut in place
+   * (`AnnDataFileSource.reopenCells`) keeps the coordinates on screen and
+   * reads only the cells it adds.
+   *
+   * @param {{firstView?: boolean}} [options]
+   */
+  async initialize({ firstView: readFirstView = true } = {}) {
     const generation = this._captureLifecycleGeneration();
     try {
       const metadata = await this._loader.getDatasetMetadata();
@@ -987,6 +1084,9 @@ export class BaseAnnDataAdapter {
       }
       this._metadata = metadata;
       this._describedObsm = described.obsm;
+      // Gene names are not read here: the first view never waits for them.
+      // The catalog states the guesses already made; the shown axis is
+      // guessed when its genes are first listed (`guessGeneNames`).
       const resolution = await this._resolveEmbeddingSlots(described, generation);
       this._slots = Object.freeze({ ...resolution.slots });
 
@@ -995,12 +1095,13 @@ export class BaseAnnDataAdapter {
       // opening. Candidate sources are adopted only after initialize()
       // resolves, so its payload is validated before then: corrupt bytes
       // cannot replace and close a still-working dataset.
-      const firstView = this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]);
+      const firstView = readFirstView ? this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]) : Promise.resolve(null);
       firstView.catch(() => {});
 
       await this._computeObsFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
-      this._candidates = this._assembleCandidates(described, resolution);
+      this._catalogInputs = { described, resolution };
+      this._assembleGuessedCandidates();
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
       await firstView;
@@ -1015,6 +1116,7 @@ export class BaseAnnDataAdapter {
         this._defaults = this._explicitDefaults;
         this._slots = null;
         this._candidates = null;
+        this._catalogInputs = null;
         this._describedObsm = null;
         this._vectorBindings.clear();
         this._obsFieldsMetadata = null;
@@ -1032,10 +1134,11 @@ export class BaseAnnDataAdapter {
    *
    * @param {ReturnType<typeof describeAnnDataProbes>} described
    * @param {{slots: Object, guessed: string[], rejected: Array<[string, string]>}} resolution
+   * @param {Record<string, string|null>} [geneNameColumns] - The settled gene-name guesses by var axis (`GeneNameGuesses`)
    * @returns {Object}
    * @private
    */
-  _assembleCandidates(described, resolution) {
+  _assembleCandidates(described, resolution, geneNameColumns = {}) {
     const launch = this._defaults;
     const chosen = {};
     if (Object.hasOwn(launch, 'knn')) {
@@ -1105,7 +1208,7 @@ export class BaseAnnDataAdapter {
       }
       chosen.latent = key;
     }
-    let candidates = assembleAnnDataCandidates(described, resolution, chosen);
+    let candidates = assembleAnnDataCandidates(described, resolution, chosen, geneNameColumns);
     if (Object.hasOwn(launch, 'geneIdColumn') && launch.geneIdColumn !== null) {
       const column = launch.geneIdColumn;
       const axisRoute = expressionAxisRoute(candidates, candidates.defaults.expression, candidates.defaults.modality ?? null);
@@ -1122,9 +1225,108 @@ export class BaseAnnDataAdapter {
         );
       }
       if (!entry.usable) throw new RangeError(`defaults.geneIdColumn '${column}': ${entry.reason}.`);
-      candidates = assembleAnnDataCandidates(described, resolution, { ...chosen, geneNames: `column:${column}` });
+      // The launch names the genes of the axis it opens on; every other
+      // axis (raw, another modality) keeps its own default.
+      const launchAxis = geneNamesVarAxis(candidates.defaults.modality ?? null, candidates.defaults.expression);
+      candidates = assembleAnnDataCandidates(
+        described,
+        resolution,
+        { ...chosen, geneNames: `column:${column}` },
+        { ...geneNameColumns, [launchAxis]: column }
+      );
     }
     return candidates;
+  }
+
+  /**
+   * Assemble the catalog from what `initialize()` described, with every
+   * gene-name guess settled so far.
+   * @private
+   */
+  _assembleGuessedCandidates() {
+    const { described, resolution } = this._catalogInputs;
+    this._candidatesGuessCount = this._geneNameGuesses.size;
+    this._candidates = this._assembleCandidates(described, resolution, this._geneNameGuesses.settled());
+  }
+
+  /**
+   * The var axes of this file that an expression matrix is on (`X` and each
+   * layer share `var`; `raw` has its own; each modality its own), with the
+   * var columns that may name their genes.
+   *
+   * @returns {Map<string, ReadonlyArray<Object>>}
+   * @private
+   */
+  _geneNameAxes() {
+    const described = this._catalogInputs?.described ?? null;
+    if (described === null) throw new Error('AnnData data-mapping candidates are not initialized');
+    const scopes = described.modalities === null || described.modalities === undefined
+      ? [{ modality: null, scope: described }]
+      : described.modalities.map(scope => ({ modality: scope.name, scope }));
+    const axes = new Map();
+    for (const { modality, scope } of scopes) {
+      if (scope.X !== null || scope.layers.some(layer => layer.usable)) {
+        axes.set(geneNamesVarAxis(modality, 'X'), scope.var.columns);
+      }
+      if (scope.raw !== null && scope.raw.X !== null) {
+        axes.set(geneNamesVarAxis(modality, 'raw'), scope.raw.var.columns);
+      }
+    }
+    return axes;
+  }
+
+  /**
+   * Guess the gene names of one var axis (`X`, `raw`, `mod/<name>`,
+   * `mod/<name>/raw`; `geneNamesVarAxis`), once, and answer the catalog with
+   * that guess in it: the var column of symbols when the axis's index holds
+   * identifiers (`inferGeneNameColumn`), else its index. Only an index of
+   * identifiers reads more: its text columns, lazily, the conventionally
+   * named first, stopping at the first that holds symbols; a column that
+   * cannot be read is passed over (choosing it in the data-mapping panel
+   * says why). An index that cannot be read fails the guess, and the next
+   * ask tries again.
+   *
+   * Nothing at opening asks: the shown axis is guessed when its genes are
+   * first listed (`getGeneList`), after the first view, and any other axis
+   * when the data-mapping panel first shows it.
+   *
+   * @param {string} axis
+   * @returns {Promise<Object>} The candidate catalog
+   */
+  async guessGeneNames(axis) {
+    const generation = this._captureLifecycleGeneration();
+    const columns = this._geneNameAxes().get(axis);
+    if (columns === undefined) {
+      throw new RangeError(`This file has no expression matrix on the var axis '${axis}'.`);
+    }
+    await this._geneNameGuesses.guess(axis, async () => {
+      const { index } = await this._loader.readVarNames(axis, null);
+      // Integers (lengths, Entrez ids) are never symbols.
+      const textual = columns
+        .filter(column => column.usable && !/^(u?int|Int)\d*$/.test(column.dtype))
+        .map(column => column.key);
+      return inferGeneNameColumn(index, textual, key => this._loader.readVarNames(axis, key).then(
+        read => read.values,
+        () => null
+      ));
+    });
+    this._assertLifecycleGeneration(generation);
+    return this.getMappingCandidates();
+  }
+
+  /**
+   * Settle the gene names the file's own gene routes (`var`, `var/{g}`)
+   * read: the default expression matrix's axis is guessed first when it is
+   * not yet, so those routes never name the genes by the index in place of
+   * a pending guess.
+   * @private
+   */
+  async _settleOwnGeneNames(path, generation) {
+    if (parseMappingGenesPath(path) !== null) return;
+    const defaults = this.getMappingCandidates().defaults;
+    if (defaults.geneNames !== null || defaults.expression === null) return;
+    await this.guessGeneNames(geneNamesVarAxis(defaults.modality ?? null, defaults.expression));
+    this._assertLifecycleGeneration(generation);
   }
 
   /**
@@ -1312,7 +1514,19 @@ export class BaseAnnDataAdapter {
     if (this._candidates === null) {
       throw new Error('AnnData data-mapping candidates are not initialized');
     }
+    // A guess settled since (by this adapter, or by the earlier reading of
+    // the same store it shares them with): the catalog states it.
+    if (this._candidatesGuessCount !== this._geneNameGuesses.size) this._assembleGuessedCandidates();
     return this._candidates;
+  }
+
+  /**
+   * The gene-name guesses of this store, for a reading of it with other
+   * cells to keep (`AnnDataFileSource.reopenCells`).
+   * @returns {GeneNameGuesses}
+   */
+  geneNameGuesses() {
+    return this._geneNameGuesses;
   }
 
   /**
@@ -1618,7 +1832,7 @@ export class BaseAnnDataAdapter {
 
         result = {
           kind: 'continuous',
-          values: values instanceof Float32Array ? values : new Float32Array(values),
+          values: values instanceof Float32Array ? values : copyTypedArray(Float32Array, values, `Observation field '${key}'`),
           min: meta.min,
           max: meta.max,
         };
@@ -1692,7 +1906,7 @@ export class BaseAnnDataAdapter {
             categoryMap.set(categories[index], index);
           }
           const { TypedArrayClass, missingValue } = getCellucidCategoryStorage(categories, key);
-          codes = new TypedArrayClass(valueCount);
+          codes = allocateTypedArray(TypedArrayClass, valueCount, `Observation field '${key}' codes`);
           for (let i = 0; i < valueCount; i++) {
             const v = field.values[i];
             if (v == null) {
@@ -1863,9 +2077,13 @@ export class BaseAnnDataAdapter {
       ? { n_cells: this._loader.nObs, n_edges: null, max_neighbors: null }
       : null;
     validateConnectivitySummary(connectivitySummary);
-    // The gene count of the gene list the file opens with (raw.X has its own).
-    const geneList = await this.getGeneList();
-    this._assertLifecycleGeneration(generation);
+    // The gene count of the gene list the file opens with (raw.X has its
+    // own), from metadata: no gene name is read before the first view.
+    const mappingDefaults = this._candidates.defaults;
+    const geneAxisRoute = mappingDefaults.expression === null
+      ? null
+      : expressionAxisRoute(this._candidates, mappingDefaults.expression, mappingDefaults.modality ?? null);
+    const geneCount = geneAxisRoute === null ? 0 : axisGeneCount(this._candidates, geneAxisRoute);
     const obsFields = this.getObsFields().fields.map(field => (
       field.kind === 'continuous'
         ? { key: field.key, kind: 'continuous' }
@@ -1886,7 +2104,7 @@ export class BaseAnnDataAdapter {
       description: file.description ?? description,
       stats: {
         n_cells: this._loader.nObs,
-        n_genes: geneList.fields.length,
+        n_genes: geneCount,
         n_obs_fields: obsFields.length,
         n_categorical_fields: obsFields.filter(
           field => field.kind === 'category'
@@ -1961,7 +2179,7 @@ export class BaseAnnDataAdapter {
     // Another caller of the same computation was handed the cached array
     // first. Every caller sharing one computation resumes in the same turn,
     // before any of them can write to it, so this copy is still the payload.
-    return { positions: new Float32Array(embedding), transform, bounds };
+    return { positions: copyLargeArray(embedding), transform, bounds };
   }
 
   /**
@@ -2235,6 +2453,7 @@ export class BaseAnnDataAdapter {
         'AnnData datasets must contain at least one observation'
       );
     }
+    await this._settleOwnGeneNames(path, generation);
     const route = this._resolveGeneRoute(path, 'list');
     const names = route === null ? null : await this._geneNames(route);
     this._assertLifecycleGeneration(generation);
@@ -2248,13 +2467,58 @@ export class BaseAnnDataAdapter {
         ? []
         : names.names.map((name, gene) => ({ key: name, kind: 'continuous', path: `${path}/${gene}` })),
       geneNames: names === null
-        ? { source: null, filledFromIndex: 0, renamed: [] }
+        ? { source: null, filledFromIndex: 0, renamed: [], ids: null }
         : {
             source: names.source,
             filledFromIndex: names.filledFromIndex,
             renamed: names.renamed.map(pair => [...pair]),
+            ids: names.ids === null ? null : [...names.ids],
           },
     };
+  }
+
+  /**
+   * The obs names of the open cells, in order: read when an export asks.
+   * @returns {Promise<string[]>}
+   */
+  async getObsNames() {
+    const generation = this._captureLifecycleGeneration();
+    const names = await this._loader.readObsNames();
+    this._assertLifecycleGeneration(generation);
+    return names;
+  }
+
+  /**
+   * The rows of some open cells of the expression matrix one gene payload
+   * path reads (`getGeneValues`): each cell's non-zero genes, by position in
+   * that matrix's gene list, and their values.
+   *
+   * @param {string} path - A gene payload path of the matrix
+   * @param {ArrayLike<number>} cells - Open cell positions
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<Array<{genes: Int32Array, values: Float32Array}>>}
+   */
+  async getMatrixRowsOf(path, cells, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const rows = await this._loader.getMatrixRows(route.element, cells, { signal });
+    this._assertLifecycleGeneration(generation);
+    return rows;
+  }
+
+  /**
+   * Columns of one `obsm` array of the open cells, row-major, as stored.
+   *
+   * @param {string} key
+   * @param {ReadonlyArray<number>} columns
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<Float32Array|Float64Array>}
+   */
+  async getObsmColumns(key, columns, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const values = await this._loader.readObsmColumns(key, columns, { signal });
+    this._assertLifecycleGeneration(generation);
+    return values;
   }
 
   /**
@@ -2270,6 +2534,7 @@ export class BaseAnnDataAdapter {
    */
   async getMarkedGenes(path, column) {
     const generation = this._captureLifecycleGeneration();
+    await this._settleOwnGeneNames(path, generation);
     const route = this._resolveGeneRoute(path, 'list');
     if (route === null) return null;
     const entry = axisVarColumns(this.getMappingCandidates(), route.axisRoute)
@@ -2321,6 +2586,10 @@ export class BaseAnnDataAdapter {
         }
         return null;
       }
+      if (defaults.geneNames === null) {
+        // `_settleOwnGeneNames` guesses them first: never the index instead.
+        throw new Error('The gene names of this expression matrix are not guessed yet.');
+      }
       axisRoute = expressionAxisRoute(candidates, defaults.expression, defaults.modality ?? null);
       namesRoute = geneNamesRoute(candidates, axisRoute, defaults.geneNames);
       gene = kind === 'gene' ? Number(own[1]) : null;
@@ -2363,9 +2632,11 @@ export class BaseAnnDataAdapter {
   /**
    * The unique gene names of one axis and name source, read once and kept:
    * the var index, or one var column whose empty values take the index name.
+   * Names from a column keep the var index beside them (`ids`), so a gene
+   * named by its symbol is still found by its identifier.
    *
    * @param {{varAxis: 'X'|'raw', column: string|null}} route
-   * @returns {Promise<{names: string[], renamed: Array<[string, string]>, filledFromIndex: number, source: string|null}>}
+   * @returns {Promise<{names: string[], renamed: Array<[string, string]>, filledFromIndex: number, source: string|null, ids: string[]|null}>}
    * @private
    */
   async _geneNames(route) {
@@ -2387,6 +2658,7 @@ export class BaseAnnDataAdapter {
       renamed: unique.renamed,
       filledFromIndex: unique.filledFromIndex,
       source: route.column,
+      ids: route.column === null ? null : Object.freeze([...index]),
     });
     this._geneNamesByRoute.set(cacheKey, result);
     return result;
@@ -2450,11 +2722,15 @@ export class BaseAnnDataAdapter {
    * the reader as one batch (`AnnDataReaderClient.getMatrixColumn`).
    *
    * @param {string} path
-   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
-   *   wait; the read stops once no caller still waits for it.
+   * @param {{signal?: AbortSignal|null, onPartial?: ((values: Float32Array, cells: number) => void)|null}} [options] -
+   *   `signal` ends this caller's wait; the read stops once no caller still
+   *   waits for it. `onPartial(values, cells)`: while the gene index of a
+   *   matrix indexed in segments is built, the gene on the first `cells`
+   *   open cells (a sample of them) and NaN on the rest, each time it has
+   *   more (`AnnDataReader.getMatrixColumn`); each caller its own array.
    * @returns {Promise<Float32Array>}
    */
-  async getGeneValues(path, { signal = null, owner = null, key = null } = {}) {
+  async getGeneValues(path, { signal = null, owner = null, key = null, onPartial = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const route = await this._geneRoute(path, generation);
     const inFlightKey = JSON.stringify([route.element, route.gene]);
@@ -2469,15 +2745,210 @@ export class BaseAnnDataAdapter {
       inFlightKey,
       generation,
       async workSignal => {
-        const column = await this._loader.getMatrixColumn(route.element, route.gene, { signal: workSignal, owner, key: readKey });
+        const column = await this._loader.getMatrixColumn(route.element, route.gene, {
+          signal: workSignal,
+          owner,
+          key: readKey,
+          // The gene on more cells as they are read, to every caller that
+          // asked for it, whenever it joined.
+          onPartial: (values, cells) => {
+            const listeners = [...(this._geneExpressionInFlight.get(inFlightKey)?.partials ?? [])];
+            listeners.forEach((listener, i) => listener(i === 0 ? values : copyLargeArray(values), cells));
+          },
+        });
         this._assertLifecycleGeneration(generation);
         return column;
       },
       signal
     );
     const entry = this._geneExpressionInFlight.get(inFlightKey);
-    if (entry !== undefined) entry.readKey ??= readKey;
+    if (entry !== undefined) {
+      entry.readKey ??= readKey;
+      if (onPartial !== null) (entry.partials ??= new Set()).add(onPartial);
+    }
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rows of the open cells
+  //
+  // What an opening grown in place appends (`AnnDataFileSource.reopenCells`,
+  // `app/open-cells-resize.js`), and what an analysis's first pass reads on
+  // the first cells of priority order: rows `[start, end)` of the open cells
+  // of a field, an embedding, a vector field or a gene, read by the reader
+  // worker with `rows` (only what those cells need where the layout allows),
+  // never cached here. Each is, bit for bit, the whole read's rows.
+  // -------------------------------------------------------------------------
+
+  /** `rows` checked against the open cells. @private */
+  _requireRows(rows, label) {
+    const n = this._loader.nObs;
+    if (!Array.isArray(rows) || rows.length !== 2 || !Number.isSafeInteger(rows[0]) || !Number.isSafeInteger(rows[1]) ||
+        rows[0] < 0 || rows[1] < rows[0] || rows[1] > n) {
+      throw new RangeError(`${label}: rows are [start, end) within the ${formatCountOf(n, 'open cell')}; got ${JSON.stringify(rows)}.`);
+    }
+    return [rows[0], rows[1]];
+  }
+
+  /**
+   * Rows `[start, end)` of one obs field: a continuous field's float32
+   * values, or a categorical field's codes under `categories`, the
+   * categories the field was loaded with (the shown field's), in their
+   * storage (`getCellucidCategoryStorage`). A text or boolean column whose
+   * rows hold a value outside `categories` answers `{changed: true}`: its
+   * categories are found from every cell, so it is read whole again.
+   *
+   * @param {string} key
+   * @param {[number, number]} rows
+   * @param {{categories?: ReadonlyArray<string|number|boolean>|null, signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{kind: 'continuous', values: Float32Array}|{kind: 'category', codes: ArrayBufferView}|{changed: true}>}
+   */
+  async getObsFieldRows(key, rows, { categories = null, signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Obs field '${key}'`);
+    const meta = this._obsFieldsMetadata?.find(field => field.key === key);
+    if (!meta) throw new Error(`Obs field '${key}' not found`);
+    const field = await this._loader.getObsField(key, { signal, rows: [start, end] });
+    this._assertLifecycleGeneration(generation);
+    const count = end - start;
+    if (meta.kind === 'continuous') {
+      const values = field.values instanceof Float32Array ? field.values : copyTypedArray(Float32Array, field.values, `Observation field '${key}'`);
+      if (values.length !== count) throw new Error(`Continuous observation field '${key}' rows did not read one value per cell`);
+      return { kind: 'continuous', values };
+    }
+    if (!Array.isArray(categories)) {
+      throw new TypeError(`Rows of categorical field '${key}' are coded under the categories it was loaded with.`);
+    }
+    const { TypedArrayClass, missingValue } = getCellucidCategoryStorage(categories, key);
+    if (!meta._needsCodeComputation) {
+      if (field.dtype !== 'categorical' || field.categories.length !== categories.length ||
+          field.categories.some((category, index) => category !== categories[index])) {
+        throw new Error(`Categorical observation field '${key}' changed its category dictionary after it was loaded`);
+      }
+      if (!(field.codes instanceof TypedArrayClass) || field.codes.length !== count) {
+        throw new Error(`Categorical observation field '${key}' rows must arrive as narrowed codes, one per cell`);
+      }
+      return { kind: 'category', codes: field.codes };
+    }
+    // A text or boolean column, coded as its first load coded it.
+    const codeOf = new Map(categories.map((category, index) => [category, index]));
+    const codes = allocateTypedArray(TypedArrayClass, count, `Observation field '${key}' codes`);
+    for (let i = 0; i < count; i++) {
+      const value = field.values[i];
+      if (value == null) {
+        codes[i] = missingValue;
+        continue;
+      }
+      const code = codeOf.get(value);
+      if (code === undefined) return { changed: true };
+      codes[i] = code;
+    }
+    return { kind: 'category', codes };
+  }
+
+  /**
+   * Rows `[start, end)` of one embedding's display coordinates, by its route
+   * (`getEmbeddingPayload`), in the frame the dataset's cells are shown in
+   * (`EmbeddingPayloads.embedding`), with their bounds.
+   *
+   * @param {string} path
+   * @param {number} dimension
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<import('./embedding-payload.js').EmbeddingPayload>}
+   */
+  async getEmbeddingRows(path, dimension, rows, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Embedding '${path}'`);
+    const route = parseMappingEmbeddingPath(path);
+    const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+    if (item === undefined) throw new RangeError(`This dataset has no embedding '${path}'.`);
+    if (route.columns.length !== dimension) {
+      throw new RangeError(`Embedding payload '${path}' holds ${route.columns.length}D coordinates, not ${dimension}D.`);
+    }
+    const { columns } = this._resolveEmbeddingRef({ key: item.key, columns: route.columns });
+    const payload = await this._loader.readEmbedding(item.key, columns, this._defaults.normalizeEmbeddings !== false, { signal, rows: [start, end] });
+    this._assertLifecycleGeneration(generation);
+    if (!(payload.positions instanceof Float32Array) || payload.positions.length !== (end - start) * dimension) {
+      throw new Error(`Embedding '${path}' rows did not read one row per cell`);
+    }
+    return payload;
+  }
+
+  /**
+   * Rows `[start, end)` of one vector field, by its route
+   * (`getVectorPayload`), scaled as the whole field is, with their largest
+   * magnitude.
+   *
+   * @param {string} path
+   * @param {number} dimension
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>}
+   */
+  async getVectorRows(path, dimension, rows, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Vector field '${path}'`);
+    const route = parseMappingVectorPath(path);
+    const vectorItem = route === null ? undefined : this._candidates?.obsm[route.vectorIndex];
+    const embeddingItem = route === null ? undefined : this._candidates?.obsm[route.embeddingIndex];
+    if (vectorItem === undefined || embeddingItem === undefined) throw new RangeError(`This dataset has no vector route '${path}'.`);
+    const embeddingRef = { key: embeddingItem.key, columns: route.embeddingColumns };
+    const resolved = resolveVectorBinding(this._candidates, { key: vectorItem.key, embedding: embeddingRef });
+    if (!resolved.ok || resolved.path !== path || resolved.dimension !== dimension) {
+      throw new RangeError(`Cannot draw vector field '${path}' at ${dimension}D.`);
+    }
+    const payload = await this._loader.readVectorField(
+      vectorItem.key,
+      route.vectorColumns,
+      { key: embeddingItem.key, columns: this._resolveEmbeddingRef(embeddingRef).columns },
+      this._defaults.normalizeEmbeddings !== false,
+      { signal, rows: [start, end] }
+    );
+    this._assertLifecycleGeneration(generation);
+    if (!(payload.vectors instanceof Float32Array) || payload.vectors.length !== (end - start) * dimension) {
+      throw new Error(`Vector field '${vectorItem.key}' rows did not read one vector per cell`);
+    }
+    return payload;
+  }
+
+  /**
+   * Rows `[start, end)` of one gene, by its route (`getGeneValues`): the
+   * gene on those cells only, reading what they need
+   * (`AnnDataReader.getMatrixColumn`, `rows`).
+   *
+   * @param {string} path
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @returns {Promise<Float32Array>}
+   */
+  async getGeneValueRows(path, rows, { signal = null, owner = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Gene '${path}'`);
+    const route = await this._geneRoute(path, generation);
+    const column = await this._loader.getMatrixColumn(route.element, route.gene, { signal, owner, rows: [start, end] });
+    this._assertLifecycleGeneration(generation);
+    if (!(column instanceof Float32Array) || column.length !== end - start) {
+      throw new Error(`Gene '${path}' rows did not read one value per cell`);
+    }
+    return column;
+  }
+
+  /**
+   * What reading the gene at `path` costs now, before it is read
+   * (`AnnDataReader.geneReadPlan`): for a matrix stored cell by cell whose
+   * gene index is not built yet, the whole-matrix read the first gene needs.
+   *
+   * @param {string} path - A gene route, as `getGeneValues`
+   * @returns {Promise<Object|null>} Null when the loader cannot tell
+   */
+  async getGeneReadPlan(path) {
+    const generation = this._captureLifecycleGeneration();
+    if (typeof this._loader.geneReadPlan !== 'function') return null;
+    const route = await this._geneRoute(path, generation);
+    const plan = await this._loader.geneReadPlan(route.element);
+    this._assertLifecycleGeneration(generation);
+    return plan;
   }
 
   /**
@@ -2505,6 +2976,7 @@ export class BaseAnnDataAdapter {
 
   /** The route of one gene payload path, checked against its gene list. @private */
   async _geneRoute(path, generation) {
+    await this._settleOwnGeneNames(path, generation);
     const route = this._resolveGeneRoute(path, 'gene');
     const names = await this._geneNames(route);
     this._assertLifecycleGeneration(generation);
@@ -2545,6 +3017,7 @@ export class BaseAnnDataAdapter {
     if (!Array.isArray(paths) || paths.length === 0) {
       throw new TypeError(`${what} reads at least one gene.`);
     }
+    await this._settleOwnGeneNames(paths[0], generation);
     const routes = paths.map(path => this._resolveGeneRoute(path, 'gene'));
     const element = routes[0].element;
     if (routes.some(route => route.element !== element)) {
@@ -2922,14 +3395,24 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Close and release resources
+   * Let go of what this adapter holds, leaving its reader open: the reader
+   * read again with other cells (`AnnDataFileSource.reopenCells`) gets a new
+   * adapter.
    */
-  close() {
+  release() {
     if (this._closed) return;
     this.clearCaches();
     this._outliers?.close();
     this._closed = true;
     this._obsFieldsMetadata = null;
+  }
+
+  /**
+   * Close and release resources, the reader with them.
+   */
+  close() {
+    if (this._closed) return;
+    this.release();
     this._loader.close();
   }
 }

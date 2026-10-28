@@ -97,7 +97,13 @@ test('snapshot attribute publication uses the narrowest renderer transaction for
     /return hpRenderer\.updateSnapshotAlphas\(\s*exactId,\s*transparency\s*\)/,
   );
   assert.match(source, /if \(visibilityMoved\) \{\n\s*highlightTools\.handleTransparencyChange\(exactId\);/);
-  assert.match(source, /if \(transparencyChanged\) snap\.transparency\.set\(nextTransparency\);/);
+  // The renderer keeps the accepted transparency by reference, so once the
+  // view's own owner holds the accepted bytes it is handed back to it: the
+  // caller's array is application state, rewritten in place.
+  assert.match(
+    source,
+    /if \(transparencyChanged\) \{\s*snap\.transparency\.set\(nextTransparency\);\s*hpRenderer\._adoptSnapshotAlphasOwner\(exactId, snap\.transparency\);\s*\}/,
+  );
   assert.equal(
     source.match(/publishSnapshotPointAttributes\(/g)?.length,
     2,

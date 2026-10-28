@@ -34,6 +34,12 @@ import {
  *   The identity id of the dataset that is open, or null.
  * @param {(record: object) => Promise<boolean>} options.openDatasetSource
  *   Opens the dataset a session file recorded; resolves whether it is open.
+ * @param {() => ({digest: string, isSubset: boolean}|null)} options.currentCellIdentity
+ *   The open dataset's cells (`data/cell-identity.js`), or null.
+ * @param {(cellSubset: Object) => Promise<{shown: boolean, inPlace: boolean}>} options.reopenDataset
+ *   Reads the open dataset again with the cells `cellSubset` asks for (a
+ *   cell subset request, `data/cell-subset-policy.js`); resolves whether it
+ *   is shown.
  * @param {(() => Promise<void>|void)|undefined} options.onAfterLoad
  */
 export function initSessionControls({
@@ -42,6 +48,8 @@ export function initSessionControls({
   datasetChanges,
   currentDatasetIdentityId,
   openDatasetSource,
+  currentCellIdentity,
+  reopenDataset,
   onAfterLoad
 }) {
   if (
@@ -57,7 +65,9 @@ export function initSessionControls({
   }
   if (
     typeof currentDatasetIdentityId !== 'function' ||
-    typeof openDatasetSource !== 'function'
+    typeof openDatasetSource !== 'function' ||
+    typeof currentCellIdentity !== 'function' ||
+    typeof reopenDataset !== 'function'
   ) {
     throw new TypeError(
       'Session controls require the dataset identity and opener.'
@@ -172,7 +182,7 @@ export function initSessionControls({
     if (!await awaitDatasetForSession(operationGeneration, sessionLoad)) {
       return false;
     }
-    const { datasetId, source } = await sessionSerializer.readSessionDataset(file);
+    const { datasetId, source, cells } = await sessionSerializer.readSessionDataset(file);
     if (!current()) return false;
     // A local file cannot be opened from the session: the restore names it
     // when the open dataset is not the one the session was saved on.
@@ -181,7 +191,7 @@ export function initSessionControls({
       || source.kind === 'file'
       || currentDatasetIdentityId() === datasetId
     ) {
-      return true;
+      return openSessionCells(datasetId, cells, current);
     }
     // Shown by the opening progress; the source and the dataset change that
     // open it join this opening, and a failure is said where it happened:
@@ -198,7 +208,27 @@ export function initSessionControls({
       else opening.dismiss();
     }
     // A source that could not be opened reported why where it failed.
-    return opened && current();
+    return opened && current() && openSessionCells(datasetId, cells, current);
+  }
+
+  /**
+   * Open the session's dataset with the cells it was saved on: a subsample's
+   * exact cells (`cells`), or every cell when it recorded none. A dataset
+   * open with other cells is read again first, so the session's per-cell
+   * state lands on the cells it names.
+   *
+   * @returns {Promise<boolean>} Whether this file is still the one to restore.
+   */
+  async function openSessionCells(datasetId, cells, current) {
+    if (currentDatasetIdentityId() !== datasetId) return current();
+    const open = currentCellIdentity();
+    if (open === null) return current();
+    const wanted = cells === null ? null : cells.digest;
+    if (wanted === null ? !open.isSubset : (open.isSubset && open.digest === wanted)) return current();
+    const { shown } = await reopenDataset(cells === null
+      ? { mode: 'all' }
+      : { mode: 'kept', spec: cells.spec, kept: cells.kept });
+    return shown === true && current();
   }
 
   if (loadStateBtn && sessionSerializer) {

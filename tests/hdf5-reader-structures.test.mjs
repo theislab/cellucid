@@ -294,6 +294,135 @@ test('a chunk-aligned range of a 5000-chunk dataset fetches only its chunks', as
   root.close();
 });
 
+test('what a many-leaf chunked dataset stores is known without reading its chunk index\'s leaves', async () => {
+  for (const name of ['many_chunks/btree_levels', 'many_chunks/btree_levels_gzip']) {
+    const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 0 });
+    const root = await openHdf5(recorder.reader());
+    const node = root.get(name);
+    const table = await node.reader.chunkTable(null);
+    recorder.reset();
+    // A whole dataset, and a range of it: estimated from the keys of the
+    // leaves' parents (each leaf's first chunk), no request made.
+    const estimate = await node.storedBytes();
+    const rangeEstimate = await node.storedBytes([[400, 440]]);
+    assert.equal(recorder.log.length, 0, `${name}: ${recorder.log.length} requests to know what it stores`);
+    assert.equal(table.count, 0, `${name}: no leaf was read`);
+    await node.read();
+    const exact = await node.storedBytes();
+    assert.equal(table.count, 5000);
+    assert.equal(await node.storedBytes([[400, 440]]), Array.from({ length: 10 }, (_, k) => table.size[table.find(100 + k)]).reduce((a, b) => a + b, 0));
+    if (name.endsWith('gzip')) {
+      assert.ok(Math.abs(estimate - exact) <= 0.25 * exact, `${name}: estimate ${estimate}, stored ${exact}`);
+      assert.ok(rangeEstimate > 0);
+    } else {
+      // Unfiltered chunks all store their full size: the estimate is exact.
+      assert.equal(estimate, exact);
+      assert.equal(rangeEstimate, 10 * 4 * 2);
+    }
+    root.close();
+  }
+});
+
+test('reads that go on in row order find the next leaves of the chunk index read ahead: one round trip each, not two', async () => {
+  // Six requests at once: the rest of the tree's leaves are too many to
+  // follow every read in one wave of background requests.
+  const latencyMs = 10;
+  const recorder = recordingSource(fixture('default-format.h5'), { latencyMs, policy: { concurrency: 6 } });
+  const root = await openHdf5(recorder.reader());
+  const node = root.get('many_chunks/btree_levels_gzip');
+  const table = await node.reader.chunkTable(null);
+  // Rows in file order, a leaf's worth (2K chunks of 4 rows) at a time, as
+  // a slab scan or a subsample's waves read them; each read after the first
+  // two finds its leaves read ahead, and waits one round trip, for its chunks.
+  const leafRows = 2 * 32 * 4;
+  for (let k = 0; k < 8; k++) {
+    const started = recorder.time.now();
+    const values = await node.read([[k * leafRows, (k + 1) * leafRows]]);
+    const waited = recorder.time.now() - started;
+    assert.equal(values[1], (k * leafRows + 1) * 3);
+    if (k >= 2) assert.ok(waited <= latencyMs, `read ${k} waited ${waited} ms: ${waited / latencyMs} round trips`);
+  }
+  // A read elsewhere reads nothing ahead.
+  const before = table.count;
+  await node.read([[15000, 15004]]);
+  await recorder.time.sleep(5 * latencyMs);
+  assert.ok(table.count - before <= 2 * 64, `${table.count - before} entries placed for a read elsewhere`);
+  root.close();
+});
+
+test('reads asked for in one task wait for the chunk index leaves of all of them, then fetch their chunks together', async () => {
+  // Two reads far apart, each needing its own leaf, asked for together; the
+  // second leaf answers late. Every chunk request of the task goes out at
+  // once when both leaves are in, not the first read's as soon as its own.
+  const bytes = fixture('default-format.h5');
+  const base = bytesByteSource(bytes, { name: 'burst.h5', policy: { concurrency: 100 } });
+  const time = virtualTime();
+  const log = [];
+  let reads = 0;
+  let first = Infinity;
+  const source = {
+    size: base.size,
+    name: base.name,
+    identity: base.identity,
+    policy: base.policy,
+    async read(offset, length, options) {
+      const n = reads++;
+      log.push({ at: time.now(), n });
+      await time.sleep(n === first + 1 ? 50 : 5);
+      return base.read(offset, length, options);
+    },
+  };
+  const root = await openHdf5(createByteReader(source, { clock: time.now }));
+  const node = root.get('many_chunks/btree_levels_gzip');
+  await node.reader.chunkTable(null);
+  first = reads;
+  const [one, two] = await Promise.all([node.read([[8000, 8004]]), node.read([[19_000, 19_004]])]);
+  assert.equal(one[1], 8001 * 3);
+  assert.equal(two[1], 19_001 * 3);
+  const requests = log.filter(entry => entry.n >= first);
+  const [leafOne, leafTwo, ...chunks] = requests;
+  assert.equal(leafOne.at, leafTwo.at, 'the two leaves are asked for together');
+  assert.ok(chunks.length >= 1);
+  assert.ok(chunks.every(entry => entry.at === chunks[0].at && entry.at >= leafTwo.at + 50),
+    `chunk requests at ${chunks.map(entry => entry.at)}, the late leaf in at ${leafTwo.at + 50}`);
+  root.close();
+});
+
+test('a read cancelled while it finds its chunks leaves no unobserved rejection behind', async () => {
+  const unobserved = [];
+  const onUnhandled = reason => unobserved.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    for (const name of ['many_chunks/btree_levels_gzip', 'many_chunks/btree_levels']) {
+      const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 1, policy: { concurrency: 6 } });
+      const root = await openHdf5(recorder.reader());
+      const node = root.get(name);
+      await node.reader.chunkTable(null);
+      for (let k = 0; k < 4; k++) {
+        const controller = new AbortController();
+        // Aborted while the leaves of the chunk index it needs are read: the
+        // read then goes on to its chunks with a signal already aborted.
+        recorder.onRead = () => controller.abort();
+        const reading = node.read([[k * 4000, k * 4000 + 2000]], { signal: controller.signal });
+        // A read its cached bytes answered made no request, and was not aborted.
+        await reading.then(
+          () => assert.equal(controller.signal.aborted, false),
+          error => assert.equal(error.name, 'AbortError')
+        );
+        recorder.onRead = null;
+      }
+      // Every fetch released settles; none of them is anybody's failure.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.deepEqual(Array.from(await node.read([[0, 3]])), name.endsWith('gzip') ? [0, 3, 6] : [0, 1, 2]);
+      root.close();
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unobserved, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
 test('the first rows of a many-leaf chunked dataset wait for one leaf of its chunk index, not all of them', async () => {
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs: 1 });
   const root = await openHdf5(recorder.reader());

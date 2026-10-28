@@ -35,7 +35,10 @@
 
 import { LOCAL_POLICY, REMOTE_POLICY, blobByteSource, httpByteSource } from '../../formats/io/byte-source.js';
 import { createByteReader } from '../../formats/io/byte-reader.js';
+import { equivalentS3Urls } from '../../formats/io/s3.js';
+import { rangeCacheKey, withRangeCache } from '../../formats/io/range-cache.js';
 import { LinkMeter } from '../../formats/io/link.js';
+import { DecodedBudget } from '../../formats/io/decoded-budget.js';
 import { Hdf5FormatError, Hdf5UnsupportedError, openHdf5 } from '../../formats/hdf5/index.js';
 import {
   ZarrFormatError,
@@ -62,6 +65,7 @@ import { H5AD_FORMAT, ZARR_FORMAT } from './elements.js';
 import { LAYOUT_VIEWS } from './views/index.js';
 import { LayoutRefusal } from './views/refusal.js';
 import { TRANSCODERS } from './transcode/index.js';
+import { forgetKeptCopy } from './transcode/space.js';
 import { formatCountOf } from '../../utils/format-units.js';
 /** Whether a source is a remote file `{url, size, ...}` rather than a `File`. */
 function isRemoteFile(file) {
@@ -71,8 +75,13 @@ function isRemoteFile(file) {
 
 /**
  * The byte reader of one file: a local `File`/`Blob`, or a remote file
- * `{url, size, name, identity, head?, access?}`, whose `head` (`{bytes, etag, ms}`,
- * read beside the probe of its size: `describeRemoteFile`) is its first read.
+ * `{url, size, name, identity, etag?, head?, access?, downloaded?}` (`etag`:
+ * the version a viewer host states in its dataset list), whose `head`
+ * (`{bytes, etag, ms}`, read beside the probe of its size:
+ * `describeRemoteFile`) is its first read. A remote file its host serves
+ * only whole is read from its `downloaded` copy (kept in this browser:
+ * `downloadRemoteFile`), under the remote file's identity, so what is kept
+ * of it is found again without downloading it.
  * A file behind a sign-in or an expiring link names its access
  * (`{provider, ref}`), which `sourceAccess` turns into the byte source's
  * `access`; its `url` is then its display link.
@@ -81,22 +90,41 @@ function readerOf(file, { onTransfer = null, sourceAccess = null } = {}) {
   if (typeof Blob !== 'undefined' && file instanceof Blob) {
     return createByteReader(blobByteSource(file));
   }
+  if (isRemoteFile(file) && typeof Blob !== 'undefined' && file.downloaded instanceof Blob) {
+    const checks = file.downloadedChecks ?? null;
+    return createByteReader(blobByteSource(file.downloaded, {
+      name: file.name,
+      identity: file.identity ?? null,
+      // Every read of the kept copy is checked; a damaged one is forgotten,
+      // so the next open downloads the file again.
+      checks: checks === null ? null : { ...checks, onDamage: () => forgetKeptCopy(checks.directory) },
+    }));
+  }
   if (isRemoteFile(file)) {
     const head = file.head ?? null;
     if (file.access != null && sourceAccess === null) {
       throw new TypeError(`${file.name} needs its access, which this reader was not given.`);
     }
-    const source = httpByteSource({
+    const fetched = httpByteSource({
       url: file.url,
       size: file.size,
       name: file.name,
       identity: file.identity ?? null,
-      etag: head?.etag ?? null,
+      // The version read beside the probe, or the one a viewer host states.
+      etag: head?.etag ?? file.etag ?? null,
+      lastModified: file.lastModified ?? null,
+      // A public S3 object's other addresses: six more connections each.
+      mirrors: file.access == null ? equivalentS3Urls(file.url) : [],
     }, file.access == null ? {} : { access: sourceAccess(file.access) });
+    // Ranges another reader of the same bytes fetched are not fetched again.
+    const source = withRangeCache(fetched, rangeCacheKey(file));
     const reader = createByteReader(source, {
       onTransfer: progress => onTransfer?.({ url: file.url, ...progress }),
       head: head === null ? null : { bytes: head.bytes, ms: head.ms },
     });
+    // Without a head read beside its probe, the host's answer to the
+    // provider's own request (`describeRemoteFile`) seeds the stall timeout.
+    if (head === null && Number.isFinite(file.answeredMs)) reader.link.responses.answered(file.answeredMs);
     reader.link.watchProtocol(source.url);
     reportArrivals(reader.link, file.url, onTransfer);
     return reader;
@@ -215,6 +243,17 @@ export function explainFormatError(error, format) {
  * @property {string} name - The file or folder name
  * @property {import('../../formats/io/link.js').LinkMeter} link - The link to
  *   the store, measured as it is read
+ * @property {Object|null} identity - What the bytes read are (`byte-source.js`
+ *   identities: the file's, a folder's every file's, a folder URL's), which a
+ *   gene index kept in this browser is filed under (`kept-column-index.js`);
+ *   null for a store transcoded in this browser
+ * @property {{url: string, version: string|null, unchanged: (options?: {signal?: AbortSignal|null}) => Promise<boolean>}|null} [folder] -
+ *   A store folder on a web host: its version as opened (its consolidated
+ *   metadata's validator) and whether it is still that version; absent or
+ *   null for every other layout
+ * @property {DecodedBudget} decodedBudget - The byte budget every cache of
+ *   the store's decoded chunks shares (`formats/io/decoded-budget.js`): the
+ *   store's own and the reader's kept across a growth (`AnnDataReader.open`)
  * @property {import('./transcode/session.js').Conversion} [conversion] - A
  *   single-stream format read once (`transcode/`): where its store is kept
  *   and what was not read; absent for every other format
@@ -239,6 +278,7 @@ async function headOf(file) {
     if (file.size === 0) return new Uint8Array(0);
     return new Uint8Array(await file.slice(0, SIGNATURE_BYTES).arrayBuffer());
   }
+  if (typeof Blob !== 'undefined' && file?.downloaded instanceof Blob) return headOf(file.downloaded);
   const bytes = file?.head?.bytes;
   return bytes instanceof Uint8Array ? bytes : null;
 }
@@ -312,23 +352,36 @@ export async function presentStore(root, { container, layout, name, ...context }
   return { format: stored.id, root, readerFormat: container === 'hdf5' ? H5AD_FORMAT : ZARR_FORMAT };
 }
 
-/** Open a Zarr store of one layout: its store, name and link. */
+/**
+ * What a folder of files is: every file's identity by its path (a picked
+ * folder's files by name, size and modification time; a served folder's
+ * remote files by theirs).
+ */
+function folderIdentity(files) {
+  return {
+    files: [...files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([filePath, file]) => (
+      typeof Blob !== 'undefined' && file instanceof Blob
+        ? { kind: 'file', name: filePath, size: file.size, lastModified: Number.isFinite(file.lastModified) ? file.lastModified : null }
+        : { ...(file?.identity ?? { kind: 'url', url: file?.url ?? null, size: file?.size ?? null }), name: filePath }
+    )),
+  };
+}
+
+/** Open a Zarr store of one layout: its store, name, link and identity. */
 async function zarrStoreOf(source, layout, { onTransfer, sourceAccess, signal, activity }) {
   if (layout === 'folder' && source.files instanceof Map) {
     const name = source.rootName;
     // A picked folder is files on this machine's disk, read with a local
-    // file's policy and never measured: each read is one file, whose
-    // time is the file system's cost of opening it plus however long the
-    // reader thread is busy before it takes the bytes, not the disk's
-    // speed. Measured, the folder's first reads (a 21 KB .zmetadata in
-    // 1 ms; files of a few bytes in 17 ms while the thread parses) put a
-    // disk delivering gigabytes a second below the 64 MB/s read-ahead
-    // line in most opens, and the cell rows of a CSC matrix were then
-    // indexed without their values (1,000 rows of Suo in Node: 2.3-2.7 s
-    // instead of 1.4-1.6 s).
+    // file's policy. Its reads measure its link: the shortest read is what
+    // one more read costs, and the fastest its bandwidth, so ranges a read
+    // apart are joined as a web host's are (`batchedRanges`). A local
+    // file's link is read ahead whatever one read measures
+    // (`LinkMeter.readsAhead`): a read's time is the file system's cost of
+    // opening it plus however long the reader thread is busy before it
+    // takes the bytes, a lower bound of the disk's speed.
     const link = new LinkMeter(LOCAL_POLICY);
     try {
-      return { store: directoryStore(source.files, { name }), name, link };
+      return { store: directoryStore(source.files, { name, link }), name, link, identity: folderIdentity(source.files) };
     } catch (error) {
       if (!(error instanceof ZarrFormatError)) throw error;
       // The metadata files are hidden (dot) files, which a browser folder
@@ -343,16 +396,22 @@ async function zarrStoreOf(source, layout, { onTransfer, sourceAccess, signal, a
     const name = source.file.name || 'dataset.zarr.zip';
     const reader = readerOf(source.file, { onTransfer, sourceAccess });
     const archive = await openZipArchive(reader, { name, signal, activity });
-    return { store: zipStore(archive, { name }), name, link: reader.link };
+    return { store: zipStore(archive, { name }), name, link: reader.link, identity: reader.identity };
   }
   const name = source.name ?? source.url;
-  const link = new LinkMeter(REMOTE_POLICY);
+  // A public S3 folder's other addresses: six more connections each.
+  const mirrors = equivalentS3Urls(source.url);
+  const link = new LinkMeter({ ...REMOTE_POLICY, concurrency: REMOTE_POLICY.concurrency * (1 + mirrors.length) });
   link.watchProtocol(new URL(source.url).href);
   // Every request measures the link and is counted for the Transfers
   // log (`{url, bytes, requests, ms}` running totals keyed by the folder).
-  const store = httpStore(source.url, { name, concurrency: link, onTransfer });
+  const store = httpStore(source.url, { name, concurrency: link, onTransfer, mirrors });
   reportArrivals(link, source.url, onTransfer);
-  return { store, name, link };
+  // A folder on a web host is known by its address and the version its
+  // consolidated metadata was read at (`version()`: a served store's ETag,
+  // new for every store a server makes), once it is opened; what is kept of
+  // it is kept for this tab only (`transcode/space.js`: no file version).
+  return { store, name, link, identity: () => ({ kind: 'url', url: new URL(source.url).href, version: store.version?.() ?? null }) };
 }
 
 /**
@@ -373,11 +432,16 @@ async function zarrStoreOf(source, layout, { onTransfer, sourceAccess, signal, a
  *   (`transcode/`): `createActivity` (its pass as an activity of its own),
  *   `choose({question, options})` (the person picks among the objects one
  *   file holds; resolves to an index), `onStore({directory, state})` (where
- *   its store is kept, `writing` then `complete`).
+ *   its store is kept, `writing` then `complete`), `onWholeRead(read)` (the
+ *   file is read whole, or what an earlier read kept is opened:
+ *   `transcode/session.js`).
  * @returns {Promise<OpenedStore>}
  */
 export async function openDatasetStore({ source, expect = null, fromLink = false }, { decodedChunkCacheBytes, onTransfer = null, signal = null, activity = null, sourceAccess = null, transcoding = {} }) {
   let format = expect?.format ?? null;
+  // One budget for every cache of the store's decoded chunks: its own, and
+  // the reader's kept across a growth (`OpenedStore.decodedBudget`).
+  const decodedBudget = new DecodedBudget(decodedChunkCacheBytes);
   try {
     const file = source?.file ?? null;
     if (file !== null && !isRemoteFile(file) && file?.size === 0) {
@@ -390,15 +454,15 @@ export async function openDatasetStore({ source, expect = null, fromLink = false
     const transcoder = expected === null ? undefined : TRANSCODERS[expected];
     if (transcoder !== undefined) {
       const byteReaderOf = item => readerOf(item, { onTransfer, sourceAccess });
-      const transcoded = await transcoder.transcode(source, { ...transcoding, signal, activity, onTransfer, byteReaderOf, expect, fromLink });
-      const stored = await openZarr(transcoded.store, { signal, activity, decodedChunkCacheBytes });
+      const transcoded = await transcoder.transcode(source, { ...transcoding, format: expected, signal, activity, onTransfer, byteReaderOf, expect, fromLink });
+      const stored = await openZarr(transcoded.store, { signal, activity, decodedChunkCacheBytes: decodedBudget });
       // A transcoder writes an object of several assays in MuData's layout
       // (`views/modalities.js`), presented as every MuData store is.
       const muData = LAYOUT_VIEWS['mudata-zarr'];
       const root = muData.recognize(stored) ? await muData.view(stored, { name: transcoded.name, layout, signal }) : stored;
       return {
         root, format: expected, layout, readerFormat: ZARR_FORMAT, zarrVersion: stored.zarrFormat ?? null,
-        name: transcoded.name, link: transcoded.link, conversion: transcoded.conversion,
+        name: transcoded.name, link: transcoded.link, identity: null, conversion: transcoded.conversion, decodedBudget,
       };
     }
     if (container !== 'hdf5' && container !== 'zarr') {
@@ -422,27 +486,34 @@ export async function openDatasetStore({ source, expect = null, fromLink = false
         throw explained(`${name} holds no count matrix file (${folderMarkersOf(expected).join(', ')}).`);
       }
       const reader = readerOf(matrix.file, { onTransfer, sourceAccess });
-      const root = await openHdf5(reader, { signal, activity, decodedChunkCacheBytes });
+      const root = await openHdf5(reader, { signal, activity, decodedChunkCacheBytes: decodedBudget });
       const readText = file => textOf(file, { onTransfer, sourceAccess });
       const opened = await presentStore(root, { container: 'hdf5', layout, name, signal, fromLink, files: source.files, base: matrix.base, readText });
       format = opened.format;
-      return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: null, name, link: reader.link };
+      return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: null, name, link: reader.link, identity: reader.identity, decodedBudget };
     }
     if (container === 'hdf5') {
       const reader = readerOf(file, { onTransfer, sourceAccess });
-      const root = await openHdf5(reader, { signal, activity, decodedChunkCacheBytes });
+      const root = await openHdf5(reader, { signal, activity, decodedChunkCacheBytes: decodedBudget });
       const opened = await presentStore(root, { container: 'hdf5', layout, name: file.name, signal, fromLink });
       format = opened.format;
-      return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: null, name: file.name, link: reader.link };
+      return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: null, name: file.name, link: reader.link, identity: reader.identity, decodedBudget };
     }
-    const { store, name, link } = await zarrStoreOf(source, layout, { onTransfer, sourceAccess, signal, activity });
-    const root = await openZarr(store, { signal, activity, decodedChunkCacheBytes });
+    const { store, name, link, identity: identityOf } = await zarrStoreOf(source, layout, { onTransfer, sourceAccess, signal, activity });
+    const root = await openZarr(store, { signal, activity, decodedChunkCacheBytes: decodedBudget });
+    const identity = typeof identityOf === 'function' ? identityOf() : identityOf;
     if (!isGroup(root)) {
       throw explained(`${name} is a single Zarr array, not an AnnData store (a group with obs, var and X).`);
     }
     const opened = await presentStore(root, { container: 'zarr', layout, name, signal, fromLink });
     format = opened.format;
-    return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: root.zarrFormat ?? null, name, link };
+    // A store folder on a web host: its version as opened, and whether it
+    // is still that version (`httpStore`), so reading it again with other
+    // cells takes over what was opened only while it is unchanged.
+    const folder = typeof store.unchanged === 'function'
+      ? Object.freeze({ url: store.url, version: store.version(), unchanged: options => store.unchanged(options) })
+      : null;
+    return { root: opened.root, format: opened.format, layout, readerFormat: opened.readerFormat, zarrVersion: root.zarrFormat ?? null, name, link, identity, folder, decodedBudget };
   } catch (error) {
     throw explainFormatError(error, format);
   }

@@ -191,7 +191,7 @@ function readFseTable(src, start, end, maxSymbol, maxAccuracyLog) {
  * set bit and ends at the first byte's lowest. `position` counts the bits
  * still unread; reading past the start yields zeros and leaves it negative.
  */
-class BackwardBits {
+export class BackwardBits {
   constructor(src, start, end) {
     if (end <= start) throw corrupt('a bit stream is empty');
     const last = src[end - 1];
@@ -212,7 +212,11 @@ class BackwardBits {
   at(position, count) {
     if (position < 0) {
       if (position + count <= 0) return 0;
-      return this.at(0, position + count) * (2 ** -position);
+      // Integer-only, as every path of this hot method: `**` is typed a
+      // double, which makes engines (JavaScriptCore) take every value the
+      // method returns as one. The bits read are fewer than `count` (at most
+      // 31) once shifted, so the shift never reaches the sign bit.
+      return this.at(0, position + count) << -position;
     }
     if (count > 24) return this.at(position, 16) + this.at(position + 16, count - 16) * 65536;
     const src = this.src;
@@ -603,14 +607,19 @@ function compressedBlock(src, start, end, frame, output) {
       offset = (1 << ofCode) + ((cont >>> avail) & ((1 << ofCode) - 1));
     } else {
       // More extra bits than one refill guarantees: the high bits, then 16.
+      // Integer operations only (`>>> 0` for codes up to 31): an
+      // exponentiation would make `offset`, and every address computed from
+      // it, a floating-point value to JavaScriptCore's optimizer even while
+      // this branch never runs, and WebKit then runs this loop in its
+      // baseline tier, several times slower.
       if (ofCode > 31) throw corrupt('an offset code is out of range');
       n = ofCode - 16;
       avail -= n;
-      const high = (cont >>> avail) & ((1 << n) - 1);
+      const high = (1 << n) | ((cont >>> avail) & ((1 << n) - 1));
       avail += at << 3; at = (avail >> 3) - 3; if (at < 0) at = 0; avail -= at << 3;
       cont = bitView.getInt32(bitStart + at, true);
       avail -= 16;
-      offset = 2 ** ofCode + high * 65536 + ((cont >>> avail) & 0xffff);
+      offset = ((high << 16) | ((cont >>> avail) & 0xffff)) >>> 0;
     }
     const mlCode = mlCodes[mlState];
     n = mlCode & 31;
@@ -757,7 +766,8 @@ function decodeFrame(src, start, output) {
 
   const frame = {
     outputStart: output.length,
-    repeats: new Int32Array([1, 4, 8]),
+    // Offsets reach 2^32 - 4 (code 31), past what an Int32Array holds.
+    repeats: new Uint32Array([1, 4, 8]),
     huffman: null,
     literalLengths: null,
     offsets: null,

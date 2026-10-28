@@ -15,47 +15,15 @@ import {
 import { buildSpatialTree, requirePrebuiltSpatialTree } from './spatial-tree.js';
 import {
   LOD_FULL_DETAIL_ADMISSION_LEVEL,
-  LOD_REDUCTION_FACTORS,
   buildDrawOrder,
-  buildHierarchicalOrder,
-  lodPrefixCounts,
+  drawBands,
+  dropDerivableLeafIds,
+  forEachLeafRun,
 } from './draw-order.js';
+import { adaptiveMinimumLevel, lodSizeMultiplier, selectLodLevel } from './lod-levels.js';
+import { DEFAULT_CELL_PRIORITY, buildPriorityOrder, requireCellPriority } from '../../data/cell-priority.js';
 import { formatCountOf, formatCount } from '../../utils/format-units.js';
 
-
-/**
- * The point count an adaptive LOD level is allowed to fall to.
- *
- * How far adaptive selection may go, from both ends.
- *
- * Adaptive selection is a frame-rate control, not a data-reduction policy, so
- * its coarsest useful answer is bounded. A fixed reduction ratio is what made a
- * large dataset unusable: at 18.1M cells the coarsest ladder step is 44x, which
- * the selector reaches on any pull-back and which discards 97.7% of the cells
- * whether or not the frame needed it.
- *
- * Two bounds, and the smaller count wins.
- *
- * `ADAPTIVE_LOD_POINT_BUDGET` is the absolute one: once a level draws this many
- * points, drawing is comfortable and further reduction buys nothing a viewer can
- * see. It is the bound that binds on an atlas.
- *
- * `ADAPTIVE_LOD_MAXIMUM_REDUCTION` is the relative one, and it is the bound that
- * binds on everything else. Expressing the floor as an absolute count alone made
- * it unsatisfiable below the budget -- no level of a 200k cloud holds 2M points,
- * so the floor landed on full detail and adaptive selection answered full detail
- * at every camera distance. On the datasets most people open, `Auto` did nothing
- * at all: the level readout never moved, and the only working control was the
- * forced-level slider. A cap on the ratio is satisfiable at every size, so the
- * camera drives the level on a 3,696-cell trajectory and an 18M-cell atlas
- * alike, while the absolute budget still stops the atlas short of the 44x step
- * that started this.
- *
- * The forced-level slider is deliberately not bounded by either. Asking for a
- * coarser level explicitly is a legitimate request on hardware that needs it.
- */
-const ADAPTIVE_LOD_POINT_BUDGET = 2_000_000;
-const ADAPTIVE_LOD_MAXIMUM_REDUCTION = 8;
 
 // ============================================================================
 // SPATIAL INDEX FOR LOD AND FRUSTUM CULLING (1D/2D/3D)
@@ -67,8 +35,9 @@ const ADAPTIVE_LOD_MAXIMUM_REDUCTION = 8;
  * - 2D: Quadtree (4 children) - for 2D projections (UMAP, t-SNE)
  * - 3D: Octree (8 children) - for 3D embeddings (PCA, etc.)
  *
- * Enables frustum culling and spatially-uniform LOD sampling in the
- * appropriate dimension space.
+ * Enables frustum culling, and LOD levels that are uniform random samples of
+ * the cells (their priority order, `draw-order.js`), in the appropriate
+ * dimension space.
  */
 export class SpatialIndex {
   /**
@@ -85,6 +54,9 @@ export class SpatialIndex {
    * @param {object|null} [options.prebuiltOrder] - That tree's draw order,
    *   computed with it off the main thread (`computeTreeDrawOrder`): banded by
    *   LOD when `buildLOD`, else one band.
+   * @param {Readonly<{seed: number|null, originals: Uint32Array|null}>} [options.priority] -
+   *   The cells' priority (`data/cell-priority.js`), the order LOD levels
+   *   admit them in; by default every point ranked under the default seed.
    */
   constructor(positions, colors, dimensionLevel, maxPointsPerNode, maxDepth, options) {
     const exactDimensionLevel = requireDimensionLevel(
@@ -110,7 +82,7 @@ export class SpatialIndex {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('SpatialIndex options must be an object.');
     }
-    const { buildLOD, prebuiltTree, prebuiltOrder } = options;
+    const { buildLOD, prebuiltTree, prebuiltOrder, priority = DEFAULT_CELL_PRIORITY } = options;
     if (typeof buildLOD !== 'boolean') {
       throw new TypeError('SpatialIndex buildLOD option must be a boolean.');
     }
@@ -171,22 +143,26 @@ export class SpatialIndex {
       if (prebuiltTree === undefined || prebuiltTree === null) {
         throw new TypeError('SpatialIndex prebuiltOrder requires the prebuilt tree it was computed with.');
       }
-      const banded = prebuiltOrder.bandCount === LOD_REDUCTION_FACTORS.length;
+      const banded = prebuiltOrder.levelBands instanceof Uint8Array;
       if (
         prebuiltOrder.pointCount !== pointCount ||
         !(prebuiltOrder.indices instanceof Uint32Array) ||
         prebuiltOrder.indices.length !== pointCount ||
-        (this._buildLOD ? !banded : prebuiltOrder.bandCount !== 1)
+        (this._buildLOD && !banded) ||
+        (!banded && prebuiltOrder.bandCount !== 1)
       ) {
         throw new TypeError(
-          `SpatialIndex prebuiltOrder must be the ${this._buildLOD ? 'LOD-banded' : 'one-band'} draw order of these ${formatCountOf(pointCount, 'point')}.`
+          `SpatialIndex prebuiltOrder must be the ${this._buildLOD ? 'LOD-banded' : 'banded or one-band'} draw order of these ${formatCountOf(pointCount, 'point')}.`
         );
       }
       this._publishDrawOrder(prebuiltOrder);
-      this.lodLevels = this._buildLOD ? this._levelsFromDrawOrder() : [];
+      // A banded order has levels whether or not they were asked for (the
+      // open cells were in priority order: banding cost nothing).
+      this._buildLOD = banded;
+      this.lodLevels = banded ? this._levelsFromDrawOrder() : [];
     } else if (this._buildLOD) {
       console.time('LOD generation');
-      this.lodLevels = this._generateLODLevels();
+      this.lodLevels = this._generateLODLevels(requireCellPriority(priority, pointCount));
       console.timeEnd('LOD generation');
     } else {
       this.lodLevels = [];
@@ -197,15 +173,17 @@ export class SpatialIndex {
    * Compute and publish the LOD-banded draw order, and return the levels.
    * @private
    */
-  _generateLODLevels() {
-    const hierarchy = buildHierarchicalOrder(this.positions, this.bounds, this.dimensionLevel);
-    this._publishDrawOrder(buildDrawOrder(
-      this.root,
-      this.dimensionLevel,
-      this.pointCount,
-      hierarchy,
-      lodPrefixCounts(this.pointCount)
-    ));
+  _generateLODLevels(priority) {
+    this._publishDrawOrder({
+      ...buildDrawOrder(
+        this.root,
+        this.dimensionLevel,
+        this.pointCount,
+        drawBands(this.pointCount),
+        priority.seed === null ? null : buildPriorityOrder(this.pointCount, priority)
+      ),
+      ranked: priority.seed === null,
+    });
     return this._levelsFromDrawOrder();
   }
 
@@ -216,10 +194,17 @@ export class SpatialIndex {
    */
   _publishDrawOrder(order) {
     this._lodMembershipOwner = null;
+    // Where the order holds the leaves' ids (3D) the tree lets its own go:
+    // the queries read them from the order (`forEachLeafRun`).
+    dropDerivableLeafIds(this.root, this.dimensionLevel);
     this.drawOrder = Object.freeze({
       indices: order.indices,
       bandCount: order.bandCount,
       bandEnds: order.bandEnds,
+      levelBands: order.levelBands ?? null,
+      // Whether band `b` holds the cells of open positions
+      // `[bandEnds[b - 1], bandEnds[b])` (`computeTreeDrawOrder`).
+      ranked: order.ranked === true,
       leafCount: order.leafCount,
       leafOffsets: order.leafOffsets,
       pointCount: order.pointCount,
@@ -234,12 +219,14 @@ export class SpatialIndex {
    * @private
    */
   _levelsFromDrawOrder() {
-    const levels = [];
     const totalPoints = this.pointCount;
     const drawOrder = this.drawOrder;
-    for (let levelIdx = 0; levelIdx < LOD_REDUCTION_FACTORS.length; levelIdx++) {
-      const factor = LOD_REDUCTION_FACTORS[levelIdx];
-      if (factor === 1) {
+    const bandEnds = drawOrder.bandEnds;
+    const levelBands = drawOrder.levelBands;
+    const levels = [];
+    for (let levelIdx = 0; levelIdx < levelBands.length; levelIdx++) {
+      const pointCount = bandEnds[levelBands[levelIdx]];
+      if (levelIdx === levelBands.length - 1) {
         levels.push({
           depth: levelIdx,
           pointCount: totalPoints,
@@ -250,7 +237,6 @@ export class SpatialIndex {
         });
         continue;
       }
-      const pointCount = drawOrder.bandEnds[levelIdx];
       levels.push({
         depth: levelIdx,
         pointCount,
@@ -258,38 +244,32 @@ export class SpatialIndex {
         indices: drawOrder.indices.subarray(0, pointCount),
         sizes: null,
         isFullDetail: false,
-        sizeMultiplier: Math.sqrt(factor) * 0.2 + 0.8
+        sizeMultiplier: lodSizeMultiplier(totalPoints, pointCount)
       });
     }
-
-    // The coarsest level adaptive selection may choose. Levels are ordered
-    // coarse-to-fine and their counts are non-decreasing, so the first level
-    // that meets the floor count is that bound. The floor count is the smaller
-    // of the absolute budget and the reduction cap, so it is satisfiable at
-    // every dataset size -- the full-detail level always holds `totalPoints`,
-    // which is above `totalPoints / ADAPTIVE_LOD_MAXIMUM_REDUCTION` -- and the
-    // loop therefore always terminates on a real level.
-    const adaptiveFloorCount = Math.min(
-      ADAPTIVE_LOD_POINT_BUDGET,
-      totalPoints / ADAPTIVE_LOD_MAXIMUM_REDUCTION
-    );
-    let adaptiveMinimumLevel = levels.length - 1;
-    for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
-      if (levels[levelIdx].pointCount >= adaptiveFloorCount) {
-        adaptiveMinimumLevel = levelIdx;
-        break;
-      }
-    }
-    this._adaptiveMinimumLevel = adaptiveMinimumLevel;
+    this._adaptiveMinimumLevel = adaptiveMinimumLevel(levels, totalPoints);
 
     const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
     const treeName = treeNames[this.dimensionLevel] || 'Octree';
-    console.log(`[${treeName}] Generated ${levels.length} LOD levels (dim=${this.dimensionLevel}):`,
-      levels.map(l => `${formatCount(l.pointCount)} pts`).join(', '),
-      `| adaptive floor: level ${adaptiveMinimumLevel} `
-      + `(${formatCount(levels[adaptiveMinimumLevel].pointCount)} pts)`);
+    console.log(`[${treeName}] Generated ${levels.length} LOD levels in ${drawOrder.bandCount} bands (dim=${this.dimensionLevel}): `
+      + `${formatCount(levels[0].pointCount)} to ${formatCount(totalPoints)} pts`
+      + ` | adaptive floor: level ${this._adaptiveMinimumLevel} `
+      + `(${formatCount(levels[this._adaptiveMinimumLevel].pointCount)} pts)`);
 
     return levels;
+  }
+
+  /**
+   * The last band a level draws (its prefix ends there); the last band for
+   * full detail.
+   *
+   * @param {number} lodLevel - A level, or -1 for full detail.
+   * @returns {number}
+   */
+  lastBandOf(lodLevel) {
+    const order = this.drawOrder;
+    if (lodLevel < 0 || order.levelBands === null) return order.bandCount - 1;
+    return order.levelBands[lodLevel];
   }
 
   /**
@@ -627,66 +607,10 @@ export class SpatialIndex {
    */
   getLODLevel(distance, previousLevel, dimensionLevel, overrideBounds = null) {
     if (this.lodLevels.length === 0) return -1;
-
-    const validDimLevel = requireDimensionLevel(
-      dimensionLevel,
-      'SpatialIndex LOD dimensionLevel'
+    return selectLodLevel(
+      this.lodLevels, this._adaptiveMinimumLevel, overrideBounds || this.bounds,
+      distance, previousLevel, dimensionLevel
     );
-
-    const numLevels = this.lodLevels.length;
-
-    // Calculate data diagonal size for scale-independent LOD selection
-    // Use override bounds if provided (for view-specific positions), otherwise use the tree's bounds
-    const bounds = overrideBounds || this.bounds;
-    const dx = bounds.maxX - bounds.minX;
-    const dy = bounds.maxY - bounds.minY;
-    const dz = bounds.maxZ - bounds.minZ;
-    // For lower dimensions, use only the significant extents (data may be along any axis)
-    // Sort extents to find the largest ones regardless of which axis they're on
-    let dataSize;
-    if (validDimLevel === 1) {
-      // 1D: use the largest extent (data could be along X, Y, or Z)
-      dataSize = Math.max(dx, dy, dz) || 1;
-	    } else if (validDimLevel === 2) {
-	      // 2D: use the two largest extents (handles XY, XZ, or YZ planes)
-	      // Avoid allocation/sort in a hot helper (used when adaptive LOD is enabled).
-	      const maxExtent = Math.max(dx, dy, dz);
-	      const minExtent = Math.min(dx, dy, dz);
-	      const midExtent = dx + dy + dz - maxExtent - minExtent;
-	      dataSize = Math.sqrt(maxExtent * maxExtent + midExtent * midExtent) || 1;
-	    } else {
-	      dataSize = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;  // 3D+: full diagonal
-	    }
-
-    // Normalize distance relative to data size
-    const distanceRatio = distance / dataSize;
-
-    // Map distance ratio to LOD level
-    const minRatio = 0.3;
-    const maxRatio = 3.0;
-    const clampedRatio = Math.max(minRatio, Math.min(maxRatio, distanceRatio));
-
-    const t = 1.0 - (Math.log(clampedRatio / minRatio) / Math.log(maxRatio / minRatio));
-    const targetLevel = t * (numLevels - 1);
-
-    // Apply hysteresis with large dead zone to prevent oscillation
-    const HYSTERESIS = 0.7;
-
-    // Use passed previousLevel for per-view hysteresis (instead of global state)
-    const currentLevel = previousLevel >= 0 ? previousLevel : Math.round(targetLevel);
-    let newLevel = currentLevel;
-
-    if (targetLevel > currentLevel + HYSTERESIS && currentLevel < numLevels - 1) {
-      newLevel = currentLevel + 1;
-    } else if (targetLevel < currentLevel - HYSTERESIS && currentLevel > 0) {
-      newLevel = currentLevel - 1;
-    }
-
-    const floorLevel = Math.min(
-      numLevels - 1,
-      Math.max(0, this._adaptiveMinimumLevel)
-    );
-    return Math.max(floorLevel, Math.min(numLevels - 1, newLevel));
   }
 
   _boundsIntersectsSphere(bounds, center, radius) {
@@ -731,11 +655,11 @@ export class SpatialIndex {
       ) {
         continue;
       }
-      if (node.indices) {
-        for (let index = 0; index < node.indices.length; index++) {
-          visitor(node.indices[index]);
-        }
-      } else if (node.children) {
+      if (node.children === null) {
+        forEachLeafRun(node, this.drawOrder, (ids, start, end) => {
+          for (let index = start; index < end; index++) visitor(ids[index]);
+        });
+      } else {
         for (let index = 0; index < node.children.length; index++) {
           const child = node.children[index];
           if (child) stack.push(child);
@@ -873,11 +797,11 @@ export class SpatialIndex {
       ) {
         continue;
       }
-      if (node.indices) {
-        for (let index = 0; index < node.indices.length; index++) {
-          visitor(node.indices[index]);
-        }
-      } else if (node.children) {
+      if (node.children === null) {
+        forEachLeafRun(node, this.drawOrder, (ids, start, end) => {
+          for (let index = start; index < end; index++) visitor(ids[index]);
+        });
+      } else {
         for (let index = 0; index < node.children.length; index++) {
           const child = node.children[index];
           if (child) stack.push(child);
@@ -898,22 +822,25 @@ export class SpatialIndex {
       if (!node) continue;
       if (!this._boundsIntersectsSphere(node.bounds, center, radius)) continue;
 
-      if (node.indices) {
-        for (let i = 0; i < node.indices.length && results.length < maxResults; i++) {
-          const idx = node.indices[i];
-          const base = idx * stride;
-          const px = this.positions[base];
-          const py = stride > 1 ? this.positions[base + 1] : 0;
-          const pz = stride > 2 ? this.positions[base + 2] : 0;
-          const dx = px - center[0];
-          const dy = py - center[1];
-          const dz = pz - center[2];
-          const dist2 = dx * dx + dy * dy + dz * dz;
-          if (dist2 <= r2) {
-            results.push(idx);
+      if (node.children === null) {
+        forEachLeafRun(node, this.drawOrder, (ids, start, end) => {
+          for (let i = start; i < end && results.length < maxResults; i++) {
+            const idx = ids[i];
+            const base = idx * stride;
+            const px = this.positions[base];
+            const py = stride > 1 ? this.positions[base + 1] : 0;
+            const pz = stride > 2 ? this.positions[base + 2] : 0;
+            const dx = px - center[0];
+            const dy = py - center[1];
+            const dz = pz - center[2];
+            const dist2 = dx * dx + dy * dy + dz * dz;
+            if (dist2 <= r2) {
+              results.push(idx);
+            }
           }
-        }
-      } else if (node.children) {
+          return results.length >= maxResults;
+        });
+      } else {
         for (const child of node.children) {
           if (child) stack.push(child);
         }
@@ -1019,9 +946,12 @@ export class SpatialIndex {
     let count = 0;
     const countLeaves = (node) => {
       if (!node) return;
-      if (node.indices) {
-        count += node.indices.length;
-      } else if (node.children) {
+      if (node.children === null) {
+        // A leaf whose ids the draw order holds counts its own: the order
+        // placed exactly its points in each band when it was built
+        // (`buildDrawOrder`), and walking its runs would cost a pass per band.
+        count += node.indices === null ? node.pointCount : node.indices.length;
+      } else {
         for (const child of node.children) {
           countLeaves(child);
         }
@@ -1037,4 +967,3 @@ export class SpatialIndex {
   }
 }
 
-export { ADAPTIVE_LOD_MAXIMUM_REDUCTION, ADAPTIVE_LOD_POINT_BUDGET };

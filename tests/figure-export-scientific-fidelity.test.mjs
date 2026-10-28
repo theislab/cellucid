@@ -1102,3 +1102,33 @@ test('SVG text from the data cannot carry characters XML forbids', async () => {
     assert.match(source, /escapeXml\(/, file);
   }
 });
+
+test('a figure of a subsample says so: its cells, the dataset\'s, how they were chosen', async () => {
+  const views = [
+    gridView({
+      id: 'live',
+      label: 'Live',
+      fieldKey: 'leiden',
+      fieldKind: 'category',
+      legendModel: clusterModel(),
+      filters: ['No filters active'],
+    }),
+  ];
+  const payload = gridPayload(views);
+  payload.meta.datasetCells = { open: 228245, of: 2282447, method: 'uniform, seed 0', digest: '3f2a00c1d2e3f405' };
+  const svg = await (await renderFigureToSvgBlob({ payload })).text();
+  assert.equal(
+    svgDescription(svg),
+    'Views: Live (Field: leiden; Filters: none) • Cells: a subsample, 228,245 of 2,282,447 '
+      + '(uniform, seed 0; cell set 3f2a00c1d2e3f405) • Source: /data/suo'
+  );
+  assert.deepEqual(svgProvenanceJson(svg).dataset.cells,
+    { open: 228245, of: 2282447, method: 'uniform, seed 0', digest: '3f2a00c1d2e3f405' });
+  // Every cell open: no claim, and the record says null.
+  delete payload.meta.datasetCells;
+  const whole = await (await renderFigureToSvgBlob({ payload })).text();
+  assert.equal(svgProvenanceJson(whole).dataset.cells, null);
+  assert.doesNotMatch(svgDescription(whole), /Cells:/);
+  payload.meta.datasetCells = { open: 5, of: 5, method: 'uniform, seed 0', digest: 'x' };
+  await assert.rejects(renderFigureToSvgBlob({ payload }), /describe a subsample/);
+});

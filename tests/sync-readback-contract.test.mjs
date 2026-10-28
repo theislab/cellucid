@@ -21,10 +21,11 @@ function method(name) {
 
 test('writes into accepted storage read no WebGL error back', () => {
   for (const name of [
-    '_uploadAlphaRegions',
+    '_writeAlphaRegions',
     '_publishLiveColors',
     '_writeOrderedColors',
-    '_createDrawOrderRecord',
+    '_createStoreOrderMap',
+    '_writeStoreOrderMap',
     '_withNeutralTextureUnpackState',
   ]) {
     const body = method(name);

@@ -1346,4 +1346,83 @@ export class FieldOverlayPublicMethods {
     );
     return { fieldIndex: newFieldIndex, key, updatedInPlace: false };
   }
+
+  /**
+   * Add a continuous obs field holding its own values -- a column a notebook
+   * pushed -- or replace the values of the one it pushed before under the
+   * same key. A field of that key the notebook did not push is never
+   * replaced: the push is refused instead.
+   *
+   * @param {{key: string, values: Float32Array, operation: {type: string}}} options
+   *   `values`: one per open cell, NaN where a cell has none
+   * @returns {{fieldIndex: number, fieldId: string, key: string, updatedInPlace: boolean}}
+   */
+  upsertUserDefinedContinuousField(options) {
+    requireExactOptions(
+      options,
+      new Set(['key', 'values', 'operation']),
+      'User-defined continuous upsert options'
+    );
+    const { key, values, operation } = options;
+    StateValidator.validateFieldKey(key);
+    requireObjectRecord(operation, 'User-defined continuous operation');
+    const registry = requireUserDefinedOwner(this);
+    const fields = requireInventory(this, FieldSource.OBS);
+    const existingIndex = fields.findIndex(
+      field => field._isDeleted !== true && field.key === key
+    );
+    if (existingIndex >= 0) {
+      const existing = fields[existingIndex];
+      if (
+        existing.kind !== FieldKind.CONTINUOUS
+        || existing._isUserDefined !== true
+        || existing._sourceField !== null
+        || existing._operation?.type !== operation.type
+      ) {
+        throw new Error(
+          `A field named "${key}" exists already; push the column under another key`
+        );
+      }
+      const fieldId = requireIdentifier(existing._userDefinedId, 'User-defined continuous target id');
+      registry.replaceStoredValues(fieldId, values, this);
+      // Every copy of the field (the live inventory and each snapshot view's)
+      // takes the new values; what was derived from the old ones is dropped.
+      const copies = [existing];
+      if (this.viewContexts instanceof Map) {
+        for (const context of this.viewContexts.values()) {
+          for (const field of context?.obsData?.fields ?? []) {
+            if (field !== existing && field?._userDefinedId === fieldId) copies.push(field);
+          }
+        }
+      }
+      // A filter on the old values goes with them: the cells it hid are
+      // shown again.
+      const filtered = copies.some(copy => copy._continuousFilter !== undefined);
+      for (const copy of copies) {
+        copy.values = values;
+        copy.loaded = true;
+        for (const derived of ['_continuousStats', '_continuousFilter', '_continuousColorRange', '_positiveStats', 'outlierQuantiles']) {
+          delete copy[derived];
+        }
+      }
+      const cacheKey = existing._originalKey || existing.key;
+      this._fieldDataCache.set(cacheKey, { values });
+      getFieldRegistry().invalidate();
+      if (this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === existingIndex) {
+        this.setActiveField(existingIndex);
+      } else if (filtered) {
+        this.computeGlobalVisibility();
+      }
+      this._notifyFieldChange(FieldSource.OBS, existingIndex, ChangeType.UPDATE, { operation: 'upsert-user-defined' });
+      return { fieldIndex: existingIndex, fieldId, key, updatedInPlace: true };
+    }
+    const created = registry.createStoredContinuous({ key, values, operation }, this);
+    const createdId = requireIdentifier(created.id, 'User-defined continuous creation id');
+    fields.push(created.field);
+    const newFieldIndex = fields.length - 1;
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: createdId });
+    return { fieldIndex: newFieldIndex, fieldId: createdId, key, updatedInPlace: false };
+  }
 }

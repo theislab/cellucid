@@ -9,6 +9,7 @@
 
 import { NA_INTEGER, hostValues } from '../../../formats/rds/index.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 /** An S4 slot holding `NULL` is stored as this symbol. */
 const NULL_SLOT = '\u0001NULL\u0001';
@@ -94,7 +95,7 @@ export async function vectorValues(node, { readRegion }) {
   if (node.values !== null && node.values !== undefined && ArrayBuffer.isView(node.values)) return node.values;
   if (node.sequence) {
     const { start, step } = node.sequence;
-    const values = node.kind === 'integer' ? new Int32Array(node.length) : new Float64Array(node.length);
+    const values = allocateTypedArray(node.kind === 'integer' ? Int32Array : Float64Array, node.length, 'An R sequence');
     for (let i = 0; i < node.length; i++) values[i] = start + i * step;
     return values;
   }
@@ -127,7 +128,7 @@ export async function vectorSlice(node, start, count, { readRegion }) {
   }
   if (node.sequence) {
     const { step } = node.sequence;
-    const values = node.kind === 'integer' ? new Int32Array(count) : new Float64Array(count);
+    const values = allocateTypedArray(node.kind === 'integer' ? Int32Array : Float64Array, count, 'An R sequence');
     for (let i = 0; i < count; i++) values[i] = node.sequence.start + (start + i) * step;
     return values;
   }
@@ -157,7 +158,7 @@ export function writable(node) {
   if (node.values !== null && node.values !== undefined) return { values: node.values, length: node.length };
   if (node.sequence) {
     const { start, step } = node.sequence;
-    const values = node.kind === 'integer' ? new Int32Array(node.length) : new Float64Array(node.length);
+    const values = allocateTypedArray(node.kind === 'integer' ? Int32Array : Float64Array, node.length, 'An R sequence');
     for (let i = 0; i < node.length; i++) values[i] = start + i * step;
     return { values, length: node.length };
   }
@@ -203,9 +204,7 @@ export async function rowCountOf(frame, context) {
 
 /** The smallest signed code type that holds `count` categories (and -1). */
 function codesOf(count, length) {
-  if (count < 128) return new Int8Array(length);
-  if (count < 32768) return new Int16Array(length);
-  return new Int32Array(length);
+  return allocateTypedArray(count < 128 ? Int8Array : count < 32768 ? Int16Array : Int32Array, length, 'Category codes');
 }
 
 /**
@@ -251,8 +250,8 @@ export async function columnOf(node, rows, context) {
     }
     case 'logical': {
       const values = await vectorValues(node, context);
-      const bytes = new Uint8Array(rows);
-      const mask = new Uint8Array(rows);
+      const bytes = allocateTypedArray(Uint8Array, rows, 'A logical column');
+      const mask = allocateTypedArray(Uint8Array, rows, 'A logical column mask');
       let missing = false;
       for (let i = 0; i < rows; i++) {
         if (values[i] === NA_INTEGER) {
@@ -269,8 +268,9 @@ export async function columnOf(node, rows, context) {
       let missing = false;
       for (let i = 0; i < rows && !missing; i++) missing = values[i] === NA_INTEGER;
       if (!missing) return { kind: 'numbers', values };
-      const copy = new Int32Array(values);
-      const mask = new Uint8Array(rows);
+      const copy = allocateTypedArray(Int32Array, values.length, 'An integer column');
+      copy.set(values);
+      const mask = allocateTypedArray(Uint8Array, rows, 'An integer column mask');
       for (let i = 0; i < rows; i++) {
         if (copy[i] === NA_INTEGER) {
           mask[i] = 1;
@@ -283,7 +283,7 @@ export async function columnOf(node, rows, context) {
       if (hasClass(node, 'integer64')) {
         const values = await vectorValues(node, context);
         const words = new BigInt64Array(values.buffer, values.byteOffset, rows);
-        const out = new Float64Array(rows);
+        const out = allocateTypedArray(Float64Array, rows, 'An integer64 column');
         for (let i = 0; i < rows; i++) out[i] = words[i] === -(2n ** 63n) ? NaN : Number(words[i]);
         return { kind: 'numbers', values: out, note: 'integer64 read as float64' };
       }
@@ -305,7 +305,7 @@ function expandRuns(valuesNode, lengths, values) {
     for (let i = 0, o = 0; i < lengths.length; i++) for (let k = 0; k < lengths[i]; k++) out[o++] = source[i];
     return { ...valuesNode, length: total, values: out };
   }
-  const out = new values.constructor(total);
+  const out = allocateTypedArray(values.constructor, total, 'An Rle vector');
   for (let i = 0, o = 0; i < lengths.length; i++) {
     out.fill(values[i], o, o + lengths[i]);
     o += lengths[i];

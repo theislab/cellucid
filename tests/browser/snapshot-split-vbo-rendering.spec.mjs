@@ -110,15 +110,20 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
     // A 2D embedding: two position components per point.
     const positions = new Float32Array(pointCount * 2);
     const colors = new Uint8Array(pointCount * 4);
+    // The snapshots' transparency (0 or 1 a cell). The live reference reads
+    // alpha from the RGBA attribute, so its alpha byte is the R8 byte the
+    // snapshots' texture holds for the same cell.
+    const transparency = new Uint8Array(pointCount);
     for (let index = 0; index < pointCount; index++) {
       positions[index * 2] =
         (((index % side) + 0.5) / side) * 2 - 1;
       positions[index * 2 + 1] =
         ((Math.floor(index / side) + 0.5) / side) * 2 - 1;
+      transparency[index] = index % 7 === 3 ? 0 : 1;
       colors[index * 4] = index & 0xff;
       colors[index * 4 + 1] = (index >>> 3) & 0xff;
       colors[index * 4 + 2] = (index >>> 7) & 0xff;
-      colors[index * 4 + 3] = 32 + (index % 224);
+      colors[index * 4 + 3] = transparency[index] * 255;
     }
 
     const renderer = new HighPerfRenderer(gl, {
@@ -136,7 +141,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
     renderer.createSnapshotBuffer(
       'split-a',
       colors,
-      null,
+      transparency,
       positions,
       2,
       'live',
@@ -145,7 +150,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
     renderer.createSnapshotBuffer(
       'split-b',
       colors,
-      null,
+      transparency,
       positions,
       2,
       'live',
@@ -237,8 +242,8 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
       if (uniforms.u_lodIndexTex !== null) {
         gl.uniform1i(uniforms.u_lodIndexTex, 1);
       }
-      if (uniforms.u_useLodIndexTex !== null) {
-        gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+      if (uniforms.u_orderedSlots !== null) {
+        gl.uniform1i(uniforms.u_orderedSlots, 0);
       }
     };
 
@@ -313,12 +318,12 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
       };
     };
     const fullPixels = comparePixels(
-      render(configureLiveRgba, renderer.vao, false),
-      render(configureSplitRgbaR8, first.vao, false),
+      render(configureLiveRgba, renderer.vao.vaos[0], false),
+      render(configureSplitRgbaR8, first.vao.vaos[0], false),
     );
     const indexedPixels = comparePixels(
-      render(configureLiveRgba, renderer.vao, true),
-      render(configureSplitRgbaR8, first.vao, true),
+      render(configureLiveRgba, renderer.vao.vaos[0], true),
+      render(configureSplitRgbaR8, first.vao.vaos[0], true),
     );
 
     // Preserve the original 32-draw timing sample while keeping each
@@ -364,10 +369,10 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
     // Compile, allocate, and warm both production shader paths before paired
     // measurement. The reference path uses baked RGBA; the split path performs
     // the snapshot-owned R8 texel fetch used by production rendering.
-    await measure(configureLiveRgba, renderer.vao, false);
-    await measure(configureSplitRgbaR8, first.vao, false);
-    await measure(configureLiveRgba, renderer.vao, true);
-    await measure(configureSplitRgbaR8, first.vao, true);
+    await measure(configureLiveRgba, renderer.vao.vaos[0], false);
+    await measure(configureSplitRgbaR8, first.vao.vaos[0], false);
+    await measure(configureLiveRgba, renderer.vao.vaos[0], true);
+    await measure(configureSplitRgbaR8, first.vao.vaos[0], true);
     const timings = {
       fullLive: [],
       fullSplit: [],
@@ -380,25 +385,25 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
             [
               'fullLive',
               configureLiveRgba,
-              renderer.vao,
+              renderer.vao.vaos[0],
               false,
             ],
             [
               'fullSplit',
               configureSplitRgbaR8,
-              first.vao,
+              first.vao.vaos[0],
               false,
             ],
             [
               'indexedLive',
               configureLiveRgba,
-              renderer.vao,
+              renderer.vao.vaos[0],
               true,
             ],
             [
               'indexedSplit',
               configureSplitRgbaR8,
-              first.vao,
+              first.vao.vaos[0],
               true,
             ],
           ]
@@ -406,25 +411,25 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
             [
               'fullSplit',
               configureSplitRgbaR8,
-              first.vao,
+              first.vao.vaos[0],
               false,
             ],
             [
               'fullLive',
               configureLiveRgba,
-              renderer.vao,
+              renderer.vao.vaos[0],
               false,
             ],
             [
               'indexedSplit',
               configureSplitRgbaR8,
-              first.vao,
+              first.vao.vaos[0],
               true,
             ],
             [
               'indexedLive',
               configureLiveRgba,
-              renderer.vao,
+              renderer.vao.vaos[0],
               true,
             ],
           ];
@@ -515,25 +520,25 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
               [
                 'fullLive',
                 configureLiveRgba,
-                renderer.vao,
+                renderer.vao.vaos[0],
                 false,
               ],
               [
                 'fullSplit',
                 configureSplitRgbaR8,
-                first.vao,
+                first.vao.vaos[0],
                 false,
               ],
               [
                 'indexedLive',
                 configureLiveRgba,
-                renderer.vao,
+                renderer.vao.vaos[0],
                 true,
               ],
               [
                 'indexedSplit',
                 configureSplitRgbaR8,
-                first.vao,
+                first.vao.vaos[0],
                 true,
               ],
             ]
@@ -541,25 +546,25 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
               [
                 'fullSplit',
                 configureSplitRgbaR8,
-                first.vao,
+                first.vao.vaos[0],
                 false,
               ],
               [
                 'fullLive',
                 configureLiveRgba,
-                renderer.vao,
+                renderer.vao.vaos[0],
                 false,
               ],
               [
                 'indexedSplit',
                 configureSplitRgbaR8,
-                first.vao,
+                first.vao.vaos[0],
                 true,
               ],
               [
                 'indexedLive',
                 configureLiveRgba,
-                renderer.vao,
+                renderer.vao.vaos[0],
                 true,
               ],
             ];
@@ -597,23 +602,24 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
       }
       return attribute;
     };
+    // Segmented vertex arrays (point-store-segments.js): one segment here.
     const splitPositionAttribute = requireTrackedAttribute(
-      first.vao,
+      first.vao.vaos[0],
       0,
       'Split snapshot',
     );
     const splitColorAttribute = requireTrackedAttribute(
-      first.vao,
+      first.vao.vaos[0],
       1,
       'Split snapshot',
     );
     const livePositionAttribute = requireTrackedAttribute(
-      renderer.vao,
+      renderer.vao.vaos[0],
       0,
       'Live full-detail',
     );
     const liveColorAttribute = requireTrackedAttribute(
-      renderer.vao,
+      renderer.vao.vaos[0],
       1,
       'Live full-detail',
     );
@@ -631,7 +637,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
 
     // Leave the production split full-detail image on the headed canvas for
     // the test artifact, then release every benchmark owner afterward.
-    render(configureSplitRgbaR8, first.vao, false);
+    render(configureSplitRgbaR8, first.vao.vaos[0], false);
     window.__disposeSnapshotSplitBenchmark = () => {
       gl.deleteBuffer(indexBuffer);
       renderer.dispose();
@@ -673,12 +679,13 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
         refCount: geometry.refCount,
       },
       snapshotAlpha: {
-        bytesMatchBakedRgba: first.alphaTexData
-          .subarray(0, pointCount)
-          .every(
-            (alpha, index) =>
-              alpha === colors[index * 4 + 3],
-          ),
+        // The texture holds the published transparency, kept by
+        // reference: no CPU copy of either view's R8 image.
+        transparencyByReference:
+          first.alphas === transparency &&
+          second.alphas === transparency &&
+          !Object.hasOwn(first, 'alphaTexData') &&
+          !Object.hasOwn(renderer, '_snapshotAlphaStagingData'),
         byteLength: first.alphaTextureByteLength,
         distinctOwners:
           first.alphaTexture !== second.alphaTexture,
@@ -689,8 +696,8 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
         trackedPointerCallCount: pointerCallCount,
         liveStreamsAreSeparate:
           livePositionAttribute.buffer ===
-            renderer.buffers.positions &&
-          liveColorAttribute.buffer === renderer.buffers.colors &&
+            renderer.buffers.positions.segments[0].buffer &&
+          liveColorAttribute.buffer === renderer.buffers.colors.segments[0].buffer &&
           livePositionAttribute.buffer !== liveColorAttribute.buffer,
         livePosition: {
           normalized: livePositionAttribute.normalized,
@@ -709,12 +716,12 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
             liveColorAttribute.type === gl.UNSIGNED_BYTE,
         },
         splitPositionIsPooled:
-          splitPositionAttribute.buffer === geometry.positionBuffer,
+          splitPositionAttribute.buffer === geometry.positionBuffer.segments[0].buffer,
         // A snapshot of the live generation draws the live position store.
         splitPositionIsLive:
-          splitPositionAttribute.buffer === renderer.buffers.positions,
+          splitPositionAttribute.buffer === renderer.buffers.positions.segments[0].buffer,
         splitColorIsPerSnapshot:
-          splitColorAttribute.buffer === first.buffer,
+          splitColorAttribute.buffer === first.buffer.segments[0].buffer,
         sameGenerationPositionShared:
           geometry.positionBuffer !== null &&
           first.geometryGeneration === second.geometryGeneration,
@@ -767,7 +774,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
   expect(result.generation.second).toBe(result.generation.live);
   expect(result.generation.refCount).toBe(2);
   expect(result.snapshotAlpha).toEqual({
-    bytesMatchBakedRgba: true,
+    transparencyByReference: true,
     byteLength: result.snapshotAlpha.expectedByteLength,
     distinctOwners: true,
     expectedByteLength: result.snapshotAlpha.expectedByteLength,

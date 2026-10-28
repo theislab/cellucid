@@ -48,8 +48,9 @@ import { isPlainRecord } from '../utils/exact-record.js';
 
 /**
  * The WebSocket address of the channel of the server at `serverUrl`: the same
- * host and path prefix as the page's server, so a notebook proxy that carries
- * the server carries the channel.
+ * host and path prefix as the page's server, so a reverse proxy that carries
+ * the server carries the channel. (A notebook widget's page reaches its host
+ * over the kernel instead: `data/viewer-embed.js`.)
  *
  * @param {string} serverUrl - Exact http(s) base URL without trailing slash
  * @param {string} [channelPath]
@@ -88,6 +89,7 @@ export class ViewerChannel {
    *   channelPath?: string,
    *   onCommand: (command: Object) => void,
    *   onEnd: (end: ViewerChannelEnd) => void,
+   *   onReopen?: () => void,
    *   isHostAlive: () => Promise<boolean>,
    *   WebSocketImpl?: typeof WebSocket,
    * }} options
@@ -101,6 +103,9 @@ export class ViewerChannel {
     });
     this._onCommand = options.onCommand;
     this._onEnd = options.onEnd;
+    // After a dropped socket was reopened and what waited was sent: the
+    // viewer sends the host everything again (its results snapshot).
+    this._onReopen = options.onReopen ?? (() => {});
     this._isHostAlive = options.isHostAlive;
     this._WebSocket = options.WebSocketImpl ?? globalThis.WebSocket;
     /** @type {WebSocket|null} */
@@ -242,6 +247,11 @@ export class ViewerChannel {
         return;
       }
       this._adopt(socket);
+      try {
+        this._onReopen();
+      } catch (error) {
+        console.error('[ViewerChannel] reopen handler failed:', error);
+      }
     } catch (error) {
       if (this.state !== 'reconnecting') return;
       const explained = await this._explainFailure(error, true);
@@ -275,8 +285,8 @@ export class ViewerChannel {
         kind = 'unreachable';
         message =
           `The notebook or R session is running, but this viewer cannot open its channel (${this._url}). ` +
-          'A proxy between this page and the host must pass WebSockets ' +
-          '(jupyter-server-proxy does; check its configuration and any reverse proxy in front of it).';
+          'Something between this page and the host does not pass WebSockets: a reverse proxy or firewall ' +
+          'in front of the host. (A notebook widget needs none: its channel runs over the kernel.)';
       } else {
         kind = 'stopped';
         message = 'The notebook or R session that opened this viewer stopped (its server no longer answers). ' +

@@ -18,6 +18,7 @@ import { Cursor } from './binary.js';
 import { hasValidChecksum } from './checksum.js';
 import { formatError } from './errors.js';
 import { ByteBudget, ByteCache } from './lru.js';
+import { SharedWorks } from '../io/abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 const MiB = 1024 * 1024;
@@ -40,7 +41,7 @@ function readOptions(cache, signal, activity) {
 export class FileContext {
   /**
    * @param {import('../io/byte-reader.js').ByteReader} reader
-   * @param {{decodedChunkCacheBytes?: number, verifyChecksums?: boolean}} [options]
+   * @param {{decodedChunkCacheBytes?: number|import('../io/decoded-budget.js').DecodedBudget, verifyChecksums?: boolean}} [options]
    */
   constructor(reader, { decodedChunkCacheBytes = 64 * MiB, verifyChecksums = true } = {}) {
     this.reader = reader;
@@ -54,8 +55,12 @@ export class FileContext {
     this.btreeK = { groupLeaf: 4, groupInternal: 16, chunk: 32 };
     /** Decoded chunks and parsed global heap collections, by key. */
     this.cache = new ByteCache(decodedChunkCacheBytes);
-    /** Parsed object headers and other shared metadata, by key. */
-    this.memo = new Map();
+    /**
+     * Loads of shared metadata in progress (global heap collections), by
+     * key: one load however many reads ask, stopped only once every one of
+     * them withdrew (`SharedWorks`).
+     */
+    this.loading = new SharedWorks();
     /** Chunk fetch-and-decodes in progress, shared by concurrent reads. */
     this.inflight = new Map();
     /**
@@ -89,6 +94,8 @@ export class FileContext {
     this.closed = false;
     /** The file itself, under no read's activity (`withActivity`). */
     this.unscoped = this;
+    /** Reads made through the file itself are not background work. */
+    this.background = false;
   }
 
   /**
@@ -117,6 +124,8 @@ export class FileContext {
     scoped.metaUpTo = (address, length, what, signal = null) => file.metaUpTo(address, length, what, signal, activity);
     scoped.data = (address, length, what, signal = null) => file.data(address, length, what, signal, activity);
     scoped.dataUpTo = (address, length, what, signal = null) => file.dataUpTo(address, length, what, signal, activity);
+    /** Whether the reads made through this view are background work. */
+    scoped.background = activity.background === true;
     return scoped;
   }
 
@@ -200,20 +209,6 @@ export class FileContext {
     if (this.verifyChecksums && !hasValidChecksum(bytes)) {
       throw formatError(what, this.base + address, 'its checksum does not match; the file is corrupt');
     }
-  }
-
-  /** Memoize an async load by key (one load per structure, however many ask). */
-  once(key, load) {
-    let promise = this.memo.get(key);
-    if (promise === undefined) {
-      promise = load();
-      this.memo.set(key, promise);
-      // A failed or aborted load may be asked for again.
-      promise.catch(() => {
-        if (this.memo.get(key) === promise) this.memo.delete(key);
-      });
-    }
-    return promise;
   }
 }
 

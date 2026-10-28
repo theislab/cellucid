@@ -9,13 +9,17 @@
  *
  * This worker hosts the exact same generators. Nothing about the data changes;
  * only the thread it is built on does. The result crosses back as transferred
- * buffers, so the payload is moved rather than copied.
+ * buffers, so the payload is moved rather than copied; an array larger than
+ * the engine's `ArrayBuffer` cap (held in a WebAssembly memory,
+ * `utils/large-arrays.js`) is posted first in pieces, `{requestId, piece}`,
+ * and assembled on the page.
  *
  * @module app/ui/modules/benchmark/generation-worker
  */
 
 import { SyntheticDataGenerator } from '../../../../dev/benchmark.js';
 import { assertGenerationRequest } from './generation-contract.js';
+import { PieceSender, canTransfer, placeArrays } from '../../../../utils/large-arrays.js';
 
 const GENERATORS = Object.freeze({
   atlas: (count) => SyntheticDataGenerator.atlasLike(count),
@@ -51,16 +55,23 @@ self.addEventListener('message', async event => {
       request.sourceUrl
     );
     const elapsedMs = performance.now() - startedAt;
+    const sender = new PieceSender((piece, transfer) =>
+      self.postMessage({ requestId: request.requestId, piece }, transfer)
+    );
+    const arrays = placeArrays(
+      { positions: data.positions, colors: data.colors },
+      view => sender.send(view)
+    );
     self.postMessage(
       {
         requestId: request.requestId,
         ok: true,
-        positions: data.positions,
-        colors: data.colors,
+        positions: arrays.positions,
+        colors: arrays.colors,
         dimensionLevel: data.dimensionLevel,
         elapsedMs
       },
-      [data.positions.buffer, data.colors.buffer]
+      [data.positions, data.colors].filter(canTransfer).map(view => view.buffer)
     );
   } catch (error) {
     self.postMessage({

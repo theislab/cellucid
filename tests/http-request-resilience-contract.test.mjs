@@ -20,6 +20,7 @@ import {
   ByteSourceError,
   REMOTE_POLICY,
   RETRY_DELAYS_MS,
+  retryDelayMs,
   fetchOnce,
   httpByteSource,
   withRetries,
@@ -350,7 +351,8 @@ test('a failure that repeats exactly, or a host that never answers this site, is
     return true;
   });
   assert.equal(failing.log.length, 2);
-  assert.equal(time.now() - started, RETRY_DELAYS_MS[0], 'reported after one short wait');
+  const waited = time.now() - started;
+  assert.ok(waited >= RETRY_DELAYS_MS[0] && waited < 1.5 * RETRY_DELAYS_MS[0], `reported after one short wait (${waited} ms)`);
 
   // No answer at all (CORS refused): asked once more, then reported.
   let corsAsked = 0;
@@ -391,4 +393,36 @@ test('the signs of a host that will answer later are asked again for the whole s
   const other500 = failure(BYTE_SOURCE_FAILURES.UNAVAILABLE, { status: 500, retryAfter: null, signature: '500:90' });
   assert.equal(worthAskingAgain(other500, [first500]), true, 'a different answer may change again');
   assert.equal(worthAskingAgain(first500, [first500]), false, 'the same answer twice is reported');
+  // A host or gateway that says it is busy keeps the whole schedule, however
+  // alike its answers (S3's 503 SlowDown: the same body, no Retry-After).
+  for (const status of [429, 502, 503, 504]) {
+    const busy = failure(status === 429 ? BYTE_SOURCE_FAILURES.RATE_LIMITED : BYTE_SOURCE_FAILURES.UNAVAILABLE,
+      { status, retryAfter: null, signature: `${status}:120` });
+    assert.equal(worthAskingAgain(busy, [busy, busy, busy]), true, `HTTP ${status}`);
+  }
+});
+
+test('S3 answering 503 SlowDown is asked again with growing, spread waits and read once it answers; the link runs fewer requests at once meanwhile', async () => {
+  const body = '<?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>';
+  const bytes = new Uint8Array(1000).map((_, i) => i & 255);
+  let asked = 0;
+  const fetch = async (url, init) => {
+    asked++;
+    if (asked <= 4) return new Response(body, { status: 503, headers: { 'Content-Length': String(body.length) } });
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    return new Response(bytes.slice(Number(start), Number(end) + 1), { status: 206 });
+  };
+  const { time, link } = virtualLink();
+  const source = httpByteSource({ url: 'https://bucket.s3.us-west-2.amazonaws.com/x.h5ad', size: 1000 }, { fetch });
+  link.concurrency = 24;
+  const started = time.now();
+  assert.deepEqual(await source.read(0, 10, { link }), bytes.subarray(0, 10));
+  assert.equal(asked, 5, 'four busy answers, then the bytes');
+  const waited = time.now() - started;
+  const least = RETRY_DELAYS_MS.slice(0, 4).reduce((a, b) => a + b, 0);
+  assert.ok(waited >= least && waited < 1.5 * least, `waited ${waited} ms`);
+  // Each busy answer halved what runs at once; answers earn it back.
+  assert.ok(link.admitted < 24, `${link.admitted} requests at once after SlowDown`);
+  assert.equal(retryDelayMs(2, () => 0), RETRY_DELAYS_MS[2]);
+  assert.equal(retryDelayMs(2, () => 0.999999), RETRY_DELAYS_MS[2] * 1.4999995);
 });

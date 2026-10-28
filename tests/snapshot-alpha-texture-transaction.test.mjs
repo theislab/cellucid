@@ -5,6 +5,7 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
+import { bufferOf, pointStoreOver, vaoOf } from './helpers/point-stores.mjs';
 import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 const MIB = 1024 * 1024;
@@ -146,7 +147,7 @@ function createTrackingGl(maxTextureSize = 4) {
     },
     bindVertexArray(vao) {
       if (vao !== null) {
-        assert.equal(live.vertexArrays.has(vao), true);
+        assert.equal(live.vertexArrays.has(vaoOf(vao)), true);
       }
       vertexArrayBinding = vao;
     },
@@ -174,7 +175,7 @@ function createTrackingGl(maxTextureSize = 4) {
     bufferSubData(target, dstByteOffset, source, sourceOffset = 0, length) {
       assert.equal(target, this.ARRAY_BUFFER);
       assert.ok(arrayBufferBinding);
-      const store = bufferBytes.get(arrayBufferBinding);
+      const store = bufferBytes.get(bufferOf(arrayBufferBinding));
       assert.ok(store, 'bufferSubData writes inside a sized store');
       const width = source.BYTES_PER_ELEMENT;
       const count = length ?? (source.length - sourceOffset);
@@ -255,13 +256,13 @@ function createTrackingGl(maxTextureSize = 4) {
       throw new TypeError(`unexpected WebGL parameter ${parameter}`);
     },
     isBuffer(handle) {
-      return live.buffers.has(handle);
+      return live.buffers.has(bufferOf(handle));
     },
     isTexture(handle) {
       return live.textures.has(handle);
     },
     isVertexArray(handle) {
-      return live.vertexArrays.has(handle);
+      return live.vertexArrays.has(vaoOf(handle));
     },
     pixelStorei(parameter, value) {
       assert.equal(unpackState.has(parameter), true);
@@ -451,9 +452,7 @@ function createTrackingGl(maxTextureSize = 4) {
 
 function configureAccounting(renderer) {
   Object.assign(renderer, {
-    _alphaTexData: null,
     _alphaTexHeight: 0,
-    _alphaTexStagingData: null,
     _alphaTexWidth: 0,
     _alphaTexture: null,
     _alphaTextureByteLength: 0,
@@ -511,7 +510,6 @@ function createRenderer({
     currentDimensionLevel: 3,
     _liveGeometryGeneration: 1,
     _nextGeometryGeneration: 2,
-    _snapshotAlphaStagingData: null,
     _snapshotGeometryPools: new Map(),
     snapshotBuffers: new Map(),
     forceLODLevel: -1,
@@ -523,7 +521,7 @@ function createRenderer({
   // borrows. It is owned outside the snapshot storage under test, so it is not
   // one of the tracking context's handles.
   renderer.buffers = {
-    positions: Object.freeze({ kind: 'buffer', id: 'live-positions' }),
+    positions: pointStoreOver(gl, Object.freeze({ kind: 'buffer', id: 'live-positions' }), pointCount, 12),
     colors: null,
   };
   renderer._positionGpuByteLength = pointData.positions.byteLength;
@@ -545,15 +543,48 @@ function createRenderer({
   };
 }
 
-function expectedAlphaBytes(alphas, colors, texelCount) {
+/**
+ * The R8 image a kept view's texture holds for its transparency: 255 for a
+ * shown cell, 0 for a hidden one, 255 for every cell when it is null and for
+ * the padding past the last cell. The colours' alpha byte is never read.
+ */
+function expectedAlphaBytes(alphas, pointCount, texelCount) {
   const result = new Uint8Array(texelCount);
   result.fill(255);
-  for (let index = 0; index < colors.length / 4; index++) {
-    result[index] = alphas === null
-      ? colors[index * 4 + 3]
-      : Math.round(alphas[index] * 255);
+  if (alphas !== null) {
+    for (let index = 0; index < pointCount; index++) {
+      result[index] = alphas[index] * 255;
+    }
   }
   return result;
+}
+
+/**
+ * Every typed array reachable from the renderer's own fields and its kept
+ * views' records holding an entry a cell, except the arrays a view was
+ * published with (kept by reference) and the bounded row scratch: none may
+ * exist, so no CPU copy of an image is held. (Row marks, an entry or two a
+ * texture row, are not a copy.)
+ */
+function heldImageSizedArrays(renderer) {
+  const published = new Set();
+  for (const snapshot of renderer.snapshotBuffers.values()) {
+    published.add(snapshot.alphas);
+    published.add(snapshot.colors);
+    published.add(snapshot.positions);
+  }
+  const found = [];
+  const visit = (owner, path) => {
+    for (const [key, value] of Object.entries(owner)) {
+      if (!ArrayBuffer.isView(value) || published.has(value) || value === renderer._alphaRows) continue;
+      for (const snapshot of renderer.snapshotBuffers.values()) {
+        if (value.length >= snapshot.pointCount) found.push(`${path}.${key}`);
+      }
+    }
+  };
+  visit(renderer, 'renderer');
+  for (const [id, snapshot] of renderer.snapshotBuffers) visit(snapshot, id);
+  return found;
 }
 
 /** A snapshot colour store holds its RGBA8 colours as they are, 4 bytes a point. */
@@ -563,7 +594,7 @@ function expectedStoreBytes(colors) {
 
 function snapshotIdentity(snapshot) {
   return {
-    alphaTexData: snapshot.alphaTexData,
+    alphas: snapshot.alphas,
     alphaTexture: snapshot.alphaTexture,
     buffer: snapshot.buffer,
     geometryGeneration: snapshot.geometryGeneration,
@@ -605,44 +636,42 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   } = explicit;
   const expected = expectedAlphaBytes(
     alphas,
-    colors,
+    renderer.pointCount,
     snapshot.alphaTexWidth * snapshot.alphaTexHeight,
   );
 
   assert.ok(snapshot.alphaTexture);
   assert.equal(snapshot.alphaTextureByteLength, expected.byteLength);
-  assert.deepEqual(snapshot.alphaTexData, expected);
-  assert.notStrictEqual(snapshot.alphaTexData, alphas);
-  assert.equal(snapshot.alphas, undefined);
-  assert.equal(
-    Object.hasOwn(snapshot, 'alphaTexStagingData'),
-    false,
-    'staging is one renderer-wide owner, never one owner per snapshot',
-  );
+  // The published transparency is kept by reference and is what the
+  // texture holds; no CPU copy of the image exists, per view or shared.
+  assert.strictEqual(snapshot.alphas, alphas);
+  assert.equal(Object.hasOwn(snapshot, 'alphaTexData'), false);
+  assert.equal(Object.hasOwn(renderer, '_snapshotAlphaStagingData'), false);
+  assert.deepEqual(heldImageSizedArrays(renderer), []);
   assert.deepEqual(
     gl._state.textureBytes.get(snapshot.alphaTexture),
     expected,
   );
   assert.deepEqual(
-    gl._state.bufferBytes.get(snapshot.buffer),
+    gl._state.bufferBytes.get(bufferOf(snapshot.buffer)),
     expectedStoreBytes(colors),
     'a snapshot colour store is RGBA8 on a 4-byte stride; its alpha is the one R8 owner, and the store\'s alpha byte is never read',
   );
   assert.equal(snapshot.bufferByteLength, renderer.pointCount * 4);
   const colorAttribute = gl._state.vertexAttribCalls
-    .filter(call => call.vao === snapshot.vao && call.index === 1)
+    .filter(call => call.vao === vaoOf(snapshot.vao) && call.index === 1)
     .at(-1);
   assert.deepEqual(
     colorAttribute,
     {
-      buffer: snapshot.buffer,
+      buffer: bufferOf(snapshot.buffer),
       index: 1,
       normalized: true,
       offset: 0,
       size: 4,
       stride: 4,
       type: gl.UNSIGNED_BYTE,
-      vao: snapshot.vao,
+      vao: vaoOf(snapshot.vao),
     },
   );
   // In source order the colours are the store's bytes: one direct upload,
@@ -657,20 +686,20 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   );
 
   const inherited = createRenderer({ alphas: null });
-  const inheritedExpected = expectedAlphaBytes(
-    null,
-    inherited.colors,
-    inherited.snapshot.alphaTexWidth *
-      inherited.snapshot.alphaTexHeight,
-  );
+  assert.equal(inherited.snapshot.alphas, null);
   assert.deepEqual(
-    inherited.snapshot.alphaTexData,
-    inheritedExpected,
-    'null alpha derives the exact source RGBA alpha channel',
+    inherited.gl._state.textureBytes.get(inherited.snapshot.alphaTexture),
+    expectedAlphaBytes(
+      null,
+      inherited.renderer.pointCount,
+      inherited.snapshot.alphaTexWidth *
+        inherited.snapshot.alphaTexHeight,
+    ),
+    'null transparency shows every cell; the colours\' alpha byte is never read',
   );
   assert.deepEqual(
     inherited.gl._state.bufferBytes.get(
-      inherited.snapshot.buffer
+      bufferOf(inherited.snapshot.buffer)
     ),
     expectedStoreBytes(inherited.colors),
   );
@@ -719,14 +748,6 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
     scaled.stats.gpuMemoryMB * MIB,
     expectedGpuBytes,
   );
-  const retainedR8CpuBytes =
-    viewCount * alphaTextureBytes + alphaTextureBytes;
-  const perSnapshotStagingBytes =
-    viewCount * alphaTextureBytes * 2;
-  assert.equal(
-    perSnapshotStagingBytes - retainedR8CpuBytes,
-    (viewCount - 1) * alphaTextureBytes,
-  );
   const physicalPaddingBytes =
     viewCount * (alphaTextureBytes - pointCount);
   assert.ok(
@@ -737,10 +758,10 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   t.diagnostic(
     `eight 30M-point views account ${expectedGpuBytes.toLocaleString()} ` +
     `GPU bytes (${physicalPaddingBytes.toLocaleString()} bounded texture-` +
-    `padding bytes above the unchanged 4N/view payload); one shared ` +
-    `staging owner avoids ` +
-    `${((viewCount - 1) * alphaTextureBytes).toLocaleString()} ` +
-    `retained CPU bytes`,
+    `padding bytes above the unchanged 4N/view payload); no CPU copy of ` +
+    `any view's R8 image is held (each keeps its published transparency ` +
+    `by reference), where a padded copy a view plus a shared staging copy ` +
+    `held ${((viewCount + 1) * alphaTextureBytes).toLocaleString()} bytes`,
   );
 });
 
@@ -772,10 +793,10 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
     snapshotIdentity(snapshot),
     {
       ...before,
-      alphaTexData: snapshot.alphaTexData,
+      alphas: replacement,
     },
+    'the accepted transparency is the published array, by reference',
   );
-  assert.notStrictEqual(snapshot.alphaTexData, before.alphaTexData);
   assert.equal(gl._state.bufferUploadCount, beforeBufferUploads);
   assert.equal(
     gl._state.maxTextureSizeQueryCount,
@@ -787,20 +808,17 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
     beforeTextureUploads + 1,
   );
   assert.deepEqual(
-    snapshot.alphaTexData.subarray(0, replacement.length),
-    Uint8Array.from(replacement, value => Math.round(value * 255)),
+    gl._state.textureBytes.get(snapshot.alphaTexture),
+    expectedAlphaBytes(
+      replacement,
+      renderer.pointCount,
+      snapshot.alphaTexPlan.texels,
+    ),
   );
-  assert.strictEqual(
-    renderer._snapshotAlphaStagingData,
-    before.alphaTexData,
-    'the prior accepted R8 owner becomes the one reusable staging owner',
-  );
+  assert.deepEqual(heldImageSizedArrays(renderer), []);
 
   const uploadsBeforeNoop = gl._state.textureUploadCount;
-  const sameQuantizedGeneration = Uint8Array.from(
-    snapshot.alphaTexData.subarray(0, replacement.length),
-    value => value / 255,
-  );
+  const sameQuantizedGeneration = Uint8Array.from(replacement);
   assert.equal(
     renderer.updateSnapshotAlphas(
       'snap_1',
@@ -820,7 +838,7 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
   );
   assert.deepEqual(snapshotIdentity(snapshot), {
     ...before,
-    alphaTexData: snapshot.alphaTexData,
+    alphas: sameQuantizedGeneration,
   });
 
   const uploadsBeforeInvalid = gl._state.textureUploadCount;
@@ -834,6 +852,7 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
     gl._state.textureUploadCount,
     uploadsBeforeInvalid,
   );
+  assert.strictEqual(snapshot.alphas, sameQuantizedGeneration);
 });
 
 test('color-only and position-only updates preserve independent snapshot owners', async (t) => {
@@ -866,7 +885,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     assert.strictEqual(snapshot.vao, before.vao);
     assert.strictEqual(snapshot.colors, replacement);
     assert.strictEqual(snapshot.alphaTexture, before.alphaTexture);
-    assert.strictEqual(snapshot.alphaTexData, before.alphaTexData);
+    assert.strictEqual(snapshot.alphas, before.alphas);
     assert.strictEqual(snapshot.positions, before.positions);
     assert.equal(
       snapshot.geometryGeneration,
@@ -880,7 +899,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     );
     assert.strictEqual(geometry.positionBuffer, positionBuffer);
     assert.deepEqual(
-      gl._state.bufferBytes.get(snapshot.buffer),
+      gl._state.bufferBytes.get(bufferOf(snapshot.buffer)),
       expectedStoreBytes(replacement),
     );
     assert.equal(
@@ -902,7 +921,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     } = createRenderer();
     const before = snapshotIdentity(snapshot);
     const beforeColorBytes = Uint8Array.from(
-      gl._state.bufferBytes.get(snapshot.buffer)
+      gl._state.bufferBytes.get(bufferOf(snapshot.buffer))
     );
     const beforeBufferUploads = gl._state.bufferUploadCount;
     const beforeTextureUploads = gl._state.textureUploadCount;
@@ -915,7 +934,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     );
     assert.strictEqual(snapshot.buffer, before.buffer);
     assert.strictEqual(snapshot.alphaTexture, before.alphaTexture);
-    assert.strictEqual(snapshot.alphaTexData, before.alphaTexData);
+    assert.strictEqual(snapshot.alphas, before.alphas);
     assert.notStrictEqual(snapshot.vao, before.vao);
     assert.notStrictEqual(snapshot.positions, before.positions);
     assert.notEqual(
@@ -923,7 +942,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
       before.geometryGeneration,
     );
     assert.deepEqual(
-      gl._state.bufferBytes.get(snapshot.buffer),
+      gl._state.bufferBytes.get(bufferOf(snapshot.buffer)),
       beforeColorBytes,
     );
     assert.equal(
@@ -946,7 +965,12 @@ test('failed alpha, color, and position publications preserve accepted owners an
       snapshot,
     } = createRenderer();
     const before = snapshotIdentity(snapshot);
-    const accepted = snapshot.alphaTexData.slice();
+    const accepted = snapshot.alphas;
+    const acceptedImage = expectedAlphaBytes(
+      accepted,
+      renderer.pointCount,
+      snapshot.alphaTexPlan.texels,
+    );
     const nextUpload = gl._state.textureUploadCount + 1;
     gl._state.fail.textureUploads.add(nextUpload);
     const replacement = Uint8Array.from([
@@ -961,10 +985,11 @@ test('failed alpha, color, and position publications preserve accepted owners an
       /WebGL|alpha|texture/i,
     );
     assert.deepEqual(snapshotIdentity(snapshot), before);
-    assert.deepEqual(snapshot.alphaTexData, accepted);
+    assert.strictEqual(snapshot.alphas, accepted);
     assert.deepEqual(
       gl._state.textureBytes.get(snapshot.alphaTexture),
-      accepted,
+      acceptedImage,
+      'the restoration rewrites the touched rows from the accepted array',
     );
     assert.equal(
       gl._state.textureUploadCount,
@@ -979,13 +1004,13 @@ test('failed alpha, color, and position publications preserve accepted owners an
     );
   });
 
-  await t.test('double R8 failure detaches poisoned texture and retries from accepted CPU bytes', () => {
+  await t.test('double R8 failure detaches poisoned texture and retries from the accepted array', () => {
     const {
       gl,
       renderer,
       snapshot,
     } = createRenderer();
-    const accepted = snapshot.alphaTexData.slice();
+    const accepted = snapshot.alphas;
     const poisonedTexture = snapshot.alphaTexture;
     const nextUpload = gl._state.textureUploadCount + 1;
     gl._state.fail.textureUploads.add(nextUpload);
@@ -1003,7 +1028,7 @@ test('failed alpha, color, and position publications preserve accepted owners an
     );
     assert.equal(snapshot.alphaTexture, null);
     assert.equal(snapshot.alphaTextureByteLength, 0);
-    assert.deepEqual(snapshot.alphaTexData, accepted);
+    assert.strictEqual(snapshot.alphas, accepted);
     assert.equal(gl._state.live.textures.has(poisonedTexture), false);
 
     gl._state.fail.textureUploads.clear();
@@ -1013,6 +1038,12 @@ test('failed alpha, color, and position publications preserve accepted owners an
     );
     assert.ok(snapshot.alphaTexture);
     assert.notStrictEqual(snapshot.alphaTexture, poisonedTexture);
+    assert.strictEqual(snapshot.alphas, replacement);
+    assert.deepEqual(
+      gl._state.textureBytes.get(snapshot.alphaTexture),
+      expectedAlphaBytes(replacement, renderer.pointCount, snapshot.alphaTexPlan.texels),
+      'the recovered texture is rebuilt from the accepted array, then the moved rows are sent',
+    );
   });
 
   await t.test('color and position upload failures leave all accepted handles intact', () => {
@@ -1136,7 +1167,7 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     );
     assert.equal(renderer.snapshotBuffers.size, 0);
     assert.equal(colorOwner.refCount, 3);
-    assert.equal(gl._state.live.buffers.has(colorBuffer), true);
+    assert.equal(gl._state.live.buffers.has(bufferOf(colorBuffer)), true);
     assert.equal(gl._state.live.textures.has(alphaTexture), true);
     assert.equal(renderer._pendingSnapshotRetirements.size, 3);
 
@@ -1155,7 +1186,7 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     const [borrowed, ...owned] = retained;
     assert.equal(borrowed.borrowsLivePositionBuffer, true);
     assert.equal(owned.length, 2);
-    assert.ok(owned.every(geometry => gl._state.live.buffers.has(geometry.positionBuffer)));
+    assert.ok(owned.every(geometry => gl._state.live.buffers.has(bufferOf(geometry.positionBuffer))));
     assert.equal(
       renderer.getRetainedGeometryBytes(),
       positionByteLength + secondPositions.byteLength,
@@ -1164,7 +1195,7 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(renderer._snapshotGeometryPools.size, 0);
     assert.equal(
       gl._state.deleted.buffers.filter(
-        handle => handle === colorBuffer
+        handle => handle === bufferOf(colorBuffer)
       ).length,
       1,
       'the last retired VAO releases and deletes the shared colour VBO exactly once',
@@ -1178,7 +1209,6 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(gl._state.live.buffers.size, 0);
     assert.equal(gl._state.live.textures.size, 0);
     assert.equal(gl._state.live.vertexArrays.size, 0);
-    assert.equal(renderer._snapshotAlphaStagingData, null);
   });
 
   await t.test('delete retries only the still-live texture', () => {
@@ -1312,7 +1342,7 @@ test('every snapshot draw path binds source-order snapshot alpha through its geo
     u_lodIndexTex: 'lod-index',
     u_lodIndexLayout: 'lod-layout',
     u_useAlphaTex: 'use-alpha',
-    u_useLodIndexTex: 'use-lod-index',
+    u_orderedSlots: 'ordered-slots',
   };
   const lastUniform = location => gl._state.uniformCalls
     .filter(call => call.location === location)
@@ -1322,22 +1352,23 @@ test('every snapshot draw path binds source-order snapshot alpha through its geo
   renderer._bindPointAlpha(gl, uniforms, snapshot.alphaTexture, snapshot.alphaTexPlan, null);
   assert.strictEqual(gl._state.textureBindings.get(0), snapshot.alphaTexture);
   assert.strictEqual(gl._state.textureBindings.get(1), dummy);
-  assert.deepEqual(lastUniform('use-lod-index'), {
+  assert.deepEqual(lastUniform('ordered-slots'), {
     kind: 'uniform1i',
-    location: 'use-lod-index',
+    location: 'ordered-slots',
     value: 0,
   });
 
-  // A geometry in a draw order: the stored slot maps back to its source
-  // index through the order's permutation, so the source-order alpha holds.
-  const order = { texture: permutation, plan: planLinearTexture(7, 4, 256) };
+  // A geometry in a draw order: a stored slot below `orderedSlots` maps
+  // back to its source index through the order's slot map, so the
+  // source-order alpha holds.
+  const order = { texture: permutation, plan: planLinearTexture(7, 4, 256), orderedSlots: 7 };
   renderer._bindPointAlpha(gl, uniforms, snapshot.alphaTexture, snapshot.alphaTexPlan, order);
   assert.strictEqual(gl._state.textureBindings.get(0), snapshot.alphaTexture);
   assert.strictEqual(gl._state.textureBindings.get(1), permutation);
-  assert.deepEqual(lastUniform('use-lod-index'), {
+  assert.deepEqual(lastUniform('ordered-slots'), {
     kind: 'uniform1i',
-    location: 'use-lod-index',
-    value: 1,
+    location: 'ordered-slots',
+    value: 7,
   });
   // The permutation's layout: width 4 (shift 2), two rows in one layer.
   assert.deepEqual(lastUniform('lod-layout'), {
@@ -1363,7 +1394,7 @@ test('a snapshot alpha update uploads only the rows that moved', () => {
   const rows = snapshot.alphaTexPlan.rows;
   assert.ok(rows > 1, 'the fixture lays its five cells over several rows');
   // Move one cell in the last row only.
-  const next = Uint8Array.from(snapshot.alphaTexData.subarray(0, 5), byte => (byte === 255 ? 1 : 0));
+  const next = Uint8Array.from(snapshot.alphas);
   const last = 4;
   next[last] = next[last] === 1 ? 0 : 1;
   const uploadsBefore = gl._state.textureUploads.length;
@@ -1371,11 +1402,77 @@ test('a snapshot alpha update uploads only the rows that moved', () => {
   const uploads = gl._state.textureUploads.slice(uploadsBefore);
   assert.equal(uploads.length, 1);
   assert.equal(uploads[0].height, 1, 'one row, not the whole texture');
-  assert.equal(snapshot.alphaTexData[last], next[last] * 255);
+  assert.strictEqual(snapshot.alphas, next);
   assert.deepEqual(
     gl._state.textureBytes.get(snapshot.alphaTexture),
-    snapshot.alphaTexData,
-    'the resident image equals the accepted bytes',
+    expectedAlphaBytes(next, renderer.pointCount, snapshot.alphaTexPlan.texels),
+    'the resident image is the accepted transparency',
   );
   assert.ok(Math.floor(last / width) === rows - 1);
+});
+
+test('a kept view adopts its own transparency owner, so a caller array rewritten in place is still compared with the accepted bytes', () => {
+  const { gl, renderer, snapshot } = createRenderer();
+  const texels = snapshot.alphaTexPlan.texels;
+  // Application state: one array rewritten in place before each publication.
+  const state = Uint8Array.from(snapshot.alphas);
+  state[0] ^= 1;
+  assert.equal(renderer.updateSnapshotAlphas('snap_1', state), true);
+  assert.strictEqual(snapshot.alphas, state);
+  // The viewer copies the accepted bytes into the view's own owner and hands
+  // it back (`updateSnapshotAttributes`).
+  const own = Uint8Array.from(state);
+  renderer._adoptSnapshotAlphasOwner('snap_1', own);
+  assert.strictEqual(snapshot.alphas, own);
+  assert.throws(
+    () => renderer._adoptSnapshotAlphasOwner('snap_1', new Uint8Array(renderer.pointCount + 1)),
+    /one exact Uint8 point array/,
+  );
+  assert.strictEqual(snapshot.alphas, own);
+
+  state[4] ^= 1;
+  const uploadsBefore = gl._state.textureUploads.length;
+  assert.equal(
+    renderer.updateSnapshotAlphas('snap_1', state),
+    true,
+    'the in-place rewrite moved a byte of the accepted generation',
+  );
+  assert.equal(gl._state.textureUploads.length, uploadsBefore + 1);
+  assert.deepEqual(
+    gl._state.textureBytes.get(snapshot.alphaTexture),
+    expectedAlphaBytes(state, renderer.pointCount, texels),
+  );
+  assert.deepEqual(heldImageSizedArrays(renderer), []);
+});
+
+test('a released kept view takes transparency updates by reference and rebuilds its texture from the accepted array', () => {
+  const { gl, renderer, snapshot } = createRenderer();
+  // Releasing detaches the colour attribute from the view's vertex array.
+  gl.disableVertexAttribArray = () => {};
+  renderer._presentedViewIds = ['live'];
+  renderer._snapshotInOperation = null;
+  const texture = snapshot.alphaTexture;
+  assert.ok(renderer._releaseDormantSnapshotStores() > 0);
+  assert.equal(snapshot.storesReleased, true);
+  assert.equal(snapshot.alphaTexture, null);
+  assert.equal(gl._state.live.textures.has(texture), false);
+
+  const next = Uint8Array.from(snapshot.alphas, value => value ^ 1);
+  const uploadsBefore = gl._state.textureUploads.length;
+  assert.equal(renderer.updateSnapshotAlphas('snap_1', next), true);
+  assert.equal(gl._state.textureUploads.length, uploadsBefore, 'nothing on the GPU to rewrite');
+  assert.strictEqual(snapshot.alphas, next);
+  assert.equal(renderer.updateSnapshotAlphas('snap_1', Uint8Array.from(next)), false);
+
+  renderer._restoreSnapshotStores(snapshot);
+  assert.equal(snapshot.storesReleased, false);
+  assert.ok(snapshot.alphaTexture);
+  assert.equal(snapshot.alphaTextureByteLength, snapshot.alphaTexPlan.texels);
+  assert.deepEqual(
+    gl._state.textureBytes.get(snapshot.alphaTexture),
+    expectedAlphaBytes(snapshot.alphas, renderer.pointCount, snapshot.alphaTexPlan.texels),
+    'the rebuilt texture is the accepted transparency',
+  );
+  assert.equal(renderer.isAlphaTextureActiveForView('snap_1'), true);
+  assert.deepEqual(heldImageSizedArrays(renderer), []);
 });

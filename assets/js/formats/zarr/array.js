@@ -6,8 +6,9 @@
  * each as it arrives (a few at a time, so decoded chunks do not pile up; a
  * view's chunks ahead of background work's, as the store's reads are) and
  * copies the selected part straight into one output allocated up front.
- * Absent chunks are filled with the fill value; an absent chunk of a Zarr v2
- * array whose fill value is null has undefined contents and is refused.
+ * Absent chunks are filled with the fill value (a Zarr v2 array whose
+ * `fill_value` is null: its data type's default, as zarr-python reads it;
+ * `dtypes.js` `defaultFill`).
  *
  * Chunks are shared between reads of one opened store:
  *
@@ -19,8 +20,10 @@
  *   column of a dense matrix) usually needs another part of it. A chunk used
  *   whole is not kept: whatever needs it next needs it whole again.
  *
- * A sharded (Zarr v3) array reads each shard's index once (cached), then
- * fetches only the inner chunks a read needs, neighbours in one request.
+ * A sharded (Zarr v3) array reads each shard's index once (cached; the
+ * indexes a read needs all at once), then fetches only the inner chunks it
+ * needs, every shard's in the same task once the indexes are in, neighbours
+ * in one request.
  *
  * @module formats/zarr/array
  */
@@ -30,36 +33,14 @@ import { ZarrFormatError } from './errors.js';
 import { decodeRaw, decodeRawField } from './dtypes.js';
 import { copyBox, cStrides, decodeChunk, fillBox, ownedCopy, storageStrides, wordsOf } from './chunks.js';
 import { expectedSizes } from './codecs/pipeline.js';
-import { onAbort } from '../io/abort.js';
+import { LOCAL_POLICY } from '../io/byte-source.js';
+import { SharedWork, onAbort } from '../io/abort.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 const EMPTY_SHARD_ENTRY = -1;
 
 function abortError(signal) {
   return signal?.reason ?? new DOMException('The read was aborted.', 'AbortError');
-}
-
-/**
- * `promise`, or a rejection as soon as `signal` aborts. Once it is not waited
- * for, `promise` failing (its fetch cancelled by the same signal) is nobody's
- * failure: it never surfaces as an unhandled rejection.
- */
-function untilAborted(promise, signal) {
-  if (signal === null || signal === undefined) return promise;
-  if (signal.aborted) {
-    promise.catch(() => {});
-    return Promise.reject(abortError(signal));
-  }
-  return new Promise((resolve, reject) => {
-    const stopWaiting = onAbort(signal, () => reject(abortError(signal)));
-    promise.then(
-      value => { stopWaiting(); resolve(value); },
-      error => { stopWaiting(); reject(error); }
-    );
-  });
-}
-
-function isAbort(error) {
-  return error?.name === 'AbortError';
 }
 
 /** Whether a fill needs writing into freshly allocated (zeroed) output. */
@@ -94,12 +75,26 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
   const raw = form === 'bytes-string' || form === 'utf32' || form === 'opaque' || form === 'compound';
   const fillZero = fill.value === null ? true : fillIsZero(fill, form);
   const cacheId = `${path}#`;
+  // A chunk stored as its values' bytes (no compressor, no filter, no
+  // shard, fixed-size values) is read in part: only the bytes of the
+  // elements a read needs, so a read of a few rows of a large chunk -- a
+  // subsample's prefix of a store a kernel serves uncompressed, a gene's
+  // first entries -- transfers those rows, not the chunk.
+  const rawChunks = sharding === null && pipeline.decoders.length === 0 && pipeline.serializer.kind === 'bytes' &&
+    !raw && (form === 'numeric' || form === 'bool') && typeof store.getRanges === 'function';
+  /**
+   * Bytes a request costs on the store's link (the merge gap it measures,
+   * `formats/io/link.js`; a local store's prior otherwise): a part of a
+   * chunk is read alone only when it leaves more than this unread, else the
+   * whole chunk is read and kept for the reads that want the rest of it.
+   */
+  const requestCostBytes = () => (typeof store.mergeGapBytes === 'function' ? store.mergeGapBytes() : LOCAL_POLICY.mergeGapBytes);
 
   /** Allocate the output of `count` elements. */
   function allocate(count) {
-    if (raw) return new Uint8Array(count * type.itemSize);
+    if (raw) return allocateTypedArray(Uint8Array, count * type.itemSize, what);
     if (form === 'vlen') return new Array(count);
-    return new type.valueClass(count);
+    return allocateTypedArray(type.valueClass, count, what);
   }
 
   // -------------------------------------------------------------------------
@@ -117,25 +112,28 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
   }
 
   /**
-   * Register a chunk being produced: later asks for it wait on the same
-   * promise, and it is cached when any asker used only part of it.
+   * The chunk `key` being produced, shared by every read asking for it from
+   * now on (`SharedWorks`: it stops only once every one of them withdrew):
+   * the one running, else `start(options)` begun now. It is cached when
+   * any asker used only part of it (`keep`).
    */
-  function track(key, promise, keep) {
-    const entry = { promise, keep, waiters: 1 };
-    context.inflight.set(key, entry);
-    promise.then(
-      decoded => {
-        if (context.inflight.get(key) === entry) context.inflight.delete(key);
-        if (entry.keep && decoded !== null && !context.closed) {
-          const kept = ownedCopy(decoded);
-          context.decoded.set(key, kept, kept.bytes);
-        }
-      },
-      () => {
-        if (context.inflight.get(key) === entry) context.inflight.delete(key);
+  function shared(key, start, options, keep) {
+    let work = context.inflight.get(key);
+    if (work !== undefined) {
+      context.stats.sharedChunks++;
+      work.keep ||= keep;
+      return work;
+    }
+    work = context.inflight.work(key, start, options);
+    work.keep = keep;
+    const produced = work;
+    produced.promise.then(decoded => {
+      if (produced.keep && decoded !== null && !context.closed) {
+        const kept = ownedCopy(decoded);
+        context.decoded.set(key, kept, kept.bytes);
       }
-    );
-    return entry;
+    }, () => {});
+    return produced;
   }
 
   /** The shard index of `shardKey`: offsets and sizes, -1 for empty inner chunks; null when the shard is absent. */
@@ -143,10 +141,9 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
     const cacheKey = `${shardKey}#index`;
     const cached = context.indexes.get(cacheKey);
     if (cached !== undefined) return Promise.resolve(cached);
-    const running = context.inflight.get(cacheKey);
-    if (running !== undefined) return running.promise;
     const range = sharding.location === 'end' ? { suffix: sharding.indexBytes } : { offset: 0, length: sharding.indexBytes };
-    const promise = store.getRanges(shardKey, [range], options).then(async parts => {
+    // Shared by every read asking for it meanwhile (`SharedWorks`).
+    return context.inflight.run(cacheKey, indexOptions => store.getRanges(shardKey, [range], indexOptions).then(async parts => {
       if (parts === null) return null;
       let bytes = parts[0];
       if (bytes.length !== sharding.indexBytes) throw new ZarrFormatError(`${what}: the shard '${shardKey}' is shorter than its index.`);
@@ -155,7 +152,7 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
       for (let i = 0; i < decoders.length; i++) bytes = await decoders[i].decode(bytes, sizes[i]);
       const littleEndian = sharding.indexPipeline.type.littleEndian;
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const index = new Float64Array(sharding.innerCount * 2);
+      const index = allocateTypedArray(Float64Array, sharding.innerCount * 2, `${what} shard index`);
       const shardSize = store.storedSize(shardKey);
       for (let i = 0; i < index.length; i += 2) {
         const at = i * 8;
@@ -178,13 +175,7 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
       }
       context.indexes.set(cacheKey, index, index.byteLength);
       return index;
-    });
-    const entry = { promise, keep: false, waiters: 1 };
-    context.inflight.set(cacheKey, entry);
-    promise.finally(() => {
-      if (context.inflight.get(cacheKey) === entry) context.inflight.delete(cacheKey);
-    }).catch(() => {});
-    return promise;
+    }), options);
   }
 
   /** Coordinates of the shard holding read-grid chunk `coords`, and the chunk's index inside it. */
@@ -204,7 +195,8 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
    * `Decoded`, or null when the chunk is absent. All fetches are asked for
    * before any is awaited, so the backend plans them together.
    */
-  function requestChunks(coordsList, keepList, options, tally) {
+  function requestChunks(coordsList, keepList, options, tally, spans = null) {
+    const signal = options.signal ?? null;
     const results = new Array(coordsList.length);
     const toFetch = [];
     coordsList.forEach((coords, i) => {
@@ -212,15 +204,27 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
       const cached = context.decoded.get(key);
       if (cached !== undefined) {
         context.stats.cacheHits++;
-        results[i] = Promise.resolve({ decoded: cached, shared: true });
+        results[i] = Promise.resolve({ decoded: cached, shared: true, offset: 0 });
         return;
       }
-      const running = context.inflight.get(key);
-      if (running !== undefined) {
-        running.waiters++;
-        running.keep ||= keepList[i];
-        context.stats.sharedChunks++;
-        results[i] = running.promise.then(decoded => ({ decoded, shared: true }));
+      const span = spans?.[i] ?? null;
+      if (span !== null) {
+        // Elements [first, first + count) of the chunk, from their bytes alone (never cached).
+        const partKey = `${key}@${span.first}+${span.count}`;
+        const width = type.itemSize;
+        const work = shared(partKey, partOptions => store.getRanges(meta.chunkKey(coords), [{ offset: span.first * width, length: span.count * width }], partOptions)
+          .then(parts => (parts === null ? null : context.decodeLimit(async () => {
+            const decoded = await decodeChunk(parts[0], pipeline, span.count, what, partOptions.signal);
+            tally.chunks++;
+            tally.bytes += decoded.bytes;
+            return decoded;
+          }, partOptions.signal, partOptions.activity))), options, false);
+        results[i] = work.join(signal).then(decoded => ({ decoded, shared: work.joins > 1, offset: span.first }));
+        return;
+      }
+      if (context.inflight.has(key)) {
+        const work = shared(key, null, options, keepList[i]);
+        results[i] = work.join(signal).then(decoded => ({ decoded, shared: true }));
         return;
       }
       toFetch.push({ i, coords, key });
@@ -228,47 +232,73 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
 
     if (sharding === null) {
       for (const { i, coords, key } of toFetch) {
-        const promise = store.get(meta.chunkKey(coords), options)
-          .then(bytes => (bytes === null ? null : decodeLimited(bytes, options, tally)));
-        const entry = track(key, promise, keepList[i]);
-        results[i] = promise.then(decoded => ({ decoded, shared: entry.waiters > 1 || entry.keep }));
+        const work = shared(key, chunkOptions => store.get(meta.chunkKey(coords), chunkOptions)
+          .then(bytes => (bytes === null ? null : decodeLimited(bytes, chunkOptions, tally))), options, keepList[i]);
+        results[i] = work.join(signal).then(decoded => ({ decoded, shared: work.joins > 1 || work.keep }));
       }
     } else {
-      // Group by shard: one index read and one ranged fetch per shard.
+      // Group by shard: one index read and one ranged fetch per shard. The
+      // chunks of every shard are fetched as one piece of work (`batch`),
+      // which each chunk's own shared work holds while any read waits for
+      // that chunk: it stops once every one of them withdrew.
       const byShard = new Map();
       for (const item of toFetch) {
         const { shardKey, local } = placeInShard(item.coords);
         let group = byShard.get(shardKey);
         if (group === undefined) byShard.set(shardKey, group = []);
-        let settle;
-        const promise = new Promise((resolve, reject) => { settle = { resolve, reject }; });
-        promise.catch(() => {});
-        const entry = track(item.key, promise, keepList[item.i]);
-        group.push({ ...item, local, settle });
-        results[item.i] = promise.then(decoded => ({ decoded, shared: entry.waiters > 1 || entry.keep }));
+        item.settled = new Promise((resolve, reject) => { item.settle = { resolve, reject }; });
+        item.settled.catch(() => {});
+        group.push({ ...item, local });
       }
-      for (const [shardKey, group] of byShard) {
-        (async () => {
-          const index = await shardIndex(shardKey, options);
-          const present = [];
-          for (const item of group) {
-            if (index === null || index[item.local * 2] === EMPTY_SHARD_ENTRY) item.settle.resolve(null);
-            else present.push(item);
-          }
-          if (present.length === 0) return;
-          const parts = await store.getRanges(shardKey, present.map(item => ({
-            offset: index[item.local * 2], length: index[item.local * 2 + 1],
-          })), options);
-          if (parts === null) throw new ZarrFormatError(`${what}: the shard '${shardKey}' disappeared while it was read.`);
-          present.forEach((item, k) => {
-            decodeLimited(parts[k], options, tally).then(item.settle.resolve, item.settle.reject);
-          });
-        })().catch(error => {
-          for (const item of group) item.settle.reject(error);
-        });
+      const batch = new SharedWork(batchSignal => fetchShards([...byShard], { ...options, signal: batchSignal }, tally));
+      for (const item of toFetch) {
+        const work = shared(item.key, chunkOptions => {
+          const leave = batch.hold();
+          const stopWaiting = onAbort(chunkOptions.signal, leave);
+          return item.settled.finally(stopWaiting);
+        }, options, keepList[item.i]);
+        results[item.i] = work.join(signal).then(decoded => ({ decoded, shared: work.joins > 1 || work.keep }));
       }
     }
     return results;
+  }
+
+  /**
+   * Fetch and decode the chunks of `shards` (`[shardKey, items]`), settling
+   * each item. Every shard's index is asked for at once, and the inner
+   * chunks of all of them once every index is in: the inner chunk reads go
+   * out in one task, which the store plans together (a ZIP's shards are
+   * ranges of one file, merged as its link prices them), not shard by shard
+   * as each index lands.
+   */
+  async function fetchShards(shards, options, tally) {
+    const indexes = shards.map(([shardKey]) => shardIndex(shardKey, options));
+    const fail = (group, error) => {
+      for (const item of group) item.settle.reject(error);
+    };
+    const settled = await Promise.allSettled(indexes);
+    const fetched = shards.map(([shardKey, group], s) => {
+      if (settled[s].status === 'rejected') {
+        fail(group, settled[s].reason);
+        return null;
+      }
+      const index = settled[s].value;
+      const present = [];
+      for (const item of group) {
+        if (index === null || index[item.local * 2] === EMPTY_SHARD_ENTRY) item.settle.resolve(null);
+        else present.push(item);
+      }
+      if (present.length === 0) return null;
+      return store.getRanges(shardKey, present.map(item => ({
+        offset: index[item.local * 2], length: index[item.local * 2 + 1],
+      })), options).then(parts => {
+        if (parts === null) throw new ZarrFormatError(`${what}: the shard '${shardKey}' disappeared while it was read.`);
+        present.forEach((item, k) => {
+          decodeLimited(parts[k], options, tally).then(item.settle.resolve, item.settle.reject);
+        });
+      }).catch(error => fail(group, error));
+    });
+    await Promise.all(fetched);
   }
 
   // -------------------------------------------------------------------------
@@ -330,15 +360,29 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
     const exact = list.length === 1 && list[0].whole && pipeline.permutation === null &&
       extents.every((extent, axis) => extent === chunkShape[axis]);
 
-    const pending = requestChunks(list.map(item => item.coords), list.map(item => !item.whole), options, tally);
+    // A chunk read in part when its bytes are its values: the run of them in
+    // storage order from the box's first element to its last (a range of a
+    // vector, whole rows of a C-order chunk, a range of a column-major
+    // chunk's column: exactly the box's bytes; some columns of some rows of
+    // a C-order chunk: those rows), when what it leaves unread costs more
+    // than a request. Any other box is read with its whole chunk, kept for
+    // the reads that want the rest of it (the columns of a dense strip).
+    const spans = !rawChunks ? null : list.map(item => {
+      if (item.whole) return null;
+      let last = item.srcStart;
+      for (let axis = 0; axis < rank; axis++) last += (item.extents[axis] - 1) * chunkStrides[axis];
+      const count = last - item.srcStart + 1;
+      return (chunkCount - count) * type.itemSize > requestCostBytes() ? { first: item.srcStart, count } : null;
+    });
+    const pending = requestChunks(list.map(item => item.coords), list.map(item => !item.whole), options, tally, spans);
     let output = exact ? null : allocate(count);
     const target = output === null ? null : wordsOf(output, raw ? type.itemSize : undefined);
-    const work = pending.map((promise, k) => untilAborted(promise, signal).then(({ decoded, shared }) => {
+    // Each chunk is waited for with this read's own signal (`SharedWork`):
+    // a chunk another read also waits for never fails this read when that
+    // read is cancelled.
+    const work = pending.map((promise, k) => promise.then(({ decoded, shared, offset = 0 }) => {
       const item = list[k];
       if (decoded === null) {
-        if (fill.value === null) {
-          throw new ZarrFormatError(`${what} has an absent chunk while its fill_value is null, so its contents are undefined.`);
-        }
         if (output === null) {
           output = allocate(count);
           if (!fillZero) fillBox(output, 0, outStrides, extents, fill.value, raw ? fill.raw : null);
@@ -357,16 +401,9 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
         return;
       }
       const source = wordsOf(decoded.data, raw ? type.itemSize : undefined);
-      copyBox(source.words, item.srcStart, chunkStrides, target.words, item.dstStart, outStrides, item.extents, target.width);
+      copyBox(source.words, item.srcStart - offset, chunkStrides, target.words, item.dstStart, outStrides, item.extents, target.width);
     }));
-    try {
-      await Promise.all(work);
-    } catch (error) {
-      // A shared fetch cancelled by another reader's signal is not this
-      // read's failure: read again.
-      if (isAbort(error) && !signal?.aborted) return assemble(selection, options);
-      throw error;
-    }
+    await Promise.all(work);
     if (hostServes !== null) await hostServes;
     if (tally.chunks > 0) options.activity?.decoded?.(tally.chunks, tally.bytes);
     return output;
@@ -415,14 +452,39 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
       if (!byShard.has(shardKey)) byShard.set(shardKey, []);
       byShard.get(shardKey).push(local);
     }
-    const sums = await Promise.all([...byShard].map(async ([shardKey, locals]) => {
-      const index = await shardIndex(shardKey, options);
-      if (index === null) return 0;
-      let sum = 0;
-      for (const local of locals) if (index[local * 2] !== EMPTY_SHARD_ENTRY) sum += index[local * 2 + 1];
-      return sum;
-    }));
-    return sums.reduce((a, b) => a + b, 0);
+    // The shard indexes in hand answer exactly, and so do those of a listed
+    // store (a folder, a ZIP: it knows each shard's size, and reading an
+    // index costs no request). Of the others (a web host's), the first is
+    // read and the rest are estimated from the indexes in hand (their inner
+    // chunks' mean stored size): what a whole array of hundreds of shards
+    // stores costs at most one request, not one per shard.
+    const shards = [...byShard];
+    const held = shard => context.indexes.get(`${shard[0]}#index`) !== undefined || store.storedSize(shard[0]) !== null;
+    const missing = shards.filter(shard => !held(shard));
+    const exact = missing.length <= 1 ? shards : [...shards.filter(held), missing[0]];
+    let total = 0;
+    let sampled = 0;
+    let sampledChunks = 0;
+    // The indexes are read together, not one after another.
+    const indexes = await Promise.all(exact.map(([shardKey]) => shardIndex(shardKey, options)));
+    for (const [s, [, locals]] of exact.entries()) {
+      const index = indexes[s];
+      if (index === null) continue;
+      for (const local of locals) if (index[local * 2] !== EMPTY_SHARD_ENTRY) total += index[local * 2 + 1];
+      for (let i = 0; i < index.length; i += 2) {
+        if (index[i] === EMPTY_SHARD_ENTRY) continue;
+        sampled += index[i + 1];
+        sampledChunks++;
+      }
+    }
+    if (exact.length === shards.length) return total;
+    const meanChunk = sampledChunks === 0 ? 0 : sampled / sampledChunks;
+    const answered = new Set(exact.map(shard => shard[0]));
+    for (const [shardKey, locals] of shards) {
+      if (answered.has(shardKey)) continue;
+      total += Math.round(locals.length * meanChunk);
+    }
+    return total;
   }
 
   const node = {
@@ -434,6 +496,9 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
     shape,
     dtype: type.dtype,
     chunks: chunkShape,
+    // Rows of a chunk stored as its values' bytes in C order are read alone
+    // (`formats/store.js`): a range of rows costs its own bytes.
+    partialChunks: rawChunks && (rank <= 1 || pipeline.permutation === null),
     fillValue: fill.value,
     dimensionNames: meta.dimensionNames,
     zarrFormat: meta.version,

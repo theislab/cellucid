@@ -19,10 +19,11 @@
  *   yet (six requests at a time over HTTP/1.1, a hundred over HTTP/2), the
  *   plan nearest the best under either is taken: merging for six would
  *   fetch several times the bytes over HTTP/2, merging for a hundred would
- *   cost round trips over HTTP/1.1. Ranges of background work (an activity
- *   marked `background`) are joined only where they touch: a gap is fetched
- *   to save a read someone waits for a round trip, never for work done
- *   ahead of need.
+ *   cost round trips over HTTP/1.1. Background work (an activity marked
+ *   `background`: a gene index built over the kept rows of a subsample, the
+ *   first gene waiting for it) is priced the same way: a gap is fetched
+ *   only when it saves time, whoever waits; background work only waits
+ *   behind other work for its turn (below).
  * - **Coalescing to the link.** When more requests wait than slots are free
  *   and their round trips would take longer than their bytes, a request
  *   about to start takes its waiting neighbours with it, nearest gap first,
@@ -67,9 +68,10 @@
  */
 
 import { isByteSource } from './byte-source.js';
-import { LinkMeter } from './link.js';
-import { onAbort } from './abort.js';
+import { LinkMeter, performanceNow } from './link.js';
+import { SharedWork, onAbort } from './abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
 
 /**
  * Run `callback` on a later macrotask: after the current task and all of its
@@ -109,21 +111,20 @@ function abortError(signal) {
  * that best the smallest. Until the link is measured, the source's prior
  * gap holds.
  *
- * @param {Array<{start: number, end: number, background: boolean}>} spans
+ * @param {Array<{start: number, end: number}>} spans
  * @param {LinkMeter} link
  * @param {number} maxRequestBytes
  * @returns {number}
  */
 export function planMergeGap(spans, link, maxRequestBytes) {
   if (!link.measured || spans.length < 2) return link.mergeGapBytes;
-  // The gaps a plan may fetch (between spans someone waits for), and the
-  // requests and bytes of the plan that fetches none.
+  // The gaps a plan may fetch, and the requests and bytes of the plan that
+  // fetches none.
   const gaps = [];
   let requests = 0;
   let bytes = 0;
   let end = -Infinity;
   let start = 0;
-  let background = true;
   const close = () => {
     if (end > start) {
       requests += Math.ceil((end - start) / maxRequestBytes);
@@ -133,20 +134,19 @@ export function planMergeGap(spans, link, maxRequestBytes) {
   for (const span of spans) {
     if (span.start > end) {
       close();
-      if (end !== -Infinity && !(background && span.background)) gaps.push(span.start - end);
+      if (end !== -Infinity) gaps.push(span.start - end);
       start = span.start;
       end = span.end;
-      background = span.background;
     } else {
       end = Math.max(end, span.end);
-      background &&= span.background;
     }
   }
   close();
   if (gaps.length === 0) return 0;
   gaps.sort((left, right) => left - right);
   const concurrencies = link.concurrencies;
-  const timeOf = (count, size, concurrency) => (count / concurrency) * link.latencyMs + size / link.bytesPerMs;
+  const bandwidth = link.pricingBytesPerMs ?? link.bytesPerMs;
+  const timeOf = (count, size, concurrency) => (count / concurrency) * link.latencyMs + size / bandwidth;
   // Every plan's time under each concurrency: merging the k smallest gaps.
   const best = concurrencies.map(() => Infinity);
   const plans = [];
@@ -201,12 +201,13 @@ export function planMergeGap(spans, link, maxRequestBytes) {
  *          clock?: () => number}} [options]
  *   `head`: the file's first bytes, read already (beside the probe of its
  *   size, `probeHttpResource`) in `ms`: they fill the cache as a read of its
- *   own would, are counted as one request, and measure the link. `clock`:
+ *   own would, are counted as one request, and measure the link (and how
+ *   long its requests may stay silent, `ResponseClock`). `clock`:
  *   the time in milliseconds that the link is measured with
  *   (`performance.now`; tests give a virtual one).
  * @returns {ByteReader}
  */
-export function createByteReader(source, { policy: overrides = null, onTransfer = null, head = null, clock = () => performance.now() } = {}) {
+export function createByteReader(source, { policy: overrides = null, onTransfer = null, head = null, clock = performanceNow } = {}) {
   if (!isByteSource(source)) {
     throw new TypeError('createByteReader needs a byte source.');
   }
@@ -298,25 +299,26 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * within the link's request size.
    */
   function companionsOf(job, worthOf) {
-    if (!link.measured || job.background) return [];
-    const concurrency = link.shapingConcurrency;
-    const free = concurrency - running - 1;
+    if (!link.measured) return [];
+    // Work of one kind travels together: a read someone waits for never
+    // carries background bytes (it would wait for them), and background
+    // work is priced over its own share of the link.
+    const concurrency = job.background ? link.backgroundConcurrency : link.shapingConcurrency;
+    const free = concurrency - (job.background ? runningBackground : running) - 1;
     const reach = link.maxRequestBytes;
     let waiting = 0;
     let waitingBytes = 0;
     const near = [];
     for (const other of queue) {
-      if (other.cancelled) continue;
-      // Background work waits its turn; its bytes are never fetched as a gap.
-      if (other.background) continue;
+      if (other.cancelled || other.background !== job.background) continue;
       waiting++;
       waitingBytes += other.end - other.start;
       if (other.end >= job.start - reach && other.start <= job.end + reach) near.push(other);
     }
     const requestMs = link.latencyMs / concurrency;
-    const roundTripsOutweighBytes = () => waiting > free && waiting * requestMs > waitingBytes / link.bytesPerMs;
+    const roundTripsOutweighBytes = () => waiting > free && waiting * requestMs > waitingBytes / link.pricingBytesPerMs;
     if (near.length === 0 || !roundTripsOutweighBytes()) return [];
-    const worth = worthOf();
+    const worth = worthOf(job.background);
     near.sort((left, right) => left.start - right.start || left.end - right.end);
     let right = near.findIndex(other => other.start >= job.start);
     if (right < 0) right = near.length;
@@ -359,12 +361,11 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
       end = Math.max(end, member.end);
     }
     const background = members.every(member => member.background);
-    const carrier = { controller: new AbortController(), live: members.length };
-    for (const member of members) member.carrier = carrier;
     running++;
     runningBytes += end - start;
     if (background) runningBackground++;
-    const started = link.begin();
+    const begun = link.begin();
+    let started = begun;
     // Bytes arriving are counted to the first read's activity as they come,
     // up to that read's length, so a long request's progress stays live;
     // its completion counts the rest.
@@ -377,12 +378,27 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
       arrived += counted;
       lead.activity.fetched(counted, 0);
     };
-    source.read(start, end - start, { signal: carrier.controller.signal, link, onBytes })
+    // A read answered in part from bytes held in memory (another reader's,
+    // `range-cache.js`) took no round trip for them: it measures nothing.
+    let held = false;
+    // The request is cancelled once every read waiting on its members has
+    // withdrawn (`SharedWork`), never before.
+    const carrier = new SharedWork(signal => source.read(start, end - start, {
+      signal,
+      link,
+      onBytes,
+      onHeld: () => { held = true; },
+      // A source that asked memory first (`range-cache.js`) times the
+      // request from when it went to the host.
+      onFetch: () => { started = clock(); },
+    }));
+    for (const member of members) member.leaveCarrier = carrier.hold();
+    carrier.promise
       .then(
         bytes => {
           stats.bytes += bytes.length;
           stats.requests++;
-          link.end(started, bytes.length);
+          link.end(started, held ? null : bytes.length, begun);
           onTransfer?.({ bytes: stats.bytes, requests: stats.requests, ms: clock() - started });
           let wanted = 0;
           for (const member of members) wanted += member.end - member.start;
@@ -399,7 +415,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
           });
         },
         error => {
-          link.end(started, null);
+          link.end(started, null, begun);
           if (arrived > 0) lead.activity?.fetched(-arrived, 0);
           for (const member of members) member.reject(error);
         }
@@ -423,8 +439,9 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * not move more bytes.
    */
   function slotFree() {
-    if (running >= link.concurrency) return false;
-    if (running < link.shapingConcurrency) return true;
+    // A host that said it is busy runs fewer at once (`link.admitted`).
+    if (running >= link.admitted) return false;
+    if (running < Math.min(link.shapingConcurrency, link.admitted)) return true;
     return runningBytes < 2 * (link.roundTripBytes ?? 0);
   }
 
@@ -432,14 +449,14 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
   function pump() {
     // The gap worth fetching to save a request, priced over what waits now
     // as a plan is (`planMergeGap`), once a pump needs it.
-    let worth = null;
-    const worthOf = () => {
-      if (worth === null) {
-        const waiting = queue.filter(other => !other.cancelled && !other.background)
+    const worth = new Map();
+    const worthOf = background => {
+      if (!worth.has(background)) {
+        const waiting = queue.filter(other => !other.cancelled && other.background === background)
           .sort((left, right) => left.start - right.start || left.end - right.end);
-        worth = planMergeGap(waiting, link, link.maxRequestBytes);
+        worth.set(background, planMergeGap(waiting, link, link.maxRequestBytes));
       }
-      return worth;
+      return worth.get(background);
     };
     while (slotFree() && queue.length > 0) {
       let index = queue.findIndex(job => !job.background && !job.cancelled);
@@ -468,7 +485,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * handle that cancels it once nothing waits on it.
    */
   function enqueue(start, end) {
-    const job = { start, end, carrier: null, waiters: 0, cancelled: false, fetched: false, activity: null, background: true };
+    const job = { start, end, leaveCarrier: null, waiters: 0, cancelled: false, fetched: false, activity: null, background: true };
     job.promise = new Promise((resolve, reject) => {
       job.resolve = resolve;
       job.reject = reject;
@@ -483,7 +500,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
         job.cancelled = true;
         // Planned but never to arrive: no longer part of what is left.
         if (!job.fetched) job.activity?.planned(-(job.end - job.start));
-        if (job.carrier !== null && --job.carrier.live === 0) job.carrier.controller.abort();
+        job.leaveCarrier?.();
         job.reject(new DOMException('The read was aborted.', 'AbortError'));
       }
     };
@@ -531,15 +548,14 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
     spans.sort((left, right) => left.start - right.start || left.end - right.end);
 
     // Merge spans into requests, then split any request over the maximum.
-    // The bytes between two spans are fetched to save a request for a read
-    // someone waits for; work nobody waits for yet (background) only joins
-    // spans that touch, and never pays for a gap.
+    // The bytes between two spans are fetched when that saves time
+    // (`planMergeGap`), for background work as for any other.
     const maxRequestBytes = link.maxRequestBytes;
     const mergeGapBytes = planMergeGap(spans, link, maxRequestBytes);
     const requests = [];
     let current = null;
     for (const span of spans) {
-      const gap = current === null || (current.background && span.background) ? 0 : mergeGapBytes;
+      const gap = current === null ? 0 : mergeGapBytes;
       if (current !== null &&
           span.start - current.end <= gap &&
           Math.max(current.end, span.end) - current.start <= maxRequestBytes) {
@@ -575,7 +591,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
         const piece = spanPieces[0];
         return parts[0].subarray(start - piece.start, end - piece.start);
       }
-      const bytes = new Uint8Array(end - start);
+      const bytes = allocateTypedArray(Uint8Array, end - start, 'Read bytes');
       spanPieces.forEach((piece, index) => {
         const from = Math.max(start, piece.start);
         const to = Math.min(end, piece.end);
@@ -625,7 +641,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
             const base = read.blocks[0] * blockBytes;
             return found[0].subarray(start - base, end - base);
           }
-          const bytes = new Uint8Array(read.length);
+          const bytes = allocateTypedArray(Uint8Array, read.length, 'Read bytes');
           found.forEach((block, index) => {
             const base = read.blocks[index] * blockBytes;
             const from = Math.max(start, base);
@@ -668,7 +684,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
       const base = first * blockBytes;
       return block.subarray(offset - base, offset - base + length);
     }
-    const bytes = new Uint8Array(length);
+    const bytes = allocateTypedArray(Uint8Array, length, 'Read bytes');
     for (let index = first; index <= last; index++) {
       const block = touchBlock(index);
       const base = index * blockBytes;
@@ -692,6 +708,10 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
     stats.bytes += length;
     stats.requests++;
     link.recordRequest(head.ms, length);
+    // How long the host took to answer: the first reads are not taken for
+    // stalled sooner (a host that answers in more than the initial second,
+    // as S3's colder storage does, would have each first read asked twice).
+    link.responses.answered(head.ms);
     onTransfer?.({ bytes: stats.bytes, requests: stats.requests, ms: head.ms });
   }
 
@@ -716,11 +736,11 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
     // start, and the two are joined.
     const held = cachedEnd(offset) - offset;
     if (held > 0) {
-      const start = fromCache(offset, held).slice();
+      const start = copyTypedArray(Uint8Array, fromCache(offset, held), 'Read bytes');
       stats.cacheHits++;
       activity?.cacheHit();
       return read(offset + held, length - held, { signal, cache, activity }).then(rest => {
-        const bytes = new Uint8Array(length);
+        const bytes = allocateTypedArray(Uint8Array, length, 'Read bytes');
         bytes.set(start, 0);
         bytes.set(rest, held);
         return bytes;

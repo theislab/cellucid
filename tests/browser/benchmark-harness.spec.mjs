@@ -18,16 +18,26 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-/** The last rung of the 18-level ladder: every point, no reduction. */
+import { lodLadder } from '../../assets/js/rendering/high-perf/draw-order.js';
+import { adaptiveMinimumLevel } from '../../assets/js/rendering/high-perf/lod-levels.js';
+
+/** Small enough to stay a smoke test on a busy machine. */
+const SMOKE_POINT_COUNT = 120_000;
+/** The renderer's level-of-detail ladder for the smoke dataset, coarse to fine. */
+const SMOKE_LADDER = lodLadder(SMOKE_POINT_COUNT);
 // Two different numbers for two different things, and conflating them is what
 // this spec got wrong. `FULL_DETAIL_LADDER_INDEX` is the rung you force to ask
 // for the whole cloud. `FULL_DETAIL_REPORTED_LEVEL` is what the renderer
 // publishes once it draws it: full detail is not a reduced level, so it draws
 // from the full buffer and reports -1, exactly as the LOD membership contract
-// publishes null for it.
-const FULL_DETAIL_LADDER_INDEX = 17;
+// publishes null for it. Both rungs come from the renderer's own ladder and
+// floor, so a change to the ladder changes them with it.
+const FULL_DETAIL_LADDER_INDEX = SMOKE_LADDER.length - 1;
 const FULL_DETAIL_REPORTED_LEVEL = -1;
-const ADAPTIVE_FLOOR_LADDER_INDEX = 8;
+const ADAPTIVE_FLOOR_LADDER_INDEX = adaptiveMinimumLevel(
+  SMOKE_LADDER.map(pointCount => ({ pointCount })),
+  SMOKE_POINT_COUNT
+);
 
 const FIXTURE_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
@@ -38,8 +48,6 @@ const PROCESS_INTENSIVE = Object.freeze({
   tag: '@browser-process-intensive',
 });
 
-/** Small enough to stay a smoke test on a busy machine. */
-const SMOKE_POINT_COUNT = 120_000;
 // The measured window's length, passed into the page and asserted against on the
 // way out. A literal on each side is how `samples` came to expect 180 frames
 // from a window configured for 60.
@@ -81,7 +89,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
 
   const outcome = await page.evaluate(
-    async ({ moduleUrl, warmupFrames, measureFrames }) => {
+    async ({ moduleUrl, warmupFrames, measureFrames, adaptiveFloor, fullDetail }) => {
       const harnessModule = await import(moduleUrl);
       const viewer = window._cellucidViewer;
       const canvas = document.getElementById('glcanvas');
@@ -143,7 +151,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
         // the camera cannot: the harness has to see one level from another
         // across the whole ladder, not only the part `Auto` uses.
         const forced = [];
-        for (const forceLodLevel of [0, 8, 17]) {
+        for (const forceLodLevel of [0, adaptiveFloor, fullDetail]) {
           await runner.applyConfiguration({
             viewCount: 1,
             lod: true,
@@ -189,7 +197,9 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
     {
       moduleUrl: HARNESS_MODULE,
       warmupFrames: SMOKE_WARMUP_FRAMES,
-      measureFrames: SMOKE_MEASURE_FRAMES
+      measureFrames: SMOKE_MEASURE_FRAMES,
+      adaptiveFloor: ADAPTIVE_FLOOR_LADDER_INDEX,
+      fullDetail: FULL_DETAIL_LADDER_INDEX
     }
   );
 

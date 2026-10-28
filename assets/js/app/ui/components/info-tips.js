@@ -46,7 +46,7 @@ const TIPS = {
     title: 'Dataset',
     body: [
       'The dataset that is open: its name, cells and genes, where it is read from (format and host) and its description. Details lists its source, citation, file, size, obs fields, embeddings, layers, raw, neighbour graph, latent space and vector fields.',
-      'Data read in place from a host shows how much has been read so far. Nothing is saved to disk: what was read stays in memory and is released when the dataset closes. A read that has to be made again is said in a notification.',
+      'Data read in place from a host shows how much has been read so far; what was read stays in this tab\'s memory, so another share of the same file fetches nothing twice. Only a file that cannot be read in parts (an R object, a MatrixMarket folder, a host that serves files only whole) and the gene index of a matrix stored cell by cell are kept in this browser\'s storage, listed under Stored with Clear. A read that has to be made again is said in a notification.',
       'Sessions and community annotations are tied to this dataset’s identity, so they only restore onto the same dataset.',
     ],
     links: [
@@ -142,6 +142,27 @@ const TIPS = {
       doc('Choose a workflow', 'b_data_loading/01_loading_options_overview', 'fast-path-choose-a-workflow-decision-tree'),
     ],
   },
+  subsample: {
+    title: 'Cells to open',
+    body: [
+      'How much of a dataset is read. At 100 % every cell is; below it, a share of the cells, chosen by a seed, and everything (the view, filters, analyses, genes, exports) works on those cells alone. Over a network, less is downloaded: only the parts of the file that hold the chosen cells.',
+      {
+        list: [
+          'This file\'s default: on a file Cellucid wrote, Uniform with the file\'s own seed; on any other file, Blocks. Either way only about the chosen share of the file is read.',
+          'Blocks: whole runs of neighbouring cells, aligned to how the file stores them, so parts holding only left-out cells are never read. Cells stored next to each other (often of one sample) come together; the panel says how far its categories are from every cell\'s.',
+          'Uniform: every cell equally likely. Except on a file Cellucid wrote, with its own seed, it reads more of the file, and the panel says how much. A smaller share keeps a subset of the cells a larger one keeps, with the same seed (as Blocks does).',
+          'Stratified: every category of a field in proportion, or the same count of each (Same count per category).',
+          'Spatial: on a grid over an embedding, dense regions are thinned and sparse ones kept.',
+        ],
+      },
+      'Apply of a larger or smaller share with the same method and seed changes the open cells in place: raising reads only the added cells, lowering reads nothing, and the camera, fields, filters, highlights and labels stay (analysis results are marked Stale). Another method or seed reads the dataset again. Datasets opened next in this tab take the same share. A session saved now opens these same cells. At least 2 cells open: one has no coordinate variation to draw.',
+      'A dataset too large for this device opens with as many cells as fit (with the file\'s default), and says so; Open all cells reads every cell anyway. A link can name a subsample (cells=10%&sample=blocks&seed=0); Copy link copies one that opens exactly these cells.',
+    ],
+    links: [
+      doc('Subsampled loading', 'b_data_loading/21_subsampled_loading', 'cells-to-open'),
+      doc('How the cells are chosen', 'b_data_loading/21_subsampled_loading', 'how-the-cells-are-chosen'),
+    ],
+  },
   'local-files': {
     title: 'File or folder',
     body: [
@@ -173,7 +194,7 @@ const TIPS = {
           'Any other web address: a server when one answers there, otherwise a folder of datasets.',
         ],
       },
-      'What is connected is shown under the bar, with Disconnect. Linked data is read in place, only what each view needs, and kept in memory only; its host must allow other sites to read it (CORS).',
+      'What is connected is shown under the bar, with Disconnect. Linked data is read in place, only what each view needs; its host must allow other sites to read it (CORS). What must be read whole, and the gene index of a matrix stored cell by cell, are kept in this browser for the next visit when the host names the file\'s version.',
     ],
     links: [
       doc('The address bar', 'b_data_loading/14_open_from_link', 'the-address-bar'),

@@ -368,7 +368,7 @@ async function checkFixture(reader, expected, where, readsMore = null) {
   } else {
     assert.deepEqual(reader.obsKeys, columns, `${where}: obs columns`);
   }
-  assert.deepEqual(reader.varNames, expected.var.index, `${where}: var names`);
+  assert.deepEqual((await reader.readVarNames('X', null)).index, expected.var.index, `${where}: var names`);
   for (const column of expected.obs.columns) {
     await checkObsColumn(reader, column, `${where} obs['${column.name}']`, readsMore);
   }

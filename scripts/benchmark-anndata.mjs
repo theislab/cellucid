@@ -7,6 +7,7 @@
  *   npm run bench:anndata -- (--data DATA | --file /abs/real.h5ad) [--baseline REF]
  *     [--modes local,remote] [--files a.h5ad,b.zarr.zip] [--latency 80] [--bandwidth 50]
  *     [--protocol http/1.1|h2] [--streams 100] [--out results.json]
+ *     [--subsample '{"mode":"subsample","method":"blocks","fraction":0.1,"seed":0}']
  *
  * The files are `.h5ad`, and Zarr v2 and v3 stores, each as a folder and as
  * a ZIP (`--file` takes any other file the app opens as well: `.loom`,
@@ -56,6 +57,7 @@ const protocol = argument('--protocol', 'http/1.1');
 const streams = argument('--streams', '100');
 const baseline = argument('--baseline');
 const out = argument('--out');
+const subsample = argument('--subsample');
 
 let baselineRoot = null;
 let worktreeParent = null;
@@ -84,6 +86,7 @@ try {
           '--bandwidth', bandwidth,
           '--protocol', protocol,
           '--streams', streams,
+          ...(subsample === null ? [] : ['--subsample', subsample]),
         ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const line = run.stdout.trim().split('\n').filter(text => text.startsWith('{')).at(-1);
         const result = line ? JSON.parse(line) : {

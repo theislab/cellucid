@@ -314,6 +314,12 @@
   flex: none;
 }
 
+/* Files read whole and kept in this browser (ui/modules/kept-stores-line.js):
+   a fact, not a live connection, so no status dot. */
+.kept-stores-line .connection-kind::before {
+  content: none;
+}
+
 /* What to do about a sign-in that did not finish (an administrator's approval). */
 .connection-help {
   flex: 0 1 auto;

@@ -26,11 +26,20 @@
  *   stored in one piece (any range of it costs only its own bytes).
  *   `partialChunks` is true when a chunk's rows (along the first dimension,
  *   every later one selected whole) are fetched alone, not the whole chunk
- *   (an unfiltered HDF5 chunk): a one-dimensional range then costs only its
- *   own bytes, as if the array were stored in one piece.
+ *   (an unfiltered HDF5 chunk; a Zarr chunk stored as its values' bytes in
+ *   C order, with no compressor or filter, as a served store answers): a
+ *   one-dimensional range then costs only its own bytes, as if the array
+ *   were stored in one piece.
  *   `storedBytes` resolves to the number of stored (compressed) bytes a read
  *   of the selection fetches, so a caller can say what a read will cost
- *   before making it.
+ *   before making it, without reading more than the index it already holds:
+ *   over an HDF5 version 1 chunk B-tree whose leaves are read as needed, a
+ *   chunk whose leaf is not read yet counts the stored size of its leaf's
+ *   first chunk (held by the leaf's parent), and over a sharded Zarr v3
+ *   array whose shard indexes are not read yet, one more index is read and
+ *   the other shards' inner chunks count the mean stored size of the
+ *   indexes in hand; the answer is then an estimate (exact for unfiltered
+ *   HDF5 chunks).
  * - Both: `path` (absolute, `/` for the root), `name`, `attrs`.
  *
  * ## Attributes

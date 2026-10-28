@@ -415,15 +415,17 @@ test('a MatrixMarket matrix of several feature types opens as one modality per t
   const genes = opened.root.get('mod/Gene Expression/X');
   const peakVar = opened.root.get('mod/Peaks/var');
   assert.deepEqual([...await peakVar.get(peakVar.attrs._index).read()], ['chr1:1-100', 'chr1:200-300', 'chr2:5-50']);
+  // The store keeps its cells in priority order: row r is cell positions[r].
+  const positions = await opened.root.get('obs/cellucid_original_position').read();
   const dense = async (node, nFeatures) => {
     const indptr = await node.get('indptr').read();
     const indices = await node.get('indices').read();
     const data = await node.get('data').read();
     const out = Array.from({ length: 4 }, () => new Array(nFeatures).fill(0));
     if (node.attrs['encoding-type'] === 'csr_matrix') {
-      for (let cell = 0; cell < 4; cell++) for (let k = indptr[cell]; k < indptr[cell + 1]; k++) out[cell][indices[k]] = data[k];
+      for (let row = 0; row < 4; row++) for (let k = indptr[row]; k < indptr[row + 1]; k++) out[positions[row]][indices[k]] = data[k];
     } else {
-      for (let f = 0; f < nFeatures; f++) for (let k = indptr[f]; k < indptr[f + 1]; k++) out[indices[k]][f] = data[k];
+      for (let f = 0; f < nFeatures; f++) for (let k = indptr[f]; k < indptr[f + 1]; k++) out[positions[indices[k]]][f] = data[k];
     }
     return out;
   };

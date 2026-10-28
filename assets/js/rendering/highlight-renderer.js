@@ -1,4 +1,5 @@
 import { requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 import { CellSet } from '../app/utils/cell-set.js';
 import {
   KnnExpansion,
@@ -27,6 +28,7 @@ import {
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 import { GpuPermuter } from './high-perf/gpu-permute.js';
+import { forEachSegmentRange } from './high-perf/point-store-segments.js';
 import {
   allocateLinearTexture,
   planLinearTextureFor,
@@ -831,11 +833,12 @@ export class HighlightRenderer {
       dimensionLevel: 0,
       drawFailure: null,
       // Vertices the draw submits: the records, or every slot of the point
-      // store the highlight is drawn from (`storeBuffer`, in the order
-      // `storeSlotSources`), most of them rejected.
+      // store the highlight is drawn from (`storeBuffer`, in the store order
+      // `storeOrder`, rendering/high-perf/store-order.js), most of them
+      // rejected.
       drawCount: 0,
       storeBuffer: null,
-      storeSlotSources: null,
+      storeOrder: null,
       // The view's visibility bytes as a texture, for a draw from the store.
       visibleTexture: null,
       // What the VAO's attributes point at: the record buffer, or the store
@@ -860,6 +863,12 @@ export class HighlightRenderer {
       published: false,
       transparencyGeneration: -1,
       vertexArray: null,
+      // Drawn from a segmented point store (`point-store-segments.js`): the
+      // store's segments, and a VAO for each segment after the first
+      // (`vertexArray` is the first's), each binding that segment's
+      // positions and its run of slot words.
+      storeSegments: null,
+      segmentVertexArrays: [],
     };
   }
 
@@ -908,6 +917,9 @@ export class HighlightRenderer {
   _detachViewResources(viewBuffer) {
     const buffer = viewBuffer.buffer;
     const vertexArray = viewBuffer.vertexArray;
+    for (const extra of viewBuffer.segmentVertexArrays ?? []) this._pendingVertexArrayDeletes.add(extra);
+    viewBuffer.segmentVertexArrays = [];
+    viewBuffer.storeSegments = null;
     const visible = viewBuffer.visibleTexture ?? null;
     if (visible !== null) {
       viewBuffer.visibleTexture = null;
@@ -1013,7 +1025,7 @@ export class HighlightRenderer {
     viewBuffer.pointCount = 0;
     viewBuffer.drawCount = 0;
     viewBuffer.storeBuffer = null;
-    viewBuffer.storeSlotSources = null;
+    viewBuffer.storeOrder = null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration = transparencyGeneration;
     viewBuffer.drawSerial = ++this._drawSerials;
@@ -1388,13 +1400,22 @@ export class HighlightRenderer {
         }
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         gl.bindVertexArray(null);
+        // Written at every highlight change: checked in a later frame, so
+        // the write never waits for the GPU (`deferWebGLErrorCheck`).
         this._slotWordWriter().writeHighlightWords(
           candidateBuffer,
           store.slots,
           store.order,
           this._highlightByteTexture(exactHighlightData),
           this._visibleByteTexture(viewBuffer, exactTransparency, exactTransparencyGeneration),
-          MIN_VISIBLE_ALPHA_BYTE
+          MIN_VISIBLE_ALPHA_BYTE,
+          {
+            onError: error => {
+              // The next publication verifies again, as after any failure.
+              viewBuffer.verifiedByteLength = 0;
+              getNotificationCenter().error(`Highlights of view "${vid}" could not be written: ${error.message}`);
+            },
+          }
         );
         gl.bindVertexArray(candidateVertexArray);
         gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
@@ -1425,30 +1446,16 @@ export class HighlightRenderer {
       // new or its source changed (records, or which store).
       const layoutSource = fromStore ? store.buffer : candidateBuffer;
       if (isInitialPublication || viewBuffer.layoutSource !== layoutSource
-        || viewBuffer.layoutDimension !== exactDimensionLevel) {
+        || viewBuffer.layoutDimension !== exactDimensionLevel
+        || (fromStore && viewBuffer.storeSegments !== store.buffer.segments)) {
         if (fromStore) {
-          // The axes a store does not have read as 0, as records write them.
-          gl.bindBuffer(gl.ARRAY_BUFFER, store.buffer);
-          gl.enableVertexAttribArray(this.attribLocations.position);
-          gl.vertexAttribPointer(
-            this.attribLocations.position,
-            exactDimensionLevel,
-            gl.FLOAT,
-            false,
-            exactDimensionLevel * 4,
-            0
-          );
-          gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
-          gl.enableVertexAttribArray(this.attribLocations.color);
-          gl.vertexAttribPointer(
-            this.attribLocations.color,
-            4,
-            gl.UNSIGNED_BYTE,
-            true,
-            HIGHLIGHT_SLOT_BYTES,
-            0
-          );
+          // One VAO a store segment: the segment's positions, and its run of
+          // slot words in the one word buffer. The axes a store does not
+          // have read as 0, as records write them.
+          this._bindStoreSegmentLayouts(viewBuffer, candidateVertexArray, store.buffer, candidateBuffer, exactDimensionLevel);
+          gl.bindVertexArray(candidateVertexArray);
         } else {
+          this._releaseStoreSegmentLayouts(viewBuffer);
           gl.enableVertexAttribArray(this.attribLocations.position);
           gl.vertexAttribPointer(
             this.attribLocations.position,
@@ -1536,7 +1543,7 @@ export class HighlightRenderer {
     viewBuffer.layoutSource = fromStore ? store.buffer : viewBuffer.buffer;
     viewBuffer.layoutDimension = exactDimensionLevel;
     viewBuffer.storeBuffer = fromStore ? store.buffer : null;
-    viewBuffer.storeSlotSources = fromStore ? store.slotSources : null;
+    viewBuffer.storeOrder = fromStore ? store.order : null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration =
       exactTransparencyGeneration;
@@ -1675,6 +1682,49 @@ export class HighlightRenderer {
   }
 
   /**
+   * Bind one VAO a segment of the point store `positions`
+   * (`point-store-segments.js`): `first` (the view's own VAO) for the first
+   * segment, a VAO of `viewBuffer.segmentVertexArrays` for each later one,
+   * each reading that segment's positions and the segment's run of slot words
+   * in `words` (one 4-byte word a slot, from the segment's first slot).
+   * Leaves no VAO bound.
+   * @private
+   */
+  _bindStoreSegmentLayouts(viewBuffer, first, positions, words, dimension) {
+    const gl = this.gl;
+    const segments = positions.segments;
+    const extras = viewBuffer.segmentVertexArrays ?? [];
+    while (extras.length > segments.length - 1) this._pendingVertexArrayDeletes.add(extras.pop());
+    while (extras.length < segments.length - 1) {
+      const vao = gl.createVertexArray();
+      if (!vao) throw new Error('Unable to allocate a highlight vertex array for a point-store segment.');
+      extras.push(vao);
+    }
+    viewBuffer.segmentVertexArrays = extras;
+    for (let index = 0; index < segments.length; index++) {
+      gl.bindVertexArray(index === 0 ? first : extras[index - 1]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, segments[index].buffer);
+      gl.enableVertexAttribArray(this.attribLocations.position);
+      gl.vertexAttribPointer(this.attribLocations.position, dimension, gl.FLOAT, false, dimension * 4, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, words);
+      gl.enableVertexAttribArray(this.attribLocations.color);
+      gl.vertexAttribPointer(
+        this.attribLocations.color, 4, gl.UNSIGNED_BYTE, true, HIGHLIGHT_SLOT_BYTES,
+        segments[index].first * HIGHLIGHT_SLOT_BYTES
+      );
+    }
+    gl.bindVertexArray(null);
+    viewBuffer.storeSegments = segments;
+  }
+
+  /** Release the per-segment VAOs of a view no longer drawn from a store. @private */
+  _releaseStoreSegmentLayouts(viewBuffer) {
+    for (const extra of viewBuffer.segmentVertexArrays ?? []) this._pendingVertexArrayDeletes.add(extra);
+    viewBuffer.segmentVertexArrays = [];
+    viewBuffer.storeSegments = null;
+  }
+
+  /**
    * The view's point store, when the highlights can be drawn from it: it
    * holds exactly `positions` (`dimension` components a point) and, with a
    * reduced level of detail, the level's members are its first slots, in
@@ -1685,19 +1735,18 @@ export class HighlightRenderer {
     const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
     if (store === null || store.positions !== positions || store.dimension !== dimension) return null;
     if (membership === null) {
-      return {
-        buffer: store.buffer,
-        slotSources: store.slotSources,
-        order: store.order,
-        slots: positions.length / dimension,
-      };
+      return { buffer: store.buffer, order: store.order, slots: positions.length / dimension };
     }
     const prefix = membership.indices;
-    const sources = store.slotSources;
-    if (sources === null || prefix.buffer !== sources.buffer || prefix.byteOffset !== sources.byteOffset) {
-      return null;
+    // Levels drawn by rank are the store's first slots in any order it holds
+    // (`RankLevels`); a tree's level is a prefix of the order it drew from.
+    if (membership.slotPrefix !== true) {
+      const sources = store.order?.drawOrder?.indices ?? null;
+      if (sources === null || prefix.buffer !== sources.buffer || prefix.byteOffset !== sources.byteOffset) {
+        return null;
+      }
     }
-    return { buffer: store.buffer, slotSources: sources, order: store.order, slots: prefix.length };
+    return { buffer: store.buffer, order: store.order, slots: prefix.length };
   }
 
   /** The transform-feedback pass that writes slot words (created on first use). @private */
@@ -1771,7 +1820,7 @@ export class HighlightRenderer {
     const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
     return store === null
       || store.buffer !== viewBuffer.storeBuffer
-      || store.slotSources !== viewBuffer.storeSlotSources;
+      || store.order !== viewBuffer.storeOrder;
   }
 
   /**
@@ -2128,8 +2177,17 @@ export class HighlightRenderer {
 
       // Attribute layout is immutable for the lifetime of the resource pair;
       // each frame needs one VAO bind instead of reconfiguring two attributes.
-      gl.bindVertexArray(vertexArray);
-      drawPointsInSegments(gl, 0, drawCount);
+      const segments = (viewBuffer.storeBuffer ?? null) !== null ? (viewBuffer.storeSegments ?? null) : null;
+      if (segments === null) {
+        gl.bindVertexArray(vertexArray);
+        drawPointsInSegments(gl, 0, drawCount);
+      } else {
+        // One draw a store segment the drawn slots reach, in slot order.
+        forEachSegmentRange(segments, 0, drawCount, (index, localFirst, localCount) => {
+          gl.bindVertexArray(index === 0 ? vertexArray : viewBuffer.segmentVertexArrays[index - 1]);
+          drawPointsInSegments(gl, localFirst, localCount);
+        });
+      }
     } catch (error) {
       drawFailure = error;
     } finally {

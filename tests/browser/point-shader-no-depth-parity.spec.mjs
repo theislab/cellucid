@@ -167,7 +167,7 @@ test('the no-depth point shaders draw what discarding draws where they write zer
       gl.uniform3f(uniform('u_fogColor'), 0.9, 0.9, 0.95);
       gl.uniform1f(uniform('u_invCenterShade'), 1 / shaders.sculptedCenterShade([0.48, 0.67, 0.48]));
       gl.uniform1i(uniform('u_useAlphaTex'), 0);
-      gl.uniform1i(uniform('u_useLodIndexTex'), 0);
+      gl.uniform1i(uniform('u_orderedSlots'), 0);
       gl.uniform1i(uniform('u_lodIndexTex'), 1);
       gl.bindVertexArray(vao);
       gl.drawArrays(gl.POINTS, 0, count);

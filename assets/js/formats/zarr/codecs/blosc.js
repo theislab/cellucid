@@ -8,7 +8,14 @@
  * to split, so similar bytes compress together), each stream compressed with
  * the frame's codec (blosclz, lz4/lz4hc, zlib or zstd; snappy is refused) or
  * stored as is, and the block is then un-shuffled (byte shuffle, or bit
- * shuffle).
+ * shuffle). A frame whose header sets the delta flag (`0x08`) is then
+ * un-deltaed (`undoDelta`).
+ *
+ * Refused, as the format defines them but this reader does not decode them:
+ * the snappy codec; a blosclz or LZ4 stream format other than 1; and Blosc2
+ * chunks (format version 3 and later: the extended header, its filter
+ * pipeline -- truncated precision, byte delta, dictionaries -- and special
+ * values), which numcodecs' Blosc never writes.
  *
  * The header is the authority on how a frame was written; the codec's
  * metadata (`cname`, `shuffle`, `blocksize`) only records what the writer
@@ -29,6 +36,11 @@ const HEADER_BYTES = 16;
 const DO_SHUFFLE = 0x01;
 const MEMCPYED = 0x02;
 const DO_BITSHUFFLE = 0x04;
+/**
+ * The delta filter (`BLOSC_DODELTA`): c-blosc2's, applied before the shuffle
+ * (`flags_to_filters`); c-blosc 1, numcodecs' and python-blosc's, has none.
+ */
+const DO_DELTA = 0x08;
 const DONT_SPLIT = 0x10;
 /** Blosc splits a block into per-byte streams only for elements this small... */
 const MAX_SPLITS = 16;
@@ -251,5 +263,29 @@ export async function bloscDecode(input, expectedSize) {
     }
   }
   await Promise.all(pending);
+  if ((flags & DO_DELTA) !== 0) undoDelta(output, blocksize, typesize);
   return output;
+}
+
+/**
+ * Undo Blosc's delta filter (c-blosc2 `delta_decoder`) over a decoded,
+ * un-shuffled frame, in place. The first block was stored as each element
+ * XORed with the one before it; every later block as each byte XORed with
+ * the first block's byte at the same place. Elements are words of the
+ * element size for 1, 2, 4 and 8 bytes, of 8 bytes for other multiples of
+ * 8, and bytes otherwise (a block is a whole number of elements, so no tail
+ * is left over).
+ */
+function undoDelta(output, blocksize, typesize) {
+  const word = typesize === 1 || typesize === 2 || typesize === 4 || typesize === 8 ? typesize : typesize % 8 === 0 ? 8 : 1;
+  const first = Math.min(blocksize, output.length);
+  const whole = first - (first % word);
+  // The first block: a running XOR of whole words, in place.
+  for (let at = word; at < whole; at++) output[at] ^= output[at - word];
+  // Every later block against the first, decoded above.
+  for (let start = blocksize; start < output.length; start += blocksize) {
+    const size = Math.min(blocksize, output.length - start);
+    const end = start + size - (size % word);
+    for (let at = start; at < end; at++) output[at] ^= output[at - start];
+  }
 }

@@ -223,7 +223,6 @@ function mockAdapter(arrays) {
     nObs: 3,
     reads: 0,
     obsKeys: [],
-    varNames: [],
     hasExpressionMatrix: false,
     async getDatasetMetadata() {
       return loaderMetadata({ nObs: 3, obsm: widths });

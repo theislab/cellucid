@@ -343,7 +343,8 @@ export class ComparisonModule {
     const subscriptions = [
       ['page:changed', () => this.onPagesChanged()],
       ['highlight:changed', () => this.onHighlightChanged()],
-      ['visibility:changed', () => this.onCellVisibilityChanged()]
+      ['visibility:changed', () => this.onCellVisibilityChanged()],
+      ['genes:listed', () => this.onGenesListed()]
     ];
     try {
       for (const [eventName, handler] of subscriptions) {
@@ -740,6 +741,16 @@ export class ComparisonModule {
   onCellVisibilityChanged() {
     this._uiManager.onCellVisibilityChanged();
     this._analysisWindowManager.onCellVisibilityChanged();
+  }
+
+  /**
+   * The gene list of the dataset shown was read after its first view (or
+   * could not be): every analysis that showed its genes loading lists them,
+   * in the panel and in every window.
+   */
+  onGenesListed() {
+    this._uiManager.onGenesListed();
+    this._analysisWindowManager.onGenesListed();
   }
 
   // ===========================================================================

@@ -117,6 +117,9 @@ test('an opening whose reader never answers says what it waits on, and the page 
         asked: [],
         terminated: false,
         postMessage(message) {
+          // The ports a reader is handed as it starts (the page's range
+          // cache, a widget's host) ask nothing of it.
+          if (message?.rangeCachePort !== undefined || message?.hostRequesterPort !== undefined) return;
           this.asked.push(message?.method ?? Object.keys(message ?? {}).join(','));
         },
         terminate() {

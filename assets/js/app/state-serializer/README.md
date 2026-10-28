@@ -221,11 +221,13 @@ that are on (`embeddings.enabled`, any number of each dimension), the default
 of each dimension (`embeddings.defaults`), the vector bindings, the neighbour
 graph, gene names, expression matrix and latent space. It is resolved
 once per load by `data/dataset-mapping.js` (from the AnnData candidate catalog
-of the `.h5ad` or Zarr file opened in the browser, or of the object a Python
-server serves) and changed in the
-Session › Data mapping panel (`state/managers/mapping-manager.js`). The panel
-changes only the embeddings (which are on, and each dimension's default); the
-other groups are fixed for the session.
+of the file opened in the browser, or of the file a Python or R server
+serves) and changed in the Session › Data mapping panel
+(`state/managers/mapping-manager.js`, `mapping-groups.js`). A dataset is
+shown before its gene names are read: its mapping's `geneNames` is null until
+its gene list is listed (`state/managers/var-axis.js`), and capture and
+restore wait for it (`whenGenesListed`), so `varCount` and `dataMapping` are
+always those of the named gene list.
 
 `cellOrder.embedding` names the layout the live view shows: an AnnData `obsm`
 key with its 0-based columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3.

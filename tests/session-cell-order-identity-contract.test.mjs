@@ -988,6 +988,22 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
   );
 });
 
+test('a published starting view applies to any subsample of its dataset; another session names its cells', async () => {
+  const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
+  const source = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  const saved = fingerprintOf(source);
+  const ctx = state => ({ dataSourceManager: makeDataSourceManager(), state });
+  // Four of the six cells open (fitted to the device, or named in the link).
+  const subsample = makeDatasetState({ cellOrder: [0, 1, 2, 3], pages: emptyPages() });
+  subsample.cellIdentity = createCellIdentity({ nObs: 6, kept: Uint32Array.of(0, 2, 3, 5) });
+  assert.equal(await verifySessionFingerprint(ctx(subsample), saved, { profile: 'published-default' }), null);
+  // A user session saved on every cell is restored on every cell (its cells are opened first).
+  assert.match(await verifySessionFingerprint(ctx(subsample), saved), /6 cells and 4 genes when it was saved, 4 cells/);
+  // A subsample of another dataset (another cell count) is still refused.
+  subsample.cellIdentity = createCellIdentity({ nObs: 7, kept: Uint32Array.of(0, 2, 3, 5) });
+  assert.match(await verifySessionFingerprint(ctx(subsample), saved, { profile: 'published-default' }), /different dataset/);
+});
+
 test(
   'a re-computed embedding at the same dimension is not called a re-ordering',
   async () => {

@@ -91,3 +91,56 @@ test('the CSV export operation writes the lines of its rows, and refuses unknown
   );
   assert.throws(() => perCellCSVHeader('page-data'), /variable name/);
 });
+
+test('cell_index names a cell by its original position, rows ascending, whatever cells are open and in what order', async () => {
+  const { pageInOriginalOrder } = await import('../assets/js/app/analysis/compute/csv-export.js');
+  const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
+  const { orderedCellIdentity } = await import('./helpers/ordered-cell-identity.mjs');
+  const cellsOf = (page, identity) => {
+    const out = pageInOriginalOrder(page, identity);
+    return { cells: out.cellIndices === null ? null : [...out.cellIndices], values: [...out.values] };
+  };
+  // Every cell open in its original order: the rows as they are.
+  const whole = createCellIdentity({ nObs: 5 });
+  assert.deepEqual(cellsOf({ values: [1, 2, 3, 4, 5] }, whole), { cells: null, values: [1, 2, 3, 4, 5] });
+  assert.deepEqual(cellsOf({ values: [1, 2], cellIndices: [3, 4] }, whole), { cells: [3, 4], values: [1, 2] });
+  // A subsample: open cell i is original position kept[i].
+  const subset = createCellIdentity({ nObs: 10, kept: Uint32Array.of(1, 4, 6, 9) });
+  assert.deepEqual(cellsOf({ values: [5, 6, 7, 8] }, subset), { cells: [1, 4, 6, 9], values: [5, 6, 7, 8] });
+  assert.deepEqual(cellsOf({ values: ['a', 'b'], cellIndices: Uint32Array.of(3, 0) }, subset), { cells: [1, 9], values: ['b', 'a'] });
+  // Every cell open in priority order (open cell i is [4, 0, 3, 1, 2][i]): ascending, values with their cells.
+  const priority = orderedCellIdentity({ nObs: 5 });
+  assert.deepEqual(cellsOf({ values: [40, 0, 30, 10, 20] }, priority), { cells: null, values: [0, 10, 20, 30, 40] });
+  assert.deepEqual(cellsOf({ values: [7, 8], cellIndices: [0, 3] }, priority), { cells: [1, 4], values: [8, 7] });
+  // A subsample opened in priority order.
+  const ordered = orderedCellIdentity({ nObs: 10, kept: [1, 4, 6, 9] });
+  assert.deepEqual(cellsOf({ values: [9, 1, 6, 4] }, ordered), { cells: [1, 4, 6, 9], values: [1, 4, 6, 9] });
+  // The rows written are the translated ones.
+  const page = pageInOriginalOrder({ pageName: 'P', values: [7, 8], cellIndices: [0, 3] }, priority);
+  assert.equal(await perCellCSVRows('page-data', [page]).text(), 'P,1,8\nP,4,7');
+  assert.throws(() => pageInOriginalOrder({ values: [] }, null), /cell identity/);
+});
+
+test('DE and marker tables name genes by identifier, the shown name beside it when they differ', async () => {
+  const { geneNameColumns, markerStatisticsCSV } = await import('../assets/js/app/analysis/compute/csv-export.js');
+  // A file whose var index is the shown name: one column, as scanpy writes it.
+  const same = geneNameColumns(['CD3E', 'MS4A1'], ['CD3E', 'MS4A1']);
+  assert.equal(same.header, 'names');
+  assert.equal(same.cells(1), 'MS4A1');
+  // A CELLxGENE file: Ensembl ids in the var index, symbols shown.
+  const ids = ['ENSG00000198851', 'ENSG00000156738'];
+  const both = geneNameColumns(['CD3E', 'MS4A1'], ids);
+  assert.equal(both.header, 'names,symbols');
+  assert.equal(both.cells(0), 'ENSG00000198851,CD3E');
+  assert.throws(() => geneNameColumns(['CD3E'], []), /identifier/);
+  const lane = values => [Float32Array.from(values)];
+  const csv = await markerStatisticsCSV({
+    genes: ['CD3E', 'MS4A1'], ids,
+    groups: [{ name: 'T', tested: true, small: false }],
+    scores: lane([2, 1]), logfoldchanges: lane([1, 0.5]), pvals: [Float64Array.of(0.01, 0.2)], pvalsAdj: [Float64Array.of(0.02, 0.2)],
+    pctIn: lane([50, 10]), pctRef: lane([5, 5]), auroc: lane([0.9, 0.6]),
+  }).text();
+  const [header, first] = csv.split('\n');
+  assert.equal(header, 'group,names,symbols,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');
+  assert.match(first, /^T,ENSG00000198851,CD3E,2,/);
+});

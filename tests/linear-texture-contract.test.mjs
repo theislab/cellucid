@@ -133,16 +133,25 @@ test('row writes place every item at its texel across layer boundaries, partial 
   }
 });
 
-test('every per-cell texture of the point renderer, its permute pass and figure export is a linear texture', () => {
+test('every per-cell texture of the point renderer, its permute pass, the velocity overlay and figure export is a linear texture', () => {
   const sources = [
     'assets/js/rendering/high-perf-renderer.js',
     'assets/js/rendering/high-perf/gpu-permute.js',
     'assets/js/rendering/shaders/high-perf-shaders.js',
+    // The velocity overlay's per-cell textures (field, positions, visibility,
+    // spawn table): linear too, so no MAX_TEXTURE_SIZE^2 cap on cells.
+    'assets/js/rendering/overlays/shared/packed-texture.js',
   ].map(path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8'));
   for (const source of sources) {
     assert.doesNotMatch(source, /texStorage2D|texImage2D\(\s*gl\.TEXTURE_2D,\s*0,\s*gl\.(R8|R32UI)/);
     assert.doesNotMatch(source, /usampler2D u_|sampler2D u_alphaTex/);
   }
+  assert.doesNotMatch(sources.at(-1), /texImage2D|texSubImage2D|TEXTURE_BINDING_2D\b/);
+  const velocity = readFileSync(new URL('../assets/js/rendering/overlays/velocity/velocity-shaders.js', import.meta.url), 'utf8');
+  for (const sampler of ['u_velocityTex', 'u_positionTex', 'u_spawnTableTex', 'u_alphaTex']) {
+    assert.match(velocity, new RegExp(`sampler2DArray ${sampler};`), sampler);
+  }
+  assert.doesNotMatch(velocity, /TexWidth|u_spawnTableWidth/);
 });
 
 test('a point draw leaves no per-point texture bound, so a texture deleted later is never rebound', async () => {

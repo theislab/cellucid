@@ -18,6 +18,7 @@
  */
 
 import { panelLetter } from './panel-label.js';
+import { formatCount } from '../../../../../utils/format-units.js';
 
 /**
  * @typedef {object} ProvenanceView
@@ -117,6 +118,25 @@ export function readProvenanceSourceFile(meta) {
 }
 
 /**
+ * The cells a figure shows when they are a subsample of the dataset: a
+ * figure of a share of the cells must say so, or it is read as the whole
+ * dataset. Null when every cell is open.
+ *
+ * @param {any} meta
+ * @returns {{open: number, of: number, method: string, digest: string}|null}
+ */
+export function readProvenanceCells(meta) {
+  const cells = meta?.datasetCells ?? null;
+  if (cells === null) return null;
+  const { open, of, method, digest } = cells;
+  if (!(Number.isSafeInteger(open) && Number.isSafeInteger(of) && open >= 0 && open < of)
+    || typeof method !== 'string' || typeof digest !== 'string') {
+    throw new TypeError('Figure export metadata must describe a subsample as {open, of, method, digest}.');
+  }
+  return { open, of, method, digest };
+}
+
+/**
  * Human-readable provenance summary embedded as the SVG `dc:description` and
  * the PNG `Description` chunk.
  *
@@ -140,6 +160,10 @@ export function buildProvenanceDescription(meta) {
   });
 
   const parts = [`Views: ${clauses.join(' | ')}`];
+  const cells = readProvenanceCells(meta);
+  if (cells !== null) {
+    parts.push(`Cells: a subsample, ${formatCount(cells.open)} of ${formatCount(cells.of)} (${cells.method}; cell set ${cells.digest})`);
+  }
   const sourceFile = readProvenanceSourceFile(meta);
   if (sourceFile) parts.push(`Source: ${sourceFile}`);
   return parts.join(' • ');
@@ -175,6 +199,8 @@ export function buildProvenanceJson(meta, payload, format) {
           url: meta?.datasetSourceUrl || null,
           citation: meta?.datasetSourceCitation || null,
         },
+        // A subsample's open cells, of the dataset's; null for every cell.
+        cells: readProvenanceCells(meta),
       },
       views: views.map((view, index) => ({
         panel: multiPanel ? panelLetter(index) : null,

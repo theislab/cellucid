@@ -611,3 +611,37 @@ test('vector loading source contains no coercion, repair, or magnitude substitut
     /field\.maxMagnitude === 0 \? 0 : 1\.0 \/ field\.maxMagnitude/
   );
 });
+
+test('a load under way is shared only by callers of the same open cells, and is work on them', async () => {
+  const { cellWorkRunning } = await import('../assets/js/data/open-cells-work.js');
+  const reads = [];
+  const releases = [];
+  const adapter = {
+    async getVectorPayload() {
+      reads.push(reads.length);
+      await new Promise(resolve => releases.push(resolve));
+      return { vectors: new Float32Array([3, 4, 0, 0]), maxMagnitude: 5 };
+    },
+  };
+  await withActiveAdapter(adapter, async () => {
+    const options = managerOptions({
+      obsm: { X_umap: 2, velocity_umap: 2 },
+      bindings: [['velocity_umap', 'X_umap', [0, 1]]],
+      manager: dimensionManager({ positionsByLayout: { X_umap: new Float32Array([0, 0, 1, 1]) } }),
+    });
+    options.dimensionManager.nCells = 2;
+    const manager = new VectorFieldManager(options);
+    const first = manager.loadField('velocity', 'X_umap');
+    const joined = manager.loadField('velocity', 'X_umap');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(reads.length, 1, 'the same cells: one read');
+    assert.equal(cellWorkRunning(), true, 'a change of the open cells waits for it');
+    // The open cells changed (grown in place): a new caller reads for them.
+    options.dimensionManager.nCells = 4;
+    const later = manager.loadField('velocity', 'X_umap');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(reads.length, 2, 'other cells: another read');
+    for (const release of releases) release();
+    await Promise.all([first, joined, later]);
+  });
+});

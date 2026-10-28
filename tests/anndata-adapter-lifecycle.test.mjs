@@ -5,7 +5,6 @@ import test from 'node:test';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import {
   MappingLoadError,
-  assembleAnnDataCandidates,
   describeAnnDataProbes,
   resolveVectorBinding,
 } from '../assets/js/data/data-mapping-candidates.js';
@@ -119,7 +118,10 @@ function installPrivateCoordinateResolution(adapter, { obsm, embeddings, nVars =
   for (const ref of embeddings) slots[`${ref.columns.length}d`] = ref;
   adapter._describedObsm = described.obsm;
   adapter._slots = Object.freeze(slots);
-  adapter._candidates = assembleAnnDataCandidates(described, { slots, guessed: [] });
+  // As initialize() leaves it: the catalog of what was described, its gene
+  // names guessed when a gene route first asks (`guessGeneNames`).
+  adapter._catalogInputs = { described, resolution: { slots, guessed: [] } };
+  adapter._assembleGuessedCandidates();
   adapter._identityEmbeddings = embeddings.map(ref => ({
     id: canonicalEmbeddingId(ref.key, ref.columns, { width: obsm[ref.key] }),
     dimension: ref.columns.length,
@@ -913,7 +915,6 @@ test('initialize rejects non-finite embedding components before anything is cach
     nObs: 2,
     nVars: 0,
     obsKeys: [],
-    varNames: [],
     async getDatasetMetadata() {
       return {
         stats: {

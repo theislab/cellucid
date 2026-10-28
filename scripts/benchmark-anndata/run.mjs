@@ -192,13 +192,28 @@ async function folderFiles(folder) {
 // ------------------------------------------------------- the implementation
 
 const worker = await import(pathToFileURL(path.join(root, 'assets/js/data/anndata-reader-worker.js')).href);
+const { PieceReceiver } = await import(pathToFileURL(path.join(root, 'assets/js/utils/large-arrays.js')).href);
 const earlier = argument('--implementation', 'current') === 'earlier';
-const handle = worker.createAnnDataReaderHandler({ post: () => {} });
+// Which cells to open (`data/anndata/subsample-plan.js`): every cell unless
+// `--subsample '{"mode":"subsample",...}'` names a subsample.
+const cellSubset = JSON.parse(argument('--subsample', '{"mode":"all"}'));
+// Arrays posted in pieces before a reply (`utils/large-arrays.js`), by request.
+const pieces = new Map();
+const handle = worker.createAnnDataReaderHandler({
+  post: message => {
+    if (message.event !== 'piece') return;
+    if (!pieces.has(message.id)) pieces.set(message.id, new PieceReceiver());
+    pieces.get(message.id).receive(message);
+  },
+});
 let nextId = 1;
 async function call(method, ...args) {
-  const { reply } = await handle({ id: nextId++, method, args });
+  const id = nextId++;
+  const { reply } = await handle({ id, method, args });
+  const received = pieces.get(id) ?? new PieceReceiver();
+  pieces.delete(id);
   if (reply.error) throw new Error(`${method}: ${reply.error.message}`);
-  return reply.result;
+  return received.resolve(reply.result);
 }
 
 let source;
@@ -226,7 +241,8 @@ async function step(label, operation) {
 
 const result = { implementation: earlier ? 'earlier' : 'current', file: name, mode, latencyMs, protocol, steps, error: null };
 try {
-  const snapshot = await step('open', () => call('open', { source }));
+  const snapshot = await step('open', () => call('open', { source, cellSubset }));
+  result.cells = { open: snapshot.nObs, stored: snapshot.cellSubset?.nObs ?? snapshot.nObs, spec: snapshot.cellSubset?.spec ?? null };
   await call('prepareMatrix', 'X');
   const metadata = await step('metadata', () => call('getDatasetMetadata'));
   const probes = await call('probeMapping');

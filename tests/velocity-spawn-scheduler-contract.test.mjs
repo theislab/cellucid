@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 import {
   VelocityOverlay,
@@ -23,13 +24,11 @@ function createSpawnState(version = 1) {
     notificationId: null,
     ready: false,
     tableSize: 1,
-    tableWidth: 1,
-    textureInfo: { height: 1, texture: { id: 'old-spawn' }, width: 1 },
+    textureInfo: { texture: { id: 'old-spawn' }, plan: planLinearTexture(1, 4096, 256) },
     version,
     visibilityTextureInfo: {
-      height: 1,
       texture: { id: 'old-visibility' },
-      width: 1,
+      plan: planLinearTexture(1, 4096, 256),
     },
   };
 }
@@ -81,8 +80,9 @@ function createSpawnTextureGl() {
     R32UI: 0x8236,
     RED: 0x1903,
     RED_INTEGER: 0x8d94,
-    TEXTURE_2D: 0x0de1,
-    TEXTURE_BINDING_2D: 0x8069,
+    TEXTURE_2D_ARRAY: 0x8c1a,
+    TEXTURE_BINDING_2D_ARRAY: 0x8c1d,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_WRAP_S: 0x2802,
@@ -98,7 +98,8 @@ function createSpawnTextureGl() {
       pixelUnpackBuffer = value;
     },
     bindTexture(target, value) {
-      assert.equal(target, this.TEXTURE_2D);
+      // Per-cell textures are linear textures (2D arrays).
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
       binding = value;
     },
     createTexture() {
@@ -122,7 +123,8 @@ function createSpawnTextureGl() {
     },
     getParameter(parameter) {
       if (parameter === this.MAX_TEXTURE_SIZE) return 4096;
-      if (parameter === this.TEXTURE_BINDING_2D) return binding;
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
+      if (parameter === this.TEXTURE_BINDING_2D_ARRAY) return binding;
       if (parameter === this.UNPACK_ALIGNMENT) return unpackAlignment;
       if (parameter === this.PIXEL_UNPACK_BUFFER_BINDING) {
         return pixelUnpackBuffer;
@@ -136,9 +138,9 @@ function createSpawnTextureGl() {
       assert.equal(parameter, this.UNPACK_ALIGNMENT);
       unpackAlignment = value;
     },
-    texImage2D() {},
+    texStorage3D() {},
     texParameteri() {},
-    texSubImage2D() {},
+    texSubImage3D() {},
   };
   return { deleteCalls, gl, textures };
 }
@@ -286,7 +288,6 @@ test('all-hidden velocity generations complete across idle slices without publis
     assert.equal(state.ready, true);
     assert.equal(state.generation, 4);
     assert.equal(state.tableSize, 0);
-    assert.equal(state.tableWidth, 1);
     assert.equal(state.textureInfo, null);
     assert.equal(state.visibilityTextureInfo, null);
     assert.deepEqual(
@@ -679,10 +680,10 @@ test('a rebuild whose tables keep their shape rewrites them in place in one slic
     const visibilityTexture = fixture.gl.createTexture();
     const spawnTexture = fixture.gl.createTexture();
     state.visibilityTextureInfo = {
-      components: 1, height: 1, texture: visibilityTexture, width: 1,
+      components: 1, texture: visibilityTexture, plan: planLinearTexture(1, 4096, 256),
     };
     state.textureInfo = {
-      components: 1, height: 1, texture: spawnTexture, width: 1,
+      components: 1, texture: spawnTexture, plan: planLinearTexture(1, 4096, 256),
     };
     const overlay = createSpawnOverlay(state);
     overlay.gl = fixture.gl;

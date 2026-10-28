@@ -53,6 +53,7 @@ test('the device estimate takes what the browser reports, and the heap limit pas
 test('budgets are shares only: no floor and no ceiling of their own', () => {
   assert.equal(residencyBudgetBytes('positions', { navigator: { deviceMemory: 2 } }), 128 * MiB);
   assert.equal(residencyBudgetBytes('columnIndex', { performance: { memory: { jsHeapSizeLimit: 16 * GiB } } }), 12 * GiB);
+  assert.equal(residencyBudgetBytes('fetchedRanges', { performance: { memory: { jsHeapSizeLimit: 16 * GiB } } }), GiB);
   assert.throws(() => residencyBudgetBytes('unknown'), /Unknown residency budget/);
 });
 

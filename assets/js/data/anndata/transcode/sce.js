@@ -38,6 +38,7 @@ import {
 import { cellsByFeatures, describeMatrix } from './r-matrices.js';
 import { RObjectRefusal } from './refusals.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
 
 /** Whether a parsed object is a SummarizedExperiment (or a class extending it). */
 export function isSummarizedExperiment(node) {
@@ -132,15 +133,18 @@ async function selfHitsGraph(hits, nCells, context) {
   const from = await vectorValues(attribute(hits, 'from'), context);
   const to = await vectorValues(attribute(hits, 'to'), context);
   if (from === null || to === null) return null;
+  // The weights are the first metadata column, whatever its name, as
+  // SingleCellExperiment reads them (`.hits2mat`): `colPair<-` of a sparse
+  // matrix names it `x`, a SelfHits made by hand often `value`; none is 1.
   const metadata = await dataFrameOf(attribute(hits, 'elementMetadata'), context);
-  const weights = metadata?.columns.find(column => column.name === 'value')?.node ?? null;
+  const weights = metadata?.columns[0]?.node ?? null;
   const values = weights === null ? null : await vectorValues(weights, context);
-  const indptr = new Int32Array(nCells + 1);
+  const indptr = allocateTypedArray(Int32Array, nCells + 1, 'Graph indptr');
   for (let k = 0; k < from.length; k++) indptr[from[k]]++;
   for (let c = 0; c < nCells; c++) indptr[c + 1] += indptr[c];
-  const next = indptr.slice(0, nCells);
-  const indices = new Int32Array(from.length);
-  const data = new Float64Array(from.length);
+  const next = copyTypedArray(Int32Array, indptr.subarray(0, nCells), 'Graph indptr');
+  const indices = allocateTypedArray(Int32Array, from.length, 'Graph indices');
+  const data = allocateTypedArray(Float64Array, from.length, 'Graph values');
   // SelfHits are sorted by `from`, then `to`: one pass places them.
   for (let k = 0; k < from.length; k++) {
     const at = next[from[k] - 1]++;

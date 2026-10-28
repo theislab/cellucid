@@ -168,7 +168,7 @@ async function readEverything(t, fixturePath) {
 
   const genes = {};
   for (const name of Object.keys(EXPECTED.genes)) {
-    const index = loader.varNames.indexOf(name);
+    const index = (await loader.readVarNames('X', null)).index.indexOf(name);
     assert.notEqual(index, -1, `gene ${name} is on the var index`);
     genes[name] = Array.from(await loader.getMatrixColumn('X', index));
   }

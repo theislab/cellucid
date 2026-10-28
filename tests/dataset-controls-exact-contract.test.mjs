@@ -442,6 +442,7 @@ function makeHarness(catalog) {
     dom,
     manager,
     reloads,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: async selection => {
       reloads.push(selection);
       await manager.switchToDataset(
@@ -536,6 +537,7 @@ test('dataset teardown drains a rejected reload without publishing stale UI', as
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: () => reload.promise,
     callbacks: harness.callbacks
   });
@@ -610,6 +612,7 @@ test('catalog keeps None explicit and distinguishes equal ids across sources', a
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -639,6 +642,7 @@ test('an empty catalog publishes the exact ready outcome and leaves None usable'
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -687,6 +691,7 @@ test('an older catalog request publishes superseded without disturbing the newer
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -725,6 +730,7 @@ test('catalog failure remains visible and disables ambiguous selection', async t
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -763,6 +769,7 @@ test('catalog publication replaces an in-flight exact dataset event atomically',
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -800,6 +807,7 @@ test('selection reloads in place and None clears every exact runtime owner', asy
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -880,6 +888,7 @@ test('a superseded None selection remains owned by the newer dataset intent', as
     clearDataset: async () => {
       throw superseded;
     },
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -929,6 +938,7 @@ test('an older DOM selection settlement cannot mutate a newer pending selection'
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
     reloadDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     callbacks: harness.callbacks
   });
   assert.deepEqual(await controls.catalogReady, { status: 'ready' });
@@ -1001,6 +1011,7 @@ test('selecting the committed dataset retires an older pending DOM intent', asyn
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: () => pending.promise,
     callbacks: harness.callbacks
   });
@@ -1049,6 +1060,7 @@ test('DOM switch failure rolls back selection and preserves terminal error styli
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1090,6 +1102,7 @@ test('DOM None and malformed failures preserve rollback error styling', async t 
     clearDataset: async () => {
       throw new Error('clear rejected');
     },
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1137,6 +1150,7 @@ test('terminal switch and malformed event failures are not guessed or hidden', a
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1206,6 +1220,7 @@ test('a failed source is named next to the selector while healthy sources still 
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1251,6 +1266,7 @@ test('an unavailable source is never announced as a failure', async t => {
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1291,6 +1307,7 @@ test('the notice retry clears the cached failure and reports its outcome', async
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1356,6 +1373,7 @@ test('a retry that fails again says so instead of settling silently', async t =>
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1397,6 +1415,7 @@ test('a total catalog failure offers the retry instead of a page reload', async 
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1444,6 +1463,7 @@ test('destroy retires the notice so no dead retry stays on screen', async t => {
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1475,6 +1495,7 @@ test('the catalog contract rejects a source record that reports both datasets an
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: harness.reloadDataset,
     callbacks: harness.callbacks
   });
@@ -1515,6 +1536,7 @@ test('a choice overtaken by a change made outside the controls puts the select b
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: selection => {
       reloadTransactions.push(selection.transaction);
       return reload.promise;
@@ -1582,6 +1604,7 @@ test('the sample catalog lists its entries while the startup dataset opens and m
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: () => opening.promise,
     callbacks: harness.callbacks
   });
@@ -1650,6 +1673,7 @@ test('while a link holds the dataset, the samples are listed by their entries an
     dataSourceManager: harness.manager,
     datasetChanges: harness.datasetChanges,
     clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
     reloadDataset: async () => true,
     callbacks: harness.callbacks
   });

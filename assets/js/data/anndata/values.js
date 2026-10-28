@@ -257,7 +257,11 @@ export async function readIntegers(array, start, end, label, options = {}) {
 export async function readNumbers(array, start, end, label, options = {}) {
   const values = await array.read([[start, end]], options);
   if (!values || values.length !== end - start) throw lengthMismatch(label);
-  if (values instanceof BigInt64Array || values instanceof BigUint64Array) return Float64Array.from(values, Number);
+  if (values instanceof BigInt64Array || values instanceof BigUint64Array) {
+    const numbers = allocateTypedArray(Float64Array, values.length, label);
+    for (let i = 0; i < values.length; i++) numbers[i] = Number(values[i]);
+    return numbers;
+  }
   return values;
 }
 

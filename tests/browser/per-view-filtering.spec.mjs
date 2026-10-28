@@ -125,11 +125,13 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
       { DataStateFilterMethods },
       { viewContextCoreMethods },
       { createViewerHostCommandHandlers },
+      { createCellIdentity },
     ] = await Promise.all([
       import('/assets/js/app/state/managers/color-manager.js'),
       import('/assets/js/app/state/managers/filter-manager.js'),
       import('/assets/js/app/state/managers/view-context-core.js'),
       import('/assets/js/app/viewer-host-command-handler.js'),
+      import('/assets/js/data/cell-identity.js'),
     ]);
 
     const pointCount = 4;
@@ -204,6 +206,10 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
       viewer,
       refreshUi() {},
       reportDataMapping: async () => false,
+      getCellIdentity: () => createCellIdentity({ nObs: state.pointCount }),
+      getShownHostDataset: () => 'example',
+      results: { answer() {} },
+      getHostLabel: () => 'Python',
     });
     const sequence = [];
     const record = label => {

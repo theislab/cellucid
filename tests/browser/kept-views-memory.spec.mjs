@@ -121,9 +121,15 @@ test('six kept views draw in a grid, and views released under memory pressure co
           out[snapshot.id] = { released: true };
           continue;
         }
+        // A segmented colour store (point-store-segments.js): every segment,
+        // read with the GL calls (the renderer facade hands stores out
+        // read-only).
         const colors = new Uint8Array(snapshot.bufferByteLength);
-        gl.bindBuffer(gl.ARRAY_BUFFER, snapshot.buffer);
-        gl.getBufferSubData(gl.ARRAY_BUFFER, 0, colors);
+        for (let index = 0; index < snapshot.buffer.segments.length; index++) {
+          const segment = snapshot.buffer.segments[index];
+          gl.bindBuffer(gl.ARRAY_BUFFER, segment.buffer);
+          gl.getBufferSubData(gl.ARRAY_BUFFER, 0, colors, segment.first * 4, segment.count * 4);
+        }
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         const plan = snapshot.alphaTexPlan;
         const alpha = new Uint8Array(plan.width * plan.rows);

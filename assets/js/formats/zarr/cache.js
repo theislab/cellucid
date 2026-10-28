@@ -8,13 +8,24 @@
  * @module formats/zarr/cache
  */
 
+import { DecodedBudget } from '../io/decoded-budget.js';
+
 export class ByteLru {
-  /** @param {number} budget - Bytes kept at most */
+  /**
+   * @param {number|DecodedBudget} budget - Bytes kept at most, or a budget
+   *   shared with the other caches of decoded chunks of the store
+   *   (`formats/io/decoded-budget.js`)
+   */
   constructor(budget) {
-    if (!Number.isSafeInteger(budget) || budget < 0) throw new TypeError('A cache budget must be a whole number of bytes.');
-    this.budget = budget;
+    this._budget = DecodedBudget.of(budget);
     this.bytes = 0;
     this.entries = new Map();
+    this._budget.attach(this);
+  }
+
+  /** The bytes this cache and those sharing its budget keep at most. */
+  get budget() {
+    return this._budget.budgetBytes;
   }
 
   get(key) {
@@ -34,11 +45,19 @@ export class ByteLru {
     }
     this.entries.set(key, { value, bytes });
     this.bytes += bytes;
-    for (const [oldest, entry] of this.entries) {
-      if (this.bytes <= this.budget) break;
-      this.entries.delete(oldest);
-      this.bytes -= entry.bytes;
-    }
+    this._budget.settle(this);
+  }
+
+  /**
+   * Let the least recently used entry go, never the most recent (the one
+   * just kept); false when there is none other.
+   */
+  evictOldest() {
+    if (this.entries.size < 2) return false;
+    const oldest = this.entries.keys().next().value;
+    this.bytes -= this.entries.get(oldest).bytes;
+    this.entries.delete(oldest);
+    return true;
   }
 
   clear() {

@@ -16,7 +16,7 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { dotplotOptions, DOTPLOT_DISPLAY_OPTIONS } from '../../options/dotplot-options.js';
-import { createGeneIndex, resolveGenes } from '../../shared/gene-sets.js';
+import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from '../../shared/gene-sets.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { groupSummaryValues, scaleByGene } from '../../compute/group-expression-summary.js';
@@ -173,6 +173,11 @@ export class DotplotUI extends FormBasedAnalysisUI {
     });
   }
 
+  /** Another set of open cells: the categories' counts are counted again on them. @override */
+  _onOpenCellsChanged() {
+    this._fieldGroups.reset();
+  }
+
   _getTitle() {
     return 'Dot plot';
   }
@@ -219,7 +224,9 @@ export class DotplotUI extends FormBasedAnalysisUI {
       pages: this.dataLayer.getPages().map(page => ({ id: page.id, name: page.name })),
       groupsFor: (_entry, record) => this._fieldGroups.groups(record.groupBy),
       getGenes: () => this._geneNames(),
+      getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
       getMarkerSets: () => this.comparisonModule.getUI('genesPanel').getMarkerGeneSets(),
+      getNotebookSets: () => notebookGeneSets(this.dataLayer.state),
       expressionMatrices: this.dataLayer.getExpressionMatrices()
     };
   }
@@ -228,7 +235,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
     if (options.groupBy === '') return 'Choose the field to group the cells by';
     const requested = options.geneSets.flatMap(set => set.genes);
     if (requested.length === 0) return 'Add the genes to plot';
-    this._geneIndex ??= createGeneIndex(this._geneNames());
+    this._geneIndex ??= createGeneIndex(this._geneNames(), geneIdentities(this.dataLayer.state?.varData));
     // Another matrix's genes are read when it runs: its "not found" chip
     // names those it lacks.
     if (options.matrix === 'mapped' && resolveGenes(requested, this._geneIndex).resolved.length === 0) {
@@ -279,11 +286,16 @@ export class DotplotUI extends FormBasedAnalysisUI {
     return mask;
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const signal = job.signal;
     // Genes: each set's genes as the dataset names them, in order; a gene in
     // two sets is a column in each, as in scanpy.
-    this._geneIndex ??= createGeneIndex(this._geneNames());
+    this._geneIndex ??= createGeneIndex(this._geneNames(), geneIdentities(this.dataLayer.state?.varData));
     // Another matrix's genes, named on its own axis (raw has its own).
     const geneIndex = options.matrix === 'mapped'
       ? this._geneIndex
@@ -318,7 +330,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
       groups.push(name);
     });
     const cellCount = field.codes.length;
-    const scope = this._scopeMask(options.cells, cellCount);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this._scopeMask(options.cells, cellCount) : sample.mask(this._scopeMask(options.cells, cellCount));
     const cellGroup = groups.length <= 0x7fff ? new Int16Array(cellCount) : new Int32Array(cellCount);
     const missing = missingCategoryCode(field.codes);
     for (let cell = 0; cell < cellCount; cell++) {
@@ -567,7 +580,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
 
   // ---------------------------------------------------------------- Sessions
 
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('dotplot', this._lastResult);
   }

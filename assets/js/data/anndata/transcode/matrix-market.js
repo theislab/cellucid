@@ -50,6 +50,7 @@ import { EntryCollector } from './entries.js';
 import { defaultModality } from '../../data-mapping.js';
 import { matrixMarketFileSets } from '../../matrix-market-files.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 const MATRIX = /(^|[._-])(matrix|cells_x_genes|quants_mat|count_matrix|DGE)\.mtx(\.gz|\.bz2|\.xz)?$/i;
 const ANY_MATRIX = /\.mtx(\.gz|\.bz2|\.xz)?$/i;
@@ -142,7 +143,9 @@ const BARCODE = /^[ACGTN]{8,}([-_.]\d+)?$/i;
 /** A feature list: `{ids, names, types}`; a header line (Parse's all_genes.csv) is dropped. */
 function featuresOf(rows) {
   let body = rows;
-  if (rows.length > 0 && /^(gene_id|gene|feature|id)/i.test(rows[0][0] ?? '') && rows.length > 1) body = rows.slice(1);
+  // A header names the column (`gene_id`, `gene`, `feature`, `id`); a gene
+  // whose name starts so (IDH1, ID2, IDO1, Gene1) is a gene.
+  if (rows.length > 1 && /^(genes?|gene[_ .-]?(ids?|names?|symbols?)|features?|feature[_ .-]?(ids?|names?)|ids?)$/i.test((rows[0][0] ?? '').trim())) body = rows.slice(1);
   return {
     ids: body.map(row => row[0] ?? ''),
     names: body.map(row => row[1] ?? row[0] ?? ''),
@@ -152,7 +155,9 @@ function featuresOf(rows) {
 
 function cellsOf(rows) {
   let body = rows;
-  if (rows.length > 1 && /^(barcode|cell|bc_wells)/i.test(rows[0][0] ?? '')) body = rows.slice(1);
+  // A header names the column (`barcode`, `cell_id`, Parse's `bc_wells`);
+  // a cell named `cell0001` or `cells_1` is a cell, never a header.
+  if (rows.length > 1 && /^(barcodes?|cells?|cell[_ .-]?(ids?|names?|barcodes?)|bc_wells)$/i.test((rows[0][0] ?? '').trim())) body = rows.slice(1);
   return body.map(row => row[0] ?? '');
 }
 
@@ -203,8 +208,8 @@ function featureGroups(types, nFeatures) {
   const named = types === null ? [] : [...new Set(types)];
   if (named.length <= 1) return { groups: [{ type: named[0] ?? null, members: null, count: nFeatures }], groupOf: null, local: null };
   const index = new Map(named.map((type, g) => [type, g]));
-  const groupOf = new Int32Array(nFeatures);
-  const local = new Int32Array(nFeatures);
+  const groupOf = allocateTypedArray(Int32Array, nFeatures, 'Feature groups');
+  const local = allocateTypedArray(Int32Array, nFeatures, 'Feature groups');
   const counts = new Array(named.length).fill(0);
   const members = named.map(() => []);
   for (let feature = 0; feature < nFeatures; feature++) {
@@ -322,14 +327,16 @@ export async function transcodeMatrixMarketFolder(source, context) {
     if (!readers.has(path)) readers.set(path, byteReaderOf(source.files.get(path)));
     return readers.get(path);
   };
-  const tables = tablePaths(source.files, set);
-  const usedPaths = [set.matrix, set.features, set.cells, ...tables];
-  activity?.expect?.(usedPaths.reduce((sum, path) => sum + source.files.get(path).size, 0));
-  const identity = { kind: 'matrix-market', files: usedPaths.map(path => ({ path, ...readerOf(path).identity })) };
+  const usedPaths = usedPathsOf(source.files, set);
+  const bytes = usedPaths.reduce((sum, path) => sum + source.files.get(path).size, 0);
+  activity?.expect?.(bytes);
+  const identity = matrixMarketIdentity(usedPaths, path => readerOf(path).identity);
+  const tables = usedPaths.slice(3);
   try {
     const result = await transcodeOnce({
       identity,
       fileName: folderName,
+      bytes,
       link: readerOf(set.matrix).link,
       context,
       build: async space => {
@@ -400,7 +407,7 @@ export async function transcodeMatrixMarketFolder(source, context) {
         });
         const first = defaultModality(modalities.map(modality => modality.name));
         model.modalities.push(...modalities.sort((a, b) => (a.name === first ? -1 : b.name === first ? 1 : 0)));
-        const written = await writeModel(model, space, { readRegion: region => space.read(region) });
+        const written = await writeModel(model, space, { readRegion: region => space.read(region), signal });
         return [{
           name: '',
           label: `${folderName} (MatrixMarket, ${formatCountOf(written.nObs, 'cell')})`,
@@ -421,6 +428,32 @@ export async function transcodeMatrixMarketFolder(source, context) {
     own?.finish(error);
     throw error;
   }
+}
+
+/** The files one set's store is read from: its matrix, its two lists, and the folder's cell tables. */
+function usedPathsOf(files, set) {
+  return [set.matrix, set.features, set.cells, ...tablePaths(files, set)];
+}
+
+/** What a MatrixMarket folder's store is filed under: every file it is read from, by its path and identity. */
+function matrixMarketIdentity(paths, identityOf) {
+  return { kind: 'matrix-market', files: paths.map(path => ({ path, ...identityOf(path) })) };
+}
+
+/**
+ * What the store of a set of remote MatrixMarket files would be filed
+ * under, as a page asks before it downloads any of them (a member its host
+ * serves only whole): null when opening it may ask which sample to open.
+ *
+ * @param {Map<string, {identity?: Object}>} files
+ * @returns {Object|null}
+ */
+export function matrixMarketSetIdentity(files) {
+  const complete = matrixMarketSets(files).filter(item => item.features !== null && item.cells !== null);
+  if (complete.length === 0) return null;
+  const [first] = complete;
+  if (complete.some(item => item.matrix !== first.matrix && sameStanding(item, first))) return null;
+  return matrixMarketIdentity(usedPathsOf(files, first), path => files.get(path).identity ?? null);
 }
 
 /**
@@ -451,7 +484,7 @@ function sameStanding(a, b) {
 function textColumn(values) {
   const categories = [...new Set(values)].sort();
   const code = new Map(categories.map((value, index) => [value, index]));
-  const codes = categories.length < 128 ? new Int8Array(values.length) : categories.length < 32768 ? new Int16Array(values.length) : new Int32Array(values.length);
+  const codes = allocateTypedArray(categories.length < 128 ? Int8Array : categories.length < 32768 ? Int16Array : Int32Array, values.length, 'Category codes');
   values.forEach((value, index) => { codes[index] = code.get(value); });
   return { kind: 'categorical', codes, categories, ordered: false };
 }

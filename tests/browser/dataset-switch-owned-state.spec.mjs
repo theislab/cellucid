@@ -56,6 +56,11 @@ async function showEdges(page) {
 
 /** The last gene of the larger file: an index the smaller one does not have. */
 async function colourByLastGene(page) {
+  // A dataset lists its genes after its first view (`areGenesPending`).
+  await expect.poll(() => page.evaluate(() => {
+    const state = window._cellucidState;
+    return !state.areGenesPending() && state.varData.fields.length > 0;
+  })).toBe(true);
   return page.evaluate(async () => {
     const state = window._cellucidState;
     const index = state.varData.fields.length - 1;

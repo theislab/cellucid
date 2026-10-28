@@ -9,7 +9,9 @@ import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
-import { buildDrawOrder, buildHierarchicalOrder } from '../assets/js/rendering/high-perf/draw-order.js';
+import { buildDrawOrder, drawBands, forEachLeafRun } from '../assets/js/rendering/high-perf/draw-order.js';
+import { buildSpatialTree } from '../assets/js/rendering/high-perf/spatial-tree.js';
+import { DEFAULT_CELL_PRIORITY, buildPriorityOrder } from '../assets/js/data/cell-priority.js';
 
 function silenceCalculationNotifications(t) {
   const notifications = getNotificationCenter();
@@ -44,7 +46,7 @@ function makePositions(pointCount, dimension, seed = 7) {
 function leavesOf(index) {
   const leaves = [];
   const visit = node => {
-    if (node.indices !== null) {
+    if (node.children === null) {
       leaves.push(node);
       return;
     }
@@ -56,33 +58,37 @@ function leavesOf(index) {
 
 /**
  * The draw units of a tree in order (`drawUnit` nodes: leaves in 3D, nodes at
- * a coarse depth in 1D and 2D), each with its source ids ascending.
+ * a coarse depth in 1D and 2D), each with its source ids ascending. The ids
+ * come from the same tree built again with its leaves' ids
+ * (`buildSpatialTree`, deterministic): a 3D index reads them from its draw
+ * order (`forEachLeafRun`), which is what is under test.
  */
 function unitsOf(index) {
+  const reference = buildSpatialTree(index.positions, index.dimensionLevel, index.maxPointsPerNode, index.maxDepth).root;
   const units = [];
   const idsUnder = node => (node.indices !== null
     ? Array.from(node.indices)
     : node.children.filter(Boolean).flatMap(idsUnder));
-  const visit = (node, depth) => {
+  const visit = (node, built, depth) => {
     if (node.drawUnit === true) {
-      units.push({ node, depth, ids: idsUnder(node).sort((a, b) => a - b) });
+      units.push({ node, depth, ids: idsUnder(built).sort((a, b) => a - b) });
       return;
     }
-    for (const child of node.children) if (child) visit(child, depth + 1);
+    node.children.forEach((child, slot) => { if (child) visit(child, built.children[slot], depth + 1); });
   };
-  visit(index.root, 0);
+  visit(index.root, reference, 0);
   return units;
 }
 
 const sorted = values => Array.from(values).sort((a, b) => a - b);
 
 for (const dimension of [1, 2, 3]) {
-  test(`${dimension}D: the draw order is a permutation and every level is the hierarchical order's set`, () => {
+  test(`${dimension}D: the draw order is a permutation and every level is the priority order's set`, () => {
     const pointCount = 6_000;
     const positions = makePositions(pointCount, dimension);
     const index = new SpatialIndex(positions, null, dimension, 64, 8, { buildLOD: true });
     const order = index.drawOrder;
-    const hierarchy = buildHierarchicalOrder(index.positions, index.bounds, index.dimensionLevel);
+    const priorityOrder = buildPriorityOrder(pointCount, DEFAULT_CELL_PRIORITY);
 
     assert.ok(Object.isFrozen(order));
     assert.equal(order.pointCount, pointCount);
@@ -97,8 +103,8 @@ for (const dimension of [1, 2, 3]) {
       assert.equal(indices.buffer, order.indices.buffer);
       assert.equal(indices.byteOffset, order.indices.byteOffset);
       assert.equal(indices.length, count);
-      // ... holding exactly the points the hierarchical order admits.
-      assert.deepEqual(sorted(indices), sorted(hierarchy.subarray(0, count)));
+      // ... holding exactly the points the priority order admits.
+      assert.deepEqual(sorted(indices), sorted(priorityOrder.subarray(0, count)));
       // Band b ends where level b's prefix ends.
       assert.equal(order.bandEnds[level], count);
       assert.ok(count >= previous);
@@ -243,7 +249,10 @@ test('a refused band count or a leaf outside the cloud never publishes a draw or
   const positions = makePositions(100, 2, 41);
   const index = new SpatialIndex(positions, null, 2, 8, 8, { buildLOD: false });
   assert.throws(
-    () => buildDrawOrder(index.root, index.dimensionLevel, index.pointCount, null, Array.from({ length: 256 }, () => 100)),
+    () => buildDrawOrder(index.root, index.dimensionLevel, index.pointCount, {
+      bandEnds: Uint32Array.from({ length: 256 }, (_, band) => (band === 255 ? 100 : band)),
+      levelBands: new Uint8Array(1),
+    }, null),
     /at most 255/,
   );
   assert.equal(index.drawOrder, null);
@@ -251,7 +260,7 @@ test('a refused band count or a leaf outside the cloud never publishes a draw or
   const saved = leaf.indices[0];
   leaf.indices[0] = 100;
   assert.throws(
-    () => buildDrawOrder(index.root, index.dimensionLevel, index.pointCount, buildHierarchicalOrder(index.positions, index.bounds, index.dimensionLevel), [100]),
+    () => buildDrawOrder(index.root, index.dimensionLevel, index.pointCount, drawBands(100), buildPriorityOrder(index.pointCount, DEFAULT_CELL_PRIORITY)),
     /outside 100 points/,
   );
   leaf.indices[0] = saved;
@@ -274,10 +283,15 @@ test('a range budget is met by bridging the gaps that hide the fewest points', (
     for (const child of node.children ?? []) if (child) visit(child);
   };
   visit(index.root);
+  // A 3D unit is a leaf whose ids the draw order holds (`forEachLeafRun`).
   const firstId = node => {
     let current = node;
-    while (current.indices === null) current = current.children.find(child => child);
-    return current.indices[0];
+    while (current.children !== null) current = current.children.find(child => child);
+    let first = Infinity;
+    forEachLeafRun(current, order, (ids, start, end) => {
+      for (let i = start; i < end; i++) first = Math.min(first, ids[i]);
+    });
+    return first;
   };
   const inBox = id => Math.abs(positions[id * 3] - 0.3) < 0.9
     && Math.abs(positions[id * 3 + 1] + 0.2) < 0.9;

@@ -85,7 +85,7 @@ a control sits), never a second look for a control.
 | Info button | `button.info-btn[aria-controls]` + `div.info-tooltip[role=dialog][data-info-tip][hidden]`, empty in markup; its text comes from the tip registry `ui/components/info-tips.js` | `createInfoTip`; `info-popovers.js` (one document-level controller) |
 | Checkbox + info | `div.checkbox-info-row` > `label.checkbox-inline` + `button.info-btn` | static |
 | Select, text, number, textarea | `.obs-select` | `createSelect`, or the element with `.obs-select` |
-| Slider | `label[for]` + `div.slider-row` > `input[type=range]` + `output.slider-value` (or `span`) | `createSliderField` |
+| Slider | `label[for]` + `div.slider-row` > `input[type=range]` + `output.slider-value` (or `span`); a value the user can type is `input.obs-select.slider-number` (+ `span.slider-unit`) | `createSliderField` |
 | Checkbox | `label.checkbox-inline` wrapping `input[type=checkbox]` + text | `createCheckbox` |
 | Switch (applies immediately) | `button.switch[role=switch][aria-checked]` > `.switch-track` + `.switch-label` | `createSwitch` |
 | Segmented (2–4 exclusive settings) | `div.segmented[role=group][aria-label]` > `button.segmented-btn[aria-pressed]` | `createSegmented` |

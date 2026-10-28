@@ -1,9 +1,10 @@
 /**
  * A format read once into this browser (an R object, a MatrixMarket folder)
  * says what became of it, as the Dataset box shows it
- * (`app/ui/modules/dataset-card.js`): where its store is kept for the tab's
- * life (this browser's storage, or memory where there is none), whether an
- * earlier opening in the tab had kept it, and every part that was not read.
+ * (`app/ui/modules/dataset-card.js`): where its store is kept (this
+ * browser's storage, for later visits when the file's identity names its
+ * version, or memory where there is none), whether the file was read whole,
+ * whether an earlier opening had kept it, and every part that was not read.
  *
  * The facts travel from the transcoder (`transcode/session.js`) through
  * `openDatasetStore` and the reader to the storage description
@@ -75,28 +76,28 @@ test('a dropped part of an R object keeps the bytes it spanned and whether it he
 
 test('an object read into memory says so, and names every part it did not read', async () => {
   const opened = await open({ file: await rFile('SeuratObject_5.4.0_pbmc_small.rda') }, { memory: true });
-  assert.deepEqual(opened.conversion, { kept: 'memory', reused: false, notes: PBMC_SMALL_NOT_READ });
+  assert.deepEqual(opened.conversion, { kept: 'memory', persistent: false, whole: true, reused: false, notes: PBMC_SMALL_NOT_READ });
   assert.ok(Object.isFrozen(opened.conversion) && Object.isFrozen(opened.conversion.notes));
 
   const whole = await open({ file: await rFile('seurat5_gzip.rds') }, { memory: true });
-  assert.deepEqual(whole.conversion, { kept: 'memory', reused: false, notes: [] });
+  assert.deepEqual(whole.conversion, { kept: 'memory', persistent: false, whole: true, reused: false, notes: [] });
 });
 
-test('kept in this browser\'s storage, then reopened from it in the same tab', async t => {
+test('kept in this browser\'s storage for later visits, then reopened from it', async t => {
   const disk = opfsOnDisk();
   t.after(disk.cleanup);
   const file = await rFile('SeuratObject_5.4.0_pbmc_small.rda');
   const first = await TRANSCODERS.rda.transcode({ file }, { byteReaderOf, environment: disk.environment });
-  assert.deepEqual(first.conversion, { kept: 'opfs', reused: false, notes: PBMC_SMALL_NOT_READ });
+  assert.deepEqual(first.conversion, { kept: 'opfs', persistent: true, whole: true, reused: false, notes: PBMC_SMALL_NOT_READ });
   const again = await TRANSCODERS.rda.transcode({ file }, { byteReaderOf, environment: disk.environment });
-  assert.deepEqual(again.conversion, { kept: 'opfs', reused: true, notes: PBMC_SMALL_NOT_READ },
+  assert.deepEqual(again.conversion, { kept: 'opfs', persistent: true, whole: true, reused: true, notes: PBMC_SMALL_NOT_READ },
     'the notes are kept with the store, so a reopening says the same');
 });
 
 test('a MatrixMarket folder converts as an R object does', async () => {
   const opened = await open(await mtxFolder('kb'), { memory: true });
   assert.equal(opened.format, 'mtx');
-  assert.deepEqual(opened.conversion, { kept: 'memory', reused: false, notes: [] });
+  assert.deepEqual(opened.conversion, { kept: 'memory', persistent: false, whole: true, reused: false, notes: [] });
 });
 
 test('an AnnData file is read in place and has no conversion', async () => {
@@ -107,7 +108,7 @@ test('an AnnData file is read in place and has no conversion', async () => {
 
 test('the storage description carries the conversion, checked, and null for every other format', () => {
   const file = new File([new Uint8Array(4)], 'pbmc_small.rds');
-  const conversion = { kept: 'opfs', reused: false, notes: ['commands (7.4 KB): Cellucid does not use it.'] };
+  const conversion = { kept: 'opfs', persistent: true, whole: true, reused: false, notes: ['commands (7.4 KB): Cellucid does not use it.'] };
   const storage = describeAnnDataStorage({ file }, { format: 'rds', layout: 'file', name: 'pbmc_small.rds', conversion });
   assert.deepEqual(storage.conversion, conversion);
   assert.ok(Object.isFrozen(storage.conversion) && Object.isFrozen(storage.conversion.notes));
@@ -115,11 +116,12 @@ test('the storage description carries the conversion, checked, and null for ever
   const h5ad = describeAnnDataStorage({ file: new File([new Uint8Array(4)], 'cells.h5ad') }, { format: 'h5ad', layout: 'file', name: 'cells.h5ad' });
   assert.equal(h5ad.conversion, null);
   const folder = describeAnnDataStorage({ files: new Map([['matrix.mtx', file]]), rootName: 'kb' }, {
-    format: 'mtx', layout: 'folder', name: 'kb', conversion: { kept: 'memory', reused: false, notes: [] },
+    format: 'mtx', layout: 'folder', name: 'kb', conversion: { kept: 'memory', persistent: false, whole: true, reused: false, notes: [] },
   });
   assert.equal(folder.conversion.kept, 'memory');
 
-  for (const bad of [{ kept: 'disk', reused: false, notes: [] }, { kept: 'opfs', reused: 'no', notes: [] }, { kept: 'opfs', reused: false, notes: [1] }]) {
+  const good = { kept: 'opfs', persistent: true, whole: true, reused: false, notes: [] };
+  for (const bad of [{ ...good, kept: 'disk' }, { ...good, reused: 'no' }, { ...good, notes: [1] }, { ...good, persistent: undefined }, { ...good, whole: 1 }]) {
     assert.throws(() => describeAnnDataStorage({ file }, { format: 'rds', layout: 'file', name: 'x.rds', conversion: bad }), TypeError);
   }
 });

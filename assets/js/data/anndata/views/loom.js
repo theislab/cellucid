@@ -47,6 +47,8 @@ import {
   viewGroup,
 } from './view-nodes.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { sharedOnce } from '../../../formats/io/abort.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
 
 /** How the AnnData reader names a Loom file in messages. */
 export const LOOM_FORMAT = Object.freeze({ storage: 'HDF5', file: 'Loom' });
@@ -156,7 +158,7 @@ function stackedArray(path, members) {
       const [first, last] = selection?.[1] ?? [0, width];
       const columns = await Promise.all(members.slice(first, last).map(member => member.read([[start, end]], options)));
       const count = last - first;
-      const out = new Output((end - start) * count);
+      const out = allocateTypedArray(Output, (end - start) * count, path);
       columns.forEach((values, column) => {
         for (let row = 0; row < end - start; row++) out[row * count + column] = Number(values[row]);
       });
@@ -250,44 +252,40 @@ function graphMatrix(group, path, nCells) {
   }
   const nnz = a.shape[0];
   const wide = nnz > 2147483647;
-  let built = null;
-  const build = options => {
-    built ??= (async () => {
-      const [rows, columns, weights] = await Promise.all([a.read(undefined, options), b.read(undefined, options), w.read(undefined, options)]);
-      const counts = new Float64Array(nCells + 1);
-      const at = index => {
-        const value = Number(rows[index]);
-        if (!Number.isInteger(value) || value < 0 || value >= nCells) throw new RangeError(`${label} names cell ${value}, outside its ${formatCountOf(nCells, 'cell')}`);
-        return value;
-      };
-      for (let index = 0; index < nnz; index++) counts[at(index) + 1]++;
-      for (let row = 0; row < nCells; row++) counts[row + 1] += counts[row];
-      const indptr = wide ? new BigInt64Array(nCells + 1) : new Int32Array(nCells + 1);
-      for (let row = 0; row <= nCells; row++) indptr[row] = wide ? BigInt(counts[row]) : counts[row];
-      const next = counts.slice(0, nCells);
-      const order = new Float64Array(nnz);
-      for (let index = 0; index < nnz; index++) order[next[Number(rows[index])]++] = index;
-      const indices = new Int32Array(nnz);
-      const data = new Float64Array(nnz);
-      for (let row = 0; row < nCells; row++) {
-        const start = counts[row];
-        const end = counts[row + 1];
-        const entries = Array.from(order.subarray(start, end));
-        entries.sort((left, right) => Number(columns[left]) - Number(columns[right]));
-        entries.forEach((index, offset) => {
-          const column = Number(columns[index]);
-          if (!Number.isInteger(column) || column < 0 || column >= nCells) {
-            throw new RangeError(`${label} names cell ${column}, outside its ${formatCountOf(nCells, 'cell')}`);
-          }
-          indices[start + offset] = column;
-          data[start + offset] = Number(weights[index]);
-        });
-      }
-      return { indptr, indices, data };
-    })();
-    built.catch(() => { built = null; });
-    return built;
-  };
+  // Built once, shared by every read asking meanwhile (`sharedOnce`).
+  const build = sharedOnce(async options => {
+    const [rows, columns, weights] = await Promise.all([a.read(undefined, options), b.read(undefined, options), w.read(undefined, options)]);
+    const counts = allocateTypedArray(Float64Array, nCells + 1, 'Loom graph row counts');
+    const at = index => {
+      const value = Number(rows[index]);
+      if (!Number.isInteger(value) || value < 0 || value >= nCells) throw new RangeError(`${label} names cell ${value}, outside its ${formatCountOf(nCells, 'cell')}`);
+      return value;
+    };
+    for (let index = 0; index < nnz; index++) counts[at(index) + 1]++;
+    for (let row = 0; row < nCells; row++) counts[row + 1] += counts[row];
+    const indptr = allocateTypedArray(wide ? BigInt64Array : Int32Array, nCells + 1, 'Loom graph indptr');
+    for (let row = 0; row <= nCells; row++) indptr[row] = wide ? BigInt(counts[row]) : counts[row];
+    const next = copyTypedArray(Float64Array, counts.subarray(0, nCells), 'Loom graph row counts');
+    const order = allocateTypedArray(Float64Array, nnz, 'Loom graph order');
+    for (let index = 0; index < nnz; index++) order[next[Number(rows[index])]++] = index;
+    const indices = allocateTypedArray(Int32Array, nnz, 'Loom graph indices');
+    const data = allocateTypedArray(Float64Array, nnz, 'Loom graph values');
+    for (let row = 0; row < nCells; row++) {
+      const start = counts[row];
+      const end = counts[row + 1];
+      const entries = Array.from(order.subarray(start, end));
+      entries.sort((left, right) => Number(columns[left]) - Number(columns[right]));
+      entries.forEach((index, offset) => {
+        const column = Number(columns[index]);
+        if (!Number.isInteger(column) || column < 0 || column >= nCells) {
+          throw new RangeError(`${label} names cell ${column}, outside its ${formatCountOf(nCells, 'cell')}`);
+        }
+        indices[start + offset] = column;
+        data[start + offset] = Number(weights[index]);
+      });
+    }
+    return { indptr, indices, data };
+  });
   const part = (name, dtype, length) => () => computedArray({
     path: joinPath(path, name),
     dtype,

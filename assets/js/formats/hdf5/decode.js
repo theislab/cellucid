@@ -21,6 +21,7 @@ import { collectionEntryBytes, findCollection, objectStart } from './heaps.js';
 import { formatError } from './errors.js';
 import { valueArrayClass } from '../store.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
 
 /* ---------- half precision ---------- */
 
@@ -83,10 +84,17 @@ export function swapBytes(bytes, size) {
 
 /** Bytes of `bytes` that a typed array of `size`-byte elements can view in place. */
 function ownedAligned(bytes, size) {
-  return bytes.byteOffset % size === 0 ? bytes : bytes.slice();
+  return bytes.byteOffset % size === 0 ? bytes : copyTypedArray(Uint8Array, bytes, 'HDF5 values');
 }
 
 /* ---------- heap references ---------- */
+
+/**
+ * How much more than the referenced objects' mean size the objects before
+ * the furthest one are taken to take, on average: strings of one column vary
+ * in length around their mean.
+ */
+const PREFIX_SPREAD = 1.125;
 
 /**
  * Add to `into` every global heap collection the `count` elements of `type`
@@ -100,29 +108,49 @@ export function heapAddresses(file, type, bytes, count, into = new Map()) {
     const fail = problem => {
       throw formatError('Variable-length data', NaN, problem);
     };
+    // Per collection: the bytes of the objects referenced, and how far into
+    // the collection the furthest of them lies. A collection is parsed from
+    // its start (objects have no index), so what is read of it is its prefix
+    // up to the furthest object: estimated from that object's index and the
+    // referenced objects' mean size (objects are written in order, so the
+    // ones before it are like them), a little more for the spread of sizes.
+    // One read then usually holds every object asked for, without reading a
+    // large collection whole (a string column's) or a second, dependent
+    // round trip for what lies past the objects' own bytes.
+    const seen = new Map();
+    let last = null;
     let lastAddress = -1;
-    let lastBytes = 0;
     for (let i = 0; i < count; i++) {
       const at = i * size;
       const length = readUintLE(bytes, at, 4, fail);
       if (length === 0) continue;
       const address = readUintLE(bytes, at + 4, file.offsetSize, fail);
       if (address === null || address === 0) continue;
-      // Neighbouring elements usually share a collection: sum locally.
+      const index = readUintLE(bytes, at + 4 + file.offsetSize, 4, fail) ?? 0;
+      // Neighbouring elements usually share a collection.
       if (address !== lastAddress) {
-        if (lastAddress >= 0) into.set(lastAddress, lastBytes);
+        last = seen.get(address);
+        if (last === undefined) {
+          last = { bytes: 0, objects: 0, maxIndex: 0 };
+          seen.set(address, last);
+        }
         lastAddress = address;
-        lastBytes = into.get(address) ?? 8 + file.lengthSize;
       }
-      lastBytes += collectionEntryBytes(file, length * unit);
+      last.bytes += collectionEntryBytes(file, length * unit);
+      last.objects++;
+      if (index > last.maxIndex) last.maxIndex = index;
     }
-    if (lastAddress >= 0) into.set(lastAddress, lastBytes);
+    for (const [address, entry] of seen) {
+      const header = 8 + file.lengthSize;
+      const prefix = header + Math.ceil(entry.maxIndex * (entry.bytes / entry.objects) * PREFIX_SPREAD);
+      into.set(address, Math.max(into.get(address) ?? 0, header + entry.bytes, prefix));
+    }
   } else if (type.class === 'compound') {
     for (const member of type.members) {
       if (!hasHeapData(member.type)) continue;
       const width = member.type.size;
       const perElement = member.shape.reduce((a, b) => a * b, 1);
-      const column = new Uint8Array(count * perElement * width);
+      const column = allocateTypedArray(Uint8Array, count * perElement * width, 'HDF5 compound member');
       for (let i = 0; i < count; i++) {
         column.set(bytes.subarray(i * type.size + member.offset, i * type.size + member.offset + perElement * width), i * perElement * width);
       }
@@ -354,7 +382,7 @@ export function numericValues(dtype, bytes, count) {
   const size = dtype.bytes;
   if (dtype.name === 'float16') {
     const table = halfToFloatTable();
-    const out = new Float32Array(count);
+    const out = allocateTypedArray(Float32Array, count, 'HDF5 float16 values');
     const source = ownedAligned(bytes, 2);
     if (dtype.littleEndian === false) swapBytes(source, 2);
     const words = new Uint16Array(source.buffer, source.byteOffset, count);
@@ -368,11 +396,11 @@ export function numericValues(dtype, bytes, count) {
 }
 
 function booleanValues(dtype, bytes, count) {
-  const out = dtype.bytes === 1 ? bytes.subarray(0, count) : new Uint8Array(count);
+  const out = dtype.bytes === 1 ? bytes.subarray(0, count) : allocateTypedArray(Uint8Array, count, 'HDF5 booleans');
   if (dtype.bytes === 1) {
     for (let i = 0; i < count; i++) if (out[i] > 1) out[i] = 1;
     if (out.byteOffset === 0 && out.length === out.buffer.byteLength) return out;
-    return out.slice();
+    return copyTypedArray(Uint8Array, out, 'HDF5 booleans');
   }
   const base = numericValues(dtype.base, bytes, count);
   for (let i = 0; i < count; i++) out[i] = base[i] ? 1 : 0;
@@ -388,7 +416,7 @@ export function decodeField(file, type, member, bytes, count, collections) {
   const perElement = member.shape.reduce((a, b) => a * b, 1);
   const width = member.type.size * perElement;
   const stride = type.size;
-  const column = new Uint8Array(count * width);
+  const column = allocateTypedArray(Uint8Array, count * width, 'HDF5 compound member');
   // Strided gather of the member's bytes: short members copy byte by byte,
   // long ones by subarray.
   if (width <= 16) {

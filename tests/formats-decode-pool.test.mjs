@@ -48,7 +48,7 @@ import { settle } from './helpers/virtual-time.mjs';
 import { corpusFolder } from './helpers/zarr-corpus.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ZARR_STORES = ['v2/cases.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr',
+const ZARR_STORES = ['v2/cases.zarr', 'v2/blosc-delta.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr', 'anndata/v3-sharded-shapes.zarr',
   'anndata/v2-uncompressed.zarr', 'anndata/v3-uncompressed.zarr'];
 const HDF5_FILES = [
   ...readdirSync(path.join(HERE, 'fixtures', 'hdf5')).filter(name => name.endsWith('.h5')).map(name => path.join(HERE, 'fixtures', 'hdf5', name)),
@@ -504,12 +504,13 @@ test('background chunks wait behind every other; bytes given up are transferred 
   configureDecodePool();
 });
 
-test('warming makes the workers before the first chunk', async () => {
+test('warming makes one worker before the first chunk, the others as chunks need them', async () => {
   const { counts, createWorker } = countingWorkers();
   configureDecodePool({ createWorker, size: 3, minBytes: 0, idleMs: 30 });
   warmDecodePool();
-  assert.equal(counts.made, 3);
-  assert.equal(decodePoolStats().workers, 3);
+  warmDecodePool();
+  assert.equal(counts.made, 1);
+  assert.equal(decodePoolStats().workers, 1);
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.equal(decodePoolStats().workers, 0, 'unused warm workers are let go when idle');
   inThreadOnly();

@@ -111,6 +111,8 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
         whenSettled: async () => {},
       },
       currentDatasetIdentityId: () => openIdentity,
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
       openDatasetSource: async record => {
         calls.push(['open', record]);
         return opens;
@@ -119,7 +121,7 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
         downloadSession() {},
         async readSessionDataset(blob) {
           assert.equal(blob, file);
-          return { datasetId: 'suo-identity', source: recorded };
+          return { datasetId: 'suo-identity', source: recorded, cells: null };
         },
         async loadSessionFromFile({ beforeRestore }) {
           const proceed = await beforeRestore(file);

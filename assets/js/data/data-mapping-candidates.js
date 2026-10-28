@@ -151,12 +151,16 @@ function requireElementProbe(probe, label) {
   if (typeof probe.numeric !== 'boolean') {
     throw new TypeError(`${label} numeric must be a boolean.`);
   }
+  if (probe.problem !== undefined && (typeof probe.problem !== 'string' || probe.problem.length === 0)) {
+    throw new TypeError(`${label} problem must be a non-empty string when given.`);
+  }
   return {
     key: probe.key,
     storage: requireStorage(probe.storage, label),
     shape: requireShape(probe.shape, label),
     dtype: probe.dtype,
     numeric: probe.numeric,
+    problem: probe.problem ?? null,
   };
 }
 
@@ -174,7 +178,9 @@ export function describeObsmProbes(probes, nObs) {
     const probe = requireElementProbe(raw, `obsm probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage === 'dataframe') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage === 'dataframe') {
       reason = 'obsm table, not an array';
     } else if (storage === 'csr' || storage === 'csc') {
       reason = 'sparse obsm arrays cannot be plotted';
@@ -234,7 +240,9 @@ function describeObsp(probes, nObs) {
     const probe = requireElementProbe(raw, `obsp probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
       reason = 'not a matrix';
     } else if (shape === null || shape.length !== 2 || shape[0] !== shape[1]) {
       reason = 'not square';
@@ -294,7 +302,9 @@ function describeLayers(probes, nObs, nVars) {
     const probe = requireElementProbe(raw, `layer probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
       reason = 'not a matrix';
     } else if (shape === null || shape.length !== 2 || shape[0] !== nObs || shape[1] !== nVars) {
       reason = `has shape ${(shape ?? []).join(' x ')}, expected ${nObs} x ${nVars}`;
@@ -433,12 +443,25 @@ export function modalityNames(candidates) {
  * already checked against the file by the caller); a chosen expression
  * matrix is not guessed.
  *
+ * `geneNameColumns` is the gene-name default of each var axis whose guess
+ * has settled (`inferGeneNameColumn`, `gene-names.js`): by var axis (`X`,
+ * `raw`, `mod/<name>`, `mod/<name>/raw`, as `geneNamesVarAxis` names them),
+ * the var column holding the symbols of an index of identifiers, or null for
+ * the index. An axis absent from it is not guessed yet: its names are read
+ * after the first view, the shown axis's at once and any other when it is
+ * first chosen (`BaseAnnDataAdapter.guessGeneNames`). The default gene names
+ * are those of the default expression matrix's axis (a column chosen so is
+ * guessed); null while that axis is not guessed yet (pending, never the
+ * index in its place). The catalog keeps the map for a modality or matrix
+ * switch (`DataState.geneNamesDefault`).
+ *
  * @param {ReturnType<typeof describeAnnDataProbes>} described
  * @param {{slots: Object, guessed: ReadonlyArray<string>, rejected?: ReadonlyArray<[string, string]>}} resolution
  * @param {{knn?: string|null, geneNames?: string, expression?: string|null, latent?: string|null}} [chosen]
+ * @param {Readonly<Record<string, string|null>>} [geneNameColumns]
  * @returns {Object} A deep-frozen candidate catalog.
  */
-export function assembleAnnDataCandidates(described, { slots, guessed, rejected = [] }, chosen = {}) {
+export function assembleAnnDataCandidates(described, { slots, guessed, rejected = [] }, chosen = {}, geneNameColumns = {}) {
   const modalities = described.modalities ?? null;
   const modality = modalities === null
     ? null
@@ -470,6 +493,21 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     raw: scope.raw === null || scope.raw.X === null ? null : { dtype: scope.raw.X.dtype },
     layers: scope.layers.filter(layer => layer.usable).map(layer => layer.key),
   });
+  const namesAxis = expression.expression === null ? null : geneNamesVarAxis(modality, expression.expression);
+  let geneNames;
+  if (Object.hasOwn(chosen, 'geneNames')) {
+    geneNames = { geneNames: chosen.geneNames, guessed: false };
+  } else if (namesAxis === null) {
+    geneNames = { geneNames: 'index', guessed: false };
+  } else if (!Object.hasOwn(geneNameColumns, namesAxis)) {
+    // Not guessed yet: pending, read after the first view.
+    geneNames = { geneNames: null, guessed: false };
+  } else {
+    const inferred = geneNameColumns[namesAxis];
+    geneNames = inferred === null
+      ? { geneNames: 'index', guessed: false }
+      : { geneNames: `column:${inferred}`, guessed: true };
+  }
   const highlyVariable = expression.expression === null
     ? { highlyVariable: null, guessed: false }
     : defaultHighlyVariable(
@@ -495,6 +533,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     raw: described.raw,
     log1p: described.log1p,
     modalities,
+    geneNameColumns: { ...geneNameColumns },
     defaults: {
       kind: ANNDATA_KIND,
       embeddings: {
@@ -505,7 +544,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
         ? chosen.knn
         : (connectivities === undefined ? null : DEFAULT_KNN_KEY),
       ...(modalities === null ? {} : { modality }),
-      geneNames: Object.hasOwn(chosen, 'geneNames') ? chosen.geneNames : 'index',
+      geneNames: geneNames.geneNames,
       expression: expression.expression,
       log1p: log1p.log1p,
       highlyVariable: highlyVariable.highlyVariable,
@@ -515,6 +554,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     guessed: [
       ...guessed,
       ...(expression.guessed ? ['expression'] : []),
+      ...(geneNames.guessed ? ['geneNames'] : []),
       ...(log1p.guessed ? ['log1p'] : []),
       ...(highlyVariable.guessed ? ['highlyVariable'] : []),
     ],
@@ -631,6 +671,33 @@ export function expressionAxisRoute(candidates, expression, modality = null) {
     return index < 0 ? null : `${prefix}layer-${index}`;
   }
   return null;
+}
+
+/**
+ * How many genes one axis route lists: its var axis's length (`raw.var`'s
+ * for `raw`), known from metadata, before any gene name is read.
+ *
+ * @param {Object} candidates
+ * @param {string} axisRoute
+ * @returns {number}
+ */
+export function axisGeneCount(candidates, axisRoute) {
+  const { scope, matrix } = axisScope(candidates, axisRoute);
+  return matrix === 'raw' ? scope.raw.n_vars : scope.var.n_vars;
+}
+
+/**
+ * The var axis an expression matrix's genes are on, as the reader names it
+ * (`readVarNames`): `X` (shared by `X` and every layer) or `raw`, behind
+ * `mod/<name>` for a modality (`mod/<name>` itself for its `X` and layers).
+ *
+ * @param {string|null} modality
+ * @param {string} expression - `X`, `raw` or `layer:<name>`
+ * @returns {string}
+ */
+export function geneNamesVarAxis(modality, expression) {
+  if (modality === null || modality === undefined) return expression === 'raw' ? 'raw' : 'X';
+  return expression === 'raw' ? `mod/${modality}/raw` : `mod/${modality}`;
 }
 
 /**

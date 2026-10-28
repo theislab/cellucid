@@ -24,6 +24,7 @@ import {
 import { formatCompactCount as formatNumber } from '../app/ui/components/display-format.js';
 import { PLACES } from '../app/ui/place-names.js';
 import { formatCountOf, formatCount, countNoun } from '../utils/format-units.js';
+import { allocateLargeArray } from '../utils/large-arrays.js';
 
 const glbBufferPromises = new Map();
 const MEBIBYTE = 1024 * 1024;
@@ -576,8 +577,8 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${formatCountOf(count, 'point')} (octopus with ${numTentacles} tentacles)...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     // Body parameters - denser core to force overdraw
     const bodyRadius = 0.36;
@@ -697,8 +698,8 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${formatCountOf(count, 'point')} (${numSpirals} spirals)...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     // Generate spiral configurations
     const spiralConfigs = [];
@@ -803,8 +804,8 @@ export class SyntheticDataGenerator {
     const startTime = performance.now();
 
     // A 2-D embedding: two position components per point, no padded z.
-    const positions = new Float32Array(count * 2);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 2);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     // Generate cluster configurations
     const clusters = [];
@@ -930,8 +931,8 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${formatCountOf(count, 'point')} (${label})...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     const clamp01 = (v) => Math.max(0, Math.min(1, v));
     const safeCellTypes = Math.max(12, Math.min(45, Math.floor(cellTypes)));
@@ -1151,8 +1152,8 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${formatCountOf(count, 'point')} in ${formatCountOf(actualClusters, 'cluster')}...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     // Generate cluster centers with varying sizes
     const clusters = [];
@@ -1229,8 +1230,8 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${formatCount(count)} random ${countNoun(count, 'point')}...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
 
     for (let i = 0; i < count; i++) {
       const idx = i * 3;
@@ -1300,8 +1301,8 @@ export class SyntheticDataGenerator {
 
     // Sample points
     console.log('[GLB] Sampling points...');
-    const positions = new Float32Array(count * 3);
-    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const positions = allocateLargeArray(Float32Array, count * 3);
+    const colors = allocateLargeArray(Uint8Array, count * 4); // RGBA packed as uint8
     const normal = new Float64Array(3);
     const logInterval = Math.max(100000, Math.floor(count / 10));
 

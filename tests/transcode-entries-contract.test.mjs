@@ -11,14 +11,19 @@
  * - what the sort wrote along the way is given back: only the matrix's own
  *   payloads are left in the space;
  * - an entry outside the matrix, and a count that is not the declared one,
- *   fail.
+ *   fail;
+ * - a matrix by cell is laid out by feature (`byFeature`, what a store keeps
+ *   of an expression matrix) with the same entries and values, whatever the
+ *   bucket size (one feature larger than a bucket included), from held
+ *   values or from big-endian payloads as R writes them, and only the
+ *   result's payloads are left in the space.
  */
 import assert from 'node:assert/strict';
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
-import { EntryCollector } from '../assets/js/data/anndata/transcode/entries.js';
+import { EntryCollector, byFeature as laidOutByFeature } from '../assets/js/data/anndata/transcode/entries.js';
 import { TRANSCODED_DIRECTORY, openTranscodeSpace } from '../assets/js/data/anndata/transcode/space.js';
 import { opfsOnDisk } from './helpers/opfs-on-disk.mjs';
 
@@ -223,3 +228,65 @@ test('pieces of a split R matrix assemble into one matrix by cell, block by bloc
     { cell: 0, feature: 1, value: 2 }, { cell: 1, feature: 2, value: 3 }, { cell: 3, feature: 0, value: 1 },
   ]);
 });
+
+/** Big-endian bytes of `values`, as R writes a vector's payload. */
+function bigEndian(values) {
+  const width = values.BYTES_PER_ELEMENT;
+  const bytes = new Uint8Array(values.length * width);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, k) => {
+    if (values instanceof Float64Array) view.setFloat64(k * width, value);
+    else view.setInt32(k * width, value);
+  });
+  return bytes;
+}
+
+for (const where of ['memory', 'opfs']) {
+  test(`a matrix by cell is laid out by feature in bounded blocks, from held values or R's payloads (${where})`, async t => {
+    const disk = opfsOnDisk();
+    t.after(disk.cleanup);
+    const nCells = 37;
+    const nFeatures = 23;
+    // Feature 5 in every cell: one feature larger than the smallest bucket.
+    const entries = entriesOf(nCells, nFeatures, 5).filter(entry => entry.feature !== 5)
+      .concat(Array.from({ length: nCells }, (_, cell) => ({ cell, feature: 5, value: cell + 0.25 }))).sort(byCell);
+    const indptr = new Int32Array(nCells + 1);
+    for (const { cell } of entries) indptr[cell + 1]++;
+    for (let cell = 0; cell < nCells; cell++) indptr[cell + 1] += indptr[cell];
+    const indices = Int32Array.from(entries, entry => entry.feature);
+    const data = Float64Array.from(entries, entry => entry.value);
+    for (const blockEntries of [5, 64, 1 << 22]) {
+      for (const held of [true, false]) {
+        const space = await openTranscodeSpace({ kind: 'file', name: `by-feature-${blockEntries}-${held}` }, { environment: disk.environment, memory: where === 'memory' });
+        let matrix = { format: 'csr', shape: [nCells, nFeatures], indptr: { values: indptr }, indices: { values: indices }, data: { values: data } };
+        if (!held) {
+          const keep = async bytes => {
+            const writer = await space.sink.open(bytes.length);
+            writer.write(bytes);
+            return writer.close();
+          };
+          matrix = {
+            ...matrix,
+            indptr: { region: await keep(bigEndian(indptr)), dtype: '>i4' },
+            indices: { region: await keep(bigEndian(indices)), dtype: '>i4' },
+            data: { region: await keep(bigEndian(data)), dtype: '>f8' },
+          };
+        }
+        const csc = await laidOutByFeature(matrix, { space, readRegion: region => space.read(region) }, { blockEntries });
+        assert.equal(csc.format, 'csc');
+        assert.deepEqual(csc.shape, [nCells, nFeatures]);
+        assert.equal(csc.data.dtype, '<f8', "R's doubles stay doubles");
+        assert.deepEqual(await storedEntries(space, csc), [...entries].sort(byFeature), `bucket of ${blockEntries}, ${held ? 'held' : 'payloads'}`);
+        if (where === 'opfs') {
+          for (const part of [matrix.indptr, matrix.indices, matrix.data]) if (part.region) await space.sink.release(part.region);
+          const left = readdirSync(path.join(disk.root, TRANSCODED_DIRECTORY, space.directory)).filter(name => name.startsWith('p'));
+          assert.deepEqual(left.sort(), [csc.indices.region.store, csc.data.region.store].sort(), 'the buckets are given back');
+        }
+        await space.discard();
+      }
+    }
+    // A matrix already by feature, or dense, is returned as it is.
+    const dense = { format: 'dense', shape: [1, 1], data: { values: new Float32Array(1) } };
+    assert.equal(await laidOutByFeature(dense, {}), dense);
+  });
+}

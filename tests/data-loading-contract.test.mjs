@@ -9,7 +9,7 @@ import {
   loadObsFieldData,
   loadVarFieldData,
 } from '../assets/js/data/data-loaders.js';
-import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
+import { BaseAnnDataAdapter, GeneNameGuesses } from '../assets/js/data/base-anndata-adapter.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { ZARR_FORMAT, valueKind } from '../assets/js/data/anndata/elements.js';
 import { resolveCategoricalColumn } from '../assets/js/data/anndata/dataframe.js';
@@ -150,7 +150,7 @@ function currentGeneList({ names = ['Gene A'] } = {}) {
   return {
     n_points: 2,
     fields: names.map((key, gene) => ({ key, kind: 'continuous', path: `var/${gene}` })),
-    geneNames: { source: null, filledFromIndex: 0, renamed: [] },
+    geneNames: { source: null, filledFromIndex: 0, renamed: [], ids: null },
   };
 }
 
@@ -198,7 +198,7 @@ test('field lists in any other form are refused: extra members, centroids, mis-i
   misplaced.fields[1] = { ...misplaced.fields[1], path: 'var/X/index/1' };
   assert.throws(() => checkGeneList(misplaced), /continuous gene at \{list\}\/1/);
   assert.throws(
-    () => checkGeneList({ ...currentGeneList(), geneNames: { source: null, filledFromIndex: 1, renamed: [] } }),
+    () => checkGeneList({ ...currentGeneList(), geneNames: { source: null, filledFromIndex: 1, renamed: [], ids: null } }),
     /filledFromIndex must count genes/
   );
   assert.throws(
@@ -267,6 +267,8 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
   adapter._closed = false;
   adapter._lifecycleGeneration = 0;
   adapter._geneNamesByRoute = new Map();
+  adapter._geneNameGuesses = new GeneNameGuesses();
+  adapter._candidatesGuessCount = 0;
   // The file opens on X named by its var index.
   adapter._candidates = {
     defaults: { expression: 'X', geneNames: 'index' },
@@ -313,7 +315,7 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
 
   const rawVar = await adapter.getGeneList();
   assert.equal(Object.hasOwn(rawVar, 'var_gene_id_column'), false);
-  assert.deepEqual(rawVar.geneNames, { source: null, filledFromIndex: 0, renamed: [] });
+  assert.deepEqual(rawVar.geneNames, { source: null, filledFromIndex: 0, renamed: [], ids: null });
   const checkedVar = checkGeneList(rawVar);
   assert.deepEqual(
     checkedVar.fields,

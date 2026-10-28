@@ -33,7 +33,7 @@ import {
   initDatasetConnections
 } from './dataset-connections.js';
 import { isPlainRecord, requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
-import { countNoun } from '../../../utils/format-units.js';
+import { formatOpenCells } from '../../../utils/format-units.js';
 
 export const NONE_DATASET_VALUE = '__none__';
 /** What the dropdown shows while the open dataset is not one of its choices. */
@@ -83,7 +83,8 @@ const DATASET_CONTROL_KEYS = [
   'datasetCard',
   'datasetChanges',
   'dom',
-  'reloadDataset'
+  'reloadDataset',
+  'resizeOpenCells'
 ];
 const DATASET_CALLBACK_KEYS = [
   'clearGeneSelection',
@@ -300,6 +301,7 @@ export function initDatasetControls(options) {
     datasetChanges,
     clearDataset,
     reloadDataset,
+    resizeOpenCells,
     callbacks
   } = options;
   requirePlainRecord(dom, 'Dataset controls DOM');
@@ -313,6 +315,9 @@ export function initDatasetControls(options) {
   }
   if (typeof reloadDataset !== 'function') {
     throw new TypeError('Dataset controls reloadDataset must be a function.');
+  }
+  if (typeof resizeOpenCells !== 'function') {
+    throw new TypeError('Dataset controls resizeOpenCells must be a function.');
   }
   if (typeof clearDataset !== 'function') {
     throw new TypeError('Dataset controls clearDataset must be a function.');
@@ -674,17 +679,49 @@ export function initDatasetControls(options) {
 
   function createDatasetOption(metadata, sourceType) {
     requireDatasetSummary(metadata, sourceType, 'Dataset option metadata');
-    return createListedOption(
+    const option = createListedOption(
       sourceType,
       metadata.id,
       metadata.name,
-      datasetOptionLabel(metadata)
+      datasetOptionLabel(metadata, sourceType)
     );
+    option.dataset.cells = String(metadata.stats.n_cells);
+    return option;
   }
 
-  /** What the picker says of one described dataset: its name and cell count. */
-  function datasetOptionLabel(metadata) {
-    return `${metadata.name} (${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')})`;
+  /**
+   * What the picker says of one described dataset: its name and cell count;
+   * while a subsample of it is open, the open cells of every cell
+   * (`formatOpenCells`), as every count of them is said.
+   */
+  function datasetOptionLabel(metadata, sourceType) {
+    const subset = openSubsetOf(sourceType, metadata.id);
+    const cells = subset === null
+      ? formatOpenCells(metadata.stats.n_cells, null, formatCompactCount)
+      : formatOpenCells(subset.kept.length, subset.nObs, formatCompactCount);
+    return `${metadata.name} (${cells})`;
+  }
+
+  /** The open subsample of this dataset (`getCellSubset`), or null: it is not open, or every cell of it is. */
+  function openSubsetOf(sourceType, datasetId) {
+    if (dataSourceManager.getCurrentSourceType() !== sourceType || dataSourceManager.getCurrentDatasetId() !== datasetId) return null;
+    const source = dataSourceManager.getSource(sourceType);
+    const annData = typeof source?.getAnnDataSource === 'function' ? source.getAnnDataSource(datasetId) : null;
+    const subset = typeof annData?.getCellSubset === 'function' ? annData.getCellSubset() : null;
+    return subset?.kept != null ? subset : null;
+  }
+
+  /** Say each described dataset's cells again: the open cells changed, or another dataset is open. */
+  function relabelDatasetOptions() {
+    for (const option of datasetOptionsByKey.values()) {
+      if (option.dataset.cells === undefined) continue;
+      const label = datasetOptionLabel(
+        { id: option.dataset.datasetId, name: option.dataset.datasetName, stats: { n_cells: Number(option.dataset.cells) } },
+        option.dataset.sourceType
+      );
+      option.dataset.label = label;
+      option.textContent = option === openingDatasetOption ? `${label} ${OPENING_OPTION_SUFFIX}` : label;
+    }
   }
 
   /**
@@ -791,8 +828,9 @@ export function initDatasetControls(options) {
       requireDatasetSummary(metadata, 'local-demo', 'Dataset option metadata');
       const option = datasetOptionsByKey.get(datasetSelectionValue('local-demo', metadata.id));
       if (option === undefined) continue;
-      const label = datasetOptionLabel(metadata);
+      const label = datasetOptionLabel(metadata, 'local-demo');
       option.dataset.datasetName = metadata.name;
+      option.dataset.cells = String(metadata.stats.n_cells);
       option.dataset.label = label;
       option.textContent = option === openingDatasetOption ? `${label} ${OPENING_OPTION_SUFFIX}` : label;
     }
@@ -1033,6 +1071,20 @@ function updateMappedDatasetFacts() {
 }
 
 /**
+ * The dataset shown, its cells grown or cut in place
+ * (`app/open-cells-resize.js`): the Dataset box says the cells open now.
+ * The fields, the gene search and the views are the dataset's still and
+ * stay as they are.
+ *
+ * @param {Object} metadata - Dataset metadata, the cell count the new one
+ */
+function refreshOpenCells(metadata) {
+  assertAlive();
+  updateDatasetInfo(metadata);
+  relabelDatasetOptions();
+}
+
+/**
  * Refresh dataset-aware UI (field dropdowns, gene search, info panel, dimension controls)
  * @param {Object|null} metadata - Dataset metadata
  */
@@ -1050,6 +1102,8 @@ function refreshDatasetUI(metadata) {
     ? null
     : dataSourceManager.getCurrentSourceType();
   updateDatasetInfo(currentMetadata, currentSourceType);
+  // The picker says the open cells of the dataset open now, every cell of the others.
+  relabelDatasetOptions();
   // A new dataset enables its own representations.
   renderRepresentationPicker();
 }
@@ -1975,8 +2029,54 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     }
   }
 
+  /**
+   * Read the open dataset again, in place, with the cells `cellSubset` asks
+   * for (a cell subset request, `data/cell-subset-policy.js`; it is this
+   * reading's own, never another's). Cells that are the open ones
+   * grown or cut (a larger or smaller share of the same method and seed)
+   * are shown in place (`resizeOpenCells`, `app/open-cells-resize.js`):
+   * only the added cells are read, and the views, fields, filters and
+   * analysis windows stay. Other cells are shown as a dataset change: its
+   * source has read them (`AnnDataFileSource.reopenCells`) and the change
+   * stages and publishes them like any other. The dataset on screen stays
+   * until the new reading is shown; Cancel keeps it.
+   *
+   * @param {Object} cellSubset
+   * @returns {Promise<{shown: boolean, inPlace: boolean}>} Whether the
+   *   dataset was shown again, and whether in place (what was shown stayed)
+   */
+  async function reopenOpenDataset(cellSubset) {
+    const datasetId = dataSourceManager.getCurrentDatasetId();
+    const sourceType = dataSourceManager.getCurrentSourceType();
+    if (typeof datasetId !== 'string' || typeof sourceType !== 'string') {
+      throw new Error('No dataset is open to read again.');
+    }
+    const source = dataSourceManager.getSource(sourceType);
+    const annData = typeof source?.getAnnDataSource === 'function' ? source.getAnnDataSource(datasetId) : null;
+    if (typeof annData?.reopenCells !== 'function') {
+      throw new Error('This dataset is not read from a file Cellucid can read again with other cells.');
+    }
+    const intent = beginDatasetSelectionIntent({
+      label: `Reading ${datasetDisplayName(sourceType, datasetId)} again…`,
+      value: datasetSelectionValue(sourceType, datasetId)
+    });
+    return await runDatasetSelectionIntent(intent, async owner => {
+      try {
+        const outcome = await trackWork(resizeOpenCells({ annData, cellSubset, signal: owner.transaction.signal }));
+        if (outcome.inPlace === true) return { shown: true, inPlace: true };
+        const shown = await handleDatasetChangeForIntent(datasetId, sourceType, DATA_LOAD_METHODS.SUBSAMPLE, source, owner);
+        return { shown: shown === true, inPlace: false };
+      } catch (error) {
+        if (isDatasetReloadSupersededError(error) || error?.name === 'AbortError') return { shown: false, inPlace: false };
+        throw error;
+      }
+    });
+  }
+
   return {
     catalogReady,
+    reopenOpenDataset: cellSubset =>
+      invokeTracked(() => reopenOpenDataset(cellSubset)),
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     destroy,
@@ -1987,6 +2087,7 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     populateDatasetDropdown: () =>
       invokeTracked(() => populateDatasetDropdown()),
     refreshDatasetUI,
+    refreshOpenCells,
     updateMappedDatasetFacts,
     showLoadedConnectivityEdges,
     selectDataset: (...args) =>

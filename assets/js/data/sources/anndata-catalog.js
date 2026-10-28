@@ -55,7 +55,9 @@ import {
   requireCellucidFileMetadata,
 } from '../anndata-cellucid-metadata.js';
 import { describeRemoteFile } from './remote-file.js';
-import { SharedWork } from '../../app/jobs/cancellable-job.js';
+import { afterWholeFileOpened, downloadReason, keptCopyOf, wholeFileOf } from '../whole-download.js';
+import { formatBytes } from '../../utils/format-units.js';
+import { SharedWork } from '../../formats/io/abort.js';
 import { ANNDATA_SOURCE_TYPE, createAnnDataFileSource } from '../anndata-file-source.js';
 import { fileFormatOfName, folderFormatOfName, openableNamesText, titleOfName } from '../input-formats.js';
 import { getTransferLog } from '../transfer-log.js';
@@ -247,6 +249,19 @@ export async function fetchAnnDataCatalog(baseUrl, sourceType, signal, { askOnce
  * The datasets of one catalog: listed from their files' metadata, opened one
  * at a time when chosen, and released when another is shown.
  */
+
+/**
+ * Whether a failure says the file changed while it was read (a byte
+ * source's `changed`, `formats/io/byte-source.js`), anywhere in its causes.
+ */
+function fileChanged(error) {
+  for (let at = error; at !== null && typeof at === 'object'; at = at.cause ?? null) {
+    if (at.code === 'changed') return true;
+    if (at instanceof AggregateError && at.errors.some(fileChanged)) return true;
+  }
+  return false;
+}
+
 export class AnnDataCatalog {
   /**
    * @param {Object} options
@@ -302,10 +317,12 @@ export class AnnDataCatalog {
    * may both wait for one description: each stops waiting with its own
    * signal, and the description stops only when none waits any more (a
    * listing abandoned because another sample failed leaves an opening's
-   * description running).
+   * description running). A file on a host that serves only whole files is
+   * downloaded by an opening, never by a listing (`listing`), which reads
+   * only what an earlier opening kept of it.
    * @private
    */
-  async _readerSource(entry, signal) {
+  async _readerSource(entry, signal, { listing = false } = {}) {
     if (entry.form.layout === 'folder') return { url: entry.url, name: entry.name };
     let described = this._resources.get(entry.id);
     if (described === undefined || described.abandoned) {
@@ -322,8 +339,23 @@ export class AnnDataCatalog {
       });
       described = work;
     }
-    const { resource } = await described.join(signal);
-    return { file: resource };
+    const { resource, transport } = await described.join(signal);
+    if (transport !== 'download') return { file: resource };
+    // A host that serves no part of the file. The listing reads only what
+    // an earlier opening kept of it, never the whole file; an opening
+    // downloads it whole, once (`whole-download.js`), saying so up front.
+    if (!listing) return { file: await wholeFileOf(resource, { format: entry.form.format, signal }) };
+    const kept = await keptCopyOf(resource, { format: entry.form.format });
+    if (kept !== null) return { file: kept };
+    throw explainedFailure(
+      `${new URL(entry.url).host} serves ${entry.path} only whole (${downloadReason(resource, 'its host')}), so the ` +
+      `catalog cannot read what it holds without downloading all of it (${formatBytes(resource.size)}). Open the ` +
+      `file by its own link, which downloads it once and keeps it, or host the catalog where parts of files are ` +
+      'served (GitHub, Zenodo, Hugging Face, a static web server).',
+      DataSourceErrorCode.UNSUPPORTED,
+      this._sourceType,
+      { datasetId: entry.id, url: entry.url }
+    );
   }
 
   /**
@@ -375,7 +407,7 @@ export class AnnDataCatalog {
           try {
             const listed = await this._listedFromOpen(entry);
             if (listed !== null) return listed;
-            const source = await this._readerSource(entry, entrySignal);
+            const source = await this._readerSource(entry, entrySignal, { listing: true });
             const described = await client.describe(source, { signal: entrySignal, expect: entry.form });
             const file = requireCellucidFileMetadata(described.cellucid, ANNDATA_SOURCE_TYPE);
             this._requireAgreeingId(entry, file.id);
@@ -433,7 +465,10 @@ export class AnnDataCatalog {
       id: entry.id,
       name: metadata.name,
       description: source.getAdapter().getFileMetadata().description ?? '',
-      stats: Object.freeze({ n_cells: metadata.stats.n_cells, n_genes: metadata.stats.n_genes }),
+      // The listing describes the file: every cell of it, as the entries
+      // not open are described, even while a subsample of it is open (the
+      // picker says the open cells of it: `dataset-controls.js`).
+      stats: Object.freeze({ n_cells: source.getCellSubset?.()?.nObs ?? metadata.stats.n_cells, n_genes: metadata.stats.n_genes }),
     });
   }
 
@@ -521,8 +556,12 @@ export class AnnDataCatalog {
           await source.loadRemoteFolder(readerSource, options);
         } else {
           await source.loadFile(readerSource.file, options);
+          await afterWholeFileOpened([readerSource.file], source.describeStorage()?.conversion ?? null);
         }
       } catch (error) {
+        // The file changed since it was described: its description (size,
+        // head bytes) is dropped, so opening it again describes it anew.
+        if (fileChanged(error)) this._resources.delete(entry.id);
         throw this._namedOpenFailure(entry, error);
       }
       this._requireAgreeingId(entry, source.getAdapter().getFileMetadata().id);

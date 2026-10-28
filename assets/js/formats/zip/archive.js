@@ -545,6 +545,8 @@ export async function openZipArchive(reader, { name, verifyCrc = true, signal = 
     entries,
     entry: path => byPath.get(path) ?? null,
     stats: () => reader.stats(),
+    /** The link the archive is read over (its byte reader's), measured as it is read. */
+    link: reader.link ?? null,
   });
 }
 

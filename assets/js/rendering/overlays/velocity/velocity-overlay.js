@@ -51,6 +51,7 @@ import {
   createOrUpdatePackedVisibilityTexture,
   packedTextureFits,
 } from '../shared/packed-texture.js';
+import { setLinearLayoutUniform } from '../../linear-texture.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../alpha-visibility.js';
 import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
 import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../../position-layout.js';
@@ -950,7 +951,7 @@ export class VelocityOverlay extends OverlayBase {
     const existing = perField.get(validated.layoutKey);
     const replacedBinding =
       existing !== undefined &&
-      this.gl.getParameter(this.gl.TEXTURE_BINDING_2D) === existing.texture;
+      this.gl.getParameter(this.gl.TEXTURE_BINDING_2D_ARRAY) === existing.texture;
     const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
       texture: null,
       data: validated.vectors,
@@ -1008,7 +1009,7 @@ export class VelocityOverlay extends OverlayBase {
       if (replacedBinding) {
         try {
           this.gl.bindTexture(
-            this.gl.TEXTURE_2D,
+            this.gl.TEXTURE_2D_ARRAY,
             textureInfo.texture
           );
         } catch (error) {
@@ -1248,7 +1249,6 @@ export class VelocityOverlay extends OverlayBase {
       state.building = false;
       state.buildToken = null;
       state.tableSize = 0;
-      state.tableWidth = 1;
       state.textureInfo = null;
       state.visibilityTextureInfo = null;
       if (state.notificationId !== null) {
@@ -2231,11 +2231,11 @@ export class VelocityOverlay extends OverlayBase {
 
     // Bind textures
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, field.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, field.texture);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, posTexture.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, posTexture.texture);
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, spawnState.textureInfo.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, spawnState.textureInfo.texture);
 
     // Set uniforms
     const u = this._uniformsUpdate;
@@ -2265,9 +2265,9 @@ export class VelocityOverlay extends OverlayBase {
       u.u_velocityBlend,
       1 - Math.pow(0.75, frameScale)
     );
-    gl.uniform1i(u.u_velocityTexWidth, field.width);
-    gl.uniform1i(u.u_positionTexWidth, posTexture.width);
-    gl.uniform1i(u.u_spawnTableWidth, spawnState.tableWidth);
+    setLinearLayoutUniform(gl, u.u_velocityLayout, field.plan);
+    setLinearLayoutUniform(gl, u.u_positionLayout, posTexture.plan);
+    setLinearLayoutUniform(gl, u.u_spawnTableLayout, spawnState.textureInfo.plan);
     gl.uniform1i(u.u_spawnTableSize, spawnState.tableSize);
 
     let transformFeedbackActive = false;
@@ -2636,9 +2636,10 @@ export class VelocityOverlay extends OverlayBase {
 
     // Visibility
     gl.uniform1i(u.u_useAlphaTex, 1);
-    gl.uniform1i(
-      u.u_alphaTexWidth,
-      spawnState.visibilityTextureInfo.width
+    setLinearLayoutUniform(
+      gl,
+      u.u_alphaLayout,
+      spawnState.visibilityTextureInfo.plan
     );
 
     // Fog
@@ -2654,7 +2655,7 @@ export class VelocityOverlay extends OverlayBase {
     // Bind textures
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(
-      gl.TEXTURE_2D,
+      gl.TEXTURE_2D_ARRAY,
       spawnState.visibilityTextureInfo.texture
     );
     gl.activeTexture(gl.TEXTURE3);
@@ -3523,10 +3524,8 @@ export class VelocityOverlay extends OverlayBase {
       !textureInfo ||
       typeof textureInfo !== 'object' ||
       !textureInfo.texture ||
-      !Number.isSafeInteger(textureInfo.width) ||
-      textureInfo.width <= 0 ||
-      !Number.isSafeInteger(textureInfo.height) ||
-      textureInfo.height <= 0 ||
+      !Number.isSafeInteger(textureInfo.plan?.texels) ||
+      textureInfo.plan.texels <= 0 ||
       !Number.isSafeInteger(bytesPerPixel) ||
       bytesPerPixel <= 0
     ) {
@@ -3534,11 +3533,7 @@ export class VelocityOverlay extends OverlayBase {
         'VelocityOverlay derived texture byte ownership is invalid.'
       );
     }
-    return (
-      BigInt(textureInfo.width) *
-      BigInt(textureInfo.height) *
-      BigInt(bytesPerPixel)
-    );
+    return BigInt(textureInfo.plan.texels) * BigInt(bytesPerPixel);
   }
 
   _queueDerivedTextureDelete(textureInfo, bytesPerPixel) {
@@ -3615,7 +3610,6 @@ export class VelocityOverlay extends OverlayBase {
       state.ready = false;
       state.generation = -1;
       state.tableSize = 0;
-      state.tableWidth = 1;
 
       if (state.notificationId !== null) {
         const notificationId = state.notificationId;
@@ -3870,11 +3864,11 @@ export class VelocityOverlay extends OverlayBase {
         'u_velocityBlend'
       ),
       u_velocityTex: gl.getUniformLocation(this._programUpdate, 'u_velocityTex'),
-      u_velocityTexWidth: gl.getUniformLocation(this._programUpdate, 'u_velocityTexWidth'),
+      u_velocityLayout: gl.getUniformLocation(this._programUpdate, 'u_velocityLayout'),
       u_positionTex: gl.getUniformLocation(this._programUpdate, 'u_positionTex'),
-      u_positionTexWidth: gl.getUniformLocation(this._programUpdate, 'u_positionTexWidth'),
+      u_positionLayout: gl.getUniformLocation(this._programUpdate, 'u_positionLayout'),
       u_spawnTableTex: gl.getUniformLocation(this._programUpdate, 'u_spawnTableTex'),
-      u_spawnTableWidth: gl.getUniformLocation(this._programUpdate, 'u_spawnTableWidth'),
+      u_spawnTableLayout: gl.getUniformLocation(this._programUpdate, 'u_spawnTableLayout'),
       u_spawnTableSize: gl.getUniformLocation(this._programUpdate, 'u_spawnTableSize')
     };
 
@@ -3896,7 +3890,7 @@ export class VelocityOverlay extends OverlayBase {
       u_cometStretch: gl.getUniformLocation(this._programRender, 'u_cometStretch'),
       u_invMaxMagnitude: gl.getUniformLocation(this._programRender, 'u_invMaxMagnitude'),
       u_alphaTex: gl.getUniformLocation(this._programRender, 'u_alphaTex'),
-      u_alphaTexWidth: gl.getUniformLocation(this._programRender, 'u_alphaTexWidth'),
+      u_alphaLayout: gl.getUniformLocation(this._programRender, 'u_alphaLayout'),
       u_useAlphaTex: gl.getUniformLocation(this._programRender, 'u_useAlphaTex'),
       u_colormapTex: gl.getUniformLocation(this._programRender, 'u_colormapTex'),
       u_fogNear: gl.getUniformLocation(this._programRender, 'u_fogNear'),
@@ -4516,7 +4510,6 @@ export class VelocityOverlay extends OverlayBase {
         textureInfo: null,
         visibilityTextureInfo: null,
         tableSize: 0,
-        tableWidth: 1,
         lastLod: null,
         ready: false,
         generation: -1,
@@ -4752,7 +4745,6 @@ export class VelocityOverlay extends OverlayBase {
           const previousVisibilityTextureInfo =
             state.visibilityTextureInfo;
           state.tableSize = 0;
-          state.tableWidth = 1;
           state.textureInfo = null;
           state.visibilityTextureInfo = null;
           state.generation = scheduledVersion;
@@ -4887,7 +4879,6 @@ export class VelocityOverlay extends OverlayBase {
           state.textureInfo = textureInfo;
           state.visibilityTextureInfo = visibilityTextureInfo;
           state.tableSize = table.length;
-          state.tableWidth = textureInfo.width;
           state.generation = scheduledVersion;
           state.cellCount = cellCount;
           state.ready = true;

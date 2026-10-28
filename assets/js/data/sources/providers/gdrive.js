@@ -307,7 +307,11 @@ export function createDriveProvider({ google = null } = {}) {
       name: String(item.name ?? ''),
       size: Number.isSafeInteger(size) ? size : null,
       head,
-      version: typeof item.md5Checksum === 'string' ? `md5:${item.md5Checksum}:${size}` : `revision:${item.headRevisionId ?? ''}:${size}`,
+      // A validator only where Drive states one (a checksum, a revision):
+      // without one the file is known by its size alone (`remote-file.js`).
+      version: typeof item.md5Checksum === 'string' && item.md5Checksum !== ''
+        ? `md5:${item.md5Checksum}:${size}`
+        : typeof item.headRevisionId === 'string' && item.headRevisionId !== '' ? `revision:${item.headRevisionId}:${size}` : null,
       attribution: { title: String(item.name ?? id), url: `https://drive.google.com/file/d/${id}/view` },
       signal,
       onStep,

@@ -6,7 +6,8 @@
  * and name, with the server's launch defaults, by the remote source and by
  * the notebook bridge alike. The server here answers exactly as the Python
  * server does (`cellucid.anndata_server`): `206` with `Content-Range` for a
- * range, `HEAD` with the length, 404 for an absent Zarr key.
+ * range, `HEAD` with the length, 404 for an absent Zarr key, every file's
+ * bytes with the `ETag` the dataset list states for it (its version).
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
@@ -16,7 +17,9 @@ import test from 'node:test';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 import { ViewerHostDataSource } from '../assets/js/data/viewer-host-source.js';
-import { requireServedAnnData } from '../assets/js/data/served-anndata.js';
+import { requireServedAnnData, servedStoreKey } from '../assets/js/data/served-anndata.js';
+import { persistsAcrossVisits } from '../assets/js/data/anndata/transcode/space.js';
+import { rangeCacheKey } from '../assets/js/formats/io/range-cache.js';
 import { viewerProtocolDocument } from '../assets/js/data/viewer-protocol.js';
 import { lastSocket } from './helpers/fake-host-socket.mjs';
 import { bytesByteSource } from '../assets/js/formats/io/byte-source.js';
@@ -53,9 +56,12 @@ function json(value) {
   });
 }
 
+/** The version every fixture file is served as, as the dataset list states it. */
+const ETAG = '"fixture"';
+
 /** One resource as the Python server answers it: HEAD, a whole GET, or one range. */
-function bytesResponse(bytes, method, range) {
-  const headers = { 'Accept-Ranges': 'bytes', ETag: '"fixture"', 'Content-Type': 'application/octet-stream' };
+function bytesResponse(bytes, method, range, etag = ETAG) {
+  const headers = { 'Accept-Ranges': 'bytes', ETag: etag, 'Content-Type': 'application/octet-stream' };
   if (range === undefined) {
     return new Response(method === 'HEAD' ? null : bytes, {
       status: 200,
@@ -86,11 +92,11 @@ async function zarrFolderKeys() {
 async function servedStore(layout) {
   if (layout === 'file') {
     const bytes = new Uint8Array(await readFile(new URL('data-mapping-full.h5ad', FIXTURES)));
-    return { file: { url: '_cellucid/anndata/data-mapping-full.h5ad', kind: 'h5ad', layout, size: bytes.length }, bytes, type: 'h5ad' };
+    return { file: { url: '_cellucid/anndata/data-mapping-full.h5ad', kind: 'h5ad', layout, size: bytes.length, etag: ETAG }, bytes, type: 'h5ad' };
   }
   if (layout === 'zip') {
     const bytes = new Uint8Array(await readFile(new URL('data-mapping-full.zarr.zip', FIXTURES)));
-    return { file: { url: '_cellucid/anndata/data-mapping-full.zarr.zip', kind: 'zarr', layout, size: bytes.length }, bytes, type: 'zarr' };
+    return { file: { url: '_cellucid/anndata/data-mapping-full.zarr.zip', kind: 'zarr', layout, size: bytes.length, etag: ETAG }, bytes, type: 'zarr' };
   }
   if (layout === 'listed folder') {
     // A MatrixMarket folder, GEO-named: a folder of files, listed by the server.
@@ -108,7 +114,7 @@ async function servedStore(layout) {
     ]) {
       keys.set(name, (await corpus.entry(`mtx/cellranger3/${inside}`).read()).slice());
     }
-    const files = [...keys].map(([path, bytes]) => ({ path, size: bytes.length })).sort((a, b) => a.path.localeCompare(b.path));
+    const files = [...keys].map(([path, bytes]) => ({ path, size: bytes.length, etag: ETAG })).sort((a, b) => a.path.localeCompare(b.path));
     return { file: { url: '_cellucid/anndata/GSM7/', kind: 'mtx', layout: 'folder', files }, keys, type: 'mtx', counts: null, defaults: { embedding2d: { key: 'X_umap', columns: [0, 1] } } };
   }
   return { file: { url: '_cellucid/anndata/data-mapping-full.zarr/', kind: 'zarr', layout }, keys: await zarrFolderKeys(), type: 'zarr' };
@@ -140,7 +146,7 @@ function installServer(t, store) {
     const route = decodeURIComponent(store.file.url);
     if (store.bytes !== undefined && path === route) {
       storeRequests.push({ method, range });
-      return bytesResponse(store.bytes, method, range);
+      return bytesResponse(store.bytes, method, range, store.answeredEtag ?? ETAG);
     }
     if (store.keys !== undefined && path.startsWith(route)) {
       storeRequests.push({ method, range });
@@ -254,7 +260,7 @@ test('the notebook bridge reads a served store in place and keeps its channel', 
 });
 
 test('a served store is declared exactly', () => {
-  const file = { url: '_cellucid/anndata/a%20b.h5ad', kind: 'h5ad', layout: 'file', size: 9 };
+  const file = { url: '_cellucid/anndata/a%20b.h5ad', kind: 'h5ad', layout: 'file', size: 9, etag: '"9-1-2-3"' };
   const declared = requireServedAnnData({ file, defaults: {} }, 'anndata');
   assert.equal(declared.file.name, 'a b.h5ad');
   assert.equal(declared.file.route, file.url);
@@ -263,27 +269,73 @@ test('a served store is declared exactly', () => {
     ['an absolute URL', { ...file, url: 'http://elsewhere/a.h5ad' }, /route under/],
     ['a nested path', { ...file, url: '_cellucid/anndata/x/a.h5ad' }, /one file/],
     ['a parent segment', { ...file, url: '_cellucid/anndata/..' }, /canonically/],
-    ['a missing size', { url: file.url, kind: 'h5ad', layout: 'file' }, /must contain exactly: kind, layout, size, url \(missing: size\)/],
+    ['a missing size', { url: file.url, kind: 'h5ad', layout: 'file', etag: file.etag }, /must contain exactly: etag, kind, layout, size, url \(missing: size\)/],
     ['an empty file', { ...file, size: 0 }, /positive byte length/],
+    // The file's version: what is kept of it is filed under it.
+    ['a missing ETag', { url: file.url, kind: 'h5ad', layout: 'file', size: 9 }, /must contain exactly: etag, kind, layout, size, url \(missing: etag\)/],
+    ['a weak ETag', { ...file, etag: 'W/"9-1"' }, /strong ETag/],
+    ['an unquoted ETag', { ...file, etag: '9-1' }, /strong ETag/],
+    ['an ETag that is not text', { ...file, etag: 9 }, /strong ETag/],
     // A Zarr store folder is listed by its metadata, a folder of files by the server.
     ['a listed Zarr folder', { url: '_cellucid/anndata/a.zarr/', kind: 'zarr', layout: 'folder', files: [] }, /must contain exactly: kind, layout, url \(unexpected: files\)/],
     ['an unlisted MatrixMarket folder', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder' }, /must contain exactly: files, kind, layout, url \(missing: files\)/],
     ['an empty listing', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [] }, /list the folder's files/],
-    ['a path leaving the folder', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: '../x', size: 1 }] }, /plain relative path/],
-    ['an absolute path', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: '/x', size: 1 }] }, /plain relative path/],
-    ['a file listed twice', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1 }, { path: 'x', size: 1 }] }, /twice/],
-    ['a size that is not exact', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1.5 }] }, /exact byte length/],
+    ['a path leaving the folder', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: '../x', size: 1, etag: '"1"' }] }, /plain relative path/],
+    ['an absolute path', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: '/x', size: 1, etag: '"1"' }] }, /plain relative path/],
+    ['a file listed twice', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1, etag: '"1"' }, { path: 'x', size: 1, etag: '"1"' }] }, /twice/],
+    ['a size that is not exact', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1.5, etag: '"1"' }] }, /exact byte length/],
+    ['a listed file without its ETag', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1 }] }, /must contain exactly: etag, path, size \(missing: etag\)/],
+    ['a listed file with a weak ETag', { url: '_cellucid/anndata/a/', kind: 'mtx', layout: 'folder', files: [{ path: 'x', size: 1, etag: 'W/"1"' }] }, /strong ETag/],
   ]) {
     assert.throws(() => requireServedAnnData({ file: value, defaults: {} }, 'anndata'), match, label);
   }
   assert.throws(() => requireServedAnnData({ file }, 'anndata'), /anndata must contain exactly: defaults, file \(missing: defaults\)/);
+  assert.equal(declared.file.etag, file.etag);
   const listed = requireServedAnnData({
-    file: { url: '_cellucid/anndata/GSM7/', kind: 'mtx', layout: 'folder', files: [{ path: 'sub/m.mtx.gz', size: 3 }] },
+    file: { url: '_cellucid/anndata/GSM7/', kind: 'mtx', layout: 'folder', files: [{ path: 'sub/m.mtx.gz', size: 3, etag: '"3-1"' }] },
     defaults: {},
   }, 'anndata');
-  assert.deepEqual(listed.file.files, [{ path: 'sub/m.mtx.gz', size: 3 }]);
-  const rds = requireServedAnnData({ file: { url: '_cellucid/anndata/x.rds.gz', kind: 'rds', layout: 'file', size: 5 }, defaults: {} }, 'anndata');
+  assert.deepEqual(listed.file.files, [{ path: 'sub/m.mtx.gz', size: 3, etag: '"3-1"' }]);
+  assert.equal(listed.file.etag, null);
+  const rds = requireServedAnnData({ file: { url: '_cellucid/anndata/x.rds.gz', kind: 'rds', layout: 'file', size: 5, etag: '"5-1"' }, defaults: {} }, 'anndata');
   assert.equal(rds.file.name, 'x.rds.gz');
+});
+
+test('a served file is known by the version its server states, so what is kept of it lasts and a rewrite is new', () => {
+  const declare = etag => ({
+    id: 'cells',
+    anndata: requireServedAnnData({ file: { url: '_cellucid/anndata/cells.h5ad', kind: 'h5ad', layout: 'file', size: 9, etag }, defaults: {} }, 'anndata'),
+  });
+  const before = declare('"9-1-1-7"');
+  const rewritten = declare('"9-2-2-7"');
+  // The same size, another version: another store to open, never the one opened.
+  assert.notEqual(servedStoreKey(SERVER, rewritten), servedStoreKey(SERVER, before));
+  assert.equal(servedStoreKey(SERVER, declare('"9-1-1-7"')), servedStoreKey(SERVER, before));
+  // Its identity names the version: kept for later visits (kept stores, gene
+  // indexes), its byte cache filed under it, a rewrite filed apart.
+  const identity = version => ({ kind: 'remote', key: 'remote:cells', version });
+  assert.equal(persistsAcrossVisits(identity(before.anndata.file.etag)), true);
+  const cached = version => rangeCacheKey({ url: `${SERVER}/_cellucid/anndata/cells.h5ad`, size: 9, identity: identity(version) });
+  assert.notEqual(cached(before.anndata.file.etag), null);
+  assert.notEqual(cached(rewritten.anndata.file.etag), cached(before.anndata.file.etag));
+  // Each file of a listed folder alike.
+  const folder = etag => servedStoreKey(SERVER, {
+    id: 'cells',
+    anndata: requireServedAnnData({ file: { url: '_cellucid/anndata/GSM7/', kind: 'mtx', layout: 'folder', files: [{ path: 'm.mtx.gz', size: 3, etag }] }, defaults: {} }, 'anndata'),
+  });
+  assert.notEqual(folder('"3-1"'), folder('"3-2"'));
+});
+
+test('a file rewritten after the list was read is refused, never mixed into the version listed', async t => {
+  silenceNotifications(t);
+  const store = await servedStore('file');
+  // The list states one version; the bytes now come with another.
+  installServer(t, { ...store, answeredEtag: '"rewritten"' });
+  const source = new RemoteDataSource();
+  await source.connect({ url: SERVER });
+  await assert.rejects(source.getMetadata('cells'), /changed|ETag|version/i);
+  assert.equal(source.getAnnDataSource(), null);
+  source.disconnect();
 });
 
 test('concurrent metadata reads open the store once', async t => {

@@ -300,8 +300,8 @@ function captureDownloadNotifications(t) {
 }
 
 /** One gene's column of X, found by its stored var name. */
-function geneColumnByName(reader, name) {
-  const index = reader.varNames.indexOf(name);
+async function geneColumnByName(reader, name) {
+  const index = (await reader.readVarNames('X', null)).index.indexOf(name);
   assert.notEqual(index, -1, `gene '${name}' is on the var index`);
   return reader.getMatrixColumn('X', index);
 }
@@ -332,6 +332,21 @@ function completeTree({ embeddingValues, geneValues }) {
     genes: ['A', 'B'],
     X: dense(Float32Array.from(geneValues), [2, 2]),
     obsm: mapping({ X_umap_2d: dense(Float32Array.from(embeddingValues), [2, 2]) }),
+  });
+}
+
+/**
+ * `completeTree` whose var index is a nullable string array: opening reads
+ * its mask (it checks that no gene name is missing), so a held mask chunk
+ * keeps the opening in flight. (A plain string index is not read at opening.)
+ */
+function slowOpeningTree(values) {
+  return minimalAnnData({
+    nObs: 2,
+    genes: ['A', 'B'],
+    X: dense(Float32Array.from(values.geneValues), [2, 2]),
+    obsm: mapping({ X_umap_2d: dense(Float32Array.from(values.embeddingValues), [2, 2]) }),
+    extra: { var: dataFrame({ _index: nullable('nullable-string-array', ['A', 'B'], [0, 0]) }) },
   });
 }
 
@@ -1455,11 +1470,11 @@ test('Zarr obsm column reads decode only the chunks that hold a selected column'
     );
   });
 
-  await t.test('an absent chunk with no fill value is refused', async () => {
+  await t.test('an absent chunk with no fill value reads as its type\'s default, as zarr-python 3 writes it', async () => {
     const { reader } = await openAnnData(chunkedObsmEntries({ fill_value: null, absent: ['1.1'] }));
-    await assert.rejects(
-      reader.readObsmColumns('X_pca', [1, 3]),
-      /The Zarr array '\/obsm\/X_pca' has an absent chunk while its fill_value is null/
+    assert.deepEqual(
+      Array.from(await reader.readObsmColumns('X_pca', [1, 3])),
+      [1, 3, 11, 13, 21, 0]
     );
   });
 });
@@ -2080,7 +2095,7 @@ test('validates every variable column declared by column-order before adoption',
     const tree = storeWith();
     tree.children.var = stringFrame(['A', 'B'], { score: array(new Float32Array([1, 2])) });
     const { reader } = await openAnnData(tree);
-    assert.deepEqual(reader.varNames, ['A', 'B']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['A', 'B']);
   });
 
   const invalidCases = [
@@ -2201,7 +2216,7 @@ test('Zarr opening supports official nullable-string dataframe indices', async t
     const { reader } = await openAnnData(withIndices(names(['cell-a', 'cell-b']), names(['gene-a', 'gene-b'])));
     assert.equal(reader.nObs, 2);
     assert.equal(reader.nVars, 2);
-    assert.deepEqual(reader.varNames, ['gene-a', 'gene-b']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['gene-a', 'gene-b']);
   });
 
   await t.test('missing observation names are rejected', async () => {
@@ -3093,11 +3108,11 @@ test('opens official-writer float16 X and embedding through public methods', asy
 });
 
 test('keeps the latest concurrent Zarr open request', async () => {
-  // The first open is still reading its var index when the second is asked for.
-  const hold = holdFirst('var/_index/0');
+  // The first open is still checking its var index when the second is asked for.
+  const hold = holdFirst('var/_index/mask/0');
   const reader = new AnnDataReader();
   const firstRequest = openAnnData(
-    completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }),
+    slowOpeningTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }),
     { reader, name: 'first-slow.zarr', onChunk: hold.onChunk }
   );
   const firstAssertion = assert.rejects(
@@ -3126,9 +3141,9 @@ test('the Zarr reader publishes no notifications and a newer store supersedes an
   await openAnnData(createStore([0, 0, 1, 1]), { name: 'direct.zarr' });
   assert.deepEqual(events, [], 'the reader runs in a worker; the data source owns notifications');
 
-  const hold = holdFirst('var/_index/0');
+  const hold = holdFirst('var/_index/mask/0');
   const overlapping = new AnnDataReader();
-  const older = openAnnData(createStore([1, 2, 3, 4]), { reader: overlapping, name: 'older.zarr', onChunk: hold.onChunk });
+  const older = openAnnData(slowOpeningTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }), { reader: overlapping, name: 'older.zarr', onChunk: hold.onChunk });
   const olderAssertion = assert.rejects(older, /superseded/i);
   await hold.started;
   await openAnnData(createStore([9, 10, 11, 12]), { reader: overlapping, name: 'newer.zarr' });
@@ -3412,4 +3427,14 @@ test('a Zarr store names itself by uns["title"], as AnnData writes it', async ()
     await titleOf({ title: scalarString('corrupt') }, entries => entries.set('uns/title/0', new Uint8Array([1, 2, 3]))),
     null
   );
+});
+
+test('opening reads no gene name; the var index is read when the names are first asked for', async () => {
+  const { reader, reads } = await openAnnData(completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }), { name: 'names-later.zarr' });
+  assert.equal(readsOf(reads, 'var/_index').length, 0, 'opening checks the var index without reading its names');
+  assert.equal(reader.nVars, 2);
+  assert.deepEqual((await reader.readVarNames('X', null)).index, ['A', 'B']);
+  assert.equal(readsOf(reads, 'var/_index').length, 1, 'read once, when asked for');
+  await reader.readVarNames('X', null);
+  assert.equal(readsOf(reads, 'var/_index').length, 1, 'and kept');
 });

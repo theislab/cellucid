@@ -10,10 +10,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
+import { SegmentedVertexArray } from '../assets/js/rendering/high-perf/point-store-segments.js';
+import { bufferOf } from './helpers/point-stores.mjs';
 
 function createRecordingGl({ refuse = null } = {}) {
   let nextId = 1;
-  const calls = { bufferData: [], bufferSubData: [], texStorage3D: [], texSubImage3D: [], getError: 0, deleted: [] };
+  const calls = { bufferData: [], bufferSubData: [], texStorage3D: [], texSubImage3D: [], getError: 0, deleted: [], created: [] };
   let pendingError = 0;
   const gl = {
     ARRAY_BUFFER: 0x8892,
@@ -35,13 +37,22 @@ function createRecordingGl({ refuse = null } = {}) {
     MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     NO_ERROR: 0,
     OUT_OF_MEMORY: 0x0505,
-    createBuffer: () => ({ id: nextId++, kind: 'buffer' }),
-    createTexture: () => ({ id: nextId++, kind: 'texture' }),
+    createBuffer: () => {
+      const handle = { id: nextId++, kind: 'buffer' };
+      calls.created.push(handle);
+      return handle;
+    },
+    createTexture: () => {
+      const handle = { id: nextId++, kind: 'texture' };
+      calls.created.push(handle);
+      return handle;
+    },
     createVertexArray: () => ({ id: nextId++, kind: 'vao' }),
     bindBuffer() {},
     bindTexture() {},
     bindVertexArray() {},
     enableVertexAttribArray() {},
+    disableVertexAttribArray() {},
     vertexAttribPointer() {},
     texParameteri() {},
     bufferData(_target, dataOrSize, usage) {
@@ -82,7 +93,7 @@ function createRenderer(gl) {
   Object.assign(renderer, {
     gl,
     buffers: { positions: null, colors: null },
-    vao: gl.createVertexArray(),
+    vao: new SegmentedVertexArray(gl),
     pointCount: 0,
     stats: { gpuMemoryMB: 0 },
     snapshotBuffers: new Map(),
@@ -119,7 +130,6 @@ test('prepared stores are adopted by the publication of exactly their dataset, w
   const colors = new Uint8Array(pointCount * 4).fill(9);
   renderer._createPointStreams(positions, colors, 3, taken);
   renderer._alphaTexture = null;
-  renderer._alphaTexData = null;
   renderer._queueDataRetirement = () => {};
   renderer._drainDataRetirements = () => [];
   renderer._createAlphaTexture(pointCount, Uint8Array.of(1, 0, 1, 1, 0), taken);
@@ -131,7 +141,8 @@ test('prepared stores are adopted by the publication of exactly their dataset, w
   assert.equal(calls.texStorage3D.length, 0, 'no texture allocated');
   assert.equal(calls.getError, 0, 'no error read back');
   assert.equal(calls.texSubImage3D.length, 1, 'the alpha values are written once');
-  assert.deepEqual([...renderer._alphaTexData.subarray(0, pointCount)], [255, 0, 255, 255, 0]);
+  const [, , , , , , , , , , written, srcOffset = 0] = calls.texSubImage3D[0];
+  assert.deepEqual([...written.subarray(srcOffset, srcOffset + pointCount)], [255, 0, 255, 255, 0]);
   // The positions cross when first needed, the colors in the first frame.
   assert.equal(renderer._positionsUploadPending, true);
   assert.equal(renderer._colorsDirty, true);
@@ -145,15 +156,16 @@ test('stores prepared for another size or dimension are released, not adopted', 
   const renderer = createRenderer(gl);
   renderer.prepareDataStores(4, 2);
   const prepared = renderer._preparedDataStores;
-  const handles = [prepared.buffers.positions, prepared.buffers.colors, prepared.alphaTexture];
+  const handles = [bufferOf(prepared.buffers.positions), bufferOf(prepared.buffers.colors), prepared.alphaTexture];
   assert.equal(renderer._takePreparedDataStores(4, 3), null);
   assert.equal(renderer._preparedDataStores, null);
   for (const handle of handles) assert.ok(calls.deleted.includes(handle), `released ${handle.kind}`);
 
   renderer.prepareDataStores(6, 3);
   const second = renderer._preparedDataStores;
+  const secondPositions = bufferOf(second.buffers.positions);
   renderer.prepareDataStores(6, 3);
-  assert.ok(calls.deleted.includes(second.buffers.positions), 'a new preparation replaces the previous one');
+  assert.ok(calls.deleted.includes(secondPositions), 'a new preparation replaces the previous one');
   renderer.releasePreparedDataStores();
   assert.equal(renderer._preparedDataStores, null);
 });
@@ -164,6 +176,9 @@ test('a dataset the device cannot hold is refused when it is prepared, and nothi
     const renderer = createRenderer(gl);
     assert.throws(() => renderer.prepareDataStores(8, 3), /could not allocate/);
     assert.equal(renderer._preparedDataStores, null);
-    assert.ok(calls.deleted.length >= 2, `${refuse}: the stores made are released`);
+    assert.ok(calls.created.length >= 1, `${refuse}: a store was made`);
+    for (const handle of calls.created) {
+      assert.ok(calls.deleted.includes(handle), `${refuse}: the stores made are released (${handle.kind} ${handle.id})`);
+    }
   }
 });

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
+import { SegmentedVertexArray } from '../assets/js/rendering/high-perf/point-store-segments.js';
+import { bufferOf, pointStoreOver, vaoOf } from './helpers/point-stores.mjs';
 
 function createDataGl() {
   let nextId = 1;
@@ -48,11 +50,14 @@ function createDataGl() {
     bindBuffer() {},
     bindTexture() {},
     bindVertexArray() {},
+    // A store made holding its bytes, or sized and then written
+    // (point-store-segments.js): either way the bytes are the uploads.
     bufferData(_target, data) {
-      gl._state.uploads.push(data);
-      if (gl._state.failAttributes) {
-        // Accepted upload; the failure is staged for the attribute binding.
-      }
+      if (typeof data !== 'number') gl._state.uploads.push(data);
+    },
+    bufferSubData(_target, _offset, data, srcOffset = 0, length = data.length - srcOffset) {
+      // Accepted upload; a staged failure is for the attribute binding.
+      gl._state.uploads.push(data.subarray(srcOffset, srcOffset + length));
     },
     enableVertexAttribArray() {},
     vertexAttribPointer() {
@@ -133,9 +138,12 @@ function createDataRenderer() {
     0, 0, 255, 255,
   ]);
   const buffers = {
-    positions: old.buffer,
-    colors: old.colorBuffer,
+    positions: pointStoreOver(gl, old.buffer, 2, 12),
+    colors: pointStoreOver(gl, old.colorBuffer, 2, 4),
   };
+  const oldVertexArray = new SegmentedVertexArray(gl);
+  oldVertexArray.vaos = [old.vao];
+  oldVertexArray.segments = [{ first: 0, count: 2 }];
   // The live store held a draw order; its permutation texture retires with
   // the publication.
   const liveOrder = {
@@ -155,16 +163,15 @@ function createDataRenderer() {
     useAdaptiveLOD: false,
     useFrustumCulling: false,
     forceLODLevel: -1,
-    vao: old.vao,
+    vao: oldVertexArray,
     buffers,
     _alphaTexture: old.texture,
     _alphaTexWidth: 2,
     _alphaTexHeight: 1,
-    _alphaTexData: new Uint8Array([255, 255]),
     _useAlphaTexture: true,
     _currentAlphas: new Float32Array([1, 1]),
     _liveOrder: liveOrder,
-    _liveColorOrder: liveOrder.drawOrder,
+    _liveColorOrder: liveOrder,
     spatialIndices: new Map(),
     _perViewState: perViewState,
     currentDimensionLevel: 3,
@@ -197,15 +204,15 @@ function createDataRenderer() {
     _dummyLodIndexTexture: null,
   });
 
-  renderer._createPointStreams = function createCandidateBuffers() {
-    this.buffers.positions = gl.createBuffer();
-    this.buffers.colors = gl.createBuffer();
+  renderer._createPointStreams = function createCandidateBuffers(positions, colors, dimension) {
+    this.buffers.positions = pointStoreOver(gl, gl.createBuffer(), colors.length / 4, dimension * 4);
+    this.buffers.colors = pointStoreOver(gl, gl.createBuffer(), colors.length / 4, 4);
+    this.vao.setStores(this.buffers.positions, this.buffers.colors, dimension);
   };
   renderer._createAlphaTexture = function createCandidateAlphaTexture() {
     this._alphaTexture = gl.createTexture();
     this._alphaTexWidth = 2;
     this._alphaTexHeight = 1;
-    this._alphaTexData = new Uint8Array([255, 255]);
   };
   renderer._computeBoundingSphere = () => ({ radius: 2 });
 
@@ -241,9 +248,9 @@ test('loadData commits before old retirement and retries each deduplicated handl
   assert.equal(renderer._colors, nextColors);
   assert.equal(renderer.currentDimensionLevel, 2);
   assert.equal(renderer._liveGeometryGeneration, 2);
-  assert.notEqual(renderer.vao, old.vao);
-  assert.notEqual(renderer.buffers.positions, old.buffer);
-  assert.notEqual(renderer.buffers.colors, old.colorBuffer);
+  assert.notEqual(vaoOf(renderer.vao), old.vao);
+  assert.notEqual(bufferOf(renderer.buffers.positions), old.buffer);
+  assert.notEqual(bufferOf(renderer.buffers.colors), old.colorBuffer);
   assert.notEqual(renderer._alphaTexture, old.texture);
   assert.equal(renderer._pendingDataRetirements.size, 1);
   assert.equal(gl._state.buffers.has(old.buffer), true);
@@ -296,7 +303,7 @@ test('failed loadData candidate rollback retains cleanup failures without touchi
   let candidateBuffer = null;
   renderer._createPointStreams = function createFailingCandidate() {
     candidateBuffer = gl.createBuffer();
-    this.buffers.positions = candidateBuffer;
+    this.buffers.positions = pointStoreOver(gl, candidateBuffer, 2, 8);
     gl._state.fail.buffers.add(candidateBuffer);
   };
   renderer._createAlphaTexture = () => {
@@ -360,9 +367,9 @@ test('dispose drains current and pending data attempt-all, retaining only failur
       dimensionLevel: 2,
     },
   );
-  const currentBuffer = renderer.buffers.positions;
-  const currentColorBuffer = renderer.buffers.colors;
-  const currentVao = renderer.vao;
+  const currentBuffer = bufferOf(renderer.buffers.positions);
+  const currentColorBuffer = bufferOf(renderer.buffers.colors);
+  const currentVao = vaoOf(renderer.vao);
   const currentTexture = renderer._alphaTexture;
 
   assert.throws(
@@ -378,9 +385,9 @@ test('dispose drains current and pending data attempt-all, retaining only failur
   assert.equal(gl._state.buffers.has(currentColorBuffer), false);
   assert.equal(gl._state.vertexArrays.has(currentVao), false);
   assert.equal(gl._state.textures.has(currentTexture), false);
-  assert.equal(renderer.buffers.positions, null);
-  assert.equal(renderer.buffers.colors, null);
-  assert.equal(renderer.vao, null);
+  assert.equal(bufferOf(renderer.buffers.positions), null);
+  assert.equal(bufferOf(renderer.buffers.colors), null);
+  assert.equal(vaoOf(renderer.vao), null);
   assert.equal(renderer._alphaTexture, null);
 
   gl._state.fail.buffers.clear();
@@ -421,11 +428,11 @@ test('a live representation switch keeps per-cell owners and retains the geometr
   assert.equal(renderer._positions, flat);
   assert.equal(renderer.currentDimensionLevel, 2);
   assert.equal(renderer._colors, colors);
-  assert.equal(renderer.buffers.colors, old.colorBuffer);
+  assert.equal(bufferOf(renderer.buffers.colors), old.colorBuffer);
   assert.equal(renderer._alphaTexture, old.texture);
   assert.equal(renderer._currentAlphas, alphas);
-  assert.notEqual(renderer.vao, old.vao);
-  assert.notEqual(renderer.buffers.positions, old.buffer);
+  assert.notEqual(vaoOf(renderer.vao), old.vao);
+  assert.notEqual(bufferOf(renderer.buffers.positions), old.buffer);
   assert.deepEqual(gl._state.uploads, [flat], 'only the new positions are uploaded');
   assert.equal(renderer._liveGeometryGeneration, 2);
   // The previous publication's VAO retires; its colour buffer and alpha
@@ -438,7 +445,7 @@ test('a live representation switch keeps per-cell owners and retains the geometr
   assert.equal(gl._state.buffers.has(old.buffer), true);
   const retained = renderer._snapshotGeometryPools.get(1);
   assert.equal(retained.positions, positions);
-  assert.equal(retained.positionBuffer, old.buffer);
+  assert.equal(bufferOf(retained.positionBuffer), old.buffer);
   assert.equal(retained.refCount, 0);
   assert.equal(retained.retained, true);
   assert.equal(retained.positionBufferByteLength, positions.byteLength);
@@ -454,13 +461,13 @@ test('switching the live view back adopts the retained geometry without an uploa
   const { gl, old, positions, renderer } = createSwitchRenderer();
   const flat = new Float32Array([-2, 0, 2, 0]);
   renderer.updatePositions(flat, 2);
-  const flatBuffer = renderer.buffers.positions;
+  const flatBuffer = bufferOf(renderer.buffers.positions);
   const uploads = gl._state.uploads.length;
 
   renderer.updatePositions(positions, 3);
 
   assert.equal(gl._state.uploads.length, uploads, 'a retained representation needs no upload');
-  assert.equal(renderer.buffers.positions, old.buffer);
+  assert.equal(bufferOf(renderer.buffers.positions), old.buffer);
   assert.equal(renderer._liveGeometryGeneration, 1);
   assert.equal(renderer.currentDimensionLevel, 3);
   const adopted = renderer._snapshotGeometryPools.get(1);
@@ -469,7 +476,7 @@ test('switching the live view back adopts the retained geometry without an uploa
   // The 2D geometry it left is retained in turn, and neither buffer is lost.
   const left = renderer._snapshotGeometryPools.get(2);
   assert.equal(left.positions, flat);
-  assert.equal(left.positionBuffer, flatBuffer);
+  assert.equal(bufferOf(left.positionBuffer), flatBuffer);
   assert.equal(left.refCount, 0);
   assert.equal(gl._state.buffers.has(flatBuffer), true);
   assert.equal(gl._state.buffers.has(old.buffer), true);
@@ -485,10 +492,10 @@ test('switching the live view back adopts the retained geometry without an uploa
 
 test('the same positions republished to the live view change nothing', () => {
   const { gl, old, positions, renderer } = createSwitchRenderer();
-  const vao = renderer.vao;
+  const vao = vaoOf(renderer.vao);
   renderer.updatePositions(positions, 3);
-  assert.equal(renderer.vao, vao);
-  assert.equal(renderer.buffers.positions, old.buffer);
+  assert.equal(vaoOf(renderer.vao), vao);
+  assert.equal(bufferOf(renderer.buffers.positions), old.buffer);
   assert.deepEqual(gl._state.uploads, []);
   assert.equal(renderer._pendingDataRetirements.size, 0);
 });

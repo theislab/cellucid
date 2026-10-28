@@ -292,9 +292,10 @@ test('genes asked for in one task go to the worker as one request, each caller o
     client.getMatrixColumn('X', 5),
   ]);
   const requests = sent().slice(before);
-  // Then the job the read is for (none for a view's genes) and the shared
-  // loads it serves (none named here).
-  assert.deepEqual(requests.map(message => [message.method, message.args]), [['getMatrixColumns', ['X', [0, 2, 5], null, []]]]);
+  // Then the job the read is for (none for a view's genes), the shared
+  // loads it serves (none named here), and whether a caller waits to see
+  // the genes on more cells as they are read (none here).
+  assert.deepEqual(requests.map(message => [message.method, message.args]), [['getMatrixColumns', ['X', [0, 2, 5], null, [], false]]]);
   assert.deepEqual(Array.from(a), Array.from(expected[0]));
   assert.deepEqual(Array.from(b), Array.from(expected[1]));
   assert.deepEqual(Array.from(c), Array.from(expected[2]));
@@ -406,4 +407,119 @@ test('genes in a few cells are read by cell through the worker and the adapter, 
     assert.deepEqual(values, cells.map(cell => columns[gene][cell]));
   });
   await assert.rejects(adapter.getGeneCellSubset([], cells), /at least one gene/);
+});
+
+test('opening another cell subset of the same file reads through the store already open: no structure read again', async t => {
+  const { fetch, requests } = servingFixture();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const call = handlerWith();
+  const file = { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad', identity: { kind: 'remote', key: 'x', version: '"v1"' } };
+  const all = await call('open', { source: { file } });
+  const every = await call('getObsField', 'cell_type');
+  const everyName = Array.from(every.codes, code => every.categories[code]);
+  const k = Math.ceil(all.nObs / 2);
+  const opening = requests.length;
+  const half = await call('open', { source: { file }, cellSubset: { mode: 'subsample', method: 'uniform', k, seed: 7 } });
+  assert.equal(half.nObs, k);
+  assert.equal(requests.length, opening, 'the structure is not read again');
+  // The kept cells, in the order they open (their priority order), read
+  // through the store the first open read.
+  const kept = half.cellSubset.openOrder;
+  const keptField = await call('getObsField', 'cell_type');
+  assert.deepEqual(Array.from(keptField.codes, code => keptField.categories[code]), Array.from(kept, cell => everyName[cell]));
+  // Another version of the file is opened anew.
+  const before = requests.length;
+  await call('open', { source: { file: { ...file, identity: { ...file.identity, version: '"v2"' } } } });
+  assert.ok(requests.length > before, 'a new version reads its structure');
+});
+
+test('another subsample of the same method and seed, opened in place, takes over the gene index of the cells both keep', async t => {
+  const { fetch, requests } = servingFixture();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const file = { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad', identity: { kind: 'remote', key: 'x', version: '"v1"' } };
+  const request = k => ({ mode: 'subsample', method: 'uniform', k, seed: 7 });
+  // A fresh opening at 30 cells: its gene index is not built.
+  const fresh = handlerWith();
+  await fresh('open', { source: { file }, cellSubset: request(30) });
+  assert.equal((await fresh('geneReadPlan', 'X')).built, false);
+  const freshGene = await fresh('getMatrixColumn', 'X', 1);
+  // Opened at 90, its index built (a gene read, then every segment), then
+  // lowered to 30 in place: the 30 are the first 30 of the 90 (priority
+  // order), and their index is the 90's, cut.
+  const call = handlerWith();
+  const wide = await call('open', { source: { file }, cellSubset: request(90) });
+  await call('getMatrixColumn', 'X', 1);
+  for (let wait = 0; (await call('geneReadPlan', 'X')).built !== true; wait++) {
+    assert.ok(wait < 500, 'the index of the 90 is built');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const lowered = await call('open', { source: { file }, cellSubset: request(30) });
+  assert.deepEqual(lowered.cellSubset.openOrder, wide.cellSubset.openOrder.subarray(0, 30));
+  assert.equal((await call('geneReadPlan', 'X')).built, true, 'the index is taken over');
+  assert.deepEqual(Array.from(await call('getMatrixColumn', 'X', 1)), Array.from(freshGene));
+  // Raised again to 90: the 30's index is taken over, the rest is to read.
+  const raised = await call('open', { source: { file }, cellSubset: request(90) });
+  assert.deepEqual(raised.cellSubset.openOrder, wide.cellSubset.openOrder);
+  const plan = await call('geneReadPlan', 'X');
+  assert.equal(plan.built, false);
+  assert.equal(plan.progressive?.done ?? 30, 30);
+});
+
+test('a reader in a new worker fetches nothing another reader of the same file fetched: the page keeps the ranges', async t => {
+  const { createByteRangeCache } = await import('../assets/js/data/byte-range-cache.js');
+  const { adoptRangeCachePort } = await import('../assets/js/formats/io/range-cache.js');
+  const { fetch, requests } = servingFixture();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetch;
+  const cache = createByteRangeCache({ budgetBytes: 64 * 1024 * 1024 });
+  const { port1, port2 } = new MessageChannel();
+  cache.connect(port1);
+  adoptRangeCachePort(port2);
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    adoptRangeCachePort(null);
+    port1.close();
+  });
+  const file = { url: 'https://example.org/x.h5ad', size: bytes.length, name: 'x.h5ad', identity: { kind: 'remote', key: 'x', version: '"v1"' } };
+  const first = handlerWith();
+  await first('open', { source: { file } });
+  const codes = (await first('getObsField', 'cell_type')).codes;
+  const fetchedByFirst = requests.length;
+  // What a worker hands the page arrives as messages do.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(cache.stats().bytes > 0, 'the first reader handed its ranges to the page');
+  // Another worker (a new handler: its own reader, its own store).
+  const second = handlerWith();
+  await second('open', { source: { file } });
+  assert.deepEqual(Array.from((await second('getObsField', 'cell_type')).codes), Array.from(codes));
+  assert.equal(requests.length, fetchedByFirst, 'the second reader fetched nothing the first one had');
+  // Another version of the file shares nothing.
+  const third = handlerWith();
+  await third('open', { source: { file: { ...file, identity: { ...file.identity, version: '"v2"' } } } });
+  assert.ok(requests.length > fetchedByFirst);
+});
+
+test('a reader\'s channel to the page\'s byte range cache ends with it: no channel is left open', async t => {
+  const { createInProcessAnnDataReaderWorker } = await import('./helpers/anndata-reader-in-process.mjs');
+  const { AnnDataReaderClient, setAnnDataReaderWorkerFactory } = await import('../assets/js/data/anndata-reader-client.js');
+  const { pageByteRangeCache } = await import('../assets/js/data/byte-range-cache.js');
+  const channels = () => pageByteRangeCache().stats().channels;
+  setAnnDataReaderWorkerFactory(() => createInProcessAnnDataReaderWorker());
+  t.after(() => setAnnDataReaderWorkerFactory(() => createInProcessAnnDataReaderWorker()));
+  const before = channels();
+  for (let i = 0; i < 3; i++) {
+    const client = new AnnDataReaderClient();
+    await client.open({ file: new File([bytes], 'x.h5ad') });
+    assert.equal(channels(), before + 1, 'an open reader holds its channel');
+    client.close();
+    assert.equal(channels(), before, 'a closed reader has ended it');
+  }
 });

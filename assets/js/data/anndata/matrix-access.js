@@ -46,20 +46,16 @@
  */
 
 import { isGroup } from '../../formats/store.js';
-import {
-  RowMajorColumnIndex,
-  allocateTypedArray,
-  sparseColumnOf,
-  sparseColumnOfDense,
-} from '../sparse-column-index.js';
+import { allocateTypedArray, copyTypedArray, RowMajorColumnIndex, sparseColumnOf, sparseColumnOfDense, sparseIndexPlan } from '../sparse-column-index.js';
 import { isAnnDataMatrixDataKind } from '../anndata-value-kinds.js';
-import { elementBytes, shapeOf, validateArrayEncoding, valueKind } from './elements.js';
+import { elementBytes, encodingType, shapeOf, validateArrayEncoding, valueKind } from './elements.js';
 import { checkPointers, sparseContract } from './sparse.js';
 import { SLAB_BYTES, readIntegers, readNumbers, writeFloat32 } from './values.js';
 import { keepSubsetEntries, keepSubsetRun, sortSubsetEntries } from './subset-entries.js';
 import { releaseDecodeContext, retainDecodeContext, runOnDecodeWorker } from '../../formats/io/decode-pool.js';
 import { READ_AHEAD_BYTES_PER_MS } from '../../formats/io/link.js';
 import { subsetEntriesScript } from '../../../workers/scripts.js';
+import { canTransfer } from '../../utils/large-arrays.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 /** The kernel of a cell subset read by gene, for a decode worker to load. */
@@ -131,9 +127,77 @@ function touchedChunkBytes(array, starts, ends, count) {
   return total * chunk * bytes;
 }
 
+/**
+ * Where `row` is in the ascending `sorted` from `from` on (the first
+ * position holding `row` or more), galloping: a gene's ascending rows walk
+ * the kept rows once.
+ */
+function gallopRows(sorted, row, from) {
+  let low = from;
+  let high = from;
+  let step = 1;
+  while (high < sorted.length && sorted[high] < row) {
+    low = high + 1;
+    high += step;
+    step *= 2;
+  }
+  if (high > sorted.length) high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (sorted[middle] < row) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/**
+ * About how many decoded bytes of a gene's value chunks hold no kept row,
+ * before its rows are read: the gene's entries taken as spread evenly over
+ * the stored rows, so entry `start + (end - start) * row / nRows` is about
+ * row `row`'s, and the kept rows' runs touch the value chunks of their
+ * entries. A gene of a foreign gene-major file at a 1 % blocks subsample
+ * leaves about half of its chunks untouched; at 10 % nearly none (each chunk
+ * spans millions of rows).
+ */
+function keptValueChunksSave(array, keptRuns, nRows, start, end) {
+  const chunk = chunkElements(array);
+  const bytes = elementBytes(array);
+  if (chunk === null) return 0;
+  const first = Math.floor(start / chunk);
+  const last = Math.floor((end - 1) / chunk);
+  const all = last - first + 1;
+  // A gene within one chunk saves nothing.
+  if (all < 2) return 0;
+  const perRow = (end - start) / Math.max(1, nRows);
+  let touched = 0;
+  let lastTouched = -1;
+  for (let r = 0; r < keptRuns.starts.length && touched < all; r++) {
+    const from = Math.max(first, Math.floor((start + keptRuns.starts[r] * perRow) / chunk));
+    const to = Math.min(last, Math.floor((start + keptRuns.ends[r] * perRow) / chunk));
+    const begin = Math.max(from, lastTouched + 1);
+    if (to >= begin) touched += to - begin + 1;
+    if (to > lastTouched) lastTouched = to;
+  }
+  return (all - touched) * chunk * bytes;
+}
+
+/** The runs of consecutive rows of an ascending row list: `{starts, ends}`. */
+function rowRunsOf(sorted) {
+  const starts = [];
+  const ends = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i] === sorted[i - 1] + 1) ends[ends.length - 1] = sorted[i] + 1;
+    else {
+      starts.push(sorted[i]);
+      ends.push(sorted[i] + 1);
+    }
+  }
+  return { starts: Float64Array.from(starts), ends: Float64Array.from(ends) };
+}
+
 /** Positions `0..n-1` of `values` ordered by value (ascending, stable). */
 function ascendingOrder(values) {
-  const order = new Uint32Array(values.length);
+  const order = allocateTypedArray(Uint32Array, values.length, 'Cell order');
   for (let i = 0; i < order.length; i++) order[i] = i;
   let sorted = true;
   for (let i = 1; i < values.length && sorted; i++) sorted = values[i] > values[i - 1];
@@ -146,8 +210,8 @@ function ascendingOrder(values) {
  * the cost of reading them.
  */
 function rangesOf(pointers, positions) {
-  const starts = new Float64Array(positions.length);
-  const ends = new Float64Array(positions.length);
+  const starts = allocateTypedArray(Float64Array, positions.length, 'Entry range starts');
+  const ends = allocateTypedArray(Float64Array, positions.length, 'Entry range ends');
   positions.forEach((position, i) => {
     starts[i] = pointers[position];
     ends[i] = pointers[position + 1];
@@ -176,12 +240,16 @@ function checkedColumnEntries(rows, values, from, to, start, nObs) {
       ? { rows, values, count: rows.length }
       : { rows: rows.subarray(from, to), values: values.subarray(from, to), count: to - from };
   }
-  const order = Uint32Array.from({ length: to - from }, (_, i) => from + i).sort((a, b) => rows[a] - rows[b] || a - b);
-  return {
-    rows: Float64Array.from(order, i => rows[i]),
-    values: Float64Array.from(order, i => values[i]),
-    count: to - from,
-  };
+  const order = allocateTypedArray(Uint32Array, to - from, 'Gene column order');
+  for (let i = 0; i < order.length; i++) order[i] = from + i;
+  order.sort((a, b) => rows[a] - rows[b] || a - b);
+  const sortedRows = allocateTypedArray(Float64Array, to - from, 'Gene column cells');
+  const sortedValues = allocateTypedArray(Float64Array, to - from, 'Gene column values');
+  for (let i = 0; i < order.length; i++) {
+    sortedRows[i] = rows[order[i]];
+    sortedValues[i] = values[order[i]];
+  }
+  return { rows: sortedRows, values: sortedValues, count: to - from };
 }
 
 /** Whether `array` holds integers only, by its type (row indices need no integer check). */
@@ -199,50 +267,70 @@ function widerThanFloat32(array) {
 
 /**
  * Access through a background index (`RowMajorColumnIndex`), made by
- * `create(options)`. When the index starts -- the first column asked for, or
- * `prepare()` -- it gets its own activity (`onIndexStart`), which its reads
- * count into and its progress updates, finished when the index is built.
- * `storedBytes()` is what the pass will read, for how much is left. `cost`
- * prices reading columns through it: `passBytes` (what the whole pass
- * decodes), `entryBytes` (what one entry costs once built) and
- * `defaultEntries` (a column's entries before they are counted).
+ * `create(options)`. Each build of the index -- started by the first column
+ * asked for, or `prepare()` ahead of need -- gets its own activity
+ * (`onIndexStart(label)`), which its reads count into and its progress
+ * updates, finished when the index is built (or cancelled, when the last
+ * gene it was built for is withdrawn). `storedBytes(index, {values})` is what
+ * a pass will read, for how much is left: a second pass (the store filled
+ * from the matrix after an indices-only first pass) expects its bytes when it
+ * starts. A matrix no store can hold is scanned once per batch of waiting
+ * genes, each scan its own activity (`onIndexStart(label, {rescan: reason})`),
+ * so it is never a silent wait. `cost` prices reading columns through it:
+ * `passBytes` (what the whole pass decodes), `entryBytes` (what one entry
+ * costs once built) and `defaultEntries` (a column's entries before they are
+ * counted).
  */
 function createIndexAccess(indexOptions, indexReadOptions, onIndexStart, storedBytes = null, cost) {
   const weight = sourceWeight(indexOptions);
   return create => {
+    const expect = (activity, options) => {
+      if (activity !== null && storedBytes !== null) {
+        storedBytes(index, options).then(bytes => activity.expect(bytes), () => {});
+      }
+    };
     const index = create({
       ...indexOptions,
       onProgress: event => {
         indexOptions.onProgress?.(event);
+        if (event.phase === 'unindexed') return;
         indexReadOptions.activity?.progress(event.done, event.total);
       },
-    });
-    let started = false;
-    const start = () => {
-      if (!started) {
-        started = true;
-        const activity = onIndexStart?.(index._label) ?? null;
+      // Pass 2's reads, exactly: what it reads again of what pass 1 did not keep.
+      onSecondPass: reads => expect(indexReadOptions.activity, { secondPass: reads }),
+      onUnindexedScan: reason => {
+        const activity = onIndexStart?.(index._label, { rescan: reason }) ?? null;
+        if (activity !== null) activity.background = false;
         indexReadOptions.activity = activity;
-        if (activity !== null && storedBytes !== null) {
-          storedBytes(index).then(bytes => activity.expect(bytes), () => {});
-        }
-        index.start().then(() => activity?.finish(), error => activity?.finish(error));
-      }
-      return index.start();
-    };
+        expect(activity, { values: true });
+        return error => activity?.finish(error);
+      },
+      // Each build its own activity, whoever started it (a gene, `prepare`,
+      // or a gene asked for while a stopped build let go).
+      onBuild: build => {
+        const activity = onIndexStart?.(index._label) ?? null;
+        if (activity !== null && waited) activity.background = false;
+        indexReadOptions.activity = activity;
+        expect(activity);
+        build.then(() => activity?.finish(), error => activity?.finish(error));
+      },
+    });
+    let waited = false;
+    const start = (ahead = false) => index.start({ ahead });
     const waiting = () => {
+      waited = true;
       start();
       // Someone now waits for the index: its reads are no longer background.
       if (indexReadOptions.activity) indexReadOptions.activity.background = false;
     };
     return {
-      column: gene => {
+      column: (gene, options = {}) => {
         waiting();
-        return index.column(gene);
+        return index.column(gene, { signal: options.signal ?? null });
       },
-      sparseColumn: gene => {
+      sparseColumn: (gene, options = {}) => {
         waiting();
-        return index.sparseColumn(gene);
+        return index.sparseColumn(gene, { signal: options.signal ?? null });
       },
       entryCount: gene => index.entryCount(gene) ?? cost.defaultEntries,
       readCost(genes) {
@@ -254,7 +342,7 @@ function createIndexAccess(indexOptions, indexReadOptions, onIndexStart, storedB
       // hold, until it is built).
       built: () => index.phase === 'ready',
       residentBytes: () => index.storeBytes ?? cost.residentBytes,
-      prepare: start,
+      prepare: () => start(true),
       retire: () => index.retire(),
       dispose: () => index.dispose(),
     };
@@ -264,14 +352,25 @@ function createIndexAccess(indexOptions, indexReadOptions, onIndexStart, storedB
 /**
  * The stored bytes an index pass over `matrix` reads: a dense matrix whole;
  * a sparse one's pointers and indices, and its values unless the index
- * leaves them in the file (`valuesOnDemand`, over the network).
+ * leaves them in the file (`valuesOnDemand`, over the network) and the pass
+ * does not read them (`values`: a scan without an index reads them); pass 2
+ * (`secondPass`: its entry ranges, `RowMajorColumnIndex` `onSecondPass`)
+ * its pointers and the ranges it reads again.
  */
 function indexPassBytes(matrix, format, label) {
-  return async index => {
+  return async (index, { values = !index.valuesOnDemand, secondPass = null } = {}) => {
     if (!isGroup(matrix)) return matrix.storedBytes();
     const sparse = sparseContract(matrix, format, `Sparse ${label}`);
+    if (secondPass !== null) {
+      const sizes = await Promise.all([
+        sparse.indptrArray.storedBytes(),
+        ...secondPass.indices.map(range => sparse.indicesArray.storedBytes([range])),
+        ...secondPass.values.map(range => sparse.dataArray.storedBytes([range])),
+      ]);
+      return sizes.reduce((sum, bytes) => sum + bytes, 0);
+    }
     const parts = [sparse.indptrArray, sparse.indicesArray];
-    if (!index.valuesOnDemand) parts.push(sparse.dataArray);
+    if (values) parts.push(sparse.dataArray);
     const sizes = await Promise.all(parts.map(array => array.storedBytes()));
     return sizes.reduce((sum, bytes) => sum + bytes, 0);
   };
@@ -294,10 +393,131 @@ function addSparseFloat32(current, value) {
  * @property {boolean} [integerRows] - Whether `readEntries` gives integer row indices
  * @property {(rows: ArrayLike<number>, values: ArrayLike<number>, from: number, to: number, start: number) => {rows: ArrayLike<number>, values: ArrayLike<number>, count: number}} [checkedEntries] -
  *   One gene's entries `from..to` of a range read from entry `start`, rows checked and sorted
+ * @property {(gene: number, rows: ArrayLike<number>, from: number, to: number) => void} [requireEntries] -
+ *   Check what a read takes of a gene, rows `from..to` of a range read, where it takes less than the
+ *   gene's stored entries (`entryCount`: a priority-ordered file opened as a prefix reads each gene's
+ *   counted entries and the next); throws when the file is damaged
  * @property {() => Promise<void>} [prepare] - Start a background index
  * @property {() => void} [retire] - Answer reads under way, then release
  * @property {() => void} [dispose]
  */
+
+/**
+ * The memory a cell-major matrix's gene index (`RowMajorColumnIndex`) holds
+ * once built: a sparse matrix's stored entries (a uint32 row each, and a
+ * float32 value unless values are read per gene, `valuesOnDemand`) and its
+ * pointers; a dense matrix's every value as float32. What `openMatrixColumns`
+ * budgets an index at, and what a subsampled opening sizes a subsample to
+ * fit (`subsample-plan.js`).
+ *
+ * @param {{layout: 'sparse'|'dense', nnz?: number, nObs: number, nVars: number, valuesOnDemand?: boolean}} matrix
+ * @returns {number}
+ */
+export function columnIndexResidentBytes({ layout, nnz = 0, nObs, nVars, valuesOnDemand = false }) {
+  if (layout === 'dense') return nObs * nVars * 4;
+  return valuesOnDemand ? nnz * 4 + (nObs + nVars) * 8 : nnz * INDEX_ENTRY_BYTES + nVars * 16;
+}
+
+/**
+ * What reading genes of one expression matrix costs, known from its metadata
+ * before any gene is read: what the person is told before the first gene of
+ * a cell-major matrix (`AnnDataReader.geneReadPlan`), and what a subsampled
+ * opening weighs (pass the matrix as the subsample presents it: a view of
+ * the kept rows, whose stored bytes are those of the chunks it fetches).
+ *
+ * - `cellMajor`: a gene is spread over every cell (CSR, or dense in chunks
+ *   spanning many genes), so the first gene reads the whole matrix (`scan`);
+ *   a gene-major matrix (CSC, dense in gene strips) reads only its own.
+ * - `scan`: the stored bytes the index pass reads before the first gene is
+ *   whole (`storedBytes`; null when the store cannot say without reading),
+ *   the bytes they decode to (`valueBytes`), and the entries it walks.
+ * - `index`: the index the pass builds (`sparseIndexPlan`): `residentBytes`
+ *   in memory, `storeBytes` for a store pass 2 fills (`passes` 2: its own
+ *   stored bytes again, `secondPassStoredBytes`).
+ *
+ * @param {Object} matrix - The matrix node (a sparse group or a dense array)
+ * @param {{format: Object, label: string, nObs: number, nVars: number, decodedChunkBytes: number, valuesOnDemand: boolean, retainIndicesBytes: number}} context
+ * @returns {Promise<{cellMajor: boolean, layout: string, entries: number, scan: {storedBytes: number|null, valueBytes: number}|null, index: {residentBytes: number, passes: 1|2, storeBytes: number, secondPassStoredBytes: number|null}|null}>}
+ */
+export async function geneReadCost(matrix, { format, label, nObs, nVars, decodedChunkBytes, valuesOnDemand, retainIndicesBytes }) {
+  const stored = async arrays => {
+    try {
+      const sizes = await Promise.all(arrays.map(array => array.storedBytes()));
+      return sizes.every(Number.isFinite) ? sizes.reduce((sum, bytes) => sum + bytes, 0) : null;
+    } catch {
+      // A store that cannot say without reading (a Zarr folder over HTTP).
+      return null;
+    }
+  };
+  if (isGroup(matrix)) {
+    const sparse = sparseContract(matrix, format, `Sparse ${label}`);
+    const nnz = sparse.dataLength;
+    if (sparse.format === 'csc') {
+      return { cellMajor: false, layout: 'csc', entries: nnz, scan: null, index: null };
+    }
+    const plan = sparseIndexPlan({ nnz, nCols: nVars, nRows: nObs, valuesOnDemand, retainIndicesBytes });
+    const firstPass = [sparse.indptrArray, sparse.indicesArray, ...(valuesOnDemand ? [] : [sparse.dataArray])];
+    // A build this gene starts: the gene waits through pass 1, so pass 2
+    // reads again only what pass 1 does not keep (`sparseIndexPlan`).
+    const secondPass = [
+      sparse.indptrArray,
+      ...(plan.keepsIndices ? [] : [sparse.indicesArray]),
+      ...(plan.keepsValues ? [] : [sparse.dataArray]),
+    ];
+    const [storedBytes, secondPassStoredBytes] = await Promise.all([
+      stored(firstPass),
+      plan.passes === 2 ? stored(secondPass) : null,
+    ]);
+    return {
+      cellMajor: true,
+      layout: 'csr',
+      entries: nnz,
+      scan: {
+        storedBytes,
+        valueBytes: (nObs + 1) * elementBytes(sparse.indptrArray) +
+          nnz * (elementBytes(sparse.indicesArray) + (valuesOnDemand ? 0 : elementBytes(sparse.dataArray))),
+      },
+      index: {
+        residentBytes: columnIndexResidentBytes({ layout: 'sparse', nnz, nObs, nVars, valuesOnDemand }),
+        passes: plan.passes,
+        storeBytes: plan.storeBytes,
+        secondPassStoredBytes,
+      },
+    };
+  }
+  const bytes = elementBytes(matrix);
+  const chunks = Array.isArray(matrix.chunks) ? matrix.chunks : null;
+  const stripColumns = chunks === null ? null : Math.min(chunks[1], nVars);
+  if (stripColumns !== null && nObs * stripColumns * bytes <= decodedChunkBytes) {
+    return { cellMajor: false, layout: 'dense-strips', entries: nObs * nVars, scan: null, index: null };
+  }
+  const residentBytes = columnIndexResidentBytes({ layout: 'dense', nObs, nVars });
+  return {
+    cellMajor: true,
+    layout: 'dense-rows',
+    entries: nObs * nVars,
+    scan: { storedBytes: await stored([matrix]), valueBytes: nObs * nVars * bytes },
+    index: { residentBytes, passes: 1, storeBytes: residentBytes, secondPassStoredBytes: null },
+  };
+}
+
+/**
+ * Whether `openMatrixColumns` reads a matrix's genes through a row-major
+ * index (`RowMajorColumnIndex`): a CSR matrix, or a dense one whose gene
+ * strips (its chunks' columns over every row) the decoded-chunk budget does
+ * not hold. A CSC matrix and a dense one in such strips read each gene as
+ * stored.
+ *
+ * @param {Object} matrix
+ * @param {{nObs: number, nVars: number, decodedChunkBytes: number}} context
+ * @returns {boolean}
+ */
+export function readsThroughRowIndex(matrix, { nObs, nVars, decodedChunkBytes }) {
+  if (isGroup(matrix)) return encodingType(matrix) === 'csr_matrix';
+  const chunks = Array.isArray(matrix.chunks) ? matrix.chunks : null;
+  const stripColumns = chunks === null ? null : Math.min(chunks[1], nVars);
+  return !(stripColumns !== null && nObs * stripColumns * elementBytes(matrix) <= decodedChunkBytes);
+}
 
 /**
  * Open column access to one matrix.
@@ -314,9 +534,14 @@ function addSparseFloat32(current, value) {
  * @param {Object} [context.readOptions] - Read options of opening (reading CSC pointers)
  * @param {Promise<ArrayLike<number>>|null} [context.pointers] - A CSC matrix's
  *   column pointers, already being read (the dataset's `X`, read as it opens)
+ * @param {Uint32Array|null} [context.keptRows] - A subsample's stored rows,
+ *   ascending, when a CSC matrix is read through them (`sparseColumn`: only
+ *   their entries are wanted; see `keptEntriesOfGene`)
+ * @param {() => number} [context.roundTripBytes] - What one round trip of the
+ *   link is worth in bytes (0 for a local file)
  * @returns {Promise<MatrixColumns>}
  */
-export async function openMatrixColumns(matrix, { format, label, nObs, nVars, decodedChunkBytes, indexOptions, onIndexStart = null, readOptions = {}, pointers: pointerRead = null }) {
+export async function openMatrixColumns(matrix, { format, label, nObs, nVars, decodedChunkBytes, indexOptions, onIndexStart = null, readOptions = {}, pointers: pointerRead = null, keptRows = null, roundTripBytes = () => 0 }) {
   const indexReadOptions = { activity: null };
   const weight = sourceWeight(indexOptions);
 
@@ -336,19 +561,63 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
 
     if (sparse.format === 'csc') {
       const raw = await (pointerRead ?? readIntegers(sparse.indptrArray, 0, nVars + 1, pointerLabel, readOptions));
-      const pointers = raw instanceof Float64Array ? raw : Float64Array.from(raw);
+      const pointers = raw instanceof Float64Array ? raw : copyTypedArray(Float64Array, raw, pointerLabel);
       checkPointers(pointers, sparse.dataLength, `Sparse ${label}`);
+      // The kept rows' runs, once (a gene's estimate walks them, not every kept row).
+      const keptRuns = keptRows === null ? null : rowRunsOf(keptRows);
       /** One gene's entries: rows checked, sorted ascending (stable) when stored unsorted. */
+      // A gene's kept entries alone, when the value chunks it would skip
+      // cost more than the round trip the extra read adds. Shared over the
+      // genes read at once, that round trip looked cheaper; measured, the
+      // runs' extra requests made 100 genes of a 1 % subsample slower
+      // (3.2 s against 2.7 s, 150 ms at 5 MB/s) for 13 % fewer bytes.
       const entries = async (gene, options) => {
         const start = pointers[gene];
         const end = pointers[gene + 1];
         if (end === start) return { rows: new Uint32Array(0), values: new Float64Array(0), count: 0 };
+        if (keptRuns !== null && keptValueChunksSave(sparse.dataArray, keptRuns, nObs, start, end) > roundTripBytes()) {
+          return keptEntriesOfGene(start, end, options);
+        }
         const [rows, values] = await Promise.all([readIndices(start, end, options), readValues(start, end, options)]);
         return checkedColumnEntries(rows, values, 0, rows.length, start, nObs);
       };
+      /**
+       * A gene's entries at the kept rows only: its row indices first, then
+       * the values of the kept entries' runs alone -- one round trip more,
+       * taken when the value chunks holding no kept entry cost more than it
+       * (`keptValueChunksSave`). Its other entries are left out (a subsample
+       * reads them for nothing).
+       */
+      const keptEntriesOfGene = async (start, end, options) => {
+        const stored = await readIndices(start, end, options);
+        const rows = [];
+        const runs = [];
+        let position = 0;
+        let lastRow = -1;
+        for (let entry = 0; entry < stored.length; entry++) {
+          const row = Number(stored[entry]);
+          if (!(row >= 0 && row < nObs) || !Number.isInteger(row)) {
+            throw new RangeError(`Sparse column row index ${row} at entry ${start + entry} is outside its ${nObs}-row shape`);
+          }
+          // Rows stored out of order: the walk starts again.
+          if (row < lastRow) position = 0;
+          lastRow = row;
+          position = gallopRows(keptRows, row, position);
+          if (position >= keptRows.length || keptRows[position] !== row) continue;
+          rows.push(row);
+          const last = runs.at(-1);
+          if (last !== undefined && last[1] === start + entry) last[1]++;
+          else runs.push([start + entry, start + entry + 1]);
+        }
+        const parts = await Promise.all(runs.map(([from, to]) => readValues(from, to, options)));
+        const values = allocateTypedArray(Float64Array, rows.length, `Sparse ${label} values`);
+        let at = 0;
+        for (const part of parts) for (let i = 0; i < part.length; i++) values[at++] = Number(part[i]);
+        return checkedColumnEntries(Uint32Array.from(rows), values, 0, rows.length, start, nObs);
+      };
       return {
         async column(gene, options = {}) {
-          const result = new Float32Array(nObs);
+          const result = allocateTypedArray(Float32Array, nObs, `Sparse ${label}`);
           const start = pointers[gene];
           const end = pointers[gene + 1];
           if (end === start) return result;
@@ -380,7 +649,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
         built: () => true,
         residentBytes: () => pointers.byteLength,
         readCost(genes) {
-          const ordered = Float64Array.from(genes).sort();
+          const ordered = copyTypedArray(Float64Array, genes, 'Gene positions').sort();
           const { starts, ends } = rangesOf(pointers, ordered);
           return (touchedChunkBytes(sparse.indicesArray, starts, ends, ordered.length) +
             touchedChunkBytes(sparse.dataArray, starts, ends, ordered.length)) * weight();
@@ -396,7 +665,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
       passBytes: nnz * (elementBytes(sparse.indicesArray) + (valuesOnDemand ? 0 : elementBytes(sparse.dataArray))),
       entryBytes: valuesOnDemand ? 4 + elementBytes(sparse.dataArray) : INDEX_ENTRY_BYTES,
       defaultEntries: nnz / Math.max(1, nVars),
-      residentBytes: valuesOnDemand ? nnz * 4 + (nObs + nVars) * 8 : nnz * INDEX_ENTRY_BYTES + nVars * 16,
+      residentBytes: columnIndexResidentBytes({ layout: 'sparse', nnz, nObs, nVars, valuesOnDemand }),
     });
     return fromIndex(options => new RowMajorColumnIndex({
       ...options,
@@ -405,9 +674,10 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
       nRows: nObs,
       nCols: nVars,
       nnz,
-      readRowPointers: (start, end) => readIntegers(sparse.indptrArray, start, end, pointerLabel, indexReadOptions),
-      readIndices: (start, end) => readIndices(start, end),
-      readValues: (start, end) => readValues(start, end),
+      // The index's reads count into its activity and stop with its build.
+      readRowPointers: (start, end, { signal = null } = {}) => readIntegers(sparse.indptrArray, start, end, pointerLabel, { ...indexReadOptions, signal }),
+      readIndices: (start, end, { signal = null } = {}) => readIndices(start, end, { ...indexReadOptions, signal }),
+      readValues: (start, end, { signal = null } = {}) => readValues(start, end, { ...indexReadOptions, signal }),
       valuesStoredBytes: () => sparse.dataArray.storedBytes(),
     }));
   }
@@ -425,7 +695,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
   const bytes = elementBytes(matrix);
   const chunks = Array.isArray(matrix.chunks) ? matrix.chunks : null;
   const stripColumns = chunks === null ? null : Math.min(chunks[1], nVars);
-  if (stripColumns !== null && nObs * stripColumns * bytes <= decodedChunkBytes) {
+  if (!readsThroughRowIndex(matrix, { nObs, nVars, decodedChunkBytes })) {
     const column = async (gene, options = {}) => {
       const values = await matrix.read([[0, nObs], [gene, gene + 1]], options);
       if (!values || values.length !== nObs) {
@@ -453,7 +723,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
     passBytes: nObs * nVars * bytes,
     entryBytes: 4,
     defaultEntries: nObs,
-    residentBytes: nObs * nVars * 4,
+    residentBytes: columnIndexResidentBytes({ layout: 'dense', nObs, nVars }),
   });
   return fromIndex(options => new RowMajorColumnIndex({
     ...options,
@@ -462,8 +732,8 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
     nRows: nObs,
     nCols: nVars,
     slabEntries: Math.max(nVars, Math.floor(SLAB_BYTES / bytes)),
-    readRows: async (rowStart, rowEnd) => {
-      const block = await matrix.read([[rowStart, rowEnd], [0, nVars]], indexReadOptions);
+    readRows: async (rowStart, rowEnd, { signal = null } = {}) => {
+      const block = await matrix.read([[rowStart, rowEnd], [0, nVars]], { ...indexReadOptions, signal });
       if (!ArrayBuffer.isView(block) || block.length !== (rowEnd - rowStart) * nVars) {
         throw new Error(`Dense ${label} row slab does not match its selection`);
       }
@@ -496,10 +766,11 @@ function sparseRowFrom(genes, values, nVars, label) {
     }
     if (entry > 0 && gene < genes[entry - 1]) sorted = false;
   }
-  const order = Uint32Array.from({ length: count }, (_, i) => i);
+  const order = allocateTypedArray(Uint32Array, count, 'Cell row order');
+  for (let i = 0; i < count; i++) order[i] = i;
   if (!sorted) order.sort((a, b) => genes[a] - genes[b] || a - b);
-  const outGenes = new Int32Array(count);
-  const outValues = new Float32Array(count);
+  const outGenes = allocateTypedArray(Int32Array, count, 'Cell row genes');
+  const outValues = allocateTypedArray(Float32Array, count, 'Cell row values');
   let kept = 0;
   for (let k = 0; k < count; k++) {
     const entry = order[k];
@@ -520,8 +791,8 @@ function sparseRowFrom(genes, values, nVars, label) {
 function sparseRowFromDense(dense) {
   let count = 0;
   for (let gene = 0; gene < dense.length; gene++) if (dense[gene] !== 0) count++;
-  const genes = new Int32Array(count);
-  const values = new Float32Array(count);
+  const genes = allocateTypedArray(Int32Array, count, 'Cell row genes');
+  const values = allocateTypedArray(Float32Array, count, 'Cell row values');
   let at = 0;
   for (let gene = 0; gene < dense.length; gene++) {
     if (dense[gene] !== 0) {
@@ -558,7 +829,7 @@ class SubsetEntries {
   add(slot, position, value) {
     if (this.count === this._slots.length) {
       const grow = (array, Type) => {
-        const next = new Type(array.length * 2);
+        const next = allocateTypedArray(Type, array.length * 2, 'Cell subset entries');
         next.set(array);
         return next;
       };
@@ -575,7 +846,7 @@ class SubsetEntries {
   /** @returns {CellSubset} */
   finish(nGenes, cellsAscending, label) {
     const total = this.count;
-    const counts = new Float64Array(nGenes + 1);
+    const counts = allocateTypedArray(Float64Array, nGenes + 1, `${label} cell subset`);
     for (let i = 0; i < total; i++) counts[this._slots[i] + 1]++;
     for (let g = 0; g < nGenes; g++) counts[g + 1] += counts[g];
     const cursor = counts.slice(0, nGenes);
@@ -594,15 +865,20 @@ class SubsetEntries {
         const from = counts[g];
         const to = counts[g + 1];
         if (to - from < 2) continue;
-        const order = Uint32Array.from({ length: to - from }, (_, i) => from + i)
-          .sort((a, b) => positions[a] - positions[b] || a - b);
-        const runPositions = Int32Array.from(order, i => positions[i]);
-        const runValues = Float64Array.from(order, i => raw[i]);
+        const order = allocateTypedArray(Uint32Array, to - from, `${label} cell subset`);
+        for (let i = 0; i < order.length; i++) order[i] = from + i;
+        order.sort((a, b) => positions[a] - positions[b] || a - b);
+        const runPositions = allocateTypedArray(Int32Array, order.length, `${label} cell subset`);
+        const runValues = allocateTypedArray(Float64Array, order.length, `${label} cell subset`);
+        for (let i = 0; i < order.length; i++) {
+          runPositions[i] = positions[order[i]];
+          runValues[i] = raw[order[i]];
+        }
         positions.set(runPositions, from);
         raw.set(runValues, from);
       }
     }
-    const pointers = new Float64Array(nGenes + 1);
+    const pointers = allocateTypedArray(Float64Array, nGenes + 1, `${label} cell subset`);
     const values = allocateTypedArray(Float32Array, total, `${label} cell subset`);
     let kept = 0;
     for (let g = 0; g < nGenes; g++) {
@@ -672,8 +948,12 @@ async function pipelined(reads, inFlightEntries, fetch, handle) {
  * while the workers keep them (every gene of the rebuilt Suo in its two
  * largest cell types, a local file in Chromium: 305-326 ms, about 150 of them
  * keeping entries on the reader thread, before; 206-215 ms after, against
- * 150 ms for reading the whole of `X`). Other columns (a gene index) are read
- * gene by gene, in groups of about `inFlightEntries` entries.
+ * 150 ms for reading the whole of `X`). A gene is the entries the access
+ * says a read of it takes (`entryCount`): a priority-ordered file opened as
+ * a prefix reads each gene's counted entries alone, checked
+ * (`requireEntries`), and its genes are then runs of their own. Other
+ * columns (a gene index) are read gene by gene, in groups of about
+ * `inFlightEntries` entries.
  *
  * @param {MatrixColumns} columns
  * @param {ReadonlyArray<number>} cells
@@ -682,15 +962,15 @@ async function pipelined(reads, inFlightEntries, fetch, handle) {
  * @returns {Promise<CellSubset>}
  */
 async function subsetByColumns(columns, cells, genes, { nObs, label, inFlightEntries, readOptions }) {
-  const positionOf = new Int32Array(nObs).fill(-1);
+  const positionOf = allocateTypedArray(Int32Array, nObs, `${label} cell subset`).fill(-1);
   cells.forEach((cell, position) => { positionOf[cell] = position; });
   const { ascending } = ascendingOrder(cells);
   // Each gene's kept entries: a slice of one part (`partOf[g]`, from
   // `startOf[g]`, `countOf[g]` entries).
   const parts = [];
-  const partOf = new Int32Array(genes.length);
-  const startOf = new Float64Array(genes.length);
-  const countOf = new Float64Array(genes.length);
+  const partOf = allocateTypedArray(Int32Array, genes.length, `${label} cell subset`);
+  const startOf = allocateTypedArray(Float64Array, genes.length, `${label} cell subset`);
+  const countOf = allocateTypedArray(Float64Array, genes.length, `${label} cell subset`);
   let scratchPositions = new Int32Array(0);
   let scratchValues = new Float32Array(0);
   const scratch = entries => {
@@ -747,6 +1027,13 @@ async function subsetByColumns(columns, cells, genes, { nObs, label, inFlightEnt
         ? Promise.resolve([new Int32Array(0), new Float32Array(0)])
         : columns.readEntries(read.start, read.end, readOptions)), (read, [rows, values]) => {
         if (failure !== null) throw failure;
+        if (columns.requireEntries !== undefined) {
+          for (let k = read.from; k < read.to; k++) {
+            const gene = genes[order[k]];
+            const from = columns.entryStart(gene) - read.start;
+            columns.requireEntries(gene, rows, from, from + columns.entryCount(gene));
+          }
+        }
         const check = checked(read.start);
         if (!(columns.integerRows || isIntegralArray(rows))) {
           // Rows that may not be integers: every gene through its checks.
@@ -760,14 +1047,14 @@ async function subsetByColumns(columns, cells, genes, { nObs, label, inFlightEnt
           closePart(at);
           return;
         }
-        const ranges = new Float64Array(2 * (read.to - read.from));
+        const ranges = allocateTypedArray(Float64Array, 2 * (read.to - read.from), `${label} cell subset`);
         for (let k = read.from; k < read.to; k++) {
           const from = columns.entryStart(genes[order[k]]) - read.start;
           ranges[2 * (k - read.from)] = from;
           ranges[2 * (k - read.from) + 1] = from + columns.entryCount(genes[order[k]]);
         }
         const args = { rows, values, ranges, nObs, ascending };
-        const owned = [rows, values].every(array => array.byteOffset === 0 && array.byteLength === array.buffer.byteLength);
+        const owned = [rows, values].every(canTransfer);
         const task = runOnDecodeWorker({
           module: SUBSET_ENTRIES_MODULE,
           name: 'keepSubsetRun',
@@ -824,7 +1111,7 @@ async function subsetByColumns(columns, cells, genes, { nObs, label, inFlightEnt
     }
   }
 
-  const pointers = new Float64Array(genes.length + 1);
+  const pointers = allocateTypedArray(Float64Array, genes.length + 1, `${label} cell subset`);
   for (let g = 0; g < genes.length; g++) pointers[g + 1] = pointers[g] + countOf[g];
   const total = pointers[genes.length];
   const cellIndex = allocateTypedArray(Int32Array, total, `${label} cell subset`);
@@ -874,7 +1161,7 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
     const pointerLabel = `Sparse ${label} indptr`;
     if (sparse.format === 'csr') {
       const raw = await readIntegers(sparse.indptrArray, 0, nObs + 1, pointerLabel, readOptions);
-      const pointers = raw instanceof Float64Array ? raw : Float64Array.from(raw);
+      const pointers = raw instanceof Float64Array ? raw : copyTypedArray(Float64Array, raw, pointerLabel);
       checkPointers(pointers, sparse.dataLength, `Sparse ${label}`);
       // Rows this close in the file are read as one range: a chunk is decoded
       // whole, so the gap between them costs nothing more.
@@ -925,13 +1212,13 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
           return result;
         },
         readCost(cells) {
-          const ordered = Float64Array.from(cells).sort();
+          const ordered = copyTypedArray(Float64Array, cells, 'Cell positions').sort();
           const { starts, ends } = rangesOf(pointers, ordered);
           return (touchedChunkBytes(sparse.indicesArray, starts, ends, ordered.length) +
             touchedChunkBytes(sparse.dataArray, starts, ends, ordered.length)) * weight();
         },
         async subset(cells, genes, options = {}) {
-          const slot = new Int32Array(nVars).fill(-1);
+          const slot = allocateTypedArray(Int32Array, nVars, `${label} cell subset`).fill(-1);
           genes.forEach((gene, g) => { slot[gene] = g; });
           const { order, ascending } = ascendingOrder(cells);
           // Runs of cells, in cell order, each read as one entry range.
@@ -987,9 +1274,9 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
       nRows: nVars,
       nCols: nObs,
       nnz: sparse.dataLength,
-      readRowPointers: (start, end) => readIntegers(sparse.indptrArray, start, end, pointerLabel, indexReadOptions),
-      readIndices: (start, end) => readIntegers(sparse.indicesArray, start, end, indexLabel, indexReadOptions),
-      readValues: (start, end) => readNumbers(sparse.dataArray, start, end, dataLabel, indexReadOptions),
+      readRowPointers: (start, end, { signal = null } = {}) => readIntegers(sparse.indptrArray, start, end, pointerLabel, { ...indexReadOptions, signal }),
+      readIndices: (start, end, { signal = null } = {}) => readIntegers(sparse.indicesArray, start, end, indexLabel, { ...indexReadOptions, signal }),
+      readValues: (start, end, { signal = null } = {}) => readNumbers(sparse.dataArray, start, end, dataLabel, { ...indexReadOptions, signal }),
       valuesStoredBytes: () => sparse.dataArray.storedBytes(),
     }));
     return {

@@ -14,6 +14,18 @@
  */
 
 import { compareNames, isGroup, normalizeSelection, pathParts, selectionSize } from '../../../formats/store.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
+import { sharedOnce } from '../../../formats/io/abort.js';
+
+/** An array of `length` elements of the kind of `values` (a typed array, or an Array of strings). */
+function arrayLike(values, length, label) {
+  return ArrayBuffer.isView(values) ? allocateTypedArray(values.constructor, length, label) : new Array(length);
+}
+
+/** Elements `[from, to)` of `values` as an array of their own. */
+function sliceOf(values, from, to, label) {
+  return ArrayBuffer.isView(values) ? copyTypedArray(values.constructor, values.subarray(from, to), label) : values.slice(from, to);
+}
 
 /**
  * The encoding attributes anndata writes for one encoding:
@@ -124,7 +136,7 @@ export function memberArray(compound, field) {
       if (width === null) return values;
       const [first, last] = selection?.[1] ?? [0, width];
       if (first === 0 && last === width) return values;
-      const selected = new values.constructor((end - start) * (last - first));
+      const selected = arrayLike(values, (end - start) * (last - first), path);
       for (let row = 0; row < end - start; row++) {
         for (let column = first; column < last; column++) {
           selected[row * (last - first) + column - first] = values[row * width + column];
@@ -170,7 +182,7 @@ export function transposedArray(real, { path = real.path, attrs = {} } = {}) {
       const nRows = rows[1] - rows[0];
       const nColumns = columns[1] - columns[0];
       if (nRows <= 1 || nColumns <= 1) return values;
-      const transposed = new values.constructor(nRows * nColumns);
+      const transposed = arrayLike(values, nRows * nColumns, path);
       for (let column = 0; column < nColumns; column++) {
         const offset = column * nRows;
         for (let row = 0; row < nRows; row++) transposed[row * nColumns + column] = values[offset + row];
@@ -225,15 +237,10 @@ export function rowWindowArray(real, { start, count, path = real.path, attrs = {
  *   attrs?: Object, storedBytes?: ((options: Object) => Promise<number|null>)|null}} definition
  * @returns {Object}
  */
-export function computedArray({ path, dtype, shape, compute, attrs = {}, storedBytes = null }) {
-  let values = null;
-  const all = options => {
-    if (values === null) {
-      values = compute(options);
-      values.catch(() => { values = null; });
-    }
-    return values;
-  };
+export function computedArray({ path, dtype, shape, compute, computeRows = null, attrs = {}, storedBytes = null }) {
+  // Computed once, shared by every read asking meanwhile: it stops only
+  // once every one of them withdrew (`sharedOnce`).
+  const all = sharedOnce(compute);
   return Object.freeze({
     kind: 'array',
     path,
@@ -247,17 +254,32 @@ export function computedArray({ path, dtype, shape, compute, attrs = {}, storedB
     storedBytes: async (_selection, options) => (storedBytes === null ? null : storedBytes(options)),
     async read(selection, options) {
       const pairs = normalizeSelection(shape, selection, path);
+      // Some rows, not computed whole yet: only those rows (a subsample's
+      // runs read this way read only the stored rows they hold).
+      if (!all.asked() && computeRows !== null && shape.length >= 1 && (pairs[0][0] > 0 || pairs[0][1] < shape[0])) {
+        const [r0, r1] = pairs[0];
+        const rows = await computeRows(options, r0, r1);
+        const width = shape.slice(1).reduce((product, extent) => product * extent, 1);
+        if (shape.length === 1 || (pairs[1][0] === 0 && pairs[1][1] === shape[1])) return rows;
+        const [, [c0, c1]] = pairs;
+        const out = arrayLike(rows, (r1 - r0) * (c1 - c0), path);
+        let at = 0;
+        for (let row = 0; row < r1 - r0; row++) {
+          for (let column = c0; column < c1; column++) out[at++] = rows[row * width + column];
+        }
+        return out;
+      }
       const whole = await all(options);
       if (shape.length === 0) return Array.isArray(whole) || ArrayBuffer.isView(whole) ? whole[0] : whole;
       if (shape.length === 1) {
-        return whole.slice(pairs[0][0], pairs[0][1]);
+        return sliceOf(whole, pairs[0][0], pairs[0][1], path);
       }
       const width = shape.slice(1).reduce((product, extent) => product * extent, 1);
       if (shape.length === 2 && pairs[1][0] === 0 && pairs[1][1] === shape[1]) {
-        return whole.slice(pairs[0][0] * width, pairs[0][1] * width);
+        return sliceOf(whole, pairs[0][0] * width, pairs[0][1] * width, path);
       }
       if (shape.length !== 2) throw new RangeError(`${path}: a computed array is read by rows, or rows and columns.`);
-      const out = new whole.constructor(selectionSize(pairs));
+      const out = arrayLike(whole, selectionSize(pairs), path);
       const [[r0, r1], [c0, c1]] = pairs;
       let at = 0;
       for (let row = r0; row < r1; row++) {

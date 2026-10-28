@@ -56,7 +56,7 @@ adata = ad.AnnData(
     obsm={"X_umap_2d": np.array([[0, 0], [1, 1]], np.float32)},
 )
 viewer = object.__new__(jupyter.AnnDataViewer)
-viewer._init_state(port=None, height=600, client_server_url=None,
+viewer._init_state(port=None, client_server_url=None,
                    web_source_url=CELLUCID_WEB_URL, web_cache_dir=None, allowed_hosts=None)
 viewer._activate()
 server = AnnDataServer(adata, host="127.0.0.1", port=0, quiet=True, serve_web_ui=False,
@@ -99,7 +99,7 @@ try:
     selection = viewer.wait_for_event("selection", timeout=120)
     cells = np.asarray(selection["cells"], dtype=np.int64)
     viewer._displayed = True
-    captured = viewer.get_session_bundle(timeout=60)
+    captured = viewer.request_session_bundle().result(timeout=60)
     say({
         "pong": pong["requestId"],
         "selection": {"n": int(cells.size), "sum": int(cells.sum()),
@@ -177,14 +177,20 @@ test('commands, events, binary frames, a dropped socket and a stop travel the on
       });
       source.onChannelEnd(end => window.__channel.ends.push(end.kind));
       if (!(await source.initialize())) throw new Error('the channel did not open');
+      // Every cell open: the page names cells by their original positions.
+      const { createCellIdentity } = await import('/assets/js/data/cell-identity.js');
+      const identity = createCellIdentity({ nObs: 6_000_000 });
+      source.setCellIdentityProvider(() => identity);
+      // The host's dataset is the one shown.
+      source.setShownDatasetProvider(() => 'channel');
       source.acceptCommands();
-      await source.notifyReady({ nCells: 2, dimensions: 2 });
+      await source.notifyReady({ dimensions: 2 });
     }, config);
     // Sent before the page connected, delivered in order once it said hello
     // (they follow the welcome on the socket).
     await expect.poll(() => page.evaluate(() => window.__channel.commands), { timeout: 30_000 })
       .toEqual(['setColorBy:leiden', 'resetCamera']);
-    expect(await next()).toEqual({ ready: { n_cells: 2, dimensions: 2 } });
+    expect(await next()).toEqual({ ready: { n_cells: 6_000_000, n_obs: 6_000_000, dimensions: 2 } });
     // Two million cells, sent in descending order as NumPy integers.
     await expect.poll(() => page.evaluate(() => window.__channel.highlights), { timeout: 60_000 }).toEqual([{
       typed: true, n: 2_000_000, sum: 3 * (1_999_999 * 2_000_000) / 2, ascending: true, last: 5_999_997, color: '#00ff7f',

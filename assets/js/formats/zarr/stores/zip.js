@@ -56,6 +56,8 @@ export function zipStore(archive, { name } = {}) {
       }));
     },
     storedSize: key => map.get(key)?.compressedSize ?? 0,
+    /** What one more request costs on the archive's link, in bytes (its merge gap). */
+    ...(archive.link == null ? {} : { mergeGapBytes: () => archive.link.mergeGapBytes }),
     list: () => [...map.keys()],
     stats: () => {
       const { bytes, requests } = archive.stats();

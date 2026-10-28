@@ -199,10 +199,16 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     requireCorrelationVariable(options.variableX, 'Correlation X variable');
     requireCorrelationVariable(options.variableY, 'Correlation Y variable');
-    const pageIds = [...this._selectedPages];
+    // A first pass correlates each page's cells in the sample.
+    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const customColors = new Map(this._pageSelector?.getCustomColors?.() || []);
     const colorBy = options.colorBy === '' ? null : options.colorBy;
     const readinessRequests = [
@@ -233,6 +239,11 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       registerInvalidationCleanup: cleanup => this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
+    if (sample !== null) {
+      for (const result of correlationResults) {
+        if (result.pageId) result.pageId = sample.basePageId(result.pageId);
+      }
+    }
     if (customColors.size > 0) {
       for (const result of correlationResults) {
         if (result.pageId && customColors.has(result.pageId)) result.pageColor = customColors.get(result.pageId);
@@ -437,6 +448,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // ===========================================================================
 
   async _exportPlotPNG() {
+    if (this._refuseStaleExport('PNG')) return;
     const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
@@ -460,7 +472,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * points, variables by key.
    * @returns {null|{kind: 'correlation', version: number, payload: unknown}}
    */
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('correlation', this._lastResult);
   }

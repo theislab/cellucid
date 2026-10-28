@@ -236,9 +236,11 @@ test('a deployed page starts every worker from its bundle and loads nothing of a
   ]));
 
   // Every script is the page's own at the URL naming its bytes, or a bundle;
-  // no worker source, and nothing a worker imports, is asked for by path.
+  // no worker source, and nothing a worker imports, is asked for by its plain
+  // path. A module the page imports too (the MatrixMarket entry scanner, whose
+  // error the page's link source names) is the page's own at its versioned URL.
   const bundles = new Set([...WORKER_SCRIPTS.values()].map(({ bundle }) => bundle));
-  expect(requests.filter(({ path }) => WORKER_SOURCES.has(path)).map(({ path }) => path)).toEqual([]);
+  expect(requests.filter(({ path, versioned }) => !versioned && WORKER_SOURCES.has(path)).map(({ path }) => path)).toEqual([]);
   expect(requests.filter(({ path, versioned }) => !versioned && !bundles.has(path)).map(({ path }) => path)).toEqual([]);
 });
 

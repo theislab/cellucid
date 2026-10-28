@@ -30,6 +30,7 @@ import { LayoutRefusal } from './refusal.js';
 import { TENX_H5_FORMAT, isTenxRoot, tenxView } from './tenx-h5.js';
 import { encodingAttrs, joinPath, valueArray, viewGroup } from './view-nodes.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 /** The matrix files of an `outs/` folder, preferred first: the filtered matrix of each Cell Ranger era. */
 export const OUTS_MATRIX_FILES = Object.freeze([
@@ -118,7 +119,7 @@ async function readAnalysis(files, base, barcodes, readText) {
       const { header, rows } = parseCsv(await readText(file), path);
       const width = header.length - 1;
       if (width < 1) continue;
-      const values = new Float64Array(nCells * width).fill(Number.NaN);
+      const values = allocateTypedArray(Float64Array, nCells * width, 'Cell Ranger analysis values').fill(Number.NaN);
       for (const row of rows) {
         const cell = cellOf.get(row[0]);
         if (cell === undefined) continue;
@@ -142,7 +143,7 @@ async function readAnalysis(files, base, barcodes, readText) {
     const labels = [...new Set(rows.map(row => row[1]))];
     labels.sort((left, right) => (Number(left) - Number(right)) || (left < right ? -1 : left > right ? 1 : 0));
     const codeOf = new Map(labels.map((label, code) => [label, code]));
-    const codes = new Int32Array(nCells).fill(-1);
+    const codes = allocateTypedArray(Int32Array, nCells, 'Cell Ranger cluster codes').fill(-1);
     for (const row of rows) {
       const cell = cellOf.get(row[0]);
       if (cell !== undefined) codes[cell] = codeOf.get(row[1]);

@@ -17,7 +17,7 @@ import { StyleManager } from '../../utils/style-manager.js';
 import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
 import { ICONS, bindDisclosure, createIconButton } from './components/controls.js';
 import { formatCompactCount } from './components/display-format.js';
-import { formatCount, formatCountOf } from '../../utils/format-units.js';
+import { formatCount, formatCountOf, formatOpenCells } from '../../utils/format-units.js';
 import { OverlapStrategy } from '../utils/field-constants.js';
 import {
   MAX_INTERSECTION_PAGES,
@@ -1305,7 +1305,8 @@ export class CategoryBuilder {
 
     const stats = this._document.createElement('div');
     stats.className = 'preview-stats';
-    stats.textContent = `Total: ${formatCountOf(this._state.pointCount, 'cell')} · ${formatCountOf(categoriesWrap.childElementCount, 'category', 'categories')}`;
+    // A subsample's open cells, said against every cell (`formatOpenCells`).
+    stats.textContent = `Total: ${formatOpenCells(this._state.pointCount, this._state.cellIdentity?.nOriginal)} · ${formatCountOf(categoriesWrap.childElementCount, 'category', 'categories')}`;
 
     preview.replaceChildren(categoriesWrap, stats);
     this._updateConfirmState();

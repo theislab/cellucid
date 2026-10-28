@@ -11,7 +11,6 @@ import test from 'node:test';
 import {
   CancellableJob,
   JOB_READ_KINDS,
-  SharedWork,
   awaitWithSignal,
   cancelledError,
   isCancellation,
@@ -250,39 +249,6 @@ test('awaitWithSignal lets one caller stop waiting while the work goes on', asyn
   await assert.rejects(left, error => error.name === 'AbortError');
   finish('values');
   assert.equal(await staying, 'values');
-});
-
-test('shared work goes on for the callers left and stops when none is', async () => {
-  let started = 0;
-  let workSignal = null;
-  let finish;
-  const shared = new SharedWork(signal => {
-    started++;
-    workSignal = signal;
-    return new Promise(resolve => {
-      finish = resolve;
-    });
-  });
-  const a = new AbortController();
-  const b = new AbortController();
-  const first = shared.join(a.signal);
-  const second = shared.join(b.signal);
-  a.abort(cancelledError('A'));
-  await assert.rejects(first, error => error.name === 'AbortError');
-  assert.equal(workSignal.aborted, false, 'one caller left: the work goes on');
-  finish('result');
-  assert.equal(await second, 'result');
-  assert.equal(started, 1);
-
-  const alone = new SharedWork(signal => new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-  }));
-  const c = new AbortController();
-  const only = alone.join(c.signal);
-  c.abort(cancelledError('C'));
-  await assert.rejects(only, error => error.name === 'AbortError');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(alone.abandoned, true, 'the last caller gone, the work stops');
 });
 
 // ---------------------------------------------------------------------------

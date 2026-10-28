@@ -56,7 +56,7 @@ function labelBlock(entry, control) {
  *   choices, `when`, `check` and data-dependent defaults. For `groups`
  *   options: `groupsFor(entry, record)` → `[{id, name, count, color}]` and
  *   `minCellsFor(entry, record)`; for `gene-sets`: `getGenes()` and
- *   `getMarkerSets()`; for `variable`: `createVariableControl(entry, value,
+ *   `getMarkerSets()` and `getNotebookSets()`; for `variable`: `createVariableControl(entry, value,
  *   onChange)` → `{root, set, destroy?}`.
  * @param {{more?: boolean, groups?: string[]}} [options.view] - Open
  *   disclosures
@@ -268,7 +268,9 @@ export function renderOptionsForm({
         const editor = createGeneSetEditor({
           value: record[key],
           getGenes: () => currentContext.getGenes(),
+          getIdentities: typeof currentContext.getGeneIdentities === 'function' ? () => currentContext.getGeneIdentities() : null,
           getMarkerSets: typeof currentContext.getMarkerSets === 'function' ? () => currentContext.getMarkerSets() : null,
+          getNotebookSets: typeof currentContext.getNotebookSets === 'function' ? () => currentContext.getNotebookSets() : null,
           onChange: next => commit(key, next),
         });
         return {

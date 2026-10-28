@@ -21,7 +21,10 @@ import {
   VIEWER_BINARY_EVENT_HEADER_FIELDS,
   VIEWER_COMMAND_FIELDS,
   VIEWER_EVENT_FIELDS,
+  VIEWER_RESULT_META_FIELDS,
   decodeViewerBinaryCommand,
+  decodeViewerResult,
+  encodeViewerResult,
   encodeViewerBinaryCommand,
   encodeViewerBinaryFrame,
   encodeViewerCells,
@@ -40,7 +43,7 @@ const FIXTURE = path.join(ROOT, 'tests/fixtures/viewer-protocol.json');
  * The digest of `viewer-protocol.json`. cellucid-python
  * (`tests/test_viewer_channel_contract.py`) and cellucid-r pin the same one.
  */
-const VIEWER_PROTOCOL_SHA256 = '642c04e1d81b574e72a5d8b3738858b3447175c2c395500d3556c8198279a9e5';
+const VIEWER_PROTOCOL_SHA256 = 'bf1db1f20d75f72359eea882297e880b9092f7682525f1caa56bdc8148b2b936';
 
 test('viewer-protocol.json is the protocol module\'s document, byte for byte, at the pinned digest', () => {
   const bytes = readFileSync(FIXTURE, 'utf8');
@@ -85,6 +88,26 @@ test('the viewer reads every example binary command, cells and all', () => {
     // Hosts pad the header so the cells start on a 4-byte boundary.
     assert.equal(new DataView(bytes.buffer).getUint32(0, true) % 4, 0);
     const command = decodeViewerBinaryCommand(bytes.buffer);
+    types.add(example.header.type);
+    if (example.header.type === 'setField') {
+      // A pushed column: its cells (null: every cell) and its values.
+      const { cells: _count, values: valueType, ...rest } = example.header;
+      assert.deepEqual(
+        { ...command, cells: command.cells === null ? null : [...command.cells], values: [...command.values] },
+        { ...rest, cells: example.cells, values: example.values }
+      );
+      assert.equal(command.values.constructor.name.toLowerCase().replace('array', ''), valueType);
+      const ValueArray = command.values.constructor;
+      assert.deepEqual(
+        encodeViewerBinaryCommand(
+          example.header,
+          example.cells === null ? null : Uint32Array.from(example.cells),
+          ValueArray.from(example.values)
+        ),
+        bytes
+      );
+      continue;
+    }
     const { all, ...rest } = example.header;
     assert.deepEqual(
       { ...command, cells: command.cells === null ? [] : [...command.cells] },
@@ -98,12 +121,11 @@ test('the viewer reads every example binary command, cells and all', () => {
       encodeViewerBinaryCommand(example.header, all ? null : Uint32Array.from(example.cells)),
       bytes
     );
-    types.add(example.header.type);
   }
   assert.deepEqual([...types].sort(), viewerBinaryCommandTypes(), 'one example per binary command');
   // A body that does not start on a 4-byte boundary is read with one copy.
   const unpadded = (() => {
-    const header = new TextEncoder().encode('{"type":"highlight","color":"#000000"}');
+    const header = new TextEncoder().encode('{"type":"highlight","color":"#000000","label":null}');
     const bytes = new Uint8Array(4 + header.length + 8);
     const view = new DataView(bytes.buffer);
     view.setUint32(0, header.length, true);
@@ -113,7 +135,7 @@ test('the viewer reads every example binary command, cells and all', () => {
     return bytes;
   })();
   assert.deepEqual([...decodeViewerBinaryCommand(unpadded).cells], [4, 9]);
-  assert.throws(() => encodeViewerBinaryCommand({ type: 'highlight', color: '#000000' }, null), /names its cells/);
+  assert.throws(() => encodeViewerBinaryCommand({ type: 'highlight', color: '#000000', label: null }, null), /names its cells/);
   assert.throws(
     () => encodeViewerBinaryCommand({ type: 'setVisibility', visible: true, all: true }, Uint32Array.of(1)),
     /names its cells/
@@ -156,6 +178,55 @@ test('binary frames are the header length, the JSON header and the body', () => 
   assert.throws(() => encodeViewerCells(Uint32Array.of()), /at least one/);
   assert.throws(() => encodeViewerCells(Uint32Array.of(3, 3)), /ascending/);
   assert.throws(() => encodeViewerCells([1, 2]), /Uint32Array/);
+});
+
+test('every result kind has an example, and each reads back to its cells and values', () => {
+  const { examples, results } = viewerProtocolDocumentFixture();
+  const resultExamples = examples.binaryEvents.filter(example => example.header.type === 'result');
+  assert.deepEqual(
+    [...new Set(resultExamples.map(example => example.header.kind))].sort(),
+    Object.keys(VIEWER_RESULT_META_FIELDS).sort(),
+    'one example per result kind'
+  );
+  assert.deepEqual(Object.keys(results.kinds).sort(), Object.keys(VIEWER_RESULT_META_FIELDS).sort());
+  for (const example of resultExamples) {
+    const decoded = decodeViewerResult(Uint8Array.from(Buffer.from(example.hex, 'hex')));
+    assert.deepEqual(decoded.header, example.header);
+    assert.deepEqual(decoded.cells === null ? null : [...decoded.cells], example.cells);
+    assert.deepEqual(decoded.values === null ? null : [...decoded.values], example.values);
+  }
+});
+
+test('a result the protocol cannot carry is refused before it is sent', () => {
+  const base = {
+    requestId: null, epoch: '00000000deadbeef', revision: 1, kind: 'highlight', id: 'highlight_1', nObs: 10,
+    meta: { label: 'L', tool: 'lasso', pageId: 'page_1', pageName: 'P', color: '#000000', enabled: true },
+    cells: Uint32Array.of(1, 2), values: null,
+  };
+  assert.ok(encodeViewerResult(base).header);
+  for (const epoch of [undefined, '', 'DEADBEEF00000000', '0123456789abcde', 7]) {
+    assert.throws(() => encodeViewerResult({ ...base, epoch }), /epoch/);
+  }
+  assert.throws(() => encodeViewerResult({ ...base, cells: Uint32Array.of(2, 1) }), /ascending/);
+  assert.throws(() => encodeViewerResult({ ...base, cells: Uint32Array.of(1, 10) }), /dataset has 10 cells/);
+  assert.throws(() => encodeViewerResult({ ...base, meta: { ...base.meta, tool: 'brush' } }), /highlight tools/);
+  assert.throws(() => encodeViewerResult({ ...base, revision: 0 }), /revision/);
+  const categorical = {
+    ...base, kind: 'categorical', id: 'user_cat_1',
+    meta: { key: 'k', categories: ['a', 'b'], origin: 'user' }, cells: null,
+  };
+  assert.throws(() => encodeViewerResult({ ...categorical, values: Uint8Array.of(0, 1, 2, 0, 0, 0, 0, 0, 0, 0) }), /names no category/);
+  assert.ok(encodeViewerResult({ ...categorical, values: new Uint8Array(10).fill(255) }));
+  assert.throws(() => encodeViewerResult({ ...categorical, values: new Uint8Array(9) }), /9 values for 10 cells/);
+  const continuous = { ...base, kind: 'continuous', id: 'c', meta: { key: 'k', origin: 'notebook' }, cells: Uint32Array.of(3) };
+  assert.ok(encodeViewerResult({ ...continuous, values: Float32Array.of(NaN) }));
+  assert.throws(() => encodeViewerResult({ ...continuous, values: Float32Array.of(Infinity) }), /finite/);
+  assert.throws(
+    () => encodeViewerBinaryCommand({
+      type: 'setField', requestId: 'r', key: 'k', kind: 'continuous', categories: ['a'], nObs: 2, cells: null, values: 'float32',
+    }, null, Float32Array.of(1, 2)),
+    /no categories/
+  );
 });
 
 test('the channel and the viewer never carry the retired notebook transport', () => {

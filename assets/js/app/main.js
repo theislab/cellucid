@@ -51,7 +51,9 @@ import {
   createVarFieldLoader,
   varLoaderMappingOf,
   loadEdges,
+  loadCoordinateRows,
   loadDatasetGeneration,
+  loadConnectivitySummary,
   loadMappingCandidates,
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
@@ -67,7 +69,9 @@ import { syntheticRepresentations } from './ui/modules/benchmark/representations
 import { describeOpeningFailure } from './ui/modules/dataset-connections.js';
 import { createMappingLayoutProvider } from './state/managers/mapping-manager.js';
 import { createVectorFieldManager, resolveVectorFields } from '../data/vector-field-manager.js';
-import { createCandidateAnnDataBinding } from '../data/anndata-provider.js';
+import { anndataCellIdentity, anndataCellPriority, createCandidateAnnDataBinding } from '../data/anndata-provider.js';
+import { parseSubsampleUrlParameters } from './subsample-url.js';
+import { setNextCellSubsetRequest, setTabCellSubsetRequest } from '../data/cell-subset-policy.js';
 import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
@@ -86,6 +90,10 @@ import {
 import {
   createViewerHostCommandHandlers
 } from './viewer-host-command-handler.js';
+import { createViewerHostResults } from './viewer-host-results.js';
+import { createOpenCellsResize } from './open-cells-resize.js';
+import { recordFirstFrame } from '../data/opening-cost.js';
+import { runAfterNextFrame } from '../rendering/frame-phases.js';
 import {
   createViewerHostPointerDelivery
 } from './viewer-host-pointer-delivery.js';
@@ -233,6 +241,22 @@ void sweepAbandonedTranscodes();
     const notifications = getNotificationCenter();
     notifications.init();
 
+    // A subsample the link names (`subsample-url.js`): the linked dataset
+    // opens with exactly it, overriding fitting to the device; a share also
+    // applies to datasets opened next in this tab. A malformed one is said
+    // by name, and the dataset opens as if it named none.
+    try {
+      const linked = parseSubsampleUrlParameters(urlParams);
+      if (linked !== null) {
+        setNextCellSubsetRequest(linked);
+        if (linked.mode === 'all' || linked.percent !== undefined) {
+          setTabCellSubsetRequest(linked.mode === 'all' ? linked : { ...linked, strict: false });
+        }
+      }
+    } catch (error) {
+      notifications.error(error.message, { category: 'data' });
+    }
+
     // The renderer and benchmark controls are wired at the far end of this
     // bootstrap, past every await below. They are painted and offered long
     // before that, so they are taken out of service here and admitted at the
@@ -362,10 +386,14 @@ void sweepAbandonedTranscodes();
     // shown.
     const HIDDEN_RELEASE_MS = 10 * 60 * 1000;
     let hiddenReleaseTimer = null;
+    // How many times the page was hidden: an opening measured across one is
+    // not measured (`data/opening-cost.js`).
+    let pageHiddenCount = 0;
     document.addEventListener('visibilitychange', () => {
       clearTimeout(hiddenReleaseTimer);
       hiddenReleaseTimer = null;
       if (document.visibilityState === 'hidden') {
+        pageHiddenCount += 1;
         hiddenReleaseTimer = setTimeout(() => {
           state.dimensionManager?.releaseUnderPressure?.();
         }, HIDDEN_RELEASE_MS);
@@ -566,11 +594,26 @@ void sweepAbandonedTranscodes();
 
     // Check if a viewer host (Python, Jupyter or R) opened this page
     let viewerHostSource = null;
+    // What the person makes, published to the host (app/viewer-host-results.js).
+    let viewerHostResults = null;
+    /** The open cells grown or cut in place (`open-cells-resize.js`), once the UI is up. */
+    let openCellsResize = null;
+    /** The AnnData source of the dataset shown, or null. */
+    const shownAnnDataSource = () => {
+      const sourceType = dataSourceManager.getCurrentSourceType?.() ?? null;
+      const datasetId = dataSourceManager.getCurrentDatasetId?.() ?? null;
+      if (sourceType === null || datasetId === null) return null;
+      return dataSourceManager.getSource(sourceType)?.getAnnDataSource?.(datasetId) ?? null;
+    };
     if (inViewerHost) {
       debug.log('[Main] Detected a viewer host, initializing the viewer channel...');
       viewerHostSource = createViewerHostBridgeDataSource(viewerHostConfig);
       dataSourceManager.registerSource('jupyter', viewerHostSource);
 
+      // A notebook widget's viewer waits for the widget to connect it: the
+      // kernel answers between cells, so this wait has no deadline.
+      startup.enter('health');
+      await viewerHostSource.connectHost();
       const viewerHostInitialized = await startup.step(
         'health',
         "the viewer's host",
@@ -1328,6 +1371,7 @@ void sweepAbandonedTranscodes();
       state.setFieldLoader(null);
       state.setVarFieldLoader(null);
       state.initVarData({ fields: [] });
+      state.beginGeneListing(false);
       state.setVectorFieldManager(null);
       state.publishDatasetMapping({ mapping: null, candidates: null, origin: null });
       state.initScene(new Float32Array(), { fields: [], count: 0 });
@@ -1568,11 +1612,13 @@ void sweepAbandonedTranscodes();
             storedOutlierLatentKey: generation.obsFields.stored_outlier_latent_key,
           }
         );
-        const varFieldLoader = generation.geneList
+        // The genes' loader needs no gene name: the list itself is read
+        // after the first view (`DataState.listPublishedGenes`).
+        const varFieldLoader = generation.identity.stats.n_genes > 0
           ? createVarFieldLoader(
               getGeneListUrl(baseUrl),
               {
-                pointCount: generation.geneList.n_points,
+                pointCount: generation.identity.stats.n_cells,
                 // How its genes' values are transformed and which are highly
                 // variable, as the mapping it opens with says.
                 mapping: varLoaderMappingOf(mapping.mapping),
@@ -1598,6 +1644,11 @@ void sweepAbandonedTranscodes();
           fieldLoader,
           generation,
           positions: positionStage.positions,
+          // Which of the dataset's cells were opened (a subsample's, or
+          // every cell): published with the scene.
+          cellIdentity: anndataCellIdentity(baseUrl, candidateAnnDataBinding),
+          // The order levels of detail and progressive analyses take them in.
+          cellPriority: anndataCellPriority(baseUrl, candidateAnnDataBinding),
           runtimeKind: 'dataset',
           defaultDimension: positionStage.defaultDimension,
           varFieldLoader,
@@ -1710,20 +1761,46 @@ void sweepAbandonedTranscodes();
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(stage.fieldLoader);
       state.setVarFieldLoader(stage.varFieldLoader);
-      // A dataset without genes publishes no gene list; it still has a var
-      // inventory, an empty one, so everything that reads it (session
-      // capture, filters, user-defined fields) treats it like any dataset.
-      state.initVarData(stage.generation.geneList ?? { fields: [] });
+      // The var inventory is published empty: the first view never waits
+      // for gene names. A dataset with genes lists them as soon as it is
+      // published (`listPublishedGenes` below); until then its gene list is
+      // pending, and everything that reads it (session capture, filters,
+      // user-defined fields) treats it as a dataset whose genes are being
+      // read.
+      state.initVarData({ fields: [] });
+      state.beginGeneListing(stage.varFieldLoader !== null);
       state.initScene(positions, obs);
+      if (stage.cellIdentity !== null) state.setCellIdentity(stage.cellIdentity);
+      if (stage.cellPriority !== null) state.setCellPriority(stage.cellPriority);
       state.clearActiveField();
       state.clearActivePageHighlights();
       state.setVectorFieldManager(stage.vectorFieldManager);
       state.publishDatasetMapping(stage.mapping);
       activeRuntimeStage = stage;
+      listPublishedGenes(stage);
 
       return restorationPublication !== null
         ? requireRestorablePublication(restorationPublication)
         : publishDatasetReplacement(stage, previousDimensionManager);
+    }
+
+    /**
+     * Read the gene list of a dataset just published (a new one, or one
+     * restored after a failed change), its shown axis's gene names guessed
+     * first (`DataState.listPublishedGenes`). Everything the first view
+     * draws is in place already: nothing it needs waits for these reads.
+     * Everything that names genes shows them loading until `genes:listed`.
+     */
+    function listPublishedGenes(stage) {
+      if (!state.areGenesPending()) return;
+      void state.listPublishedGenes().catch(error => {
+        if (activeRuntimeStage !== stage) return;
+        console.error('[Main] The gene list could not be read:', error);
+        notifications.error(
+          `The dataset is open, but its gene names could not be read: ${error instanceof Error ? error.message : String(error)}`,
+          { category: 'data' }
+        );
+      });
     }
 
     function commitSyntheticRuntimeStage(
@@ -1754,6 +1831,7 @@ void sweepAbandonedTranscodes();
       }
       const previousDimensionManager = dimensionManager;
       retireDatasetInteractions();
+      state.beginGeneListing(false);
       state.initSyntheticScene({
         positions: stage.positions,
         colors: stage.colors,
@@ -1912,12 +1990,6 @@ void sweepAbandonedTranscodes();
           debug.log(
             `[Main] Published dataset "${publication.stage.generation.identity.id}"`
           );
-          if (publication.stage.generation.geneList) {
-            debug.log(
-              `Loaded a gene list of ` +
-              `${formatCountOf(publication.stage.generation.geneList.fields.length, 'gene')}.`
-            );
-          }
           const publishedGraph = publication.stage.generation.connectivitySummary;
           if (publishedGraph) {
             debug.log(publishedGraph.n_edges === null
@@ -1925,8 +1997,9 @@ void sweepAbandonedTranscodes();
               : `Loaded a neighbour graph of ${formatCountOf(publishedGraph.n_edges, 'edge')}.`);
           }
           ui.refreshDatasetUI(activeMetadata);
-          // The notebook learns the mapping each dataset opens with.
-          if (viewerHostSource !== null && state.getDataMapping() !== null) {
+          // The notebook learns the mapping each dataset opens with: once
+          // it names its genes (`genes-listed` reports it then).
+          if (viewerHostSource !== null && state.getDataMapping() !== null && state.getDataMapping().geneNames !== null) {
             void viewerHostSource.notifyDataMapping({
               origin: state.getDataMappingOrigin(),
               requestId: null,
@@ -1935,12 +2008,21 @@ void sweepAbandonedTranscodes();
               console.error('[Main] Viewer host data-mapping report failed:', error);
             });
           }
+          // Each dataset opened starts a new epoch of results for the host:
+          // its own dataset's, or none while another one is open.
+          if (viewerHostResults !== null) {
+            void viewerHostResults.datasetOpened().catch(error => {
+              console.error('[Main] Sending the results of the opened dataset to the host failed:', error);
+            });
+          }
           // The cell count is the one thing a sensible opening point size
           // depends on, and it is known here for the first time. Applied before
           // `restoreAdvertisedDatasetState`, so a saved session or a published
-          // preset still overrides it.
+          // preset still overrides it. A progressive opening's first view is
+          // drawn as the cells it grows to will be (`open-cells-resize.js`).
           ui.applyDatasetRenderDefaults(
-            publication.stage.generation.identity.stats.n_cells,
+            shownAnnDataSource()?.getCellSubset?.()?.growth?.target
+              ?? publication.stage.generation.identity.stats.n_cells,
             publication.stage.generation.identity.embeddings.default_dimension
           );
         },
@@ -2060,6 +2142,11 @@ void sweepAbandonedTranscodes();
       let selectionStage = null;
       let runtimeStage = null;
       let urlPublication = null;
+      // When the page starts showing the cells read (their GPU stores made
+      // next): what showing a cell costs is measured from here to their
+      // first frame (`data/opening-cost.js`), while the page stays shown.
+      let showingStartedAt = null;
+      let hiddenBeforeShowing = 0;
 
       try {
         // A newer dataset change ends this step at once: a catalog dataset
@@ -2136,6 +2223,8 @@ void sweepAbandonedTranscodes();
         // itself, with its own message.
         if (Number.isSafeInteger(stagedPointCount) && stagedPointCount > 0) {
           step('Allocating the GPU memory for the cells');
+          showingStartedAt = performance.now();
+          hiddenBeforeShowing = document.visibilityState === 'hidden' ? -1 : pageHiddenCount;
           viewer.prepareDataStores(stagedPointCount, stagedDimension);
           // The publication runs in a task of its own.
           await yieldToMacrotask();
@@ -2306,6 +2395,22 @@ void sweepAbandonedTranscodes();
           }
         });
       }
+      // What showing a cell costs this page, for the next opening's first
+      // view: these cells, from their GPU stores to their first frame.
+      if (showingStartedAt !== null) {
+        const shownCells = state.pointCount;
+        void recordFirstFrame({
+          cells: shownCells,
+          startedAt: showingStartedAt,
+          afterNextFrame: runAfterNextFrame,
+          // A page hidden meanwhile drew no frame: its wait is not theirs.
+          drawn: () => pageHiddenCount === hiddenBeforeShowing &&
+            viewer.hasRendererStats('live') && viewer.getRendererStats('live').visiblePoints > 0,
+          signal: publication.signal
+        }).then(ms => {
+          if (ms !== null) debug.log(`[Main] ${formatCountOf(shownCells, 'cell')} shown: first frame ${ms.toFixed(0)} ms after their GPU stores`);
+        });
+      }
       let managerListenerError = null;
       try {
         dataSourceManager.publishDatasetSelection(managerPublication);
@@ -2406,8 +2511,15 @@ void sweepAbandonedTranscodes();
         `[Main] Published dataset state outcome: ` +
         `${settledStateOutcome.status}`
       );
-      return synchronizationOutcome.status === 'ready' ||
+      const ready = synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
+      // A progressive opening grows in place, in the background, to the
+      // cells it was asked for; a newer dataset change ends it.
+      const shown = shownAnnDataSource();
+      if (ready && shown?.getCellSubset?.()?.growth != null && openCellsResize !== null) {
+        void openCellsResize.grow(shown, publication.signal);
+      }
+      return ready;
     }
 
     /**
@@ -2815,21 +2927,83 @@ void sweepAbandonedTranscodes();
       },
       clearActiveDataset: clearActiveDatasetInPlace,
       reloadActiveDataset: reloadActiveDatasetShown,
+      resizeOpenCells: options => {
+        if (openCellsResize === null) throw new Error('The open cells cannot be resized before the app has started.');
+        return openCellsResize.resize(options);
+      },
       datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
       dataSourceManager,
       viewerHostSource
     });
     window._cellucidUi = ui;
+    // The open cells grown or cut in place: Apply of a larger or smaller
+    // share of the same method and seed, and a progressive opening's steps
+    // (`open-cells-resize.js`).
+    openCellsResize = createOpenCellsResize({
+      state,
+      viewer,
+      notify: text => notifications.info(text, { category: 'data' }),
+      onProgress: progress => ui.showOpenCellsGrowth?.(progress),
+      runtime: {
+        // The cells added: rows of an embedding's positions, in the frame
+        // shown (`loadCoordinateRows`), and the dataset's generation again.
+        readPositionRows: ({ path, dimension, rows, signal }) => loadCoordinateRows('embedding', `${DATASET_BASE_URL}${path}`, { dimension, rows, signal }),
+        loadGeneration: ({ expectedIdentityId, signal }) => loadDatasetGeneration(DATASET_BASE_URL, { expectedIdentityId, signal }),
+        stage: () => activeRuntimeStage,
+        adoptStage: stage => {
+          activeRuntimeStage = stage;
+          positions = stage.positions;
+          obs = stage.generation.obsFields;
+        },
+        retireKeptViews,
+        retireSelections: retireInProgressHighlightSelection,
+        keptViews: sessionSerializer === null
+          ? null
+          : { capture: () => sessionSerializer.captureViewCarry(), restore: record => sessionSerializer.restoreViewCarry(record) },
+        connectivity: {
+          getConnectivityGraph: connectivityRuntimeOwner.getConnectivityGraph,
+          replaceConnectivityGraph: connectivityRuntimeOwner.replaceConnectivityGraph,
+          loadSummary: (url, signal) => loadConnectivitySummary(url, { signal })
+        },
+        // Analyses' cached cell lists and gene columns are of the earlier
+        // cells; their windows stay, their results marked stale.
+        invalidateAnalysisData: () => window._comparisonModule?.dataLayer?.resetForDatasetReload?.(),
+        loadMappingCandidates: signal => loadMappingCandidates(`${DATASET_BASE_URL}${MAPPING_CANDIDATES_ROUTE}`, { signal }),
+        adoptMetadata: metadata => dataSourceManager.adoptResizedMetadata(metadata),
+        afterResize: async () => {
+          ui.refreshOpenCells(dataSourceManager.getCurrentMetadata());
+          if (viewerHostResults !== null) await viewerHostResults.resync();
+        }
+      }
+    });
     // Every runtime publication so far reached no UI.
     ui.publishCellPresence(publicationHasCells(activeDatasetPublication));
 
     if (viewerHostSource !== null) {
+      const getCellIdentity = () => state.cellIdentity;
+      viewerHostSource.setCellIdentityProvider(getCellIdentity);
+      // The host's dataset, while the viewer shows it: a dataset the person
+      // opened instead is not the one the host's cell positions describe.
+      viewerHostSource.setShownDatasetProvider(() => (
+        dataSourceManager.getCurrentSourceType() === viewerHostSource.type
+          ? dataSourceManager.getCurrentDatasetId()
+          : null
+      ));
+      viewerHostResults = createViewerHostResults({
+        state,
+        viewerHostSource,
+        getCellIdentity
+      });
       const viewerHostCommandHandlers = createViewerHostCommandHandlers({
         state,
         viewer,
         refreshUi: ui.refreshUiAfterStateLoad,
-        reportDataMapping: report => viewerHostSource.notifyDataMapping(report)
+        reportDataMapping: report => viewerHostSource.notifyDataMapping(report),
+        getCellIdentity,
+        getShownHostDataset: () => viewerHostSource.getShownHostDataset(),
+        results: viewerHostResults,
+        getHostLabel: () => viewerHostSource.getHostLabel()
       });
       // Every mapping change reaches the notebook, except an answer to its
       // own setDataMapping, which the command handler sends with the request
@@ -5210,16 +5384,27 @@ void sweepAbandonedTranscodes();
       }
       // A viewer host: it is told the viewer is ready only once its own
       // dataset is on screen. A dataset the user chose instead in this
-      // viewer is not the one Python's indices describe.
+      // viewer is not the one the host's cell positions describe: its
+      // results name no host dataset (app/viewer-host-results.js), and the
+      // commands that name cells are refused while it is open.
       if (viewerHostSource !== null && startupOutcome === 'ready') {
         await startup.step(
           'ui',
           "the viewer's host",
           () => viewerHostSource.notifyReady({
-            nCells: state.pointCount,
             dimensions: state.getDimensionLevel()
           })
         );
+        // Everything the person had made (a restored session's highlights
+        // and fields) reaches the host, replacing what it kept before; and
+        // again whenever the channel opens again after a drop.
+        if (viewerHostResults !== null) {
+          const resync = () => viewerHostResults.resync().catch(error => {
+            console.error('[Main] Sending the results snapshot to the host failed:', error);
+          });
+          viewerHostSource.onChannelReopen(() => { void resync(); });
+          void resync();
+        }
       }
     }
     startup.enter('ready');

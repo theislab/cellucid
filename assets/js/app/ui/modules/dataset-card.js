@@ -30,7 +30,9 @@ import { getTransferLog } from '../../../data/transfer-log.js';
 import { INPUT_FORMATS, inputFormat } from '../../../data/input-formats.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getOpeningProgress } from '../../../data/opening-progress.js';
+import { READ_IN_PARTS_INSTEAD, wholeReadKept, wholeReadLine } from '../../../data/whole-read-notice.js';
 import { formatBytes, formatCount, formatCountOf, countNoun } from '../../../utils/format-units.js';
+import { describeSubsampleMethod } from '../../../data/subsample.js';
 
 const CARD_DOM_KEYS = Object.freeze([
   'root',
@@ -127,8 +129,9 @@ export function describeOrigin(storage, host = null) {
 }
 
 /**
- * Where a dataset read once into this browser is kept, and how many parts
- * of it were not read, as one short line; '' for any other dataset.
+ * How a dataset read once into this browser was read, where it is kept, and
+ * how many parts of it were not read, as one short line; '' for any other
+ * dataset (`data/whole-read-notice.js`).
  *
  * @param {import('../../../data/anndata-storage.js').AnnDataStorage|null} storage
  * @returns {string}
@@ -136,28 +139,9 @@ export function describeOrigin(storage, host = null) {
 export function describeConversion(storage) {
   const conversion = storage?.conversion ?? null;
   if (conversion === null) return '';
-  const kept = conversion.kept === 'memory'
-    ? 'Read once into memory for this tab'
-    : conversion.reused
-      ? "Opened from this browser's storage, read earlier in this tab"
-      : "Read once into this browser's storage for this tab";
+  const kept = wholeReadLine(conversion);
   const skipped = conversion.notes.length;
   return skipped === 0 ? kept : `${kept} · ${formatCountOf(skipped, 'part')} not read`;
-}
-
-/**
- * Where a converted dataset is kept, as its Details row says it.
- *
- * @param {{kept: 'opfs'|'memory', reused: boolean}} conversion
- * @returns {string}
- */
-function describeKept(conversion) {
-  if (conversion.kept === 'memory') {
-    return 'In memory until this tab closes: this browser gives this page no storage (as in a private window)';
-  }
-  return conversion.reused
-    ? "In this browser's storage until this tab closes; read when it was first opened in this tab, not again"
-    : "In this browser's storage (the origin-private file system) until this tab closes";
 }
 
 /**
@@ -186,9 +170,12 @@ function listNames(names) {
  * @param {Object|null} storage
  * @param {Object|null} mapping - `describeMapping()`'s facts, or null
  * @param {number|null} [countedEdges] - The graph's edges, once they were read
+ * @param {Object|null} [cells] - The cells open (`getCellSubset()`)
+ * @param {{kept: number, of: number}|null} [graphShare] - How much of the
+ *   graph a subsample keeps, once it was read (`subsampleGraphShare`)
  * @returns {Array<{label: string, value: string, href?: string, lines?: string[]}>}
  */
-export function describeDetails(metadata, storage, mapping, countedEdges = null) {
+export function describeDetails(metadata, storage, mapping, countedEdges = null, cells = null, graphShare = null) {
   const rows = [];
   const source = metadata.source ?? null;
   // A format's label ("AnnData (.h5ad)") says no more than Format does, and
@@ -214,9 +201,12 @@ export function describeDetails(metadata, storage, mapping, countedEdges = null)
     const conversion = storage.conversion ?? null;
     let read;
     if (conversion !== null) {
+      const how = conversion.whole === false
+        ? 'Its structure once, its arrays in place'
+        : 'Whole, once, from start to end (it cannot be read in parts)';
       read = storage.remote
-        ? `Once, from start to end, from ${hostOf(storage.url) ?? storage.url}`
-        : 'Once, from start to end, from this computer; nothing is uploaded';
+        ? `${how}, from ${hostOf(storage.url) ?? storage.url}`
+        : `${how}, from this computer; nothing is uploaded`;
     } else {
       read = storage.remote
         ? `In place from ${hostOf(storage.url) ?? storage.url}, as views need it`
@@ -224,14 +214,18 @@ export function describeDetails(metadata, storage, mapping, countedEdges = null)
     }
     rows.push({ label: 'Read', value: read });
     if (conversion !== null) {
-      rows.push({ label: 'Kept', value: describeKept(conversion) });
+      rows.push({ label: 'Kept', value: wholeReadKept(conversion) });
+      if (conversion.whole !== false) rows.push({ label: 'Read in parts', value: READ_IN_PARTS_INSTEAD });
       if (conversion.notes.length > 0) {
         rows.push({ label: 'Not read', value: conversion.notes.join('\n'), lines: [...conversion.notes] });
       }
     }
   }
   const stats = metadata.stats;
-  rows.push({ label: 'Cells', value: formatCount(stats.n_cells) });
+  // A subsample: how many of the file's cells are open, and how they were chosen.
+  rows.push(cells?.kept != null
+    ? { label: 'Cells', value: `${formatCount(cells.kept.length)} of ${formatCount(cells.nObs)} (${describeSubsampleMethod(cells.spec)}${cells.autoFit !== null ? ', fitted to this device' : ''})` }
+    : { label: 'Cells', value: formatCount(cells?.nObs ?? stats.n_cells) });
   rows.push({ label: 'Genes', value: formatCount(mapping?.genes ?? stats.n_genes) });
   rows.push({
     label: 'Obs fields',
@@ -255,9 +249,12 @@ export function describeDetails(metadata, storage, mapping, countedEdges = null)
     }
   }
   const graph = mapping === null ? graphOf(stats) : mapping.graph;
+  const graphValue = describeGraph(graph !== null && graph.edges === null && countedEdges !== null ? { edges: countedEdges } : graph);
   rows.push({
     label: 'Neighbour graph',
-    value: describeGraph(graph !== null && graph.edges === null && countedEdges !== null ? { edges: countedEdges } : graph),
+    value: graph !== null && cells?.kept != null && graphShare !== null
+      ? `${graphValue} (${describeGraphShare(graphShare)})`
+      : graphValue,
   });
   if (mapping !== null) {
     rows.push({ label: 'Latent space', value: mapping.latent ?? 'None' });
@@ -268,6 +265,21 @@ export function describeDetails(metadata, storage, mapping, countedEdges = null)
 
 function graphOf(stats) {
   return stats.has_connectivity ? { edges: stats.n_edges } : null;
+}
+
+/**
+ * How much of its neighbour graph a subsample keeps: the share of the open
+ * cells' edges that join two open cells (the others lead to cells left out,
+ * and cannot be drawn).
+ *
+ * @param {{kept: number, of: number}} share
+ * @returns {string}
+ */
+export function describeGraphShare({ kept, of }) {
+  if (of === 0) return 'no edge of the open cells';
+  const percent = (100 * kept) / of;
+  const shown = percent >= 10 || percent === 0 ? Math.round(percent) : Number(percent.toPrecision(2));
+  return `${shown} % of the open cells' edges; the others lead to cells not open`;
 }
 
 /**
@@ -300,6 +312,8 @@ export function initDatasetCard({
   describeStorage,
   describeMapping,
   describeHost = () => null,
+  describeCells = () => null,
+  describeGraphShare = () => Promise.resolve(null),
   log = getTransferLog(),
   notifications = getNotificationCenter(),
   opening = getOpeningProgress(),
@@ -318,6 +332,9 @@ export function initDatasetCard({
   let readFrame = null;
   let descriptionOpen = false;
   let loadedEdges = null;
+  /** How much of the graph in use the subsample keeps, once it was read. */
+  let graphShare = null;
+  let graphShareRequest = 0;
 
   function setText(element, text) {
     if (element.textContent !== text) element.textContent = text;
@@ -344,14 +361,14 @@ export function initDatasetCard({
     applyDescriptionFold(true);
   }, { signal: lifecycle.signal });
 
-  function renderDetails(metadata, storage) {
+  function renderDetails(metadata, storage, cells = null) {
     let mapping = null;
     try {
       mapping = describeMapping();
     } catch {
       mapping = null;
     }
-    const rows = describeDetails(metadata, storage, mapping, loadedEdges);
+    const rows = describeDetails(metadata, storage, mapping, loadedEdges, cells, graphShare);
     const nodes = [];
     for (const row of rows) {
       const term = ownerDocument.createElement('dt');
@@ -479,6 +496,7 @@ export function initDatasetCard({
     shown = null;
     readUrl = null;
     loadedEdges = null;
+    graphShare = null;
     clearRetryNotice();
     hideFacts();
     setText(elements.name, 'No dataset open');
@@ -497,6 +515,7 @@ export function initDatasetCard({
     shown = null;
     readUrl = null;
     loadedEdges = null;
+    graphShare = null;
     clearRetryNotice();
     hideFacts();
     setText(elements.name, label);
@@ -511,16 +530,28 @@ export function initDatasetCard({
    */
   function show(metadata, sourceType) {
     const sameDataset = shown !== null && shown.metadata.id === metadata.id && shown.sourceType === sourceType;
-    if (!sameDataset) loadedEdges = null;
+    if (!sameDataset) {
+      loadedEdges = null;
+      graphShare = null;
+    }
     let storage = null;
     try {
       storage = describeStorage(sourceType, metadata.id);
     } catch {
       storage = null;
     }
-    shown = { metadata, sourceType, storage };
+    let cells = null;
+    try {
+      cells = describeCells(sourceType, metadata.id);
+    } catch {
+      cells = null;
+    }
+    shown = { metadata, sourceType, storage, cells };
     setText(elements.name, metadata.name);
-    setText(elements.cells, formatCompactCount(metadata.stats.n_cells));
+    // A subsample: the cells open of the cells in the file.
+    setText(elements.cells, cells?.kept != null
+      ? `${formatCompactCount(cells.kept.length)} of ${formatCompactCount(cells.nObs)}`
+      : formatCompactCount(cells?.nObs ?? metadata.stats.n_cells));
     elements.summary.hidden = false;
     const origin = describeOrigin(storage, describeHost(sourceType));
     setText(elements.origin, origin);
@@ -533,7 +564,7 @@ export function initDatasetCard({
       collapseDetails();
     }
     elements.details.hidden = false;
-    renderDetails(metadata, storage);
+    renderDetails(metadata, storage, cells);
     readUrl = storage?.remote ? storage.url : null;
     if (!sameDataset) clearRetryNotice();
     renderRead();
@@ -543,7 +574,7 @@ export function initDatasetCard({
   /** The mapping changed (another graph, gene list, latent space): rewrite the facts. */
   function refreshFacts() {
     if (shown === null) return;
-    renderDetails(shown.metadata, shown.storage);
+    renderDetails(shown.metadata, shown.storage, shown.cells);
   }
 
   /**
@@ -556,7 +587,17 @@ export function initDatasetCard({
       throw new TypeError('Connectivity edge count must be a non-negative integer.');
     }
     loadedEdges = edges;
+    graphShare = null;
     refreshFacts();
+    // A subsample: how much of the graph it keeps, now that it was read.
+    if (shown?.cells?.kept == null) return;
+    const request = ++graphShareRequest;
+    const { metadata, sourceType } = shown;
+    Promise.resolve(describeGraphShare(sourceType, metadata.id)).then(share => {
+      if (request !== graphShareRequest || shown?.metadata !== metadata) return;
+      graphShare = share;
+      refreshFacts();
+    }, () => {});
   }
 
   showNone();

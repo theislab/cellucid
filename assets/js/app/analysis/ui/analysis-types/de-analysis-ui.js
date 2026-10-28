@@ -16,14 +16,14 @@ import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
-import { toCSVCell } from '../../compute/csv-export.js';
+import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { DE_DISPLAY_KEYS, DE_OPTIONS } from '../../options/de-options.js';
 import { defineOptions } from '../../options/option-schema.js';
 import { renderOptionsForm } from '../../options/render-options-form.js';
 import { GenesPanelController, categoryOptionId } from '../../genes-panel/genes-panel-controller.js';
-import { countGeneFamilies } from '../../shared/gene-sets.js';
+import { countGeneFamilies, geneIdentities } from '../../shared/gene-sets.js';
 import { pseudobulkUnits } from '../../stats/pseudobulk.js';
 import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 import {
@@ -124,20 +124,35 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // redraw (each posted its error): Run says why until the field changes.
     if (!this._pendingFields.has(field) && !this._fieldGroupFailures.has(field)) {
       this._pendingFields.add(field);
+      const cells = this._openCells();
       void this._helperController().describeGroups(field, null).then(value => {
+        // Described for cells no longer open: read again when next asked for.
+        if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
-        if (this._isDestroyed) return;
         this._fieldGroups.set(field, value);
         this._refreshOptionsContext();
       }, error => {
+        if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
-        if (this._isDestroyed) return;
         this._fieldGroupFailures.set(field, error);
         this._notifications.error(`Differential expression groups: ${error.message}`, { category: 'analysis' });
         this._refreshOptionsContext();
       });
     }
     return [];
+  }
+
+  /**
+   * Another set of open cells: every field's categories and codes are read
+   * again on them, and the groups resolved again.
+   * @override
+   */
+  _onOpenCellsChanged() {
+    this._fieldGroups.clear();
+    this._fieldGroupFailures.clear();
+    this._pendingFields.clear();
+    this._resolvedGroups = null;
+    this._replicateBlocker = null;
   }
 
   /**
@@ -352,9 +367,18 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
-  async _runAnalysisImpl(options, requestId, job) {
-    const resolved = this._resolveGroups(options);
-    if (resolved.reason) throw new Error(resolved.reason);
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
+    const groups = this._resolveGroups(options);
+    if (groups.reason) throw new Error(groups.reason);
+    // A first pass: each group's cells in the sample.
+    const resolved = sample === null
+      ? groups
+      : { a: { ...groups.a, cells: sample.cells(groups.a.cells) }, b: { ...groups.b, cells: sample.cells(groups.b.cells) } };
     const helper = this._helperController();
     const genes = await helper.genesToTest(options);
     const deResults = await this.multiVariableAnalysis.differentialExpression({
@@ -571,10 +595,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   _exportModalCSV() {
     const full = this._lastResult?.full;
     if (!full) return;
-    const lines = ['names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b'];
-    for (const row of full.results) {
+    // Genes by identifier, the shown name beside it (`geneNameColumns`).
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
+    const shown = full.results.map(row => row.gene);
+    const columns = geneNameColumns(shown, shown.map(gene => idOf(gene)));
+    const lines = [`${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b`];
+    for (const [index, row] of full.results.entries()) {
       lines.push([
-        toCSVCell(row.gene),
+        columns.cells(index),
         toCSVCell(row.score),
         toCSVCell(row.log2FoldChange),
         toCSVCell(row.pValue),
@@ -595,7 +623,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Sessions
   // ===========================================================================
 
-  exportResult() {
+  _exportResult() {
     const full = this._lastResult?.full;
     if (!full) return null;
     const { tuning: _tuning, ...metadata } = full.metadata;

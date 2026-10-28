@@ -25,6 +25,7 @@ import { bunzip2 } from './bzip2.js';
 import { unxz } from './xz.js';
 import { gunzipWorkerScript } from '../../../workers/scripts.js';
 import { startWorker } from '../../workers/worker-script.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 /** Input bytes handed to the native decompressor per write (see `formats/io/inflate.js`). */
 const INFLATE_SLICE_BYTES = 64 * 1024;
@@ -316,7 +317,7 @@ async function peek(pieces, count) {
     held.push(value);
     have += value.length;
   }
-  const head = new Uint8Array(Math.min(have, count));
+  const head = allocateTypedArray(Uint8Array, Math.min(have, count), 'The start of an R file');
   let offset = 0;
   for (const piece of held) {
     if (offset >= head.length) break;

@@ -86,7 +86,7 @@ function directProbes({ connectivities = true, hasX = true } = {}) {
   };
 }
 
-function directCandidates(options) {
+function directCandidates(options, geneNameColumns = { X: null }) {
   return assembleAnnDataCandidates(describeAnnDataProbes(directProbes(options)), {
     slots: {
       '1d': null,
@@ -94,7 +94,7 @@ function directCandidates(options) {
       '3d': { key: 'X_umap_3d', columns: [0, 1, 2] },
     },
     guessed: [],
-  });
+  }, {}, geneNameColumns);
 }
 
 test('a file opened in the browser maps by the defaults of the catalog the viewer built', () => {
@@ -125,6 +125,19 @@ test('a file opened in the browser maps by the defaults of the catalog the viewe
       { key: 'velocity_umap_3d', embedding: { key: 'X_umap_3d', columns: [0, 1, 2] } },
     ],
   });
+});
+
+test('a file opened before its gene names are guessed maps them as pending, never as the index', () => {
+  // As a dataset opens: the first view reads no gene name.
+  const candidates = directCandidates(undefined, {});
+  assert.equal(candidates.defaults.geneNames, null);
+  assert.equal(candidates.guessed.includes('geneNames'), false);
+  const mapping = resolveAnnDataMapping(candidates, directIdentity());
+  assert.equal(mapping.geneNames, null);
+  // Nothing outside the opening admits it.
+  assert.throws(() => validateDataMapping(mapping), /geneNames must be "index" or "column:<var column>"/);
+  // Once the shown axis is guessed, the default is its own.
+  assert.equal(directCandidates(undefined, { X: null }).defaults.geneNames, 'index');
 });
 
 test('a file without connectivity or an X matrix maps no graph and no expression', () => {

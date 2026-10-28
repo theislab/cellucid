@@ -33,6 +33,8 @@ import { isArrayNode, isGroup, numericDtype, stringDtype } from '../../../format
 import { attributeValue, encodingType } from '../elements.js';
 import { computedArray, encodingAttrs, joinPath, viewGroup } from './view-nodes.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { sharedOnce } from '../../../formats/io/abort.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 /**
  * @typedef {Object} Modality
@@ -73,41 +75,104 @@ export function frameRows(frame) {
  * @returns {(options?: Object) => Promise<{rows: Int32Array|null, identity: boolean, measured: number}>}
  */
 export function cellMapOf(modality, nObs) {
-  let read = null;
-  return (options = {}) => {
-    read ??= (async () => {
-      if (modality.obsmap === null) {
-        if (modality.nCells !== nObs) {
-          throw new Error(
-            `Modality '${modality.name}' has ${formatCountOf(modality.nCells, 'cell')} and the dataset ${nObs}, and no cell map (obsmap) says which they are`
-          );
-        }
-        return { rows: null, identity: true, measured: nObs };
+  // Read once, shared by every read asking meanwhile: it stops only once
+  // every one of them withdrew (`sharedOnce`).
+  const map = sharedOnce(async options => {
+    if (modality.obsmap === null) {
+      if (modality.nCells !== nObs) {
+        throw new Error(
+          `Modality '${modality.name}' has ${formatCountOf(modality.nCells, 'cell')} and the dataset ${nObs}, and no cell map (obsmap) says which they are`
+        );
       }
-      const stored = await modality.obsmap.read(undefined, options);
-      if (stored.length !== nObs) throw new Error(`obsmap['${modality.name}'] has ${formatCountOf(stored.length, 'row')} for ${formatCountOf(nObs, 'cell')}`);
-      const rows = new Int32Array(nObs);
-      let identity = modality.nCells === nObs;
-      let measured = 0;
-      for (let cell = 0; cell < nObs; cell++) {
-        const row = Number(stored[cell]) - 1;
-        if (!(row >= -1 && row < modality.nCells) || !Number.isInteger(row)) {
-          throw new RangeError(`obsmap['${modality.name}'] places cell ${cell} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
-        }
-        rows[cell] = row;
-        if (row >= 0) measured++;
-        if (row !== cell) identity = false;
+      return { rows: null, identity: true, measured: nObs };
+    }
+    const stored = await modality.obsmap.read(undefined, options);
+    if (stored.length !== nObs) throw new Error(`obsmap['${modality.name}'] has ${formatCountOf(stored.length, 'row')} for ${formatCountOf(nObs, 'cell')}`);
+    const rows = allocateTypedArray(Int32Array, nObs, `obsmap['${modality.name}']`);
+    let identity = modality.nCells === nObs;
+    let measured = 0;
+    for (let cell = 0; cell < nObs; cell++) {
+      const row = Number(stored[cell]) - 1;
+      if (!(row >= -1 && row < modality.nCells) || !Number.isInteger(row)) {
+        throw new RangeError(`obsmap['${modality.name}'] places cell ${cell} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
       }
-      return { rows: identity ? null : rows, identity, measured };
-    })();
-    read.catch(() => { read = null; });
-    return read;
+      rows[cell] = row;
+      if (row >= 0) measured++;
+      if (row !== cell) identity = false;
+    }
+    return { rows: identity ? null : rows, identity, measured };
+  });
+  /**
+   * The modality rows of cells `[r0, r1)` (an `Int32Array`, -1 where not
+   * measured), or null when they are those cells' own rows: from the whole
+   * map when it is read, else from those cells' entries of the cell map
+   * alone (a subsample's runs of cells read no more of it).
+   */
+  map.rowsIn = async (options, r0, r1) => {
+    if (map.asked()) {
+      const whole = await map(options);
+      return whole.identity ? null : whole.rows.subarray(r0, r1);
+    }
+    // No cell map: every cell is its own row (checked by `map`).
+    if (modality.obsmap === null) {
+      await map(options);
+      return null;
+    }
+    const stored = await modality.obsmap.read([[r0, r1]], options);
+    const rows = allocateTypedArray(Int32Array, r1 - r0, `obsmap['${modality.name}']`);
+    for (let i = 0; i < rows.length; i++) {
+      const row = Number(stored[i]) - 1;
+      if (!(row >= -1 && row < modality.nCells) || !Number.isInteger(row)) {
+        throw new RangeError(`obsmap['${modality.name}'] places cell ${r0 + i} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
+      }
+      rows[i] = row;
+    }
+    return rows;
   };
+  return map;
+}
+
+/**
+ * Rows `[r0, r1)` of a modality array placed on the store's cells: only the
+ * modality rows those cells measured are read (the span between the least
+ * and the greatest of them; a modality's rows follow its cells' order), so a
+ * subsample's runs of cells read their own rows, not the whole array.
+ */
+async function placedRowsOf(array, map, options, r0, r1, width, Output, fill) {
+  const rows = map.rowsIn === undefined ? (await map(options)).rows?.subarray(r0, r1) ?? null : await map.rowsIn(options, r0, r1);
+  const tail = array.shape.length === 2 ? [[0, array.shape[1]]] : [];
+  if (rows === null) {
+    const values = await array.read([[r0, r1], ...tail], options);
+    return values instanceof Output ? values : numbersAs(Output, values);
+  }
+  let low = Infinity;
+  let high = -1;
+  for (const row of rows) {
+    if (row < 0) continue;
+    if (row < low) low = row;
+    if (row > high) high = row;
+  }
+  const out = allocateTypedArray(Output, (r1 - r0) * width, 'Modality values by cell').fill(fill);
+  if (high < 0) return out;
+  const values = await array.read([[low, high + 1], ...tail], options);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row < 0) continue;
+    for (let column = 0; column < width; column++) out[i * width + column] = Number(values[(row - low) * width + column]);
+  }
+  return out;
+}
+
+/** `values` as numbers in an `ArrayType` of their own: `ArrayType.from(values, Number)` at any size. */
+function numbersAs(ArrayType, values) {
+  const out = allocateTypedArray(ArrayType, values.length, 'Modality values');
+  for (let i = 0; i < values.length; i++) out[i] = Number(values[i]);
+  return out;
 }
 
 /** One value per modality row, placed on the store's cells (`fill` where absent). */
 function placeRows(values, rows, width, Output, fill) {
-  const out = new Output(rows.length * width);
+  const out = allocateTypedArray(Output, rows.length * width, 'Modality values by cell');
   for (let cell = 0; cell < rows.length; cell++) {
     const row = rows[cell];
     for (let column = 0; column < width; column++) {
@@ -132,9 +197,10 @@ export function placedNumbers(array, map, nObs, path) {
     attrs: encodingAttrs('array'),
     compute: async options => {
       const [cells, values] = await Promise.all([map(options), array.read(undefined, options)]);
-      if (cells.identity) return float32 ? values : Float64Array.from(values, Number);
+      if (cells.identity) return float32 ? values : numbersAs(Float64Array, values);
       return placeRows(values, cells.rows, width, float32 ? Float32Array : Float64Array, Number.NaN);
     },
+    computeRows: (options, r0, r1) => placedRowsOf(array, map, options, r0, r1, width, float32 ? Float32Array : Float64Array, Number.NaN),
   });
 }
 
@@ -152,9 +218,10 @@ function placedCategorical(group, map, nObs, path) {
         attrs: encodingAttrs('array'),
         compute: async options => {
           const [cells, values] = await Promise.all([map(options), codes.read(undefined, options)]);
-          if (cells.identity) return Int32Array.from(values, Number);
+          if (cells.identity) return numbersAs(Int32Array, values);
           return placeRows(values, cells.rows, 1, Int32Array, -1);
         },
+        computeRows: (options, r0, r1) => placedRowsOf(codes, map, options, r0, r1, 1, Int32Array, -1),
       })],
       ['categories', () => group.get('categories')],
     ]),
@@ -163,22 +230,17 @@ function placedCategorical(group, map, nObs, path) {
 
 /** A text column of one modality on the store's cells: missing where not measured. */
 function placedText(array, map, nObs, path) {
-  let placed = null;
-  const values = options => {
-    placed ??= Promise.all([map(options), array.read(undefined, options)]).then(([cells, stored]) => {
-      if (cells.identity) return { text: Array.from(stored, String), mask: new Uint8Array(nObs) };
-      const text = new Array(nObs);
-      const mask = new Uint8Array(nObs);
-      for (let cell = 0; cell < nObs; cell++) {
-        const row = cells.rows[cell];
-        text[cell] = row < 0 ? '' : String(stored[row]);
-        mask[cell] = row < 0 ? 1 : 0;
-      }
-      return { text, mask };
-    });
-    placed.catch(() => { placed = null; });
-    return placed;
-  };
+  const values = sharedOnce(options => Promise.all([map(options), array.read(undefined, options)]).then(([cells, stored]) => {
+    if (cells.identity) return { text: Array.from(stored, String), mask: allocateTypedArray(Uint8Array, nObs, 'Modality text mask') };
+    const text = new Array(nObs);
+    const mask = allocateTypedArray(Uint8Array, nObs, 'Modality text mask');
+    for (let cell = 0; cell < nObs; cell++) {
+      const row = cells.rows[cell];
+      text[cell] = row < 0 ? '' : String(stored[row]);
+      mask[cell] = row < 0 ? 1 : 0;
+    }
+    return { text, mask };
+  }));
   return viewGroup({
     path,
     attrs: encodingAttrs('nullable-string-array'),
@@ -233,47 +295,42 @@ export function placedObsColumn(node, map, nObs, path) {
 export function placedGraph(group, map, nObs, path) {
   const shape = attributeValue(group, 'shape');
   const csr = encodingType(group) === 'csr_matrix';
-  let built = null;
-  const build = options => {
-    built ??= (async () => {
-      const [cells, data, indices, indptr] = await Promise.all([
-        map(options),
-        group.get('data').read(undefined, options),
-        group.get('indices').read(undefined, options),
-        group.get('indptr').read(undefined, options),
-      ]);
-      if (cells.identity) return { data, indices, indptr };
-      const toCell = new Int32Array(Number(shape[0])).fill(-1);
-      for (let cell = 0; cell < nObs; cell++) if (cells.rows[cell] >= 0) toCell[cells.rows[cell]] = cell;
-      // A symmetric graph reads the same by row or column: rows of a CSC
-      // matrix are its columns.
-      const outPointers = new Int32Array(nObs + 1);
-      for (let cell = 0; cell < nObs; cell++) {
-        const row = cells.rows[cell];
-        outPointers[cell + 1] = outPointers[cell] + (row < 0 ? 0 : Number(indptr[row + 1]) - Number(indptr[row]));
+  const build = sharedOnce(async options => {
+    const [cells, data, indices, indptr] = await Promise.all([
+      map(options),
+      group.get('data').read(undefined, options),
+      group.get('indices').read(undefined, options),
+      group.get('indptr').read(undefined, options),
+    ]);
+    if (cells.identity) return { data, indices, indptr };
+    const toCell = allocateTypedArray(Int32Array, Number(shape[0]), 'Modality graph cells').fill(-1);
+    for (let cell = 0; cell < nObs; cell++) if (cells.rows[cell] >= 0) toCell[cells.rows[cell]] = cell;
+    // A symmetric graph reads the same by row or column: rows of a CSC
+    // matrix are its columns.
+    const outPointers = allocateTypedArray(Int32Array, nObs + 1, 'Modality graph indptr');
+    for (let cell = 0; cell < nObs; cell++) {
+      const row = cells.rows[cell];
+      outPointers[cell + 1] = outPointers[cell] + (row < 0 ? 0 : Number(indptr[row + 1]) - Number(indptr[row]));
+    }
+    const outIndices = allocateTypedArray(Int32Array, outPointers[nObs], 'Modality graph indices');
+    const outData = allocateTypedArray(data.constructor, outPointers[nObs], 'Modality graph values');
+    for (let cell = 0; cell < nObs; cell++) {
+      const row = cells.rows[cell];
+      if (row < 0) continue;
+      const entries = [];
+      for (let entry = Number(indptr[row]); entry < Number(indptr[row + 1]); entry++) {
+        const column = toCell[Number(indices[entry])];
+        if (column < 0) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
+        entries.push([column, data[entry]]);
       }
-      const outIndices = new Int32Array(outPointers[nObs]);
-      const outData = new data.constructor(outPointers[nObs]);
-      for (let cell = 0; cell < nObs; cell++) {
-        const row = cells.rows[cell];
-        if (row < 0) continue;
-        const entries = [];
-        for (let entry = Number(indptr[row]); entry < Number(indptr[row + 1]); entry++) {
-          const column = toCell[Number(indices[entry])];
-          if (column < 0) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
-          entries.push([column, data[entry]]);
-        }
-        entries.sort((left, right) => left[0] - right[0]);
-        entries.forEach(([column, value], offset) => {
-          outIndices[outPointers[cell] + offset] = column;
-          outData[outPointers[cell] + offset] = value;
-        });
-      }
-      return { data: outData, indices: outIndices, indptr: outPointers };
-    })();
-    built.catch(() => { built = null; });
-    return built;
-  };
+      entries.sort((left, right) => left[0] - right[0]);
+      entries.forEach(([column, value], offset) => {
+        outIndices[outPointers[cell] + offset] = column;
+        outData[outPointers[cell] + offset] = value;
+      });
+    }
+    return { data: outData, indices: outIndices, indptr: outPointers };
+  });
   const part = (name, dtype, length) => () => computedArray({
     path: joinPath(path, name),
     dtype,

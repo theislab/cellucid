@@ -28,6 +28,7 @@ import { createGroupNode } from './group.js';
 import { ByteLru } from './cache.js';
 import { createLimiter } from './stores/common.js';
 import { releaseIdleDecodeWorkers } from '../io/decode-pool.js';
+import { SharedWorks } from '../io/abort.js';
 import { isObjectRecord } from '../../utils/exact-record.js';
 
 const MiB = 1024 * 1024;
@@ -206,11 +207,12 @@ function hiddenPathChecks(store, nodes, storeName) {
  * Open a Zarr store.
  *
  * @param {Object} store - A store backend (`directoryStore`, `zipStore`, `httpStore`, `memoryStore`)
- * @param {{decodedChunkCacheBytes?: number, shardIndexCacheBytes?: number,
- *          version?: 2|3|null, consolidated?: boolean,
+ * @param {{decodedChunkCacheBytes?: number|import('../io/decoded-budget.js').DecodedBudget,
+ *          shardIndexCacheBytes?: number, version?: 2|3|null, consolidated?: boolean,
  *          signal?: AbortSignal|null, activity?: Object|null}} [options]
  *   `decodedChunkCacheBytes` (default 64 MiB) budgets the decoded chunks kept
- *   between reads; `version` forces a format when a store holds both;
+ *   between reads (a `DecodedBudget`: shared with the other caches of the
+ *   store's decoded chunks); `version` forces a format when a store holds both;
  *   `consolidated: false` ignores consolidated metadata (listed stores only).
  * @returns {Promise<Object>} The root node (a Group, or an ArrayNode for a
  *   store that is a single array), with `close()` and `stats()`
@@ -266,7 +268,8 @@ export async function openZarr(store, {
   const context = {
     decoded: new ByteLru(decodedChunkCacheBytes),
     indexes: new ByteLru(shardIndexCacheBytes),
-    inflight: new Map(),
+    // Chunks and shard indexes being read, shared by every read asking (`SharedWorks`).
+    inflight: new SharedWorks(),
     decodeLimit: createLimiter(DECODE_CONCURRENCY),
     stats: { chunksDecoded: 0, decodedBytes: 0, cacheHits: 0, sharedChunks: 0 },
     closed: false,

@@ -10,6 +10,9 @@ import { EventEmitter } from '../../utils/event-emitter.js';
 import { RenameRegistry } from '../../registries/rename-registry.js';
 import { DeleteRegistry } from '../../registries/delete-registry.js';
 import { UserDefinedFieldsRegistry } from '../../registries/user-defined-fields.js';
+import { DerivedResultsRegistry } from '../../registries/derived-results.js';
+import { createCellIdentity } from '../../../data/cell-identity.js';
+import { DEFAULT_CELL_PRIORITY } from '../../../data/cell-priority.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { HighlightManager, highlightStateMethods } from '../managers/highlight-manager.js';
 import { FieldManager, DataStateFieldMethods } from '../managers/field-manager.js';
@@ -21,6 +24,7 @@ import { DataStateMappingGroupMethods } from '../managers/mapping-groups.js';
 import { DataStateVarAxisMethods } from '../managers/var-axis.js';
 import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
 import { DataStateOutlierQuantileMethods } from '../managers/outlier-quantiles.js';
+import { DataStateOpenCellsMethods } from '../managers/open-cells.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -35,6 +39,14 @@ export class DataState extends EventEmitter {
     this.varFieldLoader = null;
 
     this.pointCount = 0;
+    // Which of the dataset's cells are open, and their original positions
+    // (data/cell-identity.js): every cell named outside the app is named by
+    // it. Published with each scene (`initScene`, `setCellIdentity`).
+    this.cellIdentity = createCellIdentity({ nObs: 0 });
+    // The order every "first cells" sample is taken in (data/cell-priority.js):
+    // levels of detail and progressive analyses. Published with each scene
+    // (`initScene`, `setCellPriority`).
+    this.cellPriority = DEFAULT_CELL_PRIORITY;
     // Live view's normalized positions, `positionsDimension` components per
     // cell (see rendering/position-layout.js). The two are assigned together.
     this.positionsArray = new Float32Array(0);
@@ -132,6 +144,9 @@ export class DataState extends EventEmitter {
     this._renameRegistry = new RenameRegistry();
     this._deleteRegistry = new DeleteRegistry();
     this._userDefinedFields = new UserDefinedFieldsRegistry();
+    // Gene sets and scores besides the fields: a notebook's pushed sets, the
+    // shown marker and gene signature results (registries/derived-results.js).
+    this._derivedResults = new DerivedResultsRegistry();
 
     // Bind singleton registry for fast lookups.
     getFieldRegistry().bind(this);
@@ -155,12 +170,16 @@ applyMixin(DataState.prototype, DataStateMappingGroupMethods.prototype);
 applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
 applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
 applyMixin(DataState.prototype, DataStateOutlierQuantileMethods.prototype);
+applyMixin(DataState.prototype, DataStateOpenCellsMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);
 Object.defineProperties(DataState.prototype, Object.getOwnPropertyDescriptors(highlightStateMethods));
 
 Object.defineProperties(DataState.prototype, {
+  getDerivedResults: {
+    value() { return this._derivedResults; }
+  },
   fields: {
     get() { return this._fieldsManager || (this._fieldsManager = new FieldManager(this)); }
   },

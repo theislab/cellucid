@@ -76,6 +76,7 @@
 
 import { RdsFormatError, RdsUnsupportedError } from './errors.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
 
 /** SEXP types (`Rinternals.h`) and serialization pseudo-types (`serialize.c`). */
 export const SEXP = Object.freeze({
@@ -147,8 +148,7 @@ const SINGLETONS = new Map([
 export function hostValues(kind, bytes, length, owned = false) {
   let copy = bytes;
   if (!owned || bytes.byteOffset % 8 !== 0) {
-    copy = new Uint8Array(bytes.length);
-    copy.set(bytes);
+    copy = copyTypedArray(Uint8Array, bytes, `An R ${kind} vector`);
   }
   if (kind === 'raw') return copy;
   const words = new Uint32Array(copy.buffer, copy.byteOffset, copy.byteLength >>> 2);
@@ -534,7 +534,7 @@ export async function parseItem(reader, {
         const step = Number(numbers[2]);
         let values = null;
         if (length <= inlineElements && wantVector(path, { type: kind, length }) !== 'skip') {
-          values = kind === 'integer' ? new Int32Array(length) : new Float64Array(length);
+          values = allocateTypedArray(kind === 'integer' ? Int32Array : Float64Array, length, 'An R sequence');
           for (let i = 0; i < length; i++) values[i] = start + i * step;
         }
         return { kind, length, values, region: null, sequence: { start, step }, attributes, s4, skipped: false };
@@ -818,7 +818,7 @@ export async function parseItem(reader, {
         countDropped(length);
         const elements = dropping > 0 ? null : [];
         byName = dropping > 0 ? null : dropsByName(path);
-        spans = byName === null ? null : new Float64Array(length);
+        spans = byName === null ? null : allocateTypedArray(Float64Array, length, 'An R list');
         const outerAwaiting = awaitingName;
         for (let index = 0; index < length; index++) {
           path.push(`[${index}]`);

@@ -33,6 +33,7 @@ import { MappingLoadError } from '../../data/data-mapping-candidates.js';
 import { sameJson } from '../utils/same-json.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf, countNoun } from '../../utils/format-units.js';
+import { sessionCellOrder } from './session-cell-order.js';
 
 const PARTICIPANT_KEYS = ['value', 'prepare', 'commit', 'rollback'];
 const PRESENTATION_PARTICIPANT_KEYS = [...PARTICIPANT_KEYS, 'stage'];
@@ -626,7 +627,7 @@ const DATASET_FINGERPRINT_KEYS = Object.freeze([
  * changes, so the capture guard can re-derive the fingerprint once per
  * contributor for 0.06 ms in total instead of re-reading 9.64 MiB nine times.
  *
- * @type {WeakMap<Float32Array, string>}
+ * @type {WeakMap<Float32Array, {order: Uint32Array|null, digest: string}>}
  */
 const CELL_ORDER_DIGESTS = new WeakMap();
 
@@ -637,11 +638,19 @@ const CELL_ORDER_DIGESTS = new WeakMap();
  * transcription of it: a transcription that drifted would approve exactly the
  * presets the reader then refuses.
  *
+ * The cells are folded in **original-position order** (`cellOrder`: the row of
+ * each cell, by ascending original position; `session-cell-order.js`), so a
+ * digest names the cells and their coordinates whatever order a file stores
+ * them in or the app opens them in: a file written again in priority order
+ * keeps the digest of the same cells. Null folds the rows in order (rows
+ * already in original order).
+ *
  * @param {Float32Array} positions - `dimension` components per cell.
  * @param {1|2|3} [dimension=3]
+ * @param {Uint32Array|null} [cellOrder=null] - The row of each cell, by ascending original position
  * @returns {string} 16 lowercase hexadecimal characters.
  */
-export function digestCellOrder(positions, dimension = 3) {
+export function digestCellOrder(positions, dimension = 3, cellOrder = null) {
   if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
     throw new RangeError('Cell-order digest dimension must be exactly 1, 2, or 3.');
   }
@@ -653,8 +662,12 @@ export function digestCellOrder(positions, dimension = 3) {
       `Cell-order digest requires a Float32Array with ${formatCountOf(dimension, 'value')} per cell.`
     );
   }
+  const cellCount = positions.length / dimension;
+  if (cellOrder !== null && (!(cellOrder instanceof Uint32Array) || cellOrder.length !== cellCount)) {
+    throw new TypeError('Cell-order digest order must be a Uint32Array of one row per cell.');
+  }
   const memoized = CELL_ORDER_DIGESTS.get(positions);
-  if (memoized !== undefined) return memoized;
+  if (memoized !== undefined && memoized.order === cellOrder) return memoized.digest;
   // A Float32Array is always 4-byte aligned, so its buffer can be read as
   // 32-bit words without copying.
   const words = new Uint32Array(
@@ -662,42 +675,20 @@ export function digestCellOrder(positions, dimension = 3) {
     positions.byteOffset,
     positions.length
   );
-  const cellCount = positions.length / dimension;
   const wordCount = cellCount * 3;
   let low = 0x9e3779b1 ^ wordCount;
   let high = 0x85ebca6b ^ wordCount;
-  // One fold step per XYZ word, in cell order. The axes a 1D or 2D
-  // embedding lacks fold the zero word: `word ^ 0` is the accumulator itself.
-  // A 3D array already holds exactly that word sequence.
-  if (dimension === 3) {
-    for (let index = 0; index < words.length; index++) {
-      const word = words[index];
+  // One fold step per XYZ word, cell by cell in the digest's order (rows,
+  // or `cellOrder`). The axes a 1D or 2D embedding lacks fold the zero word:
+  // `word ^ 0` is the accumulator itself.
+  for (let cell = 0; cell < cellCount; cell++) {
+    const row = cellOrder === null ? cell : cellOrder[cell];
+    for (let axis = 0; axis < 3; axis++) {
+      const word = axis < dimension ? words[row * dimension + axis] : 0;
       low = Math.imul(low ^ word, 0x85ebca77);
       high = Math.imul(high ^ word, 0xc2b2ae3d);
       low = (low << 13) | (low >>> 19);
       high = (high << 17) | (high >>> 15);
-    }
-  } else {
-    // Each cell folds its `dimension` words, then 3 - dimension zero words.
-    const zeroWords = 3 - dimension;
-    for (let index = 0; index < words.length; index++) {
-      const word = words[index];
-      low = Math.imul(low ^ word, 0x85ebca77);
-      high = Math.imul(high ^ word, 0xc2b2ae3d);
-      low = (low << 13) | (low >>> 19);
-      high = (high << 17) | (high >>> 15);
-      if (dimension === 1 || (index & 1) === 1) {
-        low = Math.imul(low, 0x85ebca77);
-        high = Math.imul(high, 0xc2b2ae3d);
-        low = (low << 13) | (low >>> 19);
-        high = (high << 17) | (high >>> 15);
-        if (zeroWords === 2) {
-          low = Math.imul(low, 0x85ebca77);
-          high = Math.imul(high, 0xc2b2ae3d);
-          low = (low << 13) | (low >>> 19);
-          high = (high << 17) | (high >>> 15);
-        }
-      }
     }
   }
   low = Math.imul(low ^ (low >>> 16), 0x2c1b3c6d)
@@ -706,7 +697,7 @@ export function digestCellOrder(positions, dimension = 3) {
     ^ Math.imul(low ^ (low >>> 13), 0x297a2d39);
   const digest = (high >>> 0).toString(16).padStart(8, '0')
     + (low >>> 0).toString(16).padStart(8, '0');
-  CELL_ORDER_DIGESTS.set(positions, digest);
+  CELL_ORDER_DIGESTS.set(positions, { order: cellOrder, digest });
   return digest;
 }
 
@@ -877,7 +868,7 @@ export function getDatasetFingerprint(ctx) {
     cellOrder: Object.freeze({
       embedding: Object.freeze(embedding),
       dimension,
-      digest: digestCellOrder(positions, dimension)
+      digest: digestCellOrder(positions, dimension, sessionCellOrder(state.cellIdentity)?.toOpen ?? null)
     }),
     dataMapping
   };
@@ -1034,7 +1025,8 @@ function describeDatasetIdentityMismatch(saved, current) {
 /**
  * The refusal shown when a session's cell-order digest does not match.
  *
- * `cellOrder.digest` is a one-way fold over the coordinate bytes in row order.
+ * `cellOrder.digest` is a one-way fold over the coordinate bytes in original
+ * order (`digestCellOrder`).
  * It changes when the rows are permuted and it changes when the coordinate
  * values change, and a hash cannot say which happened, so the message states
  * the one thing that is established and offers both causes.
@@ -1058,13 +1050,28 @@ const CELL_ORDER_MISMATCH_MESSAGE =
  * loaded (pinned, so no view's cache is disturbed) whichever layout the live
  * view shows now. Nothing is applied before all of them pass.
  *
+ * A dataset's published starting view (`profile` 'published-default') is
+ * saved on every cell and holds no per-cell state (its seven static chunks,
+ * `published-default.js`): it applies to any subsample of its dataset --
+ * fitted to the device, or named in the link -- as it does to every cell.
+ * The cell count is then the dataset's (`nOriginal` of the open cells'
+ * identity), and the cell-order digest, a fold over every cell's
+ * coordinates, cannot be taken over a subsample: the catalog binds the view
+ * to its dataset's generation by SHA-256 instead. Any other session names
+ * the cells it was saved on, which are opened before it is restored
+ * (`session-controls.js`).
+ *
  * @param {object} ctx
  * @param {any} saved - A validated `manifest.datasetFingerprint`.
+ * @param {{profile?: 'published-default'|null}} [options]
  * @returns {Promise<string|null>} The refusal to show, or null when it matches.
  */
-export async function verifySessionFingerprint(ctx, saved) {
+export async function verifySessionFingerprint(ctx, saved, { profile = null } = {}) {
   assertDatasetFingerprint(saved, 'Saved dataset fingerprint');
-  const scalars = currentFingerprintScalars(ctx);
+  const opened = currentFingerprintScalars(ctx);
+  const cells = ctx.state.cellIdentity ?? null;
+  const ontoSubsample = profile === 'published-default' && cells?.isSubset === true && cells.nOriginal === saved.cellCount;
+  const scalars = ontoSubsample ? { ...opened, cellCount: cells.nOriginal } : opened;
   // Choosing None leaves a runtime of zero cells and no data mapping. That is
   // no dataset at all, so quoting its zero counts as "the one that is open
   // now" would be untrue.
@@ -1111,6 +1118,7 @@ export async function verifySessionFingerprint(ctx, saved) {
     if (mapping !== null) return mapping;
   }
 
+  if (ontoSubsample) return null;
   const dimensionManager = ctx.state.dimensionManager;
   const layoutKey = resolveEmbeddingRefLayout(
     dimensionManager,
@@ -1130,7 +1138,7 @@ export async function verifySessionFingerprint(ctx, saved) {
   let digest;
   try {
     const positions = await dimensionManager.getPositions(layoutKey);
-    digest = digestCellOrder(positions, saved.cellOrder.dimension);
+    digest = digestCellOrder(positions, saved.cellOrder.dimension, sessionCellOrder(ctx.state.cellIdentity)?.toOpen ?? null);
   } catch (error) {
     if (!(error instanceof MappingLoadError)) throw error;
     return (

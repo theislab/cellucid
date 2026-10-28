@@ -73,16 +73,19 @@ function anndataMapping({ enabled, defaults }) {
  * live view and snapshot-1 show UMAP because it is the 2D default;
  * snapshot-2 shows t-SNE because the user chose it.
  */
-function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
+function makeMappingState({ failLoads = {}, failMoveFor = null, pendingGenes = false } = {}) {
   const described = describeAnnDataProbes(mappingProbes({
     nObs: N_OBS,
     obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2 },
     hasX: true,
   }));
+  // As the catalog is once the genes are listed (the shown axis guessed:
+  // its index names them), or right after the first view (`pendingGenes`:
+  // not guessed yet).
   const candidates = assembleAnnDataCandidates(described, {
     slots: { '1d': null, '2d': UMAP, '3d': null },
     guessed: [],
-  });
+  }, {}, pendingGenes ? {} : { X: null });
   const manager = new DimensionManager();
   manager.registerLayouts([{
     layoutKey: 'X_umap',
@@ -146,6 +149,7 @@ function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
     },
   };
   installDataMappingMethods(state, { mapping: null });
+  state.beginGeneListing(pendingGenes);
   state.publishDatasetMapping({ mapping: candidates.defaults, candidates, origin: 'default' });
   manager.setViewLayout('live', 'X_umap');
   manager.setViewLayout('snapshot-1', 'X_umap');
@@ -662,6 +666,23 @@ test('the checklist lists every representation, its dimension, its default and w
   assert.equal(panel.apply.title, 'Change something above first.');
   assert.equal(panel.revert.disabled, true);
   assert.equal(panel.status().textContent, '');
+});
+
+test('gene names read after the first view show loading, and a change waits for them', t => {
+  const panel = mountPanel(t, { pendingGenes: true });
+  assert.equal(panel.state.getDataMapping().geneNames, null);
+  const select = [...panel.root.walk()].find(node => node.id === 'data-mapping-gene-names');
+  // Loading, never the var index shown in their place.
+  assert.equal(select.disabled, true);
+  assert.equal(select.title, 'The gene names are being read.');
+  assert.deepEqual(select.children.map(option => option.textContent), ['Reading gene names…']);
+  // A change staged meanwhile waits for them: Apply says so.
+  const tsne = panel.row('t-SNE').querySelector('.data-mapping-enable');
+  tsne.checked = false;
+  tsne.dispatch('change');
+  assert.equal(panel.apply.disabled, true);
+  assert.equal(panel.status().textContent, 'Apply waits for the gene names, which are being read.');
+  assert.deepEqual(panel.applied, []);
 });
 
 test('turning a representation off stages its views\' move to the default, and Revert drops it', t => {

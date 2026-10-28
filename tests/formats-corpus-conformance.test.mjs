@@ -208,7 +208,7 @@ async function checkOpened(opened, expected, where) {
     const nVars = expected.varNames.length;
     if (expected.modalities === null) {
       assert.equal(probe.modalities, null, `${where}: one feature space`);
-      assert.deepEqual(reader.varNames, expected.varNames, `${where}: var names`);
+      assert.deepEqual((await reader.readVarNames('X', null)).index, expected.varNames, `${where}: var names`);
       const dense = await readDense(reader, 'X', reader.nObs, nVars);
       assertNumbers(dense, expected.X, Math.fround, `${where}: X`);
       await checkAccessPaths(reader, 'X', dense, reader.nObs, nVars, `${where}: X`);
@@ -232,7 +232,7 @@ async function checkOpened(opened, expected, where) {
       }
       // The default modality is presented at the root when it measured every cell.
       if (items[chosen].nCells === reader.nObs) {
-        assert.deepEqual(reader.varNames, expected.varNames, `${where}: root var is the default modality's`);
+        assert.deepEqual((await reader.readVarNames('X', null)).index, expected.varNames, `${where}: root var is the default modality's`);
         assertNumbers(await readDense(reader, 'X', reader.nObs, nVars), expected.X, Math.fround, `${where}: root X`);
       }
     }

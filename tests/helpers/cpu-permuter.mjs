@@ -1,3 +1,5 @@
+import { PointStore } from '../../assets/js/rendering/high-perf/point-store-segments.js';
+
 /**
  * Stands in for `GpuPermuter` (assets/js/rendering/high-perf/gpu-permute.js)
  * on a fake WebGL context, which cannot run a transform-feedback pass: it
@@ -8,23 +10,41 @@
  * @param {object} gl - The fake context.
  */
 export function createCpuPermuter(gl) {
-  const write = (target, view) => {
-    gl.bindBuffer(gl.ARRAY_BUFFER, target);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, view, 0, view.length);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  // A target is a segmented store (`point-store-segments.js`) or one buffer;
+  // each segment takes its run of words.
+  const segmentsOf = (target, points) => (target instanceof PointStore
+    ? target.segments
+    : [{ buffer: target, first: 0, count: points }]);
+  const write = (target, view, wordsPerPoint) => {
+    for (const segment of segmentsOf(target, view.length / wordsPerPoint)) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, segment.buffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, view, segment.first * wordsPerPoint, segment.count * wordsPerPoint);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
   };
   const requireOrder = order => {
     if (!order?.texture) {
       throw new Error('GPU permute needs a live draw-order record (permutation texture and width).');
     }
   };
-  const storeWords = (buffer, words) => {
+  const bufferWords = (buffer, words) => {
     // A fake that keeps no store contents has nothing to read back: its
     // words are never compared.
     const bytes = gl._state?.stores?.get(buffer) ?? new Uint8Array(words * 4);
     return new Uint32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + words * 4));
   };
-  const sourceOf = (order, slot) => (order === null ? slot : order.drawOrder.indices[slot]);
+  const storeWords = (store, words) => {
+    if (!(store instanceof PointStore)) return bufferWords(store, words);
+    const out = new Uint32Array(words);
+    const wordsPerPoint = words / store.pointCount;
+    for (const segment of store.segments) {
+      out.set(bufferWords(segment.buffer, segment.count * wordsPerPoint), segment.first * wordsPerPoint);
+    }
+    return out;
+  };
+  // A store order (`store-order.js`) maps the slots below its
+  // `orderedSlots`; every later slot holds its own point.
+  const sourceOf = (order, slot) => (order === null ? slot : order.sourceOf(slot));
   const permuter = {
     /** Writes by words a point: 1 (colours, 1D positions), 2, 3. */
     wordWrites: { 1: 0, 2: 0, 3: 0 },
@@ -42,8 +62,30 @@ export function createCpuPermuter(gl) {
         for (let word = 0; word < wordsPerPoint; word++) out[slot * wordsPerPoint + word] = array[from + word];
       }
       permuter.wordWrites[wordsPerPoint] += 1;
-      write(target, out);
+      write(target, out, wordsPerPoint);
     },
+    /** Slots `[first, end)` only, from the words of points `[first, end)`. */
+    writeWordsRange(target, first, end, source, order, wordsPerPoint) {
+      requireOrder(order);
+      const points = target instanceof PointStore ? target.pointCount : null;
+      const current = storeWords(target, (points ?? end) * wordsPerPoint);
+      // A source in the store itself: the band's words as the store holds
+      // them before the pass (as the GPU copies them first).
+      if (!ArrayBuffer.isView(source)) {
+        const held = source.buffer === target ? current : storeWords(source.buffer, (points ?? end) * wordsPerPoint);
+        source = held.slice(first * wordsPerPoint, end * wordsPerPoint);
+      }
+      for (let slot = first; slot < end; slot++) {
+        const from = (sourceOf(order, slot) - first) * wordsPerPoint;
+        if (from < 0 || from >= source.length) throw new RangeError(`slot ${slot} reads outside its band`);
+        for (let word = 0; word < wordsPerPoint; word++) current[slot * wordsPerPoint + word] = source[from + word];
+      }
+      permuter.rangeWrites = (permuter.rangeWrites ?? 0) + 1;
+      write(target, current, wordsPerPoint);
+    },
+    // A held source texture is a GPU allocation; nothing to hold on the CPU.
+    holdRangeSource() {},
+    releaseRangeSource() {},
     // Nothing to compile on the CPU.
     prewarm() {},
     dispose() {},

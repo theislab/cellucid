@@ -20,6 +20,7 @@ import {
 import {
   rasterizePointsWebgl,
 } from '../assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js';
+import { allocateLargeArray } from '../assets/js/utils/large-arrays.js';
 
 const figureExportRoot = new URL(
   '../assets/js/app/ui/modules/figure-export/',
@@ -763,9 +764,10 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   assert.notEqual(end, -1);
   const packBuffers = new Function(
     'drawnSequence',
+    'allocateLargeArray',
     `${rasterizerSource.slice(start, end)}
      return packBuffers;`
-  )(drawnSequence);
+  )(drawnSequence, allocateLargeArray);
 
   const membership = createMembership({
     admissionLevels: [0, 2, 1, 255],
@@ -1007,9 +1009,10 @@ test('full detail packs points in the pane draw order, and a reduced level in it
   const end = rasterizerSource.indexOf('/**\n * Render a point cloud', start);
   const packBuffers = new Function(
     'drawnSequence',
+    'allocateLargeArray',
     `${rasterizerSource.slice(start, end)}
      return packBuffers;`
-  )(drawnSequence);
+  )(drawnSequence, allocateLargeArray);
   const pack = (lodMembership, drawOrder) => packBuffers({
     positions: POSITIONS,
     dimension: 3,

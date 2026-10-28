@@ -26,9 +26,14 @@ const OTHER_MODES = Object.freeze([
  * One analysis UI over a data layer that publishes exactly `genes`. The
  * validators read only the data layer and the subclass's requirements.
  */
-function uiOver(UiClass, genes) {
+function uiOver(UiClass, genes, listing = { pending: false, failure: null }) {
   const ui = Object.create(UiClass.prototype);
   ui.dataLayer = {
+    // The gene list of a dataset just shown is read after its first view.
+    state: {
+      areGenesPending: () => listing.pending,
+      getGeneListFailure: () => listing.failure,
+    },
     getAvailableVariables(type) {
       assert.equal(type, 'gene_expression');
       return genes;
@@ -56,6 +61,22 @@ test('without genes a gene-expression mode refuses before its pages', () => {
     const refusal = { valid: false, error: 'Requires gene expression data.' };
     assert.deepEqual(ui.validateDataRequirements(), refusal, UiClass.name);
     assert.deepEqual(ui.validateRequirements([]), refusal, UiClass.name);
+  }
+});
+
+test('while the gene names are read after the first view, a gene-expression mode waits for them', () => {
+  for (const UiClass of GENE_MODES) {
+    const pending = uiOver(UiClass, [], { pending: true, failure: null });
+    assert.deepEqual(pending.validateDataRequirements(), {
+      valid: false,
+      pending: true,
+      error: 'Reading the gene names… This analysis opens once they are read.',
+    }, UiClass.name);
+    const failed = uiOver(UiClass, [], { pending: false, failure: new Error('the var index could not be read') });
+    assert.deepEqual(failed.validateDataRequirements(), {
+      valid: false,
+      error: 'The gene names could not be read: the var index could not be read',
+    }, UiClass.name);
   }
 });
 

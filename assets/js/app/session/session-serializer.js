@@ -19,6 +19,7 @@ import {
   assertDatasetSourceRecord,
   captureDatasetSourceRecord,
 } from './dataset-source-record.js';
+import { captureCellSubsetRecord, decodeCellSubsetRecord } from './cell-subset-record.js';
 import { writeBundle } from './bundle/writer.js';
 import { downloadBlob } from '../utils/download.js';
 import {
@@ -271,9 +272,13 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   ) {
     throw new TypeError('Session manifest profile is invalid.');
   }
+  // `cells` is present only for a session saved on a subsample
+  // (`cell-subset-record.js`); without it the session was saved on every cell.
   requireExactKeys(
     manifest,
-    ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks'],
+    Object.hasOwn(manifest ?? {}, 'cells')
+      ? ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks', 'cells']
+      : ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks'],
     'Session manifest'
   );
   if (
@@ -287,6 +292,12 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     'Session manifest datasetFingerprint'
   );
   assertDatasetSourceRecord(manifest.source, 'Session manifest source');
+  if (Object.hasOwn(manifest, 'cells')) {
+    const cells = decodeCellSubsetRecord(manifest.cells, 'Session manifest cells');
+    if (cells.spec.k !== manifest.datasetFingerprint.cellCount) {
+      throw new TypeError('Session manifest cells must keep exactly the fingerprint cell count.');
+    }
+  }
   assertSessionRequires(manifest.requires, 'Session manifest requires');
   if (manifestProfile === 'published-default' && manifest.source !== null) {
     throw new TypeError(
@@ -768,6 +779,51 @@ export class SessionSerializer {
   }
 
   /**
+   * What a reading of the same dataset with other cells keeps (Open data ›
+   * Cells to open, `ui/modules/subsample-control.js`): every view with its
+   * camera, layout and embedding, each view's active field and filters, the
+   * sidebar controls, and the floating analysis windows — the session's own
+   * `core-state` and `analysis-windows` records, taken in memory. Nothing per
+   * cell: highlights and labels are carried by original cell position
+   * (`cell-subset-carry.js`).
+   *
+   * @returns {{core: object, windows: Uint8Array|null}}
+   */
+  captureViewCarry() {
+    const ctx = { ...this._base };
+    const take = id => this._contributorById.get(id).capture(ctx)[0].payload;
+    return {
+      core: take('core-state'),
+      windows: this._base.analysisWindowManager === null ? null : take('analysis-windows'),
+    };
+  }
+
+  /**
+   * Give a `captureViewCarry` record back to the dataset read again. Each
+   * part is applied on its own: a part the new reading cannot take (a filter
+   * on a category none of its cells has) is skipped and named, the rest
+   * applied.
+   *
+   * @param {{core: object, windows: Uint8Array|null}} carry
+   * @returns {Promise<string[]>} The parts that could not be kept, and why
+   */
+  async restoreViewCarry(carry) {
+    const ctx = { ...this._base, abortSignal: null, restoreTransaction: null };
+    const failures = [];
+    const give = async (id, payload, label) => {
+      if (payload === null) return;
+      try {
+        await this._contributorById.get(id).restore(ctx, null, payload);
+      } catch (error) {
+        failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    await give('core-state', carry.core, 'views, fields and filters');
+    await give('analysis-windows', carry.windows, 'analysis windows');
+    return failures;
+  }
+
+  /**
    * Set the cinematic camera reference once the UI is initialized.
    * @param {object} cinematicCamera
    */
@@ -1132,12 +1188,14 @@ export class SessionSerializer {
       });
     }
 
+    const cells = captureCellSubsetRecord(this._base.dataSourceManager);
     const manifest = {
       createdAt: new Date().toISOString(),
       datasetFingerprint: datasetOwner.fingerprint,
       source: captureDatasetSourceRecord(this._base.dataSourceManager),
       requires: collectRequiredFields(this._base.state),
-      chunks: manifestChunks
+      chunks: manifestChunks,
+      ...(cells === null ? {} : { cells })
     };
 
     validateManifest(manifest, this._contributorById, null);
@@ -1207,7 +1265,9 @@ export class SessionSerializer {
    * applied, and no chunk is read.
    *
    * @param {Blob} blob
-   * @returns {Promise<{datasetId: string, name: string|null, source: object|null}>}
+   * @returns {Promise<{datasetId: string, name: string|null, source: object|null,
+   *   cells: {spec: object, kept: Uint32Array, digest: string}|null}>}
+   *   `cells`: the subsample it was saved on, null for every cell
    */
   async readSessionDataset(blob) {
     if (!(blob instanceof Blob)) {
@@ -1219,7 +1279,10 @@ export class SessionSerializer {
       return Object.freeze({
         datasetId: bundle.manifest.datasetFingerprint.datasetId,
         name: bundle.manifest.datasetFingerprint.name,
-        source: bundle.manifest.source
+        source: bundle.manifest.source,
+        cells: Object.hasOwn(bundle.manifest, 'cells')
+          ? decodeCellSubsetRecord(bundle.manifest.cells, 'Session manifest cells')
+          : null
       });
     } finally {
       await bundle.cancel('Only the session manifest was needed.');
@@ -1420,7 +1483,8 @@ export class SessionSerializer {
       // touches state.
       const mismatch = await verifySessionFingerprint(
         ctx,
-        manifest.datasetFingerprint
+        manifest.datasetFingerprint,
+        { profile: manifestProfile }
       );
       throwIfAborted(abortController.signal);
       if (mismatch !== null) {

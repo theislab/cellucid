@@ -224,7 +224,9 @@ for (const [format, input, file] of [
       await expect(expression.locator('option')).toHaveText([
         'None', 'X', "layers['counts']", "layers['log1p']", 'raw.X · 8 genes',
       ]);
-      await expect(names).toHaveValue('index');
+      // An Ensembl index with gene_symbols beside it: the symbols name the
+      // genes, guessed by content.
+      await expect(names).toHaveValue('column:gene_symbols');
       await expect(names.locator('option')).toHaveText([
         'var index',
         'gene_symbols',
@@ -233,8 +235,10 @@ for (const [format, input, file] of [
         'dispersions · floating-point values cannot name genes',
       ]);
       // One short line: what was guessed from the file, then the names note.
-      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint'))
-        .toHaveText("Guessed: highly variable genes. Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
+      const symbolsHint = "Guessed: gene names, highly variable genes. "
+        + "1 gene has no 'gene_symbols' value and uses its var index name. "
+        + "1 duplicate name was made unique, e.g. 'LYZ' → 'LYZ-1'.";
+      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(symbolsHint);
 
       // A highlight and a filtered gene colouring are in place.
       await page.evaluate(() => {
@@ -242,7 +246,7 @@ for (const [format, input, file] of [
         state.ensureHighlightPage();
         state.addHighlightDirect({ type: 'annotation', label: 'kept', cellIndices: Uint32Array.of(1, 2, 3) });
       });
-      await colourByGene(page, 'ENSG00000000003');
+      await colourByGene(page, 'LYZ');
       const range = await page.evaluate(() => {
         const state = window._cellucidState;
         const stats = state.ensureContinuousMetadata(state.varData.fields[state.activeVarFieldIndex]).stats;
@@ -252,18 +256,22 @@ for (const [format, input, file] of [
         return { min, max };
       });
 
-      // Symbols instead of Ensembl ids: the same gene, now called LYZ.
-      await names.selectOption('column:gene_symbols');
+      // Ensembl ids instead of symbols: the same gene, now called by its id.
+      await names.selectOption('index');
       await expect(page.locator('.data-mapping-status')).toHaveText('Apply keeps each coloured gene it finds and closes analysis windows.');
+      await apply(page);
+      await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
+      expect(await activeGene(page)).toEqual({ key: 'ENSG00000000003', index: 2, filter: range });
+      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint'))
+        .toHaveText("Guessed: highly variable genes. Gene names are identifiers; 'gene_symbols' holds symbols.");
+
+      // Back to the symbols: the same gene again, called LYZ.
+      await names.selectOption('column:gene_symbols');
       await apply(page);
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       expect(await activeGene(page)).toEqual({ key: 'LYZ', index: 2, filter: range });
       expect(await page.evaluate(() => window._cellucidState.getDataMapping().geneNames)).toBe('column:gene_symbols');
-      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(
-        "Guessed: highly variable genes. "
-        + "1 gene has no 'gene_symbols' value and uses its var index name. "
-          + "1 duplicate name was made unique, e.g. 'LYZ' → 'LYZ-1'."
-      );
+      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(symbolsHint);
       expect(await page.evaluate(() => window._cellucidState.getHighlightedCellCount())).toBe(3);
 
       // raw.X has its own, longer gene list: the gene is found there by name.

@@ -340,7 +340,9 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
         name,
         size: Number.isSafeInteger(size) ? size : null,
         head,
-        version: `ctag:${item.cTag ?? ''}:${size}`,
+        // A validator only where the item states its cTag: without one the
+        // file is known by its size alone (`remote-file.js`).
+        version: typeof item.cTag === 'string' && item.cTag !== '' ? `ctag:${item.cTag}:${size}` : null,
         attribution: { title: name, url: typeof item.webUrl === 'string' ? item.webUrl : display },
         signal,
         onStep,

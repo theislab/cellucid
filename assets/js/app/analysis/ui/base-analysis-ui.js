@@ -49,6 +49,7 @@ import { getComputeManager } from '../compute/compute-manager.js';
 import { OperationType } from '../compute/operations.js';
 import {
   joinPerCellCSV,
+  pageInOriginalOrder,
   perCellCSVHeader,
   splitPerCellRows
 } from '../compute/csv-export.js';
@@ -59,6 +60,8 @@ import { createControlScope } from './components/control-accessibility.js';
 import { purgePlot, downloadImage } from '../plots/plotly-loader.js';
 import { CancellableJob, createRequestIdTracker, isCancellation } from '../../jobs/cancellable-job.js';
 import { createJobStatusView } from '../../jobs/job-status-view.js';
+import { createStatusLine } from '../../ui/components/controls.js';
+import { describeCellsUsed } from '../shared/progressive-cells.js';
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
 
 /**
@@ -68,21 +71,31 @@ import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js'
  * Blobs are joined after the header. The bytes are those of writing every row
  * in order.
  *
+ * `cell_index` is the cell's original position (its row in the dataset in
+ * its original order), as every export and the notebook name a cell, and each
+ * page's rows ascend by it: the open cells' positions inside the app are
+ * translated by `identity` (`pageInOriginalOrder`), so a subsample, or a file
+ * stored in priority order, joins back to the right rows in the dataset's order.
+ *
  * @param {'page-data'|'signature-scores'} layout
  * @param {Array<{pageName: string, values: ArrayLike<unknown>, cellIndices?: ArrayLike<number>, categories?: string[], missingCode?: number}>} pageData
- * @param {string} [variableName]
+ * @param {string|undefined} variableName
+ * @param {import('../../../data/cell-identity.js').CellIdentity} identity - The open dataset's cells
  * @returns {Promise<Blob>}
  */
-export async function writePerCellCSV(layout, pageData, variableName) {
+export async function writePerCellCSV(layout, pageData, variableName, identity) {
   const header = perCellCSVHeader(layout, variableName);
-  const pages = pageData.map(pd => ({
-    pageName: pd.pageName,
-    values: pd.values,
-    cellIndices: pd.cellIndices ?? null,
-    setName: pd.setName ?? null,
-    categories: pd.categories ?? null,
-    missingCode: pd.missingCode ?? null
-  }));
+  const pages = pageData.map(pd => {
+    const { values, cellIndices } = pageInOriginalOrder(pd, identity);
+    return {
+      pageName: pd.pageName,
+      values,
+      cellIndices,
+      setName: pd.setName ?? null,
+      categories: pd.categories ?? null,
+      missingCode: pd.missingCode ?? null
+    };
+  });
   const manager = getComputeManager();
   const ranges = splitPerCellRows(pages, analysisWorkerCount());
   const parts = await Promise.all(ranges.map(range => manager.execute(
@@ -316,14 +329,31 @@ export class BaseAnalysisUI {
    */
   validateDataRequirements() {
     const requirements = this.constructor.getRequirements();
-    if (
-      requirements?.geneExpression === true &&
-      this.dataLayer.getAvailableVariables('gene_expression').length === 0
-    ) {
-      return { valid: false, error: 'Requires gene expression data.' };
+    if (requirements?.geneExpression !== true) return { valid: true };
+    // A dataset just shown reads its genes after its first view
+    // (`DataState.listPublishedGenes`): the form opens once they are read.
+    if (this.dataLayer.state.areGenesPending()) {
+      return { valid: false, pending: true, error: 'Reading the gene names… This analysis opens once they are read.' };
+    }
+    if (this.dataLayer.getAvailableVariables('gene_expression').length === 0) {
+      const failure = this.dataLayer.state.getGeneListFailure();
+      return {
+        valid: false,
+        error: failure === null
+          ? 'Requires gene expression data.'
+          : `The gene names could not be read: ${failure.message}`
+      };
     }
     return { valid: true };
   }
+
+  /**
+   * The gene list was read after the first view (or could not be). Nothing
+   * here lists genes itself: a gene selector of the controls lists them on
+   * its own (`VariableSelector`), and a form is built again
+   * (`FormBasedAnalysisUI.onGenesListed`).
+   */
+  onGenesListed() {}
 
   /**
    * Get human-readable requirement text for this analysis type
@@ -866,6 +896,46 @@ export class BaseAnalysisUI {
   }
 
   /**
+   * The line saying which cells the shown result used (a progressive run's
+   * first pass, or every cell), created on first use; the UI places `root`
+   * beside its result.
+   * @returns {{root: HTMLElement, set: Function}}
+   * @protected
+   */
+  _getCellsUsedLine() {
+    if (this._cellsUsedLine == null) {
+      this._cellsUsedLine = createStatusLine({ tone: 'muted' });
+      this._cellsUsedLine.root.classList.add('analysis-cells-used');
+      this._cellsUsedLine.root.hidden = true;
+    }
+    return this._cellsUsedLine;
+  }
+
+  /**
+   * Say which cells the shown result used: a first pass's sample (refining,
+   * or stopped before every cell), or every cell; nothing when no result is
+   * shown (`shared/progressive-cells.js`).
+   * @param {{m: number, n: number}|null} sample
+   * @param {number} [openCells]
+   * @param {'refining'|'stopped'|null} [state]
+   * @param {boolean} [shown] - A result on every open cell is shown
+   * @protected
+   */
+  _showCellsUsed(sample, openCells = 0, state = null, shown = false) {
+    const line = this._cellsUsedLine;
+    if (line == null) return;
+    if (sample === null && !shown) {
+      line.set('');
+      line.root.hidden = true;
+      delete line.root.dataset.cellsUsed;
+      return;
+    }
+    line.set(describeCellsUsed(sample, openCells, state), state === 'stopped' ? 'warning' : 'muted');
+    line.root.hidden = false;
+    line.root.dataset.cellsUsed = sample === null ? 'all' : 'sample';
+  }
+
+  /**
    * Run the analysis again after it was cancelled or failed (Run again).
    * @protected
    */
@@ -1156,7 +1226,7 @@ export class BaseAnalysisUI {
     if (!pageData || pageData.length === 0) return;
 
     try {
-      const csv = await writePerCellCSV('page-data', pageData, variableName || 'value');
+      const csv = await writePerCellCSV('page-data', pageData, variableName || 'value', this.dataLayer.state.cellIdentity);
       const baseName = String(filename || 'analysis-data').replace(/\.csv$/i, '');
       downloadCSV(csv, baseName, this._notifications);
     } catch (err) {
@@ -1259,6 +1329,26 @@ export class BaseAnalysisUI {
   /**
    * Destroy and cleanup the component
    */
+
+  /**
+   * Publish what this analysis's shown result holds besides its plot -- gene
+   * sets, per-cell scores -- to the dataset's derived results
+   * (`registries/derived-results.js`), or clear them (`result` null). The
+   * analyses whose results a notebook pulls back override it.
+   *
+   * @param {Object|null} _result
+   * @protected
+   */
+  _publishDerivedResults(_result) {}
+
+  /** `_publishDerivedResults`, reported instead of thrown: it never stops an analysis. */
+  _publishDerivedResultsSafely(result) {
+    try {
+      this._publishDerivedResults(result);
+    } catch (error) {
+      console.error(`[${this.constructor.name}] Publishing derived results failed:`, error);
+    }
+  }
   destroy() {
     if (this._baseDestroyPromise != null) {
       return this._baseDestroyPromise;
@@ -1331,6 +1421,7 @@ export class BaseAnalysisUI {
 
       this._selectedPages = [];
       this._lastResult = null;
+      this._publishDerivedResultsSafely(null);
       this._currentPageData = null;
       this._isLoading = false;
 

@@ -87,8 +87,6 @@ function makeHighPerfRenderer() {
     _colorGpuByteLength: 0,
     _positionGpuByteLength: 0,
     _alphaTexture: null,
-    _alphaTexData: null,
-    _alphaTexStagingData: null,
     _alphaTexWidth: 0,
     _alphaTexHeight: 0,
     _alphaTextureByteLength: 0,

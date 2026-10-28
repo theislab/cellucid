@@ -15,6 +15,7 @@ import {
 } from './generation-contract.js';
 import { benchmarkGenerationWorkerScript } from '../../../../../workers/scripts.js';
 import { startWorker } from '../../../../workers/worker-script.js';
+import { PieceReceiver } from '../../../../utils/large-arrays.js';
 
 /**
  * Generate a synthetic dataset without blocking the main thread.
@@ -99,8 +100,26 @@ export function generateSyntheticDataOffThread(options = {}) {
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
+    // Arrays larger than one ArrayBuffer arrive in pieces before the result.
+    const pieces = new PieceReceiver();
     worker.addEventListener('message', event => {
-      const payload = event.data;
+      let payload = event.data;
+      if (payload?.piece !== undefined && payload.requestId === request.requestId) {
+        try {
+          pieces.receive(payload.piece);
+        } catch (error) {
+          finish(reject, error);
+        }
+        return;
+      }
+      if (payload?.ok === true) {
+        try {
+          payload = pieces.resolve(payload);
+        } catch (error) {
+          finish(reject, error);
+          return;
+        }
+      }
       if (payload?.ok !== true) {
         finish(
           reject,

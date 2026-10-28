@@ -17,10 +17,13 @@
  *   for the person.
  * - `too-small`: no category has `minPoints` cells (`largest` is the biggest).
  * - `available`: not got yet; `plan` says what getting them costs
- *   (`OutlierQuantileSource.describe`), null until known.
+ *   (`OutlierQuantileSource.describe`), null until known; `estimate` as
+ *   `ready`'s when they are to be computed on a subsample's open cells.
  * - `running`: being got; `progress` is the latest read activity of it
  *   (bytes of how many, rate, time left), `plan` what it was to cost.
- * - `ready`: got; the filter works at once.
+ * - `ready`: got; the filter works at once. `estimate` is `{open, of}` when
+ *   they were computed on the open cells of a subsample only (an estimate
+ *   of the whole dataset's; stored quantiles describe every cell), else null.
  * - `failed`: getting them failed; `message` says why. Using the filter
  *   again tries again; `latentUnusable` says the latent space itself cannot
  *   be read (a NaN), so another must be chosen.
@@ -41,6 +44,7 @@ import { categorySizes } from '../../../data/latent-outliers.js';
 import { latentReadLabel } from '../../../data/latent-outliers-stream.js';
 import { MappingLoadError, obsmWidth, parseMappingLatentPath } from '../../../data/data-mapping-candidates.js';
 import { vectorFieldKeys } from '../../../data/data-mapping.js';
+import { outlierQuantilesEstimate } from '../../../data/outlier-quantile-source.js';
 import { hasAvailableOutlierQuantile, requireOutlierQuantiles } from './color-outliers.js';
 import { formatBytes, formatDuration } from '../../../utils/format-units.js';
 
@@ -206,14 +210,28 @@ export class DataStateOutlierQuantileMethods {
     }
     const tooSmall = largest => Object.freeze({ state: 'too-small', fieldKey, latentKey, minPoints, largest });
     if (field.outlierQuantiles instanceof Float32Array) {
-      if (hasAvailableOutlierQuantile(field.outlierQuantiles)) return Object.freeze({ state: 'ready', fieldKey, latentKey });
+      if (hasAvailableOutlierQuantile(field.outlierQuantiles)) {
+        return Object.freeze({ state: 'ready', fieldKey, latentKey, estimate: outlierQuantilesEstimate(field.outlierQuantiles) });
+      }
     }
     const categories = field.categories ?? null;
-    if (Number.isSafeInteger(minPoints) && field.codes && Array.isArray(categories)) {
+    // A subsample's stored quantiles rank each category over its cells in
+    // the file, not the open ones: the open counts do not say it is too small.
+    const storedOnSubsample = this.cellIdentity?.isSubset === true
+      && latentKey !== null
+      && this.fieldLoader?.storedOutlierLatentKey === latentKey
+      && !(field.outlierQuantiles instanceof Float32Array);
+    if (!storedOnSubsample && Number.isSafeInteger(minPoints) && field.codes && Array.isArray(categories)) {
       const sizes = sizesOf(field.codes, categories.length, minPoints);
       if (sizes.scored === 0) return tooSmall(sizes.largest);
     }
-    return Object.freeze({ state: 'available', fieldKey, latentKey, plan: this._outlierPlan(descriptor) });
+    const plan = this._outlierPlan(descriptor);
+    // Computed on a subsample: from its open cells only.
+    const identity = this.cellIdentity;
+    const estimate = identity?.isSubset === true && plan !== null && plan.source !== 'stored'
+      ? Object.freeze({ open: identity.n, of: identity.nOriginal })
+      : null;
+    return Object.freeze({ state: 'available', fieldKey, latentKey, plan, estimate });
   }
 
   /**

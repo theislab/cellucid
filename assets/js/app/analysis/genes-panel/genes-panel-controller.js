@@ -23,7 +23,7 @@ import { ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
 import { residencyBudgetBytes } from '../../../data/memory-budget.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
-import { filterGenes, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
+import { createGeneIndex, filterGenes, geneIdentities, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
 import { geneMomentsFor } from '../shared/gene-moments-cache.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 
@@ -272,7 +272,7 @@ export class GenesPanelController {
       const hvg = await this.dataLayer.state.varFieldLoader.highlyVariableGenes();
       only = new Set(Array.isArray(hvg) ? hvg : []);
     } else if (options.onlyGenes === 'list') {
-      only = new Set(resolveGenes(parseGeneText(options.onlyGenesList), all).resolved);
+      only = new Set(resolveGenes(parseGeneText(options.onlyGenesList), createGeneIndex(all, geneIdentities(this.dataLayer.state?.varData))).resolved);
     }
     return filterGenes(all, { exclude: options.excludeGenes, pattern: options.excludePattern, only });
   }
@@ -306,14 +306,17 @@ export class GenesPanelController {
    * @param {Object} params.options - The marker options record
    * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [params.job]
    * @param {AbortSignal|null} [params.signal]
+   * @param {Object|null} [params.sample] - A first pass's cells
+   *   (`shared/progressive-cells.js`); null for every cell
    * @returns {Promise<{stats: Object, plan: Object, metadata: Object}>}
    */
-  async runAnalysis({ options, job = null, signal = job?.signal ?? null }) {
+  async runAnalysis({ options, job = null, signal = job?.signal ?? null, sample = null }) {
     this._assertOpen();
     this._cache.setIdentity(this._getCacheIdentity());
     const startTime = performance.now();
     job?.step(ANALYSIS_PHASES.INIT);
-    const scope = this.scopeOf(options.cells);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this.scopeOf(options.cells) : sample.mask(this.scopeOf(options.cells));
     const described = await this.describeGroups(options.groupBy, scope);
     if (signal?.aborted) throw signal.reason;
     const plan = this.plan(options, described);

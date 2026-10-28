@@ -19,7 +19,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { countNoun, formatCountOf } from '../assets/js/utils/format-units.js';
+import { countNoun, formatCountOf, formatOpenCells } from '../assets/js/utils/format-units.js';
 
 const ROOT = fileURLToPath(new URL('../assets/js/', import.meta.url));
 
@@ -79,6 +79,28 @@ test('formatCountOf and countNoun make a count and its noun agree', () => {
   assert.equal(countNoun(1500, 'edge'), 'edges');
   assert.throws(() => countNoun(Number.NaN, 'cell'), /finite/);
   assert.throws(() => formatCountOf(2, ''), /non-empty/);
+});
+
+test('a count of the open cells is said against every cell on a subsample, its noun agreeing with the last count', async () => {
+  // Every cell open: the count alone.
+  assert.equal(formatOpenCells(1200, 1200), '1,200 cells');
+  assert.equal(formatOpenCells(1200, null), '1,200 cells');
+  assert.equal(formatOpenCells(1, 1), '1 cell');
+  // A subsample: "k of n cells", the one way every shown count of them reads.
+  assert.equal(formatOpenCells(300, 1200), '300 of 1,200 cells');
+  assert.equal(formatOpenCells(1, 2), '1 of 2 cells');
+  assert.equal(formatOpenCells(300, 1200, value => `${value / 100}h`), '3h of 12h cells');
+  assert.throws(() => formatOpenCells(3, 2), /never more/);
+  const { describeCountedCells } = await import('../assets/js/app/ui/modules/legend/categorical-legend.js');
+  assert.equal(describeCountedCells({ pointCount: 240, cellIdentity: { nOriginal: 1200 } }), 'Counted on the 240 of 1,200 cells open.');
+  assert.equal(describeCountedCells({ pointCount: 1200, cellIdentity: { nOriginal: 1200 } }), '');
+  const { initStatsDisplay } = await import('../assets/js/app/ui/modules/stats-display.js');
+  const el = { textContent: '' };
+  const { updateStats } = initStatsDisplay({ dom: { el } });
+  updateStats({ field: { key: 'cell_type', kind: 'category' }, pointCount: 240, cellTotal: 1200, centroidInfo: '' });
+  assert.equal(el.textContent, '240 of 1,200 cells • Field: cell_type (category)');
+  updateStats({ field: null, pointCount: 1200, cellTotal: 1200 });
+  assert.equal(el.textContent, '1,200 cells • Field: None');
 });
 
 test('no count is written before a plural noun it may not agree with', async () => {

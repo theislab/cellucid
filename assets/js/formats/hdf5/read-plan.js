@@ -33,11 +33,12 @@
 import { loadChunkTable } from './chunk-index.js';
 import { unfilter, unsupportedFilters, filterName, reviveHdf5Error } from './filters.js';
 import { decodeChunkBytes } from '../io/decode-pool.js';
-import { onAbort } from '../io/abort.js';
+import { SharedWork, onAbort } from '../io/abort.js';
 import { Hdf5FormatError, Hdf5UnsupportedError, throwIfAborted } from './errors.js';
 import { selectionSize } from '../store.js';
 import { CHUNK_GROUP_BYTES } from './context.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 const MiB = 1024 * 1024;
 
@@ -186,8 +187,8 @@ function fillWith(target, pattern) {
 }
 
 /**
- * `promise`, rejected at once when `signal` aborts (calling `onAborted` so the
- * shared fetches this read was waiting for can be released).
+ * `promise`, rejected at once when `signal` aborts (calling `onAborted`, so
+ * this read withdraws from the shared fetches it was waiting for).
  */
 function abortable(promise, signal, onAborted) {
   if (signal === null) return promise;
@@ -197,6 +198,9 @@ function abortable(promise, signal, onAborted) {
       reject(signal.reason ?? new DOMException('The read was aborted.', 'AbortError'));
     };
     if (signal.aborted) {
+      // Nobody waits for `promise` now: its failure (the fetch just
+      // released) is not left unobserved.
+      promise.catch(() => {});
       abort();
       return;
     }
@@ -214,11 +218,23 @@ function abortable(promise, signal, onAborted) {
   });
 }
 
-/** One read stops waiting for these fetch groups: cancel those nobody waits for. */
-function release(groups) {
-  for (const group of groups) {
-    group.waiters--;
-    if (group.waiters <= 0) group.controller?.abort();
+/**
+ * Call `visit(linear, coords)` for every chunk from grid coordinates `first`
+ * to `last` (inclusive, row-major), `linear` its number in `grid`.
+ */
+function forEachChunkIn(first, last, grid, visit) {
+  const rank = grid.length;
+  const coords = first.slice();
+  for (;;) {
+    let linear = 0;
+    for (let d = 0; d < rank; d++) linear = linear * grid[d] + coords[d];
+    visit(linear, coords);
+    let d = rank - 1;
+    for (; d >= 0; d--) {
+      if (++coords[d] <= last[d]) break;
+      coords[d] = first[d];
+    }
+    if (d < 0) return;
   }
 }
 
@@ -262,30 +278,28 @@ export class DatasetReader {
     }
   }
 
-  /** The chunk table, read once. */
+  /**
+   * The chunk table, read once and shared by every read asking for it
+   * meanwhile (`SharedWork`): its reads stop only once every one of them
+   * withdrew, and the next read then reads it anew.
+   */
   chunkTable(signal, activity = null) {
-    if (this.table === null) {
+    if (this.table === null || this.table.abandoned) {
       const layout = this.layout;
       const chunkBytes = layout.chunkDims.reduce((a, b) => a * b, 1) * layout.elementSize;
-      this.table = loadChunkTable(this.file.withActivity(activity), {
+      const table = new SharedWork(tableSignal => loadChunkTable(this.file.withActivity(activity), {
         dims: this.shape,
         maxDims: this.info.space.maxDims,
         layout,
         filtered: this.filters.length > 0,
         chunkBytes,
-      });
-      this.table.catch(() => {
-        this.table = null;
+      }, tableSignal));
+      this.table = table;
+      table.promise.catch(() => {
+        if (this.table === table) this.table = null;
       });
     }
-    const table = this.table;
-    if (signal === null) return table;
-    return new Promise((resolve, reject) => {
-      const abort = () => reject(signal.reason ?? new DOMException('The read was aborted.', 'AbortError'));
-      if (signal.aborted) return abort();
-      const stopWaiting = onAbort(signal, abort);
-      table.then(resolve, reject).finally(stopWaiting);
-    });
+    return this.table.join(signal);
   }
 
   /**
@@ -301,7 +315,7 @@ export class DatasetReader {
     this.requireReadable();
     throwIfAborted(signal);
     const count = selectionSize(selection);
-    const target = new Uint8Array(count * this.elementSize);
+    const target = allocateTypedArray(Uint8Array, count * this.elementSize, this.label);
     if (count === 0) return target;
     switch (this.layout.class) {
       case 'compact':
@@ -404,31 +418,21 @@ export class DatasetReader {
   async chunksFor(selection, signal, activity) {
     const table = await this.chunkTable(signal, activity);
     const chunkDims = this.layout.chunkDims;
-    const rank = chunkDims.length;
     const first = selection.map(([start], d) => Math.floor(start / chunkDims[d]));
     const last = selection.map(([, stop], d) => Math.ceil(stop / chunkDims[d]) - 1);
     const grid = table.grid;
     if (table.cover) {
       // A chunk index read as it is needed: the entries of these chunks first.
       const number = coords => coords.reduce((linear, c, d) => linear * grid[d] + c, 0);
-      await table.cover(number(first), number(last), this.file.withActivity(activity));
+      await table.cover(number(first), number(last), this.file.withActivity(activity), signal);
     }
     const chunks = [];
     let missing = false;
-    const coords = first.slice();
-    for (;;) {
-      let linear = 0;
-      for (let d = 0; d < rank; d++) linear = linear * grid[d] + coords[d];
+    forEachChunkIn(first, last, grid, (linear, coords) => {
       const slot = table.find(linear);
       if (slot < 0) missing = true;
       else chunks.push({ linear, slot, coords: coords.slice(), address: table.address[slot], size: table.size[slot], mask: table.mask[slot] });
-      let d = rank - 1;
-      for (; d >= 0; d--) {
-        if (++coords[d] <= last[d]) break;
-        coords[d] = first[d];
-      }
-      if (d < 0) break;
-    }
+    });
     return { chunks, missing };
   }
 
@@ -482,10 +486,15 @@ export class DatasetReader {
     const own = [];
     const others = [];
     const runs = [];
+    // A group every read left (being stopped) is not joined: its chunks are fetched again.
+    const sharedGroup = address => {
+      const group = file.inflight.get(address);
+      return group !== undefined && !group.work.abandoned ? group : undefined;
+    };
     for (const chunk of chunks) {
       const cached = file.cache.get(chunk.address);
       if (cached !== undefined) place(chunk, cached);
-      else if (file.inflight.has(chunk.address)) others.push(chunk);
+      else if (sharedGroup(chunk.address) !== undefined) others.push(chunk);
       else {
         const run = this.chunkRun(chunk, selection);
         if (run !== null) runs.push({ chunk, run });
@@ -513,7 +522,7 @@ export class DatasetReader {
         group.end = Math.max(group.end, end);
         group.chunks.push(chunk);
       } else {
-        group = { start: chunk.address, end, chunks: [chunk], waiters: 0, controller: null };
+        group = { start: chunk.address, end, chunks: [chunk], work: null };
         groups.push(group);
       }
     }
@@ -540,28 +549,32 @@ export class DatasetReader {
     /**
      * Register `group` at once (concurrent reads asking for its chunks from
      * now on share it), to be fetched as one request and decoded when the
-     * memory budget has room. One promise per group, not per chunk: reads of
-     * many small chunks stay cheap.
+     * memory budget has room. One shared work per group, not per chunk:
+     * reads of many small chunks stay cheap. Its fetch and decodes stop once
+     * every read waiting for it withdrew (`SharedWork`), never before.
      */
     const register = group => {
-      group.controller = new AbortController();
       group.slots = new Map(group.chunks.map((chunk, index) => [chunk.address, index]));
       group.done = new Promise((resolve, reject) => {
         group.settle = { resolve, reject };
       });
-      group.done.catch(() => {}).finally(() => {
+      group.work = new SharedWork(() => group.done);
+      const forget = () => {
         for (const chunk of group.chunks) {
           if (file.inflight.get(chunk.address) === group) file.inflight.delete(chunk.address);
         }
-      });
+      };
+      group.done.catch(() => {}).finally(forget);
+      // Every read left: the next read of these chunks fetches them anew.
+      onAbort(group.work.signal, forget);
       for (const chunk of group.chunks) file.inflight.set(chunk.address, group);
     };
     const start = group => {
-      fetcher.data(group.start, group.end - group.start, `Chunks of ${this.label}`, group.controller.signal)
+      fetcher.data(group.start, group.end - group.start, `Chunks of ${this.label}`, group.work.signal)
         .then(fetched => {
           const decoded = group.chunks.map(chunk => this.decodeChunk(chunk,
             fetched.subarray(chunk.address - group.start, chunk.address - group.start + chunk.size), chunkBytes, counts,
-            group.controller.signal));
+            group.work.signal));
           return this.filters.length > 0 ? Promise.all(decoded) : decoded;
         })
         .then(group.settle.resolve, group.settle.reject);
@@ -575,20 +588,27 @@ export class DatasetReader {
     // reads through thousands of large chunks never hold them all at once.
     const byGroup = new Map();
     for (const chunk of others) {
-      const sourceGroup = file.inflight.get(chunk.address);
+      const sourceGroup = sharedGroup(chunk.address);
       if (!byGroup.has(sourceGroup)) byGroup.set(sourceGroup, []);
       byGroup.get(sourceGroup).push(chunk);
     }
-    for (const sourceGroup of byGroup.keys()) sourceGroup.waiters++;
+    // This read waits for each group once: it withdraws from all of them
+    // when its signal aborts, or when it fails.
+    const leaves = [];
+    for (const sourceGroup of byGroup.keys()) leaves.push(sourceGroup.work.hold());
+    const ownLeaves = [];
     for (const next of groups) {
       register(next);
-      next.waiters++;
+      ownLeaves.push(next.work.hold());
     }
+    const withdraw = () => {
+      for (const leave of leaves) leave();
+      for (const leave of ownLeaves) leave();
+    };
     const othersDone = abortable(Promise.all([...byGroup].map(([sourceGroup, list]) => placeFrom(sourceGroup, list))),
-      signal, () => release(byGroup.keys()));
+      signal, withdraw);
     othersDone.catch(() => {});
-    const owned = groups.slice();
-    const placements = groups.map(next => abortable(placeFrom(next, next.chunks), signal, () => release([next])));
+    const placements = groups.map(next => abortable(placeFrom(next, next.chunks), signal, withdraw));
     // Start the groups in address order as the budget allows; nothing awaits
     // this loop but the groups themselves.
     (async () => {
@@ -602,9 +622,9 @@ export class DatasetReader {
         // A pass no one waits for yet takes its room after every read someone waits for.
         const giveBack = await file.decodeBudget.acquire(weight, () => activity?.background === true);
         next.done.catch(() => {}).finally(giveBack);
-        if (next.controller.signal.aborted) {
+        if (next.work.abandoned) {
           // Every read waiting for it gave up before it started.
-          next.settle.reject(next.controller.signal.reason ?? new DOMException('The read was aborted.', 'AbortError'));
+          next.settle.reject(next.work.signal.reason);
         } else {
           start(next);
         }
@@ -613,9 +633,9 @@ export class DatasetReader {
     try {
       await Promise.all([othersDone, ...placements, runsDone]);
     } catch (error) {
-      // This read failed (an abort has released its groups already): it no
-      // longer waits for the groups it started.
-      if (!signal?.aborted) release(owned);
+      // This read failed: it no longer waits for any group (withdrawing
+      // twice does nothing).
+      withdraw();
       throw error;
     }
     if (counts.chunks > 0) activity?.decoded?.(counts.chunks, counts.bytes);
@@ -706,7 +726,13 @@ export class DatasetReader {
     return decoded;
   }
 
-  /** Stored bytes a read of `selection` fetches. */
+  /**
+   * Stored bytes a read of `selection` fetches. Exact, except over a chunk
+   * index read as it is needed (a version 1 chunk B-tree) whose entries for
+   * the selection are not read yet: then each chunk not read yet counts the
+   * size its index node's parent key gives (`storedSizeOf`), and no more of
+   * the index is read. Asking what a whole matrix stores costs no request.
+   */
   async storedBytes(selection, { signal = null, activity = null } = {}) {
     this.requireReadable();
     if (selectionSize(selection) === 0) return 0;
@@ -714,6 +740,21 @@ export class DatasetReader {
     if (this.layout.class === 'contiguous') {
       if (this.layout.address === null) return 0;
       return this.contiguousPlan(selection).windows.reduce((sum, window) => sum + window.end - window.start, 0);
+    }
+    const table = await this.chunkTable(signal, activity);
+    const chunkDims = this.layout.chunkDims;
+    const first = selection.map(([start], d) => Math.floor(start / chunkDims[d]));
+    const last = selection.map(([, stop], d) => Math.ceil(stop / chunkDims[d]) - 1);
+    const number = coords => coords.reduce((linear, c, d) => linear * table.grid[d] + c, 0);
+    if (table.covered && !table.covered(number(first), number(last))) {
+      let total = 0;
+      forEachChunkIn(first, last, table.grid, (linear, coords) => {
+        const size = table.storedSizeOf(linear);
+        if (size === 0) return;
+        const run = this.chunkRun({ coords }, selection);
+        total += run === null ? size : run.end - run.start;
+      });
+      return total;
     }
     const { chunks } = await this.chunksFor(selection, signal, activity);
     return chunks.reduce((sum, chunk) => {

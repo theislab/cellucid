@@ -13,7 +13,8 @@ in memory to read it as a picked folder and from a web host
 attributes, shape, chunk shape, fill value, every value).
 
 Run from the repository root with the Python environment that has zarr 3,
-numcodecs and anndata:
+numcodecs, anndata and blosc2 (c-blosc2's Python package: the reference the
+Blosc delta frames are checked against):
 
     python scripts/generate-zarr-conformance-corpus.py
 
@@ -189,8 +190,12 @@ def describe(path: Path, overrides: dict | None = None) -> dict:
             data = node[...]
             values = np.asarray(data)
             entry["values"] = encode_values(values) if values.ndim else encode_values(values.reshape(1))
-            fill = node.metadata.fill_value if node.metadata.zarr_format == 3 else node.metadata.fill_value
-            entry["fill"] = None if fill is None else encode_scalar(np.asarray(fill, dtype=node.dtype)[()] if node.dtype.names is None else np.asarray(fill, dtype=node.dtype), node.dtype)
+            fill = node.metadata.fill_value
+            if fill is None:
+                # A Zarr v2 fill_value of null: zarr-python 3 reads an absent
+                # chunk as the data type's default (`fill_value_or_default`).
+                fill = node.metadata.dtype.default_scalar()
+            entry["fill"] = encode_scalar(np.asarray(fill, dtype=node.dtype)[()] if node.dtype.names is None else np.asarray(fill, dtype=node.dtype), node.dtype)
             entry.update(override)
             nodes[node_path] = entry
 
@@ -336,6 +341,23 @@ def v2_cases(base: Path):
     a[0:2] = np.array([(1, 0.5), (2, 0.25)], dtype=[("a", "<i4"), ("b", "<f4")])
     a = f.create_array("all_absent", shape=(5,), dtype="<u1", chunks=(2,), fill_value=9)
 
+    # A fill_value of null (Zarr v2: "no fill value"), as zarr-python 3
+    # writes it: every chunk equal to the data type's default is left out
+    # (anndata 0.12 on zarr 3 writes uns scalars and obs columns this way),
+    # and reads back as that default.
+    nf = g.create_group("null_fill")
+    for name, values in {**numeric, "datetime_nat": np.array(["NaT", "NaT", "NaT", "2020-01-01"], "datetime64[s]"),
+                         "timedelta_nat": np.array(["NaT", "NaT", "NaT", 5], "timedelta64[s]"),
+                         "vlen_utf8": np.array(["", "", "", "x"], dtype=object)}.items():
+        dtype = str if name == "vlen_utf8" else values.dtype
+        a = nf.create_array(name, shape=(6,), dtype=dtype, chunks=(3,), fill_value=None, compressors=blosc)
+        # The first chunk holds the default only (left out), the second values.
+        a[3:6] = values[-3:]
+    for name, value in {"int64_zero": np.int64(0), "uint32_zero": np.uint32(0), "float64_zero": np.float64(0),
+                        "bool_false": np.bool_(False)}.items():
+        nf.create_array(name, shape=(), dtype=value.dtype, fill_value=None, compressors=None)[...] = value
+    nf.create_array("text_empty", shape=(), dtype=str, fill_value=None, compressors=None)[...] = ""
+
     # Written by hand: things zarr-python 3 does not write.
     hand = g.create_group("hand")
     hand_dir = store / "hand"
@@ -352,12 +374,13 @@ def v2_cases(base: Path):
     sub = np.array([(1, (0.5, 1.5)), (2, (2.5, 3.5)), (3, (4.5, 5.5))], dtype=[("id", "<i4"), ("xy", "<f4", (2,))])
     write_v2("struct_subarray", {"shape": [3], "chunks": [2], "dtype": [["id", "<i4"], ["xy", "<f4", [2]]], "fill_value": None},
              {"0": sub[:2].tobytes(), "1": np.concatenate([sub[2:], np.zeros(1, sub.dtype)]).tobytes()})
-    overrides["/hand/struct_subarray"] = {"values": encode_values(sub), "fill": None, "numpy": str(sub.dtype.descr), "shape": [3], "chunks": [2]}
+    # zarr-python 3 does not open it; its null fill is the type's default, zeros.
+    overrides["/hand/struct_subarray"] = {"values": encode_values(sub), "fill": encode_scalar(np.zeros((), sub.dtype)[()], sub.dtype),
+                                          "numpy": str(sub.dtype.descr), "shape": [3], "chunks": [2]}
     write_v2("null_fill_complete", {"shape": [4], "chunks": [2], "dtype": "<i4", "fill_value": None},
              {"0": np.array([1, 2], "<i4").tobytes(), "1": np.array([3, 4], "<i4").tobytes()})
     write_v2("null_fill_absent", {"shape": [4], "chunks": [2], "dtype": "<i4", "fill_value": None},
              {"0": np.array([1, 2], "<i4").tobytes()})
-    overrides["/hand/null_fill_absent"] = {"error": "undefined", "partial": {"selection": [[0, 2]], "values": [1, 2]}}
     write_v2("object_fill_zero", {"shape": [3], "chunks": [3], "dtype": "|O", "fill_value": 0, "filters": [{"id": "vlen-utf8"}]},
              {"0": numcodecs.VLenUTF8().encode(np.array(["a", "b", "c"], dtype=object))})
     write_v2("bool_invalid", {"shape": [3], "chunks": [3], "dtype": "|b1", "fill_value": False}, {"0": bytes([0, 1, 2])})
@@ -375,6 +398,80 @@ def v2_cases(base: Path):
     consolidate_v2(store)
     write_expected(store, overrides)
     zip_store(store, base / "cases.zarr.zip", root_folder=True, compression=zipfile.ZIP_DEFLATED)
+
+
+def _delta_encode(raw: bytes, typesize: int, blocksize: int) -> bytes:
+    """c-blosc2's delta filter (`delta.c` `delta_encoder`) over each block:
+    the first block as each element XORed with the one before it, every
+    later block as each byte XORed with the first block's byte at its place.
+    Elements are words of the element size (1, 2, 4, 8 bytes), of 8 bytes for
+    other multiples of 8, and bytes otherwise."""
+    word = typesize if typesize in (1, 2, 4, 8) else 8 if typesize % 8 == 0 else 1
+    data = np.frombuffer(raw, dtype=np.uint8)
+    out = data.copy()
+    first = data[:blocksize]
+    words = len(first) // word
+    view = first[: words * word].reshape(words, word)
+    out[word: words * word] = (view[1:] ^ view[:-1]).reshape(-1)
+    for start in range(blocksize, len(data), blocksize):
+        block = data[start:start + blocksize]
+        out[start:start + len(block)] = block ^ first[: len(block)]
+    return out.tobytes()
+
+
+def blosc_delta_cases(base: Path):
+    """Blosc frames with the delta flag (0x08). c-blosc 1 (numcodecs,
+    python-blosc) has no delta filter; c-blosc2 defines the flag
+    (`flags_to_filters`: delta before the shuffle) and decodes such a frame
+    of format version 2. Each chunk here is a c-blosc 1 frame (numcodecs) of
+    the delta-encoded chunk with the flag set, checked to decode to the
+    original values with c-blosc2's own decoder (python-blosc2): the
+    reference this reader is held to. zarr-python cannot read them (its
+    numcodecs ignores the flag), so their values are the originals."""
+    import blosc2
+
+    store = fresh(base / "blosc-delta.zarr")
+    zarr.open_group(str(store), mode="w", zarr_format=2)
+    overrides = {}
+    # One chunk of ~68 KiB per element size: zstd at level 1 cuts it into
+    # blocks of 32 KiB (two and a leftover; streams not split), lz4 into one
+    # of 64 KiB and a leftover (streams split by byte); each shuffle mode.
+    chunk_bytes = 69632
+    walk = np.cumsum(np.random.default_rng(8).integers(-3, 4, size=chunk_bytes))
+    letters = np.frombuffer(b"abcdefgh", dtype="S1")
+    arrays = {
+        "uint8": ((walk % 200).astype("u1"), "zstd", 2),
+        "int16": ((walk[: chunk_bytes // 2] * 7).astype("<i2"), "lz4", 1),
+        "bytes3": (np.array([b"".join(letters[(i // 5 + k) % 8] for k in range(3)) for i in range(chunk_bytes // 3)], dtype="S3"), "zstd", 1),
+        "float32": ((walk[: chunk_bytes // 4] / 4).astype("<f4"), "zstd", 0),
+        "float64": ((walk[: chunk_bytes // 8] / 8).astype("<f8"), "zstd", 1),
+        "bytes16": (np.array([(b"cell-%011d" % (i // 3)) for i in range(chunk_bytes // 16)], dtype="S16"), "zstd", 2),
+    }
+    for name, (values, cname, shuffle) in arrays.items():
+        typesize = values.dtype.itemsize
+        directory = store / name
+        directory.mkdir()
+        compressor = {"id": "blosc", "cname": cname, "clevel": 1, "shuffle": shuffle, "blocksize": 0}
+        (directory / ".zarray").write_text(json.dumps({
+            "zarr_format": 2, "shape": [len(values)], "chunks": [len(values)], "dtype": values.dtype.str, "fill_value": None,
+            "order": "C", "filters": None, "compressor": compressor, "dimension_separator": ".",
+        }))
+        (directory / ".zattrs").write_text("{}")
+        codec = numcodecs.Blosc(cname=cname, clevel=1, shuffle=shuffle)
+        raw = values.tobytes()
+        # c-blosc chooses the block size from the chunk's size, element size
+        # and settings, not its values: the delta is applied to its blocks.
+        blocksize = int.from_bytes(codec.encode(values)[8:12], "little")
+        assert len(raw) > blocksize and len(raw) % blocksize != 0, (name, blocksize, "not several blocks and a leftover")
+        frame = bytearray(codec.encode(np.frombuffer(_delta_encode(raw, typesize, blocksize), dtype=values.dtype)))
+        assert int.from_bytes(frame[8:12], "little") == blocksize and frame[2] & 0x02 == 0, (name, "not a compressed frame of the same blocks")
+        frame[2] |= 0x08
+        assert blosc2.decompress(bytes(frame)) == raw, (name, "c-blosc2 does not decode the frame to the values")
+        (directory / "0").write_bytes(bytes(frame))
+        overrides[f"/{name}"] = {"values": encode_values(values), "fill": encode_scalar(np.zeros((), values.dtype)[()], values.dtype)}
+    consolidate_v2(store)
+    write_expected(store, overrides)
+    zip_store(store, base / "blosc-delta.zarr.zip", root_folder=True, compression=zipfile.ZIP_DEFLATED)
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +628,34 @@ def anndata_object():
     return adata
 
 
+def anndata_defaults_object():
+    """An AnnData whose elements hold their type's default (0, False, empty
+    text): anndata 0.12 on zarr 3 writes them in Zarr v2 with a null
+    fill_value and no chunk, as it writes a Cellucid-ready file's priority
+    seed 0 when the file is saved again."""
+    import anndata as ad
+    import pandas as pd
+
+    n_obs = 6
+    obs = pd.DataFrame(
+        {
+            "zeros": np.zeros(n_obs, "int64"),
+            "unset": np.zeros(n_obs, "float32"),
+            "no": np.zeros(n_obs, bool),
+            "blank": pd.Categorical([""] * n_obs),
+            "position": np.arange(n_obs, dtype="uint32"),
+        },
+        index=[f"c{i}" for i in range(n_obs)],
+    )
+    adata = ad.AnnData(X=np.zeros((n_obs, 2), "float32"), obs=obs)
+    adata.obsm["X_umap"] = np.zeros((n_obs, 2), "float32")
+    adata.uns["cellucid"] = {"priority": {"seed": np.uint32(0), "specVersion": 1, "levels": np.array([0, 0], "uint32")}}
+    adata.uns["flag"] = False
+    adata.uns["note"] = ""
+    adata.uns["empty_text"] = np.array(["", ""], dtype=object)
+    return adata
+
+
 def anndata_stores(base: Path):
     import anndata as ad
 
@@ -541,7 +666,85 @@ def anndata_stores(base: Path):
             adata.write_zarr(str(store))
         write_expected(store)
         zip_store(store, base / f"{label}.zarr.zip", root_folder=fmt == 2, compression=zipfile.ZIP_STORED)
+    defaults = anndata_defaults_object()
+    for label, fmt in [("v2-defaults", 2), ("v3-defaults", 3)]:
+        store = fresh(base / f"{label}.zarr")
+        with ad.settings.override(zarr_write_format=fmt, auto_shard_zarr_v3=False, allow_write_nullable_strings=False):
+            defaults.write_zarr(str(store))
+        write_expected(store)
+        zip_store(store, base / f"{label}.zarr.zip", root_folder=fmt == 2, compression=zipfile.ZIP_STORED)
+    anndata_sharded_shapes_store(base)
     anndata_uncompressed_stores(base)
+
+
+def reshard_v3(store: Path, plan) -> None:
+    """Write every array of a Zarr v3 store again as `plan(path, array)` says
+    (`create_array` keyword arguments: inner `chunks`, `shards`, codecs), or
+    leave it as it is (None); values, fill and attributes are kept."""
+    root = zarr.open_group(str(store), mode="r+", use_consolidated=False)
+    paths = []
+
+    def walk(group, prefix):
+        for name, node in group.members():
+            if isinstance(node, zarr.Group):
+                walk(node, f"{prefix}{name}/")
+            else:
+                paths.append(f"{prefix}{name}")
+
+    walk(root, "")
+    for path in paths:
+        array = root[path]
+        settings = plan(path, array)
+        if settings is None:
+            continue
+        values, attrs, fill = array[...], dict(array.attrs), array.fill_value
+        dtype = str if array.dtype.kind in "OT" else array.dtype
+        parent, _, name = path.rpartition("/")
+        group = root[parent] if parent else root
+        del group[name]
+        group.create_array(name, shape=values.shape, dtype=dtype, fill_value=fill, attributes=attrs, **settings)[...] = values
+    zarr.consolidate_metadata(str(store))
+
+
+def anndata_sharded_shapes_store(base: Path):
+    """The AnnData of `anndata_object` with every array sharded by hand: inner
+    chunks and shards of several shapes (partial edge shards and chunks),
+    every codec of the corpus inside shards (Zstandard, gzip, Blosc LZ4 with
+    byte shuffle, Blosc Zstandard with bit shuffle), the index at the end
+    (the default, CRC-32C) and at the start: CSR X, CSC and dense layers, a
+    graph, obs of every encoding, obsm and var."""
+    import anndata as ad
+    from zarr.codecs import BloscCodec, BytesCodec, GzipCodec, ShardingCodec, ZstdCodec
+
+    store = fresh(base / "v3-sharded-shapes.zarr")
+    with ad.settings.override(zarr_write_format=3, auto_shard_zarr_v3=False, allow_write_nullable_strings=False):
+        anndata_object().write_zarr(str(store))
+
+    def plan(path, array):
+        if array.ndim == 0:
+            return None
+        if path.startswith("X/"):
+            if path.endswith("indptr"):
+                return {"chunks": (8,), "shards": (32,), "compressors": BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")}
+            return {"chunks": (16,), "shards": (64,), "compressors": ZstdCodec(level=3)}
+        if path.startswith("layers/csc/"):
+            return {"chunks": (128,), "serializer": ShardingCodec(chunk_shape=(32,), codecs=[BytesCodec(), GzipCodec(level=5)], index_location="start"),
+                    "compressors": None}
+        if path == "layers/dense":
+            return {"chunks": (8, 5), "shards": (16, 10), "compressors": BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")}
+        if path.startswith("obsp/"):
+            return {"chunks": (32,), "shards": (64,), "compressors": BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")}
+        if path == "obsm/X_umap":
+            return {"chunks": (8, 2), "shards": (32, 2), "compressors": ZstdCodec(level=3)}
+        if path == "obsm/X_pca":
+            return {"chunks": (8, 5), "shards": (24, 5), "compressors": GzipCodec(level=5)}
+        if path.startswith(("obs/", "var/", "uns/")) and array.ndim == 1:
+            return {"chunks": (8,), "shards": (24,), "compressors": GzipCodec(level=5) if array.dtype.kind not in "OT" else ZstdCodec(level=3)}
+        return None
+
+    reshard_v3(store, plan)
+    write_expected(store)
+    zip_store(store, base / "v3-sharded-shapes.zarr.zip", root_folder=False, compression=zipfile.ZIP_STORED)
 
 
 def anndata_uncompressed_stores(base: Path):
@@ -566,6 +769,7 @@ def main():
     for directory in ["v2", "v3", "anndata"]:
         fresh(ROOT / directory).mkdir(parents=True)
     v2_cases(ROOT / "v2")
+    blosc_delta_cases(ROOT / "v2")
     v3_cases(ROOT / "v3")
     anndata_stores(ROOT / "anndata")
     # The folders were zipped; only the archives are kept.

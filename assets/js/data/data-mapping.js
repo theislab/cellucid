@@ -887,11 +887,18 @@ function validateModality(value, label) {
  * `geneNames`, `expression`, `log1p`, `highlyVariable`, `latent`,
  * `vectorFields`.
  *
+ * `pendingGeneNames` admits `geneNames: null`: the mapping a dataset is
+ * first shown with while the gene names of its expression matrix are still
+ * being read (they are never waited for by the first view;
+ * `DataState.publishDatasetMapping`). Nothing outside the viewer ever sees
+ * such a mapping: a session, the notebook and every change wait for the
+ * names.
+ *
  * @param {unknown} value
- * @param {{label?: string}} [options]
+ * @param {{label?: string, pendingGeneNames?: boolean}} [options]
  * @returns {object}
  */
-export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
+export function validateDataMapping(value, { label = 'dataMapping', pendingGeneNames = false } = {}) {
   if (!isPlainRecord(value)) {
     throw new DataMappingError('not_object', `${label} must be an object.`);
   }
@@ -951,7 +958,9 @@ export function validateDataMapping(value, { label = 'dataMapping' } = {}) {
     embeddings,
     knn: optionalMappingString(mapping.knn, `${label}.knn`),
     ...(hasModality ? { modality: validateModality(mapping.modality, `${label}.modality`) } : {}),
-    geneNames: validateGeneNames(mapping.geneNames, `${label}.geneNames`),
+    geneNames: pendingGeneNames && mapping.geneNames === null
+      ? null
+      : validateGeneNames(mapping.geneNames, `${label}.geneNames`),
     expression: validateExpression(mapping.expression, `${label}.expression`),
     log1p: validateLog1p(mapping.log1p, `${label}.log1p`),
     highlyVariable: optionalMappingString(mapping.highlyVariable, `${label}.highlyVariable`),

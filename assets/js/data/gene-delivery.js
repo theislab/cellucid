@@ -30,6 +30,8 @@
  * @module data/gene-delivery
  */
 
+import { allocateTypedArray } from './sparse-column-index.js';
+
 function requireName(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new TypeError(`${label} must be a non-empty string.`);
@@ -123,8 +125,8 @@ export function sparseEntriesOf(column) {
   if (!ArrayBuffer.isView(column)) return column;
   let count = 0;
   for (let cell = 0; cell < column.length; cell++) if (column[cell] !== 0) count++;
-  const indices = new Uint32Array(count);
-  const values = new Float32Array(count);
+  const indices = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+  const values = allocateTypedArray(Float32Array, count, 'Gene column values');
   let at = 0;
   for (let cell = 0; cell < column.length; cell++) {
     if (column[cell] !== 0) {
@@ -149,8 +151,8 @@ export function sparseEntriesOf(column) {
 export function splitColumnsByCellRanges(columns, bounds) {
   const ranges = bounds.length - 1;
   const genes = columns.length;
-  const starts = new Uint32Array(genes * (ranges + 1));
-  const sizes = new Float64Array(ranges);
+  const starts = allocateTypedArray(Uint32Array, genes * (ranges + 1), 'Gene delivery range starts');
+  const sizes = allocateTypedArray(Float64Array, ranges, 'Gene delivery range sizes');
   for (let gene = 0; gene < genes; gene++) {
     const { indices } = columns[gene];
     for (let range = 0; range <= ranges; range++) {
@@ -161,9 +163,9 @@ export function splitColumnsByCellRanges(columns, bounds) {
     }
   }
   return Array.from({ length: ranges }, (_, range) => {
-    const pointers = new Uint32Array(genes + 1);
-    const cells = new Uint32Array(sizes[range]);
-    const values = new Float32Array(sizes[range]);
+    const pointers = allocateTypedArray(Uint32Array, genes + 1, 'Gene delivery pointers');
+    const cells = allocateTypedArray(Uint32Array, sizes[range], 'Gene delivery cells');
+    const values = allocateTypedArray(Float32Array, sizes[range], 'Gene delivery values');
     const from = bounds[range];
     let at = 0;
     for (let gene = 0; gene < genes; gene++) {
@@ -196,9 +198,11 @@ export function subsetRun(block, first, last) {
   const { pointers, cellIndex, values } = block;
   const from = pointers[first];
   const to = pointers[last];
-  const runPointers = new Float64Array(last - first + 1);
+  const runPointers = allocateTypedArray(Float64Array, last - first + 1, 'Cell subset gene pointers');
   for (let gene = 0; gene <= last - first; gene++) runPointers[gene] = pointers[first + gene] - from;
-  const positions = new Uint32Array(to - from);
+  const positions = allocateTypedArray(Uint32Array, to - from, 'Cell subset positions');
   for (let k = from; k < to; k++) positions[k - from] = cellIndex[k];
-  return { pointers: runPointers, positions, values: values.slice(from, to) };
+  const runValues = allocateTypedArray(Float32Array, to - from, 'Cell subset values');
+  runValues.set(values.subarray(from, to));
+  return { pointers: runPointers, positions, values: runValues };
 }

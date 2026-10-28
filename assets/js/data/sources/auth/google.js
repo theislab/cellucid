@@ -144,12 +144,14 @@ export function createGoogleAuth({
     const here = pageOrigin(win);
     if (config.registeredOrigins.includes(here)) return null;
     if (!isLocalOrigin(here)) return `Google Drive works on www.cellucid.com, not on ${here}.`;
-    // A notebook embeds its viewer; `cellucid serve` opens in a tab of its own.
+    // A notebook widget frames the app from its web_source_url (by default
+    // www.cellucid.com, a registered origin); `cellucid serve` opens in a tab
+    // of its own.
     return embeddingOrigin(win) === null
       ? `Google Drive works on a local cellucid serve only on its default port, 8765 (this page is ${here}). ` +
         'Start it without --port, or open www.cellucid.com.'
-      : `Google Drive works in a notebook viewer only on port 8765 (this one is ${here}). ` +
-        'Another server held 8765 when it started: stop that one and show the data again, or open www.cellucid.com.';
+      : `Google Drive works in a notebook viewer that loads the app from www.cellucid.com (the default web_source_url), ` +
+        `or from a copy served at port 8765; this one loads it from ${here}.`;
   }
 
   /** Why public Drive files cannot be read on this page, or null. */

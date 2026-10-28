@@ -35,7 +35,7 @@ import {
   uniqueNamesNote,
   validateEmbeddingColumns,
 } from '../../../data/data-mapping.js';
-import { EmbeddingLoadError, MappingLoadError, obsmWidth } from '../../../data/data-mapping-candidates.js';
+import { EmbeddingLoadError, MappingLoadError, geneNamesVarAxis, obsmWidth } from '../../../data/data-mapping-candidates.js';
 import { LOG1P_AS_STORED, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
@@ -58,17 +58,8 @@ import {
   VECTOR_SECTION,
 } from './data-mapping/groups.js';
 import { sameJson } from '../../utils/same-json.js';
+import { namesAreIdentifiers } from '../../../data/gene-names.js';
 import { PLACES, placePath } from '../place-names.js';
-
-// Var columns that usually hold gene symbols (the Ensembl hint names one).
-const SYMBOL_COLUMNS = Object.freeze([
-  'gene_symbols',
-  'gene_symbol',
-  'symbol',
-  'feature_name',
-  'gene_name',
-  'gene_names',
-]);
 
 const REQUIRED_STATE_METHODS = Object.freeze([
   'applyDataMapping',
@@ -79,7 +70,11 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'getDataMappingOrigin',
   'getDatasetGeneration',
   'getDimensionManager',
+  'areGenesPending',
+  'geneNamesDefault',
+  'getGeneListFailure',
   'getGeneNameChoices',
+  'guessGeneNames',
   'getHighlyVariableChoices',
   'getGuessedMappingGroups',
   'getMappingCandidates',
@@ -167,6 +162,8 @@ export function initDataMappingControls({ state, root }) {
   const groupErrors = new Map();
   // Genes the last gene-list change dropped from a view's colouring.
   let droppedGenes = [];
+  // Why the gene names of a var axis staged here could not be guessed, by axis.
+  const namesGuessFailures = new Map();
 
   /**
    * The staged checklist: one row per representation the panel lists, and
@@ -335,6 +332,32 @@ export function initDataMappingControls({ state, root }) {
         const value = group === 'log1p'
           ? log1pChoiceOf(shownGroupValue(mapping, 'log1p'), expression)
           : shownGroupValue(mapping, group);
+        if (group === 'geneNames' && value === null) {
+          // The names of this matrix are not guessed yet: they are being
+          // read (never the index in their place), or could not be.
+          const failure = pendingNamesFailure(mapping);
+          summary.push(failure === null ? 'reading gene names…' : 'gene names not read');
+          fields.set(group, {
+            options: [
+              {
+                value: encodeChoice(null),
+                label: failure === null ? 'Reading gene names…' : `Not read · ${failure}`,
+                disabled: true,
+              },
+              ...(failure === null ? [] : choices.map(choice => ({
+                value: encodeChoice(choice.value),
+                label: choice.usable ? choice.label : `${choice.label} · ${choice.reason}`,
+                disabled: !choice.usable,
+                ...(choice.usable ? {} : { title: choice.reason }),
+              }))),
+            ],
+            value: encodeChoice(null),
+            disabled: busy || failure === null,
+            disabledReason: failure === null ? 'The gene names are being read.' : 'Applying the data mapping…',
+            error: groupErrors.get(group) ?? '',
+          });
+          continue;
+        }
         // The header names what differs from a plain file: a transform and
         // a highly variable column only when there is one.
         const quiet = (group === 'highlyVariable' && value === null)
@@ -386,10 +409,12 @@ export function initDataMappingControls({ state, root }) {
           source: set.source,
         });
     const guessedGroups = pending ? [] : state.getGuessedMappingGroups();
-    // One short line: what was guessed (expression without an X; Scanpy's
-    // records, uns['log1p'] and var['highly_variable']), then the names note.
+    // One short line: what was guessed (expression without an X; symbols
+    // beside an index of identifiers; Scanpy's records, uns['log1p'] and
+    // var['highly_variable']), then the names note.
     const guessed = [
       guessedGroups.includes('expression') ? 'expression (no X)' : null,
+      guessedGroups.includes('geneNames') ? 'gene names' : null,
       guessedGroups.includes('log1p') ? 'log1p values' : null,
       guessedGroups.includes('highlyVariable') ? 'highly variable genes' : null,
     ].filter(Boolean);
@@ -403,23 +428,86 @@ export function initDataMappingControls({ state, root }) {
   }
 
   /**
-   * A hint when the genes are named by Ensembl ids and the axis has a symbol
-   * column: at least 90% of a 200-name sample match `ENS…G<digits>`.
+   * The var column of symbols the dataset found for the genes of
+   * `expression` (in the modality shown), when their index holds identifiers
+   * (`inferGeneNameColumn`, `DataState.geneNamesDefault`), as a gene-name
+   * choice value, or null (none, or not guessed yet).
+   */
+  function symbolsChoice(mapping, expression) {
+    if (expression === null || expression === undefined) return null;
+    const names = state.geneNamesDefault(shownGroupValue(mapping, 'modality') ?? null, expression);
+    return names !== null && names.startsWith('column:') ? names : null;
+  }
+
+  /**
+   * Why the gene names shown as pending could not be read, or null while
+   * they are being read: the dataset's own (its gene list,
+   * `DataState.listPublishedGenes`), or those of a matrix staged here
+   * (`stagePendingGeneNames`).
+   */
+  function pendingNamesFailure(mapping) {
+    if (!stagedGroups.has('geneNames')) {
+      return state.areGenesPending() ? null : (state.getGeneListFailure()?.message ?? null);
+    }
+    const axis = geneNamesVarAxis(shownGroupValue(mapping, 'modality') ?? null, shownGroupValue(mapping, 'expression'));
+    return namesGuessFailures.get(axis) ?? null;
+  }
+
+  /**
+   * Stage the gene-name default of the matrix shown (of the modality shown):
+   * its symbols column when it has one, else its index; pending while its
+   * axis is not guessed yet, which is guessed now (`DataState.guessGeneNames`)
+   * and staged when it settles, unless the person chose otherwise meanwhile.
+   */
+  function stageDefaultGeneNames(mapping) {
+    const modality = shownGroupValue(mapping, 'modality') ?? null;
+    const expression = shownGroupValue(mapping, 'expression');
+    if (expression === null) {
+      stagedGroups.set('geneNames', 'index');
+      return;
+    }
+    const known = state.geneNamesDefault(modality, expression);
+    if (known !== null) {
+      const usable = state.withMappingModality(modality, () => state.getGeneNameChoices(expression))
+        .some(choice => choice.value === known && choice.usable !== false);
+      stagedGroups.set('geneNames', usable ? known : 'index');
+      return;
+    }
+    stagedGroups.set('geneNames', null);
+    const axis = geneNamesVarAxis(modality, expression);
+    namesGuessFailures.delete(axis);
+    const still = current => current !== null
+      && shownGroupValue(current, 'expression') === expression
+      && (shownGroupValue(current, 'modality') ?? null) === modality
+      && stagedGroups.has('geneNames') && stagedGroups.get('geneNames') === null;
+    void state.guessGeneNames(modality, expression).then(
+      () => {
+        if (destroyed || !still(state.getDataMapping())) return;
+        stageDefaultGeneNames(state.getDataMapping());
+        render();
+      },
+      error => {
+        if (destroyed || !still(state.getDataMapping())) return;
+        namesGuessFailures.set(axis, error instanceof Error ? error.message : String(error));
+        render();
+      }
+    );
+  }
+
+  /**
+   * A hint when the genes are named by identifiers (`namesAreIdentifiers`,
+   * the one rule) and the axis has a column of symbols.
    */
   function ensemblHint(mapping) {
     if (shownGroupValue(mapping, 'geneNames') !== 'index') return '';
     const keys = (state.varData?.fields ?? [])
       .filter(field => field?._isUserDefined !== true)
-      .slice(0, 200)
       .map(field => field.key);
-    if (keys.length === 0) return '';
-    const ensembl = keys.filter(key => /^ENS[A-Z]*G\d+/.test(key)).length;
-    if (ensembl < 0.9 * keys.length) return '';
-    const symbol = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
-      .find(choice => choice.usable && SYMBOL_COLUMNS.includes(choice.label));
-    return symbol === undefined
+    if (!namesAreIdentifiers(keys)) return '';
+    const symbols = symbolsChoice(mapping, shownGroupValue(mapping, 'expression'));
+    return symbols === null
       ? ''
-      : `Gene names are Ensembl ids; '${symbol.label}' holds symbols.`;
+      : `Gene names are identifiers; '${symbols.slice('column:'.length)}' holds symbols.`;
   }
 
   /** The groups whose staged value differs from the mapping's. */
@@ -624,12 +712,20 @@ export function initDataMappingControls({ state, root }) {
     const changed = embeddingsChanged || groupsChanged.length > 0;
     panel.revert.disabled = busy || !changed;
     const problem = embeddingsChanged ? checklistProblem() : null;
-    let canApply = changed && problem === null && !busy;
+    // A change names its genes: it waits while they are being read.
+    const namesPending = changed && next.geneNames === null;
+    let canApply = changed && problem === null && !busy && !namesPending;
     if (!busy) {
       if (!changed) {
         panel.status.set(loadError ?? '', loadError === null ? 'muted' : 'danger');
       } else if (problem !== null) {
         panel.status.set(problem, 'danger');
+      } else if (namesPending) {
+        const failure = pendingNamesFailure(mapping);
+        panel.status.set(
+          failure === null ? 'Apply waits for the gene names, which are being read.' : 'Choose the gene names first.',
+          'muted'
+        );
       } else {
         const refusal = state.describeDataMappingRefusal(next);
         if (refusal !== null) {
@@ -801,6 +897,8 @@ export function initDataMappingControls({ state, root }) {
       )) {
         stagedGroups.set(key, groupValue);
       }
+      // Its gene names not guessed yet: guessed now.
+      if (value !== mapping.modality && stagedGroups.get('geneNames') === null) stageDefaultGeneNames(mapping);
       render();
       return;
     }
@@ -809,8 +907,11 @@ export function initDataMappingControls({ state, root }) {
       // name (raw has its own var); otherwise the names come from its index.
       state.withMappingModality(shownGroupValue(mapping, 'modality') ?? null, () => {
         const names = shownGroupValue(mapping, 'geneNames');
-        const available = state.getGeneNameChoices(value).some(choice => choice.value === names);
-        if (!available) stagedGroups.set('geneNames', 'index');
+        const choices = state.getGeneNameChoices(value);
+        const available = names !== null && choices.some(choice => choice.value === names);
+        // That axis's own default: its column of symbols, else its index
+        // (guessed now when it is not yet).
+        if (!available) stageDefaultGeneNames(mapping);
         // Likewise the highly variable column, which is otherwise none.
         const marked = shownGroupValue(mapping, 'highlyVariable');
         if (!state.getHighlyVariableChoices(value).some(choice => choice.value === marked)) {
@@ -943,10 +1044,14 @@ export function initDataMappingControls({ state, root }) {
     });
   }
 
-  /** An applied mapping: drop staged choices that are now current. */
-  function onMappingChanged() {
+  /**
+   * An applied mapping: drop staged choices that are now current. The gene
+   * names of a dataset just shown, read after its first view
+   * (`cause: 'genes-listed'`), keep what is staged.
+   */
+  function onMappingChanged({ cause } = {}) {
     if (destroyed) return;
-    if (!busy) {
+    if (!busy && cause !== 'genes-listed') {
       unstage();
       stagedGroups.clear();
     }
@@ -967,6 +1072,7 @@ export function initDataMappingControls({ state, root }) {
     previousRows = [];
     stagedGroups.clear();
     groupErrors.clear();
+    namesGuessFailures.clear();
     loadError = null;
     panel.status.set('');
     render();

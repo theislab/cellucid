@@ -36,13 +36,17 @@
 
 import { LRUCache } from '../shared/lru-cache.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { SharedWork, abortReasonOf, throwIfAborted } from '../../jobs/cancellable-job.js';
+import { abortReasonOf, throwIfAborted } from '../../jobs/cancellable-job.js';
+import { SharedWork } from '../../../formats/io/abort.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import {
   isRestOfPageId,
+  isDerivedPageId,
   getBasePageIdFromRestOf,
-  getRestOfPageName
+  getRestOfPageName,
+  parseSamplePageId
 } from '../shared/page-derivation-utils.js';
+import { priorityPrefix } from '../../../data/cell-priority.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import {
   isCategoricalCodes,
@@ -55,6 +59,7 @@ import {
   waitForAvailableSlot
 } from '../shared/concurrency-utils.js';
 import { formatDuration, formatCountOf } from '../../../utils/format-units.js';
+import { cellsSteady } from '../../../data/open-cells-work.js';
 import { isCellList } from '../../utils/cell-set.js';
 
 // =============================================================================
@@ -181,6 +186,31 @@ export function excludeMissingCategoricalValues(pageData) {
  * @param {ArrayLike<number>} rawValues - The field's per-cell values or codes
  * @returns {(new (length: number) => ArrayLike<number>)|null}
  */
+/**
+ * A page's values of a gene read as its entries (`SparseColumn`: `indices`
+ * ascending, every other cell zero), at the page's cells: the values the
+ * gene's dense column holds there, bit for bit, found by binary search, so
+ * nothing as long as every open cell is made.
+ *
+ * @param {{length: number, indices: ArrayLike<number>, values: Float32Array}} column
+ * @param {ArrayLike<number>} cellIndices
+ * @param {Float32Array} out
+ */
+function gatherSparseColumn(column, cellIndices, out) {
+  const { indices, values } = column;
+  for (let i = 0; i < cellIndices.length; i++) {
+    const cell = cellIndices[i];
+    let low = 0;
+    let high = indices.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (indices[middle] < cell) low = middle + 1;
+      else high = middle;
+    }
+    out[i] = low < indices.length && indices[low] === cell ? values[low] : 0;
+  }
+}
+
 function continuousPageValueStorage(kind, rawValues) {
   if (kind === 'category') return null;
   if (!ArrayBuffer.isView(rawValues) || rawValues instanceof DataView) return null;
@@ -1028,6 +1058,9 @@ export class DataLayer {
     if (typeof this.state?.getHighlightPageColor !== 'function') {
       throw new TypeError('DataLayer state.getHighlightPageColor is required');
     }
+    // A sample of a page is drawn in its page's colour.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) return this.getPageColor(sample.baseId);
     const color = this.state.getHighlightPageColor(pageId);
     if (color !== null && (typeof color !== 'string' || color.length === 0)) {
       throw new TypeError('DataLayer page color must be a non-empty string or null');
@@ -1057,6 +1090,13 @@ export class DataLayer {
   getPageInfo(pageId) {
     if (!pageId) return null;
 
+    // A sample of a page (`progressive-cells.js`) is its page, on fewer cells.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      const base = this.getPageInfo(sample.baseId);
+      return base === null ? null : { id: pageId, name: base.name, derived: { kind: 'sample', baseId: sample.baseId, m: sample.m } };
+    }
+
     if (isRestOfPageId(pageId)) {
       const baseId = getBasePageIdFromRestOf(pageId);
       const basePage = baseId ? (this.getPages().find(p => p.id === baseId) || null) : null;
@@ -1083,6 +1123,8 @@ export class DataLayer {
   getCellCountForPageId(pageId) {
     if (!pageId) return 0;
 
+    if (parseSamplePageId(pageId) !== null) return this.getCellIndicesForPage(pageId).length;
+
     if (isRestOfPageId(pageId)) {
       const baseId = getBasePageIdFromRestOf(pageId);
       const total = this.state?.pointCount || 0;
@@ -1094,6 +1136,43 @@ export class DataLayer {
     if (!page) return 0;
 
     return this._getPageMembership(page).count;
+  }
+
+  /**
+   * The first `m` of the open cells in their priority order
+   * (`data/cell-priority.js`): a uniform random sample of them, as a
+   * membership test (`priorityPrefix`). A progressive analysis takes its
+   * first pass on it (`shared/progressive-cells.js`).
+   *
+   * @param {number} m
+   * @returns {ReturnType<typeof priorityPrefix>}
+   */
+  cellSample(m) {
+    const priority = this.state?.cellPriority;
+    const n = this.state?.pointCount || 0;
+    const kept = this._cellSampleMemo;
+    if (kept !== undefined && kept.priority === priority && kept.n === n && kept.m === m) return kept.prefix;
+    const prefix = priorityPrefix(priority, n, m);
+    this._cellSampleMemo = { priority, n, m, prefix };
+    return prefix;
+  }
+
+  /**
+   * A number naming the open cells' priority, for page versions: equal for
+   * the same priority object, different for any other.
+   * @private
+   */
+  _cellPriorityGeneration() {
+    const priority = this.state?.cellPriority;
+    this._priorityGenerations ??= new WeakMap();
+    if (priority === null || typeof priority !== 'object') return 0;
+    let generation = this._priorityGenerations.get(priority);
+    if (generation === undefined) {
+      this._priorityGenerationCounter = (this._priorityGenerationCounter ?? 0) + 1;
+      generation = this._priorityGenerationCounter;
+      this._priorityGenerations.set(priority, generation);
+    }
+    return generation;
   }
 
   /**
@@ -1109,6 +1188,13 @@ export class DataLayer {
   getCellIndicesForPage(pageId) {
     if (typeof pageId !== 'string' || pageId.length === 0) {
       throw new TypeError('pageId must be exact non-empty text');
+    }
+
+    // Derived "sample" page: the base page's cells among the first `m` of
+    // the open cells' priority order.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      return this.cellSample(sample.m).filter(this.getCellIndicesForPage(sample.baseId));
     }
 
     // Derived "rest-of" page: complement of base page indices
@@ -1356,6 +1442,10 @@ export class DataLayer {
    * @returns {Promise<{ fieldIndex: number, values: ArrayLike<number>, wasLoaded: boolean }>}
    */
   async ensureGeneExpressionLoaded(geneKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { silent = true, signal = null, priority = 'normal' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene load signal must be an AbortSignal or null');
@@ -1413,6 +1503,10 @@ export class DataLayer {
    * @returns {Promise<{fieldIndex: number, values: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, owned: boolean}>}
    */
   async readGeneColumn(geneKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene read signal must be an AbortSignal or null');
@@ -1539,7 +1633,12 @@ export class DataLayer {
    * @private
    */
   _openMatrix(expression) {
-    const geneNames = this.state.getDataMapping?.()?.geneNames ?? 'index';
+    // Named as the mapping names its genes: a dataset just shown reads them
+    // after its first view (`DataState.openExpressionMatrix` waits).
+    const geneNames = this.state.getDataMapping?.()?.geneNames ?? null;
+    if (geneNames === null && this.state.areGenesPending()) {
+      return this.state.whenGenesListed().then(() => this._openMatrix(expression));
+    }
     const key = JSON.stringify([this._datasetGeneration, expression, geneNames]);
     let opened = this._matrixHandles.get(key);
     if (opened === undefined) {
@@ -1605,6 +1704,10 @@ export class DataLayer {
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
   async readGeneCellSubset(geneKeys, cellIndices, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const matrix = options.matrix ?? 'mapped';
     const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
     if (expression !== null) {
@@ -1716,6 +1819,10 @@ export class DataLayer {
    * @returns {Promise<{bytes: number[]}>}
    */
   async deliverGeneColumns(geneKeys, delivery, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene delivery signal must be an AbortSignal or null');
@@ -1761,6 +1868,10 @@ export class DataLayer {
    * @returns {Promise<{bytes: number}>}
    */
   async deliverGeneCellSubset(geneKeys, cellIndices, delivery, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { signal = null, owner = null, matrix = 'mapped' } = options;
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
@@ -1806,6 +1917,10 @@ export class DataLayer {
    * @returns {Promise<Array<ArrayLike<number>|{length: number, indices: Uint32Array, values: Float32Array}>>}
    */
   async readGeneColumns(geneKeys, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (!Array.isArray(geneKeys)) {
       throw new TypeError('Gene column keys must be an array');
     }
@@ -1890,7 +2005,7 @@ export class DataLayer {
       throw new TypeError('Page cell IDs must be an array');
     }
     this.refreshPageVersions(
-      Array.from(new Set(pageIds)).filter(id => !isRestOfPageId(id))
+      Array.from(new Set(pageIds)).filter(id => !isDerivedPageId(id))
     );
     return pageIds.map(pageId => {
       const pageInfo = this.getPageInfo(pageId);
@@ -1935,6 +2050,10 @@ export class DataLayer {
    *   missing code with `missingCategoryCode`); callers must not modify it.
    */
   async ensureObsFieldLoaded(obsKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { silent = true, signal = null } = options;
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
@@ -2025,6 +2144,10 @@ export class DataLayer {
    * }
    */
   async getDataForPages(options) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Page-data fetch options must be an object');
     }
@@ -2066,7 +2189,7 @@ export class DataLayer {
     // Without refreshing page versions, cached results can become stale and plots lag behind
     // (e.g., a newly created page remains "empty" in analysis until another page change occurs).
     const uniquePageIds = Array.from(new Set(pageIds));
-    this.refreshPageVersions(uniquePageIds.filter(id => !isRestOfPageId(id)));
+    this.refreshPageVersions(uniquePageIds.filter(id => !isDerivedPageId(id)));
 
     // Check cache first (if enabled)
     if (this._dataCache && !noCache) {
@@ -2200,11 +2323,24 @@ export class DataLayer {
       });
     }
 
+    // A gene the views do not show is read as its entries for these pages
+    // (`readGeneColumn`), never installed as a column of every open cell:
+    // what a page reads costs the gene's stored values and the page's cells.
+    let sparseGene = null;
     try {
-      await this._ensureFieldLoaded(field, fieldIndex, source, {
-        signal,
-        owner: options.owner ?? null
-      });
+      if (source === 'var' && !(field.loaded && field.values) && typeof this.state.readVarSparseColumn === 'function') {
+        const read = await this.readGeneColumn(variableKey, { signal, owner: options.owner ?? null });
+        if (ArrayBuffer.isView(read.values)) {
+          // Loaded meanwhile: the field's own array.
+        } else {
+          sparseGene = read.values;
+        }
+      } else {
+        await this._ensureFieldLoaded(field, fieldIndex, source, {
+          signal,
+          owner: options.owner ?? null
+        });
+      }
     } finally {
       if (loadingNotificationId && notifications) {
         // Ensure notification is visible for minimum duration
@@ -2223,14 +2359,16 @@ export class DataLayer {
     this._requireCurrentDatasetGeneration(datasetGeneration);
 
     // Get values array
-    const rawValues = field.kind === 'category'
-      ? requireAnalysisCategoryCodes(field.codes, variableKey)
-      : field.values;
+    const rawValues = sparseGene !== null
+      ? sparseGene.values
+      : field.kind === 'category'
+        ? requireAnalysisCategoryCodes(field.codes, variableKey)
+        : field.values;
     const missingCode = field.kind === 'category'
       ? missingCategoryCode(rawValues)
       : null;
 
-    if (!rawValues || rawValues.length === 0) {
+    if (!rawValues || (sparseGene === null && rawValues.length === 0)) {
       throw new Error(`No values are available for field: ${variableKey}`);
     }
 
@@ -2285,6 +2423,19 @@ export class DataLayer {
         ? []
         : new ValueStorage(cellIndices.length);
       let position = 0;
+      if (sparseGene !== null) {
+        requireIndicesWithin(cellIndices, sparseGene.length, variableKey);
+        gatherSparseColumn(sparseGene, cellIndices, values);
+        results.push({
+          pageId,
+          pageName: pageInfo.name,
+          variableInfo: { ...variableInfo, categories: undefined },
+          values,
+          cellIndices,
+          cellCount: values.length
+        });
+        continue;
+      }
       // A typed continuous field is gathered in one tight loop: its values are
       // numbers by type, and the page's indices are checked against the field
       // once per index set (a page's index array is shared by every variable
@@ -2532,6 +2683,17 @@ export class DataLayer {
   _computePageHash(pageId) {
     const lanes = createDigestLanes();
 
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      // A sample of a page is determined by its base page's version, the
+      // sample size and the priority it is taken in.
+      foldDigestText(lanes, this._getPageVersion(sample.baseId));
+      foldDigestNumber(lanes, sample.m);
+      foldDigestNumber(lanes, this._cellPriorityGeneration());
+      foldDigestNumber(lanes, this.state?.pointCount || 0);
+      return `${pageId}:${finalizeDigest(lanes)}`;
+    }
+
     if (isRestOfPageId(pageId)) {
       // A derived "rest of" page is the exact complement of its base page
       // within the dataset, so its identity is fully determined by the base
@@ -2620,7 +2782,7 @@ export class DataLayer {
 
     // Derived pages are not stored in the version map; their exact version is
     // derived from the base page's version on demand.
-    if (isRestOfPageId(pageId)) {
+    if (isDerivedPageId(pageId)) {
       return this._computePageHash(pageId);
     }
 
@@ -2651,7 +2813,7 @@ export class DataLayer {
     if (!this._pageVersions) return;
 
     const idsToRefresh = (pageIds || this.getPages().map(p => p.id))
-      .filter(id => !isRestOfPageId(id));
+      .filter(id => !isDerivedPageId(id));
 
     for (const pageId of idsToRefresh) {
       const oldHash = this._pageVersions.get(pageId);

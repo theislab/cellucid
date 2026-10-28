@@ -312,7 +312,9 @@ export default Object.freeze({
       title,
       size: Number.isSafeInteger(entry.size) ? entry.size : null,
       head,
-      version: `figshare:${id}v${opened ?? ''}:${entry.computed_md5 ?? ''}`,
+      // A validator only where Figshare states one (the version opened, the
+      // file's checksum): without either the file is known by its size alone.
+      version: opened == null && !entry.computed_md5 ? null : `figshare:${id}v${opened ?? ''}:${entry.computed_md5 ?? ''}`,
       attribution: {
         title,
         url: typeof record.figshare_url === 'string' ? record.figshare_url : `https://figshare.com/articles/${id}`,

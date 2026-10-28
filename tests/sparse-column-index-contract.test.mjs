@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   RowMajorColumnIndex,
   createColumnStoreFactory,
+  sparseIndexPlan,
 } from '../assets/js/data/sparse-column-index.js';
 import { columnIndexMemoryBudget } from '../assets/js/data/column-store-placement.js';
 
@@ -187,19 +188,283 @@ test('a gene asked for mid-build is served from the build passes, before the ind
   assert.equal(index.phase, 'ready');
 });
 
-test('with no memory and no disk, genes are answered by scanning, never refused', async () => {
+test('with no memory and no disk, genes are answered by scanning, never refused, and never silently', async () => {
   const fixture = csrFixture(150, 7);
+  const reason = 'the gene index needs 32 GB: more than the 3 GB of memory this browser keeps for it, and no disk';
   const factory = {
-    sparse: async () => null,
-    dense: async () => null,
+    sparse: async () => ({ store: null, refusal: reason }),
+    dense: async () => ({ store: null, refusal: reason }),
   };
-  const { index } = sparseIndex(fixture, factory);
+  const events = [];
+  const scans = [];
+  const { index, reads } = sparseIndex(fixture, factory, {
+    onProgress: event => events.push(event),
+    onUnindexedScan: why => {
+      const scan = { why, ended: false, error: undefined };
+      scans.push(scan);
+      return error => {
+        scan.ended = true;
+        scan.error = error;
+      };
+    },
+  });
   await index.start();
   assert.equal(index.phase, 'unindexed');
+  assert.equal(index.unindexedReason, reason);
+  assert.ok(events.some(event => event.phase === 'unindexed' && event.reason === reason), 'the reason goes out with the progress');
   const [a, b] = await Promise.all([index.column(1), index.column(5)]);
   assert.deepEqual(a, denseColumn(fixture, 1));
   assert.deepEqual(b, denseColumn(fixture, 5));
+  assert.equal(scans.length, 1, 'genes asked for together share one announced scan');
+  const before = reads.indices;
   assert.deepEqual(await index.column(1), denseColumn(fixture, 1));
+  assert.ok(reads.indices > before, 'a later gene scans the matrix again');
+  assert.ok(scans.length >= 2, 'and that pass is announced too');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(scans.every(scan => scan.ended && scan.error === null && scan.why === reason));
+});
+
+test('a gene withdrawn by its caller stops a build no one else waits for; the next gene starts over', async () => {
+  const fixture = csrFixture(400, 9);
+  let pointerReads = 0;
+  const { index, reads } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    readRowPointers: (start, end) => {
+      pointerReads++;
+      return fixture.indptr.slice(start, end);
+    },
+    yieldControl: () => new Promise(resolve => setTimeout(resolve, 0)),
+  });
+  const controller = new AbortController();
+  const read = index.column(3, { signal: controller.signal });
+  const build = index.start();
+  await new Promise(resolve => setTimeout(resolve, 2));
+  controller.abort(new DOMException('The person cancelled', 'AbortError'));
+  await assert.rejects(read, { name: 'AbortError', message: 'The person cancelled' });
+  await assert.rejects(build, error => error.indexStopped === true);
+  assert.equal(index.phase, 'idle', 'the stopped build is forgotten');
+  const readsWhenStopped = reads.indices;
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(reads.indices, readsWhenStopped, 'nothing is read once it stopped');
+  assert.deepEqual(await index.column(3), denseColumn(fixture, 3));
+  await index.start();
+  assert.equal(index.phase, 'ready');
+  assert.ok(pointerReads > 0);
+});
+
+test('a stopped build aborts its queued reads; a gene asked for as it stops is served whole by the next build', async () => {
+  const fixture = csrFixture(400, 9);
+  const signals = [];
+  const builds = [];
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    readIndices: (start, end, { signal } = {}) => {
+      signals.push(signal);
+      // A slow host: each slab arrives a moment later, unless the read is let go.
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(fixture.indices.slice(start, end)), 1);
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+    onBuild: build => builds.push(build),
+  });
+  const controller = new AbortController();
+  const withdrawn = index.column(6, { signal: controller.signal });
+  await new Promise(resolve => setTimeout(resolve, 3));
+  controller.abort(new DOMException('cancelled', 'AbortError'));
+  assert.ok(signals.length > 0 && signals.every(signal => signal.aborted), 'every read of the stopped build is let go');
+  // Asked for before the stopped build has let go: served whole, by a new build.
+  const again = index.column(6);
+  await assert.rejects(withdrawn, { name: 'AbortError' });
+  assert.deepEqual(await again, denseColumn(fixture, 6));
+  assert.equal(builds.length, 2, 'a second build started for the gene asked for again');
+});
+
+test('without an index, a scan whose genes all withdrew stops its reads; the next gene scans again', async () => {
+  const fixture = csrFixture(400, 9);
+  const reason = 'the gene index needs 1 GB: nothing can hold it';
+  const signals = [];
+  const scans = [];
+  const { index } = sparseIndex(fixture, {
+    sparse: async () => ({ store: null, refusal: reason }),
+    dense: async () => ({ store: null, refusal: reason }),
+  }, {
+    readIndices: (start, end, { signal } = {}) => {
+      signals.push(signal);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(fixture.indices.slice(start, end)), 1);
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+    onUnindexedScan: () => {
+      const scan = { error: undefined, from: signals.length };
+      scans.push(scan);
+      return error => { scan.error = error; };
+    },
+  });
+  await index.start();
+  assert.equal(index.phase, 'unindexed');
+  const controller = new AbortController();
+  const withdrawn = index.column(4, { signal: controller.signal });
+  await new Promise(resolve => setTimeout(resolve, 3));
+  const before = signals.length;
+  controller.abort(new DOMException('cancelled', 'AbortError'));
+  await assert.rejects(withdrawn, { name: 'AbortError' });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(before > scans[0].from && signals.slice(scans[0].from, before).every(signal => signal.aborted),
+    'the stopped scan lets its reads go');
+  assert.equal(scans[0].error?.indexStopped, true, 'its activity ends as stopped');
+  assert.deepEqual(await index.column(4), denseColumn(fixture, 4));
+  assert.equal(scans.length, 2);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(scans[1].error, null);
+});
+
+test('once a gene was served, cancelling a later one never discards the build: pass 2 goes on, pass 1 is not read again', async () => {
+  const fixture = csrFixture(400, 9);
+  const reads = { indices: 0 };
+  const slow = array => (start, end, { signal } = {}) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(array.slice(start, end)), 1);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }, { once: true });
+  });
+  const readIndices = slow(fixture.indices);
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    readIndices: (start, end, options) => {
+      reads.indices++;
+      return readIndices(start, end, options);
+    },
+    readValues: slow(fixture.data),
+  });
+  // The first gene is served at the end of pass 1.
+  assert.deepEqual(await index.column(3), denseColumn(fixture, 3));
+  while (index.phase !== 'indexing') await new Promise(resolve => setTimeout(resolve, 1));
+  const pass1Reads = reads.indices;
+  const controller = new AbortController();
+  const second = index.column(5, { signal: controller.signal });
+  await new Promise(resolve => setTimeout(resolve, 3));
+  controller.abort(new DOMException('cancelled', 'AbortError'));
+  await assert.rejects(second, { name: 'AbortError' });
+  await index.start();
+  assert.equal(index.phase, 'ready', 'pass 2 went on');
+  assert.deepEqual(await index.column(5), denseColumn(fixture, 5));
+  assert.ok(reads.indices <= 2 * pass1Reads, 'pass 1 was not read again');
+  assert.equal(index._retainedIndices, null, 'what pass 1 kept for pass 2 is let go once built');
+});
+
+test('a build that fails in pass 2 lets go of what pass 1 kept for it', async () => {
+  const fixture = csrFixture(300, 8);
+  let pass2 = false;
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+    retainIndicesBytes: 1 << 20,
+    readValues: (start, end) => {
+      if (pass2) return Promise.reject(new Error('the host stopped answering'));
+      return fixture.data.slice(start, end);
+    },
+    onProgress: event => {
+      if (event.phase === 'indexing') pass2 = true;
+    },
+  });
+  await assert.rejects(index.start(), /the host stopped answering/);
+  assert.equal(index._retainedIndices, null);
+  assert.equal(index._retainedValues, null);
+  assert.deepEqual(index._besideKept, []);
+});
+
+test('pass 2 says exactly what it reads again: nothing pass 1 kept, every slab whose values it did not read', async () => {
+  const fixture = csrFixture(300, 8);
+  const nnz = fixture.indices.length;
+  const plan = budget => sparseIndexPlan({ nnz, nCols: 8, nRows: 300, valuesOnDemand: false, retainIndicesBytes: budget });
+  const storeBytes = nnz * 8 + 8 * 16;
+  // Every value fits beside the kept indices (uint8 for 8 genes): both kept.
+  assert.equal(plan(storeBytes + nnz * 5).keepsValues, true);
+  assert.equal(plan(storeBytes + nnz * 5 - 1).keepsValues, false);
+  assert.equal(plan(storeBytes + nnz * 5 - 1).keepsIndices, true);
+  assert.equal(plan(storeBytes).keepsIndices, false);
+  const run = async (budget, { waitFrom }) => {
+    let reads = null;
+    let slab = 0;
+    const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 }), {
+      retainIndicesBytes: budget,
+      onSecondPass: value => { reads = value; },
+      readIndices: (start, end) => {
+        if (slab++ === waitFrom) index.column(2);
+        return fixture.indices.slice(start, end);
+      },
+    });
+    if (waitFrom === 0) index.column(2);
+    await index.start();
+    return reads;
+  };
+  // A gene waiting from the start, everything kept: pass 2 reads only the pointers.
+  assert.deepEqual(await run(storeBytes + nnz * 5, { waitFrom: 0 }), { indices: [], values: [] });
+  // Values not kept: every value again; indices not kept either: those too.
+  assert.deepEqual(await run(storeBytes + nnz * 5 - 1, { waitFrom: 0 }), { indices: [], values: [[0, nnz]] });
+  assert.deepEqual(await run(storeBytes, { waitFrom: 0 }), { indices: [[0, nnz]], values: [[0, nnz]] });
+  // A gene asked for during pass 1: the slabs read before it, again.
+  const late = await run(storeBytes + nnz * 5, { waitFrom: 5 });
+  assert.equal(late.indices.length, 0);
+  assert.equal(late.values.length, 1);
+  assert.equal(late.values[0][0], 0);
+  assert.ok(late.values[0][1] > 0 && late.values[0][1] < nnz, `the first slabs only, got ${late.values}`);
+});
+
+test('a withdrawn gene does not stop a build another gene still waits for, nor one asked for ahead', async () => {
+  const fixture = csrFixture(300, 8);
+  const factory = createColumnStoreFactory({ memoryBudgetBytes: 1 << 30 });
+  const slow = { yieldControl: () => new Promise(resolve => setTimeout(resolve, 0)) };
+  const shared = sparseIndex(fixture, factory, slow).index;
+  const controller = new AbortController();
+  const withdrawn = shared.column(2, { signal: controller.signal });
+  const kept = shared.column(2);
+  controller.abort(new DOMException('cancelled', 'AbortError'));
+  await assert.rejects(withdrawn, { name: 'AbortError' });
+  assert.deepEqual(await kept, denseColumn(fixture, 2));
+  await shared.start();
+  assert.equal(shared.phase, 'ready');
+
+  const ahead = sparseIndex(fixture, factory, slow).index;
+  const built = ahead.start({ ahead: true });
+  const other = new AbortController();
+  const read = ahead.column(4, { signal: other.signal });
+  other.abort(new DOMException('cancelled', 'AbortError'));
+  await assert.rejects(read, { name: 'AbortError' });
+  await built;
+  assert.equal(ahead.phase, 'ready');
+});
+
+test('the store factory says why nothing can hold an index: the disk quota, or no disk', async () => {
+  const columnStart = Float64Array.from([0, 3, 5]);
+  const noDisk = createColumnStoreFactory({ memoryBudgetBytes: 8 });
+  const none = await noDisk.sparse(4, 2, columnStart, 'X');
+  // Over the budget and no disk: memory regardless, when the browser allows it.
+  assert.equal(none.store?.kind, 'memory');
+  const quota = createColumnStoreFactory({
+    memoryBudgetBytes: 8,
+    openDiskFiles: async () => assert.fail('the disk is not opened when the quota cannot hold the index'),
+    diskFreeBytes: async () => 10,
+  });
+  assert.deepEqual(await quota.plan(2 ** 30), {
+    kind: null,
+    refusal: 'the gene index needs 1.0 GB: more than the 8 B of memory this browser keeps for it, ' +
+      'and 10 B of disk storage is left to this site',
+  });
+  const full = createColumnStoreFactory({
+    memoryBudgetBytes: 8,
+    openDiskFiles: async () => {
+      const handle = fakeSyncHandle();
+      handle.truncate = () => { throw new DOMException('The disk is full', 'QuotaExceededError'); };
+      return { rows: handle, values: handle, release() {} };
+    },
+  });
+  const placed = await full.sparse(4, 2, columnStart, 'X');
+  assert.equal(placed.store?.kind, 'memory', 'a full disk falls back to memory when the browser allows it');
 });
 
 test('a contiguous dense matrix is indexed in row slabs', async () => {
@@ -470,4 +735,23 @@ test('an abandoned spill directory is swept when the app starts; a held one is k
   await sweepAbandonedIndexes({
     navigator: { storage: { getDirectory: async () => ({ getDirectoryHandle: async () => { throw new DOMException('none', 'NotFoundError'); } }) } },
   });
+});
+
+test('a build that failed on a read is made again for the next gene, never answered by the old failure', async () => {
+  const fixture = csrFixture(200, 12);
+  let failing = true;
+  let attempts = 0;
+  const { index } = sparseIndex(fixture, createColumnStoreFactory({ memoryBudgetBytes: 1 << 20 }), {
+    readIndices: (start, end) => {
+      attempts++;
+      if (failing) throw new TypeError('the connection dropped while reading');
+      return fixture.indices.slice(start, end);
+    },
+  });
+  await assert.rejects(index.column(3), /connection dropped/);
+  failing = false;
+  const before = attempts;
+  assert.deepEqual(await index.column(3), denseColumn(fixture, 3));
+  assert.ok(attempts > before, 'the next gene read the matrix again');
+  assert.deepEqual(await index.column(5), denseColumn(fixture, 5));
 });

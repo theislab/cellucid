@@ -25,7 +25,7 @@ import { isInputFormatId } from './input-formats.js';
  * @property {string|null} url - The address read from (remote only), without a query string
  * @property {string} name - The file or folder name
  * @property {number|null} bytes - Size of the file, archive or folder, when known
- * @property {Readonly<{kept: 'opfs'|'memory', reused: boolean, notes: readonly string[]}>|null} conversion -
+ * @property {Readonly<{kept: 'opfs'|'memory', persistent: boolean, whole: boolean, reused: boolean, notes: readonly string[]}>|null} conversion -
  *   For a format read once into this browser (`anndata/transcode/`): where
  *   the store is kept for the tab's life, whether an earlier opening in the
  *   tab had kept it, and what was not read; null for every other format
@@ -48,12 +48,15 @@ function withoutQuery(url) {
 /** A reader's conversion facts, checked and frozen (null when there are none). */
 function conversionOf(conversion) {
   if (conversion === null || conversion === undefined) return null;
-  const { kept, reused, notes } = conversion;
-  if ((kept !== 'opfs' && kept !== 'memory') || typeof reused !== 'boolean' ||
-    !Array.isArray(notes) || notes.some(note => typeof note !== 'string')) {
-    throw new TypeError('A conversion says where it is kept (opfs or memory), whether it was reused, and its notes.');
+  const { kept, persistent, whole, reused, notes } = conversion;
+  if ((kept !== 'opfs' && kept !== 'memory') || typeof persistent !== 'boolean' || typeof whole !== 'boolean' ||
+    typeof reused !== 'boolean' || !Array.isArray(notes) || notes.some(note => typeof note !== 'string')) {
+    throw new TypeError(
+      'A conversion says where it is kept (opfs or memory), whether for later visits, whether the file was read whole, ' +
+      'whether it was reused, and its notes.'
+    );
   }
-  return Object.freeze({ kept, reused, notes: Object.freeze([...notes]) });
+  return Object.freeze({ kept, persistent, whole, reused, notes: Object.freeze([...notes]) });
 }
 
 function sizeOf(value) {

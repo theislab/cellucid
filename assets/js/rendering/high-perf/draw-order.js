@@ -3,30 +3,48 @@
  * the tree, so it is computed the same way on the main thread
  * (`SpatialIndex`) and off it (`spatial-tree-worker.js`).
  *
- * The order the GPU stores and draws a geometry's points in is: LOD band
- * (the level that first admits the point), then draw unit (a tree leaf, or a
- * coarse node in 1D/2D), then ascending source id. A reduced LOD level is a
- * prefix of it; a run of units is one range per band.
+ * The order the GPU stores and draws a geometry's points in is: band (a run
+ * of consecutive priority ranks, `drawBands`), then draw unit (a tree leaf,
+ * or a coarse node in 1D/2D), then ascending source id. A reduced LOD level
+ * is a prefix of it; a run of units is one range per band.
+ *
+ * ## Levels of detail: fixed counts in priority order
+ *
+ * A level of detail is the first `m` cells of the **priority order**
+ * (`data/cell-priority.js`), the uniform rank of the subsampling
+ * specification: rank = the 32-bit hash of (seed, original position), under
+ * the file's own seed for a priority-ordered file, else the subsample's seed
+ * (the default seed for a whole file Cellucid did not write). So every
+ * reduced level is a uniform random sample of the open cells: it draws the
+ * cloud's density and its mix of categories as all cells do, up to sampling
+ * noise, and nothing about where a cell is decides whether it is drawn. A
+ * level of `m` cells draws the `m` cells a uniform subsample of that size
+ * with the same seed would open.
+ *
+ * The level counts are a fixed geometric ladder (`lodLadder`), the same
+ * counts whatever the number of open cells, capped by it: 1,000 cells, then
+ * each level 5/4 of the one before (rounded down), and last every open cell.
+ * A level's cells therefore do not depend on how many cells are open, which
+ * is what lets cells be added and removed in place: raising the open cells
+ * from `n` to `n'` appends ranks `[n, n')` and adds levels above `n`;
+ * lowering them drops the ranks past `n'`; every level below both counts is
+ * the same cells either way.
+ *
+ * Bands are the ladder's steps, each split further at every multiple of
+ * `DRAW_BAND_POINTS` (`drawBands`). A band boundary is therefore a fixed
+ * rank, and every tree order of the same cells puts exactly the cells of
+ * ranks `[start, end)` in the slots `[start, end)` of each band, only in
+ * another order. That is what lets a store change order one band at a time
+ * while it is drawn (`HighPerfRenderer`, "Store orders").
+ *
+ * With frustum culling the units in view draw their own share of each band,
+ * so a culled level is the same sample restricted to the view.
  */
 
 import { formatCountOf } from '../../utils/format-units.js';
+import { buildPriorityOrder } from '../../data/cell-priority.js';
 
-const HIERARCHICAL_RADIX_BITS = 11;
-export const HIERARCHICAL_RADIX_SIZE = 1 << HIERARCHICAL_RADIX_BITS;
-const HIERARCHICAL_RADIX_MASK = HIERARCHICAL_RADIX_SIZE - 1;
 export const LOD_FULL_DETAIL_ADMISSION_LEVEL = 0xff;
-
-/**
- * Quantization bits per axis for the locality code, by dimension level.
- *
- * Every code has to fit one Uint32 so the ordering can be produced by a typed
- * radix sort, which caps the product at 32 bits. Within that cap the finest
- * available grid is the right choice: the grid cell is the unit inside which
- * the ordering has nothing left to say about position, so a coarse grid is a
- * coarse sample. 2D uses the whole budget because 2D embeddings are what
- * projections are almost always viewed in.
- */
-export const LOCALITY_BITS_BY_DIMENSION = Object.freeze([0, 30, 16, 10]);
 
 /**
  * Depth of the draw units the stored point order is grouped by, per
@@ -50,218 +68,6 @@ export const LOCALITY_BITS_BY_DIMENSION = Object.freeze([0, 30, 16, 10]);
 export const DRAW_UNIT_DEPTH_BY_DIMENSION = Object.freeze([0, 6, 3, Infinity]);
 
 /**
- * Interleave one 16-bit coordinate with a single zero between bits (2D Morton).
- *
- * @param {number} coordinate
- * @returns {number}
- */
-function spreadPairwise(coordinate) {
-  let bits = coordinate & 0xffff;
-  bits = (bits | (bits << 8)) & 0x00ff00ff;
-  bits = (bits | (bits << 4)) & 0x0f0f0f0f;
-  bits = (bits | (bits << 2)) & 0x33333333;
-  bits = (bits | (bits << 1)) & 0x55555555;
-  return bits >>> 0;
-}
-
-/**
- * Interleave one 10-bit coordinate with two zeros between bits (3D Morton).
- *
- * @param {number} coordinate
- * @returns {number}
- */
-function spreadTriplewise(coordinate) {
-  let bits = coordinate & 0x3ff;
-  bits = (bits | (bits << 16)) & 0x030000ff;
-  bits = (bits | (bits << 8)) & 0x0300f00f;
-  bits = (bits | (bits << 4)) & 0x030c30c3;
-  bits = (bits | (bits << 2)) & 0x09249249;
-  return bits >>> 0;
-}
-
-/**
- * Build a stable hierarchical ordering of all points.
- *
- * Points are ranked so that coarser LOD levels are always strict subsets of
- * finer levels, which is what stops points popping in and out across a level
- * transition. The requirement on top of nesting is that *every* prefix reads
- * as the same cloud at lower density: proportional to the local density
- * everywhere, and carrying no structure of its own.
- *
- * Two steps, in this order.
- *
- * 1. Sort by the plain interleaved Morton code of the quantized position, so
- *    rank is a space-filling-curve walk of the cloud. Rank density along that
- *    walk is exactly point density.
- * 2. Emit ranks in bit-reversed (van der Corput) order. A prefix of that
- *    sequence is an evenly spaced set of *ranks* — every k-th point along the
- *    curve — so it takes the same fraction of points out of every
- *    neighbourhood the curve passes through.
- *
- * Step 2 is the whole fix for the reported square patches, and its absence
- * was the defect. Reversing the bits of the Morton code instead — sorting by
- * `reverse(morton)` — makes the sort key a bijection of the grid cell, so all
- * points of a cell are contiguous and a prefix is a complete set of cells on
- * an axis-aligned sublattice: every point of an admitted cell and none of a
- * skipped one. At 18.1M 2D points and a 44x reduction that is a ~6 px lattice
- * of ~1 px clumps, which is what a viewer sees as blocks with gaps between
- * them. Reversing the *rank* instead decimates along the curve, where the
- * spacing is measured in points rather than in pixels, so nothing lands on a
- * lattice and there is nothing to see.
- *
- * Ties — points sharing a grid cell — keep ascending source order through
- * every stable radix pass, and step 2 spreads a cell's own points across the
- * ladder rather than admitting or dropping them together.
- *
- * Dimension-aware: 1D/2D/3D codes, at the finest per-axis resolution that
- * still fits one Uint32 (see `LOCALITY_BITS_BY_DIMENSION`).
- *
- * @param {Float32Array} positions - `dimensionLevel` components a point.
- * @param {{minX: number, maxX: number, minY: number, maxY: number, minZ: number, maxZ: number}} bounds
- * @param {number} dimensionLevel
- * @returns {Uint32Array} Source ids in hierarchical order.
- */
-export function buildHierarchicalOrder(positions, bounds, dimensionLevel) {
-  const dimLevel = dimensionLevel;
-  const n = positions.length / dimLevel;
-
-  const axisBits = LOCALITY_BITS_BY_DIMENSION[dimLevel];
-  const axisMaximum = (1 << axisBits) - 1;
-  const localityBits = axisBits * dimLevel;
-  const scaleX = axisMaximum / Math.max(bounds.maxX - bounds.minX, 0.0001);
-  const scaleY = axisMaximum / Math.max(bounds.maxY - bounds.minY, 0.0001);
-  const scaleZ = axisMaximum / Math.max(bounds.maxZ - bounds.minZ, 0.0001);
-
-  // Clamping rather than masking: a coordinate exactly at the upper bound can
-  // quantize one step past the axis maximum through float rounding, and a
-  // mask would wrap that point to the very start of the curve.
-  const quantize = (value, minimum, scale) => {
-    const bin = Math.floor((value - minimum) * scale);
-    return bin < 0 ? 0 : (bin > axisMaximum ? axisMaximum : bin);
-  };
-
-  // One priority array plus two ID arrays bounds peak working memory to
-  // 12 bytes per point. Initial ascending IDs preserve the stable reference
-  // tie order through every least-significant-digit radix pass.
-  let priorities = new Uint32Array(n);
-  let sourceIds = new Uint32Array(n);
-  let targetIds = new Uint32Array(n);
-  let radixOffsets = new Uint32Array(HIERARCHICAL_RADIX_SIZE);
-
-  if (dimLevel === 1) {
-    for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-      const positionOffset = pointIndex;
-      priorities[pointIndex] = quantize(
-        positions[positionOffset],
-        bounds.minX,
-        scaleX
-      );
-      sourceIds[pointIndex] = pointIndex;
-    }
-  } else if (dimLevel === 2) {
-    for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-      const positionOffset = pointIndex * 2;
-      const x = quantize(positions[positionOffset], bounds.minX, scaleX);
-      const y = quantize(positions[positionOffset + 1], bounds.minY, scaleY);
-      priorities[pointIndex] =
-        (spreadPairwise(x) | (spreadPairwise(y) << 1)) >>> 0;
-      sourceIds[pointIndex] = pointIndex;
-    }
-  } else {
-    for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-      const positionOffset = pointIndex * 3;
-      const x = quantize(positions[positionOffset], bounds.minX, scaleX);
-      const y = quantize(positions[positionOffset + 1], bounds.minY, scaleY);
-      const z = quantize(positions[positionOffset + 2], bounds.minZ, scaleZ);
-      priorities[pointIndex] =
-        (
-          spreadTriplewise(x)
-          | (spreadTriplewise(y) << 1)
-          | (spreadTriplewise(z) << 2)
-        ) >>> 0;
-      sourceIds[pointIndex] = pointIndex;
-    }
-  }
-
-  // Locality codes are at most 32 bits wide, so three stable 11-bit passes
-  // completely order the IDs for every dimension level.
-  for (
-    let shift = 0;
-    shift < localityBits;
-    shift += HIERARCHICAL_RADIX_BITS
-  ) {
-    radixOffsets.fill(0);
-    for (let index = 0; index < n; index++) {
-      const pointId = sourceIds[index];
-      const digit =
-        (priorities[pointId] >>> shift) & HIERARCHICAL_RADIX_MASK;
-      radixOffsets[digit]++;
-    }
-
-    let offset = 0;
-    for (
-      let digit = 0;
-      digit < HIERARCHICAL_RADIX_SIZE;
-      digit++
-    ) {
-      const count = radixOffsets[digit];
-      radixOffsets[digit] = offset;
-      offset += count;
-    }
-
-    for (let index = 0; index < n; index++) {
-      const pointId = sourceIds[index];
-      const digit =
-        (priorities[pointId] >>> shift) & HIERARCHICAL_RADIX_MASK;
-      targetIds[radixOffsets[digit]++] = pointId;
-    }
-
-    const previousSource = sourceIds;
-    sourceIds = targetIds;
-    targetIds = previousSource;
-  }
-
-  // Step 2. `targetIds` is spent radix scratch of exactly the right length,
-  // so the rank permutation is written in place of another N allocation.
-  const reversalBits = n <= 1 ? 0 : 32 - Math.clz32(n - 1);
-  if (reversalBits > 30) {
-    throw new RangeError(
-      `Hierarchical ordering supports at most ${formatCountOf((1 << 30), 'point')}.`
-    );
-  }
-  const reversalSpan = 1 << reversalBits;
-  const highestBit = reversalSpan >>> 1;
-  let rank = 0;
-  let emitted = 0;
-  for (let step = 0; step < reversalSpan; step++) {
-    if (rank < n) targetIds[emitted++] = sourceIds[rank];
-    // Increment the bit-reversed counter: carry propagates from the top bit
-    // down, which is the mirror image of an ordinary binary increment.
-    let carry = highestBit;
-    while (carry !== 0 && (rank & carry) !== 0) {
-      rank ^= carry;
-      carry >>>= 1;
-    }
-    rank |= carry;
-  }
-  if (emitted !== n) {
-    throw new Error(
-      `Hierarchical ordering emitted ${emitted} of ${formatCountOf(n, 'point')}.`
-    );
-  }
-
-  // Only the final ID generation escapes. Explicitly release all build
-  // scratch references. The order is not retained: `buildDrawOrder`
-  // rewrites it in place into the draw order the levels are views of.
-  const hierarchicalOrder = targetIds;
-  priorities = null;
-  sourceIds = null;
-  targetIds = null;
-  radixOffsets = null;
-  return hierarchicalOrder;
-}
-
-/**
  * Number the tree's draw units in traversal (child) order and give every
  * node down to them the half-open range of unit ordinals under it,
  * `[leafStart, leafEnd)`. A subtree is therefore one contiguous run of
@@ -279,7 +85,7 @@ export function numberDrawUnits(root, dimensionLevel) {
   const units = [];
   const visit = (node, depth) => {
     node.leafStart = units.length;
-    if (node.indices !== null || depth >= unitDepth) {
+    if (node.indices !== null || node.children === null || depth >= unitDepth) {
       if (node.indices !== null && !(node.indices instanceof Uint32Array)) {
         throw new TypeError('Spatial tree leaf membership must be an exact Uint32Array.');
       }
@@ -298,83 +104,242 @@ export function numberDrawUnits(root, dimensionLevel) {
 }
 
 /**
+ * Whether a tree's leaf ids can be read from its draw order: its draw units
+ * are its leaves (3D, `DRAW_UNIT_DEPTH_BY_DIMENSION`), so leaf `u`'s cells
+ * are, in every band `b`, the order's slots `[leafOffsets[b * (leafCount +
+ * 1) + u], leafOffsets[b * (leafCount + 1) + u + 1])`. A 1D or 2D unit is a
+ * coarse node whose cells keep source order, so its leaves keep their ids.
+ *
+ * @param {number} dimensionLevel
+ * @returns {boolean}
+ */
+export function leafIdsFollowDrawOrder(dimensionLevel) {
+  return DRAW_UNIT_DEPTH_BY_DIMENSION[dimensionLevel] === Infinity;
+}
+
+/**
+ * Let go of a tree's leaf ids where its draw order holds them
+ * (`leafIdsFollowDrawOrder`): 4 bytes a cell, as many as the order's own
+ * indices. Call it once the order is computed (`buildDrawOrder` numbers the
+ * leaves from their ids); `forEachLeafRun` reads them from the order after.
+ *
+ * @param {object} root
+ * @param {number} dimensionLevel
+ */
+export function dropDerivableLeafIds(root, dimensionLevel) {
+  if (!leafIdsFollowDrawOrder(dimensionLevel)) return;
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === null) continue;
+    if (node.children === null) {
+      if (node.drawUnit !== true) throw new Error('A tree\'s leaf ids are dropped only after its draw order numbered its leaves.');
+      node.indices = null;
+    } else {
+      for (const child of node.children) stack.push(child);
+    }
+  }
+}
+
+/**
+ * Visit the cells of one leaf as runs of an array: `visit(array, start,
+ * end)` for `array[start..end)`, its own ids in one run, or (ids dropped,
+ * `dropDerivableLeafIds`) one run of the draw order's indices per band, in
+ * band order, ascending cell within each. A `visit` that returns true stops
+ * the walk; the function then returns true.
+ *
+ * @param {object} leaf
+ * @param {{indices: Uint32Array, bandCount: number, leafCount: number, leafOffsets: Uint32Array}|null} drawOrder
+ * @param {(array: Uint32Array, start: number, end: number) => boolean|void} visit
+ * @returns {boolean} Whether `visit` stopped the walk.
+ */
+export function forEachLeafRun(leaf, drawOrder, visit) {
+  if (leaf.indices !== null) return visit(leaf.indices, 0, leaf.indices.length) === true;
+  if (leaf.pointCount === 0) return false;
+  if (drawOrder === null || !Number.isSafeInteger(leaf.leafStart)) {
+    throw new Error('A leaf without its ids reads them from the draw order that numbered it.');
+  }
+  const stride = drawOrder.leafCount + 1;
+  const offsets = drawOrder.leafOffsets;
+  for (let band = 0, at = leaf.leafStart; band < drawOrder.bandCount; band++, at += stride) {
+    const start = offsets[at];
+    const end = offsets[at + 1];
+    if (end > start && visit(drawOrder.indices, start, end) === true) return true;
+  }
+  return false;
+}
+
+/** Cells of the coarsest level of detail (fewer cells open: one level, all of them). */
+export const LOD_LADDER_FIRST_COUNT = 1000;
+
+/**
+ * Most ranks one band holds: the ladder's steps are split at every multiple
+ * of it (`drawBands`). It bounds the work of one step when a store changes
+ * order band by band while it is drawn, and the slots a removal of cells
+ * rewrites (`HighPerfRenderer#resizeLiveCells`).
+ */
+export const DRAW_BAND_POINTS = 2 ** 21;
+
+/**
+ * The level-of-detail ladder of `pointCount` open cells: each level's cell
+ * count, coarse to fine, the last being every cell. The counts are fixed
+ * (`LOD_LADDER_FIRST_COUNT`, then 5/4 of the one before, rounded down) and
+ * only capped by the open cells, so a level's count, and so its cells, does
+ * not depend on how many cells are open (see the module comment).
+ *
+ * @param {number} pointCount
+ * @returns {number[]}
+ */
+export function lodLadder(pointCount) {
+  if (!Number.isSafeInteger(pointCount) || pointCount < 0) {
+    throw new RangeError(`A level-of-detail ladder needs a cell count, not ${pointCount}.`);
+  }
+  const counts = [];
+  for (let count = LOD_LADDER_FIRST_COUNT; count < pointCount; count = Math.floor((count * 5) / 4)) {
+    counts.push(count);
+  }
+  counts.push(pointCount);
+  return counts;
+}
+
+/**
+ * The bands of a draw order over `pointCount` cells: each band's end rank
+ * (exclusive), ascending, the last being `pointCount`, and for each level
+ * of `lodLadder(pointCount)` the band it ends with. A band boundary is a
+ * ladder count or a multiple of `bandPoints`, so it is a fixed rank,
+ * whatever the cell count (see the module comment).
+ *
+ * @param {number} pointCount
+ * @param {number} [bandPoints=DRAW_BAND_POINTS]
+ * @returns {{bandEnds: Uint32Array, levelBands: Uint8Array, ladder: number[]}}
+ */
+export function drawBands(pointCount, bandPoints = DRAW_BAND_POINTS) {
+  if (!Number.isSafeInteger(bandPoints) || bandPoints <= 0) {
+    throw new RangeError(`A draw band holds a positive number of cells, not ${bandPoints}.`);
+  }
+  const ladder = lodLadder(pointCount);
+  const ends = [];
+  const levelBands = new Uint8Array(ladder.length);
+  let previous = 0;
+  for (let level = 0; level < ladder.length; level++) {
+    const end = ladder[level];
+    for (let split = (Math.floor(previous / bandPoints) + 1) * bandPoints; split < end; split += bandPoints) {
+      ends.push(split);
+    }
+    if (end > previous || ends.length === 0) ends.push(end);
+    if (ends.length > LOD_FULL_DETAIL_ADMISSION_LEVEL) {
+      throw new RangeError(`A draw order of ${formatCountOf(pointCount, 'cell')} needs more than ${LOD_FULL_DETAIL_ADMISSION_LEVEL} bands.`);
+    }
+    levelBands[level] = ends.length - 1;
+    previous = end;
+  }
+  return { bandEnds: Uint32Array.from(ends), levelBands, ladder };
+}
+
+/**
+ * The first rank of the band that holds rank `rank` (a band boundary at or
+ * below it): ranks below it are whole bands of every draw order of more
+ * than `rank` cells.
+ *
+ * @param {number} rank
+ * @param {number} [bandPoints=DRAW_BAND_POINTS]
+ * @returns {number}
+ */
+export function bandStartAtOrBelow(rank, bandPoints = DRAW_BAND_POINTS) {
+  let start = Math.floor(rank / bandPoints) * bandPoints;
+  for (let count = LOD_LADDER_FIRST_COUNT; count <= rank; count = Math.floor((count * 5) / 4)) {
+    if (count > start) start = count;
+  }
+  return start;
+}
+
+/**
  * Publish the order the GPU draws this tree's points in, as indices into
  * the original-order point buffers.
  *
  * The points are grouped by band, then by draw unit (a leaf, or a coarse
- * node in 1D/2D, see `DRAW_UNIT_DEPTH_BY_DIMENSION`). Band `b` holds the points
- * the hierarchical order first admits at LOD level `b`; the last band holds
- * the full-detail remainder. A reduced level is therefore one prefix (bands
- * `0..b`), and within a band one run of consecutive leaves is one contiguous
- * range, so frustum culling draws whole node ranges instead of rewriting
- * per-point indices. Within a unit, points keep ascending source order.
+ * node in 1D/2D, see `DRAW_UNIT_DEPTH_BY_DIMENSION`). Band `b` holds the
+ * points of priority ranks `[bandEnds[b - 1], bandEnds[b])` (`drawBands`).
+ * A reduced level is therefore one prefix (its bands), and within a band one
+ * run of consecutive leaves is one contiguous range, so frustum culling
+ * draws whole node ranges instead of rewriting per-point indices. Within a
+ * unit, points keep ascending source order.
  *
  * `leafOffsets[band * (leafCount + 1) + leaf]` is where `leaf`'s points in
  * `band` start; the leaf's range ends where the next leaf's starts.
  *
- * Without LOD there is one band: the leaves in order.
+ * Without bands there is one: the leaves in order.
  *
  * @param {object} root - The tree's root node (draw units are numbered on it).
  * @param {number} dimensionLevel
  * @param {number} pointCount
- * @param {Uint32Array|null} hierarchy - The hierarchical order, consumed
- *   (rewritten in place); null without LOD.
- * @param {number[]|null} prefixCounts - Each level's point count, coarse to
- *   fine, the last being every point; null without LOD.
+ * @param {{bandEnds: Uint32Array, levelBands: Uint8Array}|null} bands - `drawBands(pointCount)`;
+ *   null for one band.
+ * @param {Uint32Array|null} priorityOrder - The cells in priority order
+ *   (`buildPriorityOrder`), consumed (rewritten in place); null when the
+ *   open cells are in priority order already (cell `i` has rank `i`), or
+ *   without bands.
  * @returns {{
  *   indices: Uint32Array,
  *   bandCount: number,
  *   bandEnds: Uint32Array,
+ *   levelBands: Uint8Array|null,
  *   leafCount: number,
  *   leafOffsets: Uint32Array,
  *   pointCount: number,
  * }}
  */
-export function buildDrawOrder(root, dimensionLevel, pointCount, hierarchy, prefixCounts) {
+export function buildDrawOrder(root, dimensionLevel, pointCount, bands, priorityOrder) {
   const n = pointCount;
   const leaves = numberDrawUnits(root, dimensionLevel);
   const leafCount = leaves.length;
-  const bandCount = prefixCounts === null ? 1 : prefixCounts.length;
+  const bandEnds = bands === null ? Uint32Array.of(n) : bands.bandEnds;
+  const bandCount = bandEnds.length;
   if (bandCount > LOD_FULL_DETAIL_ADMISSION_LEVEL) {
-    throw new RangeError('Draw order supports at most 255 LOD bands.');
+    throw new RangeError(`Draw order supports at most ${LOD_FULL_DETAIL_ADMISSION_LEVEL} bands.`);
   }
-  const bandEnds = new Uint32Array(bandCount);
-  if (prefixCounts === null) {
-    bandEnds[0] = n;
-  } else {
-    let previous = 0;
-    for (let band = 0; band < bandCount; band++) {
-      const end = prefixCounts[band];
-      if (!Number.isSafeInteger(end) || end < previous || end > n) {
-        throw new RangeError(`Draw order: LOD ${band} is not one monotonic prefix.`);
-      }
-      bandEnds[band] = end;
-      previous = end;
+  let previousEnd = 0;
+  for (let band = 0; band < bandCount; band++) {
+    const end = bandEnds[band];
+    if (end < previousEnd || end > n || (end === previousEnd && band > 0)) {
+      throw new RangeError(`Draw order: band ${band} is not one monotonic run of ranks.`);
     }
-    if (previous !== n) {
-      throw new RangeError('Draw order: LOD bands must end with every point.');
-    }
+    previousEnd = end;
+  }
+  if (previousEnd !== n) {
+    throw new RangeError('Draw order: bands must end with every point.');
   }
 
-  // The band of every point, from its rank in the hierarchical order.
+  // The band of every point, from its rank.
   let bandOf = null;
-  if (hierarchy !== null) {
-    if (!(hierarchy instanceof Uint32Array) || hierarchy.length !== n) {
-      throw new Error('Draw order requires one exact full point hierarchy.');
-    }
+  if (bands !== null && bandCount > 1) {
     bandOf = new Uint8Array(n);
-    let rank = 0;
-    for (let band = 0; band < bandCount; band++) {
-      const end = bandEnds[band];
-      for (; rank < end; rank++) bandOf[hierarchy[rank]] = band;
+    if (priorityOrder === null) {
+      let rank = 0;
+      for (let band = 0; band < bandCount; band++) {
+        bandOf.fill(band, rank, bandEnds[band]);
+        rank = bandEnds[band];
+      }
+    } else {
+      if (!(priorityOrder instanceof Uint32Array) || priorityOrder.length !== n) {
+        throw new Error('Draw order requires one exact priority order of every point.');
+      }
+      let rank = 0;
+      for (let band = 0; band < bandCount; band++) {
+        const end = bandEnds[band];
+        for (; rank < end; rank++) bandOf[priorityOrder[rank]] = band;
+      }
     }
   }
 
   // The unit of every point: units are leaves, or the subtrees under a
-  // coarse node (see `_numberLeaves`).
+  // coarse node (see `numberDrawUnits`).
   const unitOf = new Uint32Array(n);
   let placed = 0;
   const assign = (node, unit) => {
+    if (node.children === null && node.indices === null && node.pointCount > 0) {
+      throw new Error('Draw order: the tree\'s leaf ids follow its published draw order (`dropDerivableLeafIds`); a new order needs a new tree.');
+    }
     if (node.indices !== null) {
       const leafIndices = node.indices;
       for (let i = 0; i < leafIndices.length; i++) {
@@ -414,64 +379,67 @@ export function buildDrawOrder(root, dimensionLevel, pointCount, hierarchy, pref
       leafOffsets[base + unit] = running;
     }
     if (running !== bandEnds[band]) {
-      throw new Error(`Draw order: units place ${formatCountOf(running, 'point')} in LOD band ${band}, not ${bandEnds[band]}.`);
+      throw new Error(`Draw order: units place ${formatCountOf(running, 'point')} in band ${band}, not ${bandEnds[band]}.`);
     }
   }
 
   // Fill in ascending source order, so each (band, unit) segment holds its
   // points in source order.
-  const indices = hierarchy ?? new Uint32Array(n);
+  const indices = priorityOrder ?? new Uint32Array(n);
   const cursors = leafOffsets.slice();
   for (let id = 0; id < n; id++) {
     const band = bandOf === null ? 0 : bandOf[id];
     indices[cursors[band * stride + unitOf[id]]++] = id;
   }
 
-  return { indices, bandCount, bandEnds, leafCount, leafOffsets, pointCount: n };
+  return {
+    indices,
+    bandCount,
+    bandEnds,
+    levelBands: bands === null ? null : bands.levelBands,
+    leafCount,
+    leafOffsets,
+    pointCount: n,
+  };
 }
 
 /**
- * Point counts of the LOD levels, coarse to fine, the last being every
- * point: 1.25x steps, so a transition is below what a viewer notices.
- */
-export const LOD_REDUCTION_FACTORS = Object.freeze([
-  44, 35, 28, 23, 18, 14.5, 11.5, 9.3, 7.5, 6, 4.8, 3.8, 3, 2.4, 1.95, 1.55, 1.25, 1,
-]);
-
-/**
- * @param {number} pointCount
- * @returns {number[]} Each LOD level's point count, coarse to fine.
- */
-export function lodPrefixCounts(pointCount) {
-  return LOD_REDUCTION_FACTORS.map(factor => (
-    factor === 1
-      ? pointCount
-      : Math.min(Math.max(1000, Math.ceil(pointCount / factor)), pointCount)
-  ));
-}
-
-/**
- * The whole draw order of a tree: banded by LOD when `buildLOD`, else one
- * band. Annotates the tree's nodes with their draw-unit ranges.
+ * The whole draw order of a tree: banded (`drawBands`) when it has levels of
+ * detail (`buildLOD`), or whenever the open cells are in priority order
+ * already (banding them costs nothing then, and every store of them keeps
+ * its bands in any order), else one band. Annotates the tree's nodes with
+ * their draw-unit ranges.
  *
- * @param {Float32Array} positions
+ * @param {number} pointCount - The points the tree was built over.
  * @param {{bounds: object, root: object}} tree
  * @param {number} dimensionLevel
  * @param {boolean} buildLOD
- * @returns {{indices: Uint32Array, bandCount: number, bandEnds: Uint32Array, leafCount: number, leafOffsets: Uint32Array, pointCount: number}}
+ * @param {Readonly<{seed: number|null, originals: Uint32Array|null}>} priority - The
+ *   cells' priority (`data/cell-priority.js`).
+ * @returns {{indices: Uint32Array, bandCount: number, bandEnds: Uint32Array, levelBands: Uint8Array|null, leafCount: number, leafOffsets: Uint32Array, pointCount: number, ranked: boolean}}
  */
-export function computeTreeDrawOrder(positions, tree, dimensionLevel, buildLOD) {
-  const pointCount = positions.length / dimensionLevel;
-  if (!buildLOD) return buildDrawOrder(tree.root, dimensionLevel, pointCount, null, null);
-  const hierarchy = buildHierarchicalOrder(positions, tree.bounds, dimensionLevel);
-  return buildDrawOrder(tree.root, dimensionLevel, pointCount, hierarchy, lodPrefixCounts(pointCount));
+export function computeTreeDrawOrder(pointCount, tree, dimensionLevel, buildLOD, priority) {
+  const inPriorityOrder = priority.seed === null;
+  if (!buildLOD && !inPriorityOrder) return { ...buildDrawOrder(tree.root, dimensionLevel, pointCount, null, null), ranked: false };
+  const order = buildDrawOrder(
+    tree.root,
+    dimensionLevel,
+    pointCount,
+    drawBands(pointCount),
+    inPriorityOrder ? null : buildPriorityOrder(pointCount, priority)
+  );
+  // Bands by open position: each band's slots hold the cells of its own
+  // positions (`ranked`), so a store can take the order band by band.
+  return { ...order, ranked: inPriorityOrder };
 }
 
 /**
  * The buffers a draw order can be transferred with.
- * @param {{indices: Uint32Array, bandEnds: Uint32Array, leafOffsets: Uint32Array}} order
+ * @param {{indices: Uint32Array, bandEnds: Uint32Array, leafOffsets: Uint32Array, levelBands: Uint8Array|null}} order
  * @returns {ArrayBuffer[]}
  */
 export function drawOrderTransferList(order) {
-  return [order.indices.buffer, order.bandEnds.buffer, order.leafOffsets.buffer];
+  const list = [order.indices.buffer, order.bandEnds.buffer, order.leafOffsets.buffer];
+  if (order.levelBands !== null) list.push(order.levelBands.buffer);
+  return list;
 }

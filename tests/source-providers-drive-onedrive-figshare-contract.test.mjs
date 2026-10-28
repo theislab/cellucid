@@ -7,6 +7,7 @@
  * session, a link or a message records.
  */
 import assert from 'node:assert/strict';
+import { persistsAcrossVisits } from '../assets/js/data/anndata/transcode/space.js';
 import test from 'node:test';
 
 import { getProviderRegistry } from '../assets/js/data/sources/registry.js';
@@ -276,6 +277,20 @@ test('Drive, public: item and head go out together with the key, with no header 
   assert.deepEqual(target.headers, {});
   assert.equal(opened.file.resource.identity.key, `gdrive:${DRIVE_ID}`);
   assert.equal(opened.file.resource.identity.version, `md5:d41d:${SIZE}`);
+});
+
+test('Drive: a file is kept across visits only when Drive states a validator (a checksum or a revision)', async t => {
+  for (const [item, version] of [
+    [DRIVE_ITEM, `md5:d41d:${SIZE}`],
+    [{ ...DRIVE_ITEM, md5Checksum: undefined, headRevisionId: 'r7' }, `revision:r7:${SIZE}`],
+    [{ ...DRIVE_ITEM, md5Checksum: undefined }, `size:${SIZE}`],
+  ]) {
+    const calls = installFetch(t, async ({ url }) => (isMetadata(url) ? { status: 200, json: item } : isMedia(url) ? { status: 206 } : null));
+    const opened = await createDriveProvider({ google: fakeGoogle() }).open(DRIVE_ID);
+    assert.equal(opened.file.resource.identity.version, version);
+    assert.equal(persistsAcrossVisits(opened.file.resource.identity), !version.startsWith('size:'));
+    calls.length = 0;
+  }
 });
 
 test('Drive: a resource key goes in its header only on files whose link had one', async t => {

@@ -30,6 +30,7 @@ import { yieldToMacrotask } from '../../../../../utils/yield-macrotask.js';
 import { loadAppCode } from '../../../../app-code.js';
 import { figureExportWorkerScript } from '../../../../../../workers/scripts.js';
 import { startWorker } from '../../../../../workers/worker-script.js';
+import { PieceSender, placeArrays } from '../../../../../utils/large-arrays.js';
 
 function createDefaultWorker() {
   return startWorker(figureExportWorkerScript(), { type: 'module' });
@@ -317,7 +318,15 @@ export function openFigureExportWorkerSession({ signal = null } = {}) {
 
   function send(target, op, args, transfer) {
     const id = nextRequestId++;
-    const message = { id, op, session, uploads: uploadsFor(target, args), args };
+    let uploads = uploadsFor(target, args);
+    if (target !== pageHost) {
+      // An array larger than one ArrayBuffer (a WebAssembly memory's,
+      // `utils/large-arrays.js`) would be cloned whole: it crosses in
+      // pieces before the request instead, assembled by the worker.
+      const sender = new PieceSender((piece, pieceTransfer) => target.postMessage({ session, piece }, pieceTransfer));
+      uploads = placeArrays(uploads, view => sender.send(view));
+    }
+    const message = { id, op, session, uploads, args };
     return new Promise((resolve, reject) => {
       const onAbort = () => {
         if (!pending.has(id)) return;

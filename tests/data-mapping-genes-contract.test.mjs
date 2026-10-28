@@ -85,15 +85,36 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
     }
   });
 
-  test(`${format}: the file opens with X named by its index, and refuses a float column`, async t => {
+  test(`${format}: an index of Ensembl ids opens named by the symbols column beside it, ids searchable; a float column is refused`, async t => {
     const adapter = await open(t, format);
+    // Opening reads no gene name: the default is pending (never the index).
+    const opened = adapter.getMappingCandidates();
+    assert.equal(opened.defaults.geneNames, null);
+    assert.equal(opened.guessed.includes('geneNames'), false);
+    assert.equal(Object.hasOwn(opened.geneNameColumns, 'X'), false);
+    // Listing the genes guesses the shown axis first.
     const own = await adapter.getGeneList();
-    assert.deepEqual(own.fields.map(field => field.key), EXPECTED.genes['X/index'].names);
+    const candidates = adapter.getMappingCandidates();
+    // The var index holds Ensembl ids and var['gene_symbols'] their symbols:
+    // the symbols name the genes, chosen by content, and marked guessed.
+    assert.equal(candidates.defaults.geneNames, 'column:gene_symbols');
+    assert.ok(candidates.guessed.includes('geneNames'));
+    assert.equal(candidates.geneNameColumns.X, 'gene_symbols');
+    assert.equal(Object.hasOwn(candidates.geneNameColumns, 'raw'), false, 'only the shown axis is guessed');
+    const symbolsRoute = Object.keys(EXPECTED.genes).find(route => route.startsWith('X/') && route !== 'X/index' &&
+      EXPECTED.genes[route].gene_names.source === 'gene_symbols');
+    assert.deepEqual(own.fields.map(field => field.key), EXPECTED.genes[symbolsRoute].names);
+    assert.deepEqual(own.geneNames.ids, EXPECTED.genes['X/index'].names, 'every gene keeps its identifier');
+    assert.equal(own.geneNames.source, 'gene_symbols');
     assert.equal(
       sha256(await adapter.getGeneValues('var/2')),
       EXPECTED.genes['X/index'].values[2]
     );
-    const columns = adapter.getMappingCandidates().var.columns;
+    // The index stays one choice away.
+    const byIndex = await adapter.getGeneList(mappingGeneListPath('X', 'index'));
+    assert.deepEqual(byIndex.fields.map(field => field.key), EXPECTED.genes['X/index'].names);
+    assert.equal(byIndex.geneNames.ids, null);
+    const columns = candidates.var.columns;
     const dispersions = columns.findIndex(column => column.key === 'dispersions');
     await assert.rejects(
       adapter.getGeneList(mappingGeneListPath('X', `column-${dispersions}`)),

@@ -93,6 +93,7 @@ async function inflateCeiling() {
 
 async function firstView() {
   const worker = await import(pathToFileURL(path.join(REPOSITORY, 'assets/js/data/anndata-reader-worker.js')).href);
+  const { PieceReceiver } = await import(pathToFileURL(path.join(REPOSITORY, 'assets/js/utils/large-arrays.js')).href);
   // The reader thread's decode workers, as the browser's reader worker makes
   // them (as many as the cores and their memory budget allow), here as
   // `node:worker_threads` running the same decode worker module: blocks of
@@ -102,12 +103,23 @@ async function firstView() {
   const { residencyBudgetBytes } = await import(pathToFileURL(path.join(REPOSITORY, 'assets/js/data/memory-budget.js')).href);
   const { createNodeDecodeWorker } = await import(pathToFileURL(path.join(REPOSITORY, 'tests/helpers/node-decode-worker.mjs')).href);
   configureDecodePool({ createWorker: () => createNodeDecodeWorker(), memoryBytes: residencyBudgetBytes('decodeWorkers') });
-  const handle = worker.createAnnDataReaderHandler({ post: () => {} });
+  // Arrays posted in pieces before a reply (`utils/large-arrays.js`), by request.
+  const pieces = new Map();
+  const handle = worker.createAnnDataReaderHandler({
+    post: message => {
+      if (message.event !== 'piece') return;
+      if (!pieces.has(message.id)) pieces.set(message.id, new PieceReceiver());
+      pieces.get(message.id).receive(message);
+    },
+  });
   let nextId = 1;
   const call = async (method, ...args) => {
-    const { reply } = await handle({ id: nextId++, method, args });
+    const id = nextId++;
+    const { reply } = await handle({ id, method, args });
+    const received = pieces.get(id) ?? new PieceReceiver();
+    pieces.delete(id);
     if (reply.error) throw new Error(`${method}: ${reply.error.message}`);
-    return reply.result;
+    return received.resolve(reply.result);
   };
   let source;
   if (isFolder) {

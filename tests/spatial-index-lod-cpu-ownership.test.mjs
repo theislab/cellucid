@@ -4,35 +4,22 @@ import test from 'node:test';
 import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
   ADAPTIVE_LOD_MAXIMUM_REDUCTION,
   ADAPTIVE_LOD_POINT_BUDGET,
-  SpatialIndex,
-} from '../assets/js/rendering/high-perf/spatial-index.js';
+} from '../assets/js/rendering/high-perf/lod-levels.js';
 import { calculateSpatialBounds } from '../assets/js/rendering/high-perf/spatial-tree.js';
 import {
   VelocityOverlay,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
-import { buildHierarchicalOrder } from '../assets/js/rendering/high-perf/draw-order.js';
+import { DEFAULT_CELL_PRIORITY, buildPriorityOrder } from '../assets/js/data/cell-priority.js';
 
-const REDUCTION_FACTORS = Object.freeze([
-  44, 35, 28, 23, 18, 14.5, 11.5, 9.3, 7.5,
-  6, 4.8, 3.8, 3, 2.4, 1.95, 1.55, 1.25,
-]);
-// The hierarchical order for the eight-point fixture: Morton rank read in
-// bit-reversed order (ranks 0, 4, 2, 6, 1, 5, 3, 7 of the curve).
-const HIERARCHICAL_INDEX_ORDER = Object.freeze([0, 6, 1, 7, 4, 2, 5, 3]);
-// Its draw order. Every reduced level of eight points holds all eight (the
-// ladder floors a level at 1,000 points), so they are all one band, stored by
-// quadtree leaf (two points a leaf here) and by source id within a leaf.
-const DRAW_INDEX_ORDER = Object.freeze([0, 4, 1, 5, 2, 6, 3, 7]);
-const DRAW_INDEX_BYTES = Object.freeze(
-  DRAW_INDEX_ORDER.flatMap(id => [id, 0, 0, 0])
-);
+// The fixed ladder (draw-order.js `lodLadder`): 1,000 cells, then 5/4 of
+// the level before (rounded down), capped by the cell count.
 const LARGE_POINT_COUNT = 10001;
 const LARGE_REDUCED_COUNTS = Object.freeze([
-  1000, 1000, 1000, 1000, 1000, 1000, 1000, 1076, 1334,
-  1667, 2084, 2632, 3334, 4168, 5129, 6453, 8001,
+  1000, 1250, 1562, 1952, 2440, 3050, 3812, 4765, 5956, 7445, 9306,
 ]);
 const LARGE_LEGACY_SEPARATE_BACKING_BYTES =
   LARGE_REDUCED_COUNTS.reduce((sum, count) => sum + count, 0) *
@@ -106,7 +93,7 @@ function makeLodOnlySpatialIndex(pointCount) {
   );
   spatialIndex.bounds = calculateSpatialBounds(positions, 2);
   spatialIndex.root = singleLeafRoot(pointCount, spatialIndex.bounds);
-  spatialIndex.lodLevels = spatialIndex._generateLODLevels();
+  spatialIndex.lodLevels = spatialIndex._generateLODLevels(DEFAULT_CELL_PRIORITY);
   return { colors, positions, spatialIndex };
 }
 
@@ -148,117 +135,60 @@ function referenceRadiusQuery(
   return results;
 }
 
-test('reduced CPU LOD levels publish stable shared-prefix original-index views', () => {
+test('a dataset below the first level has one level: every cell', () => {
   const { colors, positions, spatialIndex } = makeSpatialIndex();
-  const levelsIdentity = spatialIndex.lodLevels;
-  const indexIdentities = levelsIdentity
-    .slice(0, REDUCTION_FACTORS.length)
-    .map(level => level.indices);
-
-  assert.equal(spatialIndex.positions, positions);
-  assert.equal(spatialIndex.colors, colors);
-  assert.ok(Array.isArray(levelsIdentity));
-  assert.equal(levelsIdentity.length, 18);
-
-  for (let levelIndex = 0; levelIndex < REDUCTION_FACTORS.length; levelIndex++) {
-    const level = levelsIdentity[levelIndex];
-    assert.deepEqual(Array.from(level.indices), DRAW_INDEX_ORDER);
-    // The same set of points the hierarchical order admits at that length.
-    assert.deepEqual(
-      [...level.indices].sort((a, b) => a - b),
-      [...HIERARCHICAL_INDEX_ORDER].slice(0, level.pointCount).sort((a, b) => a - b),
-    );
-    assert.deepEqual(
-      Array.from(
-        new Uint8Array(
-          level.indices.buffer,
-          level.indices.byteOffset,
-          level.indices.byteLength,
-        ),
-      ),
-      DRAW_INDEX_BYTES,
-    );
-    assert.equal(Object.hasOwn(level, 'positions'), false);
-    assert.equal(Object.hasOwn(level, 'colors'), false);
-    assert.equal(level.depth, levelIndex);
-    assert.equal(level.pointCount, positions.length / 2);
-    assert.equal(level.sizes, null);
-    assert.equal(level.isFullDetail, false);
-    assert.equal(
-      level.sizeMultiplier,
-      Math.sqrt(REDUCTION_FACTORS[levelIndex]) * 0.2 + 0.8,
-    );
-  }
-
-  const fullDetail = levelsIdentity.at(-1);
-  assert.equal(fullDetail.depth, 17);
+  assert.equal(spatialIndex.lodLevels.length, 1);
+  const fullDetail = spatialIndex.lodLevels[0];
+  assert.equal(fullDetail.depth, 0);
   assert.equal(fullDetail.pointCount, positions.length / 2);
   assert.equal(fullDetail.positions, positions);
   assert.equal(fullDetail.colors, colors);
   assert.equal(Object.hasOwn(fullDetail, 'indices'), false);
-  assert.equal(fullDetail.sizes, null);
   assert.equal(fullDetail.isFullDetail, true);
-
-  // The hierarchical order is build scratch: a fresh build reproduces it,
-  // and the levels are views of the draw order it was rewritten into.
-  assert.deepEqual(Array.from(buildHierarchicalOrder(spatialIndex.positions, spatialIndex.bounds, spatialIndex.dimensionLevel)), HIERARCHICAL_INDEX_ORDER);
-  assert.equal(Object.hasOwn(spatialIndex, '_hierarchicalOrder'), false);
-  const hierarchicalOrder = spatialIndex.drawOrder.indices;
-  assert.ok(hierarchicalOrder instanceof Uint32Array);
-  assert.deepEqual(Array.from(hierarchicalOrder), DRAW_INDEX_ORDER);
-  assert.equal(hierarchicalOrder.length, spatialIndex.pointCount);
-  assert.equal(hierarchicalOrder.byteOffset, 0);
-  assert.equal(new Set(indexIdentities).size, REDUCTION_FACTORS.length);
-  assert.equal(
-    new Set(indexIdentities.map(indices => indices.buffer)).size,
-    1,
-  );
-  for (const indices of indexIdentities) {
-    assert.equal(indices.buffer, hierarchicalOrder.buffer);
-    assert.equal(indices.byteOffset, hierarchicalOrder.byteOffset);
-    assert.equal(
-      indices.byteLength,
-      spatialIndex.pointCount * Uint32Array.BYTES_PER_ELEMENT,
-    );
-  }
-
-  // The levels are published once, at construction.
-  assert.equal(spatialIndex.lodLevels, levelsIdentity);
-  for (let levelIndex = 0; levelIndex < indexIdentities.length; levelIndex++) {
-    assert.equal(spatialIndex.lodLevels[levelIndex].indices, indexIdentities[levelIndex]);
-  }
+  assert.equal(spatialIndex.drawOrder.bandCount, 1);
 });
 
-test('one typed draw order backs every large reduced LOD prefix', () => {
+test('reduced CPU LOD levels are the fixed ladder, views of one draw order, in priority order', () => {
   const {
     colors,
     positions,
     spatialIndex,
   } = makeLodOnlySpatialIndex(LARGE_POINT_COUNT);
   const levelsIdentity = spatialIndex.lodLevels;
-  const reducedLevels = levelsIdentity.slice(0, REDUCTION_FACTORS.length);
+  const reducedLevels = levelsIdentity.slice(0, LARGE_REDUCED_COUNTS.length);
   const indexIdentities = reducedLevels.map(level => level.indices);
   const hierarchicalOrder = spatialIndex.drawOrder.indices;
+  const priority = buildPriorityOrder(LARGE_POINT_COUNT, DEFAULT_CELL_PRIORITY);
 
-  assert.equal(levelsIdentity.length, REDUCTION_FACTORS.length + 1);
+  assert.equal(levelsIdentity.length, LARGE_REDUCED_COUNTS.length + 1);
   assert.deepEqual(
     reducedLevels.map(level => level.pointCount),
     LARGE_REDUCED_COUNTS,
   );
   assert.ok(hierarchicalOrder instanceof Uint32Array);
   assert.equal(hierarchicalOrder.length, LARGE_POINT_COUNT);
-  assert.equal(new Set(indexIdentities).size, REDUCTION_FACTORS.length);
+  assert.equal(new Set(indexIdentities).size, LARGE_REDUCED_COUNTS.length);
 
   for (let levelIndex = 0; levelIndex < reducedLevels.length; levelIndex++) {
-    const { indices, pointCount } = reducedLevels[levelIndex];
+    const level = reducedLevels[levelIndex];
+    const { indices, pointCount } = level;
     assert.ok(indices instanceof Uint32Array);
-    assert.equal(indices, indexIdentities[levelIndex]);
     assert.equal(indices.buffer, hierarchicalOrder.buffer);
     assert.equal(indices.byteOffset, hierarchicalOrder.byteOffset);
     assert.equal(indices.length, pointCount);
+    assert.deepEqual(indices, hierarchicalOrder.subarray(0, pointCount));
+    // The first `pointCount` cells of the priority order.
     assert.deepEqual(
-      indices,
-      hierarchicalOrder.subarray(0, pointCount),
+      Array.from(indices).sort((x, y) => x - y),
+      Array.from(priority.subarray(0, pointCount)).sort((x, y) => x - y),
+    );
+    assert.equal(level.depth, levelIndex);
+    assert.equal(level.isFullDetail, false);
+    assert.equal(level.sizes, null);
+    assert.equal(Object.hasOwn(level, 'positions'), false);
+    assert.equal(
+      level.sizeMultiplier,
+      Math.sqrt(Math.min(44, LARGE_POINT_COUNT / pointCount)) * 0.2 + 0.8,
     );
   }
 
@@ -269,16 +199,12 @@ test('one typed draw order backs every large reduced LOD prefix', () => {
     .reduce((sum, buffer) => sum + buffer.byteLength, 0);
   assert.equal(uniqueBackingBuffers.size, 1);
   assert.equal(actualUniqueBackingBytes, LARGE_SHARED_BACKING_BYTES);
-  assert.equal(LARGE_LEGACY_SEPARATE_BACKING_BYTES, 171512);
+  assert.equal(LARGE_LEGACY_SEPARATE_BACKING_BYTES, 170152);
   assert.equal(LARGE_SHARED_BACKING_BYTES, 40004);
-  assert.equal(LARGE_AVOIDED_BACKING_BYTES, 131508);
-  assert.ok(
-    LARGE_AVOIDED_BACKING_BYTES /
-      LARGE_LEGACY_SEPARATE_BACKING_BYTES >
-      0.76,
-  );
+  assert.ok(LARGE_AVOIDED_BACKING_BYTES / LARGE_LEGACY_SEPARATE_BACKING_BYTES > 0.76);
 
   const fullDetail = levelsIdentity.at(-1);
+  assert.equal(fullDetail.depth, LARGE_REDUCED_COUNTS.length);
   assert.equal(fullDetail.positions, positions);
   assert.equal(fullDetail.colors, colors);
   assert.equal(fullDetail.pointCount, LARGE_POINT_COUNT);
@@ -288,15 +214,12 @@ test('one typed draw order backs every large reduced LOD prefix', () => {
   // The levels are published once, at construction.
   assert.equal(spatialIndex.lodLevels, levelsIdentity);
   for (let levelIndex = 0; levelIndex < indexIdentities.length; levelIndex++) {
-    assert.equal(
-      spatialIndex.lodLevels[levelIndex].indices,
-      indexIdentities[levelIndex],
-    );
+    assert.equal(spatialIndex.lodLevels[levelIndex].indices, indexIdentities[levelIndex]);
   }
 });
 
 test('index-only reduced LOD radius queries preserve source and custom-position results', () => {
-  const { positions, spatialIndex } = makeSpatialIndex();
+  const { positions, spatialIndex } = makeLodOnlySpatialIndex(LARGE_POINT_COUNT);
   const levelIndex = 0;
   const indices = spatialIndex.lodLevels[levelIndex].indices;
   const orderBeforeQueries = Uint32Array.from(
@@ -404,7 +327,7 @@ const makeNormalizedIndex = pointCount => {
     },
   );
   index.root = singleLeafRoot(pointCount, index.bounds);
-  index.lodLevels = index._generateLODLevels();
+  index.lodLevels = index._generateLODLevels(DEFAULT_CELL_PRIORITY);
   return index;
 };
 

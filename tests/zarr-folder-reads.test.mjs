@@ -14,6 +14,7 @@ import { copyBox, fillBox, mergeAxes } from '../assets/js/formats/zarr/chunks.js
 import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 
 import { corpusFolder } from './helpers/zarr-corpus.mjs';
+import { array, group, zarrEntries } from './helpers/anndata-store.mjs';
 
 /** A folder whose every file read is recorded (path, start, end). */
 function recordedFolder(files) {
@@ -54,15 +55,17 @@ test('a folder read reads each chunk file it needs once, together, and no other'
   assert.deepEqual(reads, ['0.0', '0.1', '0.2'].map(name => `cases.zarr/codecs/zstd/${name}`));
 });
 
-test('a picked folder\'s link is the disk: per-file reads never make it look slow, so it reads ahead', async () => {
+test('a picked folder\'s link is the disk: its reads measure it, never make it look slow, so it reads ahead', async () => {
   const files = await corpusFolder('anndata/v2.zarr');
   const opened = await openDatasetStore({ source: { files, rootName: 'v2.zarr' } }, { decodedChunkCacheBytes: 1 << 20 });
   // Every chunk of every array, read file by file.
   const arrays = ['X/data', 'X/indices', 'obs/n_genes', 'obsm/X_umap', 'obsp/connectivities/data'];
   await Promise.all(arrays.map(path => opened.root.get(path).read()));
   const link = opened.link.snapshot();
-  assert.equal(link.measured, false);
+  assert.equal(link.measured, true, 'the folder\'s reads measure its link');
   assert.equal(link.readsAhead, true);
+  const { LOCAL_POLICY } = await import('../assets/js/formats/io/byte-source.js');
+  assert.ok(link.mergeGapBytes >= LOCAL_POLICY.mergeGapBytes, 'one more read never costs less than a local file\'s prior');
   opened.root.close();
 });
 
@@ -217,7 +220,7 @@ function shardedFolder(n, inner) {
   return { files, values };
 }
 
-test('the inner chunks of a shard a read needs are read as one slice per run of neighbours', async () => {
+test('the inner chunks of a shard reads need are read as one slice per run of neighbours within a read\'s cost', async () => {
   const { files, values } = shardedFolder(64, 8);
   const sizes = [];
   const root = await openZarr(directoryStore(files, { readBlob: blob => { sizes.push(blob.size); return blob.arrayBuffer(); } }));
@@ -225,15 +228,38 @@ test('the inner chunks of a shard a read needs are read as one slice per run of 
   assert.deepEqual(await root.get('a').read(), values);
   // The index (8 entries of 16 bytes), then all eight inner chunks in one slice.
   assert.deepEqual(sizes, [128, 64 * 4]);
-  // Two runs of neighbours (chunks 0-1 and 6-7) of a fresh store: two slices.
-  const again = await openZarr(directoryStore(files, { readBlob: blob => { sizes.push(blob.size); return blob.arrayBuffer(); } }));
-  const array = again.get('a');
-  sizes.length = 0;
-  const [head, tail] = await Promise.all([array.read([[0, 16]]), array.read([[48, 64]])]);
-  assert.deepEqual(head, values.subarray(0, 16));
-  assert.deepEqual(tail, values.subarray(48, 64));
-  assert.deepEqual(sizes.slice(1).sort((a, b) => a - b), [64, 64]);
-  assert.equal(sizes[0], 128);
+  // Two runs of neighbours (chunks 0-1 and 6-7) of a fresh store, asked for
+  // by two reads at once: 128 bytes apart, less than one more read costs on
+  // a local file's link, they are one slice; on a link that prices a read
+  // below that gap, two.
+  for (const [link, slices] of [[undefined, [256]], [{ begin: () => 0, end: () => {}, mergeGapBytes: 64 }, [64, 64]]]) {
+    const again = await openZarr(directoryStore(files, { link, readBlob: blob => { sizes.push(blob.size); return blob.arrayBuffer(); } }));
+    const array = again.get('a');
+    sizes.length = 0;
+    const [head, tail] = await Promise.all([array.read([[0, 16]]), array.read([[48, 64]])]);
+    assert.deepEqual(head, values.subarray(0, 16));
+    assert.deepEqual(tail, values.subarray(48, 64));
+    assert.deepEqual(sizes.slice(1).sort((a, b) => a - b), slices);
+    assert.equal(sizes[0], 128);
+  }
+});
+
+test('a picked folder: the few entries of many genes in one uncompressed chunk file are one read of it, not one each', async () => {
+  // One uncompressed chunk file of 16,384 values; 40 reads of 20 values, 400
+  // values (1.6 KB) apart, asked for at once (the counted entries of 40 genes).
+  const chunk = Float32Array.from({ length: 16384 }, (_, i) => i);
+  const entries = zarrEntries(group({ x: array(chunk, { chunks: [16384] }) }));
+  const files = new Map([...entries].map(([key, bytes]) => [`s.zarr/${key}`, new File([bytes], key.split('/').at(-1))]));
+  const slices = [];
+  const store = directoryStore(files, { readBlob: blob => { slices.push(blob.size); return blob.arrayBuffer(); } });
+  const root = await openZarr(store, { decodedChunkCacheBytes: 0 });
+  const x = root.get('x');
+  slices.length = 0;
+  const genes = Array.from({ length: 40 }, (_, g) => [g * 400, g * 400 + 20]);
+  const read = await Promise.all(genes.map(([start, end]) => x.read([[start, end]])));
+  read.forEach((values, g) => assert.deepEqual(values, chunk.subarray(genes[g][0], genes[g][1])));
+  assert.equal(slices.length, 1, `one read of the chunk file, not ${slices.length}`);
+  assert.ok(slices[0] < chunk.byteLength, 'only the span the reads cover');
 });
 
 test('the limiter serves waiting tasks in order, background work last and never in the last slot, and a flipped activity in its turn', async () => {

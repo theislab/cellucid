@@ -18,7 +18,7 @@
  * @module data/anndata/transcode/r-object
  */
 
-import { INLINE_ELEMENTS, readRFile, savedObjects } from '../../../formats/rds/index.js';
+import { INLINE_ELEMENTS, isUncompressed, readRFile, savedObjects } from '../../../formats/rds/index.js';
 import { hasClass, classesOf, namedItems } from './r-values.js';
 import { isDroppedSeuratLayer, SEURAT_DROPPED_SLOTS, isSeurat, isSeuratV2, seuratModel } from './seurat.js';
 import { isSingleCellExperiment, isSummarizedExperiment, sceModel } from './sce.js';
@@ -140,6 +140,9 @@ export async function transcodeRFile(source, context) {
     const result = await transcodeOnce({
       identity: reader.identity,
       fileName,
+      bytes: reader.size,
+      // An uncompressed file is read by its structure, its arrays in place.
+      readsWhole: async () => !isUncompressed(await reader.read(0, Math.min(16, reader.size), { signal })),
       link: reader.link,
       sourceBlobs: new Map([['file', fileBlob(reader)]]),
       context,
@@ -158,7 +161,10 @@ async function buildObjects(reader, fileName, space, { signal, activity }) {
   const readRegion = region => (region.store === 'file'
     ? reader.read(region.offset, region.byteLength, { signal }).then(bytes => bytes.slice())
     : space.read(region));
-  const modelContext = { space, readRegion };
+  // An uncompressed file's arrays are read in place, never copied: its store
+  // keeps the object's order of cells (`priority.js`).
+  const ordered = !isUncompressed(await reader.read(0, Math.min(16, reader.size), { signal }));
+  const modelContext = { space, readRegion, signal, ordered };
   const candidates = parsed.container === 'rda' ? savedObjects(parsed.root) : [{ name: null, value: parsed.root }];
   const objects = [];
   const others = [];

@@ -23,8 +23,8 @@ const FIXTURE_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
   '&dataset=current-ui&acceptance=highlight-store-draw-parity-ci';
 const POINT_COUNT = 40_000;
-// A reduced level (rendering/high-perf/draw-order.js LOD_REDUCTION_FACTORS:
-// 4.8x fewer points), below the highlights of either test.
+// A reduced level (rendering/high-perf/draw-order.js `lodLadder`: 9,306 of
+// the 40,000 cells), below the highlights of either test.
 const LEVEL = 10;
 
 async function loadAtlas(page) {

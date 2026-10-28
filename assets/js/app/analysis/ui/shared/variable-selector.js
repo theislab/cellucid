@@ -104,6 +104,8 @@ class VariableSelectorComponent {
     this._typeSelect = null;
     this._variableSelect = null;
     this._geneExpressionContainer = null;
+    /** @type {(() => void)|null} Waits for the genes of a dataset just shown. */
+    this._unsubscribeGenesListed = null;
 
     // Render initial state
     this.render();
@@ -252,9 +254,25 @@ class VariableSelectorComponent {
     const geneVars = this.dataLayer.getAvailableVariables('gene_expression');
 
     if (geneVars.length === 0) {
-      this.container.appendChild(
-        createEmptyState('No gene expression data available.')
-      );
+      const state = this.dataLayer.state;
+      const pending = state.areGenesPending();
+      const failure = state.getGeneListFailure();
+      this.container.appendChild(createEmptyState(
+        pending
+          ? 'Reading the gene names…'
+          : failure !== null
+            ? `The gene names could not be read: ${failure.message}`
+            : 'No gene expression data available.'
+      ));
+      // A dataset just shown reads its genes after its first view: listed
+      // here once they are read.
+      if (pending && this._unsubscribeGenesListed === null) {
+        this._unsubscribeGenesListed = state.on('genes:listed', () => {
+          this._unsubscribeGenesListed?.();
+          this._unsubscribeGenesListed = null;
+          if (this._selectedType === 'gene') this.render();
+        });
+      }
       return;
     }
 
@@ -395,6 +413,8 @@ class VariableSelectorComponent {
    * Destroy and cleanup
    */
   destroy() {
+    this._unsubscribeGenesListed?.();
+    this._unsubscribeGenesListed = null;
     this._selectedType = '';
     this._currentSelection = { type: '', variable: '' };
     this._typeSelect = null;

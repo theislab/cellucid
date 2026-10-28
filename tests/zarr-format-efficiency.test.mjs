@@ -267,6 +267,42 @@ test('concurrent reads of a sharded array on a web host share shard indexes and 
   assert.ok(log.every(entry => !entry.range?.startsWith('bytes=-')));
 });
 
+test('a read across shards asks for every shard index before any inner chunk, each index once', async () => {
+  const entries = await corpusEntries('v3/cases.zarr');
+  const log = [];
+  const fetch = async (url, init = {}) => {
+    const relative = decodeURIComponent(new URL(url).pathname.replace(/^\/host\//, ''));
+    log.push({ key: relative, range: init.headers?.Range ?? null });
+    const bytes = entries.get(relative);
+    if (bytes === undefined) return new Response(null, { status: 404 });
+    const range = init.headers?.Range;
+    if (!range) return new Response(bytes, { status: 200 });
+    const [, a, b] = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const start = a === '' ? bytes.length - Number(b) : Number(a);
+    const end = a === '' ? bytes.length : Number(b) + 1;
+    // An index answers late for one shard: the others' chunks still wait for it.
+    if (a === '' && relative.endsWith('/c/2/1')) {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      log.push({ key: 'late index answered', range: null });
+    }
+    return new Response(bytes.subarray(start, end), { status: 206 });
+  };
+  const root = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  log.length = 0;
+  const array = root.get('sharding/end_index');
+  // Every row and column: 3 x 2 shards of 8 x 10 elements (24 x 20).
+  const values = await array.read();
+  assert.equal(values[24 * 20 - 1], 24 * 20 - 1);
+  const shards = log.filter(entry => entry.key.startsWith('sharding/end_index/c/'));
+  const indexReads = shards.filter(entry => entry.range?.startsWith('bytes=-'));
+  assert.equal(indexReads.length, 6, 'one index read per shard');
+  assert.equal(new Set(indexReads.map(entry => entry.key)).size, 6);
+  const answered = log.findIndex(entry => entry.key === 'late index answered');
+  const firstChunk = log.findIndex(entry => entry.key.startsWith('sharding/end_index/c/') && !entry.range?.startsWith('bytes=-'));
+  assert.ok(answered >= 0 && firstChunk > answered, 'the inner chunks are asked for once every index is in, together');
+  assert.equal(shards.length - 6, 6, 'each shard\'s inner chunks in one request');
+});
+
 test('a host that refuses suffix ranges is read with HEAD, once it has refused', async () => {
   const entries = await corpusEntries('v3/cases.zarr');
   const log = [];

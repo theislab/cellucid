@@ -606,7 +606,7 @@ export function getColormapByteTable(colormap) {
   if (table !== undefined) return table;
   const buckets = COLORMAP_TABLE_BUCKETS;
   const segments = colormap.colors.length - 1;
-  table = new Uint8Array((buckets + 1) * 4);
+  table = new Uint8Array((COLORMAP_TABLE_BUCKETS + 1) * 4);
   const sample = [0, 0, 0];
   colormap.sampleInto(0, sample);
   let r = Math.round(sample[0] * 255);

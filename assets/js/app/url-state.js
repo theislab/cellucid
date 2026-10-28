@@ -16,12 +16,16 @@
  *                                     (geo:GSE…), or any web address.
  *                                     `dataset` picks one entry of a link
  *                                     that holds several.
+ * - &cells=10%&sample=blocks&seed=0 → The subsample the dataset is open with,
+ *                                     when one was chosen (`subsample-url.js`);
+ *                                     never one fitted to the device
  * - ?annotations=owner/repo[@branch]→ Community annotation repo (votes/suggestions)
  * - (no params)                     → Local file or empty state
  */
 
 import { validateDatasetId } from '../data/data-source.js';
 import { validateRemoteServerUrl } from '../data/remote-source.js';
+import { SUBSAMPLE_URL_PARAMETERS, subsampleUrlEntries } from './subsample-url.js';
 
 let latestPublicationGeneration = 0;
 
@@ -58,10 +62,11 @@ export function prepareUrlForDatasetSelection(selection) {
       'Dataset selection URL source must own the exact sourceType.'
     );
   }
+  const subsample = chosenSubsampleEntries(record.source, record.datasetId);
   if (record.sourceType === 'local-demo') {
     return prepareUrlForDataSource('local-demo', {
       datasetId: record.datasetId
-    });
+    }, subsample);
   }
   if (record.sourceType === 'remote') {
     if (typeof record.source.getConnectionInfo !== 'function') {
@@ -78,7 +83,7 @@ export function prepareUrlForDatasetSelection(selection) {
     return prepareUrlForDataSource('remote', {
       datasetId: record.datasetId,
       serverUrl: connection.url
-    });
+    }, subsample);
   }
   if (record.sourceType === 'link') {
     if (typeof record.source.getConnectionInfo !== 'function') {
@@ -95,7 +100,7 @@ export function prepareUrlForDatasetSelection(selection) {
     return prepareUrlForDataSource('link', {
       datasetId: connection.datasetsCount > 1 ? record.datasetId : null,
       locator: connection.locator
-    });
+    }, subsample);
   }
   if (
     record.sourceType === 'local-user' ||
@@ -109,19 +114,36 @@ export function prepareUrlForDatasetSelection(selection) {
 }
 
 /**
+ * The parameters of the subsample a staged dataset was opened with, when
+ * one was chosen (in the Session panel or by a link); none for every cell
+ * or a subsample fitted to the device.
+ */
+function chosenSubsampleEntries(source, datasetId) {
+  const annData = typeof source.getAnnDataSource === 'function' ? source.getAnnDataSource(datasetId) : null;
+  const subset = annData?.getCellSubset?.() ?? null;
+  // Only a specification a link reproduces exactly: never cells fitted to
+  // the device, nor a restored set its specification no longer gives.
+  if (subset === null || subset.kept === null || subset.autoFit !== null || subset.reproduced === false) return [];
+  return subsampleUrlEntries(subset.spec);
+}
+
+/**
  * Validate one complete URL-state publication before dataset I/O begins.
  * The returned owner commits all data-source parameters in one replaceState
  * call and can restore the exact prior URL if final dataset publication stops.
  *
  * @param {'local-demo'|'remote'|'link'|'local-user'|'jupyter'|null} sourceType
  * @param {Object} sourceInfo
+ * @param {Array<[string, string]>} [subsampleEntries] - The subsample the
+ *   dataset is open with (`subsample-url.js`), for a source the address names
  * @returns {Readonly<{
  *   commit: () => string,
  *   rollback: () => string
  * }>}
  */
-export function prepareUrlForDataSource(sourceType, sourceInfo) {
+export function prepareUrlForDataSource(sourceType, sourceInfo, subsampleEntries = []) {
   const sourceState = requireUrlSourceState(sourceType, sourceInfo);
+  if (sourceState.entries.length > 0) sourceState.entries.push(...subsampleEntries);
   const browser = requireBrowserHistoryOwner();
   let publicationState = 'prepared';
   let publicationGeneration = null;
@@ -141,7 +163,7 @@ export function prepareUrlForDataSource(sourceType, sourceInfo) {
       const nextUrl = new URL(browser.location.href);
       // `anndata` is the Python AnnData server's startup instruction for its
       // own origin; it describes the source being replaced, so it goes too.
-      for (const name of DATA_SOURCE_URL_PARAMETERS) {
+      for (const name of [...DATA_SOURCE_URL_PARAMETERS, ...SUBSAMPLE_URL_PARAMETERS]) {
         nextUrl.searchParams.delete(name);
       }
       for (const [name, value] of sourceState.entries) {
@@ -202,7 +224,8 @@ const DATA_SOURCE_URL_PARAMETERS = Object.freeze([
 
 /**
  * The data-source parameters of a page URL, and nothing else: what a shared
- * link needs to reopen the same dataset. Display parameters and the
+ * link needs to reopen the same dataset, with the same subsample when one
+ * was chosen. Display parameters and the
  * annotation repository are left out.
  *
  * @param {string} href
@@ -211,7 +234,7 @@ const DATA_SOURCE_URL_PARAMETERS = Object.freeze([
 export function readDataSourceUrlParameters(href) {
   const source = new URL(href).searchParams;
   const out = new URLSearchParams();
-  for (const name of DATA_SOURCE_URL_PARAMETERS) {
+  for (const name of [...DATA_SOURCE_URL_PARAMETERS, ...SUBSAMPLE_URL_PARAMETERS]) {
     const value = source.get(name);
     if (value !== null) out.set(name, value);
   }

@@ -201,9 +201,9 @@ test('a server may state every format in every layout it arrives in, and nothing
         layout,
         ...(INPUT_FORMATS.find(format => format.id === kind)?.container === 'zarr'
           ? {}
-          : { files: [{ path: 'matrix.mtx.gz', size: 10 }] }),
+          : { files: [{ path: 'matrix.mtx.gz', size: 10, etag: '"a-1"' }] }),
       }
-      : { url: '_cellucid/anndata/x', kind, layout, size: 10 },
+      : { url: '_cellucid/anndata/x', kind, layout, size: 10, etag: '"a-1"' },
     defaults: {},
   }, 'dataset');
   for (const format of INPUT_FORMATS) {

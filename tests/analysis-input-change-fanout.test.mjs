@@ -54,11 +54,13 @@ function deUi(options) {
     _seenVisibleDigest: null,
     _visibleDigestCache: null,
     _missedInputChange: false,
+    _publishedStale: false,
+    _cellsSeen: null,
     _refreshOptionsContext: () => { refreshes += 1; },
     _updateStale: () => {},
     _updatePageSelectorCounts: () => {},
   });
-  ui._resultInputs = { options, pages: [], highlightRevision: 0, visibleDigest: ui._visibleCellsDigest() };
+  ui._resultInputs = { options, pages: [], highlightRevision: 0, visibleDigest: ui._visibleCellsDigest(), cells: null };
   ui._seenVisibleDigest = ui._visibleCellsDigest();
   return { ui, state, refreshes: () => refreshes };
 }

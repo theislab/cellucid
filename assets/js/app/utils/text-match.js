@@ -14,22 +14,30 @@
  * The positions of `keys` that contain `query`, best match first: equal,
  * then starting with it, then containing it; each rank in list order.
  * `keys` and `query` are compared as given (callers lower-case both).
+ * `aliases`, when given, is a second name per position (a gene's identifier
+ * beside its symbol): a position ranks by the better of its two matches.
  *
  * @param {string[]} keys
  * @param {string} query - Non-empty.
+ * @param {ReadonlyArray<string>|null} [aliases]
  * @returns {number[]}
  */
-export function rankedMatchIndices(keys, query) {
+export function rankedMatchIndices(keys, query, aliases = null) {
   const equal = [];
   const starts = [];
   const contains = [];
-  for (let index = 0; index < keys.length; index++) {
-    const key = keys[index];
+  const rankOf = key => {
     const at = key.indexOf(query);
-    if (at < 0) continue;
-    if (at > 0) contains.push(index);
-    else if (key.length === query.length) equal.push(index);
-    else starts.push(index);
+    if (at < 0) return 3;
+    if (at > 0) return 2;
+    return key.length === query.length ? 0 : 1;
+  };
+  for (let index = 0; index < keys.length; index++) {
+    let rank = rankOf(keys[index]);
+    if (aliases !== null && rank > 0 && aliases[index]) rank = Math.min(rank, rankOf(aliases[index]));
+    if (rank === 0) equal.push(index);
+    else if (rank === 1) starts.push(index);
+    else if (rank === 2) contains.push(index);
   }
   return equal.concat(starts, contains);
 }

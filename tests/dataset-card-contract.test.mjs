@@ -17,6 +17,7 @@ import {
 } from '../assets/js/app/ui/modules/dataset-card.js';
 import { TransferLog } from '../assets/js/data/transfer-log.js';
 import { describeAnnDataStorage } from '../assets/js/data/anndata-storage.js';
+import { READ_IN_PARTS_INSTEAD } from '../assets/js/data/whole-read-notice.js';
 
 /** A view whose timers wait to be run: the box redraws on its own clock. */
 function fakeView() {
@@ -168,7 +169,7 @@ const LOCAL_RDS = Object.freeze({
   url: null,
   name: 'pbmc_small.rds',
   bytes: 512_000,
-  conversion: Object.freeze({ kept: 'opfs', reused: false, notes: NOT_READ }),
+  conversion: Object.freeze({ kept: 'opfs', persistent: true, whole: true, reused: false, notes: NOT_READ }),
 });
 
 test('where a dataset is read from is one short line', () => {
@@ -287,47 +288,58 @@ test('a long description folds to two lines with More', () => {
   assert.equal(dom.descriptionToggle.textContent, 'Less');
 });
 
-test('a dataset read once into this browser says where it is kept and how much was not read, in one line', () => {
+test('a dataset read once into this browser says it was read whole, where it is kept and how much was not read, in one line', () => {
   assert.equal(describeConversion(null), '');
   assert.equal(describeConversion(LOCAL_H5AD), '', 'an AnnData file has no such line');
-  assert.equal(describeConversion(LOCAL_RDS), "Read once into this browser's storage for this tab · 2 parts not read");
+  assert.equal(describeConversion(LOCAL_RDS), "Read whole once (it cannot be read in parts), kept in this browser's storage for next time · 2 parts not read");
   const one = { ...LOCAL_RDS, conversion: { ...LOCAL_RDS.conversion, notes: NOT_READ.slice(0, 1) } };
-  assert.equal(describeConversion(one), "Read once into this browser's storage for this tab · 1 part not read");
-  const whole = { ...LOCAL_RDS, conversion: { kept: 'opfs', reused: false, notes: [] } };
-  assert.equal(describeConversion(whole), "Read once into this browser's storage for this tab");
-  const reused = { ...LOCAL_RDS, conversion: { kept: 'opfs', reused: true, notes: [] } };
-  assert.equal(describeConversion(reused), "Opened from this browser's storage, read earlier in this tab");
-  const memory = { ...LOCAL_RDS, conversion: { kept: 'memory', reused: false, notes: NOT_READ } };
-  assert.equal(describeConversion(memory), 'Read once into memory for this tab · 2 parts not read');
-  // The format is named as it is; the line above says it was read once.
+  assert.equal(describeConversion(one), "Read whole once (it cannot be read in parts), kept in this browser's storage for next time · 1 part not read");
+  const tab = { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: false, whole: true, reused: false, notes: [] } };
+  assert.equal(describeConversion(tab), "Read whole once (it cannot be read in parts), into this browser's storage for this tab");
+  const reused = { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: true, whole: true, reused: true, notes: [] } };
+  assert.equal(describeConversion(reused), "Opened from this browser's storage, read whole on an earlier open");
+  const memory = { ...LOCAL_RDS, conversion: { kept: 'memory', persistent: false, whole: true, reused: false, notes: NOT_READ } };
+  assert.equal(describeConversion(memory), 'Read whole once (it cannot be read in parts), into memory for this tab · 2 parts not read');
+  const structure = { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: true, whole: false, reused: false, notes: [] } };
+  assert.equal(describeConversion(structure), "Structure read once (arrays read in place), kept in this browser's storage for next time");
+  // The format is named as it is; the line above says how it was read.
   assert.equal(describeStorageFormat(LOCAL_RDS), 'R object (.rds)');
   assert.equal(describeOrigin(LOCAL_RDS), 'R object (.rds) · this computer');
 });
 
-test('the details of a converted dataset say how it was read, where it is kept, and each part not read', () => {
+test('the details of a converted dataset say how it was read, where it is kept, what reads in parts, and each part not read', () => {
   const rows = describeDetails(identity('pbmc_small', { source: { name: 'R object (.rds)', filename: 'pbmc_small.rds' } }), LOCAL_RDS, null);
   const byLabel = Object.fromEntries(rows.map(row => [row.label, row]));
-  assert.deepEqual(Object.keys(byLabel).slice(0, 6), ['File', 'Format', 'Size', 'Read', 'Kept', 'Not read']);
+  assert.deepEqual(Object.keys(byLabel).slice(0, 7), ['File', 'Format', 'Size', 'Read', 'Kept', 'Read in parts', 'Not read']);
   assert.equal(byLabel.Format.value, 'R object (.rds)');
-  assert.equal(byLabel.Read.value, 'Once, from start to end, from this computer; nothing is uploaded');
-  assert.equal(byLabel.Kept.value, "In this browser's storage (the origin-private file system) until this tab closes");
+  assert.equal(byLabel.Read.value, 'Whole, once, from start to end (it cannot be read in parts), from this computer; nothing is uploaded');
+  assert.equal(byLabel.Kept.value, "In this browser's storage (the origin-private file system) until it is cleared (Session › Open data: Stored, Clear) or the browser needs the room");
+  assert.equal(byLabel['Read in parts'].value, READ_IN_PARTS_INSTEAD);
   assert.deepEqual(byLabel['Not read'].lines, NOT_READ);
   assert.equal(byLabel['Not read'].value, NOT_READ.join('\n'));
 
   const remote = { ...LOCAL_RDS, remote: true, url: 'https://ftp.ncbi.nlm.nih.gov/geo/series/pbmc_small.rds' };
   const remoteRows = describeDetails(identity('pbmc_small'), remote, null);
-  assert.equal(remoteRows.find(row => row.label === 'Read').value, 'Once, from start to end, from ftp.ncbi.nlm.nih.gov');
+  assert.equal(remoteRows.find(row => row.label === 'Read').value, 'Whole, once, from start to end (it cannot be read in parts), from ftp.ncbi.nlm.nih.gov');
 
-  const reused = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', reused: true, notes: [] } }, null);
-  assert.equal(reused.find(row => row.label === 'Kept').value, "In this browser's storage until this tab closes; read when it was first opened in this tab, not again");
+  const reused = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: true, whole: true, reused: true, notes: [] } }, null);
+  assert.equal(reused.find(row => row.label === 'Kept').value, "In this browser's storage (the origin-private file system) until it is cleared (Session › Open data: Stored, Clear) or the browser needs the room; read when it was first opened, not again");
   assert.equal(reused.some(row => row.label === 'Not read'), false, 'nothing left out, no row');
 
-  const memory = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'memory', reused: false, notes: [] } }, null);
+  const tab = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: false, whole: true, reused: false, notes: [] } }, null);
+  assert.equal(tab.find(row => row.label === 'Kept').value, "In this browser's storage (the origin-private file system) until this tab closes");
+
+  const memory = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'memory', persistent: false, whole: true, reused: false, notes: [] } }, null);
   assert.equal(memory.find(row => row.label === 'Kept').value, 'In memory until this tab closes: this browser gives this page no storage (as in a private window)');
 
-  // An AnnData file has neither row.
+  // An uncompressed R file: its structure read, its arrays in place; nothing to read in parts instead.
+  const structure = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: true, whole: false, reused: false, notes: [] } }, null);
+  assert.equal(structure.find(row => row.label === 'Read').value, 'Its structure once, its arrays in place, from this computer; nothing is uploaded');
+  assert.equal(structure.some(row => row.label === 'Read in parts'), false);
+
+  // An AnnData file has none of these rows.
   const plain = describeDetails(identity('cells'), LOCAL_H5AD, null);
-  assert.equal(plain.some(row => row.label === 'Kept' || row.label === 'Not read'), false);
+  assert.equal(plain.some(row => row.label === 'Kept' || row.label === 'Not read' || row.label === 'Read in parts'), false);
 });
 
 test('the box shows the conversion line and one Details line per part not read, and drops both for the next dataset', () => {
@@ -335,7 +347,7 @@ test('the box shows the conversion line and one Details line per part not read, 
   const { card, dom } = harness;
   card.show(identity('pbmc_small'), 'local-user');
   assert.equal(dom.conversion.hidden, false);
-  assert.equal(dom.conversion.textContent, "Read once into this browser's storage for this tab · 2 parts not read");
+  assert.equal(dom.conversion.textContent, "Read whole once (it cannot be read in parts), kept in this browser's storage for next time · 2 parts not read");
   assert.equal(dom.origin.textContent, 'R object (.rds) · this computer');
   const terms = dom.detailsList.children;
   const index = terms.findIndex(node => node.tagName === 'DT' && node.textContent === 'Not read');

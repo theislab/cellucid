@@ -315,9 +315,11 @@ test('the bootstrap no longer reads the preference at all', () => {
 test('the dataset re-decides antialiasing on every publication', () => {
   // Datasets are switched in place, so a page that opened on four thousand cells
   // and now holds eighteen million has to answer for the eighteen million.
+  // A progressive opening (`app/open-cells-resize.js`) is drawn from its
+  // first view as the cells it grows to.
   assert.match(
     mainSource,
-    /ui\.applyDatasetRenderDefaults\(\s*publication\.stage\.generation\.identity\.stats\.n_cells,\s*publication\.stage\.generation\.identity\.embeddings\.default_dimension/,
+    /ui\.applyDatasetRenderDefaults\(\s*shownAnnDataSource\(\)\?\.getCellSubset\?\.\(\)\?\.growth\?\.target\s*\?\? publication\.stage\.generation\.identity\.stats\.n_cells,\s*publication\.stage\.generation\.identity\.embeddings\.default_dimension/,
     'the cell count must reach the render defaults'
   );
   assert.match(
@@ -461,7 +463,7 @@ function makeDom() {
       options: ['full', 'sculpted', 'light', 'ultralight'],
     }),
     hpLodForceInput: new FakeElement({
-      id: 'hp-lod-force', type: 'range', value: '-1', min: '-1', max: '17', step: '1',
+      id: 'hp-lod-force', type: 'range', value: '-1', min: '-1', max: '0', step: '1',
     }),
     hpLodForceContainer: new FakeElement({ id: 'lod-force-container' }),
     hpLodForceDisplay: new FakeElement({ id: 'hp-lod-force-label' }),
@@ -496,6 +498,7 @@ function makeViewer({ available = true } = {}) {
     setShaderQuality: () => {},
     setAdaptiveLOD: () => {},
     setForceLOD: () => {},
+    getLODLevelCount: () => 18,
     setFrustumCulling: () => {},
     setAntialiasing(value) {
       this.published.push(value);

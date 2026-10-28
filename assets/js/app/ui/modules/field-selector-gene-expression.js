@@ -15,12 +15,16 @@ import { createWindowedListbox } from '../components/windowed-listbox.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import {
   createDatasetFieldLoadSupersededError,
-  isDatasetFieldLoadSupersededError
+  isDatasetFieldLoadSupersededError,
+  isFieldLoadCancelledError
 } from '../../state/managers/field/loading.js';
 import {
   isFieldInteractionSupersededError
 } from './field-interaction-owner.js';
 import { rankedMatchIndices } from '../../utils/text-match.js';
+import { namesAreIdentifiers } from '../../../data/gene-names.js';
+import { geneIdentities } from '../../analysis/shared/gene-sets.js';
+import { PLACES, placePath } from '../place-names.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 const INIT_KEYS = new Set([
@@ -73,7 +77,11 @@ const RETURN_KEYS = new Set([
 
    So this copy states that count, says the panel is fixed upstream, and stops
    there. It must never assert that a searched gene was removed, nor guess how
-   many genes are absent: the app cannot know either one.
+   many genes are absent: the app cannot know either one. One thing it does
+   know: when the genes are named by identifiers (an Ensembl var index with no
+   var column of symbols found beside it), a symbol finds nothing because of
+   how the genes are named, and the copy says so and how to change it. When a
+   symbols column names them, their identifiers are searched too.
    --------------------------------------------------------------------------- */
 const GENE_PANEL_HELP_URL = 'https://docs.cellucid.com/en/latest/'
   + 'user_guide/web_app/d_fields_coloring_legends/'
@@ -165,8 +173,16 @@ function countPublishedGenes(inventory) {
  * @param {number} publishedGeneCount
  * @returns {string}
  */
-function formatGenePanelNote(publishedGeneCount) {
+function formatGenePanelNote(publishedGeneCount, identifierExample = null) {
   const noun = publishedGeneCount === 1 ? 'gene name' : 'gene names';
+  if (identifierExample !== null) {
+    /* The names are database identifiers (the var index) and no var column
+       of symbols was found to name the genes by: a symbol finds nothing
+       because of how the genes are named, not because a gene is absent. */
+    return `This dataset's ${formatCount(publishedGeneCount)} ${noun} are identifiers `
+      + `such as ${identifierExample}, not symbols: search by identifier, or choose `
+      + `the var column that holds the symbols as the gene names in ${placePath(PLACES.session, PLACES.dataMapping)}.`;
+  }
   return `This dataset publishes ${formatCount(publishedGeneCount)} ${noun}, `
     + 'chosen when its file was written and possibly a subset of the source data. '
     + 'Check for typos too.';
@@ -364,6 +380,13 @@ export function initGeneExpressionSelector(options) {
   // Lower-cased keys, built once per inventory, so a keystroke filters a
   // 30,000-gene panel without allocating 30,000 strings.
   let geneSearchKeys = [];
+  // Each gene's identifier when the names come from a var column of symbols
+  // (`geneNames.ids`), searched beside the names; null otherwise.
+  let geneIdKeys = null;
+  /** @type {Map<number, string>} Identifier by gene field index */
+  let geneIdsByIndex = new Map();
+  // An example identifier when the names themselves are identifiers.
+  let identifierExample = null;
   let publishedGeneCount = 0;
   let selectedGeneOriginalIdx = -1;
   let forceDisabled = false;
@@ -433,6 +456,7 @@ export function initGeneExpressionSelector(options) {
       if (
         isFieldInteractionSupersededError(error)
         || isDatasetFieldLoadSupersededError(error)
+        || isFieldLoadCancelledError(error)
       ) {
         return;
       }
@@ -474,6 +498,7 @@ export function initGeneExpressionSelector(options) {
       if (
         isFieldInteractionSupersededError(error)
         || isDatasetFieldLoadSupersededError(error)
+        || isFieldLoadCancelledError(error)
       ) {
         return;
       }
@@ -526,8 +551,34 @@ export function initGeneExpressionSelector(options) {
     );
     publishedGeneCount = countPublishedGenes(inventory);
     geneSearchKeys = geneFieldList.map(({ field }) => searchKeyOf(field));
+    const naming = state.varData?.geneNames ?? null;
+    // Each gene's identifier beside its shown name (`geneIdentities`).
+    const { idOf } = geneIdentities(state.varData ?? null);
+    geneIdsByIndex = new Map();
+    for (const { field, originalIdx } of geneFieldList) {
+      if (field._isUserDefined === true) continue;
+      const id = idOf(field.key);
+      if (id !== field.key) geneIdsByIndex.set(originalIdx, id);
+    }
+    geneIdKeys = geneIdsByIndex.size === 0
+      ? null
+      : geneFieldList.map(({ originalIdx }) => geneIdsByIndex.get(originalIdx)?.toLowerCase() ?? '');
+    const named = geneFieldList.filter(({ field }) => field._isUserDefined !== true);
+    identifierExample = (naming?.source ?? null) === null && namesAreIdentifiers(named.map(({ field }) => field.key))
+      ? named[0].field.key
+      : null;
     hasGeneExpressionFields = geneFieldList.length > 0;
-    geneContainer.hidden = !hasGeneExpressionFields;
+    // A dataset just shown lists its genes after its first view: the search
+    // says they are loading (or why they could not be read) until then.
+    const pending = state.areGenesPending();
+    const failure = hasGeneExpressionFields ? null : state.getGeneListFailure();
+    geneContainer.hidden = !hasGeneExpressionFields && !pending && failure === null;
+    geneContainer.setAttribute('aria-busy', String(pending));
+    geneSearch.disabled = pending || failure !== null;
+    geneSearch.placeholder = pending
+      ? 'Reading gene names…'
+      : failure !== null ? 'Gene names could not be read' : 'Search genes…';
+    geneSearch.title = failure === null ? '' : failure.message;
     if (
       selectedGeneOriginalIdx >= 0
       && !geneFieldList.some(
@@ -552,6 +603,13 @@ export function initGeneExpressionSelector(options) {
       item.title = `Original: ${field._originalKey}`;
     }
     item.textContent = label;
+    const id = geneIdsByIndex.get(originalIdx);
+    if (id !== undefined) {
+      const identifier = ownerDocument.createElement('span');
+      identifier.className = 'text-secondary';
+      identifier.textContent = ` ${id}`;
+      item.appendChild(identifier);
+    }
     item.dataset.originalIdx = String(originalIdx);
     return item;
   }
@@ -565,7 +623,7 @@ export function initGeneExpressionSelector(options) {
     // Best match first: Enter with no option active takes the first one.
     const filtered = normalizedQuery.length === 0
       ? geneFieldList
-      : rankedMatchIndices(geneSearchKeys, normalizedQuery).map(index => geneFieldList[index]);
+      : rankedMatchIndices(geneSearchKeys, normalizedQuery, geneIdKeys).map(index => geneFieldList[index]);
     geneResults = filtered;
 
     if (filtered.length === 0) {
@@ -588,7 +646,7 @@ export function initGeneExpressionSelector(options) {
         headline.appendChild(echo);
         const note = ownerDocument.createElement('div');
         note.className = 'mt-1';
-        note.textContent = formatGenePanelNote(publishedGeneCount);
+        note.textContent = formatGenePanelNote(publishedGeneCount, identifierExample);
         const help = ownerDocument.createElement('a');
         help.className = 'text-link d-inline-block mt-1';
         help.href = GENE_PANEL_HELP_URL;
@@ -692,10 +750,19 @@ export function initGeneExpressionSelector(options) {
       geneSearch.value = field.key;
       updateGeneActionButtons();
       callbacks.onBusyChanged(true);
+      // A gene of a subsample's cell-major matrix shows on more cells as
+      // they are read (`showPartialVarField`); the colours of the field
+      // shown come back if it is not shown in the end.
+      let partial = false;
       try {
         await state.ensureVarFieldLoaded(index, {
           signal: token.signal,
-          priority: 'high'
+          priority: 'high',
+          onPartial: values => {
+            if (interactionOwner.isCurrent(token) && readDatasetGeneration() === datasetGeneration) {
+              partial = state.showPartialVarField(index, values) || partial;
+            }
+          }
         });
         interactionOwner.assertCurrent(token);
         if (
@@ -711,11 +778,20 @@ export function initGeneExpressionSelector(options) {
         callbacks.onActiveFieldChanged(info);
         return info;
       } catch (error) {
+        if (partial && readDatasetGeneration() === datasetGeneration && !isDatasetFieldLoadSupersededError(error)) {
+          state.restoreActiveFieldColors();
+        }
         if (
           interactionOwner.isCurrent(token) === false
           || isFieldInteractionSupersededError(error)
           || isDatasetFieldLoadSupersededError(error)
         ) {
+          return null;
+        }
+        if (isFieldLoadCancelledError(error)) {
+          // The person stopped the load: the view shows what it showed.
+          selectedGeneOriginalIdx = -1;
+          syncFromState();
           return null;
         }
         const selectionError = requireError(error, 'Gene selection');

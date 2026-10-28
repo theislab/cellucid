@@ -37,6 +37,7 @@ import {
   writable,
 } from './r-values.js';
 import { EntryCollector, SORT_BLOCK_ENTRIES } from './entries.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
 
 /**
  * What one R matrix is.
@@ -142,7 +143,7 @@ export async function cellsByFeatures(matrix, context) {
     const values = part(matrix.values, 'values');
     if (matrix.values.kind === 'logical') {
       const numbers = await vectorValues(matrix.values, context);
-      return { format: 'dense', shape, data: { values: Float32Array.from(numbers, value => (value === -2147483648 ? NaN : value)) } };
+      return { format: 'dense', shape, data: { values: logicalNumbers(Float32Array, numbers) } };
     }
     return { format: 'dense', shape, data: values };
   }
@@ -167,11 +168,11 @@ export async function cellsByFeatures(matrix, context) {
 async function valuesPart(x, indices, context) {
   if (x === null || isNull(x)) {
     const count = indices.length;
-    return { values: new Float32Array(count).fill(1) };
+    return { values: allocateTypedArray(Float32Array, count, 'A pattern matrix').fill(1) };
   }
   if (x.kind === 'logical') {
     const numbers = await vectorValues(x, context);
-    return { values: Float32Array.from(numbers, value => (value === -2147483648 ? NaN : value)) };
+    return { values: logicalNumbers(Float32Array, numbers) };
   }
   return part(x, 'values');
 }
@@ -181,7 +182,14 @@ async function sliceOfValues(x, from, count, context) {
   if (x === null || isNull(x)) return null;
   const values = await vectorSlice(x, from, count, context);
   if (x.kind !== 'logical') return values;
-  return Float64Array.from(values, value => (value === -2147483648 ? NaN : value));
+  return logicalNumbers(Float64Array, values);
+}
+
+/** A logical vector's values as numbers of `ArrayType`, NA as NaN. */
+function logicalNumbers(ArrayType, numbers) {
+  const out = allocateTypedArray(ArrayType, numbers.length, 'A logical matrix');
+  for (let i = 0; i < numbers.length; i++) out[i] = numbers[i] === -2147483648 ? NaN : numbers[i];
+  return out;
 }
 
 /**
@@ -209,7 +217,7 @@ export async function assembleColumns(pieces, nCells, nFeatures, context, { bloc
   const loaded = [];
   let entries = 0;
   let rising = true;
-  const counts = new Float64Array(nCells);
+  const counts = allocateTypedArray(Float64Array, nCells, 'Entries per cell');
   for (const piece of pieces) {
     const p = await vectorValues(piece.matrix.p, context);
     let last = -1;
@@ -224,7 +232,7 @@ export async function assembleColumns(pieces, nCells, nFeatures, context, { bloc
     loaded.push({ ...piece, p });
   }
   if (!rising) return collectColumns(loaded, nCells, nFeatures, entries, context);
-  const pointers = new Float64Array(nCells + 1);
+  const pointers = allocateTypedArray(Float64Array, nCells + 1, 'Matrix pointers');
   for (let cell = 0; cell < nCells; cell++) pointers[cell + 1] = pointers[cell] + counts[cell];
   const indicesWriter = await context.space.sink.open(entries * 4);
   const dataWriter = await context.space.sink.open(entries * 8);
@@ -237,9 +245,9 @@ export async function assembleColumns(pieces, nCells, nFeatures, context, { bloc
     while (end < nCells && pointers[end + 1] - pointers[first] <= blockEntries) end++;
     const base = pointers[first];
     const size = pointers[end] - base;
-    const indices = new Int32Array(size);
-    const data = new Float64Array(size);
-    const filled = new Float64Array(end - first);
+    const indices = allocateTypedArray(Int32Array, size, 'Matrix entries');
+    const data = allocateTypedArray(Float64Array, size, 'Matrix entries');
+    const filled = allocateTypedArray(Float64Array, end - first, 'Matrix pointers');
     let interleaved = false;
     for (let q = 0; q < loaded.length; q++) {
       const { p, cells, features, matrix } = loaded[q];
@@ -269,14 +277,14 @@ export async function assembleColumns(pieces, nCells, nFeatures, context, { bloc
     if (interleaved || loaded.some(piece => piece.features !== null)) {
       for (let cell = first; cell < end; cell++) sortCellEntries(indices, data, pointers[cell] - base, pointers[cell + 1] - base);
     }
-    await indicesWriter.write(new Uint8Array(indices.buffer));
-    await dataWriter.write(new Uint8Array(data.buffer));
+    await indicesWriter.write(new Uint8Array(indices.buffer, indices.byteOffset, indices.byteLength));
+    await dataWriter.write(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
     first = end;
   }
   return {
     format: 'csr',
     shape: [nCells, nFeatures],
-    indptr: { values: entries < 2 ** 31 ? Int32Array.from(pointers) : pointers },
+    indptr: { values: entries < 2 ** 31 ? copyTypedArray(Int32Array, pointers, 'Matrix pointers') : pointers },
     indices: { region: await indicesWriter.close(), dtype: '<i4' },
     data: { region: await dataWriter.close(), dtype: '<f8' },
   };
@@ -287,9 +295,15 @@ function sortCellEntries(indices, data, start, end) {
   let ordered = true;
   for (let k = start + 1; k < end && ordered; k++) ordered = indices[k - 1] <= indices[k];
   if (ordered) return;
-  const order = Int32Array.from({ length: end - start }, (_, k) => start + k).sort((a, b) => indices[a] - indices[b] || a - b);
-  const sortedIndices = Int32Array.from(order, k => indices[k]);
-  const sortedData = Float64Array.from(order, k => data[k]);
+  const order = allocateTypedArray(Int32Array, end - start, 'Cell entry order');
+  for (let k = 0; k < order.length; k++) order[k] = start + k;
+  order.sort((a, b) => indices[a] - indices[b] || a - b);
+  const sortedIndices = allocateTypedArray(Int32Array, order.length, 'Matrix entries');
+  const sortedData = allocateTypedArray(Float64Array, order.length, 'Matrix entries');
+  for (let k = 0; k < order.length; k++) {
+    sortedIndices[k] = indices[order[k]];
+    sortedData[k] = data[order[k]];
+  }
   indices.set(sortedIndices, start);
   data.set(sortedData, start);
 }

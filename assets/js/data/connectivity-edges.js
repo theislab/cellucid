@@ -12,6 +12,7 @@
 
 import { yieldToMacrotask } from '../utils/yield-macrotask.js';
 import { CONNECTIVITY_RECORD_WORDS, createConnectivityEdgeOrder } from '../rendering/connectivity-edge-selection.js';
+import { allocateTypedArray } from './sparse-column-index.js';
 
 /**
  * Stored entries a graph's extraction walks between yields to the reader's
@@ -111,7 +112,14 @@ function sortedLines(indptr, indices, data, majorAxis) {
       }
     }
     if (ordered) continue;
-    copied ??= { indices: indices.slice(), data: data.slice() };
+    if (copied === null) {
+      copied = {
+        indices: allocateTypedArray(indices.constructor, indices.length, 'Connectivity neighbours'),
+        data: allocateTypedArray(data.constructor, data.length, 'Connectivity weights'),
+      };
+      copied.indices.set(indices);
+      copied.data.set(data);
+    }
     const order = Array.from({ length: end - start }, (_, i) => start + i)
       .sort((left, right) => indices[left] - indices[right]);
     order.forEach((from, i) => {
@@ -167,9 +175,9 @@ function denseConnectivityLines(sparse, nCells) {
   for (let index = 0; index < data.length; index++) {
     if (connectivityWeight(data[index], label) !== 0) stored++;
   }
-  const indptr = new Float64Array(nCells + 1);
-  const indices = new Int32Array(stored);
-  const values = data instanceof Float32Array ? new Float32Array(stored) : new Float64Array(stored);
+  const indptr = allocateTypedArray(Float64Array, nCells + 1, 'Connectivity row pointers');
+  const indices = allocateTypedArray(Int32Array, stored, 'Connectivity neighbours');
+  const values = allocateTypedArray(data instanceof Float32Array ? Float32Array : Float64Array, stored, 'Connectivity weights');
   let at = 0;
   for (let row = 0; row < nCells; row++) {
     for (let column = 0; column < nCells; column++) {
@@ -354,10 +362,10 @@ function* connectivityEdgeSteps(sparse, nCells) {
   // Passes 2 and 3 each write one array out of order (the partners, the
   // records); nothing reads out of order (a partner looked up per entry is
   // a dependent cache miss per edge).
-  const forwardOffsets = new Uint32Array(nCells + 1);
-  const lowerOffsets = new Uint32Array(nCells + 1);
+  const forwardOffsets = allocateTypedArray(Uint32Array, nCells + 1, 'Connectivity offsets');
+  const lowerOffsets = allocateTypedArray(Uint32Array, nCells + 1, 'Connectivity offsets');
   // Where each line's upper entries start (its entries ascend).
-  const upperStarts = new Float64Array(majorAxis);
+  const upperStarts = allocateTypedArray(Float64Array, majorAxis, 'Connectivity line starts');
   let lines = { indices, data };
   let counted = yield* countConnectivityLines(indptr, lines.indices, lines.data, majorAxis, nCells, forwardOffsets, lowerOffsets, upperStarts);
   if (counted === null) {
@@ -372,16 +380,17 @@ function* connectivityEdgeSteps(sparse, nCells) {
   const edgeCount = requireEdgeCount(upperCount);
   accumulateOffsets(forwardOffsets);
   accumulateOffsets(lowerOffsets);
-  const neighborOffsets = new Uint32Array(nCells + 1);
+  const neighborOffsets = allocateTypedArray(Uint32Array, nCells + 1, 'Connectivity neighbour offsets');
   for (let cell = 0; cell <= nCells; cell++) neighborOffsets[cell] = forwardOffsets[cell] + lowerOffsets[cell];
 
   const lineIndices = lines.indices;
   const lineData = lines.data;
-  const neighbors = new Uint32Array(2 * edgeCount);
+  const neighbors = allocateTypedArray(Uint32Array, 2 * edgeCount, 'Connectivity neighbours');
   // Each edge's partner and exact weight, until pass 3 has matched them.
-  const partners = new Uint32Array(edgeCount);
-  const weights = lineData instanceof Float32Array ? new Float32Array(edgeCount) : new Float64Array(edgeCount);
-  const placed = forwardOffsets.slice(0, nCells);
+  const partners = allocateTypedArray(Uint32Array, edgeCount, 'Connectivity edge partners');
+  const weights = allocateTypedArray(lineData instanceof Float32Array ? Float32Array : Float64Array, edgeCount, 'Connectivity weights');
+  const placed = allocateTypedArray(Uint32Array, nCells, 'Connectivity offsets');
+  placed.set(forwardOffsets.subarray(0, nCells));
   let stepStart = 0;
   for (let major = 0; major < majorAxis; major++) {
     const end = indptr[major + 1];
@@ -404,8 +413,8 @@ function* connectivityEdgeSteps(sparse, nCells) {
     }
   }
   const rankOf = createConnectivityEdgeOrder(edgeCount).rankOf;
-  const records = new Uint32Array(edgeCount * CONNECTIVITY_RECORD_WORDS);
-  const strengths = new Float32Array(records.buffer);
+  const records = allocateTypedArray(Uint32Array, edgeCount * CONNECTIVITY_RECORD_WORDS, 'Connectivity edges');
+  const strengths = new Float32Array(records.buffer, records.byteOffset, records.length);
   stepStart = 0;
   for (let major = 0; major < majorAxis; major++) {
     const end = indptr[major + 1];

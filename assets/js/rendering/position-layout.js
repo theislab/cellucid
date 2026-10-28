@@ -187,28 +187,3 @@ export function readPositionBounds(positions, dimension) {
 export function positionByteLength(pointCount, dimension) {
   return pointCount * dimension * POSITION_BYTES_PER_COMPONENT;
 }
-
-/**
- * Point the bound vertex array's `location` attribute at a tightly packed
- * position stream of `dimension` Float32 components per point. Declared in the
- * shader as a `vec3`, the attribute receives 0 for the components the stream
- * does not supply.
- *
- * @param {WebGL2RenderingContext} gl
- * @param {WebGLBuffer} buffer
- * @param {number} dimension
- * @param {number} [location=0]
- */
-export function bindPositionAttribute(gl, buffer, dimension, location = 0) {
-  requirePositionDimension(dimension, 'Position attribute dimension');
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.enableVertexAttribArray(location);
-  gl.vertexAttribPointer(
-    location,
-    dimension,
-    gl.FLOAT,
-    false,
-    dimension * POSITION_BYTES_PER_COMPONENT,
-    0
-  );
-}
